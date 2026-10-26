@@ -1,0 +1,254 @@
+# Phase 2: Home and Hot Cache
+
+This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model and the sync use case.
+
+---
+
+### 2.1 Home Port and Reference House
+
+**Goal:** Add `src/ports.rs` with the `Home` port and its data types, and the reference house snapshot. Later sub-phases can now build the HA adapter, the cache and the fakes against one fixed contract.
+
+- **Implements:** G8, G10. **Depends on:** 1.2.
+- **Files:** create `src/ports.rs`, `src/testing/house.json`. Modify `src/main.rs`.
+
+**Model.**
+
+- `Home` has `snapshot() -> Result<Snapshot>`, `events() -> Stream<Event>` and `call(ServiceCall) -> Result<Option<Value>>`.
+- `Snapshot`: `states`, `areas`, `devices`, `entities`. `State`: `entity_id`, `state`, `attributes`, `context`. `Context`: `id`, `user_id`, `parent_id`.
+- `Event`: `StateChanged { entity_id, old, new, context }` (`new` can be absent), `RegistryUpdated`, `Reconnected`.
+- `ServiceCall`: `domain`, `service`, `target` (entity IDs), `data`, `return_response`.
+- `house.json` is a `Snapshot` of the reference house (`01-architecture.md` section 11).
+
+**Acceptance criteria.**
+
+- AC-2.1-1: When `house.json` is parsed, it gives a `Snapshot` without error.
+- AC-2.1-2: When the snapshot is read, it has the 7 areas, 2 `person` entities, 4 satellites and their 4 presence sensors without a device class.
+- AC-2.1-3: When the snapshot is read, "Garage Light" is a `switch`, "Living Room Fan" is a `switch`, "Office Fan" is a `fan`, and the only `climate` entity is in the Kitchen.
+- AC-2.1-4: When the snapshot is read, the Office has two temperature sensors with the states `64.0` and `76.6`.
+
+**Proofs.**
+
+- P-2.1-1 to P-2.1-4. Evidence: test.
+
+---
+
+### 2.2 HA Connection and Authentication
+
+**Goal:** Add `HaHome::connect`, which opens the HA WebSocket and authenticates with the token. Add the fake HA server to the adapter tests, so later HA sub-phases test without a real HA.
+
+- **Implements:** G8. **Depends on:** 2.1.
+- **Files:** create `src/adapters/ha.rs`. Modify `src/main.rs`, `Cargo.toml`.
+
+**Model.**
+
+- Authentication states: `AwaitRequired -> SentAuth -> Ready | Rejected`. HA sends `auth_required`. Jarvis sends `auth` with the token. HA sends `auth_ok` or `auth_invalid`.
+- `FakeHaServer` (test block of `ha.rs`) is a local WebSocket server. It accepts one token, serves `house.json`, sends scripted events and records the messages it receives.
+
+**Acceptance criteria.**
+
+- AC-2.2-1: When the token is correct, `connect` returns a connected adapter.
+- AC-2.2-2: When the token is incorrect, `connect` returns an authentication error.
+- AC-2.2-3: When the server closes before `auth_required`, `connect` returns a connection error.
+- AC-2.2-4: When the server sends a message other than `auth_ok` or `auth_invalid` after `auth`, `connect` returns a protocol error that contains the message type.
+
+**Proofs.**
+
+- P-2.2-1, P-2.2-2. Evidence: test.
+- P-2.2-3, P-2.2-4. Requires: the state is `AwaitRequired` or `SentAuth`. Ensures: only `auth_ok` reaches `Ready`. Argument: the handshake is a match on `(state, message type)`. `Ready` has one incoming transition, from `SentAuth` on `auth_ok`. Every other pair, and the end of the stream, returns an error.
+
+---
+
+### 2.3 HA Requests and Snapshot
+
+**Goal:** Add request IDs to `HaHome`, so concurrent callers each receive their own result. Add `snapshot`, which loads the states and the area, device and entity registries.
+
+- **Implements:** G8. **Depends on:** 2.2.
+- **Files:** modify `src/adapters/ha.rs`, `src/ports.rs`.
+
+**Model.** `HaHome` keeps `next_id: u64` and `pending: Map<u64, reply sender>`. A request takes `next_id`, then `next_id` increases by 1. A `result` message with ID `n` goes to `pending[n]`, and `n` is removed. `snapshot` sends `get_states`, `config/area_registry/list`, `config/device_registry/list` and `config/entity_registry/list`.
+
+**Acceptance criteria.**
+
+- AC-2.3-1: When 100 requests are sent at the same time, each caller receives the result with its own ID.
+- AC-2.3-2: When `snapshot` runs, it returns the states and the three registries of `house.json`.
+- AC-2.3-3: When a result has an ID that is not pending, the adapter ignores it and other requests continue.
+- AC-2.3-4: When HA returns `success = false`, the caller receives an error with the HA error message.
+
+**Proofs.**
+
+- P-2.3-1 (AC-2.3-1). Requires: `next_id` is only read and increased under one lock. Ensures: no two pending requests have the same ID, and each result reaches exactly one caller. Argument: `next_id` strictly increases, so each request gets a new value. `pending` is a map, so one ID has one sender. Removal on delivery means a sender receives at most one result.
+- P-2.3-2. Evidence: test.
+- P-2.3-3 (AC-2.3-3). Argument: delivery looks up the ID. A missing ID is a no-op, and the map does not change.
+- P-2.3-4. Evidence: test.
+
+---
+
+### 2.4 HA Events and Reconnect
+
+**Goal:** Add `events`, which subscribes to state changes and registry updates. Add reconnect after a disconnect, with a `Reconnected` event, so the cache can load a new snapshot.
+
+- **Implements:** G8. **Depends on:** 2.3.
+- **Files:** modify `src/adapters/ha.rs`.
+
+**Model.**
+
+- After `Ready`, the adapter sends `subscribe_events` for `state_changed`, `area_registry_updated`, `device_registry_updated` and `entity_registry_updated`.
+- On a disconnect: every pending request gets a disconnect error, then the adapter connects again with backoff (100 ms, doubled, at most 2 s). After `Ready` and the new subscriptions, it gives `Reconnected`.
+- The connection has an epoch number. An event from an old epoch is dropped.
+
+**Acceptance criteria.**
+
+- AC-2.4-1: When `FakeHaServer` sends `state_changed`, `events` gives `StateChanged` with its context.
+- AC-2.4-2: When `FakeHaServer` sends `entity_registry_updated`, `events` gives `RegistryUpdated`.
+- AC-2.4-3: When `FakeHaServer` closes the connection, the adapter connects again after the first backoff delay in virtual time and `events` gives `Reconnected`.
+- AC-2.4-4: When the connection closes with a pending request, the caller receives a disconnect error.
+- AC-2.4-5: When the backoff runs five times, the delays are 100, 200, 400, 800 and 1600 ms, and the sixth is 2000 ms.
+
+**Proofs.**
+
+- P-2.4-1 to P-2.4-3. Evidence: test.
+- P-2.4-4 (AC-2.4-4). Ensures: after a disconnect, `pending` is empty and each removed sender received an error. Argument: the disconnect handler drains the map and sends an error to each sender before it starts the reconnect.
+- P-2.4-5 (AC-2.4-5). Requires: attempt `k >= 0`. Ensures: `delay(k) = min(100 * 2^k, 2000)`. Argument: the function is this closed form. `100 * 2^5 = 3200 > 2000`, so the sixth delay is 2000.
+
+---
+
+### 2.5 HA Service Calls
+
+**Goal:** Add `call`, which sends `call_service` with the target and data, and returns the response data when asked. Jarvis can now act on HA.
+
+- **Implements:** G8. **Depends on:** 2.4.
+- **Files:** modify `src/adapters/ha.rs`.
+
+**Model.** `call(c)` sends `{ type: "call_service", domain, service, target: { entity_id }, service_data: data, return_response }` and returns `response` when `return_response` is true.
+
+**Acceptance criteria.**
+
+- AC-2.5-1: When `call` runs, `FakeHaServer` receives `call_service` with the domain, service, target and data.
+- AC-2.5-2: When `call` runs with `return_response = true`, the caller receives the response data.
+- AC-2.5-3: When `call` runs with `return_response = false`, the caller receives `None`.
+
+**Proofs.**
+
+- P-2.5-1, P-2.5-2. Evidence: test.
+- P-2.5-3 (AC-2.5-3). Argument: the result is `Some(response)` only in the branch where `return_response` is true.
+
+---
+
+### 2.6 Cache Sync Quint Model
+
+**Goal:** Add `quint/cache_sync.qnt`, the model of HA state, the event stream, disconnects and the hot cache. It proves that the cache equals HA whenever the connection is idle, before the Rust code exists.
+
+- **Implements:** G8, G19. **Depends on:** 2.5.
+- **Files:** create `quint/cache_sync.qnt`.
+- **Quint:** `cache_sync.qnt`.
+
+**Model.**
+
+- Constants: `ENTITIES = Set("a", "b")`, `VALUES = Set(0, 1)`.
+- State: `home: ENTITY -> VALUE`, `cache: ENTITY -> VALUE`, `queue: List[(ENTITY, VALUE, EPOCH)]`, `connected: bool`, `epoch: int`.
+- Actions:
+  - `change(e, v)`: `home[e] := v`. If connected, append `(e, v, epoch)` to `queue`.
+  - `deliver`: pop the head. If its epoch equals `epoch`, set `cache[e] := v`.
+  - `disconnect`: `connected := false`, `queue := []`.
+  - `reconnect`: `epoch := epoch + 1`, `cache := home`, `connected := true`.
+- Invariants:
+  - `CacheEqualsHomeWhenIdle`: `connected and queue == [] implies cache == home`.
+  - `NoEventAfterDisconnect`: every queued event has the current epoch.
+
+**Acceptance criteria.**
+
+- AC-2.6-1 [Quint]: `quint typecheck` passes.
+- AC-2.6-2 [Quint]: `CacheEqualsHomeWhenIdle` holds in simulation and in `quint verify` to 10 steps.
+- AC-2.6-3 [Quint]: `NoEventAfterDisconnect` holds in simulation and in `quint verify` to 10 steps.
+- AC-2.6-4 [Quint]: The test `changeWhileDisconnected` passes: a change while disconnected is in the cache after `reconnect`.
+
+**Proofs.**
+
+- P-2.6-2 (AC-2.6-2). Claim: `CacheEqualsHomeWhenIdle` is an inductive invariant together with `QueueReplaysToHome`: applying `queue` in order to `cache` gives `home`. Argument by induction on steps. Initially `cache = home` and `queue = []`. `change` keeps `QueueReplaysToHome`, because the new entry is the last write to `e`. `deliver` moves the head from the queue into the cache, so the replay result is the same. `disconnect` makes `connected` false, so the claim is vacuous. `reconnect` sets `cache := home` with an empty queue. When the queue is empty, `QueueReplaysToHome` gives `cache = home`.
+- P-2.6-3 (AC-2.6-3). Argument by induction: `change` appends with the current epoch. `disconnect` empties the queue. `reconnect` increases the epoch only when the queue is empty, because a disconnect came first. No action adds an old epoch.
+- P-2.6-1, P-2.6-4. Evidence: model check.
+
+---
+
+### 2.7 State Cache Updates
+
+**Goal:** Add `StateCache` in the domain with `load` and `apply`. The cache now follows HA events with pure, testable functions.
+
+- **Implements:** G8. **Depends on:** 2.6.
+- **Files:** create `src/domain/state.rs`. Modify `src/main.rs`.
+
+**Model.** `StateCache` holds `states: Map<entity_id, State>`, `areas`, `devices`, `entities`. `load(snapshot) -> StateCache` replaces everything. `apply(self, event) -> StateCache`: `StateChanged` with `new` sets `states[id] := new`, and without `new` removes `id`. `RegistryUpdated` and `Reconnected` do not change the cache (the use case loads a new snapshot).
+
+**Acceptance criteria.**
+
+- AC-2.7-1: When the cache loads `house.json`, `state("light.kitchen")` returns the state in the snapshot.
+- AC-2.7-2: When the cache applies `StateChanged` with a new state, `state` returns the new state.
+- AC-2.7-3: When the cache applies `StateChanged` without a new state, `state` returns none.
+- AC-2.7-4: When the cache applies `StateChanged` for entity `a`, the state of every other entity does not change.
+- AC-2.7-5: When the cache loads a second snapshot, no state from the first snapshot remains.
+
+**Proofs.**
+
+- P-2.7-1, P-2.7-5. Requires: a snapshot. Ensures: `states` equals the states of the snapshot. Argument: `load` builds a new map from the snapshot only.
+- P-2.7-2 to P-2.7-4. Ensures: `apply(c, StateChanged(a, n)).states = c.states[a := n]` (or `c.states \ {a}` when `n` is absent). Argument: `apply` does one insert or one remove on key `a`. A map insert or remove on key `a` keeps every other key.
+
+---
+
+### 2.8 State Cache Queries
+
+**Goal:** Add the cache queries that selection and decisions need: area of a device, entities by area, domain and device class, and area by name or alias. The queries meet a 10 µs p99 with 2000 entities.
+
+- **Implements:** G8, G9. **Depends on:** 2.7.
+- **Files:** modify `src/domain/state.rs`, `Cargo.toml`, `justfile`, `.github/workflows/ci.yml`. Create `benches/domain.rs`.
+
+**Model.**
+
+- `area_of_device(device_id) -> Option<AreaId>`.
+- `area_of_entity(entity_id)`: the entity area, else the area of its device.
+- `entities(area, domain, device_class: Option) -> Vec<EntityId>`.
+- `area_by_name(text) -> Option<AreaId>`: matches the name or an alias without case sensitivity.
+- `benches/domain.rs` is the first Gungraun benchmark file. Each benchmark sets `Callgrind::hard_limits` with an absolute instruction budget. `just bench` runs it, and the `bench` CI job runs `just bench` on `ubuntu-latest`. `check` runs `bench` only on Linux, because Valgrind does not run on macOS.
+
+**Acceptance criteria.**
+
+- AC-2.8-1: When a device has an area, `area_of_device` returns that area.
+- AC-2.8-2: When an entity has no area, `area_of_entity` returns the area of its device.
+- AC-2.8-3: When `entities(living_room, "fan", None)` runs, it returns only fan entities in the Living Room.
+- AC-2.8-4: When `entities` gets a device class, it returns only entities with that device class.
+- AC-2.8-5: When `area_by_name("living ROOM")` runs, it returns the Living Room. An alias also matches.
+- AC-2.8-6: When no area has the name or alias, `area_by_name` returns none.
+- AC-2.8-7 [Bench]: `state` and `entities` with 2000 entities each stay within the instruction budget in `benches/domain.rs`.
+
+**Proofs.**
+
+- P-2.8-2 (AC-2.8-2). Ensures: `area_of_entity(e) = entity.area.or(area_of_device(entity.device))`. Argument: the function is this expression.
+- P-2.8-3, P-2.8-4. Ensures: every returned entity has the area, the domain and (if given) the device class. Argument: `entities` is a filter whose predicate is the conjunction of the three conditions.
+- P-2.8-5, P-2.8-6. Ensures: `Some(a)` if and only if the lowercase text equals the lowercase name or a lowercase alias of `a`. Argument: `area_by_name` is a `find` with that predicate. `find` returns `None` when no element matches.
+- P-2.8-1. Evidence: test.
+- P-2.8-7. Evidence: benchmark.
+
+---
+
+### 2.9 Sync Use Case
+
+**Goal:** Add the sync use case, which loads the snapshot, applies events and loads a new snapshot after a registry update or a reconnect. Add `FakeHome` and the conformance test against `cache_sync.qnt`.
+
+- **Implements:** G8, G19. **Depends on:** 2.8.
+- **Files:** create `src/app/background.rs`, `src/testing/fakes.rs`. Modify `src/main.rs`, `Cargo.toml`.
+- **Quint:** `cache_sync.qnt` (conformance).
+
+**Model.** `sync(home, cache: ArcSwap<StateCache>)`: load the snapshot, then for each event: `StateChanged` applies it, `RegistryUpdated` and `Reconnected` load a new snapshot. `FakeHome` returns `house.json`, sends scripted events, records calls and can delay calls.
+
+**Acceptance criteria.**
+
+- AC-2.9-1: When sync starts, the cache contains all states and registries from `FakeHome`.
+- AC-2.9-2: When `FakeHome` sends a state change, the cache shows the new state before virtual time advances.
+- AC-2.9-3: When `FakeHome` sends `RegistryUpdated`, `FakeHome` records a second `snapshot` call.
+- AC-2.9-4: When `FakeHome` sends `Reconnected`, the cache replaces all old data with the new snapshot.
+- AC-2.9-5: When `quint-connect` replays 100 traces of `cache_sync.qnt`, the cache equals the model `cache` after each step.
+
+**Proofs.**
+
+- P-2.9-1, P-2.9-3, P-2.9-4. Argument: the event loop is a match on the event type. `RegistryUpdated` and `Reconnected` both call `load(snapshot())`, and `load` replaces all data (P-2.7-1).
+- P-2.9-2. Argument: the event loop applies each event when it is received, with no timer between receive and apply.
+- P-2.9-5. Evidence: test. With P-2.6-2, it gives `CacheEqualsHomeWhenIdle` for the Rust code on the replayed traces.
