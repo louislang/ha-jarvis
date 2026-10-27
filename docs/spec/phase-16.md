@@ -10,13 +10,13 @@ This phase composes the component models into one Quint model of the whole reque
 
 - **Implements:** G19. **Depends on:** 15.7.
 - **Files:** create `quint/jarvis.qnt`.
-- **Quint:** `jarvis.qnt`, which imports `announce`, `commit`, `dialog`, `feedback`, `training`, `learned` and `prefetch` with small constants.
+- **Quint:** `jarvis.qnt`, which imports one instance of `commit` and one of `announce` for each request, and one instance of `dialog`, `feedback`, `training`, `learned` and `prefetch`, with small constants. `cache_sync`, `backfill` and `speaker` are not in the composition: the request reads the cache, a backfill changes only pools, and the speaker is a slot value. Their own models cover them.
 
 **Model.**
 
 - Constants: two satellites, three requests, two model versions.
 - State: for each request: `phase: Listening | Committed | Handling | Replied | Deferred | Done`, `handled: int` (number of `Handled` messages), `replyTime`, `callTime`, `fillerEnd`, `announceTimes`, `modelVersion`. Global: `activeModel`, plus the state of the imported models.
-- Actions: `audio(r)`, `commit(r)` (from `commit`), `handle(r)` (reads `activeModel` once and stores it as `modelVersion`), `reply(r)`, `call(r)`, `defer(r)`, `announce(r)` (from `announce`), `ask(r)` and `answer(r)` (from `dialog`), `mark` (from `feedback`), `swap` (from `training`: `activeModel := v`).
+- Actions: `audio(r)`, `commit(r)` (from the `commit` instance of `r`), `handle(r)` (reads `activeModel` once and stores it as `modelVersion`), `reply(r)`, `fail(r)` (an error: `not-handled`, `Handling` to `Done`, `handled += 1`), `call(r)` (enabled in `Replied` or `Deferred`, because System Two and fetch jobs call after the filler), `defer(r)`, `announce(r)` (from `announce`), `ask(r)` and `answer(r)` (from `dialog`), `mark` (from `feedback`), `swap` (from `training`: `activeModel := v`).
 - Invariants:
   - `OneHandledPerRequest`: `handled <= 1` for each request, and `handled = 1` when `phase` is `Replied`, `Deferred` or `Done`.
   - `ReplyBeforeCall`: when a request has a call, `callTime >= replyTime`.
@@ -29,11 +29,11 @@ This phase composes the component models into one Quint model of the whole reque
 - AC-16.1-1 [Quint]: `quint typecheck` passes.
 - AC-16.1-2 [Quint]: The four system invariants hold in simulation and to 10 steps in `quint verify`.
 - AC-16.1-3 [Quint]: The invariants of each imported model hold in the composition, in simulation.
-- AC-16.1-4 [Quint]: The test `swapDuringRequest` passes: a swap between `commit` and `reply` does not change the `modelVersion` of the request.
+- AC-16.1-4 [Quint]: The test `ac_16_1_4_swap_during_request` passes: a swap between `commit` and `reply` does not change the `modelVersion` of the request.
 
 **Proofs.**
 
-- P-16.1-2. `OneHandledPerRequest`: `reply`, `defer` and `ask` are the only actions that increment `handled`. Each requires `phase = Handling` and moves the phase out of `Handling`, and no action moves a request back to `Handling`. `ReplyBeforeCall`: `call(r)` is enabled only when `phase = Replied`, so it occurs after `reply(r)`, and time does not decrease. `FillerBeforeAnswer`: `announce(r)` uses the `start` guard of `announce` (P-4.7-2). `ModelSwapAtomic`: `handle(r)` writes `modelVersion` once from `activeModel`. No later action writes it, and `swap` writes only `activeModel`.
+- P-16.1-2. Bounded evidence to 10 steps. `OneHandledPerRequest`: `reply`, `fail`, `defer` and `ask` are the only actions that increment `handled`. Each requires `phase = Handling` and moves the phase out of `Handling`, and no action moves a request back to `Handling`. `ReplyBeforeCall`: `call(r)` is enabled only when `phase` is `Replied` or `Deferred`, so it occurs after `reply(r)` or `defer(r)`, which set `replyTime`, and time does not decrease. The Rust code starts `after` only after the socket write (P-5.2-4). `FillerBeforeAnswer`: `announce(r)` uses the `start` guard of `announce` (P-4.7-2). `ModelSwapAtomic`: `handle(r)` writes `modelVersion` once from `activeModel`. No later action writes it, and `swap` writes only `activeModel`.
 - P-16.1-3. Argument: each imported action keeps its own guard and effect, and the composition adds no action that writes the state of an imported model. So each inductive invariant of a component (Phases 4 to 15) still holds.
 - P-16.1-1, P-16.1-4. Evidence: model check.
 

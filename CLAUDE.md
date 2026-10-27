@@ -12,18 +12,18 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 ## Workflow
 
 1. One sub-phase is one PR with one concern. Work in the order of the phase index.
-2. Start each sub-phase in a fresh context: a new session that reads only this file, `00-overview.md`, `01-architecture.md`, `02-rules.md` and that sub-phase's section.
+2. Start each sub-phase in a fresh context: a new session that reads only this file, `00-overview.md`, `01-architecture.md`, `02-rules.md`, that sub-phase's section, and the sections that its proofs, criteria and model cite.
 3. Each phase is one stack of GitHub native stacked PRs (`gh stack`), trunk `main`, one layer per sub-phase. After a change to a lower layer, run `gh stack rebase` and `gh stack push`.
 4. Before any code, write a test for every acceptance criterion: automated test (untagged), `[Bench]` instruction budget, `[GPU host]` `#[ignore]` test, or `[Quint]` model test or invariant. Name each test after its criterion ID (`ac_2_3_1_...`). Run them and make sure they fail.
 5. Write the least code that makes them pass.
 6. The sub-phase is complete only when all of its acceptance tests pass in the required checks. A phase is complete only when all of its sub-phases' acceptance tests pass on `main`.
-7. Every test is deterministic: paused tokio clock and `FakeClock`, fixed seeds, local servers only, temporary folders, deterministic Torch, Quint `--seed=1`. No wall-clock sleeps or timing asserts outside `[GPU host]` tests.
+7. Every test is deterministic: paused tokio clock and `FakeClock`, fixed seeds, local servers only, temporary folders, deterministic Torch, Quint `--seed=1`. No wall-clock sleeps or timing asserts outside `[GPU host]` tests. Setup recipes (`models`, `fixture-model`) download model files before the tests. Tests read `models/` and do not download.
 8. Coverage is more than 80% for all code written, enforced by the hook and CI from the first commit.
 9. A stateful change updates the Rust code, its Quint model and its conformance driver in the same PR.
 10. The PR changes at most 400 lines against the layer below (not counting `Cargo.lock`, `docs/architecture.md`, `src/testing/house.json`). If it cannot fit, split the sub-phase in the spec first.
 11. The PR description follows `.github/pull_request_template.md`: a summary of two or three sentences that states what the PR actually did and which problem it solves or which feature it adds, short bullet points, and every check box. Write it after the code, from the real change. Do not copy the sub-phase goal.
 12. The Codex GitHub app reviews each PR. Resolve every thread.
-13. Merge only with `just merge <pr>`: it checks every required check, every review thread and every check box, then squash merges the bottom layer. The commit message is the PR title, a blank line and the PR summary. Never add "Co-Authored-By" or any AI attribution.
+13. Merge only with `just merge <pr>`: it checks every required check, every review thread, every check box, the title, the branch and the summary, then squash merges the bottom layer at the inspected head commit. The commit message is the PR title, a blank line and the PR summary. Never add "Co-Authored-By" or any AI attribution. Phase 0 layers before `just merge` exists follow the bootstrap rule in `02-rules.md` section 7.1.
 14. Never skip the hooks (`--no-verify`). The pre-push hook refuses pushes to `main`.
 
 ## Required Checks
@@ -36,7 +36,7 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 | `rust-lint` | Any clippy pedantic finding or warning. A function over 50 lines. Dead code. `unwrap` outside tests. `unsafe`. A missing doc comment on any item. |
 | `complexity` | A Rust or Python function with cyclomatic complexity over 10, Halstead volume over 1000 or Halstead difficulty over 30. A Python function over 50 code lines. |
 | `duplication` | More than 3% duplicated code (`jscpd`, Rust and Python). |
-| `architecture` | A layer rule is broken, or code outside `src/main.rs` names a concrete adapter. |
+| `architecture` | A layer rule is broken, or code outside `src/lib.rs` names a concrete adapter. |
 | `rust-test` | A failed test (unit, gate, structure or conformance), or line coverage of 80% or less. |
 | `bench` | A benchmark over its instruction budget. |
 | `python` | `ruff format`, `ruff check` (all rules), `mypy --strict`, `vulture`, `interrogate` (100% docstrings) or `pytest` (coverage of 80% or less) fails. |
@@ -48,13 +48,13 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 
 ## Code Rules
 
-- Rust stable, edition 2024. The only other language is Python, only in `train/`.
+- Rust stable, edition 2024. The other languages are Python, only in `train/`, and the inline JavaScript of `src/adapters/review.html`.
 - Do not repeat code. Move shared code into one function.
 - Use a crate or a tool when one gives the function. Do not write your own version.
 - As few files as possible. A file has 500 lines or fewer where possible.
 - Each struct and each function has one responsibility.
 - Use pure functions where possible. All domain functions are pure.
-- Each port has exactly one production adapter. The only exception is `Trainer` (local process and RunPod fallback). Test fakes are in `src/testing/fakes.rs` only.
+- Each port has exactly one production adapter. The only exception is `Trainer` (local process and RunPod fallback). Port fakes are in `src/testing/fakes.rs` only. A fake server that only one adapter's tests use (for example `FakeHaServer`) is in the test block of that adapter.
 - The same code runs on the GPU and the CPU. `device` in `jarvis.toml` selects it. No separate GPU and CPU code paths.
 
 ## Comments and Text
@@ -89,11 +89,11 @@ The training script in `train/` is the only Python code (Python 3.12). Every rul
 
 Hexagonal (ports and adapters). See `01-architecture.md` section 1.
 
-- `src/domain/`: pure rules. No `crate::ports`, `crate::app`, `crate::adapters`, `tokio`, `std::fs` or `std::net`. Return typed errors, not `anyhow`.
+- `src/domain/`: pure rules. No `crate::ports`, `crate::app`, `crate::adapters`, `tokio`, `std::fs`, `std::net`, `std::process`, `std::thread`, `std::env`, `std::time::SystemTime`, `std::time::Instant`, `rand::thread_rng`, `rand::rng`. Time, randomness and the environment come in as parameters. Return typed errors, not `anyhow`.
 - `src/ports.rs`: all port traits and their data types. A port gets a method only in the sub-phase that uses it.
 - `src/app/`: use cases. No `crate::adapters`.
 - `src/adapters/`: one technology each. No `crate::app`.
-- `src/main.rs`: the composition root. The only code that names concrete adapters. It declares the folders as inline modules, so there are no `mod.rs` files.
+- `src/lib.rs`: the composition root. The only code that names concrete adapters. It declares the folders as inline `pub` modules, so there are no `mod.rs` files. `src/main.rs` only calls `jarvis::main`, so `benches/` can import the library.
 - `xtask/`: developer tools (complexity, PR size, module graph, layer rules, diagram, merge gate) and the gate tests. Jarvis does not depend on it.
 - `quint/`: one Quint model for each stateful component, plus the system model.
 
@@ -101,7 +101,7 @@ Hexagonal (ports and adapters). See `01-architecture.md` section 1.
 
 - Unit tests go in a `#[cfg(test)] mod tests` block at the end of each file. Shared test code goes in `src/testing/` only.
 - Domain tests use no fakes. Application tests use port fakes, with no network and no models. Adapter tests use local servers (`wiremock`, the fake HA server), in-memory object stores or the real models in `models/`.
-- Conformance drivers (`quint-connect`) go in the test block of the module they check.
+- Conformance drivers (`quint-connect`) go in the test block of the module they check. The system driver is in `src/testing/e2e.rs`.
 - CPU performance is an instruction budget (`[Bench]`, Gungraun). Wall-clock latency is measured only in `[GPU host]` tests.
 - Tool behavior and file structure are tested in `xtask/src/gates.rs`, never left to a manual step.
 - GPU host tests have `#[ignore]` and run with `just gpu-test`. CI and the MacBook run everything else on the CPU.

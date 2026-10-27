@@ -9,7 +9,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 **Goal:** Find each person's trackers and each satellite's presence sensors from the HA registries, with optional overrides in `jarvis.toml`. Speaker identification needs no manual entity list.
 
 - **Implements:** G12. **Depends on:** 14.10.
-- **Files:** create `src/domain/speaker.rs`. Modify `src/domain/state.rs`, `src/main.rs`, `jarvis.toml`.
+- **Files:** create `src/domain/speaker.rs`. Modify `src/domain/state.rs`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.**
 
@@ -39,14 +39,14 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 **Goal:** Read who is home, whether the satellite's room is occupied, and how close each person's phone or watch is to the satellite. Log a discovery report at startup, so you can check what Jarvis found.
 
 - **Implements:** G12. **Depends on:** 15.1.
-- **Files:** modify `src/domain/speaker.rs`, `src/main.rs`.
+- **Files:** modify `src/domain/speaker.rs`, `src/lib.rs`.
 
 **Model.**
 
 - `home(cache, people) -> Vec<Person>`: people whose `person` state is `home`.
 - `occupied(cache, satellite_device) -> Option<bool>`: `None` without a presence sensor, else true when one sensor is `on`.
 - `proximity(cache, trackers, area) -> f64`: 0 when no available tracker is in the area, else `1 / (1 + distance)` of the nearest tracker in the area.
-- `discovery_report(cache, people) -> Vec<String>`: one line for each satellite with its presence sensors, and one for each person with their trackers. `run` logs it.
+- `discovery_report(cache, people) -> Vec<String>`: one line for each satellite with its presence sensors, and one for each person with their trackers. `run` logs it. `trackers` reads the current cache at each identification, so an area sensor that shows no area at startup is found when it shows one. The report names a tracker without an area sensor at that time.
 
 **Acceptance criteria.**
 
@@ -71,15 +71,15 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 **Goal:** Add the `VoiceEmbedder` and `VoiceProfiles` ports and their sherpa-onnx adapters. Jarvis can turn an utterance into a voice embedding and compare it with stored profiles.
 
 - **Implements:** G12. **Depends on:** 15.2.
-- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `justfile`, `jarvis.toml`.
+- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `justfile`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `VoiceEmbedder::embed(audio) -> Result<Vec<f32>>` with `SpeakerEmbeddingExtractor`. `VoiceProfiles::enroll(person, embedding)` and `similarities(embedding) -> Map<person, f32>` with `SpeakerEmbeddingManager`, saved to `speaker.voices`. A profile keeps the newest `max_samples` embeddings. `just models` also downloads the speaker model and the multi-speaker test voice `vits-piper-en_US-libritts_r-medium`. This sub-phase adds `[speaker]` (`model`, `voices`, `max_samples`, `threshold`).
+**Model.** `VoiceEmbedder::embed(audio) -> Result<Vec<f32>>` with `SpeakerEmbeddingExtractor`. `VoiceProfiles::enroll(person, embedding)` and `similarities(embedding) -> Map<person, f32>` with `SpeakerEmbeddingManager`, saved to `speaker.voices`. A profile keeps the newest `max_samples` embeddings. `just models` also downloads the speaker model and the multi-speaker test voice `vits-piper-en_US-libritts_r-medium`. This sub-phase adds `[speaker]` (`model`, `voices`, `max_samples`, `voice_threshold`). `voice_threshold` is a voice similarity. Sub-phase 15.6 adds `threshold`, which is a combined score.
 
 **Acceptance criteria.**
 
-- AC-15.3-1: When `just models` runs, the speaker model and the multi-speaker test voice exist in `models/`.
-- AC-15.3-2: When one test voice speaker ID speaks two different phrases, the similarity is more than `speaker.threshold`.
-- AC-15.3-3: When two different test voice speaker IDs speak, the similarity is less than `speaker.threshold`.
+- AC-15.3-1: When `just models` has run, the speaker model and the multi-speaker test voice exist in `models/` with the SHA-256 that the recipe lists.
+- AC-15.3-2: When one test voice speaker ID speaks two different phrases, the similarity is more than `speaker.voice_threshold`.
+- AC-15.3-3: When two different test voice speaker IDs speak, the similarity is less than `speaker.voice_threshold`.
 - AC-15.3-4: When `enroll` adds more than `max_samples` embeddings for a person, the profile keeps the newest `max_samples`.
 - AC-15.3-5: When the adapter starts, it loads all profiles from the voice store.
 - AC-15.3-6 [GPU host]: With `device = cpu`, one embedding of 3 s of audio has a p95 of less than 80 ms.
@@ -98,12 +98,12 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 - **Implements:** G12, G15. **Depends on:** 15.3.
 - **Files:** modify `src/app/speech.rs`, `src/app/conversation.rs`.
 
-**Model.** At commit, the speech use case spawns `embed(audio)` in a blocking task and stores the future with the utterance. The conversation use case gets it through `correlate` (sub-phase 12.1). The interaction record gets the speaker.
+**Model.** At commit, the speech use case spawns `embed(audio)` in a blocking task and stores the future with the utterance. The conversation use case gets it through `correlate` (sub-phase 12.1). Sub-phase 15.6 uses it to identify the speaker.
 
 **Acceptance criteria.**
 
 - AC-15.4-1: When an utterance commits, the transcript is returned before the embedding completes.
-- AC-15.4-2: When the embedding completes, the correlated interaction has the speaker.
+- AC-15.4-2: When the embedding completes, the conversation use case gets the embedding through `correlate`.
 - AC-15.4-3 [GPU host]: With embeddings on, all Phase 9.2 latency tests pass.
 
 **Proofs.**
@@ -124,10 +124,10 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 **Model.**
 
 - Constants: `PEOPLE = Set("alex", "sam")`.
-- State: `home: Set[PERSON]`, `occupied: Option[bool]`, `proximity: PERSON -> int`, `voice: PERSON -> int`, `result: Option[PERSON]`, `source: Presence | Proximity | Voice | Answer | NoSource`, `enrolled: List[(PERSON, source)]`.
+- State: `home: Option[Set[PERSON]]` (`None` when presence is not known), `occupied: Option[bool]`, `proximity: PERSON -> int`, `voice: PERSON -> int`, `result: Option[PERSON]`, `source: Presence | Proximity | Voice | Answer | NoSource`, `enrolled: List[(PERSON, source)]`.
 - Actions: `setSignals(...)`, `identify` (rules 1 to 4 of sub-phase 15.6), `enroll` (rule 5), `answer(p)` (the user answers `ask_person`).
 - Invariants:
-  - `SpeakerIsCandidate`: `result = Some(p)` implies `p` is in `home`, or presence is unknown.
+  - `SpeakerIsCandidate`: `result = Some(p)` implies `p` is in `home`, or `home = None`, or `source = Answer`. The user can name a person who is not home.
   - `NoVoiceOnlyEnrollment`: no entry in `enrolled` has source `Voice`.
 
 **Acceptance criteria.**
@@ -137,7 +137,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Proofs.**
 
-- P-15.5-2. `SpeakerIsCandidate`: `identify` chooses only from the candidate set, which is `home` when presence is known (rule 1). `NoVoiceOnlyEnrollment`: `enroll` is enabled only when `source` is `Presence`, `Proximity` or `Answer`.
+- P-15.5-2. `SpeakerIsCandidate`: `identify` chooses only from the candidate set, which is `home` when presence is known (rule 1). `answer(p)` sets `source = Answer`. `NoVoiceOnlyEnrollment`: `enroll` is enabled only when `source` is `Presence`, `Proximity` or `Answer`.
 - P-15.5-1. Evidence: model check.
 
 ---
@@ -147,18 +147,18 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 **Goal:** Add `identify`, which implements `speaker.qnt` by combining presence, proximity and voice, and the passive enrollment rule. Jarvis knows who is speaking without an enrollment step.
 
 - **Implements:** G12, G19. **Depends on:** 15.5.
-- **Files:** modify `src/domain/speaker.rs`, `src/app/conversation.rs`, `jarvis.toml`.
+- **Files:** modify `src/domain/speaker.rs`, `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`.
 - **Quint:** `speaker.qnt` (conformance).
 
 **Model.** Rules:
 
-1. Only people who are `home` are candidates. If presence is not known, all people are candidates.
+1. Only people who are `home` are candidates. Presence is known when each `[[people]]` person has the state `home` or `not_home`. If presence is not known, all people are candidates, and no presence identification occurs.
 2. One candidate gives that person with confidence 1.0 and source `Presence`.
 3. If `occupied` is `Some(false)`, proximity counts 0.
-4. With more than one candidate, score = proximity + voice similarity. The top score must be more than `threshold` and more than the second score plus `margin`. The source is `Proximity` when proximity alone is at least `enroll_threshold`, else `Voice`.
-5. Jarvis enrolls the embedding only when the source is `Presence`, `Proximity` or `Answer`.
+4. With more than one candidate, score = proximity + voice similarity. The top score must be more than `threshold` and more than the second score plus `margin`. The source is `Proximity` when proximity alone is at least `enroll_threshold` (`0.5` is 1 m or less), else `Voice`.
+5. Jarvis enrolls the embedding only when all of these are true: the source is `Presence`, `Proximity` or `Answer`; the utterance has `min_enroll_ms` of voice or more; and, when the person has `min_profile` samples or more, the voice similarity to that person is at least `voice_threshold` and higher than to each other person. Thus a guest, a TV or stale presence cannot change a profile that has samples.
 
-This sub-phase adds `speaker.margin` and `speaker.enroll_threshold`.
+The interaction record gets the speaker and the source. This sub-phase adds `speaker.threshold`, `speaker.margin`, `speaker.enroll_threshold`, `speaker.min_enroll_ms` and `speaker.min_profile`.
 
 **Acceptance criteria.**
 
@@ -170,13 +170,18 @@ This sub-phase adds `speaker.margin` and `speaker.enroll_threshold`.
 - AC-15.6-6: When `identify` returns confidence 1.0 from presence, `FakeVoiceProfiles` records an enroll for that person.
 - AC-15.6-7: When the identification comes from voice alone, `FakeVoiceProfiles` records no enroll.
 - AC-15.6-8: When `quint-connect` replays 100 traces of `speaker.qnt`, `identify` and the enrolls match the model after each step.
+- AC-15.6-9: When the person has `min_profile` samples and the voice similarity to that person is less than `voice_threshold`, or higher to another person, `FakeVoiceProfiles` records no enroll.
+- AC-15.6-10: When the utterance has less than `min_enroll_ms` of voice, `FakeVoiceProfiles` records no enroll.
+- AC-15.6-11: When one `person` state is `unavailable`, all people are candidates, and presence alone identifies no speaker.
+- AC-15.6-12: When `identify` returns a speaker, the interaction record has the speaker and the source.
 
 **Proofs.**
 
 - P-15.6-1. Argument: rule 2 applies when the candidate set has one element.
 - P-15.6-3. Argument: rule 3 sets proximity to 0 before rule 4 scores.
 - P-15.6-5. Argument: rule 4 requires `top > second + margin`.
-- P-15.6-6, P-15.6-7. Requires: `NoVoiceOnlyEnrollment`. Argument: rule 5 is a guard on the source, and voice-only identification has source `Voice`.
+- P-15.6-6, P-15.6-7, P-15.6-9, P-15.6-10. Requires: `NoVoiceOnlyEnrollment`. Argument: rule 5 is a conjunction of guards on the source, the voice duration and the profile similarity, and voice-only identification has source `Voice`.
+- P-15.6-11, P-15.6-12. Evidence: test.
 - P-15.6-2, P-15.6-4. Requires: `SpeakerIsCandidate`. Argument: the maximum of rule 4 ranges over candidates only. Evidence: test for the scores.
 - P-15.6-8. Evidence: test.
 
@@ -187,7 +192,7 @@ This sub-phase adds `speaker.margin` and `speaker.enroll_threshold`.
 **Goal:** Add `needs_speaker`, the `person` template variable, `next_date` and the `ask_person` question. "Add dentist to my calendar for Monday" adds the event to the speaker's calendar.
 
 - **Implements:** G12, G13. **Depends on:** 15.6.
-- **Files:** modify `src/domain/intent.rs`, `src/domain/responses.rs`, `src/domain/decide.rs`, `src/app/conversation.rs`, `intents.toml`, `responses.toml`, `jarvis.toml`.
+- **Files:** modify `src/domain/intent.rs`, `src/domain/responses.rs`, `src/domain/decide.rs`, `src/app/conversation.rs`, `intents.toml`, `responses.toml`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.** An intent with `needs_speaker = true` waits up to `speaker.wait_ms` for the embedding, then calls `identify`. The `person` variable has the name and the fields of its `[[people]]` entry. No speaker gives `Ask` from `ask_person`. `next_date(day, plus_days)`: the ISO date of the next `day` (a day name, `today` or `tomorrow`) plus `plus_days`. An empty `day` is today. Another value is an error that gives `Fallback`. This sub-phase adds `speaker.wait_ms`.
 

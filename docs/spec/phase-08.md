@@ -9,14 +9,14 @@ This phase adds new responses to a pool when the pool has too few unused respons
 **Goal:** Add the pure backfill rules: when a pool needs new responses, which candidates are valid, and how they merge. Pools can now grow without duplicates or broken templates.
 
 - **Implements:** G5. **Depends on:** 7.5.
-- **Files:** modify `src/domain/responses.rs`, `jarvis.toml`.
+- **Files:** modify `src/domain/responses.rs`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.**
 
-- `needs_backfill(pool, min_fresh) -> bool`: fewer than `min_fresh` responses have `uses = 0`.
+- `needs_backfill(pool, min_fresh, max_pool) -> bool`: fewer than `min_fresh` responses have `uses = 0`, and the pool has fewer than `max_pool` responses. A full pool rotates by `uses` and does not grow.
 - `validate(candidate, pool, variables, max_chars) -> Result<()>`: not empty, at most `max_chars`, not equal to an existing response after `normalize`, uses only allowed variables, renders without error.
-- `merge(pool, candidates) -> Pool`: appends the valid candidates with `uses = 0`.
-- This sub-phase adds `[backfill]` (`min_fresh`, `batch`, `max_chars`).
+- `merge(pool, candidates, max_pool) -> Pool`: appends the valid candidates with `uses = 0`, up to `max_pool` responses.
+- This sub-phase adds `[backfill]` (`min_fresh`, `batch`, `max_chars`, `max_pool`).
 
 **Acceptance criteria.**
 
@@ -25,10 +25,11 @@ This phase adds new responses to a pool when the pool has too few unused respons
 - AC-8.1-3: When a candidate uses a variable that the intent does not have, `validate` rejects it.
 - AC-8.1-4: When a candidate is empty or longer than `max_chars`, `validate` rejects it.
 - AC-8.1-5: When `merge` adds candidates, the result has the old responses unchanged, then the candidates with `uses = 0`.
+- AC-8.1-6: When a pool has `max_pool` responses, `needs_backfill` returns false, and `merge` adds no candidate.
 
 **Proofs.**
 
-- P-8.1-1. Argument: `needs_backfill` is `count(uses == 0) < min_fresh`.
+- P-8.1-1, P-8.1-6. Argument: `needs_backfill` is `count(uses == 0) < min_fresh and len < max_pool`. `merge` takes at most `max_pool - len` candidates.
 - P-8.1-2 to P-8.1-4. Argument: `validate` is the conjunction of the listed checks and returns the first failure.
 - P-8.1-5. Argument: `merge` is `pool ++ map(candidates, uses = 0)`. Concatenation keeps the prefix.
 
@@ -41,7 +42,7 @@ This phase adds new responses to a pool when the pool has too few unused respons
 - **Implements:** G5. **Depends on:** 8.1.
 - **Files:** modify `src/ports.rs`, `src/adapters/openai.rs`, `src/testing/fakes.rs`.
 
-**Model.** `generate(pool name, existing, variables, n) -> Result<Vec<String>>`. The request uses a JSON schema `{ "responses": [string] }`. The prompt lists all existing responses and the allowed variable names.
+**Model.** `generate(pool name, existing, variables, n) -> Result<Vec<String>>`. The request uses a JSON schema `{ "responses": [string] }` and `bulk_max_output_tokens`. The prompt lists all existing responses and the allowed variable names.
 
 **Acceptance criteria.**
 
@@ -67,11 +68,11 @@ This phase adds new responses to a pool when the pool has too few unused respons
 **Model.**
 
 - Constants: `POOLS = Set("a", "b")`.
-- State: `fresh: POOL -> int`, `inFlight: POOL -> bool`, `version: POOL -> int`, `lastResult`.
-- Actions: `use(p)` (`fresh[p] -= 1` if positive, then `start(p)` if `fresh[p] < MIN` and not in flight), `succeed(p)` (`fresh[p] += BATCH`, `version[p] += 1`, `inFlight[p] := false`), `fail(p)` (`inFlight[p] := false`).
+- State: `fresh: POOL -> int`, `running: POOL -> int` (backfill jobs of the pool), `version: POOL -> int`, `prevVersion: POOL -> int` and `lastAction` (history of the last step).
+- Actions: `use(p)` (`fresh[p] -= 1` if positive, then `start(p)` if `fresh[p] < MIN` and `running[p] = 0`: `running[p] += 1`), `succeed(p)` (when `running[p] > 0`: `fresh[p] += BATCH`, `version[p] += 1`, `running[p] -= 1`), `fail(p)` (when `running[p] > 0`: `running[p] -= 1`). Each action first sets `prevVersion := version` and `lastAction`.
 - Invariants:
-  - `OneBackfillPerPool`: each pool has `inFlight` true at most once at a time (there is no second start while it is true).
-  - `PoolsChangeOnlyOnSuccess`: `version[p]` increases only in `succeed(p)`.
+  - `OneBackfillPerPool`: `running[p] <= 1` for each pool.
+  - `PoolsChangeOnlyOnSuccess`: `version[p] != prevVersion[p]` implies `lastAction = succeed(p)`.
 
 **Acceptance criteria.**
 
@@ -81,8 +82,8 @@ This phase adds new responses to a pool when the pool has too few unused respons
 
 **Proofs.**
 
-- P-8.3-2. Argument: `start(p)` is guarded by `not inFlight[p]` and sets it to true. Only `succeed` and `fail` set it to false.
-- P-8.3-3. Argument: `version` is written only in `succeed`.
+- P-8.3-2. Argument: `start(p)` is the only increment of `running[p]`, and it is guarded by `running[p] = 0`. So `running[p]` goes from 0 to 1 and back, never to 2.
+- P-8.3-3. Argument: each action sets `prevVersion := version` first, and only `succeed(p)` then writes `version[p]`.
 - P-8.3-1. Evidence: model check.
 
 ---
@@ -95,7 +96,7 @@ This phase adds new responses to a pool when the pool has too few unused respons
 - **Files:** modify `src/app/background.rs`, `src/app/conversation.rs`, `src/app/speech.rs`.
 - **Quint:** `backfill.qnt` (conformance).
 
-**Model.** After `record_use`, if `needs_backfill`, the use case inserts the pool name into an in-flight set. If the insert succeeds, it spawns `generate`, validates, merges, saves through `Store`, pre-renders the new responses and removes the name. On error, it removes the name and changes nothing.
+**Model.** After `record_use`, if `needs_backfill`, the use case inserts the pool name into an in-flight set. If the insert succeeds, it spawns `generate`, validates, sends the merge to the pools task (sub-phase 4.8, which saves it), pre-renders the new responses and removes the name. On error, it removes the name and changes nothing.
 
 **Acceptance criteria.**
 

@@ -9,7 +9,7 @@ This phase proves the latency goal for the full pipeline.
 **Goal:** Add a test harness that drives the real Wyoming adapter in HA's order: `asr`, then `handle`, then `tts`. Later latency tests measure the whole pipeline with real models.
 
 - **Implements:** G10. **Depends on:** 8.4.
-- **Files:** create `src/testing/e2e.rs`. Modify `src/main.rs`.
+- **Files:** create `src/testing/e2e.rs`. Modify `src/lib.rs`.
 
 **Model.** The harness sends `speech(text)` at real-time pace in 20 ms chunks, sends the transcript to `handle` on a second connection, then sends `synthesize` with the reply. It uses the real Wyoming adapter, the real application, the real sherpa-onnx adapters, the ONNX adapter with the fixture model, `FakeHome` and `FakeReasoner`. It records the time of the last voiced sample and of the first audio byte.
 
@@ -33,13 +33,16 @@ This phase proves the latency goal for the full pipeline.
 
 **Acceptance criteria.**
 
+Each measured command and fetch phrase has a top intent at or above `model.commit_threshold` with the fixture model, and a response in the audio cache.
+
 - AC-9.2-1 [GPU host]: For five command phrases, the response latency has a p95 of 300 ms or less over 20 runs.
 - AC-9.2-2 [GPU host]: For "what is the weather", the latency to the filler audio has a p95 of 300 ms or less.
-- AC-9.2-3 [GPU host]: For an `unknown` phrase, with `FakeReasoner` delayed by 2 s, the latency to the filler audio has a p95 of 300 ms or less.
+- AC-9.2-3 [GPU host]: For an `unknown` phrase, with `FakeReasoner` delayed by 2 s, the latency to the filler audio has a p95 of `endpoint_ms` + 100 ms or less. An `unknown` prediction is not confident, so the commit waits `endpoint_ms`.
+- AC-9.2-4 [GPU host]: For a command whose response is not in the audio cache, the response latency has a p95 of 400 ms or less.
 
 **Proofs.**
 
-- P-9.2-1 to P-9.2-3. Evidence: test.
+- P-9.2-1 to P-9.2-4. Evidence: test.
 
 ## Field Log
 

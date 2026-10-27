@@ -9,13 +9,13 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 **Goal:** Add the `TextToSpeech` port and `SherpaTts` with the Piper voice, and the `models` recipe. Jarvis can now turn text into audio.
 
 - **Implements:** G1. **Depends on:** 5.4.
-- **Files:** create `src/adapters/sherpa.rs`. Modify `src/ports.rs`, `src/main.rs`, `justfile`, `.github/workflows/ci.yml`, `jarvis.toml`, `Cargo.toml`.
+- **Files:** create `src/adapters/sherpa.rs`. Modify `src/ports.rs`, `src/domain/speech.rs`, `src/lib.rs`, `justfile`, `.github/workflows/ci.yml`, `jarvis.toml`, `Cargo.toml`.
 
-**Model.** `TextToSpeech::synth(text) -> Result<Audio>`. `Audio { samples: Vec<i16>, rate }`. `SherpaTts` wraps `OfflineTts` with `[tts].model_dir`. `just models` downloads the 20M zipformer and the Piper voice into `models/`. `check` runs `models` first. CI caches `models/`.
+**Model.** `TextToSpeech::synth(text) -> Result<Audio>`. `Audio { samples: Vec<i16>, rate }` is in `src/domain/speech.rs`. `SherpaTts` wraps `OfflineTts` with `[tts].model_dir`. `just models` downloads the 20M zipformer and the Piper voice into `models/`. It checks the SHA-256 of each file and downloads only a missing or wrong file. `models` is a setup recipe: `check` and the `rust-test` job run it before the tests, and tests do not download. CI caches `models/`.
 
 **Acceptance criteria.**
 
-- AC-6.1-1: When you run `just models`, the STT and TTS model folders exist in `models/`.
+- AC-6.1-1: When `just models` has run, the STT and TTS model folders exist in `models/`, and each file has the SHA-256 that the recipe lists. When `ci.yml` is parsed, `rust-test` runs `just models` before `just cov`.
 - AC-6.1-2: When `SherpaTts::synth("Hello")` runs, it returns 16-bit mono audio with more than 0 samples at the model rate.
 - AC-6.1-3: When `synth("")` runs, it returns zero samples and no error.
 
@@ -31,13 +31,14 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 **Goal:** Load one shared ONNX Runtime library for `sherpa-onnx` and `ort`, and add the GPU model and GPU test recipes. Both crates now work in one process, and the GPU host runs every model on CUDA.
 
 - **Implements:** G18. **Depends on:** 6.1.
-- **Files:** modify `Cargo.toml`, `src/adapters/onnx.rs`, `src/adapters/sherpa.rs`, `justfile`, `.github/workflows/release.yml`.
+- **Files:** modify `Cargo.toml`, `src/adapters/onnx.rs`, `src/adapters/sherpa.rs`, `justfile`, `.github/workflows/release.yml`, `xtask/src/gates.rs`.
 
 **Model.**
 
 - `sherpa-onnx` uses feature `shared`. `ort` uses feature `load-dynamic`. `SHERPA_ONNX_LIB_DIR` and `ORT_DYLIB_PATH` point to one folder with `libonnxruntime` (decision 27).
 - `gpu-models` downloads the Nemotron 160 ms model, the Parakeet Unified offline model and the sherpa-onnx `cuda-12.x-cudnn-9.x` `linux-x64-gpu` libraries.
-- `gpu-test` (sub-phase 0.13) now also sets `SHERPA_ONNX_LIB_DIR` and `ORT_DYLIB_PATH` to the CUDA libraries.
+- `gpu-test` (sub-phase 0.13) now runs `gpu-models` first and sets `SHERPA_ONNX_LIB_DIR` and `ORT_DYLIB_PATH` to the CUDA libraries.
+- `models` also downloads the sherpa-onnx CPU shared libraries for the host system. `test` and `cov` set `SHERPA_ONNX_LIB_DIR` and `ORT_DYLIB_PATH` to them.
 - `device` selects the provider for `SherpaTts` and `OnnxClassifier`.
 - The Linux release job builds against the CUDA libraries and puts them in the archive. The macOS archive has the CPU libraries.
 
@@ -45,12 +46,14 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 
 - AC-6.2-1: When one test process loads the fixture classifier and `SherpaTts`, both predict or synthesize without error.
 - AC-6.2-2 [GPU host]: With `device = cuda`, `SherpaTts` and `OnnxClassifier` run in one process on the CUDA execution provider.
-- AC-6.2-3: When the release workflow builds the Linux archive, a verification step fails the job unless the archive contains `libonnxruntime` and the CUDA provider library.
+- AC-6.2-3: When `release.yml` is parsed, the Linux build job has a verification step that fails unless the archive contains `libonnxruntime` and the CUDA provider library.
 
 **Proofs.**
 
 - P-6.2-1, P-6.2-2. Evidence: test.
-- P-6.2-3. Evidence: test (release workflow step and a structure test of `release.yml`).
+- P-6.2-3. Evidence: test (a structure test of `release.yml`).
+
+**Field log.** Push a tag. Record that the Linux archive passes its verification step.
 
 ---
 
@@ -59,11 +62,11 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 **Goal:** Add the speech use case with `speak` and the audio cache, and pre-render every pool response at startup. A TTS request for a known response is now a memory read.
 
 - **Implements:** G1, G4. **Depends on:** 6.2.
-- **Files:** create `src/app/speech.rs`. Modify `src/domain/speech.rs`, `src/main.rs`, `src/testing/fakes.rs`, `benches/domain.rs`.
+- **Files:** create `src/app/speech.rs`. Modify `src/domain/speech.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `benches/domain.rs`.
 
 **Model.**
 
-- `AudioCache: DashMap<text, Audio>`. `speak(text)`: a hit returns the cached audio. A miss calls `synth` and stores the result.
+- `AudioCache: DashMap<text, Audio>`. `speak(text)`: a hit returns the cached audio. A miss calls `synth` and returns the result without a store. Only `prerender` (and the prefetch of sub-phase 14.10, which replaces the old answer) adds audio, so the cache does not grow with dynamic texts.
 - `prerender(pools, areas)`: for each template whose only variable is `area` (or no variable), render it for each area and synthesize it.
 - `chunks(audio, size) -> Vec<&[i16]>` and `duration(audio) -> Duration` are in `domain/speech.rs`.
 - `FakeTts` records each text.
@@ -76,6 +79,7 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 - AC-6.3-4: When `chunks(audio, 1024)` runs, the joined chunks equal the original audio, and every chunk except the last has 1024 samples.
 - AC-6.3-5: When `duration` gets 22050 samples at 22050 Hz, it returns 1 s.
 - AC-6.3-6 [Bench]: A cache hit stays within the instruction budget in `benches/domain.rs`.
+- AC-6.3-7: When `speak` gets a text that is not in the cache, `FakeTts` records one call and the cache size does not change.
 
 **Proofs.**
 
@@ -83,7 +87,7 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 - P-6.3-3. Argument: `prerender` filters templates by their variable set, which must be a subset of `{area}`.
 - P-6.3-4 (AC-6.3-4). Argument: `chunks` is `samples.chunks(size)`, which partitions the slice in order into pieces of `size` with a shorter last piece. Concatenation of a partition gives the slice.
 - P-6.3-5. Argument: `duration = samples / rate`.
-- P-6.3-2. Evidence: test.
+- P-6.3-2, P-6.3-7. Evidence: test.
 - P-6.3-6. Evidence: benchmark.
 
 ---
@@ -99,9 +103,9 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 **Model.**
 
 - Constants (in 100 ms units): `EARLY = 2`, `ENDPOINT = 6`, `MAX = 20`.
-- State: `now`, `lastChange`, `confident: bool`, `audio`, `committed: bool`, `reason`.
-- Actions: `tick` (`now += 1`, `audio += 1`, then commit if allowed), `partial(conf)` (`lastChange := now`, `confident := conf`).
-- `allowed = (confident and now - lastChange >= EARLY) or now - lastChange >= ENDPOINT or audio >= MAX`.
+- State: `now`, `lastVoice` (`-1` before any voiced chunk), `text: bool` (the partial is not empty), `confident: bool`, `audio`, `committed: bool`, `reason`.
+- Actions: `tick(voiced)` (`now += 1`, `audio += 1`, `lastVoice := now` when `voiced`, then commit if allowed), `partial(nonEmpty, conf)` (`text := nonEmpty`, `confident := conf`, then commit if allowed).
+- `silence = now - lastVoice`. `allowed = (lastVoice >= 0 and text and ((confident and silence >= EARLY) or silence >= ENDPOINT)) or audio >= MAX`. Silence counts from the last voiced chunk, not from the last partial change, so decoder delay does not add to the wait. Before any speech, and with an empty partial, only `MAX` commits.
 - Invariants:
   - `CommitOnlyWhenAllowed`: `committed` implies `allowed` was true at the commit step (kept in `reason`).
   - `NoLateCommit`: `not committed` implies `not allowed`.
@@ -115,31 +119,32 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 **Proofs.**
 
 - P-6.4-2 (AC-6.4-2). Argument: `committed` becomes true only inside `tick`, under `if allowed`, and `reason` records which disjunct was true.
-- P-6.4-3 (AC-6.4-3). Argument by induction: `tick` evaluates `allowed` after it updates `now` and `audio`, and commits in the same step when it is true. `partial` can only make `allowed` false (it resets `now - lastChange` to 0), and it does not change `audio` beyond `MAX`. So no reachable state has `allowed` true and `committed` false.
+- P-6.4-3 (AC-6.4-3). Argument by induction: each action that can make `allowed` true (`tick` and `partial`) evaluates `allowed` after its update and commits in the same step when it is true. No other action changes the inputs of `allowed`. So no reachable state has `allowed` true and `committed` false.
 - P-6.4-1. Evidence: model check.
 
 ---
 
 ### 6.5 Commit Policy
 
-**Goal:** Add `should_commit`, the pure commit rule of the model. Jarvis can now end listening 200 ms after confident speech and 600 ms after uncertain speech.
+**Goal:** Add `should_commit`, the pure commit rule of the model. Jarvis can now end listening 200 ms after the last voiced sample of confident speech and 600 ms after uncertain speech.
 
 - **Implements:** G1, G2, G19. **Depends on:** 6.4.
-- **Files:** modify `src/domain/speech.rs`, `jarvis.toml`.
+- **Files:** modify `src/domain/speech.rs`, `src/lib.rs`, `jarvis.toml`.
 - **Quint:** `commit.qnt` (conformance).
 
-**Model.** `should_commit(stable_ms, audio_ms, confident, policy) -> bool` is the `allowed` formula of `commit.qnt` with `early_commit_ms`, `endpoint_ms` and `max_utterance_ms`. `confident = top label is not unknown and p(top) >= model.commit_threshold`. This sub-phase adds `[asr]` (`early_commit_ms`, `endpoint_ms`, `max_utterance_ms`) and `model.commit_threshold`.
+**Model.** `should_commit(silence_ms: Option, has_text, audio_ms, confident, policy) -> bool` is the `allowed` formula of `commit.qnt` with `early_commit_ms`, `endpoint_ms` and `max_utterance_ms`. `silence_ms` is the time since the last voiced sample, and `None` before any speech. A pause of `early_commit_ms` or more after a confident command ends the utterance. This is the cost of G1. `confident = top label is not unknown and p(top) >= model.commit_threshold`. This sub-phase adds `[asr]` (`early_commit_ms`, `endpoint_ms`, `max_utterance_ms`) and `model.commit_threshold`.
 
 **Acceptance criteria.**
 
-- AC-6.5-1: When `confident` is true and `stable_ms = early_commit_ms`, `should_commit` returns true.
-- AC-6.5-2: When `confident` is false and `stable_ms = endpoint_ms - 1`, `should_commit` returns false. At `endpoint_ms`, it returns true.
+- AC-6.5-1: When `confident` is true and `silence_ms = early_commit_ms`, `should_commit` returns true.
+- AC-6.5-2: When `confident` is false and `silence_ms = endpoint_ms - 1`, `should_commit` returns false. At `endpoint_ms`, it returns true.
 - AC-6.5-3: When `audio_ms = max_utterance_ms`, `should_commit` returns true for any other input.
 - AC-6.5-4: When `quint-connect` replays 100 traces of `commit.qnt`, `should_commit` equals the model `allowed` after each step.
+- AC-6.5-5: When `silence_ms` is `None` or `has_text` is false, and `audio_ms < max_utterance_ms`, `should_commit` returns false for any `confident`.
 
 **Proofs.**
 
-- P-6.5-1 to P-6.5-3. Argument: `should_commit` is the disjunction of three `>=` comparisons. Each criterion makes one disjunct true, or all false.
+- P-6.5-1 to P-6.5-3, P-6.5-5. Argument: `should_commit` is the disjunction of the `MAX` comparison and the two silence comparisons, which are guarded by `Some(silence)` and `has_text`. Each criterion makes one disjunct true, or all false.
 - P-6.5-4. Evidence: test.
 
 ---
@@ -149,24 +154,25 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 **Goal:** Add the `SpeechToText` port with the streaming first pass and its sherpa-onnx adapter. Jarvis now has partial text while the user speaks.
 
 - **Implements:** G2. **Depends on:** 6.5.
-- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `jarvis.toml`.
+- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `justfile`, `jarvis.toml`.
 
-**Model.** `SpeechToText::stream() -> Box<dyn SttStream>`. `SttStream`: `accept(samples)`, `partial() -> String`, `reset()`. `SherpaStt` wraps `OnlineRecognizer` with `[asr].model_dir`. `speech(text)` in `fakes.rs` synthesizes text with `SherpaTts` and adds 500 ms of silence. `FakeStt` returns scripted partial texts.
+**Model.** `SpeechToText::stream() -> Box<dyn SttStream>`. `SttStream`: `accept(samples)`, `partial() -> Partial { text, voice_end_ms: Option }`, `reset()`. `SherpaStt` wraps `OnlineRecognizer` with `[asr].model_dir`, and the sherpa-onnx Silero VAD with `[asr].vad_model` on the same samples. `voice_end_ms` is the audio position of the end of the last voiced frame, and `None` before any speech. `just models` also downloads the Silero VAD model. `FakeStt` returns scripted partials with voice end times. `speech(text)` in `fakes.rs` synthesizes text with `SherpaTts` and adds 500 ms of silence. `FakeStt` returns scripted partial texts.
 
 **Acceptance criteria.**
 
 - AC-6.6-1: When `SherpaStt` gets `speech("turn on the kitchen lights")` in 20 ms chunks, the normalized final partial is "turn on the kitchen lights".
 - AC-6.6-2: When `SherpaStt` gets the audio in 20 ms chunks, it gives a non-empty partial before the last chunk.
-- AC-6.6-3: When `reset` runs, `partial` returns an empty text.
+- AC-6.6-3: When `reset` runs, `partial` returns an empty text and no voice end.
 - AC-6.6-4 [GPU host]: With `device = cpu`, the real-time factor of the 20M zipformer is less than 0.3.
 - AC-6.6-5 [GPU host]: With the Nemotron model, the normalized final partial of `speech("turn on the kitchen lights")` is "turn on the kitchen lights".
 - AC-6.6-6 [GPU host]: With the Nemotron model, the last word is in the partial less than 200 ms after the last voiced sample.
 - AC-6.6-7 [GPU host]: With the Nemotron model, the real-time factor is less than 0.1.
+- AC-6.6-8: When `SherpaStt` gets 500 ms of silence and then `speech("lights on")`, `voice_end_ms` is `None` during the silence and within 100 ms of the last voiced sample at the end.
 
 **Proofs.**
 
 - P-6.6-3. Argument: `reset` creates a new recognizer stream, which has no decoded tokens.
-- P-6.6-1, P-6.6-2, P-6.6-4 to P-6.6-7. Evidence: test.
+- P-6.6-1, P-6.6-2, P-6.6-4 to P-6.6-8. Evidence: test.
 
 ---
 
@@ -175,7 +181,7 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 **Goal:** Add `transcribe`, the offline second pass with Parakeet Unified. At commit, Jarvis can decode the whole utterance again for a more accurate transcript.
 
 - **Implements:** G2, G18. **Depends on:** 6.6.
-- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `jarvis.toml`.
+- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.** `SpeechToText::transcribe(samples) -> Result<Option<String>>`. `SherpaStt` holds an optional `OfflineRecognizer` from `[asr].second_pass_dir`. Without it, `transcribe` returns `Ok(None)`. `FakeStt` returns a scripted second-pass text.
 
@@ -198,22 +204,25 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 **Goal:** Add `listen`, which feeds audio to the first pass, predicts on each changed partial, commits by the policy and runs the second pass. Jarvis now produces a final transcript before the user's audio stream ends.
 
 - **Implements:** G1, G2. **Depends on:** 6.7.
-- **Files:** modify `src/app/speech.rs`, `src/ports.rs`, `src/main.rs`.
+- **Files:** modify `src/app/speech.rs`, `src/ports.rs`, `src/lib.rs`.
 
 **Model.**
 
 - `Assistant::listen() -> Listening`. `Listening::push(chunk) -> Option<Transcript>` and `finish() -> Transcript`.
-- `push`: accept the chunk. If the partial changed, predict with `context_text(None, [])` and keep `confident`. If `should_commit`, return the transcript.
+- `push`: accept the chunk. If the partial text changed and is not empty, predict with `context_text(None, [])` and keep `confident`. `silence_ms = audio_ms - voice_end_ms`. If `should_commit`, return the transcript.
 - The transcript is `transcribe(utterance audio)` when it returns `Some(text)`, else the first-pass partial. A `transcribe` error is logged, and the first-pass text is used.
 
 **Acceptance criteria.**
 
 - AC-6.8-1: When `FakeStt` gives the same partial two times, `FakeClassifier` records one `predict` call.
-- AC-6.8-2: When `FakeClassifier` gives `lights_on` 0.95, `push` returns the transcript after `early_commit_ms` of stable text.
+- AC-6.8-2: When `FakeClassifier` gives `lights_on` 0.95, `push` returns the transcript `early_commit_ms` after the last voiced sample.
 - AC-6.8-3: When a second pass is configured and `FakeStt` gives different first-pass and second-pass texts, `push` returns the second-pass text.
 - AC-6.8-4: When no second pass is configured, `push` returns the first-pass text.
 - AC-6.8-5: When `transcribe` returns an error, `push` returns the first-pass text.
 - AC-6.8-6: When `finish` runs before a commit, it returns the transcript at once.
+- AC-6.8-7: When `FakeStt` reports no voice for 1 s of audio, `push` returns none.
+- AC-6.8-8: When a confident partial has 150 ms of silence and then voice again, `push` does not commit. It commits `early_commit_ms` after the new last voiced sample.
+- AC-6.8-9: When the partial changes during the silence to a text that is not confident, `push` commits only at `endpoint_ms` of silence.
 
 **Proofs.**
 
@@ -221,6 +230,7 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 - P-6.8-3 to P-6.8-5. Argument: the final text is `match transcribe(audio) { Ok(Some(t)) => t, _ => first_pass }`.
 - P-6.8-2. Requires: `should_commit` (P-6.5-1). Evidence: test for the timing.
 - P-6.8-6. Argument: `finish` builds the transcript without checking `should_commit`.
+- P-6.8-7 to P-6.8-9. Requires: P-6.5-1, P-6.5-2, P-6.5-5. Evidence: test.
 
 ---
 
@@ -231,7 +241,7 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 - **Implements:** G1, G2. **Depends on:** 6.8.
 - **Files:** modify `src/adapters/wyoming.rs`, `src/ports.rs`.
 
-**Model.** `transcribe` starts a `Listening`. Each `audio-chunk` goes to `push`. When `push` returns a transcript, the adapter sends `transcript` at once and ignores the rest of the audio. `audio-stop` before a commit calls `finish` and sends `transcript`. `info` lists the `asr` program.
+**Model.** `transcribe` starts a `Listening`. Each `transcribe` event on the same connection starts a new `Listening`. `audio-start` with a rate other than 16000 Hz, a width other than 2 bytes or more than one channel gives an `error` event and ends that session. Each `audio-chunk` goes to `push`. When `push` returns a transcript, the adapter sends `transcript` at once and ignores the rest of the audio. `audio-stop` before a commit calls `finish` and sends `transcript`. `info` lists the `asr` program.
 
 **Acceptance criteria.**
 
@@ -239,11 +249,13 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 - AC-6.9-2: When the client sends `audio-stop` first, the adapter calls `finish` and sends `transcript`.
 - AC-6.9-3: When the transcript was sent, later `audio-chunk` events cause no second `transcript`.
 - AC-6.9-4: When the client sends `describe`, `info` lists the `asr` and `handle` programs.
+- AC-6.9-5: When `audio-start` has the rate 44100 Hz, the adapter sends `error` and calls no `push`.
+- AC-6.9-6: When one connection sends two `transcribe` sessions one after the other, the adapter sends one `transcript` for each.
 
 **Proofs.**
 
 - P-6.9-3 (AC-6.9-3). Argument: the connection keeps `sent: bool`. Sending sets it, and both send paths check it first.
-- P-6.9-1, P-6.9-2, P-6.9-4. Evidence: test.
+- P-6.9-1, P-6.9-2, P-6.9-4 to P-6.9-6. Evidence: test.
 
 ---
 
@@ -252,17 +264,22 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 **Goal:** Add `speak` to the `Assistant` port and connect the Wyoming `synthesize` event to it. Jarvis now serves all three Wyoming services with cached audio.
 
 - **Implements:** G1. **Depends on:** 6.9.
-- **Files:** modify `src/adapters/wyoming.rs`, `src/ports.rs`, `src/main.rs`.
+- **Files:** modify `src/adapters/wyoming.rs`, `src/ports.rs`, `src/app/speech.rs`, `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `synthesize` calls `speak(text)`. The adapter sends `audio-start`, one `audio-chunk` for each chunk of 1024 samples, and `audio-stop`. `info` lists `asr`, `handle` and `tts`.
+**Model.**
+
+- `synthesize` calls `speak(text)`. The adapter sends `audio-start`, one `audio-chunk` for each chunk of 1024 samples, and `audio-stop`. `info` lists `asr`, `handle` and `tts`.
+- `speak` records the time when it starts to send each text. The filler plays when HA asks for its audio, not at the reply. Thus a deferred job now waits until the first `speak` start of its filler text after the reply, plus `announce_delay`. When no such `speak` starts within `announce.tts_wait_ms`, the job uses the reply time (sub-phase 4.9). This sub-phase adds `announce.tts_wait_ms`.
 
 **Acceptance criteria.**
 
 - AC-6.10-1: When the client sends `synthesize`, the adapter sends `audio-start`, one or more `audio-chunk` and `audio-stop`, in that order.
 - AC-6.10-2: When the client sends `describe`, `info` lists the `asr`, `handle` and `tts` programs.
 - AC-6.10-3 [GPU host]: For a cached text, `synthesize` to the first `audio-chunk` has a p95 of less than 10 ms.
+- AC-6.10-4: When `synthesize` for the filler comes 800 ms after the reply, the announce starts at that time plus the filler duration plus `margin_ms`.
+- AC-6.10-5: When no `synthesize` for the filler comes within `tts_wait_ms`, the announce starts at the reply time plus the filler duration plus `margin_ms`.
 
 **Proofs.**
 
 - P-6.10-1. Argument: the handler writes `audio-start`, then iterates `chunks` (P-6.3-4), then writes `audio-stop`, in one sequential function.
-- P-6.10-2, P-6.10-3. Evidence: test.
+- P-6.10-2 to P-6.10-5. Evidence: test.

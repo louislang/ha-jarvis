@@ -66,7 +66,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | System Two | The OpenAI path. It handles requests that System One cannot classify. |
 | Intent | One action that Jarvis can take, for example `lights_on`. Each intent is one label of the System One model. |
 | Unknown | The reserved label for a request that matches no intent. |
-| Prediction | The output of the System One model for one transcript: the label probabilities, the slots and a sentence embedding. |
+| Prediction | The output of the System One model for one transcript: the label probabilities and the slots. |
 | Slot | A value in a transcript, for example `area = kitchen`. |
 | Pool | A list of response templates for one intent or one filler type. |
 | Filler | A response that Jarvis speaks immediately when the real answer needs more time. |
@@ -103,7 +103,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | Domain | The layer with the rules of Jarvis. It has only pure code. |
 | Port | A Rust trait at the edge of the application. |
 | Adapter | A struct that implements a port with one technology. |
-| Composition root | `src/main.rs`. It makes the adapters and connects them to the application. |
+| Composition root | `src/lib.rs`. It makes the adapters and connects them to the application. |
 | Quint model | A formal model of one stateful part of Jarvis in the Quint language, in `quint/`. |
 | Conformance test | A Rust test that replays traces of a Quint model against the Rust code with `quint-connect`. |
 | Module graph | The graph of Rust modules and their `use` dependencies. `xtask` builds it from the source. |
@@ -116,7 +116,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 
 | ID | Goal |
 |---|---|
-| G1 | The response latency for System One requests is 300 ms or less (p95) on the GPU host. |
+| G1 | The response latency for System One requests is 300 ms or less (p95) on the GPU host. A System One request here has a top intent at or above `model.commit_threshold` and a response in the audio cache. An intent with `needs_speaker` can wait `speaker.wait_ms` more (AC-15.7-9). |
 | G2 | STT starts when the first audio chunk arrives. STT has two passes: a streaming first pass and an offline second pass at commit. On the GPU host, the first pass is NVIDIA Nemotron Speech Streaming EN 0.6B and the second pass is NVIDIA Parakeet Unified EN 0.6B. |
 | G3 | The System One model classifies common requests locally. It gets the transcript, the satellite area and the habits. It gives a probability for each intent and for `unknown`, and tags the slots. The response path does not call a remote service. |
 | G4 | Each intent has a pool of responses. Jarvis selects with variety and does not repeat the last response. |
@@ -134,7 +134,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | G16 | Marks, learned intents and established habits become training data. Jarvis starts a training run after `train.min_changes` changes, or when you ask by voice. The run uses the GPU host first and RunPod when local training fails. The new model replaces the old model only when its held-out accuracy is equal or better. |
 | G17 | The repository is on GitHub. The pre-commit hook and CI run the required checks. `just merge` merges a PR only when they all pass. A `v*` tag publishes release binaries for Linux x86-64 and macOS x86-64 (Intel), and the training image. |
 | G18 | On the GPU host, STT, the System One model, TTS and voice identification run on the GPU. Other machines run the same code on the CPU. |
-| G19 | Each stateful part of Jarvis has a Quint model with named invariants. CI checks each model, and conformance tests replay its traces against the Rust code. A system model composes the parts. |
+| G19 | Each stateful part of Jarvis with concurrency or a life cycle (the parts in `01-architecture.md` section 13) has a Quint model with named invariants. CI checks each model, and conformance tests replay its traces against the Rust code. A system model composes the parts of the request life cycle. Simple stores (use counts, the correlation buffer, interaction updates, voice profiles, habit storage) have unit tests instead. A model check to a step bound is bounded evidence, not a proof for all executions. |
 | G20 | CI draws the module graph as a Mermaid diagram. On a PR, new modules are green, updated modules are orange and deleted modules are red. On each commit to `main`, CI writes the full diagram to `docs/architecture.md`. |
 | G21 | Each PR has one concern, starts in a fresh context, is one layer of the phase's stack of PRs, has at most 400 changed lines, a two- or three-sentence summary written after the code, short bullet points and a check box for each required check, and gets a Codex code review with all threads resolved. |
 | G22 | Every test is deterministic. Every check is a gated check in the pre-commit hook and in CI, not only a rule in `CLAUDE.md`. |

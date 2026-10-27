@@ -9,12 +9,12 @@ This phase selects responses, selects entities and decides the action from a pre
 **Goal:** Add response pools with `select` and `record_use`. Jarvis now varies its replies: it never repeats the last response and prefers the least used one.
 
 - **Implements:** G4. **Depends on:** 3.12.
-- **Files:** create `src/domain/responses.rs`, `responses.toml`. Modify `src/main.rs`.
+- **Files:** create `src/domain/responses.rs`, `responses.toml`. Modify `src/lib.rs`.
 
 **Model.**
 
 - `Pools: Map<pool name, Pool>`. `Pool { responses: Vec<Response { text, uses }>, last: Option<usize> }`.
-- `select(pool, rng) -> usize`: the candidates are the responses with the lowest `uses`. If there are two or more responses, the candidates exclude `last`. The result is a random candidate.
+- `select(pool, rng) -> usize`: if the pool has two or more responses, the allowed responses exclude `last`. The candidates are the allowed responses with the lowest `uses`. The result is a random candidate.
 - `record_use(pools, name, index) -> Pools`: `uses += 1` for that response, and `last := index`.
 
 **Acceptance criteria.**
@@ -44,8 +44,8 @@ This phase selects responses, selects entities and decides the action from a pre
 **Model.**
 
 - `render(template, context) -> Result<String>`. Undefined variables are errors.
-- `validate_pools(pools, catalog) -> Result<()>`: each intent has a pool, the `filler` and `failure` pools exist, and every template parses.
-- Template variables: `area`, slot names, `entity`, `response`, `person` (sub-phase 15.7).
+- `validate_pools(pools, catalog) -> Result<()>`: each intent has a pool, the `filler`, `failure` and `fallback` pools exist, each pool has one or more responses, every template parses, and every template uses only the variables of its pool (`minijinja` `undeclared_variables`).
+- Template variables: the built-ins `area` (the area name in lowercase), `entity`, `response` and `person` (sub-phase 15.7). An intent pool can also use the slots and the `habit_defaults` keys of its intent.
 
 **Acceptance criteria.**
 
@@ -53,13 +53,15 @@ This phase selects responses, selects entities and decides the action from a pre
 - AC-4.2-2: When a template uses a variable that the context does not have, `render` returns an error that names the variable.
 - AC-4.2-3: When an intent has no pool, `validate_pools` returns an error that contains the intent name.
 - AC-4.2-4: When a template has a syntax error, `validate_pools` returns an error that contains the pool name.
-- AC-4.2-5: When `filler` or `failure` is missing, `validate_pools` returns an error that names it.
+- AC-4.2-5: When `filler`, `failure` or `fallback` is missing, `validate_pools` returns an error that names it.
+- AC-4.2-6: When a template of an intent pool uses a variable that is not a built-in, a slot or a `habit_defaults` key of the intent, `validate_pools` returns an error with the pool and the variable.
+- AC-4.2-7: When a pool has no responses, `validate_pools` returns an error that names the pool.
 
 **Proofs.**
 
 - P-4.2-1. Evidence: test.
 - P-4.2-2. Argument: the environment uses `UndefinedBehavior::Strict`, which turns every undefined lookup into an error.
-- P-4.2-3 to P-4.2-5. Argument: `validate_pools` checks each intent name, each template and each required pool name in loops, and returns the first failure.
+- P-4.2-3 to P-4.2-7. Argument: `validate_pools` checks each intent name, each pool size, each template and its variables, and each required pool name in loops, and returns the first failure.
 
 ---
 
@@ -68,9 +70,9 @@ This phase selects responses, selects entities and decides the action from a pre
 **Goal:** Add the `Store<T>` port and `FileStore`, which saves TOML or JSON with an atomic write. Pools, habits and other state now survive a restart and a crash during a save.
 
 - **Implements:** G10. **Depends on:** 4.2.
-- **Files:** create `src/adapters/files.rs`. Modify `src/ports.rs`, `src/main.rs`, `Cargo.toml`.
+- **Files:** create `src/adapters/files.rs`. Modify `src/ports.rs`, `src/lib.rs`, `Cargo.toml`.
 
-**Model.** `Store<T>`: `load() -> Result<Option<T>>`, `save(&T) -> Result<()>`. The format comes from the file extension (`.toml` or `.json`). `save` writes to a temporary file in the same folder, then renames it over the target.
+**Model.** `Store<T>`: `load() -> Result<Option<T>>`, `save(&T) -> Result<()>`. The format comes from the file extension (`.toml` or `.json`). `save` writes to a temporary file in the same folder, calls `fsync` on it, then renames it over the target. A file that does not parse is an error with the path, not `None`.
 
 **Acceptance criteria.**
 
@@ -79,12 +81,13 @@ This phase selects responses, selects entities and decides the action from a pre
 - AC-4.3-3: When the save stops before the rename, the file still contains the last valid data.
 - AC-4.3-4: When the file does not exist, `load` returns `None` and no error.
 - AC-4.3-5: When the extension is not `.toml` or `.json`, the constructor returns an error with the path.
+- AC-4.3-6: When the file does not parse, `load` returns an error that contains the path.
 
 **Proofs.**
 
 - P-4.3-3 (AC-4.3-3). Requires: rename in one folder is atomic on the file system. Ensures: the target is either the old content or the new content. Argument: the target changes only through the rename. A stop before the rename leaves the target unchanged.
 - P-4.3-4, P-4.3-5. Argument: `load` maps "not found" to `Ok(None)`. The constructor matches the extension with two allowed values.
-- P-4.3-1, P-4.3-2. Evidence: test.
+- P-4.3-1, P-4.3-2, P-4.3-6. Evidence: test.
 
 ---
 
@@ -93,14 +96,14 @@ This phase selects responses, selects entities and decides the action from a pre
 **Goal:** Add entity selection for an intent and an area, with filters, exclusions and the single-entity house fallback. "Turn on the lights" now finds the right lights, including switches named as lights.
 
 - **Implements:** G9. **Depends on:** 4.3.
-- **Files:** create `src/domain/select.rs`. Modify `src/main.rs`.
+- **Files:** create `src/domain/select.rs`. Modify `src/lib.rs`.
 
 **Model.**
 
-- A filter has `domain`, optional `name` (matches the entity name or an alias, without case sensitivity, as a substring) and optional `device_class`. An entity matches when one filter matches and it is not in `exclude`.
+- A filter has `domain`, optional `name` (matches whole words of the entity name or an alias, without case sensitivity) and optional `device_class`. An entity matches when one filter matches and it is not in `exclude`.
 - `select(intent, area, cache) -> Vec<EntityId>`:
   - `target = "entities"`: all matching entities in the area.
-  - `target = "entity"`: the fixed `entity`, else the first matching entity in the area (sub-phase 11.6 uses the highest habit score).
+  - `target = "entity"`: the fixed `entity`, else the matching entity in the area with the lowest entity ID (sub-phase 11.6 uses the highest habit score).
   - If the area has no match and the house has exactly one match, the result is that entity.
 
 **Acceptance criteria.**
@@ -113,12 +116,14 @@ This phase selects responses, selects entities and decides the action from a pre
 - AC-4.4-6: When a filter has `name = "tv"`, an entity with the alias "the TV" matches.
 - AC-4.4-7: When an entity is in `exclude`, it is never in the result.
 - AC-4.4-8: When the area has no match and the house has two matches, the result is empty.
+- AC-4.4-9: When a filter has `name = "fan"`, an entity named "Infant Monitor" does not match.
+- AC-4.4-10: When two entities in the area match a `target = "entity"` intent, the result is the one with the lowest entity ID.
 
 **Proofs.**
 
 - P-4.4-3, P-4.4-7 (AC-4.4-3, AC-4.4-7). Ensures: every result entity matches a filter and is not excluded. Argument: both `target` branches and the fallback draw only from `matching = filter(cache, filters) \ exclude`.
 - P-4.4-5, P-4.4-8 (AC-4.4-5, AC-4.4-8). Ensures: the fallback applies if and only if `matching ∩ area = ∅` and `|matching| = 1`. Argument: the fallback branch is guarded by these two conditions.
-- P-4.4-1, P-4.4-2, P-4.4-4, P-4.4-6. Evidence: test on the reference house.
+- P-4.4-1, P-4.4-2, P-4.4-4, P-4.4-6, P-4.4-9, P-4.4-10. Evidence: test.
 
 ---
 
@@ -127,16 +132,16 @@ This phase selects responses, selects entities and decides the action from a pre
 **Goal:** Add `decide` for command intents and the System Two threshold. A confident prediction now becomes a reply and a service call, and an uncertain or `unknown` one becomes a deferred System Two job.
 
 - **Implements:** G3, G7, G9. **Depends on:** 4.4.
-- **Files:** create `src/domain/decide.rs`. Modify `src/main.rs`, `jarvis.toml`.
+- **Files:** create `src/domain/decide.rs`. Modify `src/lib.rs`, `jarvis.toml`.
 
 **Model.**
 
-- `Decision`: `Reply { text, call: Option<ServiceCall> }`, `Defer { filler, job: Fetch(ServiceCall, pool) | Llm(question) }`, `Fallback`.
+- `Decision`: `Reply { text, call: Option<ServiceCall> }`, `Defer { filler, job: Fetch(ServiceCall, pool) | Llm(question) }`, `Fallback`. `Fallback` means that Jarvis knows the intent but cannot act: dispatch replies from the pool `fallback` and makes no call.
 - `decide(prediction, context, catalog, cache, pools, rng)`:
-  1. If the top label is `unknown` or its probability is less than `model.threshold`, return `Defer` with a filler and `Job::Llm`.
+  1. If the top label is `unknown`, is not in the catalog, or its probability is less than `model.threshold`, return `Defer` with a filler and `Job::Llm`. A label of the model that the catalog no longer has (an intent removed before a retrain) thus goes to System Two.
   2. The area is the area slot if present, else the satellite area. An area slot that matches no area gives `Fallback`.
-  3. A command needs an area when `target = "entities"`. No area gives `Fallback`.
-  4. Render the service data. A value that parses as JSON is a JSON value, else a string. Return `Reply` with a pool response and the call.
+  3. A command needs an area when `target = "entities"`. No area gives `Fallback`. An empty selection (sub-phase 4.4) gives `Fallback`. A missing slot that is not `optional` gives `Fallback`, and a missing `optional` slot is an empty string.
+  4. Render the service data. A data value that is one `{{ expression }}` keeps the type of the result (`minijinja` `compile_expression`). Other values render as strings. Return `Reply` with a pool response and the call.
 - This sub-phase adds `[model]` with `threshold` to `jarvis.toml`.
 
 **Acceptance criteria.**
@@ -149,14 +154,19 @@ This phase selects responses, selects entities and decides the action from a pre
 - AC-4.5-6: When a `target = "entities"` intent has no slot area and no satellite area, the result is `Fallback`.
 - AC-4.5-7: When the intent is `climate_down` and the target temperature is 72, the call data has `temperature = 70` as a number.
 - AC-4.5-8: When a command has no `service`, the result is `Reply` with no call.
+- AC-4.5-9: When the selection of a command is empty, the result is `Fallback`.
+- AC-4.5-10: When the `show` slot is "24", the rendered `media_content_id` is a string that contains `"show_name": "24"`.
+- AC-4.5-11: When an `optional` slot is missing, the template renders it as an empty string. When a slot that is not `optional` is missing, the result is `Fallback`.
+- AC-4.5-12: When the top label is not in the catalog, the result is `Defer` with `Job::Llm`.
 
 **Proofs.**
 
 - P-4.5-2, P-4.5-3 (AC-4.5-2, AC-4.5-3). Ensures: `Reply` implies `top != unknown` and `p(top) >= threshold`. Argument: step 1 returns `Defer` in every other case, before any step that can return `Reply`.
 - P-4.5-4 to P-4.5-6. Argument: step 2 computes `area = slot.map(area_by_name).unwrap_or(satellite)`. A slot with `area_by_name = None` returns `Fallback`. Step 3 returns `Fallback` when the area is `None` and the target needs one.
-- P-4.5-7 (AC-4.5-7). Argument: "70" parses as a JSON number, so the data value is a number.
+- P-4.5-7, P-4.5-10 (AC-4.5-7, AC-4.5-10). Argument: `{{ entity.attributes.temperature - 2 }}` is one expression whose result is a number. The `media_content_id` value has text around `{{ show }}`, so it renders as a string.
 - P-4.5-8. Argument: `call = intent.service.map(...)`, which is `None` when there is no service.
-- P-4.5-1. Evidence: test.
+- P-4.5-12. Argument: step 1 checks catalog membership of the top label before any step that can return `Reply`.
+- P-4.5-1, P-4.5-9, P-4.5-11. Evidence: test.
 
 ---
 
@@ -175,13 +185,14 @@ This phase selects responses, selects entities and decides the action from a pre
 - AC-4.6-2: When the query entity is not in the cache, the result is `Fallback`.
 - AC-4.6-3: When the intent is `weather`, the result is `Defer` with a filler and `Job::Fetch` with `return_response = true`.
 - AC-4.6-4: When the intent is a query, the result has no service call.
+- AC-4.6-5: When the area is the Office, which has two temperature sensors, the query reads the sensor with the lowest entity ID that is not in `exclude`.
 
 **Proofs.**
 
 - P-4.6-2. Argument: the query branch returns `Fallback` when `select` is empty.
 - P-4.6-3. Argument: the fetch branch builds the call with `return_response = true`.
 - P-4.6-4. Argument: the query branch constructs `Reply { call: None }`.
-- P-4.6-1. Evidence: test.
+- P-4.6-1, P-4.6-5. Evidence: test.
 
 ---
 
@@ -221,22 +232,32 @@ This phase selects responses, selects entities and decides the action from a pre
 **Goal:** Add the `Clock` port and the dispatch of `Reply` decisions. Jarvis returns the reply at once and runs the service call in the background, so a slow HA never delays the answer.
 
 - **Implements:** G1, G3. **Depends on:** 4.7.
-- **Files:** create `src/app/conversation.rs`. Modify `src/ports.rs`, `src/main.rs`, `src/testing/fakes.rs`.
+- **Files:** create `src/app/conversation.rs`. Modify `src/ports.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `jarvis.toml`.
 
-**Model.** `Clock::now()`. `SystemClock` is in `src/main.rs`. `FakeClock` is in `fakes.rs`. `dispatch(decision)` for `Reply`: spawn `home.call(call)`, save the pools with the new use count through `Store`, return the text.
+**Model.**
+
+- `Clock::now()`. `SystemClock` is in `src/lib.rs`. `FakeClock` is in `fakes.rs`.
+- `dispatch(decision) -> Handled { text, after: Option<Work> }`. `after` is the background work. The caller sends the text first and starts `after` only after the send. Thus no call can come before the reply (`ReplyBeforeCall`, sub-phase 16.1).
+- `Reply`: `after` is `home.call(call)`. `Fallback`: the text is from `fallback`, and `after` is none.
+- A pools task owns `Pools`. `record_use` and the later backfill merges and marks are messages to it. It applies each change in order, publishes the result through `ArcSwap` and saves it to `pools.json` through `Store`. Thus no change overwrites another.
+- `responses.toml` is the source and stays unchanged in Git. At startup, the pools task merges it into the saved pools: a response in both keeps its use count; a new source response starts at 0; a source response that is no longer in `responses.toml` leaves its pool; a generated response stays. This sub-phase adds `pools`.
 
 **Acceptance criteria.**
 
 - AC-4.8-1: When dispatch gets a `Reply` with a call and `FakeHome` delays the call by 500 ms, dispatch returns before virtual time advances.
-- AC-4.8-2: When dispatch gets a `Reply` with a call, `FakeHome` records the call.
+- AC-4.8-2: When dispatch gets a `Reply` with a call and the caller starts `after`, `FakeHome` records the call. Before the start, `FakeHome` records no call.
 - AC-4.8-3: When dispatch gets a `Reply`, the response store receives the pools with the new use count.
 - AC-4.8-4: When dispatch gets a `Reply` with no call, `FakeHome` records no call.
+- AC-4.8-5: When dispatch gets `Fallback`, the text is from `fallback`, and `after` is none.
+- AC-4.8-6: When 100 dispatches record uses at the same time, the saved pools have all 100 uses.
+- AC-4.8-7: When `responses.toml` gets one new response and loses one old response, the merged pools have the new response with `uses = 0`, do not have the old one, and keep the use counts of the others. `responses.toml` does not change.
 
 **Proofs.**
 
-- P-4.8-1. Requires: `spawn` does not wait. Argument: dispatch spawns the call and does not await it, so it returns without a timer.
-- P-4.8-4. Argument: the spawn is inside `if let Some(call)`.
-- P-4.8-2, P-4.8-3. Evidence: test.
+- P-4.8-1. Argument: dispatch returns the call as `after` and does not await it, so it returns without a timer.
+- P-4.8-4, P-4.8-5. Argument: `after` is `Some` only inside `if let Some(call)`.
+- P-4.8-6. Argument: the pools task applies messages one at a time, so each use is applied to the result of the one before.
+- P-4.8-2, P-4.8-3, P-4.8-7. Evidence: test.
 
 ---
 
@@ -245,14 +266,15 @@ This phase selects responses, selects entities and decides the action from a pre
 **Goal:** Add `announce` to `Home` and the dispatch of fetch jobs. Jarvis speaks a filler, fetches the data in the background, and announces the answer after the filler ends.
 
 - **Implements:** G6, G19. **Depends on:** 4.8.
-- **Files:** create `src/domain/speech.rs`. Modify `src/ports.rs`, `src/adapters/ha.rs`, `src/app/conversation.rs`, `src/main.rs`, `src/testing/fakes.rs`, `jarvis.toml`.
+- **Files:** create `src/domain/speech.rs`. Modify `src/ports.rs`, `src/adapters/ha.rs`, `src/app/conversation.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `jarvis.toml`.
 - **Quint:** `announce.qnt` (conformance).
 
 **Model.**
 
 - `Home::announce(satellite, text)` calls `assist_satellite.announce` with `preannounce = false` and waits for it to end.
 - `announce_delay(filler_audio_duration, margin) -> Duration = duration + margin`.
-- `Defer(Fetch)`: return the filler, then in the background call the service, render the answer pool with `response`, wait until `announce_delay` has passed since the reply, and announce. On error, announce from `failure`.
+- `Defer(Fetch)`: return the filler. `after` calls the service, renders the answer pool with `response`, waits until `announce_delay` has passed since the reply, and announces. On error, it announces from `failure`.
+- When the call of a `Reply` fails, `after` logs the error and announces from `failure` on the satellite. Jarvis does not retry a failed call.
 - Announces of one request run one at a time, in order.
 - This sub-phase adds `[announce]` with `margin_ms` to `jarvis.toml`.
 
@@ -264,10 +286,11 @@ This phase selects responses, selects entities and decides the action from a pre
 - AC-4.9-4: When the fetch fails, `FakeHome` records an announce from `failure`.
 - AC-4.9-5: When `HaHome::announce` runs, `FakeHaServer` receives `assist_satellite.announce` for the satellite entity.
 - AC-4.9-6: When `quint-connect` replays 100 traces of `announce.qnt`, the announces that `FakeHome` records match the model `started` after each step.
+- AC-4.9-7: When `FakeHome` returns an error for the call of a `Reply`, `FakeHome` records an announce from `failure` and no second call.
 
 **Proofs.**
 
 - P-4.9-3 (AC-4.9-3). Argument: `announce_delay` is the sum.
 - P-4.9-2 (AC-4.9-2). Requires: `AnnounceAfterFiller` (P-4.7-2). Argument: the job sleeps until `reply time + announce_delay` before it calls `announce`, which matches the `start` guard of the model.
 - P-4.9-4. Argument: the error branch of the fetch selects from `failure`.
-- P-4.9-1, P-4.9-5, P-4.9-6. Evidence: test.
+- P-4.9-1, P-4.9-5, P-4.9-6, P-4.9-7. Evidence: test.
