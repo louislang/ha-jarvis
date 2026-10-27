@@ -53,7 +53,7 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 - P-6.2-1, P-6.2-2. Evidence: test.
 - P-6.2-3. Evidence: test (a structure test of `release.yml`).
 
-**Field log.** Push a tag. Record that the Linux archive passes its verification step.
+**Field log.** Push a tag. Record that the Linux archive passes its verification step. On the Intel MacBook, run `just models` and `just test`. Record that the sherpa-onnx macOS x86_64 libraries load ONNX Runtime 1.28.
 
 ---
 
