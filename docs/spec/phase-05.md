@@ -64,7 +64,7 @@ This phase adds the driving port and the Wyoming adapter. HA can use Jarvis as i
 - **Implements:** G1, G3, G9. **Depends on:** 5.2.
 - **Files:** modify `src/app/conversation.rs`, `src/lib.rs`.
 
-**Model.** `handle(text, ctx)`: the satellite area is `area_of_device(ctx.device_id)`. The context is `context_text(area, [])`. Then `predict`, `decide` and dispatch. An error from `predict` or `decide` gives `Err` with a `failure` text. `App` in `src/lib.rs` delegates `Assistant::handle` to this use case.
+**Model.** `handle(text, ctx)`: the satellite area is `area_of_device(ctx.device_id)`. The context is `context_text(area, [])`. Then `predict` with `normalize(text)` (in `spawn_blocking`, decision 29), `decide` and dispatch. An error from `predict` or `decide` gives `Err` with a `failure` text. `App` in `src/lib.rs` delegates `Assistant::handle` to this use case.
 
 **Acceptance criteria.**
 
@@ -74,10 +74,12 @@ This phase adds the driving port and the Wyoming adapter. HA can use Jarvis as i
 - AC-5.3-4: When the decision is `Defer`, `handle` returns a filler text.
 - AC-5.3-5: When `predict` returns an error, `handle` returns `Err` with a `failure` text.
 - AC-5.3-6 [GPU host]: Through the real Wyoming adapter and the fixture model on localhost, `transcript` to `handled` has a p95 of less than 20 ms.
+- AC-5.3-7: When `handle` gets "Turn on the Lights.", `FakeClassifier` records the text "turn on the lights".
 
 **Proofs.**
 
 - P-5.3-2, P-5.3-3. Argument: the context is `context_text(area_of_device(id), [])`. With no ID, the area is `None`, and `context_text` writes `none` (P-3.3-2).
+- P-5.3-7. Argument: `handle` passes `normalize(text)` to `predict` (P-3.1-1).
 - P-5.3-5. Argument: errors from `predict` and `decide` go through one `map_err` to the failure response.
 - P-5.3-1, P-5.3-4, P-5.3-6. Evidence: test.
 
@@ -92,7 +94,7 @@ This phase adds the driving port and the Wyoming adapter. HA can use Jarvis as i
 
 **Model.**
 
-- `run(config_path)`: `Config::load`, `Secrets::resolve`, then the adapters, the sync task, the model and the Wyoming server.
+- `run(config_path)`: `Config::load`, `Secrets::resolve`, then the adapters (`HaHome::start`, sub-phase 2.4), the sync task, the model and the Wyoming server.
 - `main` calls `run` only for the command `jarvis serve <config>`. With no command or an unknown command, `main` prints the usage and returns. Thus `./jarvis` still exits with code 0 (sub-phase 0.14).
 - The model folder is `<model.dir>/fixture`. Sub-phase 13.9 adds the training state.
 - The classifier is in an `ArcSwap`. A swap affects the next `handle`.
@@ -116,3 +118,5 @@ This phase adds the driving port and the Wyoming adapter. HA can use Jarvis as i
 - P-5.4-4 (AC-5.4-4). Ensures: each `handle` uses exactly one classifier, the one that was current when it loaded the pointer. Argument: `handle` calls `load()` on the `ArcSwap` once. `store` replaces the pointer atomically, so a later `load()` returns the new one.
 - P-5.4-7. Argument: `run` calls `parse_catalog` and `validate_pools` (P-4.2-6) before the server binds.
 - P-5.4-2, P-5.4-5, P-5.4-6. Evidence: test.
+
+**Field log.** On the GPU host, let the firewall accept port 10700 only from the HA host (`01-architecture.md` section 10). Record that another host cannot connect.

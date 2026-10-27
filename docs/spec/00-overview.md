@@ -26,7 +26,7 @@ Each sub-phase is exactly one pull request (PR) with one concern. Each sub-phase
 
 | Part | Contents |
 |---|---|
-| Title | `### <phase>.<n> <Title>`. The PR title is `<phase>.<n> <Title>`. |
+| Title | `### <phase>.<n> <Title>`. The PR title is `<phase>.<n> <Title>`. A split part adds a letter to `<n>` (`02-rules.md` section 7.1, rule 8). |
 | Goal | One or two sentences: what the sub-phase must achieve and why. It is written before the code. It is not the PR summary. |
 | Implements | The goals (section 1) that the sub-phase serves. |
 | Depends on | The sub-phases that must be merged first. |
@@ -74,7 +74,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | Announce | The HA service `assist_satellite.announce`. It speaks text on one satellite. |
 | Ask | The HA service `assist_satellite.start_conversation`. It speaks a question on one satellite, then listens without the wake word. |
 | Dialog | The state of one open conversation on one satellite. |
-| Response latency | The time from the last voiced audio sample to the first TTS audio byte that Jarvis sends. |
+| Response latency | The time that Jarvis adds to a request: from the last voiced audio sample to the `transcript` event, from `transcript` to `handled`, and from `synthesize` to the first audio chunk. The time that HA takes between these events is not part of it. |
 | Habit | A learned pattern: an entity action that occurs at a specified time of the week. |
 | Bucket | One time slot for habits: the day type (weekday or weekend) and the hour. |
 | Established habit | A habit with a score of `habits.min_score` or more in one or more buckets. |
@@ -92,7 +92,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | Training set | All labeled examples for the System One model. |
 | Held-out set | The examples that Jarvis uses only to measure accuracy. Training never uses them. |
 | Training run | One fine-tune of the System One model, on the GPU host or on RunPod. |
-| Change | One event that counts toward the next automatic training run: a new mark, a new active learned intent or a new established habit. |
+| Change | One event that counts toward the next automatic training run: a new action mark, a new active learned intent or a new established habit. |
 | Fixture model | A System One model that `just fixture-model` trains on the CPU from the seed examples. |
 | RunPod | The GPU cloud that runs a training run when local training fails. |
 | ONNX | The model file format. ONNX Runtime runs the models. |
@@ -171,7 +171,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 
 ### 1.6 Example Training Triggers
 
-- You mark 12 interactions, Jarvis adds 2 learned intents and the house gets 6 new established habits. That is 20 changes. With `train.min_changes = 20`, Jarvis starts a training run.
+- You mark the action of 12 interactions, Jarvis adds 2 learned intents and the house gets 6 new established habits. That is 20 changes. With `train.min_changes = 20`, Jarvis starts a training run.
 - You say "Start training." Jarvis starts a training run now, with any number of changes.
 
 ### 1.7 Non-Goals
@@ -189,7 +189,7 @@ Each line is one PR.
 
 | Phase | Sub-phases |
 |---|---|
-| [0 Repository and Delivery](phase-00.md) | 0.1 Repository, coverage gate, hook and CI · 0.2 Lint gates · 0.3 Complexity gate · 0.4 Duplication gate · 0.5 PR template, stacks and review · 0.6 PR size gate · 0.7 Module graph · 0.8 Layer and modularity rules · 0.9 Architecture diagram · 0.10 PR diagram with change colors · 0.11 Diagram on `main` · 0.12 Quint gate · 0.13 GPU runner · 0.14 Release workflow · 0.15 Merge gate |
+| [0 Repository and Delivery](phase-00.md) | 0.1 Repository, coverage gate, hook and CI · 0.2 Lint gates · 0.3 Complexity gate · 0.4 Duplication gate · 0.5 PR template, stacks and review · 0.6 PR size gate · 0.7 Module graph · 0.7b Module graph paths · 0.8 Layer and modularity rules · 0.9 Architecture diagram · 0.10 PR diagram with change colors · 0.11 Diagram on `main` · 0.12 Quint gate · 0.13 GPU runner · 0.14 Release workflow · 0.15 Merge rules · 0.16 Merge command · 0.17 Pre-push guard |
 | [1 Configuration](phase-01.md) | 1.1 Configuration file · 1.2 Secrets from the environment |
 | [2 Home and Hot Cache](phase-02.md) | 2.1 Home port and reference house · 2.2 HA connection and authentication · 2.3 HA requests and snapshot · 2.4 HA events and reconnect · 2.5 HA service calls · 2.6 Cache sync Quint model · 2.7 State cache updates · 2.8 State cache queries · 2.9 Sync use case |
 | [3 System One Model](phase-03.md) | 3.1 Normalize and example markup · 3.2 Intent catalog · 3.3 Seed training set · 3.4 Dataset command · 3.5 Python project and gates · 3.6 Training set loader and tag alignment · 3.7 Joint model and loss · 3.8 Training loop and ONNX export · 3.9 Fixture model · 3.10 Training image release · 3.11 Model output functions · 3.12 Classifier port and ONNX adapter |
@@ -202,7 +202,7 @@ Each line is one PR.
 | [10 Multi-Turn Dialogs](phase-10.md) | 10.1 Dialog Quint model · 10.2 Dialog state · 10.3 Answer fill and cancel · 10.4 Ask decision and HA ask · 10.5 Dialog routing · 10.6 System Two questions · 10.7 Early commit for answers |
 | [11 Habit Learning](phase-11.md) | 11.1 Source, action and bucket · 11.2 Scores and summary · 11.3 Habit learning and store · 11.4 History bootstrap · 11.5 Habits in the model context · 11.6 Habits in entity and slot selection · 11.7 Habits in the System Two prompt |
 | [12 Interaction Log and Feedback](phase-12.md) | 12.1 Audio correlation · 12.2 Feedback Quint model · 12.3 Feedback rules · 12.4 Interaction log port and SQLite storage · 12.5 Marks, unknowns and pruning · 12.6 Record interactions · 12.7 Review port and use case · 12.8 Review web API · 12.9 Review page · 12.10 Feedback in decide · 12.11 Feedback in responses and System Two |
-| [13 Training](phase-13.md) | 13.1 Mark examples and training set · 13.2 Held-out split and acceptance · 13.3 Change count · 13.4 Training Quint model · 13.5 Paraphrase generation · 13.6 Generated example store · 13.7 Trainer port and process adapter · 13.8 RunPod adapter and handler · 13.9 Training run · 13.10 Training fallback · 13.11 Voice trigger |
-| [14 Learned Intents](phase-14.md) | 14.1 Clusters · 14.2 Proposal rules · 14.3 Learned intent Quint model · 14.4 Proposal generation · 14.5 Learned intent lifecycle · 14.6 Proposal review · 14.7 Activation · 14.8 Prefetch Quint model · 14.9 Prefetch rules · 14.10 Prefetch use case |
+| [13 Training](phase-13.md) | 13.1 Mark examples and training set · 13.2 Held-out split and acceptance · 13.3 Change count · 13.4 Training Quint model · 13.5 Paraphrase generation · 13.6 Generated example store · 13.7 Trainer port and process adapter · 13.8 RunPod handler · 13.8b RunPod adapter · 13.9 Training run · 13.10 Training fallback · 13.11 Voice trigger |
+| [14 Learned Intents](phase-14.md) | 14.1 Clusters · 14.2 Proposal rules · 14.3 Learned intent Quint model · 14.4 Proposal generation · 14.5 Learned intent lifecycle · 14.6 Proposal review · 14.7 Activation · 14.8 Prefetch Quint model · 14.9 Prefetch rules · 14.10 Prefetch use case · 14.11 Learned intents in training |
 | [15 Speaker Identification](phase-15.md) | 15.1 Discovery · 15.2 Presence and proximity signals · 15.3 Voice ports and adapters · 15.4 Voice embedding at commit · 15.5 Speaker Quint model · 15.6 Identification and enrollment · 15.7 Person-specific intents |
-| [16 System Model](phase-16.md) | 16.1 System Quint model · 16.2 System conformance |
+| [16 System Model](phase-16.md) | 16.1 System Quint model · 16.2 System conformance · 16.3 Composed Quint model · 16.4 Composed conformance |

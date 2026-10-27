@@ -41,7 +41,7 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 - **Implements:** G7. **Depends on:** 7.1.
 - **Files:** modify `src/adapters/openai.rs`, `src/ports.rs`, `src/domain/decide.rs`.
 
-**Model.** `Question { text, area, entities, now }` is in `src/domain/decide.rs`, because `decide` builds it. `entities` are the entities in the area with name and state. `now` is the local time in the HA time zone (`Snapshot.config`). `system_prompt()` is a constant. `user_message(question)` has the date, the time, the HA location name, the area, the entities and the text. The system prompt has no date, so prompt caching still works.
+**Model.** `Question { text, area, entities, now }` is in `src/domain/decide.rs`, because `decide` builds it. `entities` are the entities in the area with name and state. `now` is the local time in the HA time zone (`Snapshot.config`). `system_prompt()` is a constant. It asks for plain text to speak: short sentences, with no Markdown, lists or emoji. `user_message(question)` has the date, the time, the HA location name, the area, the entities and the text. The system prompt has no date, so prompt caching still works.
 
 **Acceptance criteria.**
 
@@ -49,12 +49,13 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 - AC-7.2-2: When the prompt builder runs for the Kitchen, the user message has only Kitchen entities.
 - AC-7.2-3: When the question has no area, the user message has no entities.
 - AC-7.2-4: When `now` is Monday 2026-10-26 08:00 in `America/Chicago`, the user message has "Monday 2026-10-26 08:00" and the HA location name.
+- AC-7.2-5: When the system prompt is read, it asks for plain text to speak, with no Markdown, lists or emoji.
 
 **Proofs.**
 
-- P-7.2-1. Argument: `system_prompt` is a constant and takes no input.
-- P-7.2-4. Evidence: test.
-- P-7.2-2, P-7.2-3. Argument: the entities come from `entities(area, ...)`, which returns only entities in the area (P-2.8-3), and `None` gives an empty list.
+- P-7.2-1. Ensures: `system_prompt()` gives the same string on every call. Argument: `system_prompt` is a constant and takes no input.
+- P-7.2-4, P-7.2-5. Evidence: test.
+- P-7.2-2, P-7.2-3. Ensures: the user message lists only the entities of the area, and none without an area. Argument: the entities come from `entities(area, ...)`, which returns only entities in the area (P-2.8-3), and `None` gives an empty list.
 
 ---
 
@@ -69,21 +70,20 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 
 - `Reasoner::answer(question) -> Stream<Step>`. This sub-phase has `Step::Sentence(text)` and `Step::Done`.
 - `sentences(buffer, chunk) -> (Vec<String>, String)`: append the chunk. Each text up to and including `.`, `?` or `!` followed by a space is complete. The rest stays in the buffer. At the end of the stream, the rest is one more sentence if it is not empty.
-- `answer` stops with a timeout error after `timeout_ms`.
+- The use case limits the wait for each step (sub-phase 7.5). Thus the adapter has no timer while it waits for the socket (`02-rules.md` section 6.2).
 
 **Acceptance criteria.**
 
 - AC-7.3-1: When `sentences` gets "Hello there. It is", it returns "Hello there." and keeps "It is".
 - AC-7.3-2: When the stream ends, the rest is given as the last sentence.
 - AC-7.3-3: When the joined sentences and the rest are compared with the joined chunks, they are equal after whitespace normalization.
-- AC-7.3-4: When the mock streams two sentences with a 1 s gap, `answer` gives the first sentence before the gap ends.
-- AC-7.3-5: When the mock does not answer within `timeout_ms`, `answer` returns a timeout error.
+- AC-7.3-4: When the mock streams a response with two sentences, `answer` gives `Sentence`, `Sentence` and `Done`, in that order.
 
 **Proofs.**
 
-- P-7.3-1, P-7.3-2. Argument: `sentences` scans the buffer for the boundary pattern and splits at each match. The text after the last match is the rest.
+- P-7.3-1, P-7.3-2. Ensures: each complete sentence ends with `.`, `?` or `!` before a space, and the rest has no such boundary. At the end of the stream, a rest that is not empty is the last sentence. Argument: `sentences` scans the buffer for the boundary pattern and splits at each match. The text after the last match is the rest.
 - P-7.3-3 (AC-7.3-3). Claim: no text is lost or added. Argument: splitting a string at positions and keeping all pieces is a partition of the string. The only removed characters are the single spaces after boundaries, which whitespace normalization ignores.
-- P-7.3-4, P-7.3-5. Evidence: test.
+- P-7.3-4. Evidence: test.
 
 ---
 
@@ -92,20 +92,22 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 **Goal:** Add the `call_service` tool, so System Two can act on HA. The application runs each call through `Home`, returns the result to the model, and continues the answer.
 
 - **Implements:** G7. **Depends on:** 7.3.
-- **Files:** modify `src/adapters/openai.rs`, `src/ports.rs`, `src/testing/fakes.rs`.
+- **Files:** modify `src/adapters/openai.rs`, `src/ports.rs`, `src/testing/fakes.rs`, `jarvis.toml`.
 
-**Model.** `Step::Call(ServiceCall, reply)`: the consumer runs the call and sends the result back on `reply`. The adapter sends the tool result to OpenAI and continues the stream.
+**Model.** `Step::Call(ServiceCall, reply)`: the consumer runs the call and sends the result back on `reply`. The adapter sends the tool result to OpenAI and continues the stream. One answer makes at most `openai.max_tool_calls` tool calls. A later tool call gets the tool error "limit reached" and no `Step::Call`. This sub-phase adds `openai.max_tool_calls`.
 
 **Acceptance criteria.**
 
 - AC-7.4-1: When the mock returns a `call_service` tool call, `answer` gives `Step::Call` with the domain, service, target and data.
 - AC-7.4-2: When the consumer sends the result, the adapter sends it to the mock and then gives the final text.
 - AC-7.4-3: When the tool arguments are not valid, `answer` gives a tool error to the mock and continues.
+- AC-7.4-4: When the mock returns one more tool call than `max_tool_calls` in one answer, `answer` gives no `Step::Call` for it and sends the tool error "limit reached".
 
 **Proofs.**
 
 - P-7.4-1, P-7.4-2. Evidence: test.
 - P-7.4-3. Argument: argument parsing returns `Result`. The `Err` branch sends an error tool result instead of a `Step::Call`.
+- P-7.4-4. Argument: the adapter counts the tool calls of one answer and takes the error branch when the count reaches the limit.
 
 ---
 
@@ -120,24 +122,30 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 **Model.**
 
 - `Defer(Llm)`: return the filler. The `after` work consumes `answer`: each `Sentence` goes to the announce queue of sub-phase 4.9. Each `Call` runs through `Home` before the next step. An error announces from `failure`.
-- A `Call` runs only when its domain is in `openai.allowed_domains`. Else the consumer sends the tool error "not permitted" and makes no call. A misheard request thus cannot unlock a door. This sub-phase adds `openai.allowed_domains`.
+- The use case waits at most `openai.timeout_ms` for each step of `answer`. A longer wait is a timeout error.
+- A `Call` runs only when its service domain and the domain of each target entity are in `openai.allowed_domains`, and each target entity is in the hot cache. Else the consumer sends the tool error "not permitted" and makes no call. A misheard request thus cannot unlock a door. Leave `switch` out of the list when a switch drives a door, a gate or a lock. This sub-phase adds `openai.allowed_domains`.
 - Without a `satellite_id`, there is no satellite for an announce. `handle` then waits for the job and returns the joined sentences as the text, with no filler. A fetch job (sub-phase 4.9) works the same way. The wait ends with the `timeout_ms` error.
 
 **Acceptance criteria.**
 
 - AC-7.5-1: When `FakeClassifier` gives `unknown`, `handle` returns a filler before virtual time advances.
 - AC-7.5-2: When `FakeReasoner` gives two sentences, `FakeHome` records two announces in the same order.
-- AC-7.5-3: When the filler audio is 1.5 s, the first announce starts at 1.5 s plus `margin_ms` or later.
+- AC-7.5-3: When the satellite becomes idle 1.5 s after the reply, the first announce starts at 1.5 s plus `margin_ms` or later.
 - AC-7.5-4: When `FakeReasoner` gives `Call`, `FakeHome` records the call before the next step.
 - AC-7.5-5: When `answer` returns an error, `FakeHome` records an announce from `failure`.
 - AC-7.5-6: When `FakeReasoner` gives a `Call` for the domain `lock`, which is not in `allowed_domains`, `FakeHome` records no call and the tool result is "not permitted".
 - AC-7.5-7: When the context has no `satellite_id` and `FakeReasoner` gives two sentences, `handle` returns both sentences as the text and `FakeHome` records no announce.
+- AC-7.5-8: When `FakeReasoner` gives `light.turn_on` with the target `lock.front_door`, `FakeHome` records no call and the tool result is "not permitted".
+- AC-7.5-9: When `FakeReasoner` gives one sentence and then waits, `FakeHome` records the announce of that sentence before the reasoner continues.
+- AC-7.5-10: When `FakeReasoner` gives no step within `timeout_ms`, the job ends with a timeout error, and `FakeHome` records an announce from `failure`.
 
 **Proofs.**
 
-- P-7.5-2, P-7.5-3. Requires: `SentencesInOrder` and `AnnounceAfterFiller` (P-4.7-2, P-4.7-3) and the conformance of sub-phase 4.9. Argument: sentences enter the same queue that the model describes, in stream order.
+- P-7.5-2, P-7.5-3. Requires: `SentencesInOrder` and `AnnounceWhenIdle` (P-4.7-2, P-4.7-3) and the conformance of sub-phase 4.9. Argument: sentences enter the same queue that the model describes, in stream order.
 - P-7.5-4. Argument: the consumer awaits the call result before it reads the next step.
 - P-7.5-5. Argument: the error arm of the consumer selects from `failure`.
-- P-7.5-6. Argument: the `Call` arm checks the domain before it calls `Home`.
+- P-7.5-6, P-7.5-8. Argument: the `Call` arm checks the service domain, the domain of each target entity and the hot cache before it calls `Home`.
+- P-7.5-9. Argument: the consumer puts each sentence in the queue when it arrives, with no wait for the next step.
+- P-7.5-10. Argument: the wait for each step has the deadline `timeout_ms`, and the timeout arm takes the error arm (P-7.5-5).
 - P-7.5-7. Argument: `handle` matches on `ctx.satellite_id`. The `None` arm awaits the job instead of returning the filler.
 - P-7.5-1. Argument: `Defer` returns the filler with the job as `after`, with no await on the reasoner.

@@ -26,7 +26,7 @@ This file uses the technical names in `00-overview.md` section 0.3. All sub-phas
 | R10 | Code duplication is 3% or less. | `duplication` (`jscpd --threshold 3`) |
 | R11 | Line coverage is more than 80%. This applies to all code written, from the first commit. Gate, structure and conformance tests are part of the coverage run. | `rust-test` |
 | R12 | The layer and modularity rules (`01-architecture.md` section 1) are true. | `architecture` |
-| R13 | Only the files in `01-architecture.md` section 8. | Review, `diagram` |
+| R13 | Only the files in `01-architecture.md` section 8. | Structure test in `xtask/src/gates.rs` |
 | R14 | A file has a maximum of 500 lines where possible. | Review |
 | R15 | All domain functions are pure. Other code uses pure functions where possible. | Review, `architecture` |
 | R16 | Each port has exactly one production adapter. The only exception is `Trainer` (process and RunPod). Port fakes are in `src/testing/fakes.rs`. A fake server that only one adapter's tests use (for example `FakeHaServer`) is in the test block of that adapter. | Review |
@@ -36,7 +36,7 @@ This file uses the technical names in `00-overview.md` section 0.3. All sub-phas
 | R20 | Obey the comment rules in section 2.1. | Review |
 | R21 | Every test is deterministic (section 6). | `rust-test`, `bench`, `python`, `quint` |
 | R22 | Every required check runs in the pre-commit hook and in CI, except where section 7.3 says otherwise. | Structure tests in `xtask/src/gates.rs` |
-| R23 | The Rust toolchain and each tool have a fixed version. `setup` and the CI jobs install the same versions. | `rust-toolchain.toml`, structure tests, review |
+| R23 | The Rust toolchain and each tool have a fixed version. `setup` and the CI jobs install the same versions. | `rust-toolchain.toml`, structure tests |
 
 ### 2.1 Comment and Text Rules
 
@@ -67,7 +67,8 @@ All Rust rules that can apply to Python apply to `train/`. Sub-phase 3.5 makes t
 | R9 | Halstead volume 1000 or less. Halstead difficulty 30 or less. | `complexity` |
 | R10 | Code duplication is 3% or less (counted with Rust). | `duplication` |
 | R11 | Line coverage of `train/` is more than 80%. | `pytest --cov --cov-fail-under=80.01` |
-| R13 to R15, R20 | Only the listed files. 500 lines for each file where possible. Pure functions where possible. Comment rules. | Review |
+| R13 | Only the listed files. | Structure test |
+| R14, R15, R20 | 500 lines for each file where possible. Pure functions where possible. Comment rules. | Review |
 | R18 | The Google Rust Style Guide rules that apply to Python. `CLAUDE.md` lists them. `ruff` enforces the rules that have a lint (`F403`, `FBT`, `ISC`, `UP`, `FLY`, `ERA`, `N`, `BLE`). | `ruff check`, review |
 
 Do not turn off a rule with `# noqa` or `# type: ignore` to pass a check. Change the code.
@@ -75,7 +76,7 @@ Do not turn off a rule with `# noqa` or `# type: ignore` to pass a check. Change
 ## 4. Quint Rules
 
 1. Each stateful component in `01-architecture.md` section 13 has one model in `quint/`. The module name is the file name. Simple stores (G19) have unit tests instead.
-2. A model has state variables, an `init` action, one action for each event, a `step` action that chooses any enabled event, and the named invariants of section 13. The invariant names are binding. An invariant must be able to fail: a property that the types or a definition make true is not an invariant. A property about one step uses history variables (for example `lastAction` and the previous value). A check to a step bound is bounded evidence.
+2. A model has state variables, an `init` action, one action for each event, a `step` action that chooses any enabled event, and the named invariants of section 13. The invariant names are binding. An invariant must be able to fail: a property that the types or a definition make true is not an invariant. A property about one step uses history variables (for example `lastAction` and the previous value). A check to a step bound is bounded evidence. A model has the interleavings that the code has: concurrent requests, jobs in flight and late outside events. Thus the conformance traces reach them.
 3. A model uses small constants so that model checking ends: for example, two satellites, three intents and five time units.
 4. The model is merged in its own PR before the Rust code that implements it.
 5. `just quint` runs these commands for each model:
@@ -83,7 +84,7 @@ Do not turn off a rule with `# noqa` or `# type: ignore` to pass a check. Change
    - `quint test --seed=1` (the `run` tests in the model).
    - `quint run --seed=1 --invariant=allInvariants --max-samples=10000 --max-steps=30`.
    - `quint verify --invariant=allInvariants --max-steps=10` (Apalache).
-6. A conformance test uses `quint-connect` to replay 100 traces of 30 steps, from fixed seeds, against the Rust code. After each step, the Rust state must equal the model state. The driver is in the test block of the Rust module. The system driver (sub-phase 16.2) is in `src/testing/e2e.rs`, because it uses all modules.
+6. A conformance test uses `quint-connect` to replay 100 traces of 30 steps, from fixed seeds, against the Rust code. After each step, the Rust state must equal the model state. The driver is in the test block of the Rust module. The system driver (sub-phases 16.2 and 16.4) is in `src/testing/e2e.rs`, because it uses all modules.
 7. A change to a stateful rule changes the Rust code, the model and the driver in the same PR.
 
 ## 5. Proof Rules
@@ -100,10 +101,12 @@ Format:
 ```
 
 1. `Requires` becomes a Verus `requires` clause. `Ensures` becomes an `ensures` clause. A type invariant or a loop invariant is named in the argument.
-2. An argument uses only the model of the sub-phase, earlier proofs and the invariants of a Quint model. It names each one that it uses.
-3. A criterion that depends on an external system (HA, a model file, a network, the GPU) or on wall-clock time has no proof. Its line in the proofs part says `Evidence: test.`
-4. A `[Quint]` criterion has the proof `Evidence: model check.`
-5. A `[Bench]` criterion has the proof `Evidence: benchmark.`
+2. A criterion about a pure function (a domain function, or a pure function of `xtask` or `train.py`) has a proof with `Ensures`. The proof states `Requires` only when the function has a precondition.
+3. A criterion about other code (a use case or an adapter) has a proof when a short argument exists: an order of effects, a guard or one branch. The proof then can state only the argument. Else its line says `Evidence: test.`
+4. An argument uses only the model of the sub-phase, earlier proofs and the invariants of a Quint model. It names each one that it uses.
+5. A criterion that depends on an external system (HA, a tool, a model file, a network, the GPU), on the behavior of a crate or on wall-clock time has no proof. A conformance criterion has no proof. Its line in the proofs part says `Evidence: test.`
+6. A `[Quint]` criterion has the proof `Evidence: model check.` A criterion about an invariant can give an inductive argument instead.
+7. A `[Bench]` criterion has the proof `Evidence: benchmark.`
 
 ## 6. Test Rules
 
@@ -111,11 +114,11 @@ Format:
 
 1. A new sub-phase starts in a fresh context (section 7.1). Before any code, write a test for every acceptance criterion of the sub-phase:
    - No tag: an automated test in `rust-test` or `python`.
-   - `[Bench]`: a Gungraun benchmark in `benches/domain.rs` with an absolute instruction budget (`Callgrind::hard_limits`).
+   - `[Bench]`: a Gungraun benchmark in `benches/domain.rs` with an absolute instruction budget (`Callgrind::hard_limits`). The criterion states the budget. A toolchain update keeps the stated budget.
    - `[GPU host]`: an automated test with `#[ignore]`, run by `just gpu-test` and the `gpu-test` job on the GPU host.
    - `[Quint]`: a `run` test or a named invariant in the model, checked by `just quint`.
 2. Run the new tests and make sure they fail. Then write the code.
-3. Each acceptance criterion has exactly one test, or one test in each file that the criterion names (AC-0.1-2). The test name starts with its ID: `ac_2_3_1_<words>` in Rust, `test_ac_3_6_1_<words>` in Python, `ac_2_6_4_<words>` for a Quint `run` test. A `[Quint]` criterion about an invariant uses the invariant name of `01-architecture.md` section 13.
+3. Each acceptance criterion has exactly one test, or one test in each file that the criterion names (AC-0.1-2). The test name starts with its ID: `ac_2_3_1_<words>` in Rust, `test_ac_3_6_1_<words>` in Python, `ac_2_6_4_<words>` for a Quint `run` test. A split part keeps its letter: `ac_0_7b_1_<words>`. A `[Quint]` criterion about an invariant uses the invariant name of `01-architecture.md` section 13.
 4. A sub-phase is complete only when all of its acceptance tests pass in the required checks of section 7.3.
 5. A phase is complete only when the acceptance tests of all of its sub-phases pass on `main`.
 6. Field log steps are not tests and gate nothing. A tool behavior or a file structure is never a field log step: it is a gate test or a structure test in `xtask/src/gates.rs`.
@@ -125,7 +128,7 @@ Format:
 
 Every test gives the same result on every run with the same code.
 
-1. Time: application tests use `#[tokio::test(start_paused = true)]` and `FakeClock`. No test sleeps on the wall clock. A timing criterion is written as an order of events in virtual time ("returns before virtual time advances").
+1. Time: application tests use `#[tokio::test(start_paused = true)]` and `FakeClock`. No test sleeps on the wall clock. A timing criterion is written as an order of events in virtual time ("returns before virtual time advances"). A paused clock jumps to the next timer when all tasks wait, also when a task waits for a real socket. Thus no timer runs while code waits for a real socket in a test with a paused clock. An adapter that has such timers connects to its fake server through an in-memory stream (`tokio::io::duplex`). An adapter over a real local socket (`wiremock`) checks its deadlines between requests.
 2. Randomness: every random source takes a seed. Tests use fixed seeds.
 3. Network: tests use only local servers (`wiremock`, the fake HA server) and in-memory stores.
 4. Files: tests write only to temporary folders.
@@ -143,19 +146,23 @@ Every test gives the same result on every run with the same code.
 
 ### 7.1 PRs and Stacks
 
-1. One sub-phase is one PR with one concern.
-2. Each sub-phase starts in a fresh context: a new Claude Code session that reads only `CLAUDE.md`, `00-overview.md`, `01-architecture.md`, `02-rules.md`, the section of that sub-phase, and the sections that its proofs, criteria and model cite.
+1. One sub-phase is one PR with one concern. Two other kinds of PR exist:
+   - A spec PR changes only `docs/spec/` and `CLAUDE.md`. Its title is `Spec: <Title>`, and its branch is `spec-<short-title>`.
+   - A fix PR changes code that is on `main`: it fixes a defect or updates a dependency. Its title is `Fix: <Title>`, and its branch is `fix-<short-title>`. A defect fix adds a test that fails before the fix.
+
+   A spec PR or a fix PR has the base `main`. It is not a layer of a phase stack.
+2. Each PR starts in a fresh context: a new Claude Code session that reads only `CLAUDE.md`, `00-overview.md`, `01-architecture.md`, `02-rules.md`, the section of that sub-phase (or the sections that a spec or fix PR changes), and the sections that its proofs, criteria and model cite.
 3. Each phase is one stack of GitHub native stacked PRs, made with `gh stack`. The trunk is `main`. The layers are the sub-phases in order. The first layer of a phase can sit on the top layer of the previous phase while that stack is open.
-4. The branch name is `<phase>.<n>-<short-title>`. The PR title is `<phase>.<n> <Title>`.
+4. The branch name of a sub-phase is `<phase>.<n>-<short-title>`. Its PR title is `<phase>.<n> <Title>`. `<n>` is a number. A split part adds a letter to it (rule 8).
 5. A PR is measured and diagrammed against its base branch, which is the layer below it (`pr-size`, `diagram`).
 6. The PR description follows `.github/pull_request_template.md`:
    - The PR summary: two or three sentences that state what the PR did and which problem it solves or which feature it adds. Write it after the code, from the actual change. Do not copy the goal of the sub-phase.
    - Short bullet points of what changed.
    - One check box for each required check, and the boxes "Started in a fresh context", "Codex review threads resolved" and "`[GPU host]` criteria pass in `gpu-test`".
 7. The Codex GitHub app reviews each PR. Resolve every review thread before merge.
-8. A PR changes at most 400 lines (added plus deleted). These files do not count: `Cargo.lock`, `docs/architecture.md`, `src/testing/house.json`. If a sub-phase cannot fit, first split it in this specification in a separate PR.
-9. Merge only with `just merge <pr>` (sub-phase 0.15). It merges the bottom layer of a stack by squash when every required check passed, every review thread is resolved, every check box is checked, and the title, the branch and the summary follow rules 4 and 6. The squash commit is the inspected head commit, with the PR title and summary as its message. GitHub then rebases the rest of the stack.
-10. Bootstrap: a rule applies from the sub-phase that adds its gate. Until then, check the rule by hand. Before sub-phase 0.5, the PR description has a summary and short bullet points. Before sub-phase 0.6, count the PR size with `git diff --numstat`. Do not push to `main`. Merge layers 0.2 to 0.14 with `gh pr merge --squash --subject "<PR title>" --body "<PR summary>"` when every CI job passed, every review thread is resolved and every check box is checked. Sub-phase 0.15 merges itself with its own `just merge`.
+8. A PR changes at most 400 lines (added plus deleted). These files do not count: `Cargo.lock`, `docs/architecture.md`, `src/testing/house.json`. If a sub-phase cannot fit, first split it in a spec PR. The first part keeps its number. Each later part adds a letter: `4.5b`, `4.5c`. No other sub-phase changes its number.
+9. Merge only with `just merge <pr>` (sub-phases 0.15 and 0.16). It merges a PR whose base is `main` (the bottom layer of a stack, a spec PR or a fix PR) by squash when every required check passed, every review thread is resolved, every check box is checked, and the title, the branch and the summary follow rules 1, 4 and 6. The squash commit is the inspected head commit, with the PR title and summary as its message. GitHub then rebases the rest of the stack.
+10. Bootstrap: a rule applies from the sub-phase that adds its gate. Until then, check the rule by hand. Before sub-phase 0.5, the PR description has a summary and short bullet points. Before sub-phase 0.6, count the PR size with `git diff --numstat`. Do not push to `main`. Merge layers 0.2 to 0.15 with `gh pr merge --squash --subject "<PR title>" --body "<PR summary>"` when every CI job passed, every review thread is resolved and every check box is checked. Sub-phase 0.16 merges itself with its own `just merge`.
 11. After a change to a lower layer, run `gh stack rebase` and `gh stack push`.
 
 ### 7.2 Commits
@@ -180,7 +187,7 @@ CI runs each check as a separate job. `just merge` requires all of them. `just c
 | `bench` | `just bench` (Gungraun instruction budgets) | Push, PR | Linux only (Valgrind does not run on macOS) |
 | `python` | `just python` | Push, PR | Yes |
 | `quint` | `just quint` | Push, PR | Yes |
-| `workflow-lint` | `actionlint` | Push, PR | Yes |
+| `workflow-lint` | `just workflow-lint` (`actionlint`) | Push, PR | Yes |
 | `gpu-test` | `just gpu-test` on the self-hosted GPU runner | Push, PR | On the GPU host only (`JARVIS_DEVICE=cuda`) |
 | `pr-size` | `xtask pr-size --base origin/<base branch> --limit 400` | PR | No (needs the PR base) |
 | `diagram` | `xtask diagram --base origin/<base branch>`, posted on the PR | PR | No (needs the PR base) |

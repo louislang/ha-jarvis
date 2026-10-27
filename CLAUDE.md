@@ -11,19 +11,19 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 
 ## Workflow
 
-1. One sub-phase is one PR with one concern. Work in the order of the phase index.
+1. One sub-phase is one PR with one concern. Work in the order of the phase index. A spec PR (`Spec: <Title>`) changes only `docs/spec/` and `CLAUDE.md`. A fix PR (`Fix: <Title>`) fixes a defect or updates a dependency on `main`. Both have the base `main` (`02-rules.md` section 7.1).
 2. Start each sub-phase in a fresh context: a new session that reads only this file, `00-overview.md`, `01-architecture.md`, `02-rules.md`, that sub-phase's section, and the sections that its proofs, criteria and model cite.
 3. Each phase is one stack of GitHub native stacked PRs (`gh stack`), trunk `main`, one layer per sub-phase. After a change to a lower layer, run `gh stack rebase` and `gh stack push`.
 4. Before any code, write a test for every acceptance criterion: automated test (untagged), `[Bench]` instruction budget, `[GPU host]` `#[ignore]` test, or `[Quint]` model test or invariant. Name each test after its criterion ID (`ac_2_3_1_...`). Run them and make sure they fail.
 5. Write the least code that makes them pass.
 6. The sub-phase is complete only when all of its acceptance tests pass in the required checks. A phase is complete only when all of its sub-phases' acceptance tests pass on `main`.
-7. Every test is deterministic: paused tokio clock and `FakeClock`, fixed seeds, local servers only, temporary folders, deterministic Torch, Quint `--seed=1`. No wall-clock sleeps or timing asserts outside `[GPU host]` tests. Setup recipes (`models`, `fixture-model`) download model files before the tests. Tests read `models/` and do not download.
+7. Every test is deterministic: paused tokio clock and `FakeClock`, fixed seeds, local servers only, temporary folders, deterministic Torch, Quint `--seed=1`. No wall-clock sleeps or timing asserts outside `[GPU host]` tests. Under a paused clock, no timer runs while code waits for a real socket: an adapter with timers talks to its fake server over `tokio::io::duplex` (`02-rules.md` section 6.2). Setup recipes (`models`, `fixture-model`) download model files before the tests. Tests read `models/` and do not download.
 8. Coverage is more than 80% for all code written, enforced by the hook and CI from the first commit.
 9. A stateful change updates the Rust code, its Quint model and its conformance driver in the same PR.
-10. The PR changes at most 400 lines against the layer below (not counting `Cargo.lock`, `docs/architecture.md`, `src/testing/house.json`). If it cannot fit, split the sub-phase in the spec first.
+10. The PR changes at most 400 lines against the layer below (not counting `Cargo.lock`, `docs/architecture.md`, `src/testing/house.json`). If it cannot fit, split the sub-phase in a spec PR first: the first part keeps its number, and each later part adds a letter (`4.5b`).
 11. The PR description follows `.github/pull_request_template.md`: a summary of two or three sentences that states what the PR actually did and which problem it solves or which feature it adds, short bullet points, and every check box. Write it after the code, from the real change. Do not copy the sub-phase goal.
 12. The Codex GitHub app reviews each PR. Resolve every thread.
-13. Merge only with `just merge <pr>`: it checks every required check, every review thread, every check box, the title, the branch and the summary, then squash merges the bottom layer at the inspected head commit. The commit message is the PR title, a blank line and the PR summary. Never add "Co-Authored-By" or any AI attribution. Phase 0 layers before `just merge` exists follow the bootstrap rule in `02-rules.md` section 7.1.
+13. Merge only with `just merge <pr>`: it checks every required check, every review thread, every check box, the title, the branch and the summary, then squash merges the PR (the bottom layer of a stack, a spec PR or a fix PR) at the inspected head commit. The commit message is the PR title, a blank line and the PR summary. Never add "Co-Authored-By" or any AI attribution. Phase 0 layers before `just merge` exists follow the bootstrap rule in `02-rules.md` section 7.1.
 14. Never skip the hooks (`--no-verify`). The pre-push hook refuses pushes to `main`.
 
 ## Required Checks
@@ -89,7 +89,8 @@ The training script in `train/` is the only Python code (Python 3.12). Every rul
 
 Hexagonal (ports and adapters). See `01-architecture.md` section 1.
 
-- `src/domain/`: pure rules. No `crate::ports`, `crate::app`, `crate::adapters`, `tokio`, `std::fs`, `std::net`, `std::process`, `std::thread`, `std::env`, `std::time::SystemTime`, `std::time::Instant`, `rand::thread_rng`, `rand::rng`. Time, randomness and the environment come in as parameters. Return typed errors, not `anyhow`.
+- `src/domain/`: pure rules. No `crate::ports`, `crate::app`, `crate::adapters`, `tokio`, `std::fs`, `std::net`, `std::process`, `std::thread`, `std::env`, `std::time::SystemTime`, `std::time::Instant`, `std::collections::HashMap`, `std::collections::HashSet`, `jiff::Timestamp::now`, `jiff::Zoned::now`, `jiff::tz::TimeZone::system`, `rand::thread_rng`, `rand::rng`, `rand::random`, `rand::rngs::OsRng`, `rand::rngs::ThreadRng`. Use `BTreeMap` and `BTreeSet`. Time, randomness and the environment come in as parameters. Return typed errors, not `anyhow`.
+- CPU and GPU work (STT, TTS, `predict`, voice embedding, SQLite) runs in `spawn_blocking`, never on the async workers.
 - `src/ports.rs`: all port traits and their data types. A port gets a method only in the sub-phase that uses it.
 - `src/app/`: use cases. No `crate::adapters`.
 - `src/adapters/`: one technology each. No `crate::app`.

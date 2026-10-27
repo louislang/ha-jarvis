@@ -20,27 +20,30 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - `Cargo.toml` is a workspace with the members `jarvis` (root) and `xtask`.
 - `rust-toolchain.toml` names one fixed stable version with `clippy`, `rustfmt` and `llvm-tools-preview`.
 - `src/lib.rs` and `xtask/src/main.rs` have an empty `main`. `src/main.rs` has a `main` that only calls `jarvis::main`. Each of the three files has one test that calls its `main`.
-- `justfile`: `test` (`cargo test --workspace --release`), `cov` (`cargo llvm-cov --workspace --release --fail-under-lines 80.01`), `check` (runs `cov`), `setup` (`pre-commit install --hook-type pre-commit`).
+- `justfile`: `test` (`cargo test --workspace --release`), `cov` (`cargo llvm-cov --workspace --release --fail-under-lines 80.01`), `workflow-lint` (`actionlint`), `check` (runs `workflow-lint`, then `cov`), `setup` (runs every `install-` recipe, then `pre-commit install --hook-type pre-commit`).
+- Tool versions (R23): the `justfile` has one variable for each tool version and one `install-<tool>` recipe for each tool. This sub-phase has `cargo-llvm-cov`, `actionlint` and `pre-commit`. Each later sub-phase that adds a tool adds its variable and its recipe. A CI job installs a tool only with its `install-` recipe. A `setup-node`, `setup-java` or `setup-python` step uses the version of its `justfile` variable.
 - `.pre-commit-config.yaml`: one `local` hook, `entry: just check`, `language: system`, `stages: [pre-commit]`, `pass_filenames: false`, `always_run: true`.
-- `ci.yml`: triggers `push`, `pull_request`, `workflow_call`. Jobs `rust-test` (`just cov`) and `workflow-lint` (`actionlint`), on `ubuntu-latest`, with the cargo cache.
+- `ci.yml`: triggers `push`, `pull_request`, `workflow_call`. Jobs `rust-test` (`just cov`) and `workflow-lint` (`just workflow-lint`), on `ubuntu-latest`, with the cargo cache.
 - `xtask/src/gates.rs` is `#[cfg(test)]`. It has the helpers `fixture_crate(source)` (a temporary crate with the workspace lint settings) and `run(command) -> Output`, and the gate and structure tests of Phase 0.
-- Structure tests read `just --dump --dump-format json`, `.pre-commit-config.yaml` and the workflow files with `serde_yaml`.
+- Structure tests read `just --dump --dump-format json`, `.pre-commit-config.yaml` and the workflow files with `serde_yaml`. The file list test reads the table of `01-architecture.md` section 8 and `git ls-files`.
 
 **Acceptance criteria.**
 
 - AC-0.1-1: When you run `cargo build --workspace`, it exits with code 0.
 - AC-0.1-2: When `just test` runs, the tests `ac_0_1_2_main_returns` in `src/lib.rs`, `src/main.rs` and `xtask/src/main.rs` pass.
 - AC-0.1-3: When a fixture crate has 10 lines of which 5 are covered, `cargo llvm-cov --fail-under-lines 80.01` exits with a non-zero code. When all lines are covered, it exits with code 0.
-- AC-0.1-4: When the `justfile` is dumped, `check` runs `cov`, and `cov` has `--fail-under-lines 80.01`.
+- AC-0.1-4: When the `justfile` is dumped, `check` runs `workflow-lint` and `cov`, and `cov` has `--fail-under-lines 80.01`.
 - AC-0.1-5: When `.pre-commit-config.yaml` is parsed, it has exactly one hook, with `entry: just check`, `stages: [pre-commit]`, `always_run: true` and `pass_filenames: false`.
-- AC-0.1-6: When `ci.yml` is parsed, it has the triggers `push`, `pull_request` and `workflow_call`, a job `rust-test` that runs `just cov`, and a job `workflow-lint` that runs `actionlint`.
-- AC-0.1-7: When `git check-ignore` runs for `target/`, `models/`, `.venv/`, `habits.json`, `voices.json`, `jarvis.db`, `generated.json`, `training.json`, `pools.json` and `learned.toml`, it lists each path.
+- AC-0.1-6: When `ci.yml` is parsed, it has the triggers `push`, `pull_request` and `workflow_call`, a job `rust-test` that runs `just cov`, and a job `workflow-lint` that runs `just workflow-lint`.
+- AC-0.1-7: When `git check-ignore` runs for `target/`, `models/`, `.venv/`, `jarvis.local.toml`, `habits.json`, `voices.json`, `jarvis.db`, `generated.json`, `training.json`, `pools.json` and `learned.toml`, it lists each path.
 - AC-0.1-8: When `rust-toolchain.toml` is parsed, its channel is a fixed version `x.y.z`, and its components are `clippy`, `rustfmt` and `llvm-tools-preview`.
+- AC-0.1-9: When the `justfile` and `ci.yml` are parsed, each tool has a version variable and an `install-` recipe, `setup` runs every `install-` recipe, and each CI step that installs a tool runs its `install-` recipe or uses the version of its variable.
+- AC-0.1-10: When `git ls-files` is compared with the table of `01-architecture.md` section 8, each tracked file is in the table. A file in `docs/spec/` matches the row `docs/spec/*.md`.
 
 **Proofs.**
 
-- P-0.1-2. Requires: nothing. Ensures: each `main` returns. Argument: each `main` has an empty body or only calls `jarvis::main`, which has an empty body.
-- P-0.1-1, P-0.1-3 to P-0.1-8. Evidence: test.
+- P-0.1-2. Ensures: each `main` returns. Argument: each `main` has an empty body or only calls `jarvis::main`, which has an empty body.
+- P-0.1-1, P-0.1-3 to P-0.1-10. Evidence: test.
 
 **Field log.** Run `gh repo create jarvis --private --source . --push`. Run `just setup`. Install the Codex GitHub app on the repository. Record that the first CI run passes.
 
@@ -58,7 +61,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - `[workspace.lints.rust]`: `warnings = "deny"`, `dead_code = "deny"`, `missing_docs = "deny"`, `unsafe_code = "forbid"`.
 - `[workspace.lints.clippy]`: `pedantic = "deny"`, `unwrap_used = "deny"`, `string_add = "deny"`, `missing_docs_in_private_items = "deny"`, `undocumented_unsafe_blocks = "deny"`.
 - `clippy.toml`: `too-many-lines-threshold = 50`, `allow-unwrap-in-tests = true`.
-- `format` runs `cargo fmt --all --check`. `lint` runs `cargo clippy --workspace --all-targets -- -D clippy::pedantic -D warnings`. `check` runs `format`, `lint`, then `cov`. CI jobs `rust-format` and `rust-lint`.
+- `format` runs `cargo fmt --all --check`. `lint` runs `cargo clippy --workspace --all-targets -- -D clippy::pedantic -D warnings`. `check` runs `workflow-lint`, `format`, `lint`, then `cov`. CI jobs `rust-format` and `rust-lint`.
 
 **Acceptance criteria.**
 
@@ -68,7 +71,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - AC-0.2-4: When a fixture private function or private struct has no doc comment, `lint` fails with `missing_docs_in_private_items`.
 - AC-0.2-5: When a fixture has an `unsafe` block, the build fails with `unsafe_code`.
 - AC-0.2-6: When a fixture file is not formatted, `format` fails.
-- AC-0.2-7: When the `justfile` is dumped, `check` runs `format`, `lint` and `cov` in that order. When `ci.yml` is parsed, the jobs `rust-format` and `rust-lint` run `just format` and `just lint`.
+- AC-0.2-7: When the `justfile` is dumped, `check` runs `workflow-lint`, `format`, `lint` and `cov` in that order. When `ci.yml` is parsed, the jobs `rust-format` and `rust-lint` run `just format` and `just lint`.
 
 **Proofs.**
 
@@ -106,8 +109,8 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 **Proofs.**
 
 - P-0.3-1 to P-0.3-5. Requires: a finite space tree and the limits `(10, 1000, 30, 50)`. Ensures: a function space is in the result if and only if one of its metrics is strictly greater than its limit. Argument: the check is a disjunction of strict `>` comparisons, so a value equal to a limit passes. The `ploc` comparison is guarded by "the file is Python".
-- P-0.3-6. Argument: the walk recurses on every child. The tree is finite, so it ends, and it visits each node once.
-- P-0.3-7. Argument: the check is guarded by `kind == "function"`.
+- P-0.3-6. Ensures: every function space of the tree is checked once. Argument: the walk recurses on every child. The tree is finite, so it ends, and it visits each node once.
+- P-0.3-7. Ensures: a space that is not a function gives no violation. Argument: the check is guarded by `kind == "function"`.
 - P-0.3-8 to P-0.3-10. Evidence: test.
 
 ---
@@ -145,7 +148,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - The template has three sections: `## Summary` (two or three sentences, written after the code), `## Changes` (short bullet points) and `## Checks`.
 - `## Checks` has one box for each required CI job (`02-rules.md` section 7.3), then the boxes "Started in a fresh context", "Codex review threads resolved" and "`[GPU host]` criteria pass in `gpu-test`".
 - `setup` also runs `gh extension install github/gh-stack`.
-- The Codex GitHub app reviews each PR. Sub-phase 0.15 blocks the merge until its threads are resolved.
+- The Codex GitHub app reviews each PR. The merge gate (sub-phases 0.15 and 0.16) blocks the merge until its threads are resolved.
 - A later sub-phase that adds a CI job also adds its check box to the template.
 
 **Acceptance criteria.**
@@ -159,7 +162,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - P-0.5-2. Argument: the test builds the set of job names from `ci.yml` and the set of box labels from the template, and compares the sets.
 - P-0.5-1, P-0.5-3. Evidence: test.
 
-**Field log.** Record that the PR of this sub-phase has a Codex review.
+**Field log.** Record that the PR of this sub-phase has a Codex review. Record the login of the Codex app, and what Codex leaves on a PR when it finds no problem (a review, a comment or a reaction). Sub-phase 0.15 uses the login as `CODEX_LOGIN`.
 
 ---
 
@@ -189,15 +192,15 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 **Proofs.**
 
 - P-0.6-1, P-0.6-3, P-0.6-4. Requires: every line parses. Ensures: the result is the sum of `added + deleted` over lines that are not excluded and not binary. Argument: a fold with a running sum, where excluded and binary lines add 0.
-- P-0.6-2. Argument: the check fails on `>`, so equality passes.
-- P-0.6-5. Argument: a line must split into exactly three fields, else `Err` with the line, and the fold stops at the first `Err`.
+- P-0.6-2. Ensures: the check fails if and only if the count is more than the limit. Argument: the check fails on `>`, so equality passes.
+- P-0.6-5. Ensures: a line that does not split into three fields gives `Err` with that line. Argument: a line must split into exactly three fields, else `Err` with the line, and the fold stops at the first `Err`.
 - P-0.6-6. Evidence: test.
 
 ---
 
 ### 0.7 Module Graph
 
-**Goal:** Add the module graph builder to `xtask`. It reads the Rust source with `syn` and gives the modules, their layers and their dependencies, which the rules and the diagram need.
+**Goal:** Add the module graph builder to `xtask`. It reads the module tree and the `use` items with `syn` and gives the modules, their layers and their `use` dependencies, which the rules and the diagram need.
 
 - **Implements:** G10, G20. **Depends on:** 0.6.
 - **Files:** create `xtask/src/graph.rs`. Modify `xtask/src/main.rs`, `xtask/Cargo.toml`.
@@ -207,32 +210,61 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - A node is a module: its path (`crate::domain::intent`), its file, its layer and a hash of its file content.
 - The layer is the first path segment: `domain`, `ports`, `app`, `adapters`, `testing`, or `root` for `crate`.
 - The module tree comes from the `mod` items in `src/lib.rs`. An inline `pub mod domain { pub mod intent; }` gives the file `src/domain/intent.rs`.
-- An edge is `(from, to, test)`. Each leaf of a `use` tree gives one edge. Each path in any position (expression, type, pattern, trait bound, macro) gives one edge. `to` is the longest prefix that is a module. `test` is true inside a `#[cfg(test)]` item, and in every file of a module that `src/lib.rs` declares under `#[cfg(test)]` (for example `testing`).
-- A path that starts with `self` or `super` resolves against the current module. A `use ... as name` adds `name` to an alias table, and a path that starts with `name` resolves to the aliased path. `use super::*` gives no edge.
-- A path to an outside crate gives an `external` edge with the full path (for example `std::fs::read`). Rules match external paths by prefix.
+- An edge is `(from, to, test)`. Each leaf of a `use` tree gives one edge. `to` is the longest prefix that is a module. `test` is true inside a `#[cfg(test)]` item, and in every file of a module that `src/lib.rs` declares under `#[cfg(test)]` (for example `testing`).
+- A path that starts with `self` or `super` resolves against the current module. Each `use` leaf binds its last segment, or its `as` name, to its full path in the alias table of the file. Sub-phase 0.7b resolves other paths through this table. `use super::*` gives no edge.
 
 **Acceptance criteria.**
 
 - AC-0.7-1: When `src/lib.rs` has `pub mod domain { pub mod intent; }` and the file exists, the graph has the nodes `crate` and `crate::domain::intent` with layer `domain`.
 - AC-0.7-2: When `src/app/x.rs` has `use crate::ports::Home;`, the graph has the edge `crate::app::x -> crate::ports`.
 - AC-0.7-3: When a file has `use crate::{ports::A, domain::b::C};`, the graph has two edges.
-- AC-0.7-4: When `src/lib.rs` calls `crate::adapters::ha::HaHome::connect()`, the graph has the edge `crate -> crate::adapters::ha`.
-- AC-0.7-5: When a `use crate::testing::fakes::FakeHome;` is inside `#[cfg(test)] mod tests`, its edge has `test = true`.
-- AC-0.7-6: When a domain file has `use tokio::sync::Mutex;`, the graph has an external edge to `tokio::sync::Mutex`. When it calls `std::fs::read`, the graph has an external edge to `std::fs::read`.
-- AC-0.7-7: When the content of a file changes, its node hash changes.
-- AC-0.7-8: When `src/app/x.rs` has `use super::super::ports::Home;`, the graph has the edge `crate::app::x -> crate::ports`.
-- AC-0.7-9: When a file has `use crate::ports as p;` and a function parameter of type `p::Home`, the graph has an edge to `crate::ports` for the parameter type.
-- AC-0.7-10: When `src/lib.rs` has `#[cfg(test)] pub mod testing { pub mod fakes; }`, every edge from `crate::testing::fakes` has `test = true`.
+- AC-0.7-4: When a `use crate::testing::fakes::FakeHome;` is inside `#[cfg(test)] mod tests`, its edge has `test = true`.
+- AC-0.7-5: When the content of a file changes, its node hash changes.
+- AC-0.7-6: When `src/app/x.rs` has `use super::super::ports::Home;`, the graph has the edge `crate::app::x -> crate::ports`.
+- AC-0.7-7: When `src/lib.rs` has `#[cfg(test)] pub mod testing { pub mod fakes; }`, every edge from `crate::testing::fakes` has `test = true`.
+- AC-0.7-8: When a file has `use crate::ports::Home as H;` and `use tokio::sync::Mutex;`, the alias table maps `H` to `crate::ports::Home` and `Mutex` to `tokio::sync::Mutex`.
 
 **Proofs.**
 
 - P-0.7-1. Ensures: the node set equals the set of declared modules. Argument: the builder adds one node for each `mod` item and from no other source.
 - P-0.7-2, P-0.7-3. Ensures: one edge for each leaf of each `use` tree. Argument: a `use` tree is finite. The visitor recurses on groups and emits only at leaves.
-- P-0.7-4. Argument: the expression visitor sees every path. For a `crate` path, the longest module prefix exists because `crate` is a module.
-- P-0.7-5. Argument: the visitor keeps a depth counter of enclosing `#[cfg(test)]` items, and `test` is true when it is more than 0.
-- P-0.7-6. Argument: a path whose first segment is not `crate`, `self`, `super` or an alias is external. `self` and `super` paths become `crate` paths before the edge is made, so they cannot avoid a rule.
-- P-0.7-8 to P-0.7-10. Evidence: test.
-- P-0.7-7. Evidence: test.
+- P-0.7-4, P-0.7-7. Ensures: `test` is true exactly for an edge inside a `#[cfg(test)]` item or in a module that `src/lib.rs` declares under `#[cfg(test)]`. Argument: the visitor keeps a depth counter of enclosing `#[cfg(test)]` items. It starts the counter at 1 in the files of such a module, and `test` is true when the counter is more than 0.
+- P-0.7-6. Ensures: a path with `k` leading `super` segments resolves to the module `k` levels above the current module. Argument: the resolver removes one segment of the current module path for each `super`, then appends the rest of the path.
+- P-0.7-8. Ensures: the table maps each bound name to the full path of its `use` leaf. Argument: the visitor inserts one entry at each leaf, with the `as` name when it exists, else the last segment.
+- P-0.7-5. Evidence: test (the hash function).
+
+---
+
+### 0.7b Module Graph Paths
+
+**Goal:** Add the edges of the paths outside `use` items, with names resolved through the alias table, and the external edges. A rule now sees every crate path that code names, also inside a macro.
+
+- **Implements:** G10, G20. **Depends on:** 0.7.
+- **Files:** modify `xtask/src/graph.rs`, `xtask/Cargo.toml`.
+
+**Model.**
+
+- Each path in another position (expression, type, pattern, trait bound, macro path) gives one edge after resolution.
+- Resolution of the first segment: `crate`, `self` and `super` resolve as in sub-phase 0.7. A name in the alias table resolves to its full path. A dependency name of `Cargo.toml` (with `-` replaced by `_`), `std`, `core` and `alloc` start an external path. Any other first segment (a local item, a variable, a generic parameter, or a prelude name such as `Vec` or `Ok`) gives no edge.
+- A resolved path to an outside crate gives an `external` edge with the full path (for example `std::fs::read`). Rules match external paths by prefix.
+- A macro body is a token stream. The builder parses it as expressions separated by commas. When that fails, it takes each run of `name :: name ...` tokens as a path. Thus `format!("{}", std::fs::read_to_string(p)?)` gives an edge.
+
+**Acceptance criteria.**
+
+- AC-0.7b-1: When `src/lib.rs` calls `crate::adapters::ha::HaHome::connect()`, the graph has the edge `crate -> crate::adapters::ha`.
+- AC-0.7b-2: When a domain file has `use tokio::sync::Mutex;`, the graph has an external edge to `tokio::sync::Mutex`. When it calls `std::fs::read`, the graph has an external edge to `std::fs::read`.
+- AC-0.7b-3: When a file has `use crate::ports as p;` and a function parameter of type `p::Home`, the graph has an edge to `crate::ports` for the parameter type.
+- AC-0.7b-4: When a domain file has `use tokio::sync::Mutex;` and calls `Mutex::new()`, the graph has an external edge to `tokio::sync::Mutex::new`.
+- AC-0.7b-5: When a domain file calls `Vec::new()`, `Ok(1)` and `Intent::parse()` for a local type `Intent`, the graph has no external edge.
+- AC-0.7b-6: When a domain file has `format!("{}", std::fs::read_to_string(p)?)`, the graph has an external edge to `std::fs::read_to_string`.
+
+**Proofs.**
+
+- P-0.7b-1. Ensures: a `crate` path gives an edge to its longest module prefix. Argument: the expression visitor sees every path. The longest module prefix exists because `crate` is a module.
+- P-0.7b-2, P-0.7b-4. Ensures: a path whose first segment is a dependency name, or an alias of such a path, gives an external edge with the full path. Argument: resolution first replaces an alias with its full path, then tests the first segment against the dependency names (P-0.7-8).
+- P-0.7b-3. Ensures: a path that starts with an alias of a module gives an edge to that module. Argument: resolution replaces `p` with `crate::ports`, and the longest module prefix of `crate::ports::Home` is `crate::ports`.
+- P-0.7b-5. Ensures: a path whose first segment is not `crate`, `self`, `super`, an alias, a dependency name, `std`, `core` or `alloc` gives no edge. Argument: resolution has one arm for each of these cases and a last arm that gives no edge. `self` and `super` paths become `crate` paths first, so they cannot avoid a rule.
+- P-0.7b-6. Ensures: a path in a macro body gives the same edge as the same path in an expression. Argument: the body becomes expressions or token paths, and each path goes through the same resolution.
 
 ---
 
@@ -240,7 +272,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 
 **Goal:** Add the `rules` command and the `architecture` gate in the hook and in CI. A broken layer rule, or code outside `src/lib.rs` that names a concrete adapter, fails.
 
-- **Implements:** G10, G22. **Depends on:** 0.7.
+- **Implements:** G10, G22. **Depends on:** 0.7b.
 - **Files:** create `xtask/src/rules.rs`. Modify `xtask/src/main.rs`, `justfile`, `.github/workflows/ci.yml`, `xtask/src/gates.rs`, `.github/pull_request_template.md`.
 
 **Model.** `violations(graph) -> Vec<RuleViolation>` checks each edge with `test = false`:
@@ -258,18 +290,19 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 
 - AC-0.8-1: When a domain file uses `crate::ports`, `violations` returns rule 1 with the file and the edge.
 - AC-0.8-2: When a domain file uses `tokio`, `violations` returns rule 2. With `minijinja`, none.
-- AC-0.8-3: When a domain file uses `std::fs::read` or `std::env::var`, `violations` returns rule 2. With `std::collections::HashMap`, none.
+- AC-0.8-3: When a domain file uses `std::fs::read`, `std::env::var` or `std::collections::HashMap`, `violations` returns rule 2. With `std::collections::BTreeMap`, none.
 - AC-0.8-4: When an app file uses `crate::adapters::ha`, `violations` returns rule 3.
 - AC-0.8-5: When an adapter file uses `crate::app`, `violations` returns rule 4.
 - AC-0.8-6: When `crate::adapters::web` uses `crate::adapters::sqlite`, `violations` returns rule 5.
 - AC-0.8-7: When an edge has `test = true`, `violations` ignores it.
 - AC-0.8-8: When the `justfile` is dumped, `check` runs `architecture` after `duplication`. When `ci.yml` is parsed, the job `architecture` runs `just architecture`.
 - AC-0.8-9: When `src/ports.rs` uses `crate::app`, `violations` returns rule 6.
+- AC-0.8-10: When a domain file uses `jiff::Zoned::now` or `rand::random`, `violations` returns rule 2. With `jiff::civil::Date`, none.
 
 **Proofs.**
 
-- P-0.8-1 to P-0.8-6, P-0.8-9. Ensures: an edge with `test = false` is in the result if and only if one of rules 1 to 6 matches. Argument: `violations` is a filter with the disjunction of the six rules as its predicate.
-- P-0.8-7. Argument: the filter first requires `test = false`.
+- P-0.8-1 to P-0.8-6, P-0.8-9, P-0.8-10. Ensures: an edge with `test = false` is in the result if and only if one of rules 1 to 6 matches. Argument: `violations` is a filter with the disjunction of the six rules as its predicate. Rule 2 checks the banned paths also for a crate of the domain list.
+- P-0.8-7. Ensures: an edge with `test = true` is never in the result. Argument: the filter first requires `test = false`.
 - P-0.8-8. Evidence: test.
 
 ---
@@ -295,10 +328,10 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 **Proofs.**
 
 - P-0.9-1. Ensures: `render` is a function of the graph only. Argument: nodes and arrows are in `BTreeSet`s, and `render` reads no clock, environment or random source.
-- P-0.9-2. Argument: arrows are a set keyed by `(from, to)`.
-- P-0.9-3. Argument: only edges with `test = false` are inserted.
-- P-0.9-4. Argument: one subgraph for each distinct layer in the node set.
-- P-0.9-5. Argument: path segments are Rust identifiers, and `::` is replaced with `_`.
+- P-0.9-2. Ensures: the output has one arrow for each distinct `(from, to)`. Argument: arrows are a set keyed by `(from, to)`.
+- P-0.9-3. Ensures: no arrow comes from an edge with `test = true`. Argument: only edges with `test = false` are inserted.
+- P-0.9-4. Ensures: the number of subgraphs equals the number of distinct layers. Argument: one subgraph for each distinct layer in the node set.
+- P-0.9-5. Ensures: the node ID is the path with each `::` replaced by `_`. Argument: path segments are Rust identifiers, and `::` is replaced with `_`.
 - P-0.9-6. Evidence: test.
 
 ---
@@ -329,8 +362,8 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 **Proofs.**
 
 - P-0.10-1 to P-0.10-4. Requires: two finite module sets `B` and `H`. Ensures: each module in `B ∪ H` gets exactly one status. Argument: `H \ B`, `B \ H`, and `B ∩ H` split by hash equality are disjoint and cover `B ∪ H`.
-- P-0.10-5. Argument: with `B = H` and equal hashes, the first two sets are empty and every module is `Unchanged`.
-- P-0.10-6. Argument: the class definitions are constants.
+- P-0.10-5. Ensures: with `B = H` and equal hashes, no module has a class. Argument: the first two sets are empty and every module is `Unchanged`.
+- P-0.10-6. Ensures: the three fills are `#2da44e`, `#fb8500` and `#cf222e`. Argument: the class definitions are constants.
 - P-0.10-7. Evidence: test.
 
 ---
@@ -342,16 +375,16 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - **Implements:** G20. **Depends on:** 0.10.
 - **Files:** create `.github/workflows/architecture.yml`. Modify `xtask/src/gates.rs`.
 
-**Model.** Trigger: `push` to `main`. Permission: `contents: write`. The job runs `just diagram`. If `docs/architecture.md` changed, it commits only that file with the message `Update the architecture diagram` and the body `CI regenerated docs/architecture.md from main.`, and pushes with `GITHUB_TOKEN`. A push made with `GITHUB_TOKEN` does not start new workflow runs.
+**Model.** Trigger: `push` to `main`. Permission: `contents: write`. The workflow has `concurrency: architecture` with `cancel-in-progress: false`, so two runs never push at the same time. The job runs `just diagram`. If `docs/architecture.md` changed, it commits only that file with the message `Update the architecture diagram` and the body `CI regenerated docs/architecture.md from main.`, and pushes with `GITHUB_TOKEN`. A push made with `GITHUB_TOKEN` does not start new workflow runs.
 
 **Acceptance criteria.**
 
-- AC-0.11-1: When `architecture.yml` is parsed, it runs on `push` to `main` only, has `contents: write`, runs `just diagram`, and commits only `docs/architecture.md`.
+- AC-0.11-1: When `architecture.yml` is parsed, it runs on `push` to `main` only, has `contents: write` and the concurrency group `architecture`, runs `just diagram`, and commits only `docs/architecture.md`.
 - AC-0.11-2: When the workflow step script runs on a clean working tree, it makes no commit.
 
 **Proofs.**
 
-- P-0.11-2. Requires: `render` depends only on `src/` (P-0.9-1). Ensures: the workflow commits at most once for each push to `main`. Argument: the commit step is guarded by `git diff --quiet docs/architecture.md`. The CI commit does not start a new run, and a rerun on the same source renders the same file.
+- P-0.11-2. Requires: `render` depends only on `src/` (P-0.9-1). Ensures: the workflow commits at most once for each push to `main`. Argument: the commit step is guarded by `git diff --quiet docs/architecture.md`. The CI commit does not start a new run, a rerun on the same source renders the same file, and the concurrency group runs one workflow at a time.
 - P-0.11-1. Evidence: test.
 
 ---
@@ -387,7 +420,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - **Implements:** G18, G22. **Depends on:** 0.12.
 - **Files:** modify `justfile`, `.github/workflows/ci.yml`, `xtask/src/gates.rs`, `.github/pull_request_template.md`.
 
-**Model.** `gpu-test` runs `cargo test --workspace --release -- --ignored` with `JARVIS_DEVICE=cuda`. The GPU host also runs the live Jarvis. Thus the `gpu-test` job stops the `jarvis` service before the tests and starts it again after them, also when they fail, so the tests get the whole GPU and the latency is not noisy. The CI job `gpu-test` runs on `[self-hosted, linux, gpu]` for `push` and `pull_request`. On the GPU host, `check` also runs `gpu-test` when `JARVIS_DEVICE=cuda` is set, so the hook gates it there.
+**Model.** `gpu-test` runs `cargo test --workspace --release -- --ignored` with `JARVIS_DEVICE=cuda`. The GPU host also runs the live Jarvis as the systemd unit `jarvis` (`01-architecture.md` section 10). Thus the `gpu-test` job stops the `jarvis` service before the tests and starts it again after them, also when they fail, so the tests get the whole GPU and the latency is not noisy. Live Jarvis is down while the job runs: a push of a stack with N layers stops it N times. The CI job `gpu-test` runs on `[self-hosted, linux, gpu]` for `push` and `pull_request`. On the GPU host, `check` also runs `gpu-test` when `JARVIS_DEVICE=cuda` is set, so the hook gates it there.
 
 **Acceptance criteria.**
 
@@ -400,7 +433,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 
 - P-0.13-1 to P-0.13-4. Evidence: test.
 
-**Field log.** On the GPU host, install the NVIDIA driver, CUDA 12 and cuDNN 9. Register the GitHub Actions runner with the labels `self-hosted`, `linux` and `gpu`. Record that the `gpu-test` job runs on it.
+**Field log.** On the GPU host, install the NVIDIA driver, CUDA 12 and cuDNN 9. Register the GitHub Actions runner with the labels `self-hosted`, `linux` and `gpu`. Create the systemd unit `jarvis` and its environment file (`01-architecture.md` section 10). Until sub-phase 5.4, `jarvis` prints its usage and exits, so `stop` and `start` succeed. Let the runner user run `systemctl stop jarvis` and `systemctl start jarvis` without a password. Record that the `gpu-test` job runs on the runner.
 
 ---
 
@@ -433,46 +466,90 @@ Each build makes `jarvis-<tag>-<target>.tar.gz` with the binary and its shared l
 
 ---
 
-### 0.15 Merge Gate
+### 0.15 Merge Rules
 
-**Goal:** Add `just merge` and the pre-push guard. A free private repository cannot block merges on GitHub, so this gate refuses to merge a PR unless every required check passed and every review thread is resolved, and it refuses direct pushes to `main`.
+**Goal:** Add `merge_allowed`, the pure rule that decides whether a PR can merge. A free private repository cannot block merges on GitHub, so this rule is the gate: every required check passed, every review thread is resolved, and the PR follows the PR rules.
 
 - **Implements:** G17, G21, G22. **Depends on:** 0.14.
-- **Files:** create `xtask/src/merge.rs`. Modify `xtask/src/main.rs`, `justfile`, `xtask/src/gates.rs`.
+- **Files:** create `xtask/src/merge.rs`. Modify `xtask/src/main.rs`.
 
-**Model.**
+**Model.** `merge_allowed(pr, required) -> Result<(), Vec<Reason>>`. `pr` has the title, the branch, the base, the changed files, the description, the check results, the review threads, and the logins of the reviews, comments and reactions. The conditions:
 
-- `xtask merge <pr>` reads the PR with `gh pr view --json` (with `headRefOid`) and all pages of its review threads with `gh api graphql`, then calls `merge_allowed(pr, required) -> Result<(), Vec<Reason>>`. A failed `gh` call stops the command with code 1 and the error.
-  - Each required check (the job names in `ci.yml` that run on `pull_request`) has conclusion `success`.
-  - A Codex review exists, and every review thread is resolved.
-  - Every check box in the description is checked.
-  - The PR is the bottom of its stack: its base is `main`.
-  - The title is `<phase>.<n> <Title>`, and the branch is `<phase>.<n>-<short-title>`.
-  - The `Summary` section has two or three sentences.
-  - The description has no `Co-Authored-By` line and no `Generated with` line.
-- When `merge_allowed` returns `Ok`, the command runs `gh pr merge <pr> --squash --match-head-commit <headRefOid> --subject <title> --body <summary>`. GitHub refuses the merge when the head changed after the read. Else the command prints each reason and exits with code 1.
-- `xtask guard-push` reads the pre-push lines from standard input. It exits with code 1 when any line has the remote ref `refs/heads/main`, also for a deletion. `pre-commit` does not pass these lines to its hooks, so the guard is a direct Git hook: `setup` writes `.git/hooks/pre-push`, which runs `xtask guard-push`.
+- Each required check (the job names in `ci.yml` that run on `pull_request`) has conclusion `success`.
+- A Codex review exists: a review, a comment or a reaction by the login `CODEX_LOGIN`. Every review thread is resolved. `CODEX_LOGIN` is a constant: the login that the field log of sub-phase 0.5 records.
+- Every check box in the description is checked.
+- The base is `main`.
+- The title and the branch follow one kind of PR (`02-rules.md` section 7.1): a sub-phase (`<phase>.<n> <Title>` and `<phase>.<n>-<short-title>`, where `<n>` is a number with an optional letter), a spec PR (`Spec: <Title>` and `spec-<short-title>`) or a fix PR (`Fix: <Title>` and `fix-<short-title>`).
+- A spec PR changes only files in `docs/spec/` and `CLAUDE.md`.
+- The `Summary` section has two or three sentences.
+- The description has no `Co-Authored-By` line and no `Generated with` line.
 
 **Acceptance criteria.**
 
 - AC-0.15-1: When one required check has conclusion `failure`, `merge_allowed` returns that check as a reason.
 - AC-0.15-2: When a required check is missing, `merge_allowed` returns it as a reason.
 - AC-0.15-3: When one review thread is not resolved, `merge_allowed` returns a reason.
-- AC-0.15-4: When there is no Codex review, `merge_allowed` returns a reason.
+- AC-0.15-4: When no review, comment or reaction has the login `CODEX_LOGIN`, `merge_allowed` returns a reason. One reaction by `CODEX_LOGIN` is enough.
 - AC-0.15-5: When one check box is not checked, `merge_allowed` returns a reason.
 - AC-0.15-6: When the base is not `main`, `merge_allowed` returns a reason.
 - AC-0.15-7: When all conditions hold, `merge_allowed` returns `Ok`.
-- AC-0.15-8: When one line of the pre-push input has the remote ref `refs/heads/main`, `guard-push` exits with code 1, also when it is the second line or a deletion. When every line has the remote ref `refs/heads/2.3-ha-requests`, it exits with code 0.
-- AC-0.15-9: When the `justfile` is dumped, `setup` writes `.git/hooks/pre-push` that runs `xtask guard-push`.
-- AC-0.15-10: When a temporary repository with the hook pushes a branch and `main` in one `git push` to a temporary bare repository, the push fails and the bare repository has no `main`.
-- AC-0.15-11: When the title is not `<phase>.<n> <Title>` or the branch is not `<phase>.<n>-<short-title>`, `merge_allowed` returns a reason.
-- AC-0.15-12: When the `Summary` section has one sentence or four sentences, `merge_allowed` returns a reason.
-- AC-0.15-13: When the description has a `Co-Authored-By` line, `merge_allowed` returns a reason.
-- AC-0.15-14: When `merge_allowed` returns `Ok`, the merge command has `--match-head-commit` with the `headRefOid` that was read, `--subject` with the title and `--body` with the summary.
-- AC-0.15-15: When the review threads span two GraphQL pages and one thread on the second page is not resolved, `xtask merge` refuses the merge.
+- AC-0.15-8: When the title follows no kind of PR, or the branch does not follow the kind of the title, `merge_allowed` returns a reason.
+- AC-0.15-9: When the `Summary` section has one sentence or four sentences, `merge_allowed` returns a reason.
+- AC-0.15-10: When the description has a `Co-Authored-By` line, `merge_allowed` returns a reason.
+- AC-0.15-11: When the title and the branch are `4.5b Title` and `4.5b-title`, `Spec: Title` and `spec-title`, or `Fix: Title` and `fix-title`, `merge_allowed` returns no reason for them.
+- AC-0.15-12: When a spec PR changes a file outside `docs/spec/` and `CLAUDE.md`, `merge_allowed` returns a reason that names the file.
 
 **Proofs.**
 
-- P-0.15-1 to P-0.15-7, P-0.15-11 to P-0.15-13. Requires: the PR data and the required set. Ensures: `Ok` if and only if all conditions hold, and otherwise the result lists each failed condition. Argument: `merge_allowed` evaluates each condition, collects a reason for each failure, and returns `Ok` only when the list is empty.
-- P-0.15-8. Argument: `guard-push` is `any(line.remote_ref == "refs/heads/main")` over all lines, mapped to exit code 1. It does not skip deletions.
-- P-0.15-9, P-0.15-10, P-0.15-14, P-0.15-15. Evidence: test.
+- P-0.15-1 to P-0.15-12. Requires: the PR data and the required set. Ensures: `Ok` if and only if all conditions hold, and otherwise the result lists each failed condition. Argument: `merge_allowed` evaluates each condition, collects a reason for each failure, and returns `Ok` only when the list is empty. The title rule is one match over the three kinds of PR.
+
+---
+
+### 0.16 Merge Command
+
+**Goal:** Add `xtask merge` and `just merge`, which read the PR from GitHub, apply the merge rules and squash merge at the inspected head commit. A PR that changes after the check cannot merge.
+
+- **Implements:** G17, G21, G22. **Depends on:** 0.15.
+- **Files:** modify `xtask/src/merge.rs`, `xtask/src/main.rs`, `justfile`, `xtask/src/gates.rs`.
+
+**Model.**
+
+- `xtask merge <pr>` reads the PR with `gh pr view --json` (with `headRefOid` and the changed files). It reads all pages of the review threads, reviews, comments and reactions with `gh api graphql`. Then it calls `merge_allowed`. A failed `gh` call stops the command with code 1 and the error.
+- When `merge_allowed` returns `Ok`, the command runs `gh pr merge <pr> --squash --match-head-commit <headRefOid> --subject <title> --body <summary>`. GitHub refuses the merge when the head changed after the read. Else the command prints each reason and exits with code 1.
+- The recipe `merge` runs `cargo run -p xtask -- merge <pr>`.
+- Tests put a fake `gh` script first in `PATH`. It prints fixture JSON and records its arguments.
+
+**Acceptance criteria.**
+
+- AC-0.16-1: When `merge_allowed` returns `Ok`, the merge command has `--match-head-commit` with the `headRefOid` that was read, `--subject` with the title and `--body` with the summary.
+- AC-0.16-2: When the review threads span two GraphQL pages and one thread on the second page is not resolved, `xtask merge` refuses the merge.
+- AC-0.16-3: When a `gh` call fails, `xtask merge` exits with code 1, prints the error and runs no merge.
+- AC-0.16-4: When the `justfile` is dumped, `merge` runs `xtask merge`.
+
+**Proofs.**
+
+- P-0.16-1. Argument: the command builds the merge arguments from the values that it read and gave to `merge_allowed`. It runs the merge only in the `Ok` arm.
+- P-0.16-3. Argument: each `gh` call returns a `Result`, and the command returns at the first `Err`, before the merge call.
+- P-0.16-2, P-0.16-4. Evidence: test.
+
+---
+
+### 0.17 Pre-Push Guard
+
+**Goal:** Add the pre-push guard, which refuses a push to `main` from a local repository. Only `just merge` and the CI diagram commit change `main`.
+
+- **Implements:** G17, G22. **Depends on:** 0.16.
+- **Files:** modify `xtask/src/merge.rs`, `xtask/src/main.rs`, `justfile`, `xtask/src/gates.rs`.
+
+**Model.** `xtask guard-push` reads the pre-push lines from standard input. It exits with code 1 when any line has the remote ref `refs/heads/main`, also for a deletion. `pre-commit` does not pass these lines to its hooks, so the guard is a direct Git hook: `setup` writes `.git/hooks/pre-push`, which runs `xtask guard-push`.
+
+**Acceptance criteria.**
+
+- AC-0.17-1: When one line of the pre-push input has the remote ref `refs/heads/main`, `guard-push` exits with code 1, also when it is the second line or a deletion. When every line has the remote ref `refs/heads/2.3-ha-requests`, it exits with code 0.
+- AC-0.17-2: When the `justfile` is dumped, `setup` writes `.git/hooks/pre-push` that runs `xtask guard-push`.
+- AC-0.17-3: When a temporary repository with the hook pushes a branch and `main` in one `git push` to a temporary bare repository, the push fails and the bare repository has no `main`.
+
+**Proofs.**
+
+- P-0.17-1. Ensures: the exit code is 1 if and only if a line has the remote ref `refs/heads/main`. Argument: `guard-push` is `any(line.remote_ref == "refs/heads/main")` over all lines, mapped to exit code 1. It does not skip deletions.
+- P-0.17-2, P-0.17-3. Evidence: test.

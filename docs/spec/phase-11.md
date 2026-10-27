@@ -32,7 +32,7 @@ This phase learns the habits of the house. Habits go into the model context, hel
 **Proofs.**
 
 - P-11.1-1 to P-11.1-4. Ensures: `source` is a total function with this precedence: Jarvis user, then `parent_id`, then other `user_id`, then none. Argument: `source` is one ordered `match` on `(user_id, parent_id)` with these four arms.
-- P-11.1-5 to P-11.1-8. Argument: `action` matches on the domain and compares the tracked fields of `old` and `new`. A change in no tracked field reaches the `None` arm.
+- P-11.1-5 to P-11.1-8. Ensures: `action` gives `on` or `off` for a change of state, `play` with the show or the title, `set_temperature` with the new temperature, and `None` for a change in no tracked field. Argument: `action` matches on the domain and compares the tracked fields of `old` and `new`. A change in no tracked field reaches the `None` arm.
 - P-11.1-9. Evidence: test (time zone data).
 
 ---
@@ -50,7 +50,9 @@ This phase learns the habits of the house. Habits go into the model context, hel
 - `observe(self, entity, action, value, source, time) -> Self` adds 1 to the decayed count of `(entity, action, value, source, bucket)`. An observation older than the last update of its key is ignored.
 - `score(entity, action, time) = c(bucket(time)) + 0.5 * (c(bucket(time - 1 h)) + c(bucket(time + 1 h)))`, without `automation` counts. Thus the neighbors cross midnight with the day type of that hour.
 - `summary(area, time, n) -> Vec<String>`: the top `n` habits for the area at that time. Each line is `<entity name> <action> [<value>] <HH:00> <weekdays|weekends> <score with one decimal>`, in lowercase.
+- `HabitKey` is `(entity, action)`. `score` adds the counts of all values and of all sources except `automation`.
 - `established(min_score) -> BTreeSet<HabitKey>`: the keys with a score of `min_score` or more in one or more buckets.
+- `prune(now) -> Self` removes each key whose decayed count is less than 0.01 in every bucket. Thus the model does not grow with old shows and old entities.
 - This sub-phase adds `[habits]` (`domains`, `half_life_days`, `min_score`).
 
 **Acceptance criteria.**
@@ -60,17 +62,21 @@ This phase learns the habits of the house. Habits go into the model context, hel
 - AC-11.2-3: When all observations come from `automation`, `score` returns 0.
 - AC-11.2-4: When `summary` runs at 18:00 on a weekday, its first line has the form `living room lamp on 18:00 weekdays 4.2`.
 - AC-11.2-5: When a habit has a score of `min_score` in one bucket, `established` contains it.
-- AC-11.2-6 [Bench]: `score` with 500 habit keys stays within the instruction budget in `benches/domain.rs`.
+- AC-11.2-6 [Bench]: `score` with 500 habit keys uses 200,000 instructions or fewer.
 - AC-11.2-7: When `score` runs at Monday 00:30, it adds half of the count of the Sunday 23:00 (`weekends`) bucket.
 - AC-11.2-8: When `observe` gets a time older than the last update of the key, the count does not change.
+- AC-11.2-9: When every decayed count of a key is less than 0.01, `prune` removes the key, and the other keys do not change.
 
 **Proofs.**
 
-- P-11.2-1. Argument: `0.5^1 = 0.5`, and `4.0 * 0.5 = 2.0`.
-- P-11.2-2 (AC-11.2-2). Argument: the 18:00 bucket has 10 observations, so `c(18) > 0`. The 09:00 bucket and its neighbors have none, so `score(09:00) = 0`. Decay keeps positive counts positive.
-- P-11.2-3. Argument: `score` sums only non-`automation` counts, which are all 0.
-- P-11.2-5. Argument: `established` filters keys by `max over buckets of score >= min_score`.
-- P-11.2-4, P-11.2-7, P-11.2-8. Evidence: test.
+- P-11.2-1. Ensures: `decayed(4.0, last, last + half_life, half_life) = 2.0`. Argument: `0.5^1 = 0.5`, and `4.0 * 0.5 = 2.0`.
+- P-11.2-2 (AC-11.2-2). Ensures: `score` at 18:00 on a weekday is more than `score` at 09:00, which is 0. Argument: the 18:00 bucket has 10 observations, so `c(18) > 0`. The 09:00 bucket and its neighbors have none, so `score(09:00) = 0`. Decay keeps positive counts positive.
+- P-11.2-3. Ensures: `score = 0` when every count comes from `automation`. Argument: `score` sums only non-`automation` counts, which are all 0.
+- P-11.2-4 (AC-11.2-4). Ensures: each summary line has the format of the model in lowercase, and the first line has the highest score. Argument: `summary` sorts the keys of the area by score, highest first, takes `n`, and formats each with one `format!` and `to_lowercase`.
+- P-11.2-5. Ensures: `established = { k | max over buckets of score(k) >= min_score }`. Argument: `established` filters keys by `max over buckets of score >= min_score`.
+- P-11.2-7 (AC-11.2-7). Ensures: `score` at Monday 00:30 adds `0.5 * c(weekends, 23)`. Argument: `bucket(time - 1 h)` is the bucket of Sunday 23:30, and `bucket` takes the day type of the shifted time.
+- P-11.2-8 (AC-11.2-8). Ensures: an observation older than the last update of its key does not change the model. Argument: `observe` returns `self` unchanged when `time` is less than the last update of the key.
+- P-11.2-9 (AC-11.2-9). Ensures: `prune` keeps a key if and only if one of its decayed counts is 0.01 or more. Argument: `prune` is a filter over the keys with that predicate.
 - P-11.2-6. Evidence: benchmark.
 
 ---
@@ -82,7 +88,7 @@ This phase learns the habits of the house. Habits go into the model context, hel
 - **Implements:** G11. **Depends on:** 11.2.
 - **Files:** modify `src/app/background.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** The sync use case gives each `StateChanged` event to the cache and, for a domain in `habits.domains`, to `observe`. A `Store<Habits>` saves to `habits.file` each `save_interval_s` and at shutdown. This sub-phase adds `habits.file` and `habits.save_interval_s`.
+**Model.** The sync use case gives each `StateChanged` event to the cache and, for a domain in `habits.domains`, to `observe`. A `Store<Habits>` saves `prune(now)` of the model to `habits.file` each `save_interval_s` and at shutdown. This sub-phase adds `habits.file` and `habits.save_interval_s`.
 
 **Acceptance criteria.**
 
@@ -162,8 +168,8 @@ This phase learns the habits of the house. Habits go into the model context, hel
 
 **Proofs.**
 
-- P-11.6-1, P-11.6-2. Argument: `select` sorts the candidates by entity ID, then uses a `max_by` on the score that keeps the first of equal elements.
-- P-11.6-3, P-11.6-4. Argument: the slot value is `slot.or(top_value(habits, action, now))`. `None` from both gives `Ask`.
+- P-11.6-1, P-11.6-2. Ensures: `select` gives the candidate with the highest score, and of equal scores the lowest entity ID. Argument: `select` sorts the candidates by entity ID, then uses a `max_by` on the score that keeps the first of equal elements.
+- P-11.6-3, P-11.6-4. Ensures: an empty `habit_defaults` slot takes the value with the highest score now, and no such value gives `Ask`. Argument: the slot value is `slot.or(top_value(habits, action, now))`. `None` from both gives `Ask`.
 
 ---
 

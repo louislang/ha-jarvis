@@ -8,7 +8,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Goal:** Find each person's trackers and each satellite's presence sensors from the HA registries, with optional overrides in `jarvis.toml`. Speaker identification needs no manual entity list.
 
-- **Implements:** G12. **Depends on:** 14.10.
+- **Implements:** G12. **Depends on:** 14.11.
 - **Files:** create `src/domain/speaker.rs`. Modify `src/domain/state.rs`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.**
@@ -28,9 +28,9 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Proofs.**
 
-- P-15.1-3, P-15.1-6. Argument: both functions return the override first when it is `Some`.
-- P-15.1-4, P-15.1-5. Argument: the discovery filter requires a device class in the set of three. `None` is not in the set.
-- P-15.1-1, P-15.1-2. Argument: the tracker filter selects sensors on the same device by the two stated predicates.
+- P-15.1-3, P-15.1-6. Ensures: with an override, the result is the override. Argument: both functions return the override first when it is `Some`.
+- P-15.1-4, P-15.1-5. Ensures: a `binary_sensor` of the satellite device is a presence sensor if and only if its device class is `occupancy`, `presence` or `motion`. Argument: the discovery filter requires a device class in the set of three. `None` is not in the set.
+- P-15.1-1, P-15.1-2. Ensures: each tracker has the sensor of its device whose state is an area name and the sensor with the unit `m`. Argument: the tracker filter selects sensors on the same device by the two stated predicates.
 
 ---
 
@@ -61,8 +61,8 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 **Proofs.**
 
 - P-15.2-3 to P-15.2-6. Ensures: `proximity` is in `[0, 1]` and equals `1 / (1 + min distance)` over available trackers in the area. Argument: the function filters by availability and area, takes the minimum distance, and maps it with `1 / (1 + d)`. An empty filter gives 0. For `d >= 0`, `1 / (1 + d)` is in `(0, 1]`, and `d = 1` gives 0.5.
-- P-15.2-1, P-15.2-2. Argument: both functions are filters with the stated predicate.
-- P-15.2-7. Evidence: test.
+- P-15.2-1, P-15.2-2. Ensures: `home` gives the people whose state is `home`, and `occupied` is `None` without a presence sensor, else whether one sensor is `on`. Argument: both functions are filters with the stated predicate.
+- P-15.2-7 (AC-15.2-7). Ensures: the report has one line for each satellite with its presence sensors and one line for each person with their trackers. Argument: `discovery_report` maps over the satellites and over the people, and formats each with the result of `presence_sensors` or `trackers`.
 
 ---
 
@@ -83,11 +83,12 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 - AC-15.3-4: When `enroll` adds more than `max_samples` embeddings for a person, the profile keeps the newest `max_samples`.
 - AC-15.3-5: When the adapter starts, it loads all profiles from the voice store.
 - AC-15.3-6 [GPU host]: With `device = cpu`, one embedding of 3 s of audio has a p95 of less than 80 ms.
+- AC-15.3-7 [GPU host]: With `device = cuda`, the voice embedder runs on the CUDA execution provider.
 
 **Proofs.**
 
 - P-15.3-4. Argument: `enroll` pushes to a bounded deque that drops the oldest element when it is full.
-- P-15.3-1 to P-15.3-3, P-15.3-5, P-15.3-6. Evidence: test.
+- P-15.3-1 to P-15.3-3, P-15.3-5 to P-15.3-7. Evidence: test.
 
 ---
 
@@ -98,7 +99,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 - **Implements:** G12, G15. **Depends on:** 15.3.
 - **Files:** modify `src/app/speech.rs`, `src/app/conversation.rs`.
 
-**Model.** At commit, the speech use case spawns `embed(audio)` in a blocking task and stores the future with the utterance. The conversation use case gets it through `correlate` (sub-phase 12.1). Sub-phase 15.6 uses it to identify the speaker.
+**Model.** At commit, the speech use case spawns `embed(audio)` in a blocking task and stores the future with the utterance. The conversation use case gets it with the utterance that `handle` correlates (sub-phases 12.1 and 12.6). Sub-phase 15.6 uses it to identify the speaker.
 
 **Acceptance criteria.**
 
@@ -177,11 +178,12 @@ The interaction record gets the speaker and the source. This sub-phase adds `spe
 
 **Proofs.**
 
-- P-15.6-1. Argument: rule 2 applies when the candidate set has one element.
-- P-15.6-3. Argument: rule 3 sets proximity to 0 before rule 4 scores.
-- P-15.6-5. Argument: rule 4 requires `top > second + margin`.
+- P-15.6-1. Ensures: one candidate gives that person with confidence 1.0 and source `Presence`. Argument: rule 2 applies when the candidate set has one element.
+- P-15.6-3. Ensures: with `occupied = Some(false)`, proximity adds 0 to every score. Argument: rule 3 sets proximity to 0 before rule 4 scores.
+- P-15.6-5. Ensures: `identify` returns a speaker only when the top score is more than the second score plus `margin`. Argument: rule 4 requires `top > second + margin`.
 - P-15.6-6, P-15.6-7, P-15.6-9, P-15.6-10. Requires: `NoVoiceOnlyEnrollment`. Argument: rule 5 is a conjunction of guards on the source, the voice duration and the profile similarity, and voice-only identification has source `Voice`.
-- P-15.6-11, P-15.6-12. Evidence: test.
+- P-15.6-11 (AC-15.6-11). Ensures: when a person state is not `home` or `not_home`, all people are candidates and rule 2 does not identify. Argument: rule 1 checks that each state is `home` or `not_home` before it filters, and else takes all people with no presence identification.
+- P-15.6-12. Evidence: test.
 - P-15.6-2, P-15.6-4. Requires: `SpeakerIsCandidate`. Argument: the maximum of rule 4 ranges over candidates only. Evidence: test for the scores.
 - P-15.6-8. Evidence: test.
 
@@ -211,8 +213,8 @@ The interaction record gets the speaker and the source. This sub-phase adds `spe
 **Proofs.**
 
 - P-15.7-2, P-15.7-3. Requires: `day` is a day name. Ensures: the result is the first date after today with that weekday, plus `plus_days`. Argument: `next_date` adds `(target - today_weekday + 6) mod 7 + 1` days, which is in `1..=7`. Wednesday to Monday is `(0 - 2 + 6) mod 7 + 1 = 5` days, so 2026-10-28 plus 5 days is 2026-11-02.
-- P-15.7-4. Argument: the parser matches the allowed words and returns `Err` for others, and `decide` maps the error to `Fallback`.
-- P-15.7-5. Argument: `decide` returns `Ask` before it builds a call when the speaker is `None`.
+- P-15.7-4. Ensures: a `day` that is not a day name, `today` or `tomorrow` gives `Err`, and `decide` gives `Fallback`. Argument: the parser matches the allowed words and returns `Err` for others, and `decide` maps the error to `Fallback`.
+- P-15.7-5. Ensures: no speaker gives `Ask` from `ask_person` and no call. Argument: `decide` returns `Ask` before it builds a call when the speaker is `None`.
 - P-15.7-6. Requires: `NoVoiceOnlyEnrollment`. Argument: the answer sets the source to `Answer`, which rule 5 allows.
 - P-15.7-8. Argument: the wait is inside `if intent.needs_speaker`.
 - P-15.7-1, P-15.7-7, P-15.7-9. Evidence: test.

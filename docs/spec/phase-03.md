@@ -13,7 +13,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 **Model.**
 
-- `normalize(text) -> String`: lowercase, replace each character that is not a letter, a digit, a space or an apostrophe with a space (a `.` between two digits stays), collapse runs of spaces, trim. Jarvis uses `normalize` for comparisons (choices, feedback keys, correlation, the held-out split, seed equality). The model gets the transcript as it is.
+- `normalize(text) -> String`: lowercase, replace each character that is not a letter, a digit, a space or an apostrophe with a space (a `.` between two digits stays), collapse runs of spaces, trim. Jarvis uses `normalize` for comparisons (choices, feedback keys, correlation, the held-out split, seed equality). The model also gets the normalized transcript, because speech-to-text adds capitals and punctuation that the training examples do not have. Slot spans and slots are byte offsets in the normalized text.
 - `parse_example(markup) -> Result<Example>`: `Example { text, spans: Vec<Span> }`. `Span { slot, start, end }` are byte offsets into `text`. All Rust code uses byte offsets. Only the training set file uses character offsets (sub-phase 3.3). The text is the markup with each `[value](slot)` replaced by `value`.
 
 **Acceptance criteria.**
@@ -30,8 +30,9 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 - P-3.1-2 (AC-3.1-2). Claim: `normalize(normalize(t)) = normalize(t)`. Argument: after one pass, the text has only lowercase letters, digits, apostrophes, dots between digits and single inner spaces, with no outer spaces. Each step maps such a text to itself, so the second pass changes nothing.
 - P-3.1-3, P-3.1-4 (AC-3.1-3, AC-3.1-4). Ensures: for each span, `text[start..end] == value`, and the spans are ordered and do not overlap. Argument: the parser copies characters to `text` from left to right. When it reads a slot, it records `start = len(text)`, copies `value`, and records `end = len(text)`. Offsets only grow, so spans are ordered and disjoint.
-- P-3.1-5, P-3.1-6 (AC-3.1-5, AC-3.1-6). Argument: the parser is a small state machine (`Text`, `Value`, `Slot`). At the end of input, any state other than `Text` is an error. An empty slot name is rejected when `Slot` ends.
-- P-3.1-1, P-3.1-7. Evidence: test.
+- P-3.1-5, P-3.1-6 (AC-3.1-5, AC-3.1-6). Ensures: a `[` without a closing `](slot)`, or an empty slot name, gives `Err`. Argument: the parser is a small state machine (`Text`, `Value`, `Slot`). At the end of input, any state other than `Text` is an error. An empty slot name is rejected when `Slot` ends.
+- P-3.1-1 (AC-3.1-1). Ensures: `normalize("Turn ON the  Lights!") = "turn on the lights"`. Argument: lowercase gives `turn on the  lights!`. The `!` becomes a space, the runs of spaces collapse, and the trim removes the last space.
+- P-3.1-7 (AC-3.1-7). Ensures: `normalize("Set it to 72.5, twenty-two") = "set it to 72.5 twenty two"`. Argument: the `.` in `72.5` is between two digits, so it stays. The `,` and the `-` become spaces, and the runs of spaces collapse.
 
 ---
 
@@ -50,6 +51,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
   2. Each example parses (`parse_example`).
   3. Each template variable that is not a built-in (`area`, `entity`, `person`, `response`) and not a `habit_defaults` key is tagged in one or more examples of the intent.
   4. Names are unique, and no name is `unknown`.
+  5. The text of each example (after the markup) equals its `normalize` result.
 - `tags(catalog) -> Vec<String>`: `O`, then `B-<slot>` and `I-<slot>` for each slot name in sorted order.
 - `labels(catalog) -> Vec<String>`: `unknown`, then the intent names in file order.
 - The first `intents.toml` has `lights_on`, `fan_on`, `climate_down`, `tv_show`, `temperature_query` and `weather` from `01-architecture.md` section 9. Sub-phases 11.6, 13.11 and 15.7 add `tv_on`, `start_training` and `calendar_add`.
@@ -64,12 +66,13 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - AC-3.2-6: When an intent is named `unknown`, the parse returns an error.
 - AC-3.2-7: When the slots are `show` and `area`, `tags` returns `O, B-area, I-area, B-show, I-show`.
 - AC-3.2-8: When `labels` runs, the first label is `unknown` and the others are the intent names in file order.
+- AC-3.2-9: When the text of an example is not normalized (for example it has a capital letter or a comma), the parse returns an error that contains the example.
 
 **Proofs.**
 
-- P-3.2-2 to P-3.2-6. Ensures: `parse_catalog` returns `Ok` if and only if checks 1 to 4 pass. Argument: the function runs the four checks in sequence and returns the first `Err`. Each check is a `for` loop over a finite list with one comparison.
+- P-3.2-2 to P-3.2-6, P-3.2-9. Ensures: `parse_catalog` returns `Ok` if and only if checks 1 to 5 pass. Argument: the function runs the five checks in sequence and returns the first `Err`. Each check is a `for` loop over a finite list with one comparison.
 - P-3.2-7 (AC-3.2-7). Ensures: `tags` is determined by the set of slot names. Argument: the slot names go into a `BTreeSet`, which iterates in sorted order. The output is `O` followed by two entries for each element.
-- P-3.2-8 (AC-3.2-8). Argument: `labels` prepends `unknown` to a map over the intent list, which keeps the order.
+- P-3.2-8 (AC-3.2-8). Ensures: `labels(c) = [unknown] ++ names(c.intents)`, in file order. Argument: `labels` prepends `unknown` to a map over the intent list, which keeps the order.
 - P-3.2-1. Evidence: test.
 
 ---
@@ -105,28 +108,29 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 **Proofs.**
 
-- P-3.3-1, P-3.3-2. Argument: `context_text` is a `format!` with two branches for empty values.
-- P-3.3-3 (AC-3.3-3). Argument: `sample_context` reads only `rng` and `areas`. A seeded RNG gives the same sequence.
-- P-3.3-4 (AC-3.3-4). Argument: `seed_set` maps each seed example to one example and each unknown seed to one example, then concatenates. Map keeps length.
-- P-3.3-5. Argument: `seed_set` calls `labels` and `tags` (P-3.2-7, P-3.2-8).
-- P-3.3-6, P-3.3-7. Evidence: test.
-- P-3.3-8. Argument: `xxh3` with a fixed seed is a pure function, and `normalize` is pure.
+- P-3.3-1, P-3.3-2. Ensures: the result is `area: <area or none> | habits: <lines joined by "; " or none>`. Argument: `context_text` is a `format!` with two branches for empty values.
+- P-3.3-3 (AC-3.3-3). Ensures: the same areas and the same seed give the same context. Argument: `sample_context` reads only `rng` and `areas`. A seeded RNG gives the same sequence.
+- P-3.3-4 (AC-3.3-4). Ensures: the number of examples is the number of seed examples plus the number of unknown seeds. Argument: `seed_set` maps each seed example to one example and each unknown seed to one example, then concatenates. Map keeps length.
+- P-3.3-5. Ensures: the labels equal `labels(catalog)` and the tags equal `tags(catalog)`. Argument: `seed_set` calls `labels` and `tags` (P-3.2-7, P-3.2-8).
+- P-3.3-7 (AC-3.3-7). Ensures: a byte span `[b, e)` becomes the character span `[chars(text[..b]), chars(text[..e]))`, and the reader gives the byte span back. Argument: the writer counts the characters before each byte offset, and the reader counts the bytes of that many characters. `é` is 2 bytes and 1 character, so the end 13 becomes 12.
+- P-3.3-6. Evidence: test (`serde_json`).
+- P-3.3-8. Ensures: `held_out(t, h)` depends only on `normalize(t)` and `h`. Argument: `xxh3` with a fixed seed is a pure function, and `normalize` is pure.
 - P-3.3-9. Evidence: test (statistical property of the hash on this input set).
 
 ---
 
 ### 3.4 Dataset Command
 
-**Goal:** Add `jarvis dataset <out> [--house <snapshot.json>]`, which writes the training set from the current data. The fixture model and debugging now have one command that produces the contract file.
+**Goal:** Add `jarvis dataset <config> <out> [--house <snapshot.json>]`, which writes the training set from the current data. The fixture model and debugging now have one command that produces the contract file.
 
 - **Implements:** G3. **Depends on:** 3.3.
-- **Files:** modify `src/lib.rs`, `jarvis.toml`.
+- **Files:** modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
 
-**Model.** The command reads `jarvis.toml` (`[train]`: `base_model`, `epochs`, `batch_size`) and `intents.toml`. With `--house`, the areas come from that snapshot. Without it, the area list is empty. It writes the result of `seed_set` as JSON, without the held-out examples. Thus the fixture model never trains on a held-out seed, and the first comparison in sub-phase 13.9 is fair. The RNG has the fixed seed 1, so two runs give the same file.
+**Model.** `clap` parses the command line of `jarvis`. The command reads the configuration file `<config>` (`[train]`: `base_model`, `epochs`, `batch_size`) and the catalog file that its key `intents` names. This sub-phase adds `intents`. With `--house`, the areas come from that snapshot. Without it, the area list is empty. It writes the result of `seed_set` as JSON, without the held-out examples. Thus the fixture model never trains on a held-out seed, and the first comparison in sub-phase 13.9 is fair. The RNG has the fixed seed 1, so two runs give the same file.
 
 **Acceptance criteria.**
 
-- AC-3.4-1: When `jarvis dataset out.json --house src/testing/house.json` runs, `out.json` is a valid training set.
+- AC-3.4-1: When `jarvis dataset jarvis.toml out.json --house src/testing/house.json` runs, `out.json` is a valid training set.
 - AC-3.4-2: When it runs with `--house`, each context names an area of the reference house.
 - AC-3.4-3: When it runs without `--house`, each context is `"area: none | habits: none"`.
 - AC-3.4-4: When the command runs two times with the same inputs, the two files are equal.
@@ -135,8 +139,8 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Proofs.**
 
 - P-3.4-1, P-3.4-4. Evidence: test.
-- P-3.4-5. Argument: the writer filters with `not held_out(text)` (P-3.3-8).
-- P-3.4-2, P-3.4-3. Argument: contexts come from `sample_context`, which chooses only from the given area list, and an empty list gives `none`.
+- P-3.4-5. Ensures: no example in the file has `held_out(text)`. Argument: the writer filters with `not held_out(text)` (P-3.3-8).
+- P-3.4-2, P-3.4-3. Ensures: each context names an area of the given list, or `none` when the list is empty. Argument: contexts come from `sample_context`, which chooses only from the given area list, and an empty list gives `none`.
 
 ---
 
@@ -145,12 +149,12 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Goal:** Add the Python project in `train/` with its pinned packages, its tool configuration and the command-line entry point. Add the `python` check, so the Python rules are enforced from the first line of Python.
 
 - **Implements:** G10, G17. **Depends on:** 3.4.
-- **Files:** create `train/pyproject.toml`, `train/train.py`, `train/test_train.py`. Modify `justfile`, `.pre-commit-config.yaml`, `.github/workflows/ci.yml`, `xtask/src/gates.rs`, `.github/pull_request_template.md`.
+- **Files:** create `train/pyproject.toml`, `train/train.py`, `train/test_train.py`. Modify `justfile`, `.github/workflows/ci.yml`, `xtask/src/gates.rs`, `.github/pull_request_template.md`.
 
 **Model.**
 
-- `train/pyproject.toml`: the runtime and `dev` packages of `01-architecture.md` section 7, and the `ruff`, `mypy`, `pytest`, `coverage`, `vulture` and `interrogate` settings of `02-rules.md` section 3. The pins have wheels for Intel macOS: `torch==2.2.2` (the last release with them) and `numpy<2`. `mypy` has `ignore_missing_imports` only for the modules without type information (`onnxruntime`, `runpod`).
-- `train.py` has `parse_args(argv) -> Args` with `--data`, `--out` and `--device` (`cpu` or `cuda`).
+- `train/pyproject.toml`: the runtime and `dev` packages of `01-architecture.md` section 7, and the `ruff`, `mypy`, `pytest`, `coverage`, `vulture` and `interrogate` settings of `02-rules.md` section 3. The pins have wheels for Intel macOS: `torch==2.2.2` (the last release with them) and `numpy<2`. torch 2.2.2 has no kernels for GPUs newer than compute capability 9.0, so RunPod uses older GPUs (Phase 13 field log). `mypy` has `ignore_missing_imports` only for the modules without type information (`onnxruntime`, `runpod`).
+- `train.py` has `parse_args(argv) -> Args` with `--data`, `--out`, `--device` (`cpu` or `cuda`) and the optional `--max-vram-gb` (sub-phase 3.8).
 - `just python` runs, in order: `ruff format --check`, `ruff check`, `mypy --strict`, `vulture --min-confidence 60 --ignore-names forward` (PyTorch calls `forward`), `interrogate --fail-under 100` and `pytest --cov --cov-fail-under=80.01`, all on `train/`.
 - `just setup` also makes `.venv` and installs `./train[dev]`. `check` runs `python` after `quint`. The CI job `python` runs `just python`.
 - The `complexity` recipe now runs on `src xtask train`.
@@ -165,10 +169,12 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - AC-3.5-6: When a fixture Python function is not used, `vulture` fails and names it.
 - AC-3.5-7: When a fixture Python function has 51 code lines, cyclomatic complexity 11, Halstead volume over 1000 or Halstead difficulty over 30, `xtask complexity` fails and names it.
 - AC-3.5-8: When the `justfile` is dumped, `complexity` runs on `train`.
+- AC-3.5-9: When `parse_args` gets `--max-vram-gb 1.0`, it returns `1.0`. Without the option, the value is `None`.
 
 **Proofs.**
 
-- P-3.5-1, P-3.5-2. Argument: `--device` uses `choices=["cpu", "cuda"]`, so the parser rejects any other value.
+- P-3.5-1, P-3.5-2. Ensures: `parse_args` returns the three values when `--device` is `cpu` or `cuda`, and raises for any other value. Argument: `--device` uses `choices=["cpu", "cuda"]`, so the parser rejects any other value.
+- P-3.5-9. Ensures: `max_vram_gb` is the given number, or `None`. Argument: the option has the type `float` and the default `None`.
 - P-3.5-3. Evidence: test.
 - P-3.5-4 to P-3.5-7. Evidence: test (gate tests in `xtask/src/gates.rs` run each tool on a fixture file in a temporary folder).
 - P-3.5-8. Evidence: test.
@@ -199,7 +205,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Proofs.**
 
 - P-3.6-1. Evidence: test.
-- P-3.6-2, P-3.6-3. Argument: the validator checks each example with the two conditions and raises on the first failure.
+- P-3.6-2, P-3.6-3. Ensures: `load_set` raises for the first example that has both `intent` and `not`, or a label that is not in `labels`. Argument: the validator checks each example with the two conditions and raises on the first failure.
 - P-3.6-4 to P-3.6-6 (AC-3.6-4 to AC-3.6-6). Requires: token offsets are ordered and spans do not overlap (P-3.1-3). Ensures: each segment B token inside a span gets exactly one `B-` or `I-` label of that span, the first such token gets `B-`, and all other segment B tokens get `O`. Argument: `align` is one pass over tokens with a "current span" pointer that only moves forward. A token whose start is in `[start, end)` of the current span gets `B-` if it is the first one, else `I-`. Segment A, special tokens and `spans = None` take the `-100` branch first.
 
 ---
@@ -220,7 +226,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 **Acceptance criteria.**
 
-- AC-3.7-1: When the model runs on a batch of 2 with 5 labels and 7 tags, the shapes are `[2, 5]`, `[2, seq, 7]` and `[2, hidden]`.
+- AC-3.7-1: When the model runs on a batch of 2 with 5 labels and 7 tags, the shapes are `[2, 5]` and `[2, seq, 7]`.
 - AC-3.7-2: When an example has `not = k`, the loss decreases when `p(k)` decreases with all other values fixed.
 - AC-3.7-3: When all slot labels are `-100`, the slot loss is 0.
 - AC-3.7-4: When an example has `intent = k`, the loss decreases when `p(k)` increases.
@@ -228,7 +234,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Proofs.**
 
 - P-3.7-2 (AC-3.7-2). Claim: `f(p) = -log(1 - p)` strictly increases on `[0, 1)`. Argument: `f'(p) = 1 / (1 - p) > 0`. So a lower `p(k)` gives a lower loss.
-- P-3.7-3 (AC-3.7-3). Argument: the slot loss is the mean over tokens with a label not `-100`. With no such token, the implementation returns 0 for the empty set.
+- P-3.7-3 (AC-3.7-3). Ensures: the slot loss is 0 when every slot label is `-100`. Argument: the slot loss is the mean over tokens with a label not `-100`. With no such token, the implementation returns 0 for the empty set.
 - P-3.7-4 (AC-3.7-4). Claim: `g(p) = -log(p)` strictly decreases on `(0, 1]`. Argument: `g'(p) = -1 / p < 0`.
 - P-3.7-1. Evidence: test.
 
@@ -241,7 +247,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - **Implements:** G3, G16. **Depends on:** 3.7.
 - **Files:** modify `train/train.py`, `train/test_train.py`.
 
-**Model.** `train(set, device) -> JointModel` runs `epochs` passes with `batch_size` and AdamW. `export(model, tokenizer, set, out)` writes `model.onnx` (inputs `input_ids`, `attention_mask`, `token_type_ids`; outputs `intent_logits`, `slot_logits`), `tokenizer.json` and `labels.json` (`labels` and `tags` in set order). `main` does `load_set`, `train`, `export`.
+**Model.** `train(set, device, max_vram_gb) -> JointModel` runs `epochs` passes with `batch_size` and AdamW. On `cuda` with `max_vram_gb`, it first calls `torch.cuda.set_per_process_memory_fraction` with `max_vram_gb` divided by the GPU memory, so a run that needs more fails with "CUDA out of memory" (AC-13.10-5 measures it). `export(model, tokenizer, set, out)` writes `model.onnx` (inputs `input_ids`, `attention_mask`, `token_type_ids`; outputs `intent_logits`, `slot_logits`), `tokenizer.json` and `labels.json` (`labels` and `tags` in set order). `main` does `load_set`, `train`, `export`.
 
 **Acceptance criteria.**
 
@@ -252,8 +258,8 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 **Proofs.**
 
-- P-3.8-3 (AC-3.8-3). Argument: `export` writes `set.labels` and `set.tags` without change.
-- P-3.8-4 (AC-3.8-4). Argument: the loop is `for epoch in range(set.epochs)`.
+- P-3.8-3 (AC-3.8-3). Ensures: `labels.json` has the labels and the tags of the set, in order. Argument: `export` writes `set.labels` and `set.tags` without change.
+- P-3.8-4 (AC-3.8-4). Ensures: the loop runs `set.epochs` passes. Argument: the loop is `for epoch in range(set.epochs)`.
 - P-3.8-1, P-3.8-2. Evidence: test.
 
 ---
@@ -265,7 +271,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - **Implements:** G3, G10. **Depends on:** 3.8.
 - **Files:** modify `justfile`, `.github/workflows/ci.yml`, `xtask/src/gates.rs`.
 
-**Model.** `fixture-stale <stamp>` exits with code 0 when `<stamp>` differs from the SHA-256 of the Git-tracked files `intents.toml`, `jarvis.toml`, `src/lib.rs`, `src/domain/intent.rs`, `src/domain/training.rs`, `src/testing/house.json` and `train/`, or when a model file is missing. Untracked caches in `train/` do not change the hash. `fixture-model` runs `fixture-stale models/system-one/fixture/inputs.sha256`. If stale, it runs `jarvis dataset target/fixture/train.json --house src/testing/house.json`, then `train.py --device cpu` into `models/system-one/fixture/`, then writes the new stamp. Training uses fixed seeds and deterministic algorithms. `check` runs `fixture-model` before `cov`. CI caches `models/system-one/fixture/` with that hash as the key. The `rust-test` job sets up Python 3.12, installs `./train` and runs `just fixture-model` before `just cov`. `fixture-model` is a setup recipe: it can download `train.base_model`, and tests read only its output.
+**Model.** `fixture-model` first runs `jarvis dataset jarvis.toml target/fixture/train.json --house src/testing/house.json`. `fixture-stale <stamp>` exits with code 0 when `<stamp>` differs from the SHA-256 of `target/fixture/train.json` and the Git-tracked files in `train/`, or when a model file is missing. Thus a change that does not change the training set or the script does not train again. Untracked caches in `train/` do not change the hash. `fixture-model` runs `fixture-stale models/system-one/fixture/inputs.sha256`. If stale, it runs `train.py --device cpu` into `models/system-one/fixture/`, then writes the new stamp. Training uses fixed seeds and deterministic algorithms. `check` runs `fixture-model` before `cov`. The `rust-test` job sets up Python 3.12, installs `./train` and runs `jarvis dataset`. Then it restores `models/system-one/fixture/` from the CI cache with the hash as the key, and runs `just fixture-model` before `just cov`. `fixture-model` is a setup recipe: it can download `train.base_model`, and tests read only its output. CPU training gives different weights on different machines. Thus a criterion that uses the fixture model checks only examples that the model trained on.
 
 **Acceptance criteria.**
 
@@ -273,12 +279,13 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - AC-3.9-2: When `just fixture-model` runs a second time without changes, `model.onnx` keeps the same hash and modification time.
 - AC-3.9-3: When `just fixture-stale <stamp>` gets a stamp that differs from the hash of the inputs, it exits with code 0 (stale). With the matching stamp, it exits with code 1.
 - AC-3.9-4: When the stamp matches but `model.onnx` is missing, `fixture-stale` exits with code 0. When an untracked file is added to `train/`, the hash does not change.
-- AC-3.9-5: When `ci.yml` is parsed, the job `rust-test` installs `./train` and runs `just fixture-model` before `just cov`.
+- AC-3.9-5: When `ci.yml` is parsed, the job `rust-test` installs `./train`, restores the cache with the hash of the training set as the key, and runs `just fixture-model` before `just cov`.
+- AC-3.9-6: When only `src/lib.rs` changes and the training set file stays the same, `fixture-stale` exits with code 1.
 
 **Proofs.**
 
 - P-3.9-1. Evidence: test.
-- P-3.9-2, P-3.9-3. Argument: the recipe trains only when `fixture-stale` exits with code 0, and `fixture-stale` compares the stored hash with the hash of the inputs. Evidence: test.
+- P-3.9-2, P-3.9-3, P-3.9-6. Argument: the recipe trains only when `fixture-stale` exits with code 0, and `fixture-stale` compares the stored hash with the hash of the training set and the script. Evidence: test.
 - P-3.9-4, P-3.9-5. Evidence: test.
 
 ---
@@ -331,9 +338,9 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Proofs.**
 
 - P-3.11-1 (AC-3.11-1). Claim (real numbers): `softmax(x)_i = e^(x_i - m) / Σ_j e^(x_j - m)` is in `(0, 1]` and sums to 1. Argument: each term is positive, and the denominator is the sum of the numerators. Floating-point rounding gives the 0.0001 margin.
-- P-3.11-2 (AC-3.11-2). Argument: after subtracting `m = max(x)`, every exponent is `<= 0`, so every `e^(x_i - m)` is in `(0, 1]`, and the largest is exactly 1. There is no overflow, and the denominator is at least 1.
-- P-3.11-3, P-3.11-4. Argument: `decode_bio` is one pass with a state "open span of slot `x` or none". Each tag maps to exactly one transition, as listed in the model. `I-x` with state none, or with another slot, takes the "start" transition.
-- P-3.11-5, P-3.11-6 (AC-3.11-5, AC-3.11-6). Argument: `ranked` uses a stable sort with a descending comparison. A sort gives a non-increasing order, and a stable sort keeps the input order of equal keys.
+- P-3.11-2 (AC-3.11-2). Ensures: for finite logits, every output value is finite. Argument: after subtracting `m = max(x)`, every exponent is `<= 0`, so every `e^(x_i - m)` is in `(0, 1]`, and the largest is exactly 1. There is no overflow, and the denominator is at least 1.
+- P-3.11-3, P-3.11-4. Ensures: each slot is a maximal run of tokens that starts with `B-x`, or with `I-x` after a tag of another slot or `O`, and continues with `I-x`. Argument: `decode_bio` is one pass with a state "open span of slot `x` or none". Each tag maps to exactly one transition, as listed in the model. `I-x` with state none, or with another slot, takes the "start" transition.
+- P-3.11-5, P-3.11-6 (AC-3.11-5, AC-3.11-6). Ensures: the probabilities are non-increasing, and equal probabilities keep the label order. Argument: `ranked` uses a stable sort with a descending comparison. A sort gives a non-increasing order, and a stable sort keeps the input order of equal keys.
 
 ---
 
@@ -353,10 +360,10 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 **Acceptance criteria.**
 
-- AC-3.12-1: When the fixture model gets each seed example, the top label is the label of the example.
-- AC-3.12-2: When the fixture model gets "turn on the kitchen lights", the slots contain `area = kitchen`.
-- AC-3.12-3: When the fixture model gets "put the tv on the office", the slots contain `show = the office`.
-- AC-3.12-4: When the fixture model gets "what is the meaning of life", the top label is `unknown`.
+- AC-3.12-1: When the fixture model gets each intent seed example that is not held out, the top label is the intent of the example.
+- AC-3.12-2: When the fixture model gets each seed example with an `area` span that is not held out, the slots contain that `area` value.
+- AC-3.12-3: When the fixture model gets each seed example with a `show` span that is not held out, the slots contain that `show` value.
+- AC-3.12-4: When the fixture model gets each `unknown` seed example that is not held out, the top label is `unknown`.
 - AC-3.12-5: When the folder has no `labels.json`, `load` returns an error that names the file.
 - AC-3.12-6: When `labels.json` has a different number of labels than `intent_logits`, `load` returns an error with both numbers. When it has a different number of tags than `slot_logits`, `load` returns an error with both numbers.
 - AC-3.12-7: When `device = cpu`, the session uses only the CPU execution provider.

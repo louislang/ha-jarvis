@@ -23,7 +23,7 @@ The training script (`train/`) is outside the layers. It is the only Python code
 
 Dependency rules:
 
-1. The domain does not use `crate::ports`, `crate::app`, `crate::adapters`, `tokio`, `std::fs`, `std::net`, `std::process`, `std::thread`, `std::env`, `std::time::SystemTime`, `std::time::Instant`, `rand::thread_rng` or `rand::rng`. It gets time, randomness and the environment as parameters.
+1. The domain does not use `crate::ports`, `crate::app`, `crate::adapters`, `tokio`, `std::fs`, `std::net`, `std::process`, `std::thread`, `std::env`, `std::time::SystemTime`, `std::time::Instant`, `std::collections::HashMap`, `std::collections::HashSet`, `jiff::Timestamp::now`, `jiff::Zoned::now`, `jiff::tz::TimeZone::system`, `rand::thread_rng`, `rand::rng`, `rand::random`, `rand::rngs::OsRng` or `rand::rngs::ThreadRng`. It gets time, randomness and the environment as parameters. It uses `BTreeMap` and `BTreeSet`, because the iteration order of a `HashMap` changes from run to run.
 2. The application does not use `crate::adapters`.
 3. An adapter does not use `crate::app`.
 4. Only `src/lib.rs` names concrete adapter types. Use cases and other adapters see only port traits.
@@ -68,7 +68,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | `Classifier` | Driven | `predict` | `adapters/onnx.rs` |
 | `ModelLoader` | Driven | `load` (gives a `Classifier` for a model folder) | `adapters/onnx.rs` |
 | `Trainer` | Driven | `train` (gives a model folder for a training set) | `adapters/process.rs` (local GPU) and `adapters/runpod.rs` (fallback) |
-| `Reasoner` | Driven | `warm`, `answer` (gives steps: sentence, call, ask, done), `generate`, `paraphrase`, `propose` | `adapters/openai.rs` |
+| `Reasoner` | Driven | `warm`, `answer` (gives steps: sentence, call, ask, done), `generate`, `paraphrase`, `embed`, `propose` | `adapters/openai.rs` |
 | `InteractionLog` | Driven | `append`, `update`, `list`, `audio`, `mark`, `marked`, `unknowns`, `prune` | `adapters/sqlite.rs` |
 | `Store<T>` | Driven | `load`, `save` | `adapters/files.rs` (TOML or JSON from the file extension) |
 | `Clock` | Driven | `now` | `SystemClock` in `src/lib.rs` |
@@ -82,11 +82,11 @@ The System One model is one ONNX model with two heads: intent classification and
 Input: two text segments.
 
 - Segment A is the context. `context_text` makes it from the satellite area and the habit summary.
-- Segment B is the transcript.
+- Segment B is the normalized transcript (sub-phase 3.1).
 
 ```
 User: "Turn on the lights"
-Context: "area: living room | habits: living room lamp on 18:00 weekdays 4.2; tv play bluey 20:00 weekdays 3.1"
+Context: "area: living room | habits: living room lamp on 18:00 weekdays 4.2; tv play bluey 18:00 weekdays 3.1"
 ```
 
 Output:
@@ -128,10 +128,10 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 ## 5. Key Design Decisions
 
 1. **Early commit.** HA reads the STT result while it sends audio. HA accepts the first `Transcript` event and stops the stream. Thus Jarvis decides the end of speech itself. It does not wait for the HA voice activity detection. (Source: `homeassistant/components/wyoming/stt.py`.)
-2. **Speculative prediction.** The speech use case runs the System One model on each changed partial transcript. The audio stream has no satellite ID, so this prediction uses an empty context. When the top intent is not `unknown` and its probability is `model.commit_threshold` or more, Jarvis uses a short silence threshold (`early_commit_ms`). Other transcripts use a longer threshold (`endpoint_ms`). Silence is the time since the last voiced sample, which a Silero VAD in the first-pass adapter finds. Thus decoder delay does not add to the wait, and silence before speech does not commit.
+2. **Speculative prediction.** The speech use case runs the System One model on each changed partial transcript. The audio stream has no satellite ID, so this prediction uses an empty context. When the top intent is not `unknown` and its probability is `model.commit_threshold` or more, Jarvis uses a short silence threshold (`early_commit_ms`). Other transcripts use a longer threshold (`endpoint_ms`). Silence is the time since the last voiced sample, which a Silero VAD in the first-pass adapter finds. Silence counts only audio that the VAD has processed, so a late VAD decision cannot commit early. Thus decoder delay does not add to the wait, and silence before speech does not commit.
 3. **Reply first, act after.** Jarvis returns `Handled` before the HA service call completes. The service call runs in the background.
 4. **Pre-rendered audio.** Jarvis synthesizes at startup each pool response whose only variable is `area`. A TTS request for such a response is a memory read. Other responses synthesize at request time and are not cached.
-5. **Filler, then announce.** For external data and for System Two, Jarvis returns a filler in `Handled`. Then Jarvis speaks the answer with `assist_satellite.announce` on the same satellite. The first announce starts after the filler audio ends.
+5. **Filler, then announce.** For external data and for System Two, Jarvis returns a filler in `Handled`. Then Jarvis speaks the answer with `assist_satellite.announce` on the same satellite. When an announce or a question starts, HA cancels the running pipeline of the satellite. HA returns the result only after the satellite plays the audio. (Source: `homeassistant/components/assist_satellite/entity.py`, `homeassistant/components/esphome/assist_satellite.py`.) Thus each satellite has one queue of announces and questions. An item starts when the hot cache shows the satellite entity `idle`, which is after the filler ends. A new request on a satellite stops the older deferred jobs of that satellite. HA caches TTS audio by text, so the time of a `synthesize` event does not show when the filler plays.
 6. **Area from context.** HA sends `device_id` and `satellite_id` in the `Transcript` context. Jarvis finds the area of the device in the hot cache. (Source: `homeassistant/components/wyoming/conversation.py`.)
 7. **One templating engine.** `minijinja` renders the response text and the service call data. All pools and intents use the same syntax.
 8. **Time is an input.** Domain functions receive the current time as an argument. The application gets the time from the `Clock` port. Tests use `FakeClock`.
@@ -143,7 +143,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 14. **Training trigger.** Jarvis counts changes since the last training run. At `train.min_changes`, Jarvis starts a run. A voice request starts a run at any count. Only one run occurs at a time. After each run, accepted or rejected, the count starts again from 0.
 15. **Speaker identification is not on the critical path.** Jarvis calculates the voice embedding in the background after commit. Only intents with `needs_speaker = true` wait for the result.
 16. **Passive voice enrollment.** When presence or proximity identifies the speaker with high confidence, Jarvis adds the voice embedding to the profile of that person. No enrollment step is necessary.
-17. **Ask through `start_conversation`.** The HA Wyoming conversation agent does not set `continue_conversation`. Thus `Handled` cannot open the microphone again. To ask a question, Jarvis returns `Handled` with empty text. Then Jarvis calls `assist_satellite.start_conversation` with the question and `preannounce = false`. The satellite speaks the question and listens. (Source: `homeassistant/components/wyoming/conversation.py`.)
+17. **Ask through `start_conversation`.** The HA Wyoming conversation agent does not set `continue_conversation`. Thus `Handled` cannot open the microphone again. To ask a question, Jarvis returns `Handled` with empty text. Then, when the satellite is idle (decision 5), Jarvis calls `assist_satellite.start_conversation` with the question and `preannounce = false`. The satellite speaks the question and listens. (Source: `homeassistant/components/wyoming/conversation.py`.)
 18. **Dialogs by satellite.** `start_conversation` starts a new pipeline run with a new `conversation_id`. Thus Jarvis keys each dialog by `satellite_id`. When the context has no `satellite_id` (for example, text from the HA UI), Jarvis keys the dialog by `conversation_id` and puts the question in `Handled`. A dialog closes on completion, on cancel, after `dialog.max_turns` questions, or `dialog.timeout_s` after the last question.
 19. **System Two asks with a tool.** The OpenAI request has an `ask_user` tool. When the model calls it, Jarvis asks the question and keeps the dialog open. The next turn sends the answer as the `function_call_output` of that call, with `previous_response_id`.
 20. **System Two teaches System One.** Jarvis clusters the OpenAI embeddings of recent `unknown` requests. For each large cluster, System Two writes a proposal: name, kind, examples, responses and an optional service. Jarvis validates it and saves it to `learned.toml`. The next training run adds it to the model.
@@ -155,6 +155,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 26. **Feedback rules.** A bad action blocks that decision (intent and targets) for that normalized text at once. `decide` then uses the next entity candidate, then the next intent with enough probability. Else it sends the request to System Two with the bad action as a correction. A bad response leaves its pool. The next training run learns from all marks and corrections.
 27. **One ONNX Runtime, GPU or CPU.** `sherpa-onnx` (feature `shared`) and `ort` (feature `load-dynamic`) load the same ONNX Runtime 1.28 shared library. On the GPU host, it is the CUDA 12 and cuDNN 9 build from the sherpa-onnx `linux-x64-gpu` release. On other machines, it is the CPU build. Thus the two crates cannot conflict, and `device` selects the CUDA or the CPU execution provider for all models.
 28. **Two-pass STT.** The first pass streams, so Jarvis knows the words while the user speaks. It uses NVIDIA Nemotron Speech Streaming EN 0.6B with 160 ms chunks on the GPU host. A 160 ms chunk is shorter than `early_commit_ms`, so the last words arrive inside the silence wait. At commit, the second pass decodes the whole utterance with NVIDIA Parakeet Unified EN 0.6B in offline mode. The second pass has full context, so it is more accurate. On the Open ASR Leaderboard sets, the average word error rate goes from 7.67% to 5.91%, and on LibriSpeech test-clean from 2.56% to 1.63%. HA receives the second-pass text. Both models are official sherpa-onnx exports. Cloud streaming APIs take about 250 ms to 300 ms to give the final text, so they cannot meet G1. CPU machines use the 20M zipformer for the first pass and have no second pass.
+29. **Blocking work off the async workers.** STT decoding, the second pass, `predict`, TTS synthesis, voice embedding and SQLite calls run in `tokio::task::spawn_blocking`. The async workers only move bytes and wait. Thus a decode for one satellite does not delay `handle` for another.
 
 ## 6. Latency Budget (System One)
 
@@ -167,7 +168,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 | Margin | 30 ms |
 | **Total response latency** | **300 ms** |
 
-HA to satellite audio delivery is outside Jarvis. The Phase 9 field log records it on real hardware.
+The budget is the response latency (`00-overview.md` section 0.3). HA's own time between the events, and HA to satellite audio delivery, are outside Jarvis. The Phase 9 field log records the end-to-end time on real hardware.
 
 The budget applies to the GPU host. The `gpu-test` job runs the latency tests there (section 10).
 
@@ -201,6 +202,7 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `hound` | Adapter | WAV encode for audio playback. |
 | `toml`, `tempfile` | Adapter, root | File stores with atomic write. Configuration. |
 | `wiremock` (dev) | Adapter tests | Mock OpenAI and RunPod servers. |
+| `rubato` (dev) | Test | Resample TTS audio to 16 kHz in `speech(text)`. |
 | `cargo-llvm-cov` (tool) | — | Coverage gate. |
 | `rust-code-analysis-cli` (tool) | — | Cyclomatic complexity, Halstead and Python function length metrics. `xtask complexity` reads its JSON output. |
 | `pre-commit` (tool) | — | Git hook manager. |
@@ -211,7 +213,8 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `gh-stack` (GitHub CLI extension) | — | GitHub native stacked PRs. |
 | Codex (GitHub app) | — | AI code review of each PR. |
 | `quint-connect` (dev) | Domain and application tests | Conformance tests: replay Quint traces against the Rust code. |
-| `syn`, `clap` | `xtask` | Parse the Rust source for the module graph. Command line of `xtask`. |
+| `syn`, `toml` | `xtask` | Parse the Rust source and the dependency names of `Cargo.toml` for the module graph. |
+| `clap` | `xtask`, root | Command lines of `xtask` and `jarvis`. |
 | Quint CLI (`@informalsystems/quint`, tool) | — | Type check, test, simulate and model check the Quint models. |
 | Apalache (tool, through `quint verify`, needs Java 17) | — | Bounded model checking of the Quint invariants. |
 
@@ -233,26 +236,26 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `CLAUDE.md` | — | Working rules for code changes. | — |
 | `docs/spec/*.md` | — | This specification. | — |
 | `docs/architecture.md` | — | The full architecture diagram. CI writes it on each commit to `main`. | 0.9 |
-| `.gitignore` | — | Ignore `target/`, `models/`, `.venv/` and the data files. | 0.1 |
+| `.gitignore` | — | Ignore `target/`, `models/`, `.venv/`, `jarvis.local.toml` and the data files. | 0.1 |
 | `rust-toolchain.toml` | — | The fixed Rust version and its components. | 0.1 |
 | `Cargo.toml` | — | Workspace (`jarvis`, `xtask`), crates and lint levels. | 0.1 |
 | `Cargo.lock` | — | Locked crate versions. | 0.1 |
 | `clippy.toml` | — | Clippy thresholds. | 0.2 |
 | `justfile` | — | All developer commands. | 0.1 |
-| `.pre-commit-config.yaml` | — | The pre-commit hook and the pre-push guard. | 0.1 |
+| `.pre-commit-config.yaml` | — | The pre-commit hook. `setup` writes the pre-push guard to `.git/hooks/pre-push` (sub-phase 0.17). | 0.1 |
 | `.github/workflows/ci.yml` | — | The required checks for each push and PR. | 0.1 |
 | `.github/pull_request_template.md` | — | The PR description template. | 0.5 |
 | `.github/workflows/architecture.yml` | — | Diagram regeneration on each commit to `main`. | 0.11 |
 | `.github/workflows/release.yml` | — | Release binaries and the training image for each `v*` tag. | 0.14 |
 | `xtask/Cargo.toml` | Tools | The `xtask` crate. | 0.1 |
 | `xtask/src/main.rs` | Tools | Command line: `complexity`, `pr-size`, `rules`, `diagram`, `merge`, `guard-push`. | 0.1 |
-| `xtask/src/gates.rs` | Tools | `#[cfg(test)]` only. Gate tests (real tools on fixtures) and structure tests (hook, `justfile`, workflows, PR template). | 0.1 |
+| `xtask/src/gates.rs` | Tools | `#[cfg(test)]` only. Gate tests (real tools on fixtures) and structure tests (hook, `justfile`, workflows, PR template, tool versions, the file list of this section). | 0.1 |
 | `xtask/src/complexity.rs` | Tools | Reads `rust-code-analysis-cli` JSON and applies the limits. | 0.3 |
 | `xtask/src/pr_size.rs` | Tools | Counts the changed lines of a PR without the excluded files. | 0.6 |
 | `xtask/src/graph.rs` | Tools | Builds the module graph from the source with `syn`. | 0.7 |
 | `xtask/src/rules.rs` | Tools | Checks the layer and modularity rules on the module graph. | 0.8 |
 | `xtask/src/mermaid.rs` | Tools | Draws the module graph in Mermaid, with change colors. | 0.9 |
-| `xtask/src/merge.rs` | Tools | The merge gate and the pre-push guard. | 0.15 |
+| `xtask/src/merge.rs` | Tools | The merge rules, the merge command and the pre-push guard. | 0.15 |
 | `benches/domain.rs` | Test | Gungraun benchmarks with absolute instruction budgets. | 2.8 |
 | `jarvis.toml` | — | Runtime configuration. | 1.1 |
 | `intents.toml` | — | Intent catalog with seed examples. | 3.2 |
@@ -275,14 +278,14 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/lib.rs` | Root | Module tree, `Config`, `SystemClock`, `App` (implements `Assistant` by delegation), `run`, the `dataset` command, `main`. | 0.1 |
 | `src/main.rs` | Root | Binary entry point. `main` only calls `jarvis::main`. | 0.1 |
 | `src/ports.rs` | Ports | All port traits and their data types. | 2.1 |
-| `src/domain/state.rs` | Domain | Hot cache data and queries. | 2.7 |
+| `src/domain/state.rs` | Domain | Hot cache data and queries. | 2.1 |
 | `src/domain/intent.rs` | Domain | Normalize, example markup, catalog parse and validation, tag list. | 3.1 |
 | `src/domain/training.rs` | Domain | Training set, context samples, held-out split, accuracy, accept rule, change count. | 3.3 |
 | `src/domain/model.rs` | Domain | Softmax, BIO decode, prediction ranking. | 3.11 |
 | `src/domain/responses.rs` | Domain | Pools: select, render, record use, backfill policy, validation. | 4.1 |
 | `src/domain/select.rs` | Domain | Entity selection for an intent and an area. | 4.4 |
 | `src/domain/decide.rs` | Domain | `decide`: prediction and context to `Decision`. | 4.5 |
-| `src/domain/speech.rs` | Domain | Announce delay, commit policy, audio chunks, sentence split, audio correlation. | 4.9 |
+| `src/domain/speech.rs` | Domain | Audio type, commit policy, audio chunks, sentence split, audio correlation. | 6.1 |
 | `src/domain/dialog.rs` | Domain | Dialog state, answer fill, cancel, turn limit. | 10.2 |
 | `src/domain/habits.rs` | Domain | Habit model: source, buckets, decay, scores, summary. | 11.1 |
 | `src/domain/feedback.rs` | Domain | Marks, corrections, feedback rules. | 12.3 |
@@ -303,22 +306,24 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/adapters/web.rs` | Driving adapter | Review web server with token auth. It calls `Review`. | 12.8 |
 | `src/adapters/review.html` | Driving adapter | The review page. `web.rs` embeds it with `include_str!`. | 12.9 |
 | `src/adapters/process.rs` | Adapter | `Trainer` that runs `train/train.py` as a local process. | 13.7 |
-| `src/adapters/runpod.rs` | Adapter | `Trainer` with the RunPod REST API and network volume (fallback). | 13.8 |
+| `src/adapters/runpod.rs` | Adapter | `Trainer` with the RunPod REST API and network volume (fallback). | 13.8b |
 | `src/testing/house.json` | Test | The reference house snapshot (section 11). | 2.1 |
 | `src/testing/fakes.rs` | Test | `#[cfg(test)]` only. A fake for each port, `FakeWyomingClient`, `speech(text)`. | 2.9 |
 | `src/testing/e2e.rs` | Test | `#[cfg(test)]` only. Pipeline harness and end-to-end latency tests. | 9.1 |
 
-Jarvis also writes these data files: `habits.json`, `voices.json`, `jarvis.db`, `generated.json`, `training.json`, `pools.json` (use counts and generated responses), `learned.toml` (learned intents) and the model folders in `models/system-one/`. They are not source files, and Git ignores them. Edit `learned.toml` only while Jarvis is stopped.
+Jarvis also writes these data files: `habits.json`, `voices.json`, `jarvis.db`, `generated.json`, `training.json`, `pools.json` (use counts and generated responses), `learned.toml` (learned intents) and the model folders in `models/system-one/`. They are not source files, and Git ignores them. Edit `learned.toml` only while Jarvis is stopped. `jarvis.local.toml` is the configuration of a machine other than the GPU host (section 9). Git ignores it too.
 
 Unit tests are in a `#[cfg(test)] mod tests` block at the end of each source file. The conformance driver for a Quint model is in the test block of the module that it checks. Shared test code is in `src/testing/` only. The fake HA WebSocket server is in the test block of `src/adapters/ha.rs`. `src/testing/house.json` is a data file: tests embed it with `include_str!`, and the `dataset` command reads it from its `--house` path.
 
 ## 9. Configuration Files
 
+`jarvis.toml` is the configuration of the GPU host. Another machine copies it to `jarvis.local.toml`, sets `device = "cpu"` and the CPU model folders, and runs `jarvis serve jarvis.local.toml`. Git ignores `jarvis.local.toml`.
+
 `jarvis.toml`:
 
 ```toml
 listen = "0.0.0.0:10700"
-device = "cuda"    # "cpu" on the test machine and in CI
+device = "cuda"
 intents = "intents.toml"
 responses = "responses.toml"
 pools = "pools.json"
@@ -327,6 +332,8 @@ pools = "pools.json"
 url = "ws://homeassistant.local:8123/api/websocket"
 token_env = "HA_TOKEN"
 request_timeout_ms = 5000
+announce_timeout_s = 60     # announce and ask: HA answers after the audio plays
+ping_interval_s = 30
 
 [model]
 dir = "models/system-one"
@@ -341,6 +348,8 @@ model_dir = "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-202
 # Optional. Without it, the final transcript is the first-pass text (CPU machines).
 second_pass_dir = "models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"
 vad_model = "models/silero_vad.onnx"
+vad_threshold = 0.5
+vad_min_silence_ms = 100
 early_commit_ms = 200
 endpoint_ms = 600
 max_utterance_ms = 8000
@@ -355,6 +364,7 @@ timeout_ms = 8000
 warm_idle_s = 60
 max_output_tokens = 150      # answers
 bulk_max_output_tokens = 8000 # structured output: generate, paraphrase, propose
+max_tool_calls = 5
 embedding_model = "text-embedding-3-small"
 allowed_domains = ["light", "switch", "fan", "media_player", "climate", "calendar", "weather"]
 
@@ -366,7 +376,7 @@ max_pool = 30
 
 [announce]
 margin_ms = 300
-tts_wait_ms = 1000
+idle_wait_s = 30
 
 [dialog]
 max_turns = 3
@@ -393,6 +403,7 @@ check_interval_s = 600
 holdout = 0.1
 failure_backoff_s = 21600
 timeout_min = 60
+max_vram_gb = 1.0
 paraphrases = 50
 unknown_paraphrases = 300
 python = ".venv/bin/python"
@@ -555,18 +566,18 @@ kind = "train"
 examples = ["start training", "retrain yourself", "train your model", "start a new training run"]
 ```
 
-- `examples` are seed examples. `[value](slot)` marks a slot value. Each intent has `min_examples` examples or more.
+- `examples` are seed examples. `[value](slot)` marks a slot value. Each intent has `min_examples` examples or more. The text of each example is normalized (sub-phase 3.1): lowercase, with no punctuation.
 - `unknown_examples` are seed examples for the `unknown` label.
 - `kind = "command"`: Jarvis replies from the pool and calls the service in the background. A command with no `service` only replies. Static intents use this form.
 - `kind = "query"`: Jarvis replies with data from the hot cache. No remote call.
 - `kind = "fetch"`: Jarvis replies with a filler. Then it calls the service with `return_response` and announces the answer.
 - `kind = "prefetch"`: Jarvis replies with the prefetched answer when it is fresh. Else Jarvis treats the request as System Two. Only learned intents use this kind.
 - `kind = "train"`: Jarvis replies from the pool and starts a training run (sub-phase 13.11).
-- `select` is a list of entity filters. A filter has a `domain`, an optional `name` and an optional `device_class`. `name` matches whole words of the entity name or an alias, without case sensitivity (`fan` matches "Office Fan", not "Infant Monitor"). An entity matches when one filter matches.
+- `select` is a list of entity filters. A filter has a `domain`, an optional `name` and an optional `device_class`. `name` matches whole words of the entity name or an alias, without case sensitivity (`fan` matches "Office Fan", not "Infant Monitor"). An entity matches when one filter matches. `select` skips an entity that has an entity category, that is hidden or disabled, or that is on a satellite device (a device with an `assist_satellite` entity).
 - `exclude` is a list of entity IDs that `select` never matches. Use it for a sensor that gives bad values.
 - The area is the area slot. If no slot, it is the satellite area. The area slot matches an area name or alias without case sensitivity.
 - `target = "entities"` uses all matching entities in the area.
-- `target = "entity"` uses `entity`, or the matching entity in the area with the lowest entity ID. Sub-phase 11.6 replaces "lowest entity ID" with "highest habit score".
+- `target = "entity"` uses `entity`, or the matching entity in the area with the lowest entity ID. Sub-phase 11.6 replaces "lowest entity ID" with "highest habit score". `target` is `entity` when it is absent.
 - A command or query whose selection is empty gives `Fallback`: Jarvis replies from the pool `fallback` and makes no call.
 - When the area has no matching entity and the house has exactly one, Jarvis uses that entity. Example: one thermostat for the house.
 - `habit_defaults` maps a slot to a habit action. When the slot is empty, Jarvis uses the most frequent value of that action now.
@@ -623,13 +634,16 @@ responses = ["Who is asking?"]
 [pools.ask_show]
 responses = ["What would you like to watch?"]
 
+[pools.ask_summary]
+responses = ["What should I add?"]
+
 [pools.cancelled]
 responses = ["Okay, never mind."]
 ```
 
-A pool named `ask_<slot>` holds the questions for one missing slot.
+A pool named `ask_<slot>` holds the questions for one missing slot. A pool that is not an intent pool uses no template variable.
 
-Template variables: `area` (area name), slot names, `entity` (state, attributes, name), `response` (fetch result), `person` (name and the fields of its `[[people]]` entry).
+Template variables of an intent pool: `area` (area name), slot names, `entity` (state, attributes, name), `response` (fetch result), `person` (name and the fields of its `[[people]]` entry). `entity` exists only for `target = "entity"`, `response` only for `kind = "fetch"`, and `person` only for `needs_speaker = true`.
 
 Training set file (the contract between Jarvis and `train/train.py`):
 
@@ -660,6 +674,8 @@ Training set file (the contract between Jarvis and `train/train.py`):
 | CI | `ubuntu-latest` | `cpu` | 20M zipformer | `just check`. |
 | RunPod | RunPod serverless | GPU | — | Training fallback. |
 
+The GPU host runs Jarvis as the systemd unit `jarvis`: `jarvis serve jarvis.toml` in a checkout of the release tag. An environment file of the unit holds the secrets and `ORT_DYLIB_PATH`, which points to the `libonnxruntime` in the release folder. The release binary finds the other shared libraries in its own folder (sub-phase 6.2). Port 10700 (Wyoming) has no authentication, so the host firewall accepts it only from the HA host.
+
 VRAM budget on the GPU host (6 GB):
 
 | Use | Budget |
@@ -673,7 +689,7 @@ VRAM budget on the GPU host (6 GB):
 | Reserve (not usable on a 6 GB card) | 0.5 GB |
 | **Total** | **6.0 GB** |
 
-The model budgets assume fp16 weights. The int8 models use less. The usable budget is 5.5 GB, below the 5.8 GB limit of AC-13.10-5. A GPU host test measures the real peak and checks that each model runs on the CUDA execution provider (AC-6.2-2). If a local run fails with "CUDA out of memory", the run moves to RunPod (decision 12). Live STT never stops for training.
+The model budgets assume fp16 weights. The int8 models use less. The usable budget is 5.5 GB, below the 5.8 GB limit of AC-13.10-5. GPU host tests measure the real peak and check that each model runs on the CUDA execution provider (AC-3.12-9, AC-6.2-2, AC-6.6-9, AC-6.7-5, AC-15.3-7). The process trainer limits the PyTorch memory of a local run to `train.max_vram_gb` (`torch.cuda.set_per_process_memory_fraction`), so a run cannot take the memory of the live models. If a local run fails with "CUDA out of memory", the run moves to RunPod (decision 12). Live STT never stops for training.
 
 The GPU host needs the NVIDIA driver, CUDA 12, cuDNN 9, and a Python 3.12 virtual environment in `.venv` with `pip install ./train`.
 
@@ -689,7 +705,7 @@ The test fixtures (`FakeHome`, `FakeHaServer`) model this house. The data comes 
 - Climate: one thermostat, in the Kitchen.
 - TV: one media player in the Living Room with the aliases "the TV" and "plex".
 - Speakers: each satellite area has speaker media players.
-- Office: two temperature sensors with different values (64.0 °F and 76.6 °F). The higher value is probably the satellite sensor, which the device makes warm.
+- Office: two temperature sensors with different values (64.0 °F and 76.6 °F). The higher value is probably the satellite sensor, which the device makes warm. Entity selection skips the entities of a satellite device (section 9).
 
 ---
 
@@ -716,13 +732,13 @@ Each model has state variables, actions and named invariants. `02-rules.md` sect
 | Model | Component | Rust module | Invariants |
 |---|---|---|---|
 | `cache_sync.qnt` | Hot cache sync | `domain/state.rs`, `app/background.rs` | `CacheEqualsHomeWhenIdle`, `NoEventAfterDisconnect` |
-| `announce.qnt` | Filler and announces | `app/conversation.rs` | `AnnounceAfterFiller`, `SentencesInOrder` |
-| `commit.qnt` | Commit policy | `domain/speech.rs` | `CommitOnlyWhenAllowed`, `NoLateCommit` |
+| `announce.qnt` | Announce queue of one satellite | `app/conversation.rs` | `AnnounceWhenIdle`, `NoStaleAnnounce`, `SentencesInOrder` |
+| `commit.qnt` | Commit policy and VAD | `domain/speech.rs` | `CommitOnlyWhenAllowed`, `NoLateCommit`, `NoCommitDuringSpeech` |
 | `backfill.qnt` | Backfill | `app/background.rs` | `OneBackfillPerPool`, `PoolsChangeOnlyOnSuccess` |
-| `dialog.qnt` | Dialogs | `domain/dialog.rs` | `TurnLimit`, `NoCallAfterCancel` |
+| `dialog.qnt` | Dialogs and deferred jobs | `domain/dialog.rs`, `app/conversation.rs` | `TurnLimit`, `NoCallAfterCancel` |
 | `feedback.qnt` | Marks | `domain/feedback.rs` | `DecideAvoidsBlocked` |
 | `training.qnt` | Training | `domain/training.rs`, `app/training.rs` | `OneRun`, `SwapNeverWorse`, `CountResetsAfterRun`, `FailureKeepsModel`, `FallbackOnce` |
 | `learned.qnt` | Learned intents | `domain/learn.rs`, `app/background.rs` | `ServiceNeedsApproval`, `NoReproposal`, `ActivationCountsOnce` |
 | `prefetch.qnt` | Prefetch | `domain/learn.rs`, `app/background.rs` | `NoCallFromPrefetch`, `ServedAnswerIsFresh` |
 | `speaker.qnt` | Speaker identification | `domain/speaker.rs` | `SpeakerIsCandidate`, `NoVoiceOnlyEnrollment` |
-| `jarvis.qnt` | System | All use cases | `OneHandledPerRequest`, `ReplyBeforeCall`, `FillerBeforeAnswer`, `ModelSwapAtomic` |
+| `jarvis.qnt` | System | All use cases | `OneHandledPerRequest`, `ReplyBeforeCall`, `FillerBeforeAnswer`, `ModelSwapAtomic`, `NoTalkOver` |

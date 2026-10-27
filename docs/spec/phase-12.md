@@ -25,7 +25,7 @@ This phase logs each request with its audio, action and response. You mark the a
 **Proofs.**
 
 - P-12.1-1 to P-12.1-3. Ensures: the result is `Some(u)` if and only if `u` is the only element of `{ u | normalize(u.text) = normalize(text) and now - u.time <= window }`. Argument: `correlate` filters by both conditions and matches on the result length: one gives `Some`, any other gives `None`.
-- P-12.1-4, P-12.1-5. Argument: each append and each `correlate` first removes the entries with `now - time > window`, and a match removes its entry.
+- P-12.1-4, P-12.1-5. Ensures: after an append or a `correlate`, no entry is older than the window, and a returned utterance is no longer in the list. Argument: each append and each `correlate` first removes the entries with `now - time > window`, and a match removes its entry.
 - P-12.1-6. Evidence: test.
 
 ---
@@ -72,6 +72,7 @@ This phase logs each request with its audio, action and response. You mark the a
 
 - `Mark { interaction, target: Action | Response(index), value: Good | Bad | None, correction: Option<intent>, time }`. `index` is the position of the response in the interaction (filler, reply, announce or question). A correction is an intent name or `unknown`. `unknown` means "send this to System Two".
 - `Feedback::apply(self, mark) -> Self`. A `None` value removes the earlier mark of that interaction and target.
+- A dialog answer (an interaction with `link`) is not a request of its own. A mark on it counts for the text of the first interaction of the dialog.
 - `blocked(text, intent, targets) -> bool`: bad action marks are more than good action marks for that normalized text, intent and targets. `targets` is the sorted set of entity IDs.
 - `bad_responses() -> Set<(pool, template)>`, from the pool and the template of each marked response (sub-phase 12.4).
 - `corrections(text, n) -> Vec<String>`: the bad actions and corrections for this text, in plain words.
@@ -86,12 +87,14 @@ This phase logs each request with its audio, action and response. You mark the a
 - AC-12.3-5: When the response at index 1 of an interaction is marked bad, `bad_responses` contains the pool and the template of that response, and no other response of the interaction.
 - AC-12.3-6: When a text has one bad action with the correction `tv_show`, `corrections` returns one line that names the intent, the targets and `tv_show`.
 - AC-12.3-7: When `quint-connect` replays 100 traces of `feedback.qnt`, `blocked` equals the model `blocked` after each step.
+- AC-12.3-8: When the action of a dialog answer is marked bad, `blocked` returns true for the text of the first interaction, with the intent and the targets of the answer.
 
 **Proofs.**
 
-- P-12.3-1 to P-12.3-3. Argument: `blocked` is the `blocked` definition of `feedback.qnt`. It compares the two counts for the key `(normalize(text), intent, targets)`. Another text is another key.
-- P-12.3-4 (AC-12.3-4). Argument: each interaction has at most one mark for each target. `apply` first subtracts the old mark from the counts and then adds the new one. A removal adds nothing, so the counts return to their earlier values.
-- P-12.3-5, P-12.3-6. Argument: both functions are filters over the marks.
+- P-12.3-1 to P-12.3-3. Ensures: `blocked(t, i, g)` is true if and only if the bad action marks for the key `(normalize(t), i, g)` are more than the good ones. Argument: `blocked` is the `blocked` definition of `feedback.qnt`. It compares the two counts for the key `(normalize(text), intent, targets)`. Another text is another key.
+- P-12.3-4 (AC-12.3-4). Ensures: `apply` of a `None` mark gives the counts from before the removed mark. Argument: each interaction has at most one mark for each target. `apply` first subtracts the old mark from the counts and then adds the new one. A removal adds nothing, so the counts return to their earlier values.
+- P-12.3-5, P-12.3-6. Ensures: `bad_responses` has exactly the pool and template of each response with a bad mark, and `corrections` has one line for each bad action of the text. Argument: both functions are filters over the marks.
+- P-12.3-8. Ensures: a mark on a dialog answer counts for the key of the text of the first interaction. Argument: `apply` takes the text of the interaction that `link` names when `link` is set.
 - P-12.3-7. Evidence: test.
 
 ---
@@ -105,10 +108,10 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Model.**
 
-- `Interaction` (in `src/domain/feedback.rs`, because the training domain reads it): `id`, `time`, `satellite`, `transcript`, `model_context`, `model` (the run name of the classifier), `top labels` (three labels with probabilities), `slots` (name, value, byte offsets), `decision`, `service calls`, `responses` (text, pool, template), `latency_ms` (from the `voice_end` of the correlated utterance to the end of `handle`; none without audio), `link` (the first interaction of a dialog), `marks`.
+- `Interaction` (in `src/domain/feedback.rs`, because the training domain reads it): `id`, `time`, `satellite`, `transcript`, `model_context`, `model` (the run name of the classifier), `top labels` (three labels with probabilities), `slots` (name, value, byte offsets in the normalized transcript), `decision`, `service calls`, `responses` (text, pool, template), `latency_ms` (from the `voice_end` of the correlated utterance to the end of `handle`; none without audio), `link` (the first interaction of a dialog), `marks`.
 - The audio is a BLOB of 16-bit mono PCM at 16 kHz.
 - `append`, `update(id, change)`, `list(filter, page) -> Vec<Interaction>` (newest first, `review.page_size`), `audio(id) -> Option<Audio>`.
-- The adapter creates the schema when the database file does not exist. It stores the schema version in `PRAGMA user_version`. A database with another version is an error with both versions.
+- The adapter creates the schema when the database file does not exist. It stores the schema version in `PRAGMA user_version`. The version starts at 1. A later sub-phase that changes the schema adds one migration step and increases the version. On start, the adapter runs the steps from the stored version to the current version in one transaction, so marks survive an update. A version newer than the code is an error with both versions.
 - This sub-phase adds `log.database`.
 
 **Acceptance criteria.**
@@ -118,7 +121,7 @@ This phase logs each request with its audio, action and response. You mark the a
 - AC-12.4-3: When `list` gets a page size of 50 with 60 interactions, it returns 50, newest first.
 - AC-12.4-4: When `audio` runs for an interaction with audio, it returns the same samples that `append` stored.
 - AC-12.4-5: When the database file does not exist, the adapter creates it with the schema.
-- AC-12.4-6: When the database has another schema version, the adapter returns an error with both versions.
+- AC-12.4-6: When the database has a schema version newer than the code, the adapter returns an error with both versions.
 
 **Proofs.**
 
@@ -134,19 +137,21 @@ This phase logs each request with its audio, action and response. You mark the a
 - **Implements:** G14, G15. **Depends on:** 12.4.
 - **Files:** modify `src/ports.rs`, `src/adapters/sqlite.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `mark(mark)` (stores the mark with its time), `marked() -> Vec<Interaction>`, `unknowns(since) -> Vec<Unknown { id, text, time }>` (interactions after `since` whose top label is `unknown`, without a bad action mark; `Unknown` is in `src/domain/feedback.rs`), `prune(now)`: delete audio older than `audio_days` and unmarked records older than `record_days`. This sub-phase adds `log.audio_days` and `log.record_days`.
+**Model.** `mark(mark)` (stores the mark with its time), `marked() -> Vec<Interaction>`, `unknowns(since) -> Vec<Unknown { id, text, time }>` (interactions after `since` whose top label is `unknown`, without a bad action mark and without a `link`; `Unknown` is in `src/domain/feedback.rs`), `prune(now)`: delete audio older than `audio_days` and unmarked records older than `record_days`. A dialog answer is not a request, so `unknowns` leaves it out. The marks are migration step 2 of the schema (sub-phase 12.4). This sub-phase adds `log.audio_days` and `log.record_days`.
 
 **Acceptance criteria.**
 
 - AC-12.5-1: When `mark` sets the action mark to `bad` with the correction `tv_show`, `marked` returns the interaction with the correction.
 - AC-12.5-2: When `list` gets the filter `bad`, it returns only interactions with a bad mark.
-- AC-12.5-3: When `unknowns(since)` runs, it returns only interactions after `since` whose top label is `unknown`, without a bad action mark. A System Two interaction whose top label is a known intent with a low probability is not in the result.
+- AC-12.5-3: When `unknowns(since)` runs, it returns only interactions after `since` whose top label is `unknown`, without a bad action mark and without a `link`. A System Two interaction whose top label is a known intent with a low probability is not in the result.
 - AC-12.5-4: When `prune` runs, it deletes audio older than `audio_days` and unmarked records older than `record_days`.
 - AC-12.5-5: When `prune` runs, it keeps every marked record, at any age.
+- AC-12.5-6: When the database has schema version 1 with records, the adapter migrates it to version 2 and keeps every record.
 
 **Proofs.**
 
-- P-12.5-3. Argument: the query has the three conditions in its `WHERE` clause.
+- P-12.5-3. Argument: the query has the four conditions in its `WHERE` clause.
+- P-12.5-6. Evidence: test.
 - P-12.5-4, P-12.5-5. Argument: the record delete has `marks IS NULL AND time < now - record_days`. A marked record fails the first condition.
 - P-12.5-1, P-12.5-2. Evidence: test.
 
@@ -159,7 +164,7 @@ This phase logs each request with its audio, action and response. You mark the a
 - **Implements:** G15. **Depends on:** 12.5.
 - **Files:** modify `src/app/conversation.rs`, `src/app/speech.rs`, `src/app/background.rs`.
 
-**Model.** `handle` makes the interaction ID before dispatch. Before it returns, it sends the append to the log writer task on an unbounded channel. The writer correlates the audio (sub-phase 12.1) and runs appends and updates in the order it receives them. Deferred work gets the ID and sends `update` messages, which thus come after the append. A dialog answer is a new interaction with `link` set to the first interaction. The background use case calls `prune` once a day.
+**Model.** `handle` makes the interaction ID before dispatch. When the context has a `satellite_id`, `handle` correlates the audio once (sub-phase 12.1). A match removes the utterance, so `handle` is the only caller: it sends the utterance with the append, and sub-phase 15.6 uses the same utterance for the speaker. Before it returns, it sends the append to the log writer task on an unbounded channel. The writer runs appends and updates in the order it receives them. Deferred work gets the ID and sends `update` messages, which thus come after the append. A dialog answer is a new interaction with `link` set to the first interaction. The background use case calls `prune` once a day.
 
 **Acceptance criteria.**
 
@@ -213,7 +218,7 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Model.**
 
-- `GET /api/interactions?filter=&page=`, `GET /api/interactions/{id}/audio` (WAV), `GET /api/intents`, `POST /api/interactions/{id}/mark` with `{ "target": "action" | "response", "value": "good" | "bad" | null, "correction": "<intent>" | null }`.
+- `GET /api/interactions?filter=&page=`, `GET /api/interactions/{id}/audio` (WAV), `GET /api/intents`, `POST /api/interactions/{id}/mark` with `{ "target": "action" | "response", "index": <n> | null, "value": "good" | "bad" | null, "correction": "<intent>" | null }`. `index` is the position of the response in the interaction (sub-phase 12.3). It is required for `response`.
 - `GET /` returns the page without a token. The page has no data. Each `/api/` request needs `Authorization: Bearer <token>`.
 - A browser cannot send this header when it opens a page or loads an `<audio>` source. Thus the page asks for the token, keeps it in `sessionStorage`, sends it with each `fetch`, and plays audio from a blob URL that an authenticated `fetch` makes.
 - This sub-phase adds `[review]` (`listen`, `token_env`, `page_size`) and resolves the token in `Secrets`.
@@ -226,11 +231,13 @@ This phase logs each request with its audio, action and response. You mark the a
 - AC-12.8-4: When the interaction has no audio, the audio endpoint returns 404.
 - AC-12.8-5: When `POST /mark` has a correction that is not an intent name, the adapter returns 400.
 - AC-12.8-6: When `GET /` has no token, the adapter returns the page.
+- AC-12.8-7: When `POST /mark` has `"target": "response"` and `"index": 2`, `FakeReview` receives a mark with `Response(2)`. Without `index`, the adapter returns 400.
 
 **Proofs.**
 
 - P-12.8-1, P-12.8-6. Argument: one middleware layer wraps every `/api/` route and compares the token before the handler runs. `GET /` is outside that layer.
 - P-12.8-4, P-12.8-5. Argument: the handlers map `None` to 404 and the `Review::mark` error to 400.
+- P-12.8-7. Argument: the handler maps `("response", Some(n))` to `Response(n)` and `("response", None)` to 400.
 - P-12.8-2, P-12.8-3. Evidence: test.
 
 ---
@@ -263,7 +270,7 @@ This phase logs each request with its audio, action and response. You mark the a
 - **Files:** modify `src/domain/decide.rs`, `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`.
 - **Quint:** `feedback.qnt` (`DecideAvoidsBlocked`).
 
-**Model.** Candidates in order: for the top intent, its target choices. With `target = "entity"`, each matching entity is one choice, in selection order. With `target = "entities"`, the set of all matching entities is the only choice. Then the same for each next intent with probability at least `model.next_threshold`. Softmax probabilities sum to 1, so a next intent cannot also reach `model.threshold`. This sub-phase adds `model.next_threshold`. `decide` returns the first candidate that is not `blocked`. If none remains, it returns `Defer` with `Job::Llm`, and the `Question` contains `corrections(text, 3)`.
+**Model.** Candidates in order: for the top intent, its target choices. With `target = "entity"`, each matching entity is one choice, in selection order. With `target = "entities"`, the set of all matching entities is the only choice. Then the same for each next intent with probability at least `model.next_threshold`. A next intent with a missing slot that is not `optional` is skipped, because Jarvis does not ask about a second guess. Softmax probabilities sum to 1 and `model.threshold > 0.5` (sub-phase 1.1), so a next intent cannot also reach `model.threshold`. This sub-phase adds `model.next_threshold`. `decide` returns the first candidate that is not `blocked`. If none remains, it returns `Defer` with `Job::Llm`, and the `Question` contains `corrections(text, 3)`.
 
 **Acceptance criteria.**
 
@@ -271,11 +278,13 @@ This phase logs each request with its audio, action and response. You mark the a
 - AC-12.10-2: When all entity candidates of the top intent are blocked and the probabilities are 0.7 for the top intent and 0.25 for the next intent, `decide` uses the next intent.
 - AC-12.10-3: When all candidates are blocked, `decide` returns `Defer` with `Job::Llm`, and the `Question` contains the correction.
 - AC-12.10-4: When a `target = "entities"` action with all kitchen lights is blocked, `decide` does not try a single light.
+- AC-12.10-5: When the next intent needs a slot that the prediction does not have, `decide` does not use it.
 
 **Proofs.**
 
-- P-12.10-4. Argument: a `target = "entities"` intent has one choice, the whole set, so no single entity is a candidate.
-- P-12.10-1 to P-12.10-3. Requires: `DecideAvoidsBlocked` (P-12.2-2). Argument: `decide` is `candidates.find(not blocked)`, with `None` mapped to `Defer(Llm)`. This is the `decide` action of the model, with the candidate order of this sub-phase.
+- P-12.10-4. Ensures: a `target = "entities"` intent gives one candidate, the set of all matching entities. Argument: a `target = "entities"` intent has one choice, the whole set, so no single entity is a candidate.
+- P-12.10-1 to P-12.10-3. Requires: `DecideAvoidsBlocked` (P-12.2-2). Ensures: `decide` gives the first candidate that is not blocked, else `Defer` with `Job::Llm` and the corrections. Argument: `decide` is `candidates.find(not blocked)`, with `None` mapped to `Defer(Llm)`. This is the `decide` action of the model, with the candidate order of this sub-phase.
+- P-12.10-5. Ensures: no candidate comes from a next intent with a missing slot that is not `optional`. Argument: the candidate list filters the next intents by their slots before it adds their choices.
 
 ---
 
@@ -291,17 +300,17 @@ This phase logs each request with its audio, action and response. You mark the a
 **Acceptance criteria.**
 
 - AC-12.11-1: When a response is marked bad, `select` never returns it.
-- AC-12.11-2: When all responses in a pool are marked bad, `needs_backfill` returns true.
+- AC-12.11-2: When all responses in a pool whose templates use only `area` are marked bad, `needs_backfill` returns true.
 - AC-12.11-3: When the backfill prompt runs, it contains the good and bad examples of the pool.
 - AC-12.11-4: When Jarvis restarts, the feedback model contains every mark from the log.
 - AC-12.11-5 [GPU host]: With 10,000 interactions and 1,000 marks, all Phase 9.2 latency tests pass.
-- AC-12.11-6: When every response of a pool is bad, `select` returns none and the reply text is empty. When a pool of two has one bad response, `select` returns the other one, also when it is `last`.
+- AC-12.11-6: When every response of a pool is bad, `select` returns none and the reply text is empty. When a pool of two has one bad response, `select` returns the other one, also when it is `last`. AC-4.1-1 now applies to the responses that are not bad.
 
 **Proofs.**
 
-- P-12.11-1, P-12.11-6. Argument: `select` first removes `bad_responses`, then removes `last` only when two or more remain, then takes the minimum. An empty set gives `None`.
-- P-12.11-2. Argument: with all responses bad, the count of fresh responses that are not bad is 0, which is less than `min_fresh >= 1`.
-- P-12.11-4. Argument: startup folds `apply` over `marked()`.
+- P-12.11-1, P-12.11-6. Ensures: `select` never returns a bad response, excludes `last` only when two or more responses are not bad, and returns `None` when every response is bad. Argument: `select` first removes `bad_responses`, then removes `last` only when two or more remain, then takes the minimum. An empty set gives `None`.
+- P-12.11-2. Ensures: a pool with every response bad needs a backfill. Argument: with all responses bad, the count of fresh responses that are not bad is 0, which is less than `min_fresh >= 1`.
+- P-12.11-4. Ensures: the feedback model after startup has every mark of the log. Argument: startup folds `apply` over `marked()`.
 - P-12.11-3, P-12.11-5. Evidence: test.
 
 ---

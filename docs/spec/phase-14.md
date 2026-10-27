@@ -22,7 +22,7 @@ This phase makes System Two teach System One. Jarvis clusters frequent `unknown`
 
 **Proofs.**
 
-- P-14.1-3, P-14.1-4. Argument: `covered` is `any(entry: dist(cluster.centroid, entry.centroid) <= distance)`.
+- P-14.1-3, P-14.1-4. Ensures: `covered` is true if and only if one learned entry has a centroid within `distance` of the cluster centroid. Argument: `covered` is `any(entry: dist(cluster.centroid, entry.centroid) <= distance)`.
 - P-14.1-1, P-14.1-2. Evidence: test (the DBSCAN crate).
 
 ---
@@ -55,8 +55,8 @@ This phase makes System Two teach System One. Jarvis clusters frequent `unknown`
 
 **Proofs.**
 
-- P-14.2-1 to P-14.2-3, P-14.2-5, P-14.2-6. Argument: `validate_proposal` is a conjunction of checks that returns the first failure. The kind checks are one `match` on `kind`.
-- P-14.2-4. Argument: `needs_approval` is `is_some()` on the service.
+- P-14.2-1 to P-14.2-3, P-14.2-5, P-14.2-6. Ensures: `validate_proposal` returns `Ok` if and only if the common checks and the checks of its kind pass, and else the first failure with the field. Argument: `validate_proposal` is a conjunction of checks that returns the first failure. The kind checks are one `match` on `kind`.
+- P-14.2-4. Ensures: `needs_approval(i)` is true if and only if `i` has a `service`. Argument: `needs_approval` is `is_some()` on the service.
 
 ---
 
@@ -100,7 +100,7 @@ This phase makes System Two teach System One. Jarvis clusters frequent `unknown`
 - **Implements:** G14. **Depends on:** 14.3.
 - **Files:** modify `src/ports.rs`, `src/adapters/openai.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `embed(texts) -> Result<Vec<Vec<f32>>>` calls the OpenAI embeddings API with `openai.embedding_model`. `propose(texts, intent names) -> Result<Proposal>` with structured output `{ name, kind, examples, responses, service, target, select, data, question }` and `bulk_max_output_tokens`. `question` is the question that a `prefetch` intent asks System Two. `kind` is `command`, `query`, `fetch`, `prefetch` or `none`. `none` means the requests are not suitable for an intent.
+**Model.** `embed(texts) -> Result<Vec<Vec<f32>>>` calls the OpenAI embeddings API with `openai.embedding_model`. `propose(texts, intent names) -> Result<Proposal>` with structured output `{ name, kind, examples, responses, service, target, select, data, question }` and `bulk_max_output_tokens`. The prompt asks for `learn.responses` responses. This sub-phase adds `learn.responses`. `question` is the question that a `prefetch` intent asks System Two. `kind` is `command`, `query`, `fetch`, `prefetch` or `none`. `none` means the requests are not suitable for an intent.
 
 **Acceptance criteria.**
 
@@ -176,23 +176,23 @@ This phase makes System Two teach System One. Jarvis clusters frequent `unknown`
 - **Implements:** G1, G14, G16. **Depends on:** 14.6.
 - **Files:** modify `src/app/background.rs`, `src/app/speech.rs`, `src/app/training.rs`, `src/domain/habits.rs`.
 
-**Model.** On activation, in this order: save the pool through the pools task, pre-render it, add the intent to the live catalog (an `ArcSwap<Catalog>` of `intents.toml` and the active learned intents), set and save `activated := now` (so `changes` counts it once, sub-phase 13.3), then observe one `jarvis.intent` habit for each cluster interaction time. Each step before `activated` is idempotent. At startup, each `active` entry without `activated` runs activation again. A crash after `activated` loses only the seed habits, which normal use replaces, and never adds a duplicate. `Review::intents` now also returns the active learned intent names. The habit model also records each voice request as entity `jarvis.intent`, action = the intent name, source `voice`.
+**Model.** On activation, in this order: save the pool through the pools task, pre-render it, add the intent to the live catalog (an `ArcSwap<Catalog>` of `intents.toml` and the active learned intents), set and save `activated := now` (so `changes` counts it once, sub-phase 14.11), then observe one `jarvis.intent` habit for each cluster interaction time. Each step before `activated` is idempotent. At startup, each `active` entry without `activated` runs activation again. A crash after `activated` loses only the seed habits, which normal use replaces, and never adds a duplicate. `Review::intents` now also returns the active learned intent names. The habit model also records each voice request as entity `jarvis.intent`, action = the intent name, source `voice`. `jarvis.intent` has no area and is not a device habit, so `summary` and `established` leave it out.
 
 **Acceptance criteria.**
 
 - AC-14.7-1: When an entry becomes `active`, the saved pools have its pool and the audio cache has its responses.
-- AC-14.7-2: When an entry becomes `active`, the change count increases by 1.
-- AC-14.7-3: When an entry becomes `active`, the habit model has one `jarvis.intent` observation for each cluster interaction.
-- AC-14.7-4: When `FakeClassifier` gives `tell_joke` 0.9 after a training run, `handle` replies from the `tell_joke` pool.
-- AC-14.7-5: When a static intent pool has fewer than `min_fresh` unused responses, the Phase 8 backfill adds responses.
-- AC-14.7-6 [GPU host]: In the Phase 9 harness with `FakeClassifier` that gives `tell_joke`, the response latency p95 is 300 ms or less.
-- AC-14.7-7: When Jarvis restarts with an `active` entry without `activated`, the pool exists once and `activated` is set.
-- AC-14.7-8: When an entry becomes `active`, `intents` returns its name.
+- AC-14.7-2: When an entry becomes `active`, the habit model has one `jarvis.intent` observation for each cluster interaction.
+- AC-14.7-3: When `FakeClassifier` gives `tell_joke` 0.9 after a training run, `handle` replies from the `tell_joke` pool.
+- AC-14.7-4: When a static intent pool has fewer than `min_fresh` unused responses, the Phase 8 backfill adds responses.
+- AC-14.7-5 [GPU host]: In the Phase 9 harness with `FakeClassifier` that gives `tell_joke`, the response latency p95 is 300 ms or less.
+- AC-14.7-6: When Jarvis restarts with an `active` entry without `activated`, the pool exists once and `activated` is set.
+- AC-14.7-7: When an entry becomes `active`, `intents` returns its name.
+- AC-14.7-8: When the habit model has `jarvis.intent` keys, `summary` and `established` do not contain them.
 
 **Proofs.**
 
-- P-14.7-2. Requires: `ActivationCountsOnce`. Argument: `activated` is written once at activation, and `changes` counts entries with `activated > last_time` (P-13.3-1).
-- P-14.7-1, P-14.7-3 to P-14.7-8. Evidence: test.
+- P-14.7-8. Ensures: no line of `summary` and no key of `established` has the entity `jarvis.intent`. Argument: both functions filter out that entity before they score.
+- P-14.7-1 to P-14.7-7. Evidence: test.
 
 ---
 
@@ -242,9 +242,9 @@ This phase makes System Two teach System One. Jarvis clusters frequent `unknown`
 
 **Proofs.**
 
-- P-14.9-1. Argument: `s - lead = 07:55:00` is in `(07:54:23, 07:55:23]` only on a weekday, where `(weekday, 8)` is in `usual`. It is not in `(07:55:23, 07:56:23]`.
-- P-14.9-2. Argument: `fresh` is `<=`.
-- P-14.9-3. Argument: `usual_times` filters by `score >= min_score`.
+- P-14.9-1. Ensures: `prefetch_due` is true if and only if a usual bucket start `s` has `last_check < s - lead <= now`. Argument: `s - lead = 07:55:00` is in `(07:54:23, 07:55:23]` only on a weekday, where `(weekday, 8)` is in `usual`. It is not in `(07:55:23, 07:56:23]`.
+- P-14.9-2. Ensures: `fresh(a, now, ttl)` is true if and only if `now - a <= ttl`. Argument: `fresh` is `<=`.
+- P-14.9-3. Ensures: `usual_times` has a bucket if and only if the score of the intent there is `min_score` or more. Argument: `usual_times` filters by `score >= min_score`.
 
 ---
 
@@ -276,3 +276,30 @@ This phase makes System Two teach System One. Jarvis clusters frequent `unknown`
 - P-14.10-5. Requires: `NoCallFromPrefetch`. Argument: the `Call` arm of the prefetch consumer checks the service against `prefetch_services` before it calls `Home`. Any other service returns a discard.
 - P-14.10-8, P-14.10-9. Evidence: test.
 - P-14.10-1, P-14.10-2, P-14.10-6, P-14.10-7. Evidence: test.
+
+---
+
+### 14.11 Learned Intents in Training
+
+**Goal:** Add the active learned intents to the training set, the change count and the generated examples. After the next training run, a learned intent gets System One speed.
+
+- **Implements:** G14, G16. **Depends on:** 14.10.
+- **Files:** modify `src/domain/training.rs`, `src/app/training.rs`, `src/lib.rs`.
+
+**Model.**
+
+- `training_set` (sub-phase 13.1) gets the active learned intents. Their labels, slots and examples join those of the catalog. The precedence rule counts their examples as seeds.
+- `changes` (sub-phase 13.3) adds the number of learned intents activated after `last_time`.
+- `refresh` (sub-phase 13.6) treats an active learned intent like a catalog intent, with its examples as seeds. It removes the entries of intents that are neither in the catalog nor active.
+
+**Acceptance criteria.**
+
+- AC-14.11-1: When an active learned intent exists, the training set labels contain it, the tags contain its slots, and the set has its examples.
+- AC-14.11-2: When an entry becomes `active`, the change count increases by 1.
+- AC-14.11-3: When a learned intent becomes active, `refresh` calls `paraphrase` for it once. When it is no longer active, `refresh` removes its generated examples.
+
+**Proofs.**
+
+- P-14.11-1. Ensures: the labels and the tags of the set are those of `catalog.intents ++ learned.active()`. Argument: `labels` and `tags` run over that list (P-3.2-7, P-3.2-8).
+- P-14.11-2. Requires: `ActivationCountsOnce` (P-14.3-2). Ensures: each activation adds 1 to the count once. Argument: `activated` is written once at activation (sub-phase 14.7), and `changes` counts the entries with `activated > last_time`.
+- P-14.11-3. Argument: `refresh` takes the catalog intents and the active learned intents as one list, so the hash check of sub-phase 13.6 applies to both.
