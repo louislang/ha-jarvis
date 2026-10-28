@@ -15,6 +15,8 @@ Jarvis uses hexagonal architecture (ports and adapters). There are four layers.
 
 A data type that the domain uses is in the domain, and the ports use it from there (for example `Snapshot`, `ServiceCall`, `Audio`, `Question`, `Interaction`). Thus the domain never needs `crate::ports`.
 
+Verus verifies every domain function. The Verus proofs are in the domain files, and the trusted contracts are in `src/domain/contracts.rs` (`02-rules.md` section 5.1).
+
 The composition root (`src/lib.rs`) is the only code that knows all layers. The binary `src/main.rs` only calls `jarvis::main`.
 
 `xtask/` is a separate crate in the same Cargo workspace. It holds the developer tools: the complexity gate, the PR size gate, the module graph, the layer rules and the diagram. Jarvis does not depend on it.
@@ -183,6 +185,7 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `dashmap` | Application | Concurrent audio cache. |
 | `ndarray`, `linfa`, `linfa-clustering` | Domain | DBSCAN clusters of `unknown` embeddings. |
 | `xxhash-rust` | Domain | Stable hash for the held-out split. |
+| `vstd` | Domain | Verus: `#[verus_spec]`, `#[verus_verify]`, `verus!`, spec types and the `vstd` specifications of `std`. A normal build erases the proof code. |
 | `serde`, `serde_json` | All | Data types and messages. |
 | `tokio` | Application, adapters | Async runtime, TCP, timers, channels. |
 | `arc-swap` | Application | Atomic swap of the System One model. |
@@ -217,6 +220,7 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `clap` | `xtask`, root | Command lines of `xtask` and `jarvis`. |
 | Quint CLI (`@informalsystems/quint`, tool) | — | Type check, test, simulate and model check the Quint models. |
 | Apalache (tool, through `quint verify`, needs Java 17) | — | Bounded model checking of the Quint invariants. |
+| Verus (tool, with `cargo-verus` and Z3) | — | Proves the Verus proofs of the domain (`cargo verus verify`). Its release sets the Rust version of `rust-toolchain.toml`. |
 
 Python packages for `train/` (pinned in `train/pyproject.toml`):
 
@@ -237,8 +241,8 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `docs/spec/*.md` | — | This specification. | — |
 | `docs/architecture.md` | — | The full architecture diagram. CI writes it on each commit to `main`. | 0.9 |
 | `.gitignore` | — | Ignore `target/`, `models/`, `.venv/`, `jarvis.local.toml` and the data files. | 0.1 |
-| `rust-toolchain.toml` | — | The fixed Rust version and its components. | 0.1 |
-| `Cargo.toml` | — | Workspace (`jarvis`, `xtask`), crates and lint levels. | 0.1 |
+| `rust-toolchain.toml` | — | The fixed Rust version and its components. The version is the one that the pinned Verus release requires (sub-phase 0.18). | 0.1 |
+| `Cargo.toml` | — | Workspace (`jarvis`, `xtask`), crates, lint levels and the Verus settings. | 0.1 |
 | `Cargo.lock` | — | Locked crate versions. | 0.1 |
 | `clippy.toml` | — | Clippy thresholds. | 0.2 |
 | `justfile` | — | All developer commands. | 0.1 |
@@ -249,7 +253,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `.github/workflows/release.yml` | — | Release binaries and the training image for each `v*` tag. | 0.14 |
 | `xtask/Cargo.toml` | Tools | The `xtask` crate. | 0.1 |
 | `xtask/src/main.rs` | Tools | Command line: `complexity`, `pr-size`, `rules`, `diagram`, `merge`, `guard-push`. | 0.1 |
-| `xtask/src/gates.rs` | Tools | `#[cfg(test)]` only. Gate tests (real tools on fixtures) and structure tests (hook, `justfile`, workflows, PR template, tool versions, the file list of this section). | 0.1 |
+| `xtask/src/gates.rs` | Tools | `#[cfg(test)]` only. Gate tests (real tools on fixtures) and structure tests (hook, `justfile`, workflows, PR template, tool versions, the file list of this section, the Verus attributes and the trusted code of the domain). | 0.1 |
 | `xtask/src/complexity.rs` | Tools | Reads `rust-code-analysis-cli` JSON and applies the limits. | 0.3 |
 | `xtask/src/pr_size.rs` | Tools | Counts the changed lines of a PR without the excluded files. | 0.6 |
 | `xtask/src/graph.rs` | Tools | Builds the module graph from the source with `syn`. | 0.7 |
@@ -278,6 +282,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/lib.rs` | Root | Module tree, `Config`, `SystemClock`, `App` (implements `Assistant` by delegation), `run`, the `dataset` command, `main`. | 0.1 |
 | `src/main.rs` | Root | Binary entry point. `main` only calls `jarvis::main`. | 0.1 |
 | `src/ports.rs` | Ports | All port traits and their data types. | 2.1 |
+| `src/domain/contracts.rs` | Domain | Trusted Verus contracts and axioms for the `std` and domain crate functions that the domain calls. | 0.18 |
 | `src/domain/state.rs` | Domain | Hot cache data and queries. | 2.1 |
 | `src/domain/intent.rs` | Domain | Normalize, example markup, catalog parse and validation, tag list. | 3.1 |
 | `src/domain/training.rs` | Domain | Training set, context samples, held-out split, accuracy, accept rule, change count. | 3.3 |
@@ -722,8 +727,8 @@ G10 requires that each change below touches only the listed files. Sub-phase 0.8
 | Change the System One base model | `jarvis.toml` (`train.base_model`). |
 | Replace the technology of a port (for example, a different LLM provider) | One new adapter file, `Cargo.toml`, `src/lib.rs`, and the port and file tables in this file. |
 | Add a port | `src/ports.rs`, one adapter file, `src/testing/fakes.rs`, the use case that calls it, `src/lib.rs`. |
-| Add a domain rule | One domain file, and the use case that calls it. |
-| Change a stateful rule | The domain file, its Quint model, and its conformance driver. |
+| Add a domain rule | One domain file, and the use case that calls it. `src/domain/contracts.rs` when the rule calls a `std` or crate function that has no `vstd` specification and no contract yet. |
+| Change a stateful rule | The domain file, its Quint model, and its conformance driver. `src/domain/contracts.rs` when the rule calls a `std` or crate function that has no `vstd` specification and no contract yet. |
 
 ## 13. Quint Models
 

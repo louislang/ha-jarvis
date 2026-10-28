@@ -14,8 +14,8 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 1. One sub-phase is one PR with one concern. Work in the order of the phase index. A spec PR (`Spec: <Title>`) changes only `docs/spec/` and `CLAUDE.md`. A fix PR (`Fix: <Title>`) fixes a defect or updates a dependency on `main`. Both have the base `main` (`02-rules.md` section 7.1).
 2. Start each sub-phase in a fresh context: a new session that reads only this file, `00-overview.md`, `01-architecture.md`, `02-rules.md`, that sub-phase's section, and the sections that its proofs, criteria and model cite.
 3. Each phase is one stack of GitHub native stacked PRs (`gh stack`), trunk `main`, one layer per sub-phase. After a change to a lower layer, run `gh stack rebase` and `gh stack push`.
-4. Before any code, write a test for every acceptance criterion: automated test (untagged), `[Bench]` instruction budget, `[GPU host]` `#[ignore]` test, or `[Quint]` model test or invariant. Name each test after its criterion ID (`ac_2_3_1_...`). Run them and make sure they fail.
-5. Write the least code that makes them pass.
+4. Before any code, write a test for every acceptance criterion: automated test (untagged), `[Bench]` instruction budget, `[GPU host]` `#[ignore]` test, or `[Quint]` model test or invariant. Name each test after its criterion ID (`ac_2_3_1_...`). Before the body of each domain function, write its Verus `requires` and `ensures` clauses from the proofs (`02-rules.md` section 5.1). Run the tests and `just verus`, and make sure they fail.
+5. Write the least code and proof code that makes them pass.
 6. The sub-phase is complete only when all of its acceptance tests pass in the required checks. A phase is complete only when all of its sub-phases' acceptance tests pass on `main`.
 7. Every test is deterministic: paused tokio clock and `FakeClock`, fixed seeds, local servers only, temporary folders, deterministic Torch, Quint `--seed=1`. No wall-clock sleeps or timing asserts outside `[GPU host]` tests. Under a paused clock, no timer runs while code waits for a real socket: an adapter with timers talks to its fake server over `tokio::io::duplex` (`02-rules.md` section 6.2). Setup recipes (`models`, `fixture-model`) download model files before the tests. Tests read `models/` and do not download.
 8. Coverage is more than 80% for all code written, enforced by the hook and CI from the first commit.
@@ -41,6 +41,7 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 | `bench` | A benchmark over its instruction budget. |
 | `python` | `ruff format`, `ruff check` (all rules), `mypy --strict`, `vulture`, `interrogate` (100% docstrings) or `pytest` (coverage of 80% or less) fails. |
 | `quint` | A Quint model fails type check, its tests, simulation or model checking. |
+| `verus` | Verus cannot prove a domain function: a `requires` or `ensures` clause, an integer overflow, an index out of bounds or an `expect` that can fail. |
 | `workflow-lint` | `actionlint` finds a problem in a workflow. |
 | `gpu-test` | A `[GPU host]` test fails on the GPU host. |
 | `pr-size` | The PR changes more than 400 counted lines. |
@@ -90,6 +91,7 @@ The training script in `train/` is the only Python code (Python 3.12). Every rul
 Hexagonal (ports and adapters). See `01-architecture.md` section 1.
 
 - `src/domain/`: pure rules. No `crate::ports`, `crate::app`, `crate::adapters`, `tokio`, `std::fs`, `std::net`, `std::process`, `std::thread`, `std::env`, `std::time::SystemTime`, `std::time::Instant`, `std::collections::HashMap`, `std::collections::HashSet`, `jiff::Timestamp::now`, `jiff::Zoned::now`, `jiff::tz::TimeZone::system`, `rand::thread_rng`, `rand::rng`, `rand::random`, `rand::rngs::OsRng`, `rand::rngs::ThreadRng`. Use `BTreeMap` and `BTreeSet`. Time, randomness and the environment come in as parameters. Return typed errors, not `anyhow`.
+- Verus: every function in `src/domain/` has `#[verus_spec]`, or `#[verus_verify]` when it has no clauses. Spec functions, proof functions and lemmas go in one `verus!` block at the end of the file, before the test module. Trusted contracts and axioms go only in `src/domain/contracts.rs`, and state only what the documentation of the function states (`02-rules.md` section 5.1).
 - CPU and GPU work (STT, TTS, `predict`, voice embedding, SQLite) runs in `spawn_blocking`, never on the async workers.
 - `src/ports.rs`: all port traits and their data types. A port gets a method only in the sub-phase that uses it.
 - `src/app/`: use cases. No `crate::adapters`.
@@ -114,7 +116,7 @@ From <https://google.github.io/styleguide/rustguide.html>. Jarvis is application
 ### Organization and Imports
 
 - Name a file or leaf module after its main item (`foo.rs` for `Foo`).
-- No glob imports, except `use super::*` in a test module and `use Enum::*` inside code that is about that enum.
+- No glob imports, except `use super::*` in a test module, `use Enum::*` inside code that is about that enum, and `use vstd::prelude::*`.
 - One module per `use` statement. Do not nest paths inside braces (`use a::{b::C}`). rustfmt cannot enforce this on stable, so check it by hand.
 - Import a trait inside the function body that uses it, unless the whole file uses its methods.
 - Call free functions through their module (`mem::take`, not `take`). Use types and traits unqualified, except ambiguous names such as `io::Error`.

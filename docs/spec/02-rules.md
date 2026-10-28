@@ -37,6 +37,7 @@ This file uses the technical names in `00-overview.md` section 0.3. All sub-phas
 | R21 | Every test is deterministic (section 6). | `rust-test`, `bench`, `python`, `quint` |
 | R22 | Every required check runs in the pre-commit hook and in CI, except where section 7.3 says otherwise. | Structure tests in `xtask/src/gates.rs` |
 | R23 | The Rust toolchain and each tool have a fixed version. `setup` and the CI jobs install the same versions. | `rust-toolchain.toml`, structure tests |
+| R24 | Verus verifies every function in `src/domain/`. Trusted code is only in `src/domain/contracts.rs` (section 5.1). | `verus`, structure test in `xtask/src/gates.rs` |
 
 ### 2.1 Comment and Text Rules
 
@@ -89,7 +90,7 @@ Do not turn off a rule with `# noqa` or `# type: ignore` to pass a check. Change
 
 ## 5. Proof Rules
 
-Each acceptance criterion about Jarvis logic has a plain-English proof. The proofs are written so that they can become Verus specifications later.
+Each acceptance criterion about Jarvis logic has a plain-English proof. A proof about a domain function is also a Verus proof. The sub-phase that writes the function writes its Verus proof in the same PR, and the `verus` check proves it (section 5.1).
 
 Format:
 
@@ -100,13 +101,25 @@ Format:
   Argument: <short reasoning from the model and the code structure>.
 ```
 
-1. `Requires` becomes a Verus `requires` clause. `Ensures` becomes an `ensures` clause. A type invariant or a loop invariant is named in the argument.
+1. `Requires` and `Ensures` are exact enough to become Verus clauses. A type invariant or a loop invariant is named in the argument.
 2. A criterion about a pure function (a domain function, or a pure function of `xtask` or `train.py`) has a proof with `Ensures`. The proof states `Requires` only when the function has a precondition.
 3. A criterion about other code (a use case or an adapter) has a proof when a short argument exists: an order of effects, a guard or one branch. The proof then can state only the argument. Else its line says `Evidence: test.`
 4. An argument uses only the model of the sub-phase, earlier proofs and the invariants of a Quint model. It names each one that it uses.
 5. A criterion that depends on an external system (HA, a tool, a model file, a network, the GPU), on the behavior of a crate or on wall-clock time has no proof. A conformance criterion has no proof. Its line in the proofs part says `Evidence: test.`
 6. A `[Quint]` criterion has the proof `Evidence: model check.` A criterion about an invariant can give an inductive argument instead.
 7. A `[Bench]` criterion has the proof `Evidence: benchmark.`
+
+### 5.1 Verus Proofs
+
+1. A proof with `Ensures` about a domain function is a Verus proof. `Requires` becomes the `requires` clause and `Ensures` becomes the `ensures` clause of the `#[verus_spec]` attribute on that function. The argument becomes the proof code: loop invariants, `proof!` blocks, and the spec functions and lemmas of the file.
+2. Verus verifies every function in `src/domain/`, also a function without a proof. Each function has `#[verus_spec]`, or `#[verus_verify]` when it has no clauses. A `#[verus_verify]` on an `impl` block applies to its methods. Thus Verus also proves that no domain function overflows an integer, indexes out of bounds or fails an `expect`.
+3. The spec functions, proof functions and lemmas of a file are in one `verus!` block at the end of the file, before the test module. They obey the comment rules of section 2.1. A normal build erases them and the `#[verus_spec]` clauses.
+4. Only the proofs about domain functions are Verus proofs. Verus does not verify async code, so use cases and adapters keep their tests and Quint models. The proofs about `xtask` and `train.py` stay plain English.
+5. Trusted code is only in `src/domain/contracts.rs`. It has a contract (`assume_specification`) for each function of `std` or of a domain crate (`01-architecture.md` section 7) that domain code calls and that `vstd` does not specify. It also has the axioms about these types that the proofs need. Float arithmetic, Unicode text functions and `jiff` methods get contracts in the same way.
+6. A contract or an axiom states only what the documentation of its function or type states. Its doc comment links that documentation.
+7. No other file has an `assume_specification`, a call of `assume` or `admit`, or an attribute whose name starts with `external`. A structure test in `xtask/src/gates.rs` checks this rule and rule 2 (sub-phase 0.18).
+8. A sub-phase that writes domain code can also modify `src/domain/contracts.rs`, also when its Files list does not name it.
+9. Verus does not compute float values. A clause about floats states the expression that gives the result, or an order that the code compares (for example `p(top) >= threshold`). The test of the criterion checks a claim about a numeric value (for example `decayed(4.0, last, last + half_life, half_life) = 2.0`).
 
 ## 6. Test Rules
 
@@ -117,7 +130,7 @@ Format:
    - `[Bench]`: a Gungraun benchmark in `benches/domain.rs` with an absolute instruction budget (`Callgrind::hard_limits`). The criterion states the budget. A toolchain update keeps the stated budget.
    - `[GPU host]`: an automated test with `#[ignore]`, run by `just gpu-test` and the `gpu-test` job on the GPU host.
    - `[Quint]`: a `run` test or a named invariant in the model, checked by `just quint`.
-2. Run the new tests and make sure they fail. Then write the code.
+2. Before the body of each domain function, write its `#[verus_spec]` clauses from the proofs (section 5.1). Run the new tests and `just verus`, and make sure they fail. Then write the code and the proof code.
 3. Each acceptance criterion has exactly one test, or one test in each file that the criterion names (AC-0.1-2). The test name starts with its ID: `ac_2_3_1_<words>` in Rust, `test_ac_3_6_1_<words>` in Python, `ac_2_6_4_<words>` for a Quint `run` test. A split part keeps its letter: `ac_0_7b_1_<words>`. A `[Quint]` criterion about an invariant uses the invariant name of `01-architecture.md` section 13.
 4. A sub-phase is complete only when all of its acceptance tests pass in the required checks of section 7.3.
 5. A phase is complete only when the acceptance tests of all of its sub-phases pass on `main`.
@@ -187,6 +200,7 @@ CI runs each check as a separate job. `just merge` requires all of them. `just c
 | `bench` | `just bench` (Gungraun instruction budgets) | Push, PR | Linux only (Valgrind does not run on macOS) |
 | `python` | `just python` | Push, PR | Yes |
 | `quint` | `just quint` | Push, PR | Yes |
+| `verus` | `just verus` (`cargo verus verify -p jarvis`) | Push, PR | Yes |
 | `workflow-lint` | `just workflow-lint` (`actionlint`) | Push, PR | Yes |
 | `gpu-test` | `just gpu-test` on the self-hosted GPU runner | Push, PR | On the GPU host only (`JARVIS_DEVICE=cuda`) |
 | `pr-size` | `xtask pr-size --base origin/<base branch> --limit 400` | PR | No (needs the PR base) |
