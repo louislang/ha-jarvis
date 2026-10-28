@@ -139,21 +139,17 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 
 ### 0.5 PR Template, Stacks and Review
 
-**Goal:** Add the PR template, the stack tooling and the Codex review jobs. Every PR states what it did, confirms each required check, and sits in the phase stack, and each push to a PR gets an AI code review.
+**Goal:** Add the PR template and the stack tooling. Every PR states what it did, confirms each required check, and sits in the phase stack, and each PR gets an AI code review.
 
 - **Implements:** G21. **Depends on:** 0.4.
-- **Files:** create `.github/pull_request_template.md`. Modify `justfile`, `.github/workflows/ci.yml`, `xtask/src/gates.rs`.
+- **Files:** create `.github/pull_request_template.md`. Modify `justfile`, `xtask/src/gates.rs`.
 
 **Model.**
 
 - The template has three sections: `## Summary` (two or three sentences, written after the code), `## Changes` (short bullet points) and `## Checks`.
 - `## Checks` has one box for each required CI job (`02-rules.md` section 7.3), then the boxes "Started in a fresh context", "Codex review threads resolved" and "`[GPU host]` criteria pass in `gpu-test`".
 - `setup` also runs `gh extension install github/gh-stack`.
-- The `justfile` has the variable `codex_version` and the recipe `install-codex` (`npm install --global @openai/codex@<codex_version>`).
-- `ci.yml` has two jobs that run only on `pull_request`, so each push to a PR gets a review:
-  - `codex-review` has only the permission `contents: read`. It checks out the PR head and its base branch with `persist-credentials: false`. Then it runs `openai/codex-action` at a fixed release tag with `openai-api-key: ${{ secrets.OPENAI_API_KEY }}`, `permission-profile: ":workspace"`, the version `codex_version` and an output schema. The prompt asks Codex to review only the changes of the PR, against `CLAUDE.md` and the spec sections that the PR implements. The schema is a list of findings, each with `path`, `line` and `body`. The job output is the final message.
-  - `codex-post` needs `codex-review` and has the permission `pull-requests: write`. With `actions/github-script` at a fixed release tag, it posts one PR review on the head commit. Each finding is one review comment, so each finding is one review thread. A finding on a line outside the diff becomes a file comment. With no finding, the review body says that Codex found no problem.
-- The merge gate (sub-phases 0.15 and 0.16) blocks the merge until both jobs passed on the head commit and every review thread is resolved.
+- The Codex GitHub app reviews each PR. The merge gate (sub-phases 0.15 and 0.16) blocks the merge until its threads are resolved.
 - A later sub-phase that adds a CI job also adds its check box to the template.
 
 **Acceptance criteria.**
@@ -161,14 +157,13 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - AC-0.5-1: When the template is parsed, it has the sections `Summary`, `Changes` and `Checks`, in that order.
 - AC-0.5-2: When the template is compared with `ci.yml`, it has exactly one check box for each required CI job name, plus the three other boxes.
 - AC-0.5-3: When the `justfile` is dumped, `setup` installs `github/gh-stack`.
-- AC-0.5-4: When `ci.yml` is parsed, the jobs `codex-review` and `codex-post` run only on `pull_request`. `codex-review` has only the permission `contents: read` and uses `openai/codex-action` at a fixed release tag, with the secret `OPENAI_API_KEY`, the permission profile `:workspace` and an output schema. `codex-post` needs `codex-review` and has the permission `pull-requests: write`.
 
 **Proofs.**
 
 - P-0.5-2. Argument: the test builds the set of job names from `ci.yml` and the set of box labels from the template, and compares the sets.
-- P-0.5-1, P-0.5-3, P-0.5-4. Evidence: test.
+- P-0.5-1, P-0.5-3. Evidence: test.
 
-**Field log.** Add the repository secret `OPENAI_API_KEY`. Record that the PR of this sub-phase gets a Codex review: one review thread for each finding, or a review that says that Codex found no problem.
+**Field log.** Install the Codex GitHub app on the repository. Record that the PR of this sub-phase has a Codex review. Record the login of the Codex app, and what Codex leaves on a PR when it finds no problem (a review, a comment or a reaction). Sub-phase 0.15 uses the login as `CODEX_LOGIN`.
 
 ---
 
@@ -479,10 +474,10 @@ Each build makes `jarvis-<tag>-<target>.tar.gz` with the binary and its shared l
 - **Implements:** G17, G21, G22. **Depends on:** 0.14.
 - **Files:** create `xtask/src/merge.rs`. Modify `xtask/src/main.rs`.
 
-**Model.** `merge_allowed(pr, required) -> Result<(), Vec<Reason>>`. `pr` has the title, the branch, the base, the changed files, the description, the check results and the review threads. The conditions:
+**Model.** `merge_allowed(pr, required) -> Result<(), Vec<Reason>>`. `pr` has the title, the branch, the base, the changed files, the description, the check results, the review threads, and the logins of the reviews, comments and reactions. The conditions:
 
 - Each required check (the job names in `ci.yml` that run on `pull_request`) has conclusion `success`.
-- Every review thread is resolved. The required checks include `codex-review` and `codex-post`, so the head commit has a Codex review (sub-phase 0.5).
+- A Codex review exists: a review, a comment or a reaction by the login `CODEX_LOGIN`. Every review thread is resolved. `CODEX_LOGIN` is a constant: the login that the field log of sub-phase 0.5 records.
 - Every check box in the description is checked.
 - The base is `main`.
 - The title and the branch follow one kind of PR (`02-rules.md` section 7.1): a sub-phase (`<phase>.<n> <Title>` and `<phase>.<n>-<short-title>`, where `<n>` is a number with an optional letter), a spec PR (`Spec: <Title>` and `spec-<short-title>`) or a fix PR (`Fix: <Title>` and `fix-<short-title>`).
@@ -495,18 +490,19 @@ Each build makes `jarvis-<tag>-<target>.tar.gz` with the binary and its shared l
 - AC-0.15-1: When one required check has conclusion `failure`, `merge_allowed` returns that check as a reason.
 - AC-0.15-2: When a required check is missing, `merge_allowed` returns it as a reason.
 - AC-0.15-3: When one review thread is not resolved, `merge_allowed` returns a reason.
-- AC-0.15-4: When one check box is not checked, `merge_allowed` returns a reason.
-- AC-0.15-5: When the base is not `main`, `merge_allowed` returns a reason.
-- AC-0.15-6: When all conditions hold, `merge_allowed` returns `Ok`.
-- AC-0.15-7: When the title follows no kind of PR, or the branch does not follow the kind of the title, `merge_allowed` returns a reason.
-- AC-0.15-8: When the `Summary` section has one sentence or four sentences, `merge_allowed` returns a reason.
-- AC-0.15-9: When the description has a `Co-Authored-By` line, `merge_allowed` returns a reason.
-- AC-0.15-10: When the title and the branch are `4.5b Title` and `4.5b-title`, `Spec: Title` and `spec-title`, or `Fix: Title` and `fix-title`, `merge_allowed` returns no reason for them.
-- AC-0.15-11: When a spec PR changes a file outside `docs/spec/` and `CLAUDE.md`, `merge_allowed` returns a reason that names the file.
+- AC-0.15-4: When no review, comment or reaction has the login `CODEX_LOGIN`, `merge_allowed` returns a reason. One reaction by `CODEX_LOGIN` is enough.
+- AC-0.15-5: When one check box is not checked, `merge_allowed` returns a reason.
+- AC-0.15-6: When the base is not `main`, `merge_allowed` returns a reason.
+- AC-0.15-7: When all conditions hold, `merge_allowed` returns `Ok`.
+- AC-0.15-8: When the title follows no kind of PR, or the branch does not follow the kind of the title, `merge_allowed` returns a reason.
+- AC-0.15-9: When the `Summary` section has one sentence or four sentences, `merge_allowed` returns a reason.
+- AC-0.15-10: When the description has a `Co-Authored-By` line, `merge_allowed` returns a reason.
+- AC-0.15-11: When the title and the branch are `4.5b Title` and `4.5b-title`, `Spec: Title` and `spec-title`, or `Fix: Title` and `fix-title`, `merge_allowed` returns no reason for them.
+- AC-0.15-12: When a spec PR changes a file outside `docs/spec/` and `CLAUDE.md`, `merge_allowed` returns a reason that names the file.
 
 **Proofs.**
 
-- P-0.15-1 to P-0.15-11. Requires: the PR data and the required set. Ensures: `Ok` if and only if all conditions hold, and otherwise the result lists each failed condition. Argument: `merge_allowed` evaluates each condition, collects a reason for each failure, and returns `Ok` only when the list is empty. The title rule is one match over the three kinds of PR.
+- P-0.15-1 to P-0.15-12. Requires: the PR data and the required set. Ensures: `Ok` if and only if all conditions hold, and otherwise the result lists each failed condition. Argument: `merge_allowed` evaluates each condition, collects a reason for each failure, and returns `Ok` only when the list is empty. The title rule is one match over the three kinds of PR.
 
 ---
 
@@ -519,7 +515,7 @@ Each build makes `jarvis-<tag>-<target>.tar.gz` with the binary and its shared l
 
 **Model.**
 
-- `xtask merge <pr>` reads the PR with `gh pr view --json` (with `headRefOid` and the changed files). It reads all pages of the review threads with `gh api graphql`. Then it calls `merge_allowed`. A failed `gh` call stops the command with code 1 and the error.
+- `xtask merge <pr>` reads the PR with `gh pr view --json` (with `headRefOid` and the changed files). It reads all pages of the review threads, reviews, comments and reactions with `gh api graphql`. Then it calls `merge_allowed`. A failed `gh` call stops the command with code 1 and the error.
 - When `merge_allowed` returns `Ok`, the command runs `gh pr merge <pr> --squash --match-head-commit <headRefOid> --subject <title> --body <summary>`. GitHub refuses the merge when the head changed after the read. Else the command prints each reason and exits with code 1.
 - The recipe `merge` runs `cargo run -p xtask -- merge <pr>`.
 - Tests put a fake `gh` script first in `PATH`. It prints fixture JSON and records its arguments.
