@@ -1,0 +1,407 @@
+//! Gate tests (real tools on fixtures) and structure tests (the files that configure the checks).
+
+use std::collections::BTreeSet;
+use std::env;
+use std::ffi::OsString;
+use std::fs;
+use std::path::Path;
+use std::process::{Command, Output};
+
+use tempfile::TempDir;
+
+/// The environment variables that a nested tool gets. The coverage settings of an outer `cargo llvm-cov` would change its result.
+const KEPT_VARIABLES: [&str; 5] = [
+    "PATH",
+    "HOME",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+];
+
+/// A fixture crate with 10 lines, of which its test covers 5.
+const HALF_COVERED: &str = "pub fn covered(value: u32) -> u32 {
+    let next = value + 1;
+    next
+}
+
+pub fn uncovered(value: u32) -> u32 {
+    let doubled = value * 2;
+    let tripled = value * 3;
+    doubled + tripled
+}
+
+#[test]
+fn covers() { assert_eq!(covered(1), 2); }
+";
+
+/// A test that covers the lines of [`HALF_COVERED`] that its own test does not cover.
+const REST_COVERED: &str = "
+#[test]
+fn covers_rest() { assert_eq!(uncovered(1), 5); }
+";
+
+/// The paths that Git must ignore: build output, models, the virtual environment, the local configuration and the data files.
+const IGNORED: [&str; 11] = [
+    "target/",
+    "models/",
+    ".venv/",
+    "jarvis.local.toml",
+    "habits.json",
+    "voices.json",
+    "jarvis.db",
+    "generated.json",
+    "training.json",
+    "pools.json",
+    "learned.toml",
+];
+
+/// The repository root.
+fn root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask is a folder of the repository root")
+}
+
+/// Runs `command` with only the kept environment variables.
+fn run(command: &mut Command) -> Output {
+    let kept: Vec<(OsString, OsString)> = env::vars_os()
+        .filter(|(name, _)| {
+            name.to_str()
+                .is_some_and(|name| KEPT_VARIABLES.contains(&name))
+        })
+        .collect();
+    command
+        .env_clear()
+        .envs(kept)
+        .output()
+        .expect("the command starts")
+}
+
+/// Runs `program` with `arguments` in the repository root and returns its standard output.
+fn stdout_in_root(program: &str, arguments: &[&str]) -> String {
+    let output = run(Command::new(program).args(arguments).current_dir(root()));
+    assert!(
+        output.status.success(),
+        "{program} {arguments:?} fails: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("the output is UTF-8")
+}
+
+/// Reads a file of the repository.
+fn read(path: &str) -> String {
+    fs::read_to_string(root().join(path)).expect("the file exists")
+}
+
+/// Parses a YAML file of the repository.
+fn yaml(path: &str) -> serde_yaml::Value {
+    serde_yaml::from_str(&read(path)).expect("the file is YAML")
+}
+
+/// Writes a temporary crate with `source` as `src/lib.rs` and the workspace lint settings.
+fn fixture_crate(source: &str) -> TempDir {
+    let workspace: toml::Table = read("Cargo.toml").parse().expect("Cargo.toml is TOML");
+    let mut lints = toml::Table::new();
+    if let Some(workspace_lints) = workspace
+        .get("workspace")
+        .and_then(|table| table.get("lints"))
+    {
+        lints.insert("lints".to_owned(), workspace_lints.clone());
+    }
+    let folder = TempDir::new().expect("a temporary folder");
+    let manifest = format!(
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n{lints}"
+    );
+    fs::write(folder.path().join("Cargo.toml"), manifest).expect("the manifest is written");
+    fs::create_dir(folder.path().join("src")).expect("the source folder is made");
+    fs::write(folder.path().join("src/lib.rs"), source).expect("the source is written");
+    folder
+}
+
+/// Runs the coverage gate on a fixture crate with `source`.
+fn coverage_gate(source: &str) -> Output {
+    let fixture = fixture_crate(source);
+    run(Command::new("cargo")
+        .args(["llvm-cov", "--fail-under-lines", "80.01"])
+        .current_dir(fixture.path()))
+}
+
+/// The `justfile` as JSON.
+fn justfile() -> serde_json::Value {
+    let dump = stdout_in_root("just", &["--dump", "--dump-format", "json"]);
+    serde_json::from_str(&dump).expect("the dump is JSON")
+}
+
+/// The names of the recipes that `recipe` depends on.
+fn dependencies(justfile: &serde_json::Value, recipe: &str) -> Vec<String> {
+    let dependencies = justfile["recipes"][recipe]["dependencies"]
+        .as_array()
+        .expect("the recipe exists");
+    dependencies
+        .iter()
+        .map(|dependency| {
+            dependency["recipe"]
+                .as_str()
+                .expect("a recipe name")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The steps of all jobs of a workflow.
+fn steps(workflow: &serde_yaml::Value) -> Vec<&serde_yaml::Value> {
+    let jobs = workflow["jobs"]
+        .as_mapping()
+        .expect("the workflow has jobs");
+    jobs.values()
+        .flat_map(|job| job["steps"].as_sequence().expect("the job has steps"))
+        .collect()
+}
+
+/// The `run` commands of the steps of `job`.
+fn runs<'workflow>(workflow: &'workflow serde_yaml::Value, job: &str) -> Vec<&'workflow str> {
+    let steps = workflow["jobs"][job]["steps"]
+        .as_sequence()
+        .expect("the job exists");
+    steps
+        .iter()
+        .filter_map(|step| step["run"].as_str())
+        .collect()
+}
+
+/// Checks that a CI step installs a tool only with its `install-` recipe or with the version of its variable.
+fn assert_installs_pinned(
+    step: &serde_yaml::Value,
+    justfile: &serde_json::Value,
+    installed: &BTreeSet<String>,
+) {
+    if let Some(command) = step["run"]
+        .as_str()
+        .filter(|command| command.contains("install"))
+    {
+        let recipe = command.strip_prefix("just install-").unwrap_or(command);
+        assert!(
+            installed.contains(recipe),
+            "the step runs an install- recipe: {command}"
+        );
+    }
+    let action = step["uses"]
+        .as_str()
+        .and_then(|uses| uses.split_once('/'))
+        .and_then(|(_, action)| action.strip_prefix("setup-"));
+    if let Some((tool, _)) = action.and_then(|action| action.split_once('@')) {
+        let variable = format!("{}_version", tool.replace('-', "_"));
+        let version = justfile["assignments"][&variable]["value"]
+            .as_str()
+            .expect("the tool has a version variable");
+        assert_eq!(
+            step["with"][format!("{tool}-version").as_str()].as_str(),
+            Some(version),
+            "the {tool} step uses the version of {variable}"
+        );
+    }
+}
+
+/// The paths of the file table of `01-architecture.md` section 8.
+fn file_table() -> Vec<String> {
+    let architecture = read("docs/spec/01-architecture.md");
+    let (_, section) = architecture
+        .split_once("## 8. Files")
+        .expect("section 8 exists");
+    let (section, _) = section.split_once("\n## ").expect("section 9 follows");
+    section
+        .lines()
+        .filter_map(|line| line.strip_prefix("| `"))
+        .filter_map(|line| line.split_once('`'))
+        .map(|(path, _)| path.to_owned())
+        .collect()
+}
+
+/// Whether `path` matches a row of the file table. A `*` in a row matches any text.
+fn in_table(table: &[String], path: &str) -> bool {
+    table.iter().any(|row| match row.split_once('*') {
+        Some((prefix, suffix)) => path.starts_with(prefix) && path.ends_with(suffix),
+        None => row == path,
+    })
+}
+
+/// The workspace builds.
+#[test]
+fn ac_0_1_1_workspace_builds() {
+    let target = TempDir::new().expect("a temporary folder");
+    let output = run(Command::new("cargo")
+        .args(["build", "--workspace", "--target-dir"])
+        .arg(target.path())
+        .current_dir(root()));
+    assert!(
+        output.status.success(),
+        "cargo build --workspace fails: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The coverage gate fails 50% line coverage and passes 100%.
+#[test]
+fn ac_0_1_3_coverage_gate() {
+    let half = coverage_gate(HALF_COVERED);
+    let report = String::from_utf8_lossy(&half.stdout);
+    let total: Vec<&str> = report
+        .lines()
+        .find(|line| line.starts_with("TOTAL"))
+        .expect("the report has a total")
+        .split_whitespace()
+        .collect();
+    assert!(
+        total.windows(3).any(|lines| lines == ["10", "5", "50.00%"]),
+        "the fixture has 10 lines with 5 missed, the total is {total:?}"
+    );
+    assert!(!half.status.success(), "the gate passes 50% line coverage");
+    let full = coverage_gate(&format!("{HALF_COVERED}{REST_COVERED}"));
+    assert!(
+        full.status.success(),
+        "the gate fails 100% line coverage: {}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+}
+
+/// `check` runs the workflow lint and the coverage gate with its limit.
+#[test]
+fn ac_0_1_4_check_runs_coverage_gate() {
+    let justfile = justfile();
+    let check = dependencies(&justfile, "check");
+    assert!(
+        check.contains(&"workflow-lint".to_owned()) && check.contains(&"cov".to_owned()),
+        "check runs workflow-lint and cov, it runs {check:?}"
+    );
+    let cov = justfile["recipes"]["cov"]["body"].to_string();
+    assert!(
+        cov.contains("--fail-under-lines 80.01"),
+        "cov has the 80.01 limit: {cov}"
+    );
+}
+
+/// The pre-commit hook runs `just check` on each commit.
+#[test]
+fn ac_0_1_5_hook_runs_check() {
+    let config = yaml(".pre-commit-config.yaml");
+    let repos = config["repos"].as_sequence().expect("the config has repos");
+    let hooks: Vec<&serde_yaml::Value> = repos
+        .iter()
+        .flat_map(|repo| repo["hooks"].as_sequence().expect("the repo has hooks"))
+        .collect();
+    let [hook] = hooks.as_slice() else {
+        panic!("the config has one hook, it has {}", hooks.len());
+    };
+    let expected: serde_yaml::Value = serde_yaml::from_str(
+        "{entry: just check, stages: [pre-commit], always_run: true, pass_filenames: false}",
+    )
+    .expect("the expected hook is YAML");
+    let expected = expected
+        .as_mapping()
+        .expect("the expected hook is a mapping");
+    for (key, value) in expected {
+        assert_eq!(&hook[key], value, "hook field {key:?}");
+    }
+}
+
+/// CI has the triggers and runs the checks of this sub-phase.
+#[test]
+fn ac_0_1_6_ci_runs_checks() {
+    let ci = yaml(".github/workflows/ci.yml");
+    for trigger in ["push", "pull_request", "workflow_call"] {
+        assert!(
+            ci["on"].get(trigger).is_some(),
+            "ci.yml has the trigger {trigger}"
+        );
+    }
+    assert!(
+        runs(&ci, "rust-test").contains(&"just cov"),
+        "rust-test runs just cov"
+    );
+    assert!(
+        runs(&ci, "workflow-lint").contains(&"just workflow-lint"),
+        "workflow-lint runs just workflow-lint"
+    );
+}
+
+/// Git ignores build output, models and data files.
+#[test]
+fn ac_0_1_7_git_ignores_generated_files() {
+    let mut arguments = vec!["-c", "core.excludesFile=/dev/null", "check-ignore"];
+    arguments.extend(IGNORED);
+    let ignored = stdout_in_root("git", &arguments);
+    let lines: Vec<&str> = ignored.lines().collect();
+    assert_eq!(lines, IGNORED);
+}
+
+/// The toolchain is one fixed version with the required components.
+#[test]
+fn ac_0_1_8_toolchain_is_fixed() {
+    let toolchain: toml::Table = read("rust-toolchain.toml")
+        .parse()
+        .expect("the file is TOML");
+    let channel = toolchain["toolchain"]["channel"]
+        .as_str()
+        .expect("a channel");
+    let parts: Result<Vec<u32>, _> = channel.split('.').map(str::parse).collect();
+    assert!(
+        matches!(parts.as_deref(), Ok([_, _, _])),
+        "the channel is a version x.y.z: {channel}"
+    );
+    let components: BTreeSet<&str> = toolchain["toolchain"]["components"]
+        .as_array()
+        .expect("components")
+        .iter()
+        .map(|component| component.as_str().expect("a component name"))
+        .collect();
+    assert_eq!(
+        components,
+        BTreeSet::from(["clippy", "rustfmt", "llvm-tools-preview"])
+    );
+}
+
+/// Each tool has a fixed version that `setup` and CI install.
+#[test]
+fn ac_0_1_9_tools_have_fixed_versions() {
+    let justfile = justfile();
+    let variables = justfile["assignments"].as_object().expect("assignments");
+    let versioned: BTreeSet<String> = variables
+        .keys()
+        .filter_map(|name| name.strip_suffix("_version"))
+        .map(|tool| tool.replace('_', "-"))
+        .collect();
+    let recipes = justfile["recipes"].as_object().expect("recipes");
+    let installed: BTreeSet<String> = recipes
+        .keys()
+        .filter_map(|name| name.strip_prefix("install-"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        versioned, installed,
+        "each tool has a version variable and an install- recipe"
+    );
+    let setup: BTreeSet<String> = dependencies(&justfile, "setup")
+        .into_iter()
+        .filter_map(|name| name.strip_prefix("install-").map(str::to_owned))
+        .collect();
+    assert_eq!(setup, installed, "setup runs every install- recipe");
+    let ci = yaml(".github/workflows/ci.yml");
+    for step in steps(&ci) {
+        assert_installs_pinned(step, &justfile, &installed);
+    }
+}
+
+/// Each tracked file is in the file table.
+#[test]
+fn ac_0_1_10_tracked_files_are_in_table() {
+    let table = file_table();
+    let tracked = stdout_in_root("git", &["ls-files"]);
+    let unlisted: Vec<&str> = tracked
+        .lines()
+        .filter(|path| !in_table(&table, path))
+        .collect();
+    assert!(
+        unlisted.is_empty(),
+        "files not in 01-architecture.md section 8: {unlisted:?}"
+    );
+}

@@ -1,0 +1,11 @@
+/target/
+/models/
+/.venv/
+/jarvis.local.toml
+/habits.json
+/voices.json
+/jarvis.db
+/generated.json
+/training.json
+/pools.json
+/learned.toml
