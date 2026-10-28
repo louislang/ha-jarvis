@@ -3,6 +3,7 @@ just_version := "1.59.0"
 cargo_llvm_cov_version := "0.9.1"
 actionlint_version := "1.7.12"
 pre_commit_version := "4.7.0"
+rust_code_analysis_cli_version := "0.0.25"
 
 # Run the tests.
 test:
@@ -20,15 +21,19 @@ format:
 lint:
     cargo clippy --workspace --all-targets -- -D clippy::pedantic -D warnings
 
+# Check the complexity limits of each function.
+complexity:
+    cargo run -p xtask -- complexity src xtask
+
 # Lint the workflows.
 workflow-lint:
     actionlint
 
 # Run the checks of the pre-commit hook.
-check: workflow-lint format lint cov
+check: workflow-lint format lint complexity cov
 
 # Install the tools and the pre-commit hook.
-setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit
+setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli
     pre-commit install --hook-type pre-commit
 
 install-just:
@@ -42,3 +47,6 @@ install-actionlint:
 
 install-pre-commit:
     pipx install --force pre-commit=={{ pre_commit_version }}
+
+install-rust-code-analysis-cli:
+    cargo install rust-code-analysis-cli --version {{ rust_code_analysis_cli_version }} --locked
