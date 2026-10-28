@@ -386,6 +386,46 @@ fn fixture_file(name: &str, source: &str) -> TempDir {
     folder
 }
 
+/// Checks that `check` runs `recipe` after `before`, and that the CI job `recipe` runs `just <recipe>`.
+fn assert_check_and_ci_run_after(before: &str, recipe: &str) {
+    let check = dependencies(&justfile(), "check");
+    let position = |name: &str| check.iter().position(|dependency| dependency == name);
+    assert!(
+        matches!((position(before), position(recipe)), (Some(first), Some(second)) if first < second),
+        "check runs {recipe} after {before}, it runs {check:?}"
+    );
+    let command = format!("just {recipe}");
+    assert!(
+        runs(&yaml(".github/workflows/ci.yml"), recipe).contains(&command.as_str()),
+        "{recipe} runs {command}"
+    );
+}
+
+/// A fixture file with a function of 40 lines, of which no two are the same.
+fn distinct_function() -> String {
+    let lines: Vec<String> = (1..=37)
+        .map(|line| format!("    let total = total * {line} + 1;\n"))
+        .collect();
+    format!(
+        "fn distinct(total: u32) -> u32 {{\n{}    total\n}}\n",
+        lines.concat()
+    )
+}
+
+/// Runs `jscpd` with the limits of the `duplication` recipe on `folder`.
+fn duplication_gate(folder: &Path) -> Output {
+    run(Command::new("jscpd")
+        .args([
+            "--threshold",
+            "3",
+            "--min-tokens",
+            "50",
+            "--format",
+            "rust,python",
+        ])
+        .arg(folder))
+}
+
 /// The workspace builds.
 #[test]
 fn ac_0_1_1_workspace_builds() {
@@ -682,15 +722,31 @@ fn ac_0_3_9_metrics_for_let_chains() {
 /// `check` runs the complexity gate after the lint gate, and CI runs it.
 #[test]
 fn ac_0_3_10_check_and_ci_run_complexity_gate() {
-    let check = dependencies(&justfile(), "check");
-    let position = |recipe: &str| check.iter().position(|name| name == recipe);
+    assert_check_and_ci_run_after("lint", "complexity");
+}
+
+/// `jscpd` fails two copies of a 40-line function and names both files.
+#[test]
+fn ac_0_4_1_duplication_fails_two_copies() {
+    let fixture = fixture_file("first.rs", &distinct_function());
+    fs::write(fixture.path().join("second.rs"), distinct_function()).expect("the copy is written");
+    let output = duplication_gate(fixture.path());
+    let report = String::from_utf8_lossy(&output.stdout);
     assert!(
-        matches!((position("lint"), position("complexity")), (Some(lint), Some(complexity)) if lint < complexity),
-        "check runs complexity after lint, it runs {check:?}"
+        !output.status.success() && report.contains("first.rs") && report.contains("second.rs"),
+        "jscpd fails and names both files, its output is: {report}"
     );
-    let ci = yaml(".github/workflows/ci.yml");
-    assert!(
-        runs(&ci, "complexity").contains(&"just complexity"),
-        "complexity runs just complexity"
-    );
+}
+
+/// `jscpd` passes one copy of the function.
+#[test]
+fn ac_0_4_2_duplication_passes_one_copy() {
+    let fixture = fixture_file("first.rs", &distinct_function());
+    assert_passes(&duplication_gate(fixture.path()));
+}
+
+/// `check` runs the duplication gate after the complexity gate, and CI runs it.
+#[test]
+fn ac_0_4_3_check_and_ci_run_duplication_gate() {
+    assert_check_and_ci_run_after("complexity", "duplication");
 }

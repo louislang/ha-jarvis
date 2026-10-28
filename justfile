@@ -4,6 +4,7 @@ cargo_llvm_cov_version := "0.9.1"
 actionlint_version := "1.7.12"
 pre_commit_version := "4.7.0"
 rust_code_analysis_cli_version := "0.0.25"
+jscpd_version := "5.4.2"
 
 # Run the tests.
 test:
@@ -25,15 +26,19 @@ lint:
 complexity:
     cargo run -p xtask -- complexity src xtask
 
+# Check the duplication limit.
+duplication:
+    jscpd --threshold 3 --min-tokens 50 --format rust,python --ignore "**/target/**" src xtask
+
 # Lint the workflows.
 workflow-lint:
     actionlint
 
 # Run the checks of the pre-commit hook.
-check: workflow-lint format lint complexity cov
+check: workflow-lint format lint complexity duplication cov
 
 # Install the tools and the pre-commit hook.
-setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli
+setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd
     pre-commit install --hook-type pre-commit
 
 install-just:
@@ -50,3 +55,6 @@ install-pre-commit:
 
 install-rust-code-analysis-cli:
     cargo install rust-code-analysis-cli --version {{ rust_code_analysis_cli_version }} --locked
+
+install-jscpd:
+    npm install --global jscpd@{{ jscpd_version }}
