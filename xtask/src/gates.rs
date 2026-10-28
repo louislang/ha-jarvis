@@ -156,6 +156,13 @@ const IGNORED: [&str; 11] = [
     "learned.toml",
 ];
 
+/// The check boxes of the PR template that are not CI jobs.
+const OTHER_BOXES: [&str; 3] = [
+    "Started in a fresh context",
+    "Codex review threads resolved",
+    "`[GPU host]` criteria pass in `gpu-test`",
+];
+
 /// The repository root.
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -749,4 +756,49 @@ fn ac_0_4_2_duplication_passes_one_copy() {
 #[test]
 fn ac_0_4_3_check_and_ci_run_duplication_gate() {
     assert_check_and_ci_run_after("complexity", "duplication");
+}
+
+/// The PR template has the sections `Summary`, `Changes` and `Checks`, in that order.
+#[test]
+fn ac_0_5_1_template_has_sections() {
+    let template = read(".github/pull_request_template.md");
+    let headings: Vec<&str> = template
+        .lines()
+        .filter_map(|line| line.strip_prefix("## "))
+        .collect();
+    assert_eq!(headings, ["Summary", "Changes", "Checks"]);
+}
+
+/// The PR template has one check box for each CI job and the three other boxes.
+#[test]
+fn ac_0_5_2_template_has_box_for_each_job() {
+    let template = read(".github/pull_request_template.md");
+    let boxes: Vec<&str> = template
+        .lines()
+        .filter_map(|line| line.strip_prefix("- [ ] "))
+        .collect();
+    let labels: BTreeSet<String> = boxes.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        boxes.len(),
+        labels.len(),
+        "each box is in the template once: {boxes:?}"
+    );
+    let ci = yaml(".github/workflows/ci.yml");
+    let jobs = ci["jobs"].as_mapping().expect("the workflow has jobs");
+    let mut expected: BTreeSet<String> = jobs
+        .keys()
+        .map(|job| format!("`{}`", job.as_str().expect("a job name")))
+        .collect();
+    expected.extend(OTHER_BOXES.map(str::to_owned));
+    assert_eq!(labels, expected);
+}
+
+/// `setup` installs the `gh-stack` extension.
+#[test]
+fn ac_0_5_3_setup_installs_gh_stack() {
+    let setup = justfile()["recipes"]["setup"]["body"].to_string();
+    assert!(
+        setup.contains("gh extension install github/gh-stack"),
+        "setup installs github/gh-stack: {setup}"
+    );
 }
