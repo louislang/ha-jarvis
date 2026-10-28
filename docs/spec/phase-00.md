@@ -54,12 +54,13 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 **Goal:** Turn on the format and lint gates, including doc comments on every item, in the hook and in CI. Code that breaks a Rust rule fails before it can merge.
 
 - **Implements:** G10, G22. **Depends on:** 0.1.
-- **Files:** create `clippy.toml`. Modify `Cargo.toml`, `justfile`, `.github/workflows/ci.yml`, `xtask/src/gates.rs`.
+- **Files:** create `clippy.toml`. Modify `Cargo.toml`, `xtask/Cargo.toml`, `justfile`, `.github/workflows/ci.yml`, `xtask/src/gates.rs`.
 
 **Model.**
 
 - `[workspace.lints.rust]`: `warnings = "deny"`, `dead_code = "deny"`, `missing_docs = "deny"`, `unsafe_code = "forbid"`.
 - `[workspace.lints.clippy]`: `pedantic = "deny"`, `unwrap_used = "deny"`, `string_add = "deny"`, `missing_docs_in_private_items = "deny"`, `undocumented_unsafe_blocks = "deny"`.
+- `jarvis` and `xtask` have `[lints] workspace = true`. Thus the lint levels apply to both crates.
 - `clippy.toml`: `too-many-lines-threshold = 50`, `allow-unwrap-in-tests = true`.
 - `format` runs `cargo fmt --all --check`. `lint` runs `cargo clippy --workspace --all-targets -- -D clippy::pedantic -D warnings`. `check` runs `workflow-lint`, `format`, `lint`, then `cov`. CI jobs `rust-format` and `rust-lint`.
 
