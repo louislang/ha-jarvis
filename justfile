@@ -12,12 +12,20 @@ test:
 cov:
     cargo llvm-cov --workspace --release --fail-under-lines 80.01
 
+# Check the format of the Rust code.
+format:
+    cargo fmt --all --check
+
+# Lint the Rust code.
+lint:
+    cargo clippy --workspace --all-targets -- -D clippy::pedantic -D warnings
+
 # Lint the workflows.
 workflow-lint:
     actionlint
 
 # Run the checks of the pre-commit hook.
-check: workflow-lint cov
+check: workflow-lint format lint cov
 
 # Install the tools and the pre-commit hook.
 setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit
