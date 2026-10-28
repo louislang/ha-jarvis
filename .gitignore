@@ -1,4 +1,5 @@
 /target/
+/_apalache-out/
 /models/
 /.venv/
 /jarvis.local.toml

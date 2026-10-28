@@ -5,6 +5,8 @@ actionlint_version := "1.7.12"
 pre_commit_version := "4.7.0"
 rust_code_analysis_cli_version := "0.0.25"
 jscpd_version := "5.4.2"
+quint_version := "0.33.0"
+quint_evaluator_version := "v0.7.0"
 
 # Run the tests.
 test:
@@ -34,6 +36,18 @@ duplication:
 architecture:
     cargo run -p xtask -- rules
 
+# Check each Quint model.
+quint:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    shopt -s nullglob
+    for model in quint/*.qnt; do
+        quint typecheck "$model"
+        quint test --seed=1 --match='^ac_' "$model"
+        quint run --seed=1 --invariant=allInvariants --max-samples=10000 --max-steps=30 "$model"
+        quint verify --invariant=allInvariants --max-steps=10 "$model"
+    done
+
 # Write the architecture diagram.
 diagram:
     cargo run -p xtask -- diagram docs/architecture.md
@@ -43,10 +57,10 @@ workflow-lint:
     actionlint
 
 # Run the checks of the pre-commit hook.
-check: workflow-lint format lint complexity duplication architecture cov
+check: workflow-lint format lint complexity duplication architecture quint cov
 
 # Install the tools and the pre-commit hook.
-setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd
+setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint install-quint-evaluator
     pre-commit install --hook-type pre-commit
     gh extension install github/gh-stack
 
@@ -67,3 +81,11 @@ install-rust-code-analysis-cli:
 
 install-jscpd:
     npm install --global jscpd@{{ jscpd_version }}
+
+install-quint:
+    npm install --global @informalsystems/quint@{{ quint_version }}
+
+# Quint fetches the evaluator through the GitHub API, whose rate limit fails a runner without a token.
+install-quint-evaluator:
+    mkdir -p ~/.quint/rust-evaluator-{{ quint_evaluator_version }}
+    curl -sSfL https://github.com/quint-co/quint/releases/download/evaluator/{{ quint_evaluator_version }}/quint_evaluator-$(rustc -vV | sed -n 's/host: //p').tar.gz | tar -xz -C ~/.quint/rust-evaluator-{{ quint_evaluator_version }}

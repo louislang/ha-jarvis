@@ -6,6 +6,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::Mutex;
 
 use tempfile::TempDir;
 
@@ -156,6 +157,9 @@ const IGNORED: [&str; 11] = [
     "learned.toml",
 ];
 
+/// Holds the gate tests that run `quint verify` one at a time: each starts an Apalache server on the same port.
+static APALACHE: Mutex<()> = Mutex::new(());
+
 /// The check boxes of the PR template that are not CI jobs.
 const OTHER_BOXES: [&str; 3] = [
     "Started in a fresh context",
@@ -239,15 +243,19 @@ fn long_function(lines: usize) -> String {
     )
 }
 
-/// Runs the `justfile` recipe `recipe` on a fixture crate with `source`.
-fn recipe_on_fixture(recipe: &str, source: &str) -> Output {
-    let fixture = fixture_crate(source);
+/// Runs the `justfile` recipe `recipe` in `folder`.
+fn recipe_in(folder: &Path, recipe: &str) -> Output {
     run(Command::new("just")
         .arg("--justfile")
         .arg(root().join("justfile"))
         .arg("--working-directory")
-        .arg(fixture.path())
+        .arg(folder)
         .arg(recipe))
+}
+
+/// Runs the `justfile` recipe `recipe` on a fixture crate with `source`.
+fn recipe_on_fixture(recipe: &str, source: &str) -> Output {
+    recipe_in(fixture_crate(source).path(), recipe)
 }
 
 /// Checks that `output` is a failure that names `lint`. Rustc writes lint names with `-`, Clippy with `_`.
@@ -954,4 +962,98 @@ fn ac_0_11_2_clean_tree_makes_no_commit() {
         .current_dir(repository.path())));
     let count = git(repository.path(), &["rev-list", "--count", "HEAD"]);
     assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+}
+
+/// A fixture Quint model with a counter that `next` updates, the invariant `count < 3` and one `run` test.
+fn counter_model(next: &str) -> String {
+    format!(
+        "module fixture {{
+  var count: int
+
+  action init = count' = 0
+
+  action step = count' = {next}
+
+  val allInvariants = count < 3
+
+  run ac_counts = init.then(step).expect(count == 1)
+}}
+"
+    )
+}
+
+/// Runs the `quint` recipe in a fixture folder whose `quint/` folder has `model`, if any.
+fn quint_gate(model: Option<&str>) -> Output {
+    let fixture = TempDir::new().expect("a temporary folder");
+    let models = fixture.path().join("quint");
+    fs::create_dir(&models).expect("the model folder is made");
+    if let Some(model) = model {
+        fs::write(models.join("fixture.qnt"), model).expect("the model is written");
+    }
+    let _apalache = APALACHE.lock().expect("no test panics while it runs Quint");
+    recipe_in(fixture.path(), "quint")
+}
+
+/// The exit code and the result lines of a `quint` output: test results, trace states and verdicts, without timings.
+fn quint_results(output: &Output) -> (Option<i32>, Vec<String>) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<String> = stdout
+        .lines()
+        .filter(|line| line.starts_with('[') || line.contains("ac_"))
+        .map(|line| {
+            line.split_once(" (")
+                .map_or(line, |(result, _)| result)
+                .trim()
+                .to_owned()
+        })
+        .collect();
+    (output.status.code(), lines)
+}
+
+/// `quint` passes a fixture folder with no model.
+#[test]
+fn ac_0_12_1_quint_passes_no_model() {
+    assert_passes(&quint_gate(None));
+}
+
+/// `quint` fails a model whose invariant a reachable state breaks, and prints the trace.
+#[test]
+fn ac_0_12_2_quint_fails_broken_invariant() {
+    let output = quint_gate(Some(&counter_model("count + 1")));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success() && stdout.contains("[State 3] { count: 3 }"),
+        "quint fails and prints the trace to count 3, its output is: {stdout}"
+    );
+}
+
+/// `quint` passes a model whose invariant holds in every reachable state.
+#[test]
+fn ac_0_12_3_quint_passes_true_invariant() {
+    assert_passes(&quint_gate(Some(&counter_model("(count + 1) % 3"))));
+}
+
+/// Two runs of `quint` on the same model give the same exit code and results.
+#[test]
+fn ac_0_12_4_quint_is_deterministic() {
+    for next in ["count + 1", "(count + 1) % 3"] {
+        let model = counter_model(next);
+        let first = quint_results(&quint_gate(Some(&model)));
+        assert!(!first.1.is_empty(), "quint prints results for {next}");
+        assert_eq!(
+            first,
+            quint_results(&quint_gate(Some(&model))),
+            "two runs with {next}"
+        );
+    }
+}
+
+/// `check` runs the Quint gate after the architecture gate, CI runs it, and `rust-test` installs the Quint CLI.
+#[test]
+fn ac_0_12_5_check_and_ci_run_quint_gate() {
+    assert_check_and_ci_run_after("architecture", "quint");
+    assert!(
+        runs(&yaml(".github/workflows/ci.yml"), "rust-test").contains(&"just install-quint"),
+        "rust-test runs just install-quint"
+    );
 }
