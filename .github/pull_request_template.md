@@ -13,6 +13,7 @@
 - [ ] `complexity`
 - [ ] `duplication`
 - [ ] `architecture`
+- [ ] `quint`
 - [ ] `rust-test`
 - [ ] `workflow-lint`
 - [ ] `pr-size`

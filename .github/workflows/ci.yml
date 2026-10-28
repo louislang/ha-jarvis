@@ -67,7 +67,20 @@ jobs:
       - run: just install-cargo-llvm-cov
       - run: just install-rust-code-analysis-cli
       - run: just install-jscpd
+      - run: echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+      - run: just install-quint
       - run: just cov
+
+  quint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: "1.59.0"
+      - run: echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+      - run: just install-quint
+      - run: just quint
 
   workflow-lint:
     runs-on: ubuntu-latest
