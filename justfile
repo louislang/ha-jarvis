@@ -40,6 +40,7 @@ check: workflow-lint format lint complexity duplication cov
 # Install the tools and the pre-commit hook.
 setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd
     pre-commit install --hook-type pre-commit
+    gh extension install github/gh-stack
 
 install-just:
     cargo install just --version {{ just_version }} --locked
