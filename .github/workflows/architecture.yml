@@ -1,0 +1,34 @@
+name: Architecture
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: architecture
+  cancel-in-progress: false
+
+jobs:
+  diagram:
+    runs-on: ubuntu-latest
+    steps:
+      # The head of `main`, not the pushed commit: a queued run then includes the diagram commit of the run before it.
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: "1.59.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: just diagram
+      - run: |
+          if git diff --quiet docs/architecture.md; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update the architecture diagram" -m "CI regenerated docs/architecture.md from main." -- docs/architecture.md
+          git push
