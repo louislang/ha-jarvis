@@ -5,6 +5,7 @@ actionlint_version := "1.7.12"
 pre_commit_version := "4.7.0"
 rust_code_analysis_cli_version := "0.0.25"
 jscpd_version := "5.4.2"
+codex_version := "0.162.0"
 
 # Run the tests.
 test:
@@ -38,8 +39,9 @@ workflow-lint:
 check: workflow-lint format lint complexity duplication cov
 
 # Install the tools and the pre-commit hook.
-setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd
+setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-codex
     pre-commit install --hook-type pre-commit
+    gh extension install github/gh-stack
 
 install-just:
     cargo install just --version {{ just_version }} --locked
@@ -58,3 +60,6 @@ install-rust-code-analysis-cli:
 
 install-jscpd:
     npm install --global jscpd@{{ jscpd_version }}
+
+install-codex:
+    npm install --global @openai/codex@{{ codex_version }}

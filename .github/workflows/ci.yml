@@ -68,3 +68,84 @@ jobs:
           just-version: "1.59.0"
       - run: just install-actionlint
       - run: just workflow-lint
+
+  codex-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      findings: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: codex
+        uses: openai/codex-action@v1.13
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          permission-profile: ":workspace"
+          codex-version: "0.162.0"
+          prompt: |
+            Review pull request #${{ github.event.pull_request.number }} of this repository.
+            Review only the changes of the PR: git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+            Check the changes against CLAUDE.md and against the sections of docs/spec/ that the PR implements.
+            The PR title names the sub-phase: ${{ github.event.pull_request.title }}
+            Report each defect or rule violation as one finding: the file path, the line in the new file, and a short body.
+            Report no finding for a change that obeys the rules.
+          output-schema: |
+            {
+              "type": "object",
+              "properties": {
+                "findings": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "path": { "type": "string" },
+                      "line": { "type": "integer" },
+                      "body": { "type": "string" }
+                    },
+                    "required": ["path", "line", "body"],
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "required": ["findings"],
+              "additionalProperties": false
+            }
+
+  codex-post:
+    if: github.event_name == 'pull_request'
+    needs: codex-review
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/github-script@v9.0.0
+        env:
+          FINDINGS: ${{ needs.codex-review.outputs.findings }}
+        with:
+          script: |
+            const { findings } = JSON.parse(process.env.FINDINGS);
+            const pull = context.payload.pull_request;
+            const target = { ...context.repo, pull_number: pull.number, commit_id: pull.head.sha };
+            const files = await github.paginate(github.rest.pulls.listFiles, { ...context.repo, pull_number: pull.number });
+            const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm;
+            const hunks = new Map(files.map((file) => [
+              file.filename,
+              [...(file.patch ?? '').matchAll(hunk)].map(([, start, count = '1']) => [Number(start), Number(start) + Number(count)]),
+            ]));
+            const inDiff = ({ path, line }) => (hunks.get(path) ?? []).some(([start, end]) => line >= start && line < end);
+            await github.rest.pulls.createReview({
+              ...target,
+              event: 'COMMENT',
+              body: findings.length === 0 ? 'Codex found no problem.' : `Codex findings: ${findings.length}.`,
+              comments: findings.filter(inDiff),
+            });
+            // A review comment must be on a line of the diff. Other findings are file comments.
+            for (const { path, body } of findings.filter((finding) => !inDiff(finding))) {
+              await github.rest.pulls.createReviewComment({ ...target, path, body, subject_type: 'file' });
+            }

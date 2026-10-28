@@ -156,6 +156,13 @@ const IGNORED: [&str; 11] = [
     "learned.toml",
 ];
 
+/// The check boxes of the PR template that are not CI jobs.
+const OTHER_BOXES: [&str; 3] = [
+    "Started in a fresh context",
+    "Codex review threads resolved",
+    "`[GPU host]` criteria pass in `gpu-test`",
+];
+
 /// The repository root.
 fn root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -424,6 +431,31 @@ fn duplication_gate(folder: &Path) -> Output {
             "rust,python",
         ])
         .arg(folder))
+}
+
+/// Parses `source` as a YAML mapping.
+fn mapping(source: &str) -> serde_yaml::Value {
+    serde_yaml::from_str(source).expect("the expected value is YAML")
+}
+
+/// The inputs of the step of `job` that uses `openai/codex-action`. Checks that the action has a fixed release tag.
+fn codex_inputs(job: &serde_yaml::Value) -> &serde_yaml::Value {
+    let codex = job["steps"]
+        .as_sequence()
+        .expect("the job has steps")
+        .iter()
+        .find_map(|step| {
+            let uses = step["uses"].as_str()?;
+            Some((step, uses.strip_prefix("openai/codex-action@v")?))
+        });
+    let Some((step, version)) = codex else {
+        panic!("the job uses openai/codex-action at a version tag");
+    };
+    assert!(
+        version.split('.').count() > 1,
+        "the action has a fixed release tag, not v{version}"
+    );
+    &step["with"]
 }
 
 /// The workspace builds.
@@ -749,4 +781,78 @@ fn ac_0_4_2_duplication_passes_one_copy() {
 #[test]
 fn ac_0_4_3_check_and_ci_run_duplication_gate() {
     assert_check_and_ci_run_after("complexity", "duplication");
+}
+
+/// The PR template has the sections `Summary`, `Changes` and `Checks`, in that order.
+#[test]
+fn ac_0_5_1_template_has_sections() {
+    let template = read(".github/pull_request_template.md");
+    let headings: Vec<&str> = template
+        .lines()
+        .filter_map(|line| line.strip_prefix("## "))
+        .collect();
+    assert_eq!(headings, ["Summary", "Changes", "Checks"]);
+}
+
+/// The PR template has one check box for each CI job and the three other boxes.
+#[test]
+fn ac_0_5_2_template_has_box_for_each_job() {
+    let template = read(".github/pull_request_template.md");
+    let boxes: Vec<&str> = template
+        .lines()
+        .filter_map(|line| line.strip_prefix("- [ ] "))
+        .collect();
+    let labels: BTreeSet<String> = boxes.iter().map(ToString::to_string).collect();
+    assert_eq!(
+        boxes.len(),
+        labels.len(),
+        "each box is in the template once: {boxes:?}"
+    );
+    let ci = yaml(".github/workflows/ci.yml");
+    let jobs = ci["jobs"].as_mapping().expect("the workflow has jobs");
+    let mut expected: BTreeSet<String> = jobs
+        .keys()
+        .map(|job| format!("`{}`", job.as_str().expect("a job name")))
+        .collect();
+    expected.extend(OTHER_BOXES.map(str::to_owned));
+    assert_eq!(labels, expected);
+}
+
+/// `setup` installs the `gh-stack` extension.
+#[test]
+fn ac_0_5_3_setup_installs_gh_stack() {
+    let setup = justfile()["recipes"]["setup"]["body"].to_string();
+    assert!(
+        setup.contains("gh extension install github/gh-stack"),
+        "setup installs github/gh-stack: {setup}"
+    );
+}
+
+/// The Codex jobs run only on `pull_request`, with the action, the secret, the profile and the permissions.
+#[test]
+fn ac_0_5_4_ci_runs_codex_review() {
+    let ci = yaml(".github/workflows/ci.yml");
+    let (review, post) = (&ci["jobs"]["codex-review"], &ci["jobs"]["codex-post"]);
+    for job in [review, post] {
+        assert_eq!(
+            job["if"].as_str(),
+            Some("github.event_name == 'pull_request'"),
+            "the job runs only on pull_request"
+        );
+    }
+    assert_eq!(review["permissions"], mapping("{contents: read}"));
+    let inputs = codex_inputs(review);
+    assert_eq!(
+        inputs["openai-api-key"].as_str(),
+        Some("${{ secrets.OPENAI_API_KEY }}")
+    );
+    assert_eq!(inputs["permission-profile"].as_str(), Some(":workspace"));
+    assert_eq!(
+        inputs["codex-version"].as_str(),
+        justfile()["assignments"]["codex_version"]["value"].as_str()
+    );
+    let schema = inputs["output-schema"].as_str().expect("an output schema");
+    let _: serde_json::Value = serde_json::from_str(schema).expect("the output schema is JSON");
+    assert_eq!(post["needs"].as_str(), Some("codex-review"));
+    assert_eq!(post["permissions"], mapping("{pull-requests: write}"));
 }
