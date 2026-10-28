@@ -214,7 +214,7 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `serde_yaml`, `tempfile` (dev) | `xtask` | Structure tests and gate test fixtures. |
 | `actionlint` (tool) | — | Workflow lint. |
 | `gh-stack` (GitHub CLI extension) | — | GitHub native stacked PRs. |
-| `openai/codex-action` (GitHub Action), Codex CLI (`@openai/codex`, tool) | — | AI code review of each push to a PR, in the CI jobs `codex-review` and `codex-post`. Needs the repository secret `OPENAI_API_KEY`. |
+| Codex (GitHub app) | — | AI code review of each PR. |
 | `quint-connect` (dev) | Domain and application tests | Conformance tests: replay Quint traces against the Rust code. |
 | `syn`, `toml` | `xtask` | Parse the Rust source and the dependency names of `Cargo.toml` for the module graph. |
 | `clap` | `xtask`, root | Command lines of `xtask` and `jarvis`. |
