@@ -1,0 +1,2 @@
+too-many-lines-threshold = 50
+allow-unwrap-in-tests = true

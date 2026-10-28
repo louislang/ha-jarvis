@@ -19,11 +19,15 @@ const KEPT_VARIABLES: [&str; 5] = [
 ];
 
 /// A fixture crate with 10 lines, of which its test covers 5.
-const HALF_COVERED: &str = "pub fn covered(value: u32) -> u32 {
+const HALF_COVERED: &str = "//! Fixture.
+
+/// Adds one.
+pub fn covered(value: u32) -> u32 {
     let next = value + 1;
     next
 }
 
+/// Adds the double and the triple.
 pub fn uncovered(value: u32) -> u32 {
     let doubled = value * 2;
     let tripled = value * 3;
@@ -38,6 +42,92 @@ fn covers() { assert_eq!(covered(1), 2); }
 const REST_COVERED: &str = "
 #[test]
 fn covers_rest() { assert_eq!(uncovered(1), 5); }
+";
+
+/// A fixture crate with a function that is not used.
+const UNUSED_FUNCTION: &str = "//! Fixture.
+
+/// Returns one.
+fn unused() -> u32 {
+    1
+}
+";
+
+/// A fixture crate that calls `unwrap` outside a test.
+const UNWRAP_OUTSIDE_TEST: &str = "//! Fixture.
+
+/// Parses a number.
+///
+/// # Panics
+///
+/// When `text` is not a number.
+#[must_use]
+pub fn parse(text: &str) -> u32 {
+    text.parse().unwrap()
+}
+";
+
+/// A fixture crate that calls `unwrap` inside a test.
+const UNWRAP_INSIDE_TEST: &str = "//! Fixture.
+
+/// Tests of the fixture.
+#[cfg(test)]
+mod tests {
+    /// Parses a number.
+    #[test]
+    fn parses() {
+        let number: u32 = \"1\".parse().unwrap();
+        assert_eq!(number, 1);
+    }
+}
+";
+
+/// A fixture crate with a private function that has no doc comment.
+const UNDOCUMENTED_FUNCTION: &str = "//! Fixture.
+
+/// Returns `value`.
+#[must_use]
+pub fn public(value: u32) -> u32 {
+    private(value)
+}
+
+fn private(value: u32) -> u32 {
+    value
+}
+";
+
+/// A fixture crate with a private struct that has no doc comment.
+const UNDOCUMENTED_STRUCT: &str = "//! Fixture.
+
+/// Returns `value`.
+#[must_use]
+pub fn public(value: u32) -> u32 {
+    Private { value }.value
+}
+
+struct Private {
+    /// The value.
+    value: u32,
+}
+";
+
+/// A fixture crate with an `unsafe` block.
+const UNSAFE_BLOCK: &str = "//! Fixture.
+
+/// Reads `value` through a raw pointer.
+#[must_use]
+pub fn read(value: &u32) -> u32 {
+    // SAFETY: a reference is valid to read.
+    unsafe { *std::ptr::from_ref(value) }
+}
+";
+
+/// A fixture crate that is not formatted.
+const UNFORMATTED: &str = "//! Fixture.
+
+/// Returns one.
+#[must_use]
+pub fn one( ) -> u32 { 1 }
 ";
 
 /// The paths that Git must ignore: build output, models, the virtual environment, the local configuration and the data files.
@@ -115,7 +205,49 @@ fn fixture_crate(source: &str) -> TempDir {
     fs::write(folder.path().join("Cargo.toml"), manifest).expect("the manifest is written");
     fs::create_dir(folder.path().join("src")).expect("the source folder is made");
     fs::write(folder.path().join("src/lib.rs"), source).expect("the source is written");
+    fs::copy(
+        root().join("clippy.toml"),
+        folder.path().join("clippy.toml"),
+    )
+    .expect("clippy.toml is copied");
     folder
+}
+
+/// A fixture crate with one function whose body has `lines` lines.
+fn long_function(lines: usize) -> String {
+    let additions = "    total += 1;\n".repeat(lines - 2);
+    format!(
+        "//! Fixture.\n\n/// Adds.\n#[must_use]\npub fn long(value: u32) -> u32 {{\n    let mut total = value;\n{additions}    total\n}}\n"
+    )
+}
+
+/// Runs the `justfile` recipe `recipe` on a fixture crate with `source`.
+fn recipe_on_fixture(recipe: &str, source: &str) -> Output {
+    let fixture = fixture_crate(source);
+    run(Command::new("just")
+        .arg("--justfile")
+        .arg(root().join("justfile"))
+        .arg("--working-directory")
+        .arg(fixture.path())
+        .arg(recipe))
+}
+
+/// Checks that `output` is a failure that names `lint`. Rustc writes lint names with `-`, Clippy with `_`.
+fn assert_fails_with(output: &Output, lint: &str) {
+    let stderr = String::from_utf8_lossy(&output.stderr).replace('-', "_");
+    assert!(
+        !output.status.success() && stderr.contains(lint),
+        "the command fails with {lint}, its output is: {stderr}"
+    );
+}
+
+/// Checks that `output` is a success.
+fn assert_passes(output: &Output) {
+    assert!(
+        output.status.success(),
+        "the command fails: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// Runs the coverage gate on a fixture crate with `source`.
@@ -404,4 +536,76 @@ fn ac_0_1_10_tracked_files_are_in_table() {
         unlisted.is_empty(),
         "files not in 01-architecture.md section 8: {unlisted:?}"
     );
+}
+
+/// `lint` fails a function with 51 lines and passes 50.
+#[test]
+fn ac_0_2_1_lint_fails_long_function() {
+    let long = recipe_on_fixture("lint", &long_function(51));
+    assert_fails_with(&long, "too_many_lines");
+    assert_fails_with(&long, "(51/50)");
+    assert_passes(&recipe_on_fixture("lint", &long_function(50)));
+}
+
+/// `lint` fails a function that is not used.
+#[test]
+fn ac_0_2_2_lint_fails_dead_code() {
+    assert_fails_with(&recipe_on_fixture("lint", UNUSED_FUNCTION), "dead_code");
+}
+
+/// `lint` fails `unwrap` outside a test and passes it inside a test.
+#[test]
+fn ac_0_2_3_lint_fails_unwrap_outside_test() {
+    assert_fails_with(
+        &recipe_on_fixture("lint", UNWRAP_OUTSIDE_TEST),
+        "unwrap_used",
+    );
+    assert_passes(&recipe_on_fixture("lint", UNWRAP_INSIDE_TEST));
+}
+
+/// `lint` fails a private function or a private struct without a doc comment.
+#[test]
+fn ac_0_2_4_lint_fails_missing_private_docs() {
+    for source in [UNDOCUMENTED_FUNCTION, UNDOCUMENTED_STRUCT] {
+        assert_fails_with(
+            &recipe_on_fixture("lint", source),
+            "missing_docs_in_private_items",
+        );
+    }
+}
+
+/// The build fails an `unsafe` block.
+#[test]
+fn ac_0_2_5_build_fails_unsafe_code() {
+    let fixture = fixture_crate(UNSAFE_BLOCK);
+    let output = run(Command::new("cargo")
+        .arg("build")
+        .current_dir(fixture.path()));
+    assert_fails_with(&output, "unsafe_code");
+}
+
+/// `format` fails a file that is not formatted.
+#[test]
+fn ac_0_2_6_format_fails_unformatted_file() {
+    let output = recipe_on_fixture("format", UNFORMATTED);
+    let diff = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success() && diff.contains("Diff in"),
+        "format fails with a diff, its output is: {diff}"
+    );
+}
+
+/// `check` runs the lint gates before the coverage gate, and CI runs them.
+#[test]
+fn ac_0_2_7_check_and_ci_run_lint_gates() {
+    let gates = ["workflow-lint", "format", "lint", "cov"];
+    let check: Vec<String> = dependencies(&justfile(), "check")
+        .into_iter()
+        .filter(|recipe| gates.contains(&recipe.as_str()))
+        .collect();
+    assert_eq!(check, gates, "check runs the gates in this order");
+    let ci = yaml(".github/workflows/ci.yml");
+    for (job, command) in [("rust-format", "just format"), ("rust-lint", "just lint")] {
+        assert!(runs(&ci, job).contains(&command), "{job} runs {command}");
+    }
 }
