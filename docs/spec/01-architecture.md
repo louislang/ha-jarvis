@@ -219,6 +219,7 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `syn`, `toml` | `xtask` | Parse the Rust source and the dependency names of `Cargo.toml` for the module graph. |
 | `clap` | `xtask`, root | Command lines of `xtask` and `jarvis`. |
 | Quint CLI (`@informalsystems/quint`, tool) | — | Type check, test, simulate and model check the Quint models. |
+| Quint Rust evaluator (tool, through `quint run` and `quint test`) | — | Simulation and `run` tests. |
 | Apalache (tool, through `quint verify`, needs Java 21 as `java` on `PATH`) | — | Bounded model checking of the Quint invariants. |
 | Verus (tool, with `cargo-verus` and Z3) | — | Proves the Verus proofs of the domain (`cargo verus verify`). Its release sets the Rust version of `rust-toolchain.toml`. |
 
