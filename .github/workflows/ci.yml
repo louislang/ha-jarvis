@@ -46,6 +46,16 @@ jobs:
       - run: just install-jscpd
       - run: just duplication
 
+  architecture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: "1.59.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: just architecture
+
   rust-test:
     runs-on: ubuntu-latest
     steps:
