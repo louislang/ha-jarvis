@@ -1,13 +1,19 @@
 //! Builds the module graph from the source with `syn`.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::mem;
 use std::path::{Path, PathBuf};
 
+use syn::buffer::{Cursor, TokenBuffer};
+use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
-use syn::{Attribute, Ident, ImplItemFn, Item, TraitItemFn, UseTree};
+use syn::{
+    Attribute, Expr, Ident, ImplItemFn, Item, Macro, Token, TraitItemFn, UseTree, VisRestricted,
+};
+use toml::Table;
 
 /// A module of the graph.
 #[derive(Clone, Debug, PartialEq)]
@@ -20,23 +26,25 @@ pub struct Node {
     pub hash: u64,
 }
 
-/// A `use` dependency from one module to another.
+/// A path that one module names.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Edge {
-    /// The module that has the `use` item.
+    /// The module that names the path.
     pub from: String,
-    /// The longest prefix of the used path that is a module.
+    /// The longest prefix of the path that is a module, or the full path of an outside item.
     pub to: String,
     /// True inside test code.
     pub test: bool,
+    /// True when `to` is in an outside crate.
+    pub external: bool,
 }
 
-/// The modules of a crate and their `use` dependencies.
+/// The modules of a crate and the paths that they name.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Graph {
     /// Each module path to its node.
     pub nodes: BTreeMap<String, Node>,
-    /// One edge for each leaf of each `use` tree that names a module.
+    /// One edge for each path that names a module or an outside crate.
     pub edges: Vec<Edge>,
 }
 
@@ -49,7 +57,7 @@ struct Found {
     test: bool,
 }
 
-/// Collects the declared modules, the `use` paths and the alias table of one file.
+/// Collects the declared modules, the paths and the alias table of one file.
 #[derive(Default)]
 struct FileVisitor {
     /// The current module path, with the inline modules.
@@ -58,8 +66,8 @@ struct FileVisitor {
     test_depth: usize,
     /// The modules that `mod` items without a body declare.
     declared: Vec<Found>,
-    /// The resolved path of each `use` leaf.
-    uses: Vec<Found>,
+    /// Each path that the file names, with a leading `self` or `super` resolved.
+    paths: Vec<Found>,
     /// Each name that a `use` leaf binds to its full path.
     aliases: BTreeMap<String, String>,
 }
@@ -82,7 +90,7 @@ impl FileVisitor {
             UseTree::Name(name) => self.add_leaf(prefix, &name.ident, &name.ident),
             UseTree::Rename(rename) => self.add_leaf(prefix, &rename.ident, &rename.rename),
             UseTree::Glob(_) if prefix == ["super"] => {}
-            UseTree::Glob(_) => self.uses.push(self.found(resolve(&self.module, prefix))),
+            UseTree::Glob(_) => self.add_path(prefix),
             UseTree::Group(group) => {
                 for tree in &group.items {
                     self.add_use(prefix, tree);
@@ -103,7 +111,31 @@ impl FileVisitor {
             bound.to_string()
         };
         self.aliases.insert(bound, path.join("::"));
-        self.uses.push(self.found(path));
+        self.paths.push(self.found(path));
+    }
+
+    /// Records `segments` with a leading `self` or `super` resolved.
+    fn add_path(&mut self, segments: &[String]) {
+        let found = self.found(resolve(&self.module, segments));
+        self.paths.push(found);
+    }
+
+    /// Records each run of `name :: name ...` tokens from `cursor`, also inside groups.
+    fn add_token_paths(&mut self, mut cursor: Cursor<'_>) {
+        while let Some((_, mut next)) = cursor.token_tree() {
+            if let Some((inside, ..)) = cursor.any_group() {
+                self.add_token_paths(inside);
+            } else if let Some((ident, mut after)) = cursor.ident() {
+                let mut segments = vec![ident.to_string()];
+                while let Some((ident, rest)) = path_separator(after).and_then(Cursor::ident) {
+                    segments.push(ident.to_string());
+                    after = rest;
+                }
+                self.add_path(&segments);
+                next = after;
+            }
+            cursor = next;
+        }
     }
 
     /// Runs `visit` one test level deeper when `attributes` has `#[cfg(test)]`.
@@ -143,6 +175,38 @@ impl Visit<'_> for FileVisitor {
             visit::visit_trait_item_fn(visitor, item);
         });
     }
+
+    fn visit_path(&mut self, path: &syn::Path) {
+        let segments: Vec<String> = path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect();
+        self.add_path(&segments);
+        visit::visit_path(self, path);
+    }
+
+    fn visit_macro(&mut self, item: &Macro) {
+        visit::visit_macro(self, item);
+        match item.parse_body_with(Punctuated::<Expr, Token![,]>::parse_terminated) {
+            Ok(expressions) => {
+                for expression in &expressions {
+                    self.visit_expr(expression);
+                }
+            }
+            Err(_) => self.add_token_paths(TokenBuffer::new2(item.tokens.clone()).begin()),
+        }
+    }
+
+    // `pub(crate)` and `pub(super)` name no dependency.
+    fn visit_vis_restricted(&mut self, _: &VisRestricted) {}
+}
+
+/// The cursor after a `::` at `cursor`.
+fn path_separator(cursor: Cursor<'_>) -> Option<Cursor<'_>> {
+    let (first, next) = cursor.punct()?;
+    let (second, next) = next.punct()?;
+    (first.as_char() == ':' && second.as_char() == ':').then_some(next)
 }
 
 /// The attributes of the items that can hold a `use` item.
@@ -201,6 +265,31 @@ fn hash(content: &str) -> u64 {
     hasher.finish()
 }
 
+/// The edge from `from` to `found`, with its first segment resolved through `aliases`.
+/// `None` when the path starts in no module of the crate and in no crate of `dependencies`.
+fn resolve_edge(
+    from: &str,
+    found: &Found,
+    aliases: &BTreeMap<String, String>,
+    dependencies: &BTreeSet<String>,
+) -> Option<Edge> {
+    let (first, rest) = found.path.split_first()?;
+    let head = aliases.get(first).unwrap_or(first);
+    let to = if rest.is_empty() {
+        head.clone()
+    } else {
+        format!("{head}::{}", rest.join("::"))
+    };
+    let start = head.split("::").next()?;
+    let external = dependencies.contains(start);
+    (external || start == "crate").then(|| Edge {
+        from: from.to_owned(),
+        to,
+        test: found.test,
+        external,
+    })
+}
+
 /// The longest prefix of `path` that is a node of `nodes`.
 fn module_prefix(nodes: &BTreeMap<String, Node>, path: &str) -> Option<String> {
     let segments: Vec<&str> = path.split("::").collect();
@@ -210,11 +299,37 @@ fn module_prefix(nodes: &BTreeMap<String, Node>, path: &str) -> Option<String> {
         .find(|prefix| nodes.contains_key(prefix))
 }
 
-/// Adds the node and the unresolved `use` edges of `module` to `graph`. Returns its declared modules.
-fn add_module(root: &Path, module: &Found, graph: &mut Graph) -> Result<Vec<Found>, String> {
+/// The content of the file `file` in `root`. The error names the file.
+fn read(root: &Path, file: &Path) -> Result<String, String> {
+    fs::read_to_string(root.join(file)).map_err(|error| format!("{}: {error}", file.display()))
+}
+
+/// The crate names that start an external path: the dependencies of `Cargo.toml`, `std`, `core` and `alloc`.
+fn dependencies(root: &Path) -> Result<BTreeSet<String>, String> {
+    let manifest: Table = read(root, Path::new("Cargo.toml"))?
+        .parse()
+        .map_err(|error| format!("Cargo.toml: {error}"))?;
+    let sections = ["dependencies", "dev-dependencies", "build-dependencies"];
+    let names = sections
+        .iter()
+        .filter_map(|section| manifest.get(*section)?.as_table())
+        .flat_map(Table::keys)
+        .map(|name| name.replace('-', "_"));
+    Ok(names
+        .chain(["std", "core", "alloc"].map(str::to_owned))
+        .collect())
+}
+
+/// Adds the node and the edges of `module` to `graph`. A module edge keeps its full path.
+/// Returns the declared modules.
+fn add_module(
+    root: &Path,
+    dependencies: &BTreeSet<String>,
+    module: &Found,
+    graph: &mut Graph,
+) -> Result<Vec<Found>, String> {
     let file = file_of(&module.path);
-    let content = fs::read_to_string(root.join(&file))
-        .map_err(|error| format!("{}: {error}", file.display()))?;
+    let content = read(root, &file)?;
     let syntax =
         syn::parse_file(&content).map_err(|error| format!("{}: {error}", file.display()))?;
     let mut visitor = FileVisitor {
@@ -224,13 +339,12 @@ fn add_module(root: &Path, module: &Found, graph: &mut Graph) -> Result<Vec<Foun
     };
     visitor.visit_file(&syntax);
     let from = module.path.join("::");
-    graph
-        .edges
-        .extend(visitor.uses.into_iter().map(|found| Edge {
-            from: from.clone(),
-            to: found.path.join("::"),
-            test: found.test,
-        }));
+    graph.edges.extend(
+        visitor
+            .paths
+            .iter()
+            .filter_map(|found| resolve_edge(&from, found, &visitor.aliases, dependencies)),
+    );
     let layer = layer(&module.path);
     let hash = hash(&content);
     graph.nodes.insert(from, Node { file, layer, hash });
@@ -241,20 +355,24 @@ fn add_module(root: &Path, module: &Found, graph: &mut Graph) -> Result<Vec<Foun
 ///
 /// # Errors
 ///
-/// When a module file cannot be read or parsed. The error names the file.
+/// When `Cargo.toml` or a module file cannot be read or parsed. The error names the file.
 pub fn build(root: &Path) -> Result<Graph, String> {
+    let dependencies = dependencies(root)?;
     let mut graph = Graph::default();
     let mut pending = vec![Found {
         path: vec!["crate".to_owned()],
         test: false,
     }];
     while let Some(module) = pending.pop() {
-        pending.extend(add_module(root, &module, &mut graph)?);
+        pending.extend(add_module(root, &dependencies, &module, &mut graph)?);
     }
     let edges = mem::take(&mut graph.edges);
     graph.edges = edges
         .into_iter()
         .filter_map(|edge| {
+            if edge.external {
+                return Some(edge);
+            }
             let to = module_prefix(&graph.nodes, &edge.to)?;
             Some(Edge { to, ..edge })
         })
@@ -272,7 +390,8 @@ mod tests {
     /// Builds the graph of a crate with the files `(path, content)`.
     fn graph(files: &[(&str, &str)]) -> Graph {
         let folder = TempDir::new().expect("a temporary folder");
-        for (path, content) in files {
+        let manifest = ("Cargo.toml", "[dependencies]\ntokio = \"1\"\n");
+        for (path, content) in [&[manifest], files].concat() {
             let file = folder.path().join(path);
             fs::create_dir_all(file.parent().expect("a parent folder"))
                 .expect("the folder is made");
@@ -287,6 +406,15 @@ mod tests {
             from: from.to_owned(),
             to: to.to_owned(),
             test,
+            external: false,
+        }
+    }
+
+    /// An external edge from `from` to `to` outside test code.
+    fn external(from: &str, to: &str) -> Edge {
+        Edge {
+            external: true,
+            ..edge(from, to, false)
         }
     }
 
@@ -391,5 +519,88 @@ mod tests {
         assert_eq!(visitor.aliases.len(), 2);
         assert_eq!(visitor.aliases["H"], "crate::ports::Home");
         assert_eq!(visitor.aliases["Mutex"], "tokio::sync::Mutex");
+    }
+
+    /// A `crate` path in an expression gives an edge to its longest module prefix.
+    #[test]
+    fn ac_0_7b_1_expression_path() {
+        let graph = graph(&[
+            (
+                "src/lib.rs",
+                "pub mod adapters { pub mod ha; }\nfn main() {\n    crate::adapters::ha::HaHome::connect();\n}\n",
+            ),
+            ("src/adapters/ha.rs", ""),
+        ]);
+        assert_eq!(graph.edges, [edge("crate", "crate::adapters::ha", false)]);
+    }
+
+    /// A dependency path in a `use` item or in an expression gives an external edge.
+    #[test]
+    fn ac_0_7b_2_external_edges() {
+        assert_eq!(
+            edges(
+                "src/domain/b.rs",
+                "use tokio::sync::Mutex;\nfn f() {\n    std::fs::read(\"a\");\n}\n"
+            ),
+            [
+                external("crate::domain::b", "tokio::sync::Mutex"),
+                external("crate::domain::b", "std::fs::read"),
+            ]
+        );
+    }
+
+    /// A type path that starts with a module alias gives an edge to that module.
+    #[test]
+    fn ac_0_7b_3_module_alias() {
+        assert_eq!(
+            edges(
+                "src/app/x.rs",
+                "use crate::ports as p;\nfn f(home: p::Home) {}\n"
+            ),
+            [
+                edge("crate::app::x", "crate::ports", false),
+                edge("crate::app::x", "crate::ports", false),
+            ]
+        );
+    }
+
+    /// A path that starts with an alias of a dependency item gives an external edge.
+    #[test]
+    fn ac_0_7b_4_dependency_alias() {
+        assert_eq!(
+            edges(
+                "src/domain/b.rs",
+                "use tokio::sync::Mutex;\nfn f() {\n    Mutex::new();\n}\n"
+            ),
+            [
+                external("crate::domain::b", "tokio::sync::Mutex"),
+                external("crate::domain::b", "tokio::sync::Mutex::new"),
+            ]
+        );
+    }
+
+    /// Prelude names and local items give no edge.
+    #[test]
+    fn ac_0_7b_5_local_names() {
+        let edges = edges(
+            "src/domain/b.rs",
+            "struct Intent;\nimpl Intent {\n    fn parse() {}\n}\nfn f() {\n    Vec::new();\n    Ok(1);\n    Intent::parse();\n}\n",
+        );
+        assert!(edges.is_empty(), "expected no edge, got {edges:?}");
+    }
+
+    /// A path in a macro body gives an edge, also when the body is not expressions.
+    #[test]
+    fn ac_0_7b_6_macro_body() {
+        assert_eq!(
+            edges(
+                "src/domain/b.rs",
+                "fn f(p: &str) {\n    let _ = format!(\"{}\", std::fs::read_to_string(p)?);\n    m!(fn g() { std::fs::write });\n}\n"
+            ),
+            [
+                external("crate::domain::b", "std::fs::read_to_string"),
+                external("crate::domain::b", "std::fs::write"),
+            ]
+        );
     }
 }
