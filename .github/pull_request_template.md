@@ -12,6 +12,7 @@
 - [ ] `rust-lint`
 - [ ] `complexity`
 - [ ] `duplication`
+- [ ] `architecture`
 - [ ] `rust-test`
 - [ ] `workflow-lint`
 - [ ] `pr-size`

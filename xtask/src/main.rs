@@ -6,10 +6,9 @@ use std::process::ExitCode;
 mod complexity;
 #[cfg(test)]
 mod gates;
-mod pr_size;
-// `rules` (sub-phase 0.8) uses the graph outside the tests.
-#[cfg(test)]
 mod graph;
+mod pr_size;
+mod rules;
 
 /// Entry point of the `xtask` command line.
 fn main() -> ExitCode {
@@ -21,8 +20,11 @@ fn main() -> ExitCode {
         {
             pr_size::run(base, limit)
         }
+        [command] if command == "rules" => rules::run(),
         _ => {
-            eprintln!("usage: xtask complexity <paths> | xtask pr-size --base <ref> --limit <n>");
+            eprintln!(
+                "usage: xtask complexity <paths> | xtask pr-size --base <ref> --limit <n> | xtask rules"
+            );
             ExitCode::FAILURE
         }
     }

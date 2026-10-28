@@ -832,3 +832,9 @@ fn ac_0_6_6_ci_runs_pr_size_on_pull_requests() {
         "pr-size passes the PR base, it runs {commands:?}"
     );
 }
+
+/// `check` runs the architecture gate after the duplication gate, and CI runs it.
+#[test]
+fn ac_0_8_8_check_and_ci_run_architecture_gate() {
+    assert_check_and_ci_run_after("duplication", "architecture");
+}

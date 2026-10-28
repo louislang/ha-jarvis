@@ -30,12 +30,16 @@ complexity:
 duplication:
     jscpd --threshold 3 --min-tokens 50 --format rust,python --ignore "**/target/**" src xtask
 
+# Check the layer and modularity rules.
+architecture:
+    cargo run -p xtask -- rules
+
 # Lint the workflows.
 workflow-lint:
     actionlint
 
 # Run the checks of the pre-commit hook.
-check: workflow-lint format lint complexity duplication cov
+check: workflow-lint format lint complexity duplication architecture cov
 
 # Install the tools and the pre-commit hook.
 setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd
