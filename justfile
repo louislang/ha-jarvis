@@ -6,6 +6,7 @@ pre_commit_version := "4.7.0"
 rust_code_analysis_cli_version := "0.0.25"
 jscpd_version := "5.4.2"
 quint_version := "0.33.0"
+quint_evaluator_version := "v0.7.0"
 
 # Run the tests.
 test:
@@ -59,7 +60,7 @@ workflow-lint:
 check: workflow-lint format lint complexity duplication architecture quint cov
 
 # Install the tools and the pre-commit hook.
-setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint
+setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint install-quint-evaluator
     pre-commit install --hook-type pre-commit
     gh extension install github/gh-stack
 
@@ -83,3 +84,8 @@ install-jscpd:
 
 install-quint:
     npm install --global @informalsystems/quint@{{ quint_version }}
+
+# Quint fetches the evaluator through the GitHub API, whose rate limit fails a runner without a token.
+install-quint-evaluator:
+    mkdir -p ~/.quint/rust-evaluator-{{ quint_evaluator_version }}
+    curl -sSfL https://github.com/quint-co/quint/releases/download/evaluator/{{ quint_evaluator_version }}/quint_evaluator-$(rustc -vV | sed -n 's/host: //p').tar.gz | tar -xz -C ~/.quint/rust-evaluator-{{ quint_evaluator_version }}

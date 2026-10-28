@@ -69,6 +69,7 @@ jobs:
       - run: just install-jscpd
       - run: echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
       - run: just install-quint
+      - run: just install-quint-evaluator
       - run: just cov
 
   quint:
@@ -80,6 +81,7 @@ jobs:
           just-version: "1.59.0"
       - run: echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
       - run: just install-quint
+      - run: just install-quint-evaluator
       - run: just quint
 
   workflow-lint:
