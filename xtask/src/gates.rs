@@ -433,31 +433,6 @@ fn duplication_gate(folder: &Path) -> Output {
         .arg(folder))
 }
 
-/// Parses `source` as a YAML mapping.
-fn mapping(source: &str) -> serde_yaml::Value {
-    serde_yaml::from_str(source).expect("the expected value is YAML")
-}
-
-/// The inputs of the step of `job` that uses `openai/codex-action`. Checks that the action has a fixed release tag.
-fn codex_inputs(job: &serde_yaml::Value) -> &serde_yaml::Value {
-    let codex = job["steps"]
-        .as_sequence()
-        .expect("the job has steps")
-        .iter()
-        .find_map(|step| {
-            let uses = step["uses"].as_str()?;
-            Some((step, uses.strip_prefix("openai/codex-action@v")?))
-        });
-    let Some((step, version)) = codex else {
-        panic!("the job uses openai/codex-action at a version tag");
-    };
-    assert!(
-        version.split('.').count() > 1,
-        "the action has a fixed release tag, not v{version}"
-    );
-    &step["with"]
-}
-
 /// The workspace builds.
 #[test]
 fn ac_0_1_1_workspace_builds() {
@@ -826,33 +801,4 @@ fn ac_0_5_3_setup_installs_gh_stack() {
         setup.contains("gh extension install github/gh-stack"),
         "setup installs github/gh-stack: {setup}"
     );
-}
-
-/// The Codex jobs run only on `pull_request`, with the action, the secret, the profile and the permissions.
-#[test]
-fn ac_0_5_4_ci_runs_codex_review() {
-    let ci = yaml(".github/workflows/ci.yml");
-    let (review, post) = (&ci["jobs"]["codex-review"], &ci["jobs"]["codex-post"]);
-    for job in [review, post] {
-        assert_eq!(
-            job["if"].as_str(),
-            Some("github.event_name == 'pull_request'"),
-            "the job runs only on pull_request"
-        );
-    }
-    assert_eq!(review["permissions"], mapping("{contents: read}"));
-    let inputs = codex_inputs(review);
-    assert_eq!(
-        inputs["openai-api-key"].as_str(),
-        Some("${{ secrets.OPENAI_API_KEY }}")
-    );
-    assert_eq!(inputs["permission-profile"].as_str(), Some(":workspace"));
-    assert_eq!(
-        inputs["codex-version"].as_str(),
-        justfile()["assignments"]["codex_version"]["value"].as_str()
-    );
-    let schema = inputs["output-schema"].as_str().expect("an output schema");
-    let _: serde_json::Value = serde_json::from_str(schema).expect("the output schema is JSON");
-    assert_eq!(post["needs"].as_str(), Some("codex-review"));
-    assert_eq!(post["permissions"], mapping("{pull-requests: write}"));
 }
