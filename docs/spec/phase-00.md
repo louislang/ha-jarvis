@@ -123,7 +123,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - **Implements:** G10, G22. **Depends on:** 0.3.
 - **Files:** modify `justfile`, `.github/workflows/ci.yml`, `xtask/src/gates.rs`.
 
-**Model.** `duplication` runs `jscpd --threshold 3 --min-tokens 50 --format rust,python --ignore "**/target/**" src xtask train`. `check` runs it after `complexity`. CI job `duplication`.
+**Model.** `duplication` runs `jscpd --threshold 3 --min-tokens 50 --format rust,python --ignore "**/target/**" src xtask`. `check` runs it after `complexity`. CI job `duplication`. Sub-phase 3.5 adds `train`, because `jscpd` fails on a path that does not exist.
 
 **Acceptance criteria.**
 

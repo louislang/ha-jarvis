@@ -157,7 +157,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - `train.py` has `parse_args(argv) -> Args` with `--data`, `--out`, `--device` (`cpu` or `cuda`) and the optional `--max-vram-gb` (sub-phase 3.8).
 - `just python` runs, in order: `ruff format --check`, `ruff check`, `mypy --strict`, `vulture --min-confidence 60 --ignore-names forward` (PyTorch calls `forward`), `interrogate --fail-under 100` and `pytest --cov --cov-fail-under=80.01`, all on `train/`.
 - `just setup` also makes `.venv` and installs `./train[dev]`. `check` runs `python` after `quint`. The CI job `python` runs `just python`.
-- The `complexity` recipe now runs on `src xtask train`.
+- The `complexity` and `duplication` recipes now run on `src xtask train`.
 
 **Acceptance criteria.**
 
@@ -168,7 +168,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - AC-3.5-5: When a fixture Python function has no docstring, `interrogate` fails.
 - AC-3.5-6: When a fixture Python function is not used, `vulture` fails and names it.
 - AC-3.5-7: When a fixture Python function has 51 code lines, cyclomatic complexity 11, Halstead volume over 1000 or Halstead difficulty over 30, `xtask complexity` fails and names it.
-- AC-3.5-8: When the `justfile` is dumped, `complexity` runs on `train`.
+- AC-3.5-8: When the `justfile` is dumped, `complexity` and `duplication` run on `train`.
 - AC-3.5-9: When `parse_args` gets `--max-vram-gb 1.0`, it returns `1.0`. Without the option, the value is `None`.
 
 **Proofs.**
