@@ -88,3 +88,31 @@ jobs:
           fetch-depth: 0
       - uses: Swatinem/rust-cache@v2
       - run: cargo run -p xtask -- pr-size --base origin/${{ github.base_ref }} --limit 400
+
+  diagram:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@v2
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          MARKER: "<!-- jarvis-architecture -->"
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          {
+            echo "$MARKER"
+            cargo run -p xtask -- diagram --base origin/${{ github.base_ref }}
+          } > diagram.md
+          cat diagram.md >> "$GITHUB_STEP_SUMMARY"
+          comment=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -n 1)
+          if [ -n "$comment" ]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$comment" -F body=@diagram.md
+          else
+            gh pr comment "$PR" --body-file diagram.md
+          fi

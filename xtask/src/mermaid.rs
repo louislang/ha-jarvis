@@ -9,40 +9,119 @@ use std::process::ExitCode;
 use crate::graph;
 use crate::graph::Graph;
 
-/// A Mermaid flowchart of `graph`: one subgraph for each layer, one node for each module and one
-/// arrow for each distinct module edge outside test code.
-#[must_use]
-pub fn render(graph: &Graph) -> String {
-    let mut layers: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-    for (module, node) in &graph.nodes {
-        layers.entry(&node.layer).or_default().push(module);
+/// The class definitions of the change colors.
+const CLASSES: [&str; 3] = [
+    "    classDef added fill:#2da44e",
+    "    classDef updated fill:#fb8500",
+    "    classDef deleted fill:#cf222e",
+];
+
+/// The change of a module from the base graph to the head graph.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Status {
+    /// Only in head.
+    Added,
+    /// In both, with different content.
+    Updated,
+    /// Only in base.
+    Deleted,
+    /// In both, with the same content.
+    Unchanged,
+}
+
+impl Status {
+    /// The status of `module` from `base` to `head`.
+    fn of(base: &Graph, head: &Graph, module: &str) -> Self {
+        match (base.nodes.get(module), head.nodes.get(module)) {
+            (None, _) => Self::Added,
+            (Some(_), None) => Self::Deleted,
+            (Some(old), Some(new)) if old.hash != new.hash => Self::Updated,
+            _ => Self::Unchanged,
+        }
     }
-    // An external edge points to no module, so it has no node to draw.
-    let arrows: BTreeSet<(&str, &str)> = graph
-        .edges
-        .iter()
-        .filter(|edge| !edge.test && !edge.external)
-        .map(|edge| (edge.from.as_str(), edge.to.as_str()))
-        .collect();
+
+    /// The class assignment of a node with this status.
+    fn class(self) -> &'static str {
+        match self {
+            Self::Added => ":::added",
+            Self::Updated => ":::updated",
+            Self::Deleted => ":::deleted",
+            Self::Unchanged => "",
+        }
+    }
+}
+
+/// A Mermaid flowchart of the modules of `base` and `head`: one subgraph for each layer, one node
+/// for each module with the class of its change, and one arrow for each distinct module edge
+/// outside test code. The arrows of a deleted module come from `base` and are dashed.
+#[must_use]
+pub fn render(base: &Graph, head: &Graph) -> String {
     let mut lines = vec!["flowchart LR".to_owned()];
-    for (layer, modules) in &layers {
+    for (layer, nodes) in layers(base, head) {
         lines.push(format!("    subgraph {layer}"));
-        lines.extend(modules.iter().map(|module| node(module)));
+        lines.extend(nodes);
         lines.push("    end".to_owned());
     }
-    lines.extend(
-        arrows
-            .iter()
-            .map(|(from, to)| format!("    {} --> {}", node_id(from), node_id(to))),
-    );
+    lines.extend(links(base, head));
+    // The file and the layer of a node are functions of its module path. Thus the node maps
+    // differ exactly when a module is not `Unchanged`.
+    if base.nodes != head.nodes {
+        lines.extend(CLASSES.map(str::to_owned));
+    }
     lines.push(String::new());
     lines.join("\n")
 }
 
-/// The node line of `module`, labeled with its last segment.
-fn node(module: &str) -> String {
+/// The node lines of the modules of `base` and `head`, for each layer.
+fn layers<'graph>(base: &'graph Graph, head: &'graph Graph) -> BTreeMap<&'graph str, Vec<String>> {
+    let modules: BTreeMap<&str, &str> = base
+        .nodes
+        .iter()
+        .chain(&head.nodes)
+        .map(|(module, node)| (module.as_str(), node.layer.as_str()))
+        .collect();
+    let mut layers: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    for (module, layer) in modules {
+        let status = Status::of(base, head, module);
+        layers.entry(layer).or_default().push(node(module, status));
+    }
+    layers
+}
+
+/// The arrow lines: solid for the edges of `head`, dashed for the edges of `base` that touch a
+/// deleted module.
+fn links(base: &Graph, head: &Graph) -> Vec<String> {
+    let deleted = |module: &str| !head.nodes.contains_key(module);
+    let dashed = arrows(base);
+    let dashed = dashed
+        .iter()
+        .filter(|(from, to)| deleted(from) || deleted(to))
+        .map(|arrow| line(arrow, "-.->"));
+    let solid = arrows(head);
+    let solid = solid.iter().map(|arrow| line(arrow, "-->"));
+    solid.chain(dashed).collect()
+}
+
+/// The distinct module edges of `graph` outside test code.
+fn arrows(graph: &Graph) -> BTreeSet<(&str, &str)> {
+    // An external edge points to no module, so it has no node to draw.
+    graph
+        .edges
+        .iter()
+        .filter(|edge| !edge.test && !edge.external)
+        .map(|edge| (edge.from.as_str(), edge.to.as_str()))
+        .collect()
+}
+
+/// The arrow line from `from` to `to` with the Mermaid link `link`.
+fn line((from, to): &(&str, &str), link: &str) -> String {
+    format!("    {} {link} {}", node_id(from), node_id(to))
+}
+
+/// The node line of `module`, labeled with its last segment, with the class of `status`.
+fn node(module: &str, status: Status) -> String {
     let label = module.rsplit("::").next().unwrap_or_default();
-    format!("        {}[{label}]", node_id(module))
+    format!("        {}[{label}]{}", node_id(module), status.class())
 }
 
 /// The Mermaid node ID of `module`.
@@ -55,7 +134,7 @@ fn node_id(module: &str) -> String {
 pub fn document(graph: &Graph) -> String {
     format!(
         "# Architecture\n\nCI writes this file from the module graph on each commit to `main`.\n\n```mermaid\n{}```\n",
-        render(graph)
+        render(graph, graph)
     )
 }
 
@@ -69,10 +148,32 @@ pub fn write(root: &Path, file: &Path) -> Result<(), String> {
     fs::write(file, document(&graph)).map_err(|error| format!("{}: {error}", file.display()))
 }
 
+/// The Mermaid block of the crate in `root`, from the Git revision `reference` to the working tree.
+///
+/// # Errors
+///
+/// When a graph does not build. The error names the file.
+pub fn changes(root: &Path, reference: &str) -> Result<String, String> {
+    let base = graph::build_at(root, reference)?;
+    let head = graph::build(root)?;
+    Ok(format!("```mermaid\n{}```\n", render(&base, &head)))
+}
+
 /// Writes the document of the crate in the current folder to `file`.
 #[must_use]
 pub fn run(file: &str) -> ExitCode {
-    match write(Path::new("."), Path::new(file)) {
+    exit(write(Path::new("."), Path::new(file)))
+}
+
+/// Prints the Mermaid block of the crate in the current folder from the Git revision `reference`.
+#[must_use]
+pub fn run_base(reference: &str) -> ExitCode {
+    exit(changes(Path::new("."), reference).map(|block| print!("{block}")))
+}
+
+/// The exit code of `result`. An error goes to the standard error.
+fn exit(result: Result<(), String>) -> ExitCode {
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
@@ -120,7 +221,7 @@ mod tests {
 
     /// The number of arrows in the diagram of `graph`.
     fn arrows(graph: &Graph) -> usize {
-        render(graph).matches(" --> ").count()
+        render(graph, graph).matches(" --> ").count()
     }
 
     /// Two renders of one graph are equal.
@@ -133,9 +234,9 @@ mod tests {
                 ("crate::ports", "crate::domain::intent", false),
             ],
         );
-        let first = render(&graph);
+        let first = render(&graph, &graph);
         assert!(!first.is_empty(), "expected a diagram");
-        assert_eq!(first, render(&graph));
+        assert_eq!(first, render(&graph, &graph));
     }
 
     /// Two edges with the same `from` and `to` give one arrow.
@@ -179,13 +280,14 @@ mod tests {
             ],
             &[],
         );
-        assert_eq!(render(&graph).matches("subgraph ").count(), 4);
+        assert_eq!(render(&graph, &graph).matches("subgraph ").count(), 4);
     }
 
     /// The node ID is the path with `::` replaced by `_`, and the label is the last segment.
     #[test]
     fn ac_0_9_5_node_id() {
-        let diagram = render(&graph(&["crate::domain::intent"], &[]));
+        let graph = graph(&["crate::domain::intent"], &[]);
+        let diagram = render(&graph, &graph);
         assert!(
             diagram.contains("crate_domain_intent[intent]\n"),
             "expected the node crate_domain_intent, got {diagram}"
@@ -202,7 +304,8 @@ mod tests {
         let file = folder.path().join("architecture.md");
         write(root, &file).expect("the diagram is written");
         let content = fs::read_to_string(&file).expect("the file is read");
-        let diagram = render(&graph::build(root).expect("the graph builds"));
+        let graph = graph::build(root).expect("the graph builds");
+        let diagram = render(&graph, &graph);
         assert!(
             content.starts_with("# Architecture\n"),
             "no title: {content}"
@@ -216,5 +319,85 @@ mod tests {
             content.contains(&format!("```mermaid\n{diagram}```\n")),
             "no diagram: {content}"
         );
+    }
+
+    /// The diagram from `base` to `head`, with a check that it has `line`.
+    fn assert_line(base: &Graph, head: &Graph, line: &str) -> String {
+        let diagram = render(base, head);
+        assert!(
+            diagram.lines().any(|candidate| candidate.trim() == line),
+            "expected the line {line}, got {diagram}"
+        );
+        diagram
+    }
+
+    /// A module only in head is `added`.
+    #[test]
+    fn ac_0_10_1_added_module() {
+        let base = graph(&["crate"], &[]);
+        let head = graph(&["crate", "crate::ports"], &[]);
+        assert_line(&base, &head, "crate_ports[ports]:::added");
+    }
+
+    /// A module in both with different content is `updated`.
+    #[test]
+    fn ac_0_10_2_updated_module() {
+        let base = graph(&["crate", "crate::ports"], &[]);
+        let mut head = base.clone();
+        head.nodes
+            .get_mut("crate::ports")
+            .expect("the module exists")
+            .hash = 1;
+        assert_line(&base, &head, "crate_ports[ports]:::updated");
+        assert_line(&base, &head, "crate[crate]");
+    }
+
+    /// A module only in base is `deleted`, and its arrows are dashed.
+    #[test]
+    fn ac_0_10_3_deleted_module() {
+        let base = graph(
+            &["crate", "crate::app::x", "crate::ports"],
+            &[
+                ("crate::app::x", "crate::ports", false),
+                ("crate", "crate::app::x", false),
+            ],
+        );
+        let head = graph(
+            &["crate", "crate::app::x"],
+            &[("crate", "crate::app::x", false)],
+        );
+        assert_line(&base, &head, "crate_ports[ports]:::deleted");
+        assert_line(&base, &head, "crate_app_x -.-> crate_ports");
+        assert_line(&base, &head, "crate --> crate_app_x");
+    }
+
+    /// A module in both with the same content has no class.
+    #[test]
+    fn ac_0_10_4_unchanged_module() {
+        let base = graph(&["crate", "crate::ports"], &[]);
+        let head = graph(&["crate", "crate::ports", "crate::app::x"], &[]);
+        assert_line(&base, &head, "crate_ports[ports]");
+    }
+
+    /// The diagram of one Git revision against itself has no class assignments.
+    #[test]
+    fn ac_0_10_5_same_graphs_have_no_classes() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask is a folder of the repository root");
+        let graph = graph::build_at(root, "HEAD").expect("the graph builds");
+        assert!(graph.nodes.contains_key("crate"), "no root module");
+        let diagram = render(&graph, &graph);
+        assert!(!diagram.contains(":::"), "expected no class, got {diagram}");
+    }
+
+    /// The class definitions have the change colors.
+    #[test]
+    fn ac_0_10_6_class_fills() {
+        let base = graph(&["crate::ports"], &[]);
+        let head = graph(&["crate::app::x"], &[]);
+        assert_line(&base, &head, "classDef added fill:#2da44e");
+        assert_line(&base, &head, "classDef updated fill:#fb8500");
+        assert_line(&base, &head, "classDef deleted fill:#cf222e");
     }
 }

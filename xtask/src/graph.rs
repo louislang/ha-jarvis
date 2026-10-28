@@ -7,6 +7,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::iter;
 use std::mem;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use syn::buffer::{Cursor, TokenBuffer};
 use syn::punctuated::Punctuated;
@@ -316,10 +317,31 @@ fn read(root: &Path, file: &Path) -> Result<String, String> {
     fs::read_to_string(root.join(file)).map_err(|error| format!("{}: {error}", file.display()))
 }
 
+/// The content of the file `file` at the Git revision `reference` of the repository in `root`.
+/// The error names the revision and the file.
+fn show(root: &Path, reference: &str, file: &Path) -> Result<String, String> {
+    let object = format!("{reference}:{}", file.display());
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", &object])
+        .output()
+        .map_err(|error| format!("{object}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{object}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    String::from_utf8(output.stdout).map_err(|error| format!("{object}: {error}"))
+}
+
 /// The crate names that start an external path: the dependencies of `Cargo.toml`, also of each
 /// target, `std`, `core` and `alloc`.
-fn dependencies(root: &Path) -> Result<BTreeSet<String>, String> {
-    let manifest: Table = read(root, Path::new("Cargo.toml"))?
+fn dependencies(
+    read: &impl Fn(&Path) -> Result<String, String>,
+) -> Result<BTreeSet<String>, String> {
+    let manifest: Table = read(Path::new("Cargo.toml"))?
         .parse()
         .map_err(|error| format!("Cargo.toml: {error}"))?;
     let targets = manifest.get("target").and_then(Value::as_table);
@@ -346,13 +368,13 @@ fn dependencies(root: &Path) -> Result<BTreeSet<String>, String> {
 /// Adds the node and the edges of `module` to `graph`. A module edge keeps its full path.
 /// Returns the declared modules.
 fn add_module(
-    root: &Path,
+    read: &impl Fn(&Path) -> Result<String, String>,
     dependencies: &BTreeSet<String>,
     module: &Found,
     graph: &mut Graph,
 ) -> Result<Vec<Found>, String> {
     let file = file_of(&module.path);
-    let content = read(root, &file)?;
+    let content = read(&file)?;
     let syntax =
         syn::parse_file(&content).map_err(|error| format!("{}: {error}", file.display()))?;
     let mut visitor = FileVisitor {
@@ -380,14 +402,29 @@ fn add_module(
 ///
 /// When `Cargo.toml` or a module file cannot be read or parsed. The error names the file.
 pub fn build(root: &Path) -> Result<Graph, String> {
-    let dependencies = dependencies(root)?;
+    build_from(&|file| read(root, file))
+}
+
+/// Builds the graph of the crate in `root` from its files at the Git revision `reference`.
+///
+/// # Errors
+///
+/// When `git show` fails for `Cargo.toml` or a module file, or the file cannot be parsed. The
+/// error names the file.
+pub fn build_at(root: &Path, reference: &str) -> Result<Graph, String> {
+    build_from(&|file| show(root, reference, file))
+}
+
+/// Builds the graph of the crate whose files `read` gives.
+fn build_from(read: &impl Fn(&Path) -> Result<String, String>) -> Result<Graph, String> {
+    let dependencies = dependencies(read)?;
     let mut graph = Graph::default();
     let mut pending = vec![Found {
         path: vec!["crate".to_owned()],
         test: false,
     }];
     while let Some(module) = pending.pop() {
-        pending.extend(add_module(root, &dependencies, &module, &mut graph)?);
+        pending.extend(add_module(read, &dependencies, &module, &mut graph)?);
     }
     let edges = mem::take(&mut graph.edges);
     graph.edges = edges

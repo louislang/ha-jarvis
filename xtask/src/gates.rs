@@ -803,17 +803,20 @@ fn ac_0_5_3_setup_installs_gh_stack() {
     );
 }
 
-/// CI runs `pr-size` only on PRs, with the full history and the PR base.
-#[test]
-fn ac_0_6_6_ci_runs_pr_size_on_pull_requests() {
-    let ci = yaml(".github/workflows/ci.yml");
-    let job = &ci["jobs"]["pr-size"];
+/// Checks that the CI job `job` runs only on PRs, with the full history, and that a command has
+/// `command`. Returns the job.
+fn assert_pull_request_job<'workflow>(
+    ci: &'workflow serde_yaml::Value,
+    job: &str,
+    command: &str,
+) -> &'workflow serde_yaml::Value {
+    let steps = &ci["jobs"][job];
     assert_eq!(
-        job["if"].as_str(),
+        steps["if"].as_str(),
         Some("github.event_name == 'pull_request'"),
-        "pr-size runs only on pull_request"
+        "{job} runs only on pull_request"
     );
-    let checkout = job["steps"]
+    let checkout = steps["steps"]
         .as_sequence()
         .expect("the job has steps")
         .iter()
@@ -824,12 +827,21 @@ fn ac_0_6_6_ci_runs_pr_size_on_pull_requests() {
         })
         .expect("the job checks out");
     assert_eq!(checkout["with"]["fetch-depth"].as_u64(), Some(0));
-    let commands = runs(&ci, "pr-size");
+    let commands = runs(ci, job);
     assert!(
-        commands
-            .iter()
-            .any(|command| command.contains("pr-size --base origin/${{ github.base_ref }}")),
-        "pr-size passes the PR base, it runs {commands:?}"
+        commands.iter().any(|run| run.contains(command)),
+        "{job} runs {command}, it runs {commands:?}"
+    );
+    steps
+}
+
+/// CI runs `pr-size` only on PRs, with the full history and the PR base.
+#[test]
+fn ac_0_6_6_ci_runs_pr_size_on_pull_requests() {
+    assert_pull_request_job(
+        &yaml(".github/workflows/ci.yml"),
+        "pr-size",
+        "pr-size --base origin/${{ github.base_ref }}",
     );
 }
 
@@ -837,4 +849,38 @@ fn ac_0_6_6_ci_runs_pr_size_on_pull_requests() {
 #[test]
 fn ac_0_8_8_check_and_ci_run_architecture_gate() {
     assert_check_and_ci_run_after("duplication", "architecture");
+}
+
+/// CI posts the PR diagram against the PR base in one comment with the marker.
+#[test]
+fn ac_0_10_7_ci_posts_diagram_on_pull_requests() {
+    let ci = yaml(".github/workflows/ci.yml");
+    let job = assert_pull_request_job(
+        &ci,
+        "diagram",
+        "diagram --base origin/${{ github.base_ref }}",
+    );
+    assert_eq!(
+        job["permissions"]["pull-requests"].as_str(),
+        Some("write"),
+        "diagram can write PR comments"
+    );
+    let marker = "<!-- jarvis-architecture -->";
+    let step = steps(&ci)
+        .into_iter()
+        .find(|step| {
+            step["run"]
+                .as_str()
+                .is_some_and(|run| run.contains("diagram --base"))
+        })
+        .expect("a step draws the diagram");
+    let run = step["run"].as_str().unwrap_or_default();
+    assert_eq!(step["env"]["MARKER"].as_str(), Some(marker));
+    for command in [
+        "$GITHUB_STEP_SUMMARY",
+        "startswith(\\\"$MARKER\\\")",
+        "--method PATCH",
+    ] {
+        assert!(run.contains(command), "diagram runs {command}: {run}");
+    }
 }
