@@ -250,6 +250,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `.pre-commit-config.yaml` | — | The pre-commit hook. `setup` writes the pre-push guard to `.git/hooks/pre-push` (sub-phase 0.17). | 0.1 |
 | `.github/workflows/ci.yml` | — | The required checks for each push and PR. | 0.1 |
 | `.github/pull_request_template.md` | — | The PR description template. | 0.5 |
+| `.github/actionlint.yaml` | — | The `actionlint` configuration: the label `gpu` of the self-hosted runner. | 0.13 |
 | `.github/workflows/architecture.yml` | — | Diagram regeneration on each commit to `main`. | 0.11 |
 | `.github/workflows/release.yml` | — | Release binaries and the training image for each `v*` tag. | 0.14 |
 | `xtask/Cargo.toml` | Tools | The `xtask` crate. | 0.1 |

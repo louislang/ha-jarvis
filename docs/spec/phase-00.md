@@ -419,9 +419,9 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 **Goal:** Add the `gpu-test` CI job on the GPU host as a self-hosted runner. Every `[GPU host]` criterion is gated on each PR, on the real hardware.
 
 - **Implements:** G18, G22. **Depends on:** 0.12.
-- **Files:** modify `justfile`, `.github/workflows/ci.yml`, `xtask/src/gates.rs`, `.github/pull_request_template.md`.
+- **Files:** create `.github/actionlint.yaml`. Modify `justfile`, `.github/workflows/ci.yml`, `xtask/src/gates.rs`, `.github/pull_request_template.md`.
 
-**Model.** `gpu-test` runs `cargo test --workspace --release -- --ignored` with `JARVIS_DEVICE=cuda`. The GPU host also runs the live Jarvis as the systemd unit `jarvis` (`01-architecture.md` section 10). Thus the `gpu-test` job stops the `jarvis` service before the tests and starts it again after them, also when they fail, so the tests get the whole GPU and the latency is not noisy. Live Jarvis is down while the job runs: a push of a stack with N layers stops it N times. The CI job `gpu-test` runs on `[self-hosted, linux, gpu]` for `push` and `pull_request`. On the GPU host, `check` also runs `gpu-test` when `JARVIS_DEVICE=cuda` is set, so the hook gates it there.
+**Model.** `gpu-test` runs `cargo test --workspace --release -- --ignored` with `JARVIS_DEVICE=cuda`. The GPU host also runs the live Jarvis as the systemd unit `jarvis` (`01-architecture.md` section 10). Thus the `gpu-test` job stops the `jarvis` service before the tests and starts it again after them, also when they fail, so the tests get the whole GPU and the latency is not noisy. Live Jarvis is down while the job runs: a push of a stack with N layers stops it N times. The CI job `gpu-test` runs on `[self-hosted, linux, gpu]` for `push` and `pull_request`. On the GPU host, `check` also runs `gpu-test` when `JARVIS_DEVICE=cuda` is set, so the hook gates it there. `actionlint` knows only the GitHub-hosted labels and the standard self-hosted labels. `.github/actionlint.yaml` declares the label `gpu`.
 
 **Acceptance criteria.**
 
