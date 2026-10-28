@@ -34,6 +34,10 @@ duplication:
 architecture:
     cargo run -p xtask -- rules
 
+# Write the architecture diagram.
+diagram:
+    cargo run -p xtask -- diagram docs/architecture.md
+
 # Lint the workflows.
 workflow-lint:
     actionlint

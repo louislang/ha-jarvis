@@ -7,23 +7,22 @@ mod complexity;
 #[cfg(test)]
 mod gates;
 mod graph;
+mod mermaid;
 mod pr_size;
 mod rules;
 
 /// Entry point of the `xtask` command line.
 fn main() -> ExitCode {
     let arguments: Vec<String> = env::args().skip(1).collect();
-    match arguments.as_slice() {
-        [command, paths @ ..] if command == "complexity" => complexity::run(paths),
-        [command, base_flag, base, limit_flag, limit]
-            if command == "pr-size" && base_flag == "--base" && limit_flag == "--limit" =>
-        {
-            pr_size::run(base, limit)
-        }
-        [command] if command == "rules" => rules::run(),
+    let words: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    match words.as_slice() {
+        ["complexity", ..] => complexity::run(arguments.get(1..).unwrap_or_default()),
+        ["pr-size", "--base", base, "--limit", limit] => pr_size::run(base, limit),
+        ["rules"] => rules::run(),
+        ["diagram", file] => mermaid::run(file),
         _ => {
             eprintln!(
-                "usage: xtask complexity <paths> | xtask pr-size --base <ref> --limit <n> | xtask rules"
+                "usage: xtask complexity <paths> | xtask pr-size --base <ref> --limit <n> | xtask rules | xtask diagram <file>"
             );
             ExitCode::FAILURE
         }
