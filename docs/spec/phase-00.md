@@ -553,3 +553,41 @@ Each build makes `jarvis-<tag>-<target>.tar.gz` with the binary and its shared l
 
 - P-0.17-1. Ensures: the exit code is 1 if and only if a line has the remote ref `refs/heads/main`. Argument: `guard-push` is `any(line.remote_ref == "refs/heads/main")` over all lines, mapped to exit code 1. It does not skip deletions.
 - P-0.17-2, P-0.17-3. Evidence: test.
+
+---
+
+### 0.18 Verus Gate
+
+**Goal:** Add the `verus` gate in the hook and in CI. From sub-phase 2.1 on, each domain sub-phase writes Verus proofs, and this gate proves them before the merge.
+
+- **Implements:** G22, G23. **Depends on:** 0.17.
+- **Files:** create `src/domain/contracts.rs`. Modify `Cargo.toml`, `rust-toolchain.toml`, `src/lib.rs`, `justfile`, `.github/workflows/ci.yml`, `.github/pull_request_template.md`, `xtask/src/gates.rs`.
+
+**Model.**
+
+- `Cargo.toml`: the `jarvis` package depends on `vstd` and has `[package.metadata.verus] verify = true`. The workspace lints declare the `verus_only` cfg (`unexpected_cfgs`), so a normal build gives no warning.
+- `rust-toolchain.toml`: the channel is the Rust version that the pinned Verus release requires.
+- `src/domain/contracts.rs` has its module doc comment and an empty `verus!` block. `src/lib.rs` declares the module `domain::contracts`.
+- `justfile`: the variable `verus_version` and the recipe `install-verus`. The recipe downloads the release `verus_version` for the platform (`x86-linux`, `x86-macos` or `arm64-macos`) from the Verus GitHub releases, unpacks it to `~/.verus/<verus_version>/`, and installs the Rust toolchain that the release requires. The recipe `verus` runs `cargo verus verify -p jarvis` with that folder on the `PATH`. `check` runs `verus` after `quint`.
+- CI job `verus` on `ubuntu-latest`: `just install-verus`, then `just verus`. The job `rust-test` also runs `just install-verus`, for the gate tests.
+- `.github/pull_request_template.md`: a check box for `verus`.
+- `verus_findings(files) -> Vec<Finding>` in `xtask/src/gates.rs` reads Rust files with `syn`. It does not enter a `#[cfg(test)]` module. It gives a finding for:
+  1. Each function outside a `verus!` block without `#[verus_spec]` or `#[verus_verify]` on the function or on its `impl` block.
+  2. Each trusted item in a file other than `src/domain/contracts.rs`: an `assume_specification`, a call of `assume` or `admit`, or an attribute whose name starts with `external`. This check also reads the tokens inside `verus!` blocks.
+- A structure test runs `verus_findings` on `src/domain/`.
+
+**Acceptance criteria.**
+
+- AC-0.18-1: When a fixture crate has a function whose `ensures` clause does not hold, `cargo verus verify` exits with a non-zero code and names the function. When the clause holds, it exits with code 0.
+- AC-0.18-2: When a fixture function returns the sum of two `u32` parameters and has no `requires` clause, `cargo verus verify` exits with a non-zero code. With `requires a < 1000, b < 1000`, it exits with code 0.
+- AC-0.18-3: When `just verus` runs two times on the same code, the exit codes and the result of each function are the same.
+- AC-0.18-4: When a fixture domain file has a function without `#[verus_spec]` or `#[verus_verify]`, `verus_findings` returns that function. A method in an `impl` block with `#[verus_verify]`, a function in a `#[cfg(test)]` module and a spec function in a `verus!` block give no finding.
+- AC-0.18-5: When a fixture domain file has an `assume_specification`, a call of `admit` in a `verus!` block and a `#[verus_verify(external_body)]` attribute, `verus_findings` returns each of them with the file. The same file at the path `src/domain/contracts.rs` gives no finding.
+- AC-0.18-6: When `verus_findings` runs on `src/domain/`, it returns no finding.
+- AC-0.18-7: When `verus --version` runs, the version in its `Toolchain` line equals the channel of `rust-toolchain.toml`.
+- AC-0.18-8: When the `justfile` is dumped, `check` runs `verus` after `quint`, and `verus` runs `cargo verus verify -p jarvis`. When `ci.yml` is parsed, the job `verus` runs `just install-verus` and `just verus`, and the job `rust-test` runs `just install-verus`. The PR template has a check box for `verus`.
+
+**Proofs.**
+
+- P-0.18-4, P-0.18-5. Ensures: a function outside the test modules and the `verus!` blocks is in the result if and only if neither it nor its `impl` block has `#[verus_spec]` or `#[verus_verify]`. A trusted item is in the result if and only if its file is not `src/domain/contracts.rs`. Argument: the walk visits each item of each file once and does not enter a `#[cfg(test)]` module. The attribute check is a disjunction over the function and its `impl` block. The trusted-item check reads every token of the file, also inside `verus!` blocks, and then filters by the file path.
+- P-0.18-1 to P-0.18-3, P-0.18-6 to P-0.18-8. Evidence: test.

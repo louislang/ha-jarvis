@@ -8,7 +8,7 @@ This phase loads `jarvis.toml` and the secrets. Each later sub-phase adds only t
 
 **Goal:** Add `Config`, which parses `jarvis.toml` with defaults and rejects unknown fields. Jarvis now has one typed source for all settings, and a typo in the file fails at startup.
 
-- **Implements:** G10. **Depends on:** 0.17.
+- **Implements:** G10. **Depends on:** 0.18.
 - **Files:** create `jarvis.toml`. Modify `src/lib.rs`, `Cargo.toml`.
 
 **Model.**

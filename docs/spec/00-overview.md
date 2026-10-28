@@ -30,14 +30,14 @@ Each sub-phase is exactly one pull request (PR) with one concern. Each sub-phase
 | Goal | One or two sentences: what the sub-phase must achieve and why. It is written before the code. It is not the PR summary. |
 | Implements | The goals (section 1) that the sub-phase serves. |
 | Depends on | The sub-phases that must be merged first. |
-| Files | The files that the PR creates, modifies or deletes. No other files are permitted. |
+| Files | The files that the PR creates, modifies or deletes. No other files are permitted. A sub-phase that writes domain code can also modify `src/domain/contracts.rs` (`02-rules.md` section 5.1, rule 8). |
 | Quint | The Quint model that the sub-phase writes or checks against, if any. |
-| Model | A high-level description of the data, the functions and the invariants. Verus specifications come from this part later. |
+| Model | A high-level description of the data, the functions and the invariants. The Verus spec functions of a domain sub-phase come from this part. |
 | Acceptance criteria | Numbered, binary, testable statements. `AC-<phase>.<n>-<k>`. |
-| Proofs | Plain-English proofs for each criterion about Jarvis logic. `P-<phase>.<n>-<k>`. `02-rules.md` section 5 gives the format. |
+| Proofs | Plain-English proofs for each criterion about Jarvis logic. `P-<phase>.<n>-<k>`. A proof about a domain function is also a Verus proof in the same PR. `02-rules.md` section 5 gives the format. |
 | Field log | Optional. Steps on real hardware or accounts that are not tests. |
 
-Every acceptance criterion gets a test before any code of the sub-phase is written (`02-rules.md` section 6). A sub-phase is complete only when all of its acceptance tests pass. A phase is complete only when the acceptance tests of all of its sub-phases pass on `main`.
+Every acceptance criterion gets a test before any code of the sub-phase is written (`02-rules.md` section 6). Every domain function gets its Verus clauses before its body (`02-rules.md` section 6.1). A sub-phase is complete only when all of its acceptance tests pass. A phase is complete only when the acceptance tests of all of its sub-phases pass on `main`.
 
 Tags on acceptance criteria:
 
@@ -138,6 +138,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | G20 | CI draws the module graph as a Mermaid diagram. On a PR, new modules are green, updated modules are orange and deleted modules are red. On each commit to `main`, CI writes the full diagram to `docs/architecture.md`. |
 | G21 | Each PR has one concern, starts in a fresh context, is one layer of the phase's stack of PRs, has at most 400 changed lines, a two- or three-sentence summary written after the code, short bullet points and a check box for each required check, and gets a Codex code review with all threads resolved. |
 | G22 | Every test is deterministic. Every check is a gated check in the pre-commit hook and in CI, not only a rule in `CLAUDE.md`. |
+| G23 | Each proof about a domain function is a Verus proof, written in the same PR as the function. Verus also proves that no domain function overflows an integer, indexes out of bounds or fails an `expect`. The only trusted code is the contracts in `src/domain/contracts.rs`. |
 
 ### 1.1 Example System One Requests
 
@@ -179,7 +180,6 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 - Wake word detection. The satellite does this with microWakeWord.
 - Custom satellite firmware.
 - Languages other than English.
-- Machine-checked Verus proofs. The proofs in this specification are plain English. They are written so that they can become Verus specifications later.
 
 ---
 
@@ -189,7 +189,7 @@ Each line is one PR.
 
 | Phase | Sub-phases |
 |---|---|
-| [0 Repository and Delivery](phase-00.md) | 0.1 Repository, coverage gate, hook and CI · 0.2 Lint gates · 0.3 Complexity gate · 0.4 Duplication gate · 0.5 PR template, stacks and review · 0.6 PR size gate · 0.7 Module graph · 0.7b Module graph paths · 0.8 Layer and modularity rules · 0.9 Architecture diagram · 0.10 PR diagram with change colors · 0.11 Diagram on `main` · 0.12 Quint gate · 0.13 GPU runner · 0.14 Release workflow · 0.15 Merge rules · 0.16 Merge command · 0.17 Pre-push guard |
+| [0 Repository and Delivery](phase-00.md) | 0.1 Repository, coverage gate, hook and CI · 0.2 Lint gates · 0.3 Complexity gate · 0.4 Duplication gate · 0.5 PR template, stacks and review · 0.6 PR size gate · 0.7 Module graph · 0.7b Module graph paths · 0.8 Layer and modularity rules · 0.9 Architecture diagram · 0.10 PR diagram with change colors · 0.11 Diagram on `main` · 0.12 Quint gate · 0.13 GPU runner · 0.14 Release workflow · 0.15 Merge rules · 0.16 Merge command · 0.17 Pre-push guard · 0.18 Verus gate |
 | [1 Configuration](phase-01.md) | 1.1 Configuration file · 1.2 Secrets from the environment |
 | [2 Home and Hot Cache](phase-02.md) | 2.1 Home port and reference house · 2.2 HA connection and authentication · 2.3 HA requests and snapshot · 2.4 HA events and reconnect · 2.5 HA service calls · 2.6 Cache sync Quint model · 2.7 State cache updates · 2.8 State cache queries · 2.9 Sync use case |
 | [3 System One Model](phase-03.md) | 3.1 Normalize and example markup · 3.2 Intent catalog · 3.3 Seed training set · 3.4 Dataset command · 3.5 Python project and gates · 3.6 Training set loader and tag alignment · 3.7 Joint model and loss · 3.8 Training loop and ONNX export · 3.9 Fixture model · 3.10 Training image release · 3.11 Model output functions · 3.12 Classifier port and ONNX adapter |
