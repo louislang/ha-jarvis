@@ -397,7 +397,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - **Implements:** G19, G22. **Depends on:** 0.11.
 - **Files:** modify `justfile`, `.github/workflows/ci.yml`, `.gitignore`, `xtask/src/gates.rs`, `.github/pull_request_template.md`.
 
-**Model.** Each model defines `val allInvariants`. `just quint` runs for each `quint/*.qnt`: `quint typecheck`, `quint test --seed=1`, `quint run --seed=1 --invariant=allInvariants --max-samples=10000 --max-steps=30` and `quint verify --invariant=allInvariants --max-steps=10`. With no model, it exits with code 0. `check` runs `quint` after `architecture`. CI job `quint` with Node and Java 17. The `rust-test` job also installs Node and the Quint CLI, because `quint-connect` runs Quint. `.gitignore` adds `_apalache-out/`.
+**Model.** Each model defines `val allInvariants`. `just quint` runs for each `quint/*.qnt`: `quint typecheck`, `quint test --seed=1 --match='^ac_'`, `quint run --seed=1 --invariant=allInvariants --max-samples=10000 --max-steps=30` and `quint verify --invariant=allInvariants --max-steps=10`. With no model, it exits with code 0. `check` runs `quint` after `architecture`. CI job `quint` with Node and Java 21. The `rust-test` job also installs the Quint CLI and puts Java 21 on `PATH`, because the gate tests and `quint-connect` run Quint. Apalache takes `java` from `PATH`. The `ubuntu-latest` runner has Node and Java 21 (`JAVA_HOME_21_X64`). Gate tests that run `quint verify` run one at a time, because each `quint verify` starts an Apalache server on the same port. `.gitignore` adds `_apalache-out/`.
 
 **Acceptance criteria.**
 

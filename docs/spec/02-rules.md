@@ -82,7 +82,7 @@ Do not turn off a rule with `# noqa` or `# type: ignore` to pass a check. Change
 4. The model is merged in its own PR before the Rust code that implements it.
 5. `just quint` runs these commands for each model:
    - `quint typecheck`.
-   - `quint test --seed=1` (the `run` tests in the model).
+   - `quint test --seed=1 --match='^ac_'` (the `run` tests in the model). Without `--match`, Quint runs only the names that end with `Test`. Section 6.1 names the tests `ac_<phase>_<n>_<k>_<words>`.
    - `quint run --seed=1 --invariant=allInvariants --max-samples=10000 --max-steps=30`.
    - `quint verify --invariant=allInvariants --max-steps=10` (Apalache).
 6. A conformance test uses `quint-connect` to replay 100 traces of 30 steps, from fixed seeds, against the Rust code. After each step, the Rust state must equal the model state. The driver is in the test block of the Rust module. The system driver (sub-phases 16.2 and 16.4) is in `src/testing/e2e.rs`, because it uses all modules.
