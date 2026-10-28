@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::iter;
 use std::mem;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,7 @@ use syn::{
     Attribute, Expr, Ident, ImplItemFn, Item, Macro, Token, TraitItemFn, UseTree, VisRestricted,
 };
 use toml::Table;
+use toml::Value;
 
 /// A module of the graph.
 #[derive(Clone, Debug, PartialEq)]
@@ -209,14 +211,24 @@ fn path_separator(cursor: Cursor<'_>) -> Option<Cursor<'_>> {
     (first.as_char() == ':' && second.as_char() == ':').then_some(next)
 }
 
-/// The attributes of the items that can hold a `use` item.
+/// The attributes of `item`.
 fn attributes(item: &Item) -> &[Attribute] {
     match item {
-        Item::Fn(item) => &item.attrs,
-        Item::Impl(item) => &item.attrs,
-        Item::Mod(item) => &item.attrs,
-        Item::Trait(item) => &item.attrs,
-        Item::Use(item) => &item.attrs,
+        Item::Const(syn::ItemConst { attrs, .. })
+        | Item::Enum(syn::ItemEnum { attrs, .. })
+        | Item::ExternCrate(syn::ItemExternCrate { attrs, .. })
+        | Item::Fn(syn::ItemFn { attrs, .. })
+        | Item::ForeignMod(syn::ItemForeignMod { attrs, .. })
+        | Item::Impl(syn::ItemImpl { attrs, .. })
+        | Item::Macro(syn::ItemMacro { attrs, .. })
+        | Item::Mod(syn::ItemMod { attrs, .. })
+        | Item::Static(syn::ItemStatic { attrs, .. })
+        | Item::Struct(syn::ItemStruct { attrs, .. })
+        | Item::Trait(syn::ItemTrait { attrs, .. })
+        | Item::TraitAlias(syn::ItemTraitAlias { attrs, .. })
+        | Item::Type(syn::ItemType { attrs, .. })
+        | Item::Union(syn::ItemUnion { attrs, .. })
+        | Item::Use(syn::ItemUse { attrs, .. }) => attrs,
         _ => &[],
     }
 }
@@ -304,15 +316,26 @@ fn read(root: &Path, file: &Path) -> Result<String, String> {
     fs::read_to_string(root.join(file)).map_err(|error| format!("{}: {error}", file.display()))
 }
 
-/// The crate names that start an external path: the dependencies of `Cargo.toml`, `std`, `core` and `alloc`.
+/// The crate names that start an external path: the dependencies of `Cargo.toml`, also of each
+/// target, `std`, `core` and `alloc`.
 fn dependencies(root: &Path) -> Result<BTreeSet<String>, String> {
     let manifest: Table = read(root, Path::new("Cargo.toml"))?
         .parse()
         .map_err(|error| format!("Cargo.toml: {error}"))?;
+    let targets = manifest.get("target").and_then(Value::as_table);
+    let tables = iter::once(&manifest).chain(
+        targets
+            .into_iter()
+            .flat_map(Table::values)
+            .filter_map(Value::as_table),
+    );
     let sections = ["dependencies", "dev-dependencies", "build-dependencies"];
-    let names = sections
-        .iter()
-        .filter_map(|section| manifest.get(*section)?.as_table())
+    let names = tables
+        .flat_map(|table| {
+            sections
+                .iter()
+                .filter_map(|section| table.get(*section)?.as_table())
+        })
         .flat_map(Table::keys)
         .map(|name| name.replace('-', "_"));
     Ok(names
@@ -390,7 +413,10 @@ mod tests {
     /// Builds the graph of a crate with the files `(path, content)`.
     fn graph(files: &[(&str, &str)]) -> Graph {
         let folder = TempDir::new().expect("a temporary folder");
-        let manifest = ("Cargo.toml", "[dependencies]\ntokio = \"1\"\n");
+        let manifest = (
+            "Cargo.toml",
+            "[dependencies]\ntokio = \"1\"\n[target.'cfg(unix)'.dependencies]\nlibc = \"1\"\n",
+        );
         for (path, content) in [&[manifest], files].concat() {
             let file = folder.path().join(path);
             fs::create_dir_all(file.parent().expect("a parent folder"))
@@ -467,18 +493,19 @@ mod tests {
         );
     }
 
-    /// A `use` inside a `#[cfg(test)]` module, method or trait method gives a test edge.
+    /// A path inside a `#[cfg(test)]` module, method, trait method or struct gives a test edge.
     #[test]
     fn ac_0_7_4_use_in_test_module() {
         assert_eq!(
             edges(
                 "src/app/x.rs",
-                "#[cfg(test)]\nmod tests {\n    use crate::testing::fakes::FakeHome;\n}\nimpl A {\n    #[cfg(test)]\n    fn f() {\n        use crate::ports::Home;\n    }\n}\ntrait T {\n    #[cfg(test)]\n    fn g() {\n        use crate::domain::b::C;\n    }\n}\n"
+                "#[cfg(test)]\nmod tests {\n    use crate::testing::fakes::FakeHome;\n}\nimpl A {\n    #[cfg(test)]\n    fn f() {\n        use crate::ports::Home;\n    }\n}\ntrait T {\n    #[cfg(test)]\n    fn g() {\n        use crate::domain::b::C;\n    }\n}\n#[cfg(test)]\nstruct S(crate::ports::Home);\n"
             ),
             [
                 edge("crate::app::x", "crate::testing::fakes", true),
                 edge("crate::app::x", "crate::ports", true),
                 edge("crate::app::x", "crate::domain::b", true),
+                edge("crate::app::x", "crate::ports", true),
             ]
         );
     }
@@ -534,17 +561,19 @@ mod tests {
         assert_eq!(graph.edges, [edge("crate", "crate::adapters::ha", false)]);
     }
 
-    /// A dependency path in a `use` item or in an expression gives an external edge.
+    /// A dependency path in a `use` item or in an expression gives an external edge, also for a
+    /// target dependency.
     #[test]
     fn ac_0_7b_2_external_edges() {
         assert_eq!(
             edges(
                 "src/domain/b.rs",
-                "use tokio::sync::Mutex;\nfn f() {\n    std::fs::read(\"a\");\n}\n"
+                "use tokio::sync::Mutex;\nfn f() {\n    std::fs::read(\"a\");\n    libc::getpid();\n}\n"
             ),
             [
                 external("crate::domain::b", "tokio::sync::Mutex"),
                 external("crate::domain::b", "std::fs::read"),
+                external("crate::domain::b", "libc::getpid"),
             ]
         );
     }
