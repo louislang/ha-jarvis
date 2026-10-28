@@ -7,7 +7,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 
 use syn::visit::{self, Visit};
-use syn::{Attribute, Ident, Item, UseTree};
+use syn::{Attribute, Ident, ImplItemFn, Item, TraitItemFn, UseTree};
 
 /// A module of the graph.
 #[derive(Clone, Debug, PartialEq)]
@@ -50,6 +50,7 @@ struct Found {
 }
 
 /// Collects the declared modules, the `use` paths and the alias table of one file.
+#[derive(Default)]
 struct FileVisitor {
     /// The current module path, with the inline modules.
     module: Vec<String>,
@@ -64,17 +65,6 @@ struct FileVisitor {
 }
 
 impl FileVisitor {
-    /// A visitor for the file of `module`. Test code when `test`.
-    fn new(module: Vec<String>, test: bool) -> Self {
-        Self {
-            module,
-            test_depth: usize::from(test),
-            declared: Vec::new(),
-            uses: Vec::new(),
-            aliases: BTreeMap::new(),
-        }
-    }
-
     /// A path in the current scope.
     fn found(&self, path: Vec<String>) -> Found {
         Found {
@@ -115,26 +105,43 @@ impl FileVisitor {
         self.aliases.insert(bound, path.join("::"));
         self.uses.push(self.found(path));
     }
+
+    /// Runs `visit` one test level deeper when `attributes` has `#[cfg(test)]`.
+    fn scoped(&mut self, attributes: &[Attribute], visit: impl FnOnce(&mut Self)) {
+        let test = usize::from(attributes.iter().any(is_cfg_test));
+        self.test_depth += test;
+        visit(self);
+        self.test_depth -= test;
+    }
 }
 
 impl Visit<'_> for FileVisitor {
     fn visit_item(&mut self, item: &Item) {
-        let test = usize::from(attributes(item).iter().any(is_cfg_test));
-        self.test_depth += test;
-        match item {
+        self.scoped(attributes(item), |visitor| match item {
             Item::Mod(module) => {
-                self.module.push(module.ident.to_string());
+                visitor.module.push(module.ident.to_string());
                 if module.content.is_some() {
-                    visit::visit_item_mod(self, module);
+                    visit::visit_item_mod(visitor, module);
                 } else {
-                    self.declared.push(self.found(self.module.clone()));
+                    visitor.declared.push(visitor.found(visitor.module.clone()));
                 }
-                self.module.pop();
+                visitor.module.pop();
             }
-            Item::Use(item_use) => self.add_use(&[], &item_use.tree),
-            _ => visit::visit_item(self, item),
-        }
-        self.test_depth -= test;
+            Item::Use(item_use) => visitor.add_use(&[], &item_use.tree),
+            _ => visit::visit_item(visitor, item),
+        });
+    }
+
+    fn visit_impl_item_fn(&mut self, item: &ImplItemFn) {
+        self.scoped(&item.attrs, |visitor| {
+            visit::visit_impl_item_fn(visitor, item);
+        });
+    }
+
+    fn visit_trait_item_fn(&mut self, item: &TraitItemFn) {
+        self.scoped(&item.attrs, |visitor| {
+            visit::visit_trait_item_fn(visitor, item);
+        });
     }
 }
 
@@ -182,6 +189,11 @@ fn file_of(module: &[String]) -> PathBuf {
     }
 }
 
+/// The first segment of `module` after `crate`, or `root` for `crate`.
+fn layer(module: &[String]) -> String {
+    module.get(1).map_or("root", String::as_str).to_owned()
+}
+
 /// A hash of `content`.
 fn hash(content: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -198,15 +210,18 @@ fn module_prefix(nodes: &BTreeMap<String, Node>, path: &str) -> Option<String> {
         .find(|prefix| nodes.contains_key(prefix))
 }
 
-/// Reads and parses the file of `module`, adds its node and its unresolved `use` edges to `graph`.
-/// Returns the modules that the file declares.
+/// Adds the node and the unresolved `use` edges of `module` to `graph`. Returns its declared modules.
 fn add_module(root: &Path, module: &Found, graph: &mut Graph) -> Result<Vec<Found>, String> {
     let file = file_of(&module.path);
     let content = fs::read_to_string(root.join(&file))
         .map_err(|error| format!("{}: {error}", file.display()))?;
     let syntax =
         syn::parse_file(&content).map_err(|error| format!("{}: {error}", file.display()))?;
-    let mut visitor = FileVisitor::new(module.path.clone(), module.test);
+    let mut visitor = FileVisitor {
+        module: module.path.clone(),
+        test_depth: usize::from(module.test),
+        ..FileVisitor::default()
+    };
     visitor.visit_file(&syntax);
     let from = module.path.join("::");
     graph
@@ -216,7 +231,7 @@ fn add_module(root: &Path, module: &Found, graph: &mut Graph) -> Result<Vec<Foun
             to: found.path.join("::"),
             test: found.test,
         }));
-    let layer = module.path.get(1).map_or("root", String::as_str).to_owned();
+    let layer = layer(&module.path);
     let hash = hash(&content);
     graph.nodes.insert(from, Node { file, layer, hash });
     Ok(visitor.declared)
@@ -275,8 +290,8 @@ mod tests {
         }
     }
 
-    /// The edges of `src/app/x.rs` with `source`, beside `crate::ports` and `crate::domain::b`.
-    fn app_edges(source: &str) -> Vec<Edge> {
+    /// The edges of a fixture crate where the file `path` has `source`.
+    fn edges(path: &str, source: &str) -> Vec<Edge> {
         graph(&[
             (
                 "src/lib.rs",
@@ -284,8 +299,9 @@ mod tests {
             ),
             ("src/ports.rs", ""),
             ("src/domain/b.rs", ""),
+            ("src/app/x.rs", ""),
             ("src/testing/fakes.rs", ""),
-            ("src/app/x.rs", source),
+            (path, source),
         ])
         .edges
     }
@@ -297,22 +313,16 @@ mod tests {
             ("src/lib.rs", "pub mod domain { pub mod intent; }\n"),
             ("src/domain/intent.rs", ""),
         ]);
-        let layers: Vec<(&str, &str)> = graph
-            .nodes
-            .iter()
-            .map(|(path, node)| (path.as_str(), node.layer.as_str()))
-            .collect();
-        assert_eq!(
-            layers,
-            [("crate", "root"), ("crate::domain::intent", "domain")]
-        );
+        assert_eq!(graph.nodes.len(), 2);
+        assert_eq!(graph.nodes["crate"].layer, "root");
+        assert_eq!(graph.nodes["crate::domain::intent"].layer, "domain");
     }
 
     /// A `use` of a port type gives an edge to the ports module.
     #[test]
     fn ac_0_7_2_use_gives_edge() {
         assert_eq!(
-            app_edges("use crate::ports::Home;\n"),
+            edges("src/app/x.rs", "use crate::ports::Home;\n"),
             [edge("crate::app::x", "crate::ports", false)]
         );
     }
@@ -321,7 +331,7 @@ mod tests {
     #[test]
     fn ac_0_7_3_group_gives_edge_for_each_leaf() {
         assert_eq!(
-            app_edges("use crate::{ports::A, domain::b::C};\n"),
+            edges("src/app/x.rs", "use crate::{ports::A, domain::b::C};\n"),
             [
                 edge("crate::app::x", "crate::ports", false),
                 edge("crate::app::x", "crate::domain::b", false),
@@ -329,12 +339,19 @@ mod tests {
         );
     }
 
-    /// A `use` inside `#[cfg(test)] mod tests` gives a test edge.
+    /// A `use` inside a `#[cfg(test)]` module, method or trait method gives a test edge.
     #[test]
     fn ac_0_7_4_use_in_test_module() {
         assert_eq!(
-            app_edges("#[cfg(test)]\nmod tests {\n    use crate::testing::fakes::FakeHome;\n}\n"),
-            [edge("crate::app::x", "crate::testing::fakes", true)]
+            edges(
+                "src/app/x.rs",
+                "#[cfg(test)]\nmod tests {\n    use crate::testing::fakes::FakeHome;\n}\nimpl A {\n    #[cfg(test)]\n    fn f() {\n        use crate::ports::Home;\n    }\n}\ntrait T {\n    #[cfg(test)]\n    fn g() {\n        use crate::domain::b::C;\n    }\n}\n"
+            ),
+            [
+                edge("crate::app::x", "crate::testing::fakes", true),
+                edge("crate::app::x", "crate::ports", true),
+                edge("crate::app::x", "crate::domain::b", true),
+            ]
         );
     }
 
@@ -349,7 +366,7 @@ mod tests {
     #[test]
     fn ac_0_7_6_super_resolves() {
         assert_eq!(
-            app_edges("use super::super::ports::Home;\n"),
+            edges("src/app/x.rs", "use super::super::ports::Home;\n"),
             [edge("crate::app::x", "crate::ports", false)]
         );
     }
@@ -357,16 +374,8 @@ mod tests {
     /// Every edge of a module that `src/lib.rs` declares under `#[cfg(test)]` is a test edge.
     #[test]
     fn ac_0_7_7_test_module_edges() {
-        let graph = graph(&[
-            (
-                "src/lib.rs",
-                "pub mod ports;\n#[cfg(test)]\npub mod testing { pub mod fakes; }\n",
-            ),
-            ("src/ports.rs", ""),
-            ("src/testing/fakes.rs", "use crate::ports::Home;\n"),
-        ]);
         assert_eq!(
-            graph.edges,
+            edges("src/testing/fakes.rs", "use crate::ports::Home;\n"),
             [edge("crate::testing::fakes", "crate::ports", true)]
         );
     }
@@ -377,16 +386,10 @@ mod tests {
         let file: syn::File =
             syn::parse_str("use crate::ports::Home as H;\nuse tokio::sync::Mutex;\n")
                 .expect("the source parses");
-        let mut visitor = FileVisitor::new(vec!["crate".to_owned()], false);
+        let mut visitor = FileVisitor::default();
         visitor.visit_file(&file);
-        let aliases: Vec<(&str, &str)> = visitor
-            .aliases
-            .iter()
-            .map(|(name, path)| (name.as_str(), path.as_str()))
-            .collect();
-        assert_eq!(
-            aliases,
-            [("H", "crate::ports::Home"), ("Mutex", "tokio::sync::Mutex")]
-        );
+        assert_eq!(visitor.aliases.len(), 2);
+        assert_eq!(visitor.aliases["H"], "crate::ports::Home");
+        assert_eq!(visitor.aliases["Mutex"], "tokio::sync::Mutex");
     }
 }
