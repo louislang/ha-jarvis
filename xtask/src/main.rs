@@ -19,10 +19,11 @@ fn main() -> ExitCode {
         ["complexity", ..] => complexity::run(arguments.get(1..).unwrap_or_default()),
         ["pr-size", "--base", base, "--limit", limit] => pr_size::run(base, limit),
         ["rules"] => rules::run(),
+        ["diagram", "--base", reference] => mermaid::run_base(reference),
         ["diagram", file] => mermaid::run(file),
         _ => {
             eprintln!(
-                "usage: xtask complexity <paths> | xtask pr-size --base <ref> --limit <n> | xtask rules | xtask diagram <file>"
+                "usage: xtask complexity <paths> | xtask pr-size --base <ref> --limit <n> | xtask rules | xtask diagram <file> | xtask diagram --base <ref>"
             );
             ExitCode::FAILURE
         }
