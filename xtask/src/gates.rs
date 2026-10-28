@@ -802,3 +802,33 @@ fn ac_0_5_3_setup_installs_gh_stack() {
         "setup installs github/gh-stack: {setup}"
     );
 }
+
+/// CI runs `pr-size` only on PRs, with the full history and the PR base.
+#[test]
+fn ac_0_6_6_ci_runs_pr_size_on_pull_requests() {
+    let ci = yaml(".github/workflows/ci.yml");
+    let job = &ci["jobs"]["pr-size"];
+    assert_eq!(
+        job["if"].as_str(),
+        Some("github.event_name == 'pull_request'"),
+        "pr-size runs only on pull_request"
+    );
+    let checkout = job["steps"]
+        .as_sequence()
+        .expect("the job has steps")
+        .iter()
+        .find(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+        })
+        .expect("the job checks out");
+    assert_eq!(checkout["with"]["fetch-depth"].as_u64(), Some(0));
+    let commands = runs(&ci, "pr-size");
+    assert!(
+        commands
+            .iter()
+            .any(|command| command.contains("pr-size --base origin/${{ github.base_ref }}")),
+        "pr-size passes the PR base, it runs {commands:?}"
+    );
+}

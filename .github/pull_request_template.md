@@ -14,6 +14,7 @@
 - [ ] `duplication`
 - [ ] `rust-test`
 - [ ] `workflow-lint`
+- [ ] `pr-size`
 - [ ] Started in a fresh context
 - [ ] Codex review threads resolved
 - [ ] `[GPU host]` criteria pass in `gpu-test`
