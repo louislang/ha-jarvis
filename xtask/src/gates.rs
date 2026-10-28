@@ -130,6 +130,17 @@ const UNFORMATTED: &str = "//! Fixture.
 pub fn one( ) -> u32 { 1 }
 ";
 
+/// A fixture file with let chains in two functions.
+const LET_CHAINS: &str = "fn first(a: Option<u32>, b: Option<u32>) -> u32 {
+    if let Some(x) = a && let Some(y) = b && x > y { x } else { 0 }
+}
+
+fn second(a: Option<u32>) -> bool {
+    while let Some(x) = a && x > 1 { return true; }
+    false
+}
+";
+
 /// The paths that Git must ignore: build output, models, the virtual environment, the local configuration and the data files.
 const IGNORED: [&str; 11] = [
     "target/",
@@ -355,6 +366,24 @@ fn in_table(table: &[String], path: &str) -> bool {
         Some((prefix, suffix)) => path.starts_with(prefix) && path.ends_with(suffix),
         None => row == path,
     })
+}
+
+/// A fixture file with a function that has 11 `if` branches: cyclomatic complexity 12.
+fn branchy_function() -> String {
+    let branches: Vec<String> = (1..=11)
+        .map(|branch| format!("    if value == {branch} {{ return {branch}; }}\n"))
+        .collect();
+    format!(
+        "fn branchy(value: u32) -> u32 {{\n{}    0\n}}\n",
+        branches.concat()
+    )
+}
+
+/// Writes `source` to a temporary folder as `name`.
+fn fixture_file(name: &str, source: &str) -> TempDir {
+    let folder = TempDir::new().expect("a temporary folder");
+    fs::write(folder.path().join(name), source).expect("the source is written");
+    folder
 }
 
 /// The workspace builds.
@@ -608,4 +637,60 @@ fn ac_0_2_7_check_and_ci_run_lint_gates() {
     for (job, command) in [("rust-format", "just format"), ("rust-lint", "just lint")] {
         assert!(runs(&ci, job).contains(&command), "{job} runs {command}");
     }
+}
+
+/// `xtask complexity` fails a function with 11 `if` branches and names it.
+#[test]
+fn ac_0_3_8_complexity_fails_branchy_function() {
+    let fixture = fixture_file("branchy.rs", &branchy_function());
+    let target = TempDir::new().expect("a temporary folder");
+    let output = run(Command::new("cargo")
+        .args(["run", "--quiet", "--package", "xtask", "--target-dir"])
+        .arg(target.path())
+        .args(["--", "complexity"])
+        .arg(fixture.path().join("branchy.rs"))
+        .current_dir(root()));
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "the exit code, output: {report}"
+    );
+    assert!(
+        report.contains("branchy"),
+        "the output names the function: {report}"
+    );
+}
+
+/// `rust-code-analysis-cli` gives metrics for each function of a file with let chains.
+#[test]
+fn ac_0_3_9_metrics_for_let_chains() {
+    let fixture = fixture_file("chains.rs", LET_CHAINS);
+    let path = fixture.path().join("chains.rs");
+    let units = crate::complexity::units(path.to_str().expect("the path is UTF-8"));
+    let [unit] = units.as_slice() else {
+        panic!("one unit for one file, there are {}", units.len());
+    };
+    let functions: Vec<(&str, f64)> = unit
+        .spaces
+        .iter()
+        .map(|space| (space.name.as_str(), space.metrics["cyclomatic"]["sum"]))
+        .collect();
+    assert_eq!(functions, [("first", 4.0), ("second", 3.0)]);
+}
+
+/// `check` runs the complexity gate after the lint gate, and CI runs it.
+#[test]
+fn ac_0_3_10_check_and_ci_run_complexity_gate() {
+    let check = dependencies(&justfile(), "check");
+    let position = |recipe: &str| check.iter().position(|name| name == recipe);
+    assert!(
+        matches!((position("lint"), position("complexity")), (Some(lint), Some(complexity)) if lint < complexity),
+        "check runs complexity after lint, it runs {check:?}"
+    );
+    let ci = yaml(".github/workflows/ci.yml");
+    assert!(
+        runs(&ci, "complexity").contains(&"just complexity"),
+        "complexity runs just complexity"
+    );
 }

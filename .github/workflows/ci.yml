@@ -25,6 +25,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: just lint
 
+  complexity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: "1.59.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: just install-rust-code-analysis-cli
+      - run: just complexity
+
   rust-test:
     runs-on: ubuntu-latest
     steps:
@@ -34,6 +45,7 @@ jobs:
           just-version: "1.59.0"
       - uses: Swatinem/rust-cache@v2
       - run: just install-cargo-llvm-cov
+      - run: just install-rust-code-analysis-cli
       - run: just cov
 
   workflow-lint:
