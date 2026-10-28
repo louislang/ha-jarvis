@@ -22,13 +22,13 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 9. A stateful change updates the Rust code, its Quint model and its conformance driver in the same PR.
 10. The PR changes at most 400 lines against the layer below (not counting `Cargo.lock`, `docs/architecture.md`, `src/testing/house.json`). If it cannot fit, split the sub-phase in a spec PR first: the first part keeps its number, and each later part adds a letter (`4.5b`).
 11. The PR description follows `.github/pull_request_template.md`: a summary of two or three sentences that states what the PR actually did and which problem it solves or which feature it adds, short bullet points, and every check box. Write it after the code, from the real change. Do not copy the sub-phase goal.
-12. The Codex GitHub app reviews each PR. Resolve every thread.
+12. The CI job `codex-review` reviews each push to a PR with `openai/codex-action`, and `codex-post` posts each finding as a review thread. Resolve every thread.
 13. Merge only with `just merge <pr>`: it checks every required check, every review thread, every check box, the title, the branch and the summary, then squash merges the PR (the bottom layer of a stack, a spec PR or a fix PR) at the inspected head commit. The commit message is the PR title, a blank line and the PR summary. Never add "Co-Authored-By" or any AI attribution. Phase 0 layers before `just merge` exists follow the bootstrap rule in `02-rules.md` section 7.1.
 14. Never skip the hooks (`--no-verify`). The pre-push hook refuses pushes to `main`.
 
 ## Required Checks
 
-`just check` runs these in the pre-commit hook. CI runs each as a separate job. `bench` runs in the hook on Linux only. `gpu-test` runs in the hook on the GPU host only. `pr-size` and `diagram` run in CI only, because they need the PR base.
+`just check` runs these in the pre-commit hook. CI runs each as a separate job. `bench` runs in the hook on Linux only. `gpu-test` runs in the hook on the GPU host only. `pr-size`, `diagram`, `codex-review` and `codex-post` run in CI only, because they need the PR.
 
 | Check | What fails it |
 |---|---|
@@ -46,6 +46,8 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 | `gpu-test` | A `[GPU host]` test fails on the GPU host. |
 | `pr-size` | The PR changes more than 400 counted lines. |
 | `diagram` | The PR diagram cannot be generated. |
+| `codex-review` | Codex cannot review the PR, for example because the `OPENAI_API_KEY` secret is missing. A finding does not fail it: it becomes a review thread. |
+| `codex-post` | The review cannot be posted on the PR. |
 
 ## Code Rules
 
