@@ -94,6 +94,19 @@ jobs:
       - run: just install-actionlint
       - run: just workflow-lint
 
+  gpu-test:
+    runs-on: [self-hosted, linux, gpu]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: "1.59.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo systemctl stop jarvis
+      - run: just gpu-test
+      - if: always()
+        run: sudo systemctl start jarvis
+
   pr-size:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest

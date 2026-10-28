@@ -48,6 +48,10 @@ quint:
         quint verify --invariant=allInvariants --max-steps=10 "$model"
     done
 
+# Run the `[GPU host]` tests on CUDA.
+gpu-test:
+    JARVIS_DEVICE=cuda cargo test --workspace --release -- --ignored
+
 # Write the architecture diagram.
 diagram:
     cargo run -p xtask -- diagram docs/architecture.md
@@ -58,6 +62,7 @@ workflow-lint:
 
 # Run the checks of the pre-commit hook.
 check: workflow-lint format lint complexity duplication architecture quint cov
+    {{ if env("JARVIS_DEVICE", "") == "cuda" { "just gpu-test" } else { "" } }}
 
 # Install the tools and the pre-commit hook.
 setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint install-quint-evaluator

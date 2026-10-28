@@ -16,6 +16,7 @@
 - [ ] `quint`
 - [ ] `rust-test`
 - [ ] `workflow-lint`
+- [ ] `gpu-test`
 - [ ] `pr-size`
 - [ ] `diagram`
 - [ ] Started in a fresh context
