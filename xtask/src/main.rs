@@ -7,6 +7,9 @@ mod complexity;
 #[cfg(test)]
 mod gates;
 mod pr_size;
+// `rules` (sub-phase 0.8) uses the graph outside the tests.
+#[cfg(test)]
+mod graph;
 
 /// Entry point of the `xtask` command line.
 fn main() -> ExitCode {
