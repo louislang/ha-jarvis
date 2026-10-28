@@ -884,3 +884,74 @@ fn ac_0_10_7_ci_posts_diagram_on_pull_requests() {
         assert!(run.contains(command), "diagram runs {command}: {run}");
     }
 }
+
+/// The script of the `architecture.yml` step that commits the diagram.
+fn commit_script(workflow: &serde_yaml::Value) -> &str {
+    steps(workflow)
+        .into_iter()
+        .filter_map(|step| step["run"].as_str())
+        .find(|run| run.contains("git commit"))
+        .expect("a step commits the diagram")
+}
+
+/// `architecture.yml` runs on `push` to `main` only, draws the diagram and commits only `docs/architecture.md`.
+#[test]
+fn ac_0_11_1_workflow_commits_diagram_on_main() {
+    let workflow = yaml(".github/workflows/architecture.yml");
+    let expected: serde_yaml::Value =
+        serde_yaml::from_str("{push: {branches: [main]}}").expect("the expected trigger is YAML");
+    assert_eq!(workflow["on"], expected, "the triggers");
+    assert_eq!(workflow["permissions"]["contents"].as_str(), Some("write"));
+    assert_eq!(
+        workflow["concurrency"]["group"].as_str(),
+        Some("architecture")
+    );
+    assert_eq!(
+        workflow["concurrency"]["cancel-in-progress"].as_bool(),
+        Some(false)
+    );
+    assert!(
+        runs(&workflow, "diagram").contains(&"just diagram"),
+        "the job runs just diagram"
+    );
+    let script = commit_script(&workflow);
+    let commits: Vec<&str> = script
+        .lines()
+        .filter(|line| line.starts_with("git commit") || line.starts_with("git add"))
+        .collect();
+    assert!(
+        matches!(commits.as_slice(), [commit] if commit.ends_with(" -- docs/architecture.md")),
+        "one commit of docs/architecture.md only, the script runs {commits:?}"
+    );
+}
+
+/// Runs `git` with `arguments` in `repository`, with a fixed identity and no signing.
+fn git(repository: &Path, arguments: &[&str]) -> Output {
+    run(Command::new("git")
+        .args(["-c", "user.name=Test", "-c", "user.email=test@example.com"])
+        .args(["-c", "commit.gpgsign=false"])
+        .args(arguments)
+        .current_dir(repository))
+}
+
+/// The commit step makes no commit on a clean working tree.
+#[test]
+fn ac_0_11_2_clean_tree_makes_no_commit() {
+    let repository = TempDir::new().expect("a temporary folder");
+    fs::create_dir(repository.path().join("docs")).expect("the docs folder is made");
+    fs::write(repository.path().join("docs/architecture.md"), "graph TD\n")
+        .expect("the diagram is written");
+    for arguments in [
+        &["init", "--quiet"][..],
+        &["add", "docs/architecture.md"],
+        &["commit", "--quiet", "-m", "Initial"],
+    ] {
+        assert_passes(&git(repository.path(), arguments));
+    }
+    let workflow = yaml(".github/workflows/architecture.yml");
+    assert_passes(&run(Command::new("bash")
+        .args(["-eo", "pipefail", "-c", commit_script(&workflow)])
+        .current_dir(repository.path())));
+    let count = git(repository.path(), &["rev-list", "--count", "HEAD"]);
+    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
+}
