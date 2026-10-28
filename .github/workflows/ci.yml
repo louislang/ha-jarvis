@@ -68,3 +68,13 @@ jobs:
           just-version: "1.59.0"
       - run: just install-actionlint
       - run: just workflow-lint
+
+  pr-size:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo run -p xtask -- pr-size --base origin/${{ github.base_ref }} --limit 400
