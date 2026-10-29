@@ -811,8 +811,11 @@ fn ac_0_5_3_setup_installs_gh_stack() {
     );
 }
 
-/// Checks that the CI job `job` runs only on PRs, with the full history, and that a command has
-/// `command`. Returns the job.
+/// The shell line that reads the PR base. In a native stack, `github.base_ref` is the trunk.
+const READ_BASE: &str = "base=$(gh pr view \"$PR\" --json baseRefName --jq .baseRefName)";
+
+/// Checks that the CI job `job` runs only on PRs, with the full history, reads the PR base, and
+/// that a command has `command`. Returns the job.
 fn assert_pull_request_job<'workflow>(
     ci: &'workflow serde_yaml::Value,
     job: &str,
@@ -837,6 +840,10 @@ fn assert_pull_request_job<'workflow>(
     assert_eq!(checkout["with"]["fetch-depth"].as_u64(), Some(0));
     let commands = runs(ci, job);
     assert!(
+        commands.iter().any(|run| run.contains(READ_BASE)),
+        "{job} reads the PR base, it runs {commands:?}"
+    );
+    assert!(
         commands.iter().any(|run| run.contains(command)),
         "{job} runs {command}, it runs {commands:?}"
     );
@@ -849,7 +856,7 @@ fn ac_0_6_6_ci_runs_pr_size_on_pull_requests() {
     assert_pull_request_job(
         &yaml(".github/workflows/ci.yml"),
         "pr-size",
-        "pr-size --base origin/${{ github.base_ref }}",
+        "pr-size --base \"origin/$base\"",
     );
 }
 
@@ -863,11 +870,7 @@ fn ac_0_8_8_check_and_ci_run_architecture_gate() {
 #[test]
 fn ac_0_10_7_ci_posts_diagram_on_pull_requests() {
     let ci = yaml(".github/workflows/ci.yml");
-    let job = assert_pull_request_job(
-        &ci,
-        "diagram",
-        "diagram --base origin/${{ github.base_ref }}",
-    );
+    let job = assert_pull_request_job(&ci, "diagram", "diagram --base \"origin/$base\"");
     assert_eq!(
         job["permissions"]["pull-requests"].as_str(),
         Some("write"),
