@@ -853,10 +853,12 @@ fn assert_pull_request_job<'workflow>(
 /// CI runs `pr-size` only on PRs, with the full history and the PR base.
 #[test]
 fn ac_0_6_6_ci_runs_pr_size_on_pull_requests() {
-    assert_pull_request_job(
-        &yaml(".github/workflows/ci.yml"),
-        "pr-size",
-        "pr-size --base \"origin/$base\"",
+    let ci = yaml(".github/workflows/ci.yml");
+    let job = assert_pull_request_job(&ci, "pr-size", "pr-size --base \"origin/$base\"");
+    assert_eq!(
+        job["permissions"]["pull-requests"].as_str(),
+        Some("read"),
+        "pr-size can read the PR base"
     );
 }
 
