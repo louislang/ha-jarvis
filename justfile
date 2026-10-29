@@ -56,6 +56,10 @@ gpu-test:
 diagram:
     cargo run -p xtask -- diagram docs/architecture.md
 
+# Squash merge a PR when it meets the merge rules.
+merge pr:
+    cargo run -p xtask -- merge {{ pr }}
+
 # Lint the workflows.
 workflow-lint:
     actionlint

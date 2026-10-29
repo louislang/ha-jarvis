@@ -7,8 +7,6 @@ mod complexity;
 #[cfg(test)]
 mod gates;
 mod graph;
-// `merge` (sub-phase 0.16) uses the merge rules outside the tests.
-#[cfg(test)]
 mod merge;
 mod mermaid;
 mod pr_size;
@@ -24,9 +22,10 @@ fn main() -> ExitCode {
         ["rules"] => rules::run(),
         ["diagram", "--base", reference] => mermaid::run_base(reference),
         ["diagram", file] => mermaid::run(file),
+        ["merge", number] => merge::run(number, &env::var_os("PATH").unwrap_or_default()),
         _ => {
             eprintln!(
-                "usage: xtask complexity <paths> | xtask pr-size --base <ref> --limit <n> | xtask rules | xtask diagram <file> | xtask diagram --base <ref>"
+                "usage: xtask complexity <paths> | xtask pr-size --base <ref> --limit <n> | xtask rules | xtask diagram <file> | xtask diagram --base <ref> | xtask merge <pr>"
             );
             ExitCode::FAILURE
         }
