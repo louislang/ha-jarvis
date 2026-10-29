@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+    # The called `diagram` job asks for `pull-requests: write`. A called job cannot get more than the caller.
+    permissions:
+      contents: read
+      pull-requests: write
+
+  build:
+    needs: ci
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      ARCHIVE: jarvis-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+    steps:
+      - uses: actions/checkout@v7
+      - run: cargo build --release --target ${{ matrix.target }}
+      - run: tar -czf "$ARCHIVE" -C target/${{ matrix.target }}/release jarvis
+      - run: |
+          mkdir verify
+          tar -xzf "$ARCHIVE" -C verify
+          cd verify
+          file jarvis | grep -E 'ELF 64-bit LSB .*executable, x86-64|Mach-O 64-bit executable x86_64'
+          ./jarvis
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          merge-multiple: true
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" jarvis-*.tar.gz --repo "$GITHUB_REPOSITORY"
