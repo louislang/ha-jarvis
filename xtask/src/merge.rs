@@ -58,8 +58,7 @@ pub enum Reason {
 pub fn merge_allowed(pr: &PullRequest, required: &[&str]) -> Result<(), Vec<Reason>> {
     let reasons: Vec<Reason> = [
         failed_checks(pr, required),
-        review_reasons(pr),
-        branch_reasons(pr),
+        pr_reasons(pr),
         description_reasons(&pr.body),
     ]
     .concat();
@@ -74,36 +73,23 @@ pub fn merge_allowed(pr: &PullRequest, required: &[&str]) -> Result<(), Vec<Reas
 fn failed_checks(pr: &PullRequest, required: &[&str]) -> Vec<Reason> {
     required
         .iter()
-        .filter(|name| {
-            pr.checks
-                .get(**name)
-                .is_none_or(|conclusion| conclusion != "SUCCESS")
-        })
+        .filter(|name| pr.checks.get(**name).map(String::as_str) != Some("SUCCESS"))
         .map(|name| Reason::Check((*name).to_owned()))
         .collect()
 }
 
-/// The reasons about the review threads and the Codex review.
-fn review_reasons(pr: &PullRequest) -> Vec<Reason> {
-    let codex = pr.logins.iter().any(|login| is_codex(login));
-    [
-        (pr.unresolved_threads > 0).then_some(Reason::UnresolvedThreads(pr.unresolved_threads)),
-        (!codex).then_some(Reason::NoCodexReview),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
-}
-
-/// The reasons about the base, the title, the branch and the files of a spec PR.
-fn branch_reasons(pr: &PullRequest) -> Vec<Reason> {
+/// The reasons about the review, the base, the title, the branch and the files of a spec PR.
+fn pr_reasons(pr: &PullRequest) -> Vec<Reason> {
     let spec = pr.title.starts_with("Spec: ");
     let spec_files = pr
         .files
         .iter()
         .filter(|file| spec && !file.starts_with("docs/spec/") && *file != "CLAUDE.md")
         .map(|file| Reason::SpecFile(file.clone()));
+    let threads = pr.unresolved_threads;
     let single = [
+        (threads > 0).then_some(Reason::UnresolvedThreads(threads)),
+        (!pr.logins.iter().any(|login| is_codex(login))).then_some(Reason::NoCodexReview),
         (pr.base != "main").then(|| Reason::Base(pr.base.clone())),
         (!follows_kind(&pr.title, &pr.branch)).then_some(Reason::Kind),
     ];
@@ -112,9 +98,14 @@ fn branch_reasons(pr: &PullRequest) -> Vec<Reason> {
 
 /// The reasons about the check boxes, the summary and the attribution lines of `body`.
 fn description_reasons(body: &str) -> Vec<Reason> {
+    let body = &without_comments(body);
     let unchecked = body
         .lines()
-        .filter_map(|line| line.trim_start().strip_prefix("- [ ] "))
+        .filter_map(|line| {
+            line.trim_start()
+                .strip_prefix(['-', '*', '+'])?
+                .strip_prefix(" [ ] ")
+        })
         .map(|label| Reason::Unchecked(label.to_owned()));
     let count = sentences(body);
     let single = [
@@ -122,6 +113,17 @@ fn description_reasons(body: &str) -> Vec<Reason> {
         has_attribution(body).then_some(Reason::Attribution),
     ];
     unchecked.chain(single.into_iter().flatten()).collect()
+}
+
+/// `body` without its HTML comments, which GitHub does not render.
+fn without_comments(body: &str) -> String {
+    match body.split_once("<!--") {
+        Some((before, rest)) => {
+            let after = rest.split_once("-->").map_or("", |(_, after)| after);
+            format!("{before}{}", without_comments(after))
+        }
+        None => body.to_owned(),
+    }
 }
 
 /// True for `CODEX_LOGIN`. GraphQL gives the login of a bot reaction the `[bot]` suffix.
@@ -195,15 +197,9 @@ mod tests {
             base: "main".to_owned(),
             files: vec!["docs/spec/phase-00.md".to_owned()],
             body: BODY.to_owned(),
-            checks: REQUIRED
-                .iter()
-                .map(|name| ((*name).to_owned(), "SUCCESS".to_owned()))
-                .collect(),
+            checks: BTreeMap::from(REQUIRED.map(|name| (name.to_owned(), "SUCCESS".to_owned()))),
             unresolved_threads: 0,
-            logins: vec![
-                "github-actions".to_owned(),
-                "chatgpt-codex-connector".to_owned(),
-            ],
+            logins: vec!["chatgpt-codex-connector".to_owned()],
         }
     }
 
@@ -228,8 +224,7 @@ mod tests {
     #[test]
     fn ac_0_15_1_failed_check() {
         let mut pr = allowed();
-        pr.checks
-            .insert("rust-lint".to_owned(), "FAILURE".to_owned());
+        *pr.checks.get_mut("rust-lint").expect("a fixture check") = "FAILURE".to_owned();
         assert_eq!(
             merge_allowed(&pr, &REQUIRED),
             Err(vec![Reason::Check("rust-lint".to_owned())])
@@ -278,16 +273,21 @@ mod tests {
         assert_eq!(merge_allowed(&reaction, &REQUIRED), Ok(()));
     }
 
-    /// An unchecked box is a reason that names its label.
+    /// An unchecked `-` or `*` box is a reason that names its label.
     #[test]
     fn ac_0_15_5_unchecked_box() {
         let pr = PullRequest {
-            body: BODY.replace("- [x] `rust-lint`", "- [ ] `rust-lint`"),
+            body: BODY
+                .replace("- [x] `rust", "* [ ] `rust")
+                .replace("[x]", "[ ]"),
             ..allowed()
         };
+        let labels = ["`rust-lint`", "Started in a fresh context"];
         assert_eq!(
             merge_allowed(&pr, &REQUIRED),
-            Err(vec![Reason::Unchecked("`rust-lint`".to_owned())])
+            Err(labels
+                .map(|label| Reason::Unchecked(label.to_owned()))
+                .to_vec())
         );
     }
 
@@ -331,7 +331,7 @@ mod tests {
         }
     }
 
-    /// One sentence and four sentences are reasons.
+    /// One sentence and four sentences are reasons. An HTML comment has no sentences.
     #[test]
     fn ac_0_15_9_summary_sentences() {
         assert_eq!(
@@ -341,6 +341,10 @@ mod tests {
         assert_eq!(
             merge_allowed(&summarized("One. Two `a.rs`. Three? Four!"), &REQUIRED),
             Err(vec![Reason::Sentences(4)])
+        );
+        assert_eq!(
+            merge_allowed(&summarized("<!-- One. Two. -->One."), &REQUIRED),
+            Err(vec![Reason::Sentences(1)])
         );
     }
 
