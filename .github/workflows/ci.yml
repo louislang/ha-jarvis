@@ -97,12 +97,20 @@ jobs:
   pr-size:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - uses: Swatinem/rust-cache@v2
-      - run: cargo run -p xtask -- pr-size --base origin/${{ github.base_ref }} --limit 400
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          base=$(gh pr view "$PR" --json baseRefName --jq .baseRefName)
+          cargo run -p xtask -- pr-size --base "origin/$base" --limit 400
 
   diagram:
     if: github.event_name == 'pull_request'
@@ -120,9 +128,10 @@ jobs:
           MARKER: "<!-- jarvis-architecture -->"
           PR: ${{ github.event.pull_request.number }}
         run: |
+          base=$(gh pr view "$PR" --json baseRefName --jq .baseRefName)
           {
             echo "$MARKER"
-            cargo run -p xtask -- diagram --base origin/${{ github.base_ref }}
+            cargo run -p xtask -- diagram --base "origin/$base"
           } > diagram.md
           cat diagram.md >> "$GITHUB_STEP_SUMMARY"
           comment=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments" --paginate --jq ".[] | select(.body | startswith(\"$MARKER\")) | .id" | head -n 1)

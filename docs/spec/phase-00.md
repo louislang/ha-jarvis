@@ -179,7 +179,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - `xtask pr-size --base <ref> --limit <n>` runs `git diff --numstat <ref>...HEAD`.
 - `counted_lines(numstat, excluded) -> Result<usize>`: each line is `<added>\t<deleted>\t<path>`. A binary file (`-\t-`) counts 0. An excluded path counts 0. Other lines count `added + deleted`. Another format is an error.
 - `excluded = ["Cargo.lock", "docs/architecture.md", "src/testing/house.json"]`.
-- The CI job runs only for `pull_request` with `--base origin/${{ github.base_ref }}`. In a stack, the base is the branch of the layer below, so each PR is measured alone. The job checks out with `fetch-depth: 0`, so the base exists.
+- The CI job runs only for `pull_request`. It reads the PR base branch with `gh pr view <number> --json baseRefName` and passes `--base origin/<base branch>`. In a native stack, `github.base_ref` is the trunk `main`, but the PR base is the branch of the layer below, so each PR is measured alone. The job has the permission `pull-requests: read` and checks out with `fetch-depth: 0`, so the base exists.
 
 **Acceptance criteria.**
 
@@ -188,7 +188,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - AC-0.6-3: When `Cargo.lock` has 5000 changed lines, they do not count.
 - AC-0.6-4: When a binary file changes, it counts 0.
 - AC-0.6-5: When a numstat line has two fields, `counted_lines` returns an error that contains the line.
-- AC-0.6-6: When `ci.yml` is parsed, the job `pr-size` runs only on `pull_request`, checks out with `fetch-depth: 0` and passes `origin/${{ github.base_ref }}` as the base.
+- AC-0.6-6: When `ci.yml` is parsed, the job `pr-size` runs only on `pull_request`, has `pull-requests: read`, checks out with `fetch-depth: 0`, reads the base with `gh pr view` and passes `origin/<base branch>` as the base.
 
 **Proofs.**
 
@@ -348,7 +348,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 
 - The base graph is built from the files at `<ref>` (`git show <ref>:<path>`). The head graph is built from the working tree.
 - `status(module)` over both module sets: `Added` (head only, class `added`, fill `#2da44e`), `Updated` (both, different hashes, class `updated`, fill `#fb8500`), `Deleted` (base only, class `deleted`, fill `#cf222e`, dashed arrows), `Unchanged` (no class).
-- The `diagram` job runs only for `pull_request`, with `--base origin/${{ github.base_ref }}` (the layer below in a stack). It checks out with `fetch-depth: 0` and has the permission `pull-requests: write`. It writes the job summary and creates or updates one PR comment that starts with `<!-- jarvis-architecture -->`.
+- The `diagram` job runs only for `pull_request`, with `--base origin/<base branch>` from `gh pr view <number> --json baseRefName` (the layer below in a stack). It checks out with `fetch-depth: 0` and has the permission `pull-requests: write`. It writes the job summary and creates or updates one PR comment that starts with `<!-- jarvis-architecture -->`.
 
 **Acceptance criteria.**
 
@@ -358,7 +358,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - AC-0.10-4: When a module is in both with the same content, its node has no class.
 - AC-0.10-5: When base and head are the same, the output has no class assignments.
 - AC-0.10-6: When the output defines the classes, the fills are `#2da44e`, `#fb8500` and `#cf222e`.
-- AC-0.10-7: When `ci.yml` is parsed, the job `diagram` runs only on `pull_request`, checks out with `fetch-depth: 0`, has `pull-requests: write`, passes `origin/${{ github.base_ref }}`, and updates a comment with the marker `<!-- jarvis-architecture -->`.
+- AC-0.10-7: When `ci.yml` is parsed, the job `diagram` runs only on `pull_request`, checks out with `fetch-depth: 0`, has `pull-requests: write`, reads the base with `gh pr view`, passes `origin/<base branch>`, and updates a comment with the marker `<!-- jarvis-architecture -->`.
 
 **Proofs.**
 
