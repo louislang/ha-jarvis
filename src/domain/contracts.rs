@@ -178,6 +178,15 @@ pub fn ex_string_as_bytes(text: &String) -> (bytes: &[u8])
     text.as_bytes()
 }
 
+/// Gives the length of `text` in bytes. <https://doc.rust-lang.org/std/string/struct.String.html#method.len>
+#[verifier::external_fn_specification]
+pub fn ex_string_len(text: &String) -> (len: usize)
+    ensures
+        len == vstd::utf8::encode_utf8(text@).len(),
+{
+    text.len()
+}
+
 /// The lowercase form of `text`.
 pub uninterp spec fn lowercase(text: Seq<char>) -> Seq<char>;
 
