@@ -1187,3 +1187,13 @@ fn ac_0_14_2_release_verifies_archives() {
         "the release job runs gh release create"
     );
 }
+
+/// `merge` runs `xtask merge` with the PR number.
+#[test]
+fn ac_0_16_4_merge_recipe_runs_xtask_merge() {
+    let merge = justfile()["recipes"]["merge"]["body"].to_string();
+    assert!(
+        merge.contains("cargo run -p xtask -- merge "),
+        "merge runs xtask merge: {merge}"
+    );
+}

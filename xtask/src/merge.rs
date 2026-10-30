@@ -1,9 +1,26 @@
-//! The merge rules: whether a PR can merge.
+//! The merge rules and the merge command.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
+use std::process::{Command, ExitCode};
+
+use serde_json::Value;
 
 /// The login of the Codex GitHub app (field log of sub-phase 0.5).
 const CODEX_LOGIN: &str = "chatgpt-codex-connector";
+
+/// The CI workflow. Each of its jobs runs on `pull_request`, so each is a required check.
+const CI: &str = include_str!("../../.github/workflows/ci.yml");
+
+/// The fields that `gh pr view` reads.
+const VIEW_FIELDS: &str = "title,headRefName,baseRefName,files,body,statusCheckRollup,headRefOid";
+
+/// The connections of a PR with the logins of the reviews, comments and reactions, each read as `author { login }`.
+const LOGIN_CONNECTIONS: [(&str, &str); 3] = [
+    ("reviews", "author { login }"),
+    ("comments", "author { login }"),
+    ("reactions", "author: user { login }"),
+];
 
 /// The PR data that the merge rules read.
 #[derive(Clone, Debug, Default)]
@@ -160,11 +177,17 @@ fn is_number(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit())
 }
 
-/// The number of words that end a sentence in the `Summary` section of `body`.
-fn sentences(body: &str) -> usize {
+/// The text of the `Summary` section of `body`.
+fn summary(body: &str) -> &str {
     body.split("## ")
         .find_map(|section| section.strip_prefix("Summary"))
         .unwrap_or_default()
+        .trim()
+}
+
+/// The number of words that end a sentence in the `Summary` section of `body`.
+fn sentences(body: &str) -> usize {
+    summary(body)
         .split_whitespace()
         .filter(|word| word.ends_with(['.', '!', '?']))
         .count()
@@ -178,9 +201,177 @@ fn has_attribution(body: &str) -> bool {
     })
 }
 
-/// Tests of the merge rules.
+/// Merges PR `number` when it meets the merge rules, else prints each reason. `path` is the `PATH` that finds `gh`.
+#[must_use]
+pub fn run(number: &str, path: &OsStr) -> ExitCode {
+    match merge(number, path) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(errors) => {
+            for error in errors {
+                eprintln!("{error}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Reads PR `number`, applies the merge rules and squash merges at the head commit that was read.
+fn merge(number: &str, path: &OsStr) -> Result<(), Vec<String>> {
+    let (pr, head) = read(number, path).map_err(|error| vec![error])?;
+    if let Err(reasons) = merge_allowed(&pr, &jobs(CI)) {
+        return Err(reasons.iter().map(|reason| format!("{reason:?}")).collect());
+    }
+    let body = without_comments(&pr.body);
+    let arguments = [
+        "pr",
+        "merge",
+        number,
+        "--squash",
+        "--match-head-commit",
+        &head,
+        "--subject",
+        &pr.title,
+        "--body",
+        summary(&body),
+    ];
+    gh(path, &arguments).map_err(|error| vec![error])?;
+    Ok(())
+}
+
+/// The PR data and the head commit of PR `number`.
+fn read(number: &str, path: &OsStr) -> Result<(PullRequest, String), String> {
+    let view = json(&gh(path, &["pr", "view", number, "--json", VIEW_FIELDS])?)?;
+    let threads = nodes(path, number, "reviewThreads", "isResolved")?;
+    let pr = PullRequest {
+        title: text(&view, "/title"),
+        branch: text(&view, "/headRefName"),
+        base: text(&view, "/baseRefName"),
+        files: list(&view, "/files")
+            .iter()
+            .map(|file| text(file, "/path"))
+            .collect(),
+        body: text(&view, "/body"),
+        checks: conclusions(list(&view, "/statusCheckRollup")),
+        unresolved_threads: threads
+            .iter()
+            .filter(|thread| thread["isResolved"] != true)
+            .count(),
+        logins: logins(path, number)?,
+    };
+    Ok((pr, text(&view, "/headRefOid")))
+}
+
+/// The logins of the reviews, comments and reactions of PR `number`.
+fn logins(path: &OsStr, number: &str) -> Result<Vec<String>, String> {
+    let mut logins = Vec::new();
+    for (connection, fields) in LOGIN_CONNECTIONS {
+        let nodes = nodes(path, number, connection, fields)?;
+        logins.extend(nodes.iter().map(|node| text(node, "/author/login")));
+    }
+    Ok(logins)
+}
+
+/// The nodes of `connection` of PR `number` over all pages, with `fields` for each node.
+fn nodes(path: &OsStr, number: &str, connection: &str, fields: &str) -> Result<Vec<Value>, String> {
+    let query = format!(
+        "query($owner: String!, $repo: String!, $number: Int!, $endCursor: String) {{ repository(owner: $owner, name: $repo) {{ pullRequest(number: $number) {{ connection: {connection}(first: 100, after: $endCursor) {{ nodes {{ {fields} }} pageInfo {{ hasNextPage endCursor }} }} }} }} }}"
+    );
+    let number = format!("number={number}");
+    let query = format!("query={query}");
+    let arguments = [
+        "api",
+        "graphql",
+        "--paginate",
+        "--slurp",
+        "-F",
+        "owner={owner}",
+        "-F",
+        "repo={repo}",
+        "-F",
+        &number,
+        "-f",
+        &query,
+    ];
+    let pages = json(&gh(path, &arguments)?)?;
+    let nodes = list(&pages, "")
+        .iter()
+        .flat_map(|page| list(page, "/data/repository/pullRequest/connection/nodes"));
+    Ok(nodes.cloned().collect())
+}
+
+/// The conclusion of each check over its runs. A skipped run does not count. A run without success outranks a success.
+fn conclusions(runs: &[Value]) -> BTreeMap<String, String> {
+    let mut checks = BTreeMap::new();
+    for run in runs {
+        let conclusion = text(run, "/conclusion");
+        if conclusion == "SKIPPED" {
+            continue;
+        }
+        let current = checks
+            .entry(text(run, "/name"))
+            .or_insert_with(|| conclusion.clone());
+        if *current == "SUCCESS" {
+            *current = conclusion;
+        }
+    }
+    checks
+}
+
+/// The standard output of `gh` with `arguments`, else its standard error. `path` is the `PATH` that finds `gh`.
+fn gh(path: &OsStr, arguments: &[&str]) -> Result<String, String> {
+    let output = Command::new("gh")
+        .env("PATH", path)
+        .args(arguments)
+        .output()
+        .map_err(|error| format!("gh does not start: {error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+    }
+}
+
+/// `text` parsed as JSON.
+fn json(text: &str) -> Result<Value, String> {
+    serde_json::from_str(text).map_err(|error| error.to_string())
+}
+
+/// The string at `pointer` in `value`, or an empty string.
+fn text(value: &Value, pointer: &str) -> String {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The array at `pointer` in `value`, or an empty slice.
+fn list<'value>(value: &'value Value, pointer: &str) -> &'value [Value] {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// The job names of `workflow`: the keys with two spaces of indent after `jobs:`.
+fn jobs(workflow: &str) -> Vec<&str> {
+    let (_, jobs) = workflow.split_once("\njobs:\n").unwrap_or_default();
+    jobs.lines()
+        .filter_map(|line| line.strip_prefix("  ")?.strip_suffix(':'))
+        .filter(|name| !name.starts_with(' '))
+        .collect()
+}
+
+/// Tests of the merge rules and the merge command.
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    use serde_json::Value;
+    use serde_json::json;
+    use tempfile::TempDir;
+
     use super::*;
 
     /// The required checks of the fixtures.
@@ -393,5 +584,92 @@ mod tests {
             merge_allowed(&pr, &REQUIRED),
             Err(vec![Reason::SpecFile("xtask/src/merge.rs".to_owned())])
         );
+    }
+
+    /// The `gh pr view` output of a PR that meets every rule, with a push run of each check and a skipped one.
+    fn view() -> Value {
+        let mut runs: Vec<Value> = jobs(CI)
+            .iter()
+            .map(|name| json!({"name": name, "conclusion": "SUCCESS"}))
+            .collect();
+        runs.push(json!({"name": "pr-size", "conclusion": "SKIPPED"}));
+        json!({
+            "title": "0.16 Merge Command",
+            "headRefName": "0.16-merge-command",
+            "baseRefName": "main",
+            "files": [{"path": "xtask/src/merge.rs"}],
+            "body": BODY,
+            "headRefOid": "0123abc",
+            "statusCheckRollup": runs,
+        })
+    }
+
+    /// A shell command that prints `gh api graphql --paginate --slurp` output with one page for each list of nodes.
+    fn print_pages(pages: &[Value]) -> String {
+        let pages: Vec<Value> = pages
+            .iter()
+            .map(|nodes| json!({"data": {"repository": {"pullRequest": {"connection": {"nodes": nodes}}}}}))
+            .collect();
+        format!("printf '%s' '{}'", Value::from(pages))
+    }
+
+    /// A folder with a fake `gh` that records each call in `gh.calls`, prints `view()` and a Codex login, and runs
+    /// `threads` for the review thread query.
+    fn fake_gh(threads: &str) -> TempDir {
+        let folder = TempDir::new().expect("a temporary folder");
+        let logins = print_pages(&[json!([{"author": {"login": "chatgpt-codex-connector"}}])]);
+        let script = format!(
+            "#!/bin/sh\nprintf '[%s]' \"$@\" >> \"$0.calls\"\necho >> \"$0.calls\"\ncase \"$*\" in\n\"pr view\"*) printf '%s' '{}' ;;\n*reviewThreads*) {threads} ;;\n*graphql*) {logins} ;;\nesac\n",
+            view()
+        );
+        let gh = folder.path().join("gh");
+        fs::write(&gh, script).expect("the fake gh is written");
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755))
+            .expect("the fake gh is executable");
+        folder
+    }
+
+    /// The calls of the fake `gh` in `folder`, one line each, with each argument in brackets.
+    fn calls(folder: &TempDir) -> String {
+        fs::read_to_string(folder.path().join("gh.calls")).expect("gh was called")
+    }
+
+    /// The merge has the head commit, the title and the summary that were read.
+    #[test]
+    fn ac_0_16_1_merge_at_read_head() {
+        let gh = fake_gh(&print_pages(&[json!([{"isResolved": true}])]));
+        assert_eq!(merge("16", gh.path().as_os_str()), Ok(()));
+        let merge_call = "[pr][merge][16][--squash][--match-head-commit][0123abc][--subject][0.16 Merge Command][--body][Adds the merge rules. They decide whether a PR can merge.]\n";
+        assert!(
+            calls(&gh).ends_with(merge_call),
+            "the last call merges at the head: {}",
+            calls(&gh)
+        );
+    }
+
+    /// An unresolved thread on the second page refuses the merge.
+    #[test]
+    fn ac_0_16_2_threads_on_two_pages() {
+        let gh = fake_gh(&print_pages(&[
+            json!([{"isResolved": true}]),
+            json!([{"isResolved": false}]),
+        ]));
+        assert_eq!(
+            merge("16", gh.path().as_os_str()),
+            Err(vec!["UnresolvedThreads(1)".to_owned()])
+        );
+        assert!(!calls(&gh).contains("[merge]"), "no merge: {}", calls(&gh));
+    }
+
+    /// A failed `gh` call exits with code 1, gives its error and runs no merge.
+    #[test]
+    fn ac_0_16_3_failed_gh_call() {
+        let gh = fake_gh("echo 'HTTP 502: Bad Gateway' >&2; exit 1");
+        assert_eq!(
+            merge("16", gh.path().as_os_str()),
+            Err(vec!["HTTP 502: Bad Gateway".to_owned()])
+        );
+        assert_eq!(run("16", gh.path().as_os_str()), ExitCode::FAILURE);
+        assert!(!calls(&gh).contains("[merge]"), "no merge: {}", calls(&gh));
     }
 }
