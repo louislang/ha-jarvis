@@ -71,6 +71,7 @@ jobs:
       - run: echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
       - run: just install-quint
       - run: just install-quint-evaluator
+      - run: just install-verus
       - run: just cov
 
   quint:
@@ -84,6 +85,17 @@ jobs:
       - run: just install-quint
       - run: just install-quint-evaluator
       - run: just quint
+
+  verus:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: "1.59.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: just install-verus
+      - run: just verus
 
   workflow-lint:
     runs-on: ubuntu-latest
