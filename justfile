@@ -120,8 +120,7 @@ install-verus:
     esac
     folder=~/.verus/{{ verus_version }}
     rm -rf "$folder" "$folder.zip" ~/.verus/verus-$platform
-    mkdir -p ~/.verus
-    curl -sSfL -o "$folder.zip" https://github.com/verus-lang/verus/releases/download/release%2F{{ verus_version }}/verus-{{ verus_version }}-$platform.zip
+    curl -sSfL --create-dirs -o "$folder.zip" https://github.com/verus-lang/verus/releases/download/release%2F{{ verus_version }}/verus-{{ verus_version }}-$platform.zip
     unzip -q "$folder.zip" -d ~/.verus
     mv ~/.verus/verus-$platform "$folder"
     rm "$folder.zip"

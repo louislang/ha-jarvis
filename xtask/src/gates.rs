@@ -4,13 +4,15 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Mutex;
 
 use syn::buffer::{Cursor, TokenBuffer};
+use syn::punctuated::Punctuated;
 use syn::visit::{self, Visit};
-use syn::{Attribute, ImplItemFn, ItemFn, ItemImpl, ItemMod, ItemTrait, TraitItemFn};
+use syn::{Attribute, ImplItemFn, ItemFn, ItemImpl, ItemMod, ItemTrait, Meta, Token, TraitItemFn};
 use tempfile::TempDir;
 
 /// The environment variables that a nested tool gets. The coverage settings of an outer `cargo llvm-cov` would change its result.
@@ -1271,8 +1273,7 @@ fn verus_function(attribute: &str, function: &str) -> String {
 }
 
 /// A fixture domain file with a function and a trait default method without a Verus attribute.
-const UNVERIFIED_DOMAIN: &str = "use vstd::prelude::*;
-pub fn unverified() {}
+const UNVERIFIED_DOMAIN: &str = "pub fn unverified() {}
 #[verus_verify]
 impl Unit {
     pub fn method() {}
@@ -1290,9 +1291,8 @@ mod tests {
 }
 ";
 
-/// A fixture domain file with three trusted items.
-const TRUSTED_DOMAIN: &str = "use vstd::prelude::*;
-verus! {
+/// A fixture domain file with three trusted items and a parameter named `external_value`.
+const TRUSTED_DOMAIN: &str = "verus! {
     pub assume_specification[ core::cmp::max::<u32> ](a: u32, b: u32) -> u32;
     proof fn lemma() {
         admit();
@@ -1300,6 +1300,8 @@ verus! {
 }
 #[verus_verify(external_body)]
 pub fn trusted() {}
+#[verus_spec(requires external_value < 1000)]
+pub fn bounded(external_value: u32) {}
 ";
 
 /// The trusted code file of the domain.
@@ -1387,21 +1389,35 @@ fn attribute(cursor: Cursor<'_>) -> Option<(Cursor<'_>, Cursor<'_>)> {
     Some((inside, after))
 }
 
+/// The names that start with `external` of the attribute with the tokens `inside`: its own name, or an argument of `verus_verify`.
+fn external_names(inside: Cursor<'_>) -> Vec<String> {
+    let Ok(meta) = syn::parse2::<Meta>(inside.token_stream()) else {
+        return Vec::new();
+    };
+    let arguments = match &meta {
+        Meta::List(list) if list.path.is_ident("verus_verify") => list
+            .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
+            .unwrap_or_default(),
+        _ => Punctuated::new(),
+    };
+    let paths = iter::once(&meta).chain(&arguments).map(Meta::path);
+    let names = paths.filter_map(|path| path.segments.last().map(|last| last.ident.to_string()));
+    names.filter(|name| name.starts_with("external")).collect()
+}
+
 /// Adds the trusted items of the tokens from `cursor` to `found`, also inside groups and `verus!` blocks.
-fn add_trusted(mut cursor: Cursor<'_>, in_attribute: bool, found: &mut Vec<String>) {
+fn add_trusted(mut cursor: Cursor<'_>, found: &mut Vec<String>) {
     while let Some((_, mut next)) = cursor.token_tree() {
         if let Some((inside, after)) = attribute(cursor) {
-            add_trusted(inside, true, found);
+            found.extend(external_names(inside));
+            add_trusted(inside, found);
             next = after;
         } else if let Some((inside, ..)) = cursor.any_group() {
-            add_trusted(inside, in_attribute, found);
+            add_trusted(inside, found);
         } else if let Some((ident, after)) = cursor.ident() {
             let name = ident.to_string();
             let call = after.any_group().is_some() && matches!(name.as_str(), "assume" | "admit");
-            if call
-                || name == "assume_specification"
-                || in_attribute && name.starts_with("external")
-            {
+            if call || name == "assume_specification" {
                 found.push(name);
             }
         }
@@ -1419,7 +1435,7 @@ fn verus_findings(files: &[PathBuf]) -> Vec<Finding> {
         let mut items = unverified.0;
         if !file.ends_with(CONTRACTS) {
             let tokens = TokenBuffer::new2(source.parse().expect("the file is Rust tokens"));
-            add_trusted(tokens.begin(), false, &mut items);
+            add_trusted(tokens.begin(), &mut items);
         }
         findings.extend(items.into_iter().map(|item| Finding {
             file: file.clone(),
@@ -1511,11 +1527,7 @@ fn ac_0_18_3_verus_is_deterministic() {
         let source = verus_function(&attribute, ONE);
         let first = verus_results(&verus_gate(&source));
         assert!(!first.1.is_empty(), "verus prints results for {source}");
-        assert_eq!(
-            first,
-            verus_results(&verus_gate(&source)),
-            "two runs of {source}"
-        );
+        assert_eq!(first, verus_results(&verus_gate(&source)), "{source}");
     }
 }
 
@@ -1563,14 +1575,9 @@ fn ac_0_18_7_verus_toolchain_is_channel() {
         .find_map(|line| line.trim().strip_prefix("Toolchain: "))
         .and_then(|toolchain| toolchain.split_once('-'))
         .map(|(version, _)| version);
-    let channels: toml::Table = read("rust-toolchain.toml")
-        .parse()
-        .expect("the file is TOML");
-    assert_eq!(
-        toolchain,
-        channels["toolchain"]["channel"].as_str(),
-        "{stdout}"
-    );
+    let channels: toml::Table = read("rust-toolchain.toml").parse().expect("TOML");
+    let channel = channels["toolchain"]["channel"].as_str();
+    assert_eq!(toolchain, channel, "{stdout}");
 }
 
 /// `check` runs `verus` after `quint`, `verus` runs `cargo verus verify -p jarvis`, CI installs Verus, and the PR template has its box.
@@ -1578,20 +1585,11 @@ fn ac_0_18_7_verus_toolchain_is_channel() {
 fn ac_0_18_8_check_and_ci_run_verus_gate() {
     assert_check_and_ci_run_after("quint", "verus");
     let verus = justfile()["recipes"]["verus"]["body"].to_string();
-    assert!(
-        verus.contains("cargo verus verify -p jarvis"),
-        "verus runs cargo verus verify -p jarvis: {verus}"
-    );
+    assert!(verus.contains("cargo verus verify -p jarvis"), "{verus}");
     let ci = yaml(".github/workflows/ci.yml");
     for job in ["verus", "rust-test"] {
-        assert!(
-            runs(&ci, job).contains(&"just install-verus"),
-            "{job} runs just install-verus"
-        );
+        assert!(runs(&ci, job).contains(&"just install-verus"), "{job}");
     }
     let template = read(".github/pull_request_template.md");
-    assert!(
-        template.lines().any(|line| line == "- [ ] `verus`"),
-        "the PR template has a box for verus"
-    );
+    assert!(template.contains("\n- [ ] `verus`\n"), "{template}");
 }
