@@ -19,5 +19,7 @@ flowchart LR
     end
     crate --> crate
     crate_adapters_ha --> crate
+    crate_adapters_ha --> crate_adapters_ha
+    crate_adapters_ha --> crate_domain_state
     crate_ports --> crate_domain_state
 ```
