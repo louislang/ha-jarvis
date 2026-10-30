@@ -15,6 +15,11 @@ pub mod domain {
 
 pub mod ports;
 
+/// Port implementations, one technology each.
+pub mod adapters {
+    pub mod ha;
+}
+
 /// Runtime configuration from `jarvis.toml`.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -32,9 +37,26 @@ impl Config {
     ///
     /// # Errors
     ///
-    /// The text is not TOML, or a field is unknown, absent or of the wrong type.
+    /// The text is not TOML, a field is unknown, absent or of the wrong type, or
+    /// [`Config::validate`] fails.
     pub fn parse(text: &str) -> anyhow::Result<Self> {
-        Ok(toml::from_str(text)?)
+        let config: Self = toml::from_str(text)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Checks the range of each field.
+    ///
+    /// # Errors
+    ///
+    /// A field is out of its range. The error names the field and the range.
+    fn validate(&self) -> anyhow::Result<()> {
+        let timeout = self.ha.request_timeout_ms;
+        anyhow::ensure!(
+            timeout > 0,
+            "ha.request_timeout_ms = {timeout} is out of range: it must be more than 0"
+        );
+        Ok(())
     }
 
     /// Reads and parses the configuration file at `path`.
@@ -67,6 +89,8 @@ pub struct HaConfig {
     pub url: String,
     /// Environment variable that holds the HA token.
     pub token_env: String,
+    /// Deadline of the authentication and of each request.
+    pub request_timeout_ms: u64,
 }
 
 /// Secrets from the environment variables that [`Config`] names.
@@ -129,6 +153,7 @@ mod tests {
             ha: HaConfig {
                 url: "ws://homeassistant.local:8123/api/websocket".to_owned(),
                 token_env: "HA_TOKEN".to_owned(),
+                request_timeout_ms: 5000,
             },
         };
         assert_eq!(Config::parse(VALID)?, expected);
@@ -173,6 +198,17 @@ mod tests {
     fn ac_1_1_6_unknown_device_names_device() {
         let error = parse_error(&VALID.replace("\"cuda\"", "\"gpu\""));
         assert!(error.contains("device"), "error has no field: {error}");
+    }
+
+    /// AC-2.2-6.
+    #[test]
+    fn ac_2_2_6_out_of_range_names_field_and_range() {
+        let error =
+            parse_error(&VALID.replace("request_timeout_ms = 5000", "request_timeout_ms = 0"));
+        assert!(
+            error.contains("ha.request_timeout_ms") && error.contains("more than 0"),
+            "error has no field or range: {error}"
+        );
     }
 
     /// Resolves the secrets of `VALID` from an environment with `variables`.
