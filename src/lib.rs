@@ -66,6 +66,31 @@ pub struct HaConfig {
     pub token_env: String,
 }
 
+/// Secrets from the environment variables that [`Config`] names.
+#[derive(Clone)]
+pub struct Secrets {
+    /// HA long-lived access token.
+    pub ha_token: String,
+}
+
+impl Secrets {
+    /// Reads each secret with `lookup`, which gives the value of an environment variable.
+    ///
+    /// # Errors
+    ///
+    /// A variable is not set or is empty. The error names the variable.
+    pub fn resolve(
+        config: &Config,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Self> {
+        let name = &config.ha.token_env;
+        match lookup(name) {
+            Some(ha_token) if !ha_token.is_empty() => Ok(Self { ha_token }),
+            _ => anyhow::bail!("environment variable {name} is not set or is empty"),
+        }
+    }
+}
+
 /// Entry point of Jarvis.
 pub fn main() {}
 
@@ -73,6 +98,8 @@ pub fn main() {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::collections::BTreeMap;
 
     /// A valid configuration with every field.
     const VALID: &str = include_str!("../jarvis.toml");
@@ -143,5 +170,42 @@ mod tests {
     fn ac_1_1_6_unknown_device_names_device() {
         let error = parse_error(&VALID.replace("\"cuda\"", "\"gpu\""));
         assert!(error.contains("device"), "error has no field: {error}");
+    }
+
+    /// Resolves the secrets of `VALID` from an environment with `variables`.
+    fn resolve(variables: &[(&str, &str)]) -> anyhow::Result<Secrets> {
+        let environment: BTreeMap<&str, &str> = variables.iter().copied().collect();
+        Secrets::resolve(&Config::parse(VALID)?, |name| {
+            environment.get(name).map(|value| (*value).to_owned())
+        })
+    }
+
+    /// Returns the text of the error that `resolve` gives for `variables`.
+    fn resolve_error(variables: &[(&str, &str)]) -> String {
+        resolve(variables)
+            .err()
+            .expect("the environment has no valid secrets")
+            .to_string()
+    }
+
+    /// AC-1.2-1.
+    #[test]
+    fn ac_1_2_1_resolve_returns_ha_token() -> anyhow::Result<()> {
+        assert_eq!(resolve(&[("HA_TOKEN", "abc")])?.ha_token, "abc");
+        Ok(())
+    }
+
+    /// AC-1.2-2.
+    #[test]
+    fn ac_1_2_2_unset_token_names_variable() {
+        let error = resolve_error(&[]);
+        assert!(error.contains("HA_TOKEN"), "error has no variable: {error}");
+    }
+
+    /// AC-1.2-3.
+    #[test]
+    fn ac_1_2_3_empty_token_names_variable() {
+        let error = resolve_error(&[("HA_TOKEN", "")]);
+        assert!(error.contains("HA_TOKEN"), "error has no variable: {error}");
     }
 }
