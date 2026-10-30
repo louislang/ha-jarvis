@@ -1,5 +1,7 @@
 //! Trusted Verus contracts and axioms for the `std` and domain crate functions that the domain calls.
 
+use std::borrow::Borrow;
+use std::hash::Hash;
 use std::sync::Arc;
 
 use jiff::Timestamp;
@@ -7,9 +9,11 @@ use serde_json::Map;
 use serde_json::Value;
 
 use crate::domain::state::Area;
+use crate::domain::state::AreaId;
 use crate::domain::state::Context;
 use crate::domain::state::Device;
 use crate::domain::state::Entity;
+use crate::domain::state::EntityId;
 use crate::domain::state::Event;
 use crate::domain::state::HomeConfig;
 use crate::domain::state::Snapshot;
@@ -59,18 +63,23 @@ pub struct ExContext(Context);
 
 /// An area registry entry.
 #[verifier::external_type_specification]
-#[verifier::external_body]
 pub struct ExArea(Area);
 
 /// A device registry entry.
 #[verifier::external_type_specification]
-#[verifier::external_body]
 pub struct ExDevice(Device);
 
 /// An entity registry entry.
 #[verifier::external_type_specification]
-#[verifier::external_body]
 pub struct ExEntity(Entity);
+
+/// The ID of an area.
+#[verifier::external_type_specification]
+pub struct ExAreaId(AreaId);
+
+/// The ID of an entity.
+#[verifier::external_type_specification]
+pub struct ExEntityId(EntityId);
 
 /// The HA configuration that Jarvis uses.
 #[verifier::external_type_specification]
@@ -112,5 +121,61 @@ pub broadcast axiom fn axiom_arc_str_borrow()
     ensures
         #[trigger] vstd::std_specs::btree::borrowed_key_ordering_matches::<Arc<str>, str>(),
 ;
+
+/// `Arc<str>` borrows as its text, so a lookup by `&str` finds the key with that text. <https://doc.rust-lang.org/std/sync/struct.Arc.html#impl-Borrow%3CT%3E-for-Arc%3CT,+A%3E>
+pub broadcast axiom fn axiom_arc_str_contains_borrowed_key<Item>(map: vstd::map::Map<Arc<str>, Item>, key: &str)
+    ensures
+        #[trigger] vstd::std_specs::btree::contains_borrowed_key::<Arc<str>, Item, str>(map, key)
+            <==> map.contains_key(str_key(key@)),
+;
+
+/// `Arc<str>` borrows as its text, so a lookup by `&str` gives the value of the key with that text. <https://doc.rust-lang.org/std/sync/struct.Arc.html#impl-Borrow%3CT%3E-for-Arc%3CT,+A%3E>
+pub broadcast axiom fn axiom_arc_str_maps_borrowed_key<Item>(map: vstd::map::Map<Arc<str>, Item>, key: &str, item: Item)
+    ensures
+        #[trigger] vstd::std_specs::btree::maps_borrowed_key_to_value::<Arc<str>, Item, str>(map, key, item)
+            <==> map.contains_key(str_key(key@)) && map[str_key(key@)] == item,
+;
+
+/// The value of `key` in the JSON object `map`.
+pub uninterp spec fn attribute<Key: ?Sized>(map: Map<String, Value>, key: &Key) -> Option<Value>;
+
+/// Gives the value of `key`. <https://docs.rs/serde_json/1/serde_json/struct.Map.html#method.get>
+#[verifier::external_fn_specification]
+pub fn ex_map_get<'map, Key>(map: &'map Map<String, Value>, key: &Key) -> (value: Option<&'map Value>)
+    where
+        String: Borrow<Key>,
+        Key: ?Sized + Ord + Eq + Hash,
+    ensures
+        match value {
+            Some(value) => attribute(*map, key) == Some(*value),
+            None => attribute(*map, key) is None,
+        },
+{
+    map.get(key)
+}
+
+/// The text of the JSON string `value`, or `None` for another JSON type.
+pub uninterp spec fn text(value: Value) -> Option<Seq<char>>;
+
+/// Gives the text of a JSON string. <https://docs.rs/serde_json/1/serde_json/enum.Value.html#method.as_str>
+#[verifier::external_fn_specification]
+pub fn ex_value_as_str(value: &Value) -> (result: Option<&str>)
+    ensures
+        match result {
+            Some(result) => text(*value) == Some(result@),
+            None => text(*value) is None,
+        },
+{
+    value.as_str()
+}
+
+/// Gives the UTF-8 bytes of `text`. <https://doc.rust-lang.org/std/string/struct.String.html#method.as_bytes>
+#[verifier::external_fn_specification]
+pub fn ex_string_as_bytes(text: &String) -> (bytes: &[u8])
+    ensures
+        bytes@ == vstd::utf8::encode_utf8(text@),
+{
+    text.as_bytes()
+}
 
 } // verus!
