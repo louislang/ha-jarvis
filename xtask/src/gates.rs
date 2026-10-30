@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::iter;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::Mutex;
@@ -1275,28 +1274,19 @@ fn verus_function(attribute: &str, function: &str) -> String {
 /// A fixture domain file with a function and a trait default method without a Verus attribute.
 const UNVERIFIED_DOMAIN: &str = "pub fn unverified() {}
 #[verus_verify]
-impl Unit {
-    pub fn method() {}
-}
-pub trait Increment {
-    fn increment(x: u32) -> u32 { x + 1 }
-    fn declared();
-}
-verus! {
-    pub open spec fn double(x: int) -> int { 2 * x }
-}
+impl Unit { pub fn method() {} }
+pub trait Increment { fn increment(x: u32) -> u32 { x + 1 } fn declared(); }
+verus! { pub open spec fn double(x: int) -> int { 2 * x } }
 #[cfg(test)]
-mod tests {
-    fn helper() {}
-}
+mod tests { fn helper() {} }
 ";
 
-/// A fixture domain file with three trusted items and a parameter named `external_value`.
+/// A fixture domain file with four trusted items, one in `cfg_attr`, and a parameter named `external_value`.
 const TRUSTED_DOMAIN: &str = "verus! {
     pub assume_specification[ core::cmp::max::<u32> ](a: u32, b: u32) -> u32;
-    proof fn lemma() {
-        admit();
-    }
+    proof fn lemma() { admit(); }
+    #[cfg_attr(all(), verifier::external_body)]
+    fn hidden() {}
 }
 #[verus_verify(external_body)]
 pub fn trusted() {}
@@ -1389,27 +1379,30 @@ fn attribute(cursor: Cursor<'_>) -> Option<(Cursor<'_>, Cursor<'_>)> {
     Some((inside, after))
 }
 
-/// The names that start with `external` of the attribute with the tokens `inside`: its own name, or an argument of `verus_verify`.
-fn external_names(inside: Cursor<'_>) -> Vec<String> {
-    let Ok(meta) = syn::parse2::<Meta>(inside.token_stream()) else {
-        return Vec::new();
-    };
-    let arguments = match &meta {
-        Meta::List(list) if list.path.is_ident("verus_verify") => list
-            .parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)
-            .unwrap_or_default(),
-        _ => Punctuated::new(),
-    };
-    let paths = iter::once(&meta).chain(&arguments).map(Meta::path);
-    let names = paths.filter_map(|path| path.segments.last().map(|last| last.ident.to_string()));
-    names.filter(|name| name.starts_with("external")).collect()
+/// The names of `meta` that start with `external`: its own name, or one in the arguments of `verus_verify` or `cfg_attr`.
+fn external_names(meta: &Meta) -> Vec<String> {
+    let own = meta
+        .path()
+        .segments
+        .last()
+        .map(|last| last.ident.to_string());
+    let mut names = Vec::new();
+    names.extend(own.filter(|name| name.starts_with("external")));
+    if let Meta::List(list) = meta
+        && (list.path.is_ident("verus_verify") || list.path.is_ident("cfg_attr"))
+    {
+        let arguments = list.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated);
+        names.extend(arguments.iter().flatten().flat_map(external_names));
+    }
+    names
 }
 
 /// Adds the trusted items of the tokens from `cursor` to `found`, also inside groups and `verus!` blocks.
 fn add_trusted(mut cursor: Cursor<'_>, found: &mut Vec<String>) {
     while let Some((_, mut next)) = cursor.token_tree() {
         if let Some((inside, after)) = attribute(cursor) {
-            found.extend(external_names(inside));
+            let meta = syn::parse2::<Meta>(inside.token_stream());
+            found.extend(meta.iter().flat_map(external_names));
             add_trusted(inside, found);
             next = after;
         } else if let Some((inside, ..)) = cursor.any_group() {
@@ -1543,7 +1536,15 @@ fn ac_0_18_4_findings_unverified_function() {
 #[test]
 fn ac_0_18_5_findings_trusted_items() {
     let (_folder, file) = domain_file("src/domain/fixture.rs", TRUSTED_DOMAIN);
-    let expected = findings(&file, &["assume_specification", "admit", "external_body"]);
+    let expected = findings(
+        &file,
+        &[
+            "assume_specification",
+            "admit",
+            "external_body",
+            "external_body",
+        ],
+    );
     assert_eq!(verus_findings(&[file]), expected);
     let (_folder, contracts) = domain_file(CONTRACTS, TRUSTED_DOMAIN);
     assert_eq!(verus_findings(&[contracts]), []);
