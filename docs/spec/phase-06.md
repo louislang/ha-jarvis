@@ -150,7 +150,7 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 **Proofs.**
 
 - P-6.5-1 to P-6.5-3, P-6.5-5. Ensures: `should_commit = (silence_ms = Some(s) and has_text and ((confident and s >= early_commit_ms) or s >= endpoint_ms)) or audio_ms >= max_utterance_ms`. Argument: `should_commit` is the disjunction of the `MAX` comparison and the two silence comparisons, which are guarded by `Some(silence)` and `has_text`. Each criterion makes one disjunct true, or all false.
-- P-6.5-6. Ensures: a configuration that breaks a relation of sub-phase 1.1 gives `Err` with both field names. Argument: `validate` compares the two fields of each relation and returns the first failure.
+- P-6.5-6. Ensures: a configuration that breaks a relation of sub-phase 2.2 gives `Err` with both field names. Argument: `validate` compares the two fields of each relation and returns the first failure.
 - P-6.5-4. Evidence: test.
 
 ---
