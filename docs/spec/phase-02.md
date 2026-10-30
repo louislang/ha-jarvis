@@ -95,39 +95,78 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 
 ---
 
-### 2.4 HA Events and Reconnect
+### 2.4 HA Background Connection
 
-**Goal:** Add `events`, which subscribes to state changes and registry updates. Add reconnect after a disconnect, with a `Reconnected` event, so the cache can load a new snapshot.
+**Goal:** Make `HaHome::start` return at once and connect in the background, so a slow or absent HA does not block the start. A request without a connection gets a disconnect error.
 
 - **Implements:** G8. **Depends on:** 2.3.
-- **Files:** modify `src/adapters/ha.rs`, `jarvis.toml`.
+- **Files:** modify `src/adapters/ha.rs`, `src/lib.rs`, `Cargo.toml`.
 
 **Model.**
 
-- After `Ready`, the adapter sends `subscribe_events` for `state_changed`, `area_registry_updated`, `device_registry_updated` and `entity_registry_updated`.
-- On a disconnect: every pending request gets a disconnect error, then the adapter connects again with backoff (100 ms, doubled, at most 2 s). After `Ready` and the new subscriptions, it gives `Reconnected`.
-- Every `ha.ping_interval_s`, the adapter sends `ping`. No `pong` within `ha.request_timeout_ms` is a disconnect. Thus a dead TCP connection does not leave the cache stale. This sub-phase adds `ha.ping_interval_s`.
-- `HaHome::start(connector, token, config)` returns at once. It makes the first connection in the background with the same backoff as a reconnect. A request before the first `Ready` gets a disconnect error. The first `Ready` also gives `Reconnected`.
-- The connection has an epoch number. An event from an old epoch is dropped.
-- `events` keeps the events from the first subscription in order, until the consumer reads them. A connection that reaches `Ready` resets the backoff attempt to 0.
+- `HaHome::start(connector, token, config)` returns at once. A background task makes the first connection and reads it. A request before the first `Ready` gets a disconnect error.
+- On a disconnect, every pending request gets a disconnect error.
 
 **Acceptance criteria.**
 
-- AC-2.4-1: When `FakeHaServer` sends `state_changed`, `events` gives `StateChanged` with its context.
-- AC-2.4-2: When `FakeHaServer` sends `entity_registry_updated`, `events` gives `RegistryUpdated`.
-- AC-2.4-3: When `FakeHaServer` closes the connection, the adapter connects again after the first backoff delay in virtual time and `events` gives `Reconnected`.
-- AC-2.4-4: When the connection closes with a pending request, the caller receives a disconnect error.
-- AC-2.4-5: When the backoff runs five times, the delays are 100, 200, 400, 800 and 1600 ms, and the sixth is 2000 ms.
-- AC-2.4-6: When a reconnect reaches `Ready` after three attempts and the connection closes again, the next delay is 100 ms.
-- AC-2.4-7: When `FakeHaServer` stops answering `ping`, the adapter connects again after the `pong` deadline in virtual time, and `events` gives `Reconnected`.
-- AC-2.4-8: When no server is available at `start`, `start` returns an adapter. When the server becomes available, `events` gives `Reconnected`.
+- AC-2.4-1: When the connection closes with a pending request, the caller receives a disconnect error.
 
 **Proofs.**
 
-- P-2.4-1 to P-2.4-3, P-2.4-7, P-2.4-8. Evidence: test.
-- P-2.4-4 (AC-2.4-4). Ensures: after a disconnect, `pending` is empty and each removed sender received an error. Argument: the disconnect handler drains the map and sends an error to each sender before it starts the reconnect.
-- P-2.4-6. Argument: `Ready` sets the attempt to 0, and `delay(0) = 100`.
-- P-2.4-5 (AC-2.4-5). Requires: attempt `k >= 0`. Ensures: `delay(k) = min(100 * 2^k, 2000)`. Argument: the function is this closed form. `100 * 2^5 = 3200 > 2000`, so the sixth delay is 2000.
+- P-2.4-1 (AC-2.4-1). Ensures: after a disconnect, `pending` is empty and each removed sender received an error. Argument: the disconnect handler drains the map and sends an error to each sender.
+
+---
+
+### 2.4b HA Events
+
+**Goal:** Add `events`, which subscribes to state changes and registry updates.
+
+- **Implements:** G8. **Depends on:** 2.4.
+- **Files:** modify `src/adapters/ha.rs`.
+
+**Model.**
+
+- After `Ready`, the adapter sends `subscribe_events` for `state_changed`, `area_registry_updated`, `device_registry_updated` and `entity_registry_updated`. After `Ready` and the subscriptions, it gives `Reconnected`. Thus the first `Ready` also gives `Reconnected`.
+- `events` keeps the events from the first subscription in order, until the consumer reads them.
+
+**Acceptance criteria.**
+
+- AC-2.4b-1: When `FakeHaServer` sends `state_changed`, `events` gives `StateChanged` with its context.
+- AC-2.4b-2: When `FakeHaServer` sends `entity_registry_updated`, `events` gives `RegistryUpdated`.
+
+**Proofs.**
+
+- P-2.4b-1, P-2.4b-2. Evidence: test.
+
+---
+
+### 2.4c HA Reconnect and Ping
+
+**Goal:** Connect again after a disconnect, with a `Reconnected` event, so the cache can load a new snapshot. Find a dead connection with `ping`.
+
+- **Implements:** G8. **Depends on:** 2.4b.
+- **Files:** modify `src/adapters/ha.rs`, `src/lib.rs`, `jarvis.toml`.
+
+**Model.**
+
+- After a disconnect, the adapter connects again with backoff (100 ms, doubled, at most 2 s). After `Ready` and the new subscriptions, it gives `Reconnected`.
+- When the first connection at `start` fails, the adapter tries again with the same backoff.
+- Every `ha.ping_interval_s`, the adapter sends `ping`. No `pong` within `ha.request_timeout_ms` is a disconnect. Thus a dead TCP connection does not leave the cache stale. This sub-phase adds `ha.ping_interval_s`.
+- A connection that reaches `Ready` resets the backoff attempt to 0.
+
+**Acceptance criteria.**
+
+- AC-2.4c-1: When `FakeHaServer` closes the connection, the adapter connects again after the first backoff delay in virtual time and `events` gives `Reconnected`.
+- AC-2.4c-2: When the backoff runs five times, the delays are 100, 200, 400, 800 and 1600 ms, and the sixth is 2000 ms.
+- AC-2.4c-3: When a reconnect reaches `Ready` after three attempts and the connection closes again, the next delay is 100 ms.
+- AC-2.4c-4: When `FakeHaServer` stops answering `ping`, the adapter connects again after the `pong` deadline in virtual time, and `events` gives `Reconnected`.
+- AC-2.4c-5: When no server is available at `start`, `start` returns an adapter. When the server becomes available, `events` gives `Reconnected`.
+
+**Proofs.**
+
+- P-2.4c-1, P-2.4c-4, P-2.4c-5. Evidence: test.
+- P-2.4c-3. Argument: `Ready` sets the attempt to 0, and `delay(0) = 100`.
+- P-2.4c-2 (AC-2.4c-2). Requires: attempt `k >= 0`. Ensures: `delay(k) = min(100 * 2^k, 2000)`. Argument: the function is this closed form. `100 * 2^5 = 3200 > 2000`, so the sixth delay is 2000.
 
 ---
 
@@ -135,7 +174,7 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 
 **Goal:** Add `call`, which sends `call_service` with the target and data, and returns the response data when asked. Jarvis can now act on HA.
 
-- **Implements:** G8. **Depends on:** 2.4.
+- **Implements:** G8. **Depends on:** 2.4c.
 - **Files:** modify `src/adapters/ha.rs`.
 
 **Model.** `call(c)` sends `{ type: "call_service", domain, service, target: { entity_id }, service_data: data, return_response }` and returns `response` when `return_response` is true.
