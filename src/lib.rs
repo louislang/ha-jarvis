@@ -51,11 +51,16 @@ impl Config {
     ///
     /// A field is out of its range. The error names the field and the range.
     fn validate(&self) -> anyhow::Result<()> {
-        let timeout = self.ha.request_timeout_ms;
-        anyhow::ensure!(
-            timeout > 0,
-            "ha.request_timeout_ms = {timeout} is out of range: it must be more than 0"
-        );
+        let positive = [
+            ("ha.request_timeout_ms", self.ha.request_timeout_ms),
+            ("ha.ping_interval_s", self.ha.ping_interval_s),
+        ];
+        for (name, value) in positive {
+            anyhow::ensure!(
+                value > 0,
+                "{name} = {value} is out of range: it must be more than 0"
+            );
+        }
         Ok(())
     }
 
@@ -91,6 +96,8 @@ pub struct HaConfig {
     pub token_env: String,
     /// Deadline of the authentication and of each request.
     pub request_timeout_ms: u64,
+    /// Time between two pings.
+    pub ping_interval_s: u64,
 }
 
 /// Secrets from the environment variables that [`Config`] names.
@@ -154,6 +161,7 @@ mod tests {
                 url: "ws://homeassistant.local:8123/api/websocket".to_owned(),
                 token_env: "HA_TOKEN".to_owned(),
                 request_timeout_ms: 5000,
+                ping_interval_s: 30,
             },
         };
         assert_eq!(Config::parse(VALID)?, expected);
