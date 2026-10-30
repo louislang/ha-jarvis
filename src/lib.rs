@@ -1,5 +1,8 @@
 //! Voice-controlled home automation for Home Assistant.
 
+// Verus reads loop invariants from attributes on loops.
+#![cfg_attr(verus_only, feature(proc_macro_hygiene))]
+
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -9,6 +12,7 @@ use serde::Deserialize;
 
 /// Pure rules.
 pub mod domain {
+    #[cfg(verus_only)]
     pub mod contracts;
     pub mod state;
 }
