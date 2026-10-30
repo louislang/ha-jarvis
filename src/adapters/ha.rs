@@ -2,7 +2,6 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::pin;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::time::Duration;
@@ -17,6 +16,7 @@ use futures::lock::Mutex as AsyncMutex;
 use futures::stream::SplitSink;
 use futures::stream::SplitStream;
 use serde::Deserialize;
+use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 use tokio::io::AsyncRead;
@@ -109,7 +109,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HaHome<S> {
             self.request(json!({ "type": "get_config" })),
             self.request(json!({ "type": "auth/current_user" })),
         )?;
-        self.add_aliases(&mut entities).await?;
+        self.complete(&mut entities, &states).await?;
         let snapshot = json!({
             "states": states, "areas": areas, "devices": devices,
             "entities": entities, "config": config, "user_id": user["id"],
@@ -117,18 +117,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HaHome<S> {
         serde_json::from_value(snapshot).context("protocol error: the snapshot is not valid")
     }
 
-    /// Puts the aliases of `config/entity_registry/get_entries` into each listed entity.
-    async fn add_aliases(&self, entities: &mut Value) -> anyhow::Result<()> {
+    /// Completes each listed entity with its entry of `get_entries` and the names of `states`.
+    async fn complete(&self, entities: &mut Value, states: &Value) -> anyhow::Result<()> {
         let listed = entities.as_array_mut().context("protocol error")?;
         let ids: Vec<&Value> = listed.iter().map(|entity| &entity["entity_id"]).collect();
         let command = json!({ "type": "config/entity_registry/get_entries", "entity_ids": ids });
         let entries = self.request(command).await?;
-        for entity in listed {
-            let id = entity["entity_id"].as_str().unwrap_or_default();
-            let aliases = entries[id].get("aliases").cloned();
-            if let Some(fields) = entity.as_object_mut() {
-                fields.insert("aliases".to_owned(), aliases.unwrap_or_else(|| json!([])));
-            }
+        let names: HashMap<&Value, &Value> = states
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|state| (&state["entity_id"], &state["attributes"]["friendly_name"]))
+            .filter(|(_, name)| name.is_string())
+            .collect();
+        let objects = listed.iter_mut().filter_map(Value::as_object_mut);
+        for fields in objects {
+            complete_entity(fields, &entries, &names);
         }
         Ok(())
     }
@@ -161,7 +165,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HaHome<S> {
         receiver: &mut oneshot::Receiver<anyhow::Result<Value>>,
     ) -> anyhow::Result<Value> {
         loop {
-            let read = pin::pin!(async { self.reader.lock().await.next().await });
+            let read = std::pin::pin!(async { self.reader.lock().await.next().await });
             match future::select(&mut *receiver, read).await {
                 Either::Left((result, _)) => return result.context("connection error")?,
                 Either::Right((Some(Ok(Message::Text(text))), _)) => self.deliver(&text),
@@ -198,6 +202,23 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HaHome<S> {
     }
 }
 
+/// Puts the aliases of `entries` into `fields`, and a name from `names` or the ID if it has none.
+fn complete_entity(
+    fields: &mut Map<String, Value>,
+    entries: &Value,
+    names: &HashMap<&Value, &Value>,
+) {
+    let id = fields.get("entity_id").cloned().unwrap_or_default();
+    let aliases = entries[id.as_str().unwrap_or_default()]
+        .get("aliases")
+        .cloned();
+    fields.insert("aliases".to_owned(), aliases.unwrap_or_else(|| json!([])));
+    if fields.get("name").is_none_or(Value::is_null) {
+        let name = names.get(&id).copied().unwrap_or(&id).clone();
+        fields.insert("name".to_owned(), name);
+    }
+}
+
 /// A message with a request ID.
 #[derive(Deserialize)]
 struct Reply {
@@ -207,7 +228,6 @@ struct Reply {
     #[serde(rename = "type")]
     kind: String,
     /// True when HA ran the command.
-    #[serde(default)]
     success: bool,
     /// The result of the command.
     #[serde(default)]
@@ -382,11 +402,12 @@ mod tests {
         }
     }
 
-    /// `entity` as `config/entity_registry/list` gives it: with no aliases.
+    /// `entity` as `config/entity_registry/list` gives it: with no aliases and no name.
     fn without_aliases(entity: &Value) -> Value {
         let mut entity = entity.clone();
         if let Some(fields) = entity.as_object_mut() {
             fields.remove("aliases");
+            fields.insert("name".to_owned(), Value::Null);
         }
         entity
     }
@@ -394,15 +415,11 @@ mod tests {
     /// The entries of `ids` by entity ID, as `config/entity_registry/get_entries` gives them.
     fn entries(entities: &[Value], ids: &Value) -> Value {
         let ids = ids.as_array().expect("the request has entity IDs");
-        let requested = entities
+        let entry = |id: &Value| entities.iter().find(|entity| entity["entity_id"] == *id);
+        let pairs = ids
             .iter()
-            .filter(|entity| ids.contains(&entity["entity_id"]));
-        let id = |entity: &Value| entity["entity_id"].as_str().map(str::to_owned);
-        Value::Object(
-            requested
-                .filter_map(|entity| Some((id(entity)?, entity.clone())))
-                .collect(),
-        )
+            .filter_map(|id| Some((id.as_str()?.to_owned(), entry(id)?.clone())));
+        Value::Object(pairs.collect())
     }
 
     /// The `[ha]` section of `jarvis.toml`.
@@ -526,12 +543,6 @@ mod tests {
         json!({ "type": "echo", "n": n })
     }
 
-    /// Returns the text of the error that an `echo` request gives.
-    async fn echo_error(home: &HaHome<DuplexStream>) -> String {
-        let result = home.request(echo(1)).await;
-        format!("{:#}", result.expect_err("the request fails"))
-    }
-
     /// AC-2.3-1.
     #[tokio::test(start_paused = true)]
     async fn ac_2_3_1_concurrent_callers_receive_own_results() -> anyhow::Result<()> {
@@ -590,19 +601,16 @@ mod tests {
             server.wait_close().await;
         })
         .await;
-        let error = echo_error(&home).await;
-        assert!(
-            error.contains("Entity not found."),
-            "no HA message: {error}"
-        );
+        let error = home.request(echo(1)).await.expect_err("HA fails");
+        assert!(format!("{error}").contains("Entity not found."), "{error}");
     }
 
     /// AC-2.3-5.
     #[tokio::test(start_paused = true)]
     async fn ac_2_3_5_no_result_is_timeout_error_and_not_pending() {
         let home = ready(FakeHaServer::wait_close).await;
-        let error = echo_error(&home).await;
-        assert!(error.contains("timeout"), "not a timeout error: {error}");
+        let error = home.request(echo(1)).await.expect_err("HA does not answer");
+        assert!(format!("{error}").contains("timeout"), "{error}");
         assert!(home.pending().is_empty(), "the ID is still pending");
     }
 
