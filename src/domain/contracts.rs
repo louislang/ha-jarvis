@@ -178,4 +178,16 @@ pub fn ex_string_as_bytes(text: &String) -> (bytes: &[u8])
     text.as_bytes()
 }
 
+/// The lowercase form of `text`.
+pub uninterp spec fn lowercase(text: Seq<char>) -> Seq<char>;
+
+/// Gives the lowercase form of `text`. <https://doc.rust-lang.org/std/primitive.str.html#method.to_lowercase>
+#[verifier::external_fn_specification]
+pub fn ex_str_to_lowercase(text: &str) -> (lower: String)
+    ensures
+        lower@ == lowercase(text@),
+{
+    text.to_lowercase()
+}
+
 } // verus!
