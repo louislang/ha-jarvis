@@ -1,0 +1,6 @@
+listen = "0.0.0.0:10700"
+device = "cuda"
+
+[ha]
+url = "ws://homeassistant.local:8123/api/websocket"
+token_env = "HA_TOKEN"
