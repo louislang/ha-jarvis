@@ -7,6 +7,7 @@ rust_code_analysis_cli_version := "0.0.25"
 jscpd_version := "5.4.2"
 quint_version := "0.33.0"
 quint_evaluator_version := "v0.7.0"
+verus_version := "0.2026.10.26.d17fbd0"
 
 # Run the tests.
 test:
@@ -48,6 +49,10 @@ quint:
         quint verify --invariant=allInvariants --max-steps=10 "$model"
     done
 
+# Prove the Verus proofs of the domain.
+verus:
+    PATH="$HOME/.verus/{{ verus_version }}:$PATH" cargo verus verify -p jarvis
+
 # Run the `[GPU host]` tests on CUDA.
 gpu-test:
     JARVIS_DEVICE=cuda cargo test --workspace --release -- --ignored
@@ -65,11 +70,11 @@ workflow-lint:
     actionlint
 
 # Run the checks of the pre-commit hook.
-check: workflow-lint format lint complexity duplication architecture quint cov
+check: workflow-lint format lint complexity duplication architecture quint verus cov
     {{ if env("JARVIS_DEVICE", "") == "cuda" { "just gpu-test" } else { "" } }}
 
 # Install the tools and the pre-commit hook.
-setup: pre-push-hook install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint install-quint-evaluator
+setup: pre-push-hook install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint install-quint-evaluator install-verus
     pre-commit install --hook-type pre-commit
     gh extension install github/gh-stack
 
@@ -103,3 +108,20 @@ install-quint:
 install-quint-evaluator:
     mkdir -p ~/.quint/rust-evaluator-{{ quint_evaluator_version }}
     curl -sSfL https://github.com/quint-co/quint/releases/download/evaluator/{{ quint_evaluator_version }}/quint_evaluator-$(rustc -vV | sed -n 's/host: //p').tar.gz | tar -xz -C ~/.quint/rust-evaluator-{{ quint_evaluator_version }}
+
+install-verus:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case "$(uname -sm)" in
+        "Linux x86_64") platform=x86-linux ;;
+        "Darwin x86_64") platform=x86-macos ;;
+        "Darwin arm64") platform=arm64-macos ;;
+        *) echo "Verus has no release for $(uname -sm)." >&2; exit 1 ;;
+    esac
+    folder=~/.verus/{{ verus_version }}
+    rm -rf "$folder" "$folder.zip" ~/.verus/verus-$platform
+    curl -sSfL --create-dirs -o "$folder.zip" https://github.com/verus-lang/verus/releases/download/release%2F{{ verus_version }}/verus-{{ verus_version }}-$platform.zip
+    unzip -q "$folder.zip" -d ~/.verus
+    mv ~/.verus/verus-$platform "$folder"
+    rm "$folder.zip"
+    rustup toolchain install "$("$folder/verus" --version | sed -n 's/^ *Toolchain: \([^ ]*\).*/\1/p')"

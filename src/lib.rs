@@ -1,5 +1,10 @@
 //! Voice-controlled home automation for Home Assistant.
 
+/// Pure rules.
+pub mod domain {
+    pub mod contracts;
+}
+
 /// Entry point of Jarvis.
 pub fn main() {}
 

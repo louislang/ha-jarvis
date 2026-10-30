@@ -7,6 +7,12 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[dependencies]
+vstd = "=0.0.0-2026-10-25-0158"
+
+[package.metadata.verus]
+verify = true
+
 [lints]
 workspace = true
 
@@ -15,6 +21,7 @@ warnings = "deny"
 dead_code = "deny"
 missing_docs = "deny"
 unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(verus_only)"] }
 
 [workspace.lints.clippy]
 pedantic = "deny"

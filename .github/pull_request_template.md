@@ -14,6 +14,7 @@
 - [ ] `duplication`
 - [ ] `architecture`
 - [ ] `quint`
+- [ ] `verus`
 - [ ] `rust-test`
 - [ ] `workflow-lint`
 - [ ] `gpu-test`
