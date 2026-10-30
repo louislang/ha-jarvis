@@ -2,20 +2,27 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::Weak;
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::Context as _;
 use futures::SinkExt;
 use futures::StreamExt;
+use futures::channel::mpsc;
 use futures::channel::oneshot;
+use futures::future;
 use futures::future::AbortHandle;
 use futures::future::Abortable;
+use futures::future::Either;
 use futures::lock::Mutex as AsyncMutex;
+use futures::stream;
+use futures::stream::BoxStream;
 use futures::stream::SplitSink;
+use futures::stream::SplitStream;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
@@ -27,10 +34,24 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::HaConfig;
+use crate::domain::state::Context;
+use crate::domain::state::Event;
 use crate::domain::state::Snapshot;
+use crate::domain::state::State;
+
+/// The sender of the events of all connections.
+type Events = mpsc::UnboundedSender<Event>;
 
 /// The sender of the result of one request.
 type ResultSender = oneshot::Sender<anyhow::Result<Value>>;
+
+/// The HA events that the adapter subscribes to.
+const EVENT_TYPES: [&str; 4] = [
+    "area_registry_updated",
+    "device_registry_updated",
+    "entity_registry_updated",
+    "state_changed",
+];
 
 /// `Home` over the HA WebSocket API.
 pub struct HaHome<S> {
@@ -38,6 +59,8 @@ pub struct HaHome<S> {
     writer: AsyncMutex<Writer<S>>,
     /// The result sender of each request that waits, by request ID.
     pending: Mutex<HashMap<u64, ResultSender>>,
+    /// The events, until [`HaHome::events`] takes them.
+    events: Mutex<Option<mpsc::UnboundedReceiver<Event>>>,
     /// The deadline of each request.
     deadline: Duration,
     /// Stops the connection task when the adapter drops.
@@ -76,18 +99,20 @@ impl Drop for Pending<'_> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
     /// Returns at once. A background task opens a transport with `connector`, authenticates
-    /// with `token` and reads the connection until it closes.
+    /// with `token`, subscribes to the events and reads the connection until it closes.
     pub fn start<F>(connector: impl FnOnce() -> F, token: &str, config: &HaConfig) -> Arc<Self>
     where
         F: Future<Output = io::Result<S>> + Send + 'static,
     {
         let (task, registration) = AbortHandle::new_pair();
+        let (sender, receiver) = mpsc::unbounded();
         let home = Arc::new(Self {
             writer: AsyncMutex::new(Writer {
                 sink: None,
                 next_id: 1,
             }),
             pending: Mutex::new(HashMap::new()),
+            events: Mutex::new(Some(receiver)),
             deadline: Duration::from_millis(config.request_timeout_ms),
             task,
         });
@@ -96,25 +121,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         let weak = Arc::downgrade(&home);
         let connection = async move {
             if let Ok(socket) = connect(transport, &token, &config).await {
-                Self::serve(&weak, socket).await;
+                Self::serve(&weak, socket, &sender).await;
             }
         };
         tokio::spawn(Abortable::new(connection, registration));
         home
     }
 
-    /// Delivers each message until the connection closes, then fails each pending request.
-    async fn serve(home: &Weak<Self>, socket: WebSocketStream<S>) {
-        let (sink, mut stream) = socket.split();
+    /// The changes in HA, in order, from the first subscription. Only the first call gets them.
+    pub fn events(&self) -> BoxStream<'static, Event> {
+        let receiver = self.events.lock().ok().and_then(|mut events| events.take());
+        stream::iter(receiver).flatten().boxed()
+    }
+
+    /// Delivers each message and subscribes until the connection closes, then fails each
+    /// pending request.
+    async fn serve(home: &Weak<Self>, socket: WebSocketStream<S>, events: &Events) {
+        let (sink, stream) = socket.split();
         let Some(adapter) = home.upgrade() else {
             return;
         };
         adapter.writer.lock().await.sink = Some(sink);
         drop(adapter);
-        while let Some(Ok(message)) = stream.next().await {
-            if let (Message::Text(text), Some(adapter)) = (message, home.upgrade()) {
-                adapter.deliver(&text);
-            }
+        let read = pin::pin!(Self::read(home, stream, events));
+        // The subscriptions need the read loop for their results. A close stops them.
+        if let Either::Right(((), read)) =
+            future::select(read, pin::pin!(Self::subscribe(home, events))).await
+        {
+            read.await;
         }
         let Some(adapter) = home.upgrade() else {
             return;
@@ -124,6 +158,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         writer.sink = None;
         for (_, sender) in adapter.pending().drain() {
             sender.send(Err(disconnected())).ok();
+        }
+    }
+
+    /// Delivers each message of `stream` until the connection closes.
+    async fn read(home: &Weak<Self>, mut stream: SplitStream<WebSocketStream<S>>, events: &Events) {
+        while let Some(Ok(message)) = stream.next().await {
+            if let (Message::Text(text), Some(adapter)) = (message, home.upgrade()) {
+                adapter.deliver(&text, events);
+            }
+        }
+    }
+
+    /// Subscribes to [`EVENT_TYPES`], then gives `Reconnected`.
+    async fn subscribe(home: &Weak<Self>, events: &Events) {
+        let Some(adapter) = home.upgrade() else {
+            return;
+        };
+        let subscriptions = EVENT_TYPES
+            .map(|kind| adapter.request(json!({ "type": "subscribe_events", "event_type": kind })));
+        if future::try_join_all(subscriptions).await.is_ok() {
+            events.unbounded_send(Event::Reconnected).ok();
         }
     }
 
@@ -193,19 +248,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             .map_err(|_| anyhow::anyhow!("timeout error: no result within {:?}", self.deadline))?
     }
 
-    /// Sends a `result` message to its pending request. Ignores other messages and IDs.
-    fn deliver(&self, text: &str) {
-        let reply = match serde_json::from_str::<Reply>(text) {
-            Ok(reply) if reply.kind == "result" => reply,
-            _ => return,
+    /// Sends a result to its pending request and an event to `events`. Ignores other messages
+    /// and IDs.
+    fn deliver(&self, text: &str, events: &Events) {
+        let (id, result) = match serde_json::from_str(text) {
+            Ok(Incoming::Result {
+                id,
+                success: true,
+                result,
+                ..
+            }) => (id, Ok(result)),
+            Ok(Incoming::Result { id, error, .. }) => {
+                (id, Err(anyhow::anyhow!("HA error: {error}")))
+            }
+            Ok(Incoming::Event { event }) => {
+                events.unbounded_send(event.into()).ok();
+                return;
+            }
+            Err(_) => return,
         };
-        let Some(sender) = self.pending().remove(&reply.id) else {
+        let Some(sender) = self.pending().remove(&id) else {
             return;
-        };
-        let result = if reply.success {
-            Ok(reply.result)
-        } else {
-            Err(anyhow::anyhow!("HA error: {}", reply.error))
         };
         // The request can time out between the removal and the send.
         sender.send(result).ok();
@@ -241,22 +304,73 @@ fn complete_entity(
     }
 }
 
-/// A message with a request ID.
+/// A message from HA after the authentication.
 #[derive(Deserialize)]
-struct Reply {
-    /// The request ID.
-    id: u64,
-    /// For example `result`.
-    #[serde(rename = "type")]
-    kind: String,
-    /// True when HA ran the command.
-    success: bool,
-    /// The result of the command.
-    #[serde(default)]
-    result: Value,
-    /// The code and the message of the error when `success` is false.
-    #[serde(default)]
-    error: Value,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum Incoming {
+    /// The result of a command.
+    Result {
+        /// The request ID.
+        id: u64,
+        /// True when HA ran the command.
+        success: bool,
+        /// The result of the command.
+        #[serde(default)]
+        result: Value,
+        /// The code and the message of the error when `success` is false.
+        #[serde(default)]
+        error: Value,
+    },
+    /// An event of a subscription.
+    Event {
+        /// The event.
+        event: HaEvent,
+    },
+}
+
+/// An HA event of one of [`EVENT_TYPES`].
+#[derive(Deserialize)]
+#[serde(tag = "event_type", rename_all = "snake_case")]
+enum HaEvent {
+    /// The state of one entity changed.
+    StateChanged {
+        /// The entity and its states.
+        data: StateChange,
+        /// The cause of the change.
+        context: Context,
+    },
+    /// An area, device or entity registry changed.
+    #[serde(
+        rename = "area_registry_updated",
+        alias = "device_registry_updated",
+        alias = "entity_registry_updated"
+    )]
+    RegistryUpdated,
+}
+
+/// The data of a `state_changed` event.
+#[derive(Deserialize)]
+struct StateChange {
+    /// The entity that changed.
+    entity_id: String,
+    /// Absent for a new entity.
+    old_state: Option<Box<State>>,
+    /// Absent for a removed entity.
+    new_state: Option<Box<State>>,
+}
+
+impl From<HaEvent> for Event {
+    fn from(event: HaEvent) -> Self {
+        match event {
+            HaEvent::StateChanged { data, context } => Self::StateChanged {
+                entity_id: data.entity_id,
+                old: data.old_state,
+                new: data.new_state,
+                context,
+            },
+            HaEvent::RegistryUpdated => Self::RegistryUpdated,
+        }
+    }
 }
 
 /// The type of an HA message.
@@ -403,6 +517,25 @@ mod tests {
             let message =
                 json!({ "id": request["id"], "type": "result", "success": true, "result": result });
             self.send_json(&message).await;
+        }
+
+        /// Sends `event` as an event of a subscription.
+        async fn send_event(&mut self, event: Value) {
+            self.send_json(&json!({ "id": 1, "type": "event", "event": event }))
+                .await;
+        }
+
+        /// Answers the subscription to each type of [`EVENT_TYPES`].
+        async fn subscribe(&mut self) {
+            let mut kinds = Vec::new();
+            for _ in EVENT_TYPES {
+                let subscription = self.receive().await;
+                assert_eq!(subscription["type"], "subscribe_events");
+                kinds.push(subscription["event_type"].clone());
+                self.reply(&subscription, Value::Null).await;
+            }
+            kinds.sort_by_key(ToString::to_string);
+            assert_eq!(kinds, EVENT_TYPES.map(Value::from));
         }
 
         /// Answers each request from `house.json` as HA does, until the client closes.
@@ -575,10 +708,11 @@ mod tests {
         let client = open(|mut fake| async move {
             fake.receive_auth().await;
             fake.send("auth_ok").await;
+            fake.subscribe().await;
             server(fake).await;
         });
         let home = HaHome::start(|| async { Ok(client) }, TOKEN, &config());
-        // The paused clock advances only when every task waits, thus after `auth_ok`.
+        // The paused clock advances only when every task waits, thus after the subscriptions.
         time::sleep(Duration::from_millis(1)).await;
         home
     }
@@ -686,5 +820,47 @@ mod tests {
         let error = home.request(echo(1)).await.expect_err("HA closes");
         assert!(format!("{error}").contains("disconnected"), "{error}");
         assert!(home.pending().is_empty(), "the ID is still pending");
+    }
+
+    /// Starts an adapter that receives `event` after `Reconnected`, and gives its next event.
+    async fn next_event(event: Value) -> Event {
+        let home = ready(|mut server| async move {
+            // After `Reconnected`: the paused clock advances only when every task waits.
+            time::sleep(Duration::from_millis(1)).await;
+            server.send_event(event).await;
+            server.wait_close().await;
+        })
+        .await;
+        let mut events = home.events();
+        assert_eq!(events.next().await, Some(Event::Reconnected));
+        events.next().await.expect("the events continue")
+    }
+
+    /// AC-2.4b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_2_4b_1_state_changed_gives_state_changed_with_context() -> anyhow::Result<()> {
+        let state = house()["states"][0].clone();
+        let context = json!({ "id": "01K", "user_id": "u1", "parent_id": null });
+        let data =
+            json!({ "entity_id": state["entity_id"], "old_state": null, "new_state": state });
+        let event = json!({ "event_type": "state_changed", "data": data, "context": context });
+        let expected = Event::StateChanged {
+            entity_id: serde_json::from_value(state["entity_id"].clone())?,
+            old: None,
+            new: Some(serde_json::from_value(state)?),
+            context: serde_json::from_value(context)?,
+        };
+        assert_eq!(next_event(event).await, expected);
+        Ok(())
+    }
+
+    /// AC-2.4b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_2_4b_2_entity_registry_updated_gives_registry_updated() {
+        let data = json!({ "action": "update", "entity_id": "light.kitchen" });
+        let context = json!({ "id": "01K", "user_id": null, "parent_id": null });
+        let event =
+            json!({ "event_type": "entity_registry_updated", "data": data, "context": context });
+        assert_eq!(next_event(event).await, Event::RegistryUpdated);
     }
 }
