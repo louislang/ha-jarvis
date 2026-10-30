@@ -1,6 +1,7 @@
 //! Developer tools of Jarvis.
 
 use std::env;
+use std::io;
 use std::process::ExitCode;
 
 mod complexity;
@@ -23,9 +24,11 @@ fn main() -> ExitCode {
         ["diagram", "--base", reference] => mermaid::run_base(reference),
         ["diagram", file] => mermaid::run(file),
         ["merge", number] => merge::run(number, &env::var_os("PATH").unwrap_or_default()),
+        ["guard-push"] => io::read_to_string(io::stdin())
+            .map_or(ExitCode::FAILURE, |input| merge::guard_push(&input)),
         _ => {
             eprintln!(
-                "usage: xtask complexity <paths> | xtask pr-size --base <ref> --limit <n> | xtask rules | xtask diagram <file> | xtask diagram --base <ref> | xtask merge <pr>"
+                "usage: xtask complexity <paths> | xtask pr-size --base <ref> --limit <n> | xtask rules | xtask diagram <file> | xtask diagram --base <ref> | xtask merge <pr> | xtask guard-push"
             );
             ExitCode::FAILURE
         }

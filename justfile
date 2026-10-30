@@ -69,9 +69,14 @@ check: workflow-lint format lint complexity duplication architecture quint cov
     {{ if env("JARVIS_DEVICE", "") == "cuda" { "just gpu-test" } else { "" } }}
 
 # Install the tools and the pre-commit hook.
-setup: install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint install-quint-evaluator
+setup: pre-push-hook install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint install-quint-evaluator
     pre-commit install --hook-type pre-commit
     gh extension install github/gh-stack
+
+# Write the pre-push guard as a direct Git hook: `pre-commit` does not pass the pushed refs to its hooks.
+pre-push-hook:
+    printf '#!/bin/sh\nexec cargo run --quiet --manifest-path "%s" -p xtask -- guard-push\n' "{{ justfile_directory() / "Cargo.toml" }}" > .git/hooks/pre-push
+    chmod +x .git/hooks/pre-push
 
 install-just:
     cargo install just --version {{ just_version }} --locked
