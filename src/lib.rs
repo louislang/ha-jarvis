@@ -19,9 +19,20 @@ pub mod domain {
 
 pub mod ports;
 
+/// Use cases.
+pub mod app {
+    pub mod background;
+}
+
 /// Port implementations, one technology each.
 pub mod adapters {
     pub mod ha;
+}
+
+/// Shared test code.
+#[cfg(test)]
+pub mod testing {
+    pub mod fakes;
 }
 
 /// Runtime configuration from `jarvis.toml`.

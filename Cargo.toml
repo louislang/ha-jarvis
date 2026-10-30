@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.104"
+arc-swap = "1.9.3"
 async-trait = "0.1.92"
 futures = "0.3.34"
 jiff = { version = "0.2.38", features = ["serde"] }
@@ -27,6 +28,7 @@ workspace = true
 
 [dev-dependencies]
 gungraun = "=0.20.0"
+quint-connect = "0.1.2"
 tokio = { version = "1.54.1", features = ["macros", "rt", "test-util", "io-util"] }
 
 [[bench]]
