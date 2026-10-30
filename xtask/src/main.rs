@@ -7,6 +7,9 @@ mod complexity;
 #[cfg(test)]
 mod gates;
 mod graph;
+// `merge` (sub-phase 0.16) uses the merge rules outside the tests.
+#[cfg(test)]
+mod merge;
 mod mermaid;
 mod pr_size;
 mod rules;
