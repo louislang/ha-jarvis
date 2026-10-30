@@ -8,6 +8,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
+anyhow = "1.0.104"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
 vstd = "=0.0.0-2026-10-25-0158"
 
 [package.metadata.verus]
