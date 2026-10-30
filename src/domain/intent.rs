@@ -1,6 +1,44 @@
-//! Text normalization.
+//! Text normalization and example markup.
+
+use std::mem;
 
 use vstd::prelude::*;
+
+/// A seed example without its slot markup.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Example {
+    /// The markup with each `[value](slot)` replaced by `value`.
+    pub text: String,
+    /// The slot values in `text`, in text order.
+    pub spans: Vec<Span>,
+}
+
+/// One slot value in the text of an example.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Span {
+    /// The slot name.
+    pub slot: String,
+    /// The byte offset of the value.
+    pub start: usize,
+    /// The byte offset after the value.
+    pub end: usize,
+}
+
+/// An error in example markup.
+#[verus_verify]
+#[must_use]
+#[derive(Clone, Debug, PartialEq)]
+pub enum MarkupError {
+    /// A `[` has no closing `](slot)`.
+    Unclosed {
+        /// The byte offset of the `[` in the markup.
+        position: usize,
+    },
+    /// A slot name is empty.
+    EmptySlot,
+}
 
 /// The text with ASCII letters in lowercase, and only letters, digits, apostrophes, dots between
 /// digits and single inner spaces.
@@ -79,9 +117,180 @@ fn between_digits(chars: &[char], index: usize) -> bool {
         && chars[index + 1].is_ascii_digit()
 }
 
+/// The text and the slot spans of `markup`.
+///
+/// # Errors
+///
+/// A `[` has no closing `](slot)`, or a slot name is empty.
+#[verus_spec(result =>
+    ensures
+        result is Ok <==> accepted(markup@),
+        result matches Ok(example)
+            ==> in_order(example.spans@, vstd::utf8::encode_utf8(example.text@).len() as int),
+)]
+pub fn parse_example(markup: &str) -> Result<Example, MarkupError> {
+    let chars: Vec<char> = markup.chars().collect();
+    let bytes = markup.as_bytes();
+    let mut parser = Parser {
+        text: String::new(),
+        spans: Vec::new(),
+        slot: String::new(),
+        mode: Mode::Text,
+        open: 0,
+        start: 0,
+        end: 0,
+    };
+    let mut byte = 0;
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            parsing(markup@, chars@, bytes@, index as int, byte as int, parser),
+        decreases bytes@.len() - byte,
+    ))]
+    while byte < bytes.len() {
+        proof! {
+            lemma_prefix(chars@, index as int);
+        }
+        let c = chars[index];
+        parser.read(c, byte)?;
+        byte += c.len_utf8();
+        index += 1;
+    }
+    proof! {
+        lemma_prefix(chars@, index as int);
+    }
+    parser.finish()
+}
+
+/// The state of the markup parser.
+#[verus_verify]
+enum Mode {
+    /// Outside a slot.
+    Text,
+    /// In the value of a slot.
+    Value,
+    /// After the `]` of a value.
+    Close,
+    /// In the name of a slot.
+    Slot,
+}
+
+/// The markup parser between two characters.
+#[verus_verify]
+struct Parser {
+    /// The text so far.
+    text: String,
+    /// The closed spans so far.
+    spans: Vec<Span>,
+    /// The name of the open slot so far.
+    slot: String,
+    /// The parser state.
+    mode: Mode,
+    /// The byte offset of the open `[` in the markup.
+    open: usize,
+    /// The byte offset of the open value in `text`.
+    start: usize,
+    /// The byte offset after the open value in `text`.
+    end: usize,
+}
+
+#[verus_verify]
+impl Parser {
+    /// Reads the character `c` at byte `byte` of the markup.
+    #[verus_spec(result =>
+        requires
+            valid(*old(self)),
+        ensures
+            reads(*old(self), *final(self), c, result is Ok),
+    )]
+    fn read(&mut self, c: char, byte: usize) -> Result<(), MarkupError> {
+        match self.mode {
+            Mode::Text | Mode::Value => {
+                self.read_value(c, byte);
+                Ok(())
+            }
+            Mode::Close | Mode::Slot => self.read_slot(c),
+        }
+    }
+
+    /// Reads the character `c` at byte `byte` of the markup outside a slot or in a value.
+    #[verus_spec(
+        requires
+            valid(*old(self)),
+            old(self).mode is Text || old(self).mode is Value,
+        ensures
+            reads(*old(self), *final(self), c, true),
+    )]
+    fn read_value(&mut self, c: char, byte: usize) {
+        if matches!(self.mode, Mode::Text) && c == '[' {
+            self.mode = Mode::Value;
+            self.open = byte;
+            self.start = self.text.len();
+        } else if matches!(self.mode, Mode::Value) && c == ']' {
+            self.mode = Mode::Close;
+            self.end = self.text.len();
+        } else {
+            self.text.push(c);
+        }
+    }
+
+    /// Reads the character `c` of the markup after a value or in a slot name.
+    #[verus_spec(result =>
+        requires
+            valid(*old(self)),
+            old(self).mode is Close || old(self).mode is Slot,
+        ensures
+            reads(*old(self), *final(self), c, result is Ok),
+    )]
+    fn read_slot(&mut self, c: char) -> Result<(), MarkupError> {
+        match self.mode {
+            Mode::Close if c == '(' => self.mode = Mode::Slot,
+            Mode::Slot if c != ')' => self.slot.push(c),
+            Mode::Slot if !self.slot.is_empty() => {
+                let mut slot = String::new();
+                mem::swap(&mut slot, &mut self.slot);
+                self.spans.push(Span {
+                    slot,
+                    start: self.start,
+                    end: self.end,
+                });
+                self.mode = Mode::Text;
+            }
+            Mode::Slot => return Err(MarkupError::EmptySlot),
+            Mode::Text | Mode::Value | Mode::Close => {
+                return Err(MarkupError::Unclosed {
+                    position: self.open,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The example after the last character.
+    #[verus_spec(result =>
+        requires
+            valid(self),
+        ensures
+            result is Ok <==> self.mode is Text,
+            result matches Ok(example)
+                ==> in_order(example.spans@, vstd::utf8::encode_utf8(example.text@).len() as int),
+    )]
+    fn finish(self) -> Result<Example, MarkupError> {
+        match self.mode {
+            Mode::Text => Ok(Example {
+                text: self.text,
+                spans: self.spans,
+            }),
+            Mode::Value | Mode::Close | Mode::Slot => Err(MarkupError::Unclosed {
+                position: self.open,
+            }),
+        }
+    }
+}
+
 verus! {
 
-broadcast use crate::domain::contracts::axiom_ascii_alphabetic;
+broadcast use {crate::domain::contracts::axiom_ascii_alphabetic, vstd::utf8::encode_utf8_push};
 
 /// True when `c` is a letter that is not an ASCII capital, a digit, an apostrophe, a dot or a
 /// space.
@@ -199,9 +408,131 @@ proof fn lemma_trimmed(text: Seq<char>, normal: Seq<char>, space: bool)
     }
 }
 
+/// True when the markup `chars` has no error.
+pub closed spec fn accepted(chars: Seq<char>) -> bool {
+    run(chars) == Some((Mode::Text, false))
+}
+
+/// The parser state and whether the slot name is not empty after `chars`, or `None` after an
+/// error.
+spec fn run(chars: Seq<char>) -> Option<(Mode, bool)>
+    decreases chars.len(),
+{
+    if chars.len() == 0 {
+        Some((Mode::Text, false))
+    } else {
+        match run(chars.drop_last()) {
+            Some((mode, named)) => step(mode, named, chars.last()),
+            None => None,
+        }
+    }
+}
+
+/// The parser state after `c` in `mode`, or `None` for an error.
+spec fn step(mode: Mode, named: bool, c: char) -> Option<(Mode, bool)> {
+    match mode {
+        Mode::Text => Some((if c == '[' { Mode::Value } else { Mode::Text }, false)),
+        Mode::Value => Some((if c == ']' { Mode::Close } else { Mode::Value }, false)),
+        Mode::Close => if c == '(' { Some((Mode::Slot, false)) } else { None },
+        Mode::Slot => if c != ')' {
+            Some((Mode::Slot, true))
+        } else if named {
+            Some((Mode::Text, false))
+        } else {
+            None
+        },
+    }
+}
+
+/// True when each span of `spans` is in a text of `len` bytes, and the spans are in order and
+/// do not overlap.
+pub open spec fn in_order(spans: Seq<Span>, len: int) -> bool {
+    &&& forall|index: int| #![trigger spans[index]] 0 <= index < spans.len()
+        ==> spans[index].start <= spans[index].end <= len
+    &&& forall|index: int| #![trigger spans[index]] 0 < index < spans.len()
+        ==> spans[index - 1].end <= spans[index].start
+}
+
+/// True when `after` is `before` after it reads `c`, and `ok` is false only for an error.
+spec fn reads(before: Parser, after: Parser, c: char, ok: bool) -> bool {
+    match step(before.mode, before.slot@.len() > 0, c) {
+        Some(state) => ok && valid(after) && state == (after.mode, after.slot@.len() > 0),
+        None => !ok,
+    }
+}
+
+/// True when the spans, the offsets and the slot name of `parser` agree with its state.
+spec fn valid(parser: Parser) -> bool {
+    let len = vstd::utf8::encode_utf8(parser.text@).len() as int;
+    &&& in_order(parser.spans@, len)
+    &&& !(parser.mode is Text) ==> parser.start <= len
+    &&& !(parser.mode is Text) && parser.spans@.len() > 0 ==> parser.spans@.last().end <= parser.start
+    &&& (parser.mode is Close || parser.mode is Slot) ==> parser.start <= parser.end <= len
+    &&& !(parser.mode is Slot) ==> parser.slot@.len() == 0
+}
+
+/// The loop invariant of `parse_example`: `parser` has read the first `index` characters of
+/// `markup`, which end at byte `byte`.
+spec fn parsing(markup: Seq<char>, chars: Seq<char>, bytes: Seq<u8>, index: int, byte: int, parser: Parser) -> bool {
+    &&& chars == markup
+    &&& bytes == vstd::utf8::encode_utf8(markup)
+    &&& 0 <= index <= chars.len()
+    &&& byte == vstd::utf8::encode_utf8(chars.take(index)).len()
+    &&& valid(parser)
+    &&& run(chars.take(index)) == Some((parser.mode, parser.slot@.len() > 0))
+}
+
+/// The facts about the prefix of `chars` with `index` characters that the loop of
+/// `parse_example` needs.
+proof fn lemma_prefix(chars: Seq<char>, index: int)
+    requires
+        0 <= index <= chars.len(),
+    ensures
+        index == chars.len() ==> chars.take(index) == chars,
+        index < chars.len() ==> {
+            &&& chars.take(index + 1).drop_last() == chars.take(index)
+            &&& chars.take(index).push(chars[index]) == chars.take(index + 1)
+            &&& vstd::utf8::encode_utf8(chars.take(index)).len()
+                < vstd::utf8::encode_utf8(chars).len()
+            &&& vstd::utf8::encode_utf8(chars.take(index + 1)).len()
+                <= vstd::utf8::encode_utf8(chars).len()
+            &&& run(chars.take(index + 1)) is None ==> run(chars) is None
+        },
+{
+    assert(chars.take(chars.len() as int) =~= chars);
+    if index < chars.len() {
+        assert(chars.take(index + 1).drop_last() =~= chars.take(index));
+        assert(chars.take(index).push(chars[index]) =~= chars.take(index + 1));
+        vstd::utf8::lemma_encode_utf8_len_strictly_monotonic(chars, index, chars.len() as int);
+        if index + 1 < chars.len() {
+            vstd::utf8::lemma_encode_utf8_len_strictly_monotonic(chars, index + 1, chars.len() as int);
+        }
+        if run(chars.take(index + 1)) is None {
+            lemma_run_none(chars, index + 1);
+        }
+    }
+}
+
+/// An error in a prefix of `chars` is an error of `chars`.
+proof fn lemma_run_none(chars: Seq<char>, index: int)
+    requires
+        0 <= index <= chars.len(),
+        run(chars.take(index)) is None,
+    ensures
+        run(chars) is None,
+    decreases chars.len() - index,
+{
+    if index == chars.len() {
+        assert(chars.take(index) =~= chars);
+    } else {
+        assert(chars.take(index + 1).drop_last() =~= chars.take(index));
+        lemma_run_none(chars, index + 1);
+    }
+}
+
 } // verus!
 
-/// Tests of normalize.
+/// Tests of normalize and example markup.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,6 +560,57 @@ mod tests {
                 "normalize changed its output for {text:?}"
             );
         }
+    }
+
+    /// AC-3.1b-1.
+    #[test]
+    fn ac_3_1b_1_parse_example_gives_text_and_span() {
+        let example = parse_example("turn on the [kitchen](area) lights").expect("valid markup");
+        assert_eq!(example.text, "turn on the kitchen lights");
+        assert_eq!(
+            example.spans,
+            [Span {
+                slot: "area".to_owned(),
+                start: 12,
+                end: 19,
+            }]
+        );
+    }
+
+    /// AC-3.1b-2.
+    #[test]
+    fn ac_3_1b_2_two_slots_give_spans_in_text_order() {
+        let example =
+            parse_example("set the [bedroom](area) to [72](temperature)").expect("valid markup");
+        let slots: Vec<(&str, &str)> = example
+            .spans
+            .iter()
+            .map(|span| (span.slot.as_str(), &example.text[span.start..span.end]))
+            .collect();
+        assert_eq!(slots, [("area", "bedroom"), ("temperature", "72")]);
+    }
+
+    /// AC-3.1b-3.
+    #[test]
+    fn ac_3_1b_3_unclosed_bracket_gives_its_byte_offset() {
+        for markup in ["on [the hall", "on [the] hall", "café [a](area"] {
+            assert_eq!(
+                parse_example(markup),
+                Err(MarkupError::Unclosed {
+                    position: markup.find('[').expect("markup has a ["),
+                }),
+                "markup {markup:?}"
+            );
+        }
+    }
+
+    /// AC-3.1b-4.
+    #[test]
+    fn ac_3_1b_4_empty_slot_name_is_an_error() {
+        assert_eq!(
+            parse_example("turn on the [kitchen]() lights"),
+            Err(MarkupError::EmptySlot)
+        );
     }
 
     /// AC-3.1-7.
