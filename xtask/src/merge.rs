@@ -1,4 +1,4 @@
-//! The merge rules and the merge command.
+//! The merge rules, the merge command and the pre-push guard.
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -215,6 +215,20 @@ pub fn run(number: &str, path: &OsStr) -> ExitCode {
     }
 }
 
+/// Exits with code 1 when a line of the pre-push input `input` has the remote ref `refs/heads/main`, also for a deletion.
+#[must_use]
+pub fn guard_push(input: &str) -> ExitCode {
+    if input
+        .lines()
+        .any(|line| line.split(' ').nth(2) == Some("refs/heads/main"))
+    {
+        eprintln!("A push to main is not permitted. Merge with `just merge`.");
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
 /// Reads PR `number`, applies the merge rules and squash merges at the head commit that was read.
 fn merge(number: &str, path: &OsStr) -> Result<(), Vec<String>> {
     let (pr, head) = read(number, path).map_err(|error| vec![error])?;
@@ -362,7 +376,7 @@ fn jobs(workflow: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Tests of the merge rules and the merge command.
+/// Tests of the merge rules, the merge command and the pre-push guard.
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -671,5 +685,16 @@ mod tests {
         );
         assert_eq!(run("16", gh.path().as_os_str()), ExitCode::FAILURE);
         assert!(!calls(&gh).contains("[merge]"), "no merge: {}", calls(&gh));
+    }
+
+    /// A line with the remote ref `refs/heads/main` exits with code 1, also as the second line or a deletion.
+    #[test]
+    fn ac_0_17_1_guard_push() {
+        let branch = "refs/heads/main 1111111 refs/heads/2.3-ha-requests 2222222\n";
+        let main = "refs/heads/2.3-ha-requests 1111111 refs/heads/main 2222222\n";
+        let deletion = "(delete) 0000000 refs/heads/main 2222222\n";
+        assert_eq!(guard_push(&format!("{branch}{main}")), ExitCode::FAILURE);
+        assert_eq!(guard_push(deletion), ExitCode::FAILURE);
+        assert_eq!(guard_push(&branch.repeat(2)), ExitCode::SUCCESS);
     }
 }

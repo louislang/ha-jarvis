@@ -1197,3 +1197,51 @@ fn ac_0_16_4_merge_recipe_runs_xtask_merge() {
         "merge runs xtask merge: {merge}"
     );
 }
+
+/// `setup` writes `.git/hooks/pre-push`, which runs `xtask guard-push`.
+#[test]
+fn ac_0_17_2_setup_writes_pre_push_hook() {
+    let justfile = justfile();
+    let setup = dependencies(&justfile, "setup");
+    assert!(
+        setup.contains(&"pre-push-hook".to_owned()),
+        "setup runs pre-push-hook, it runs {setup:?}"
+    );
+    let hook = justfile["recipes"]["pre-push-hook"]["body"].to_string();
+    assert!(
+        hook.contains("> .git/hooks/pre-push") && hook.contains("-p xtask -- guard-push"),
+        "pre-push-hook writes a hook that runs xtask guard-push: {hook}"
+    );
+}
+
+/// A repository with the branches `main` and `2.3-ha-requests` and the pre-push hook of `setup`.
+fn repository_with_hook() -> TempDir {
+    let repository = TempDir::new().expect("a temporary folder");
+    for arguments in [
+        &["init", "--quiet", "--initial-branch=main"][..],
+        &["commit", "--quiet", "--allow-empty", "-m", "Initial"],
+        &["branch", "2.3-ha-requests"],
+    ] {
+        assert_passes(&git(repository.path(), arguments));
+    }
+    assert_passes(&recipe_in(repository.path(), "pre-push-hook"));
+    repository
+}
+
+/// A push of a branch and `main` through the hook fails, and the remote gets no `main`.
+#[test]
+fn ac_0_17_3_hook_refuses_push_to_main() {
+    let remote = TempDir::new().expect("a temporary folder");
+    assert_passes(&git(remote.path(), &["init", "--quiet", "--bare"]));
+    let repository = repository_with_hook();
+    let url = remote.path().to_str().expect("a UTF-8 path");
+    let push = git(repository.path(), &["push", url, "2.3-ha-requests", "main"]);
+    let stderr = String::from_utf8_lossy(&push.stderr);
+    assert!(
+        !push.status.success() && stderr.contains("A push to main is not permitted."),
+        "the guard refuses the push: {stderr}"
+    );
+    let refs = git(remote.path(), &["for-each-ref", "--format=%(refname)"]);
+    let refs = String::from_utf8_lossy(&refs.stdout);
+    assert!(!refs.contains("refs/heads/main"), "the remote has {refs}");
+}
