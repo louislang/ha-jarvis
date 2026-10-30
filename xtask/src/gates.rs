@@ -1062,3 +1062,70 @@ fn ac_0_12_5_check_and_ci_run_quint_gate() {
         "rust-test runs just install-quint"
     );
 }
+
+/// CI runs `gpu-test` on the self-hosted GPU runner.
+#[test]
+fn ac_0_13_1_ci_runs_gpu_test_on_gpu_runner() {
+    let ci = yaml(".github/workflows/ci.yml");
+    let labels: serde_yaml::Value =
+        serde_yaml::from_str("[self-hosted, linux, gpu]").expect("the expected labels are YAML");
+    assert_eq!(
+        ci["jobs"]["gpu-test"]["runs-on"], labels,
+        "the runner labels"
+    );
+    assert!(
+        runs(&ci, "gpu-test").contains(&"just gpu-test"),
+        "gpu-test runs just gpu-test"
+    );
+}
+
+/// `gpu-test` runs the ignored tests on CUDA, and `check` runs it only when `JARVIS_DEVICE=cuda` is set.
+#[test]
+fn ac_0_13_2_check_runs_gpu_test_on_cuda() {
+    let justfile = justfile();
+    let gpu_test = justfile["recipes"]["gpu-test"]["body"].to_string();
+    for part in ["JARVIS_DEVICE=cuda", "-- --ignored"] {
+        assert!(gpu_test.contains(part), "gpu-test has {part}: {gpu_test}");
+    }
+    let condition = serde_json::json!([
+        "if",
+        ["==", ["call", "env", "JARVIS_DEVICE", ""], "cuda"],
+        "just gpu-test",
+        ""
+    ]);
+    assert_eq!(
+        justfile["recipes"]["check"]["body"],
+        serde_json::json!([[[condition]]]),
+        "check runs gpu-test only on CUDA"
+    );
+}
+
+/// `gpu-test` passes a crate with no ignored tests.
+#[test]
+fn ac_0_13_3_gpu_test_passes_no_ignored_tests() {
+    assert_passes(&recipe_on_fixture("gpu-test", HALF_COVERED));
+}
+
+/// The `gpu-test` job stops `jarvis` before the tests and always starts it again after them.
+#[test]
+fn ac_0_13_4_gpu_test_job_pauses_jarvis() {
+    let ci = yaml(".github/workflows/ci.yml");
+    let steps = ci["jobs"]["gpu-test"]["steps"]
+        .as_sequence()
+        .expect("the job exists");
+    let position = |command: &str| {
+        steps
+            .iter()
+            .position(|step| step["run"].as_str() == Some(command))
+    };
+    let order = [
+        position("sudo systemctl stop jarvis"),
+        position("just gpu-test"),
+        position("sudo systemctl start jarvis"),
+    ];
+    assert!(
+        matches!(order, [Some(stop), Some(test), Some(start)]
+            if stop < test && test < start && steps[start]["if"].as_str() == Some("always()")),
+        "gpu-test stops jarvis, runs the tests, then always starts jarvis: {order:?}"
+    );
+}
