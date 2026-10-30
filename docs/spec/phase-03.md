@@ -4,35 +4,50 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 ---
 
-### 3.1 Normalize and Example Markup
+### 3.1 Normalize
 
-**Goal:** Add `normalize` and `parse_example` to the domain. Seed examples can now mark slot values with `[value](slot)`, and every text that Jarvis compares goes through one normalization.
+**Goal:** Add `normalize` to the domain, so that every text that Jarvis compares goes through one normalization.
 
 - **Implements:** G3. **Depends on:** 2.9.
 - **Files:** create `src/domain/intent.rs`. Modify `src/lib.rs`.
 
 **Model.**
 
-- `normalize(text) -> String`: lowercase, replace each character that is not a letter, a digit, a space or an apostrophe with a space (a `.` between two digits stays), collapse runs of spaces, trim. Jarvis uses `normalize` for comparisons (choices, feedback keys, correlation, the held-out split, seed equality). The model also gets the normalized transcript, because speech-to-text adds capitals and punctuation that the training examples do not have. Slot spans and slots are byte offsets in the normalized text.
-- `parse_example(markup) -> Result<Example>`: `Example { text, spans: Vec<Span> }`. `Span { slot, start, end }` are byte offsets into `text`. All Rust code uses byte offsets. Only the training set file uses character offsets (sub-phase 3.3). The text is the markup with each `[value](slot)` replaced by `value`.
+- `normalize(text) -> String`: lowercase the ASCII letters `A` to `Z`, replace each character that is not a letter, a digit, a space or an apostrophe with a space (a `.` between two digits stays), collapse runs of spaces, trim. A letter that is not ASCII stays unchanged, because Verus cannot prove that Unicode lowercase is idempotent. Jarvis uses `normalize` for comparisons (choices, feedback keys, correlation, the held-out split, seed equality). The model also gets the normalized transcript, because speech-to-text adds capitals and punctuation that the training examples do not have. Slot spans and slots are byte offsets in the normalized text.
 
 **Acceptance criteria.**
 
 - AC-3.1-1: When `normalize("Turn ON the  Lights!")` runs, it returns `"turn on the lights"`.
 - AC-3.1-2: When `normalize` runs on its own output, the result does not change.
-- AC-3.1-3: When `parse_example("turn on the [kitchen](area) lights")` runs, it returns the text "turn on the kitchen lights" and the span `area` from 12 to 19.
-- AC-3.1-4: When an example has two slots, both spans are correct and in text order.
-- AC-3.1-5: When an example has `[` without a closing `](slot)`, `parse_example` returns an error that contains the position.
-- AC-3.1-6: When a slot name is empty, `parse_example` returns an error.
 - AC-3.1-7: When `normalize("Set it to 72.5, twenty-two")` runs, it returns `"set it to 72.5 twenty two"`.
 
 **Proofs.**
 
-- P-3.1-2 (AC-3.1-2). Claim: `normalize(normalize(t)) = normalize(t)`. Argument: after one pass, the text has only lowercase letters, digits, apostrophes, dots between digits and single inner spaces, with no outer spaces. Each step maps such a text to itself, so the second pass changes nothing.
-- P-3.1-3, P-3.1-4 (AC-3.1-3, AC-3.1-4). Ensures: for each span, `text[start..end] == value`, and the spans are ordered and do not overlap. Argument: the parser copies characters to `text` from left to right. When it reads a slot, it records `start = len(text)`, copies `value`, and records `end = len(text)`. Offsets only grow, so spans are ordered and disjoint.
-- P-3.1-5, P-3.1-6 (AC-3.1-5, AC-3.1-6). Ensures: a `[` without a closing `](slot)`, or an empty slot name, gives `Err`. Argument: the parser is a small state machine (`Text`, `Value`, `Slot`). At the end of input, any state other than `Text` is an error. An empty slot name is rejected when `Slot` ends.
-- P-3.1-1 (AC-3.1-1). Ensures: `normalize("Turn ON the  Lights!") = "turn on the lights"`. Argument: lowercase gives `turn on the  lights!`. The `!` becomes a space, the runs of spaces collapse, and the trim removes the last space.
-- P-3.1-7 (AC-3.1-7). Ensures: `normalize("Set it to 72.5, twenty-two") = "set it to 72.5 twenty two"`. Argument: the `.` in `72.5` is between two digits, so it stays. The `,` and the `-` become spaces, and the runs of spaces collapse.
+- P-3.1-2 (AC-3.1-2). Claim: `normalize(normalize(t)) = normalize(t)`. Argument: after one pass, the text has only lowercase ASCII letters, other letters, digits, apostrophes, dots between digits and single inner spaces, with no outer spaces. Each step maps such a text to itself, so the second pass changes nothing.
+- P-3.1-1, P-3.1-7. Evidence: test.
+
+---
+
+### 3.1b Example Markup
+
+**Goal:** Add `parse_example` to the domain, so that seed examples can mark slot values with `[value](slot)`.
+
+- **Implements:** G3. **Depends on:** 3.1.
+- **Files:** modify `src/domain/intent.rs`.
+
+**Model.** `parse_example(markup) -> Result<Example>`: `Example { text, spans: Vec<Span> }`. `Span { slot, start, end }` are byte offsets into `text`. All Rust code uses byte offsets. Only the training set file uses character offsets (sub-phase 3.3). The text is the markup with each `[value](slot)` replaced by `value`.
+
+**Acceptance criteria.**
+
+- AC-3.1b-1: When `parse_example("turn on the [kitchen](area) lights")` runs, it returns the text "turn on the kitchen lights" and the span `area` from 12 to 19.
+- AC-3.1b-2: When an example has two slots, both spans are correct and in text order.
+- AC-3.1b-3: When an example has `[` without a closing `](slot)`, `parse_example` returns an error that contains the byte offset of the `[` in the markup.
+- AC-3.1b-4: When a slot name is empty, `parse_example` returns an error.
+
+**Proofs.**
+
+- P-3.1b-1, P-3.1b-2 (AC-3.1b-1, AC-3.1b-2). Ensures: for each span, `text[start..end] == value`, and the spans are ordered and do not overlap. Argument: the parser copies characters to `text` from left to right. When it reads a slot, it records `start = len(text)`, copies `value`, and records `end = len(text)`. Offsets only grow, so spans are ordered and disjoint.
+- P-3.1b-3, P-3.1b-4 (AC-3.1b-3, AC-3.1b-4). Ensures: a `[` without a closing `](slot)`, or an empty slot name, gives `Err`. Argument: the parser is a small state machine (`Text`, `Value`, `Close`, `Slot`). At the end of input, any state other than `Text` is an error. An empty slot name is rejected when `Slot` ends.
 
 ---
 
@@ -40,7 +55,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 **Goal:** Add `intents.toml` and `parse_catalog`, which validates the intents and their seed examples and gives the slot tag list. The catalog is now the single source of the System One labels.
 
-- **Implements:** G3. **Depends on:** 3.1.
+- **Implements:** G3. **Depends on:** 3.1b.
 - **Files:** create `intents.toml`. Modify `src/domain/intent.rs`.
 
 **Model.**
@@ -206,7 +221,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 - P-3.6-1. Evidence: test.
 - P-3.6-2, P-3.6-3. Ensures: `load_set` raises for the first example that has both `intent` and `not`, or a label that is not in `labels`. Argument: the validator checks each example with the two conditions and raises on the first failure.
-- P-3.6-4 to P-3.6-6 (AC-3.6-4 to AC-3.6-6). Requires: token offsets are ordered and spans do not overlap (P-3.1-3). Ensures: each segment B token inside a span gets exactly one `B-` or `I-` label of that span, the first such token gets `B-`, and all other segment B tokens get `O`. Argument: `align` is one pass over tokens with a "current span" pointer that only moves forward. A token whose start is in `[start, end)` of the current span gets `B-` if it is the first one, else `I-`. Segment A, special tokens and `spans = None` take the `-100` branch first.
+- P-3.6-4 to P-3.6-6 (AC-3.6-4 to AC-3.6-6). Requires: token offsets are ordered and spans do not overlap (P-3.1b-1). Ensures: each segment B token inside a span gets exactly one `B-` or `I-` label of that span, the first such token gets `B-`, and all other segment B tokens get `O`. Argument: `align` is one pass over tokens with a "current span" pointer that only moves forward. A token whose start is in `[start, end)` of the current span gets `B-` if it is the first one, else `I-`. Segment A, special tokens and `spans = None` take the `-100` branch first.
 
 ---
 
