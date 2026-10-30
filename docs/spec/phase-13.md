@@ -152,7 +152,7 @@ This phase improves the System One model. Jarvis builds the training set, trains
 
 **Proofs.**
 
-- P-13.5-3 to P-13.5-5, P-13.5-7. Ensures: `validate_example` returns `Ok` if and only if the markup parses, the text is normalized, the slots are the intent's slots and the text is not a seed. Argument: `validate_example` is the conjunction of `parse_example` (P-3.1-5), a comparison of the text with its `normalize` result, a subset check on the slot names, and a set membership check on normalized seeds.
+- P-13.5-3 to P-13.5-5, P-13.5-7. Ensures: `validate_example` returns `Ok` if and only if the markup parses, the text is normalized, the slots are the intent's slots and the text is not a seed. Argument: `validate_example` is the conjunction of `parse_example` (P-3.1b-3), a comparison of the text with its `normalize` result, a subset check on the slot names, and a set membership check on normalized seeds.
 - P-13.5-1, P-13.5-2, P-13.5-6. Evidence: test.
 
 ---
