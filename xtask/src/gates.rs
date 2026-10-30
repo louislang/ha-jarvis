@@ -724,12 +724,24 @@ fn ac_0_3_9_metrics_for_let_chains() {
     let [unit] = units.as_slice() else {
         panic!("one unit for one file, there are {}", units.len());
     };
-    let functions: Vec<(&str, f64)> = unit
+    let functions: Vec<(&str, Option<f64>)> = unit
         .spaces
         .iter()
         .map(|space| (space.name.as_str(), space.metrics["cyclomatic"]["sum"]))
         .collect();
-    assert_eq!(functions, [("first", 4.0), ("second", 3.0)]);
+    assert_eq!(functions, [("first", Some(4.0)), ("second", Some(3.0))]);
+}
+
+/// `xtask complexity` passes a file without functions, whose unit has metrics without a value.
+#[test]
+fn complexity_passes_file_without_functions() {
+    let fixture = fixture_file("constant.rs", "/// One.\nconst ONE: u32 = 1;\n");
+    let path = fixture.path().join("constant.rs");
+    let units = crate::complexity::units(path.to_str().expect("the path is UTF-8"));
+    let [unit] = units.as_slice() else {
+        panic!("one unit for one file, there are {}", units.len());
+    };
+    assert!(crate::complexity::violations(unit, &crate::complexity::LIMITS).is_empty());
 }
 
 /// `check` runs the complexity gate after the lint gate, and CI runs it.
