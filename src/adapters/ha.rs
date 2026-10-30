@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::time::Duration;
@@ -10,11 +11,8 @@ use anyhow::Context;
 use futures::SinkExt;
 use futures::StreamExt;
 use futures::channel::oneshot;
-use futures::future;
-use futures::future::Either;
 use futures::lock::Mutex as AsyncMutex;
 use futures::stream::SplitSink;
-use futures::stream::SplitStream;
 use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
@@ -35,8 +33,6 @@ type ResultSender = oneshot::Sender<anyhow::Result<Value>>;
 pub struct HaHome<S> {
     /// The send half of the socket and the next request ID.
     writer: AsyncMutex<Writer<S>>,
-    /// The receive half of the socket. The request that holds it reads for all requests.
-    reader: AsyncMutex<SplitStream<WebSocketStream<S>>>,
     /// The result sender of each request that waits, by request ID.
     pending: Mutex<HashMap<u64, ResultSender>>,
     /// The deadline of each request.
@@ -45,8 +41,8 @@ pub struct HaHome<S> {
 
 /// The send half and the next ID, under one lock: HA refuses an ID that does not increase.
 struct Writer<S> {
-    /// The send half of the socket.
-    sink: SplitSink<WebSocketStream<S>, Message>,
+    /// The send half of the socket. `None` while HA is disconnected.
+    sink: Option<SplitSink<WebSocketStream<S>, Message>>,
     /// The ID of the next request.
     next_id: u64,
 }
@@ -67,32 +63,46 @@ impl Drop for Pending<'_> {
     }
 }
 
-impl<S: AsyncRead + AsyncWrite + Unpin> HaHome<S> {
-    /// Opens a transport with `connector` and authenticates with `token`.
-    ///
-    /// # Errors
-    ///
-    /// A connection, authentication, protocol or timeout error.
-    pub async fn connect<F>(
-        connector: impl FnOnce() -> F,
-        token: &str,
-        config: &HaConfig,
-    ) -> anyhow::Result<Self>
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
+    /// Returns at once. A background task opens a transport with `connector`, authenticates
+    /// with `token` and reads the connection until it closes.
+    pub fn start<F>(connector: impl FnOnce() -> F, token: &str, config: &HaConfig) -> Arc<Self>
     where
-        F: Future<Output = io::Result<S>>,
+        F: Future<Output = io::Result<S>> + Send + 'static,
     {
-        let deadline = Duration::from_millis(config.request_timeout_ms);
-        let handshake = authenticate(connector, token, &config.url);
-        let socket = time::timeout(deadline, handshake)
-            .await
-            .map_err(|_| anyhow::anyhow!("timeout error: no auth_ok within {deadline:?}"))??;
-        let (sink, stream) = socket.split();
-        Ok(Self {
-            writer: AsyncMutex::new(Writer { sink, next_id: 1 }),
-            reader: AsyncMutex::new(stream),
+        let home = Arc::new(Self {
+            writer: AsyncMutex::new(Writer {
+                sink: None,
+                next_id: 1,
+            }),
             pending: Mutex::new(HashMap::new()),
-            deadline,
-        })
+            deadline: Duration::from_millis(config.request_timeout_ms),
+        });
+        let (transport, token, config) = (connector(), token.to_owned(), config.clone());
+        let background = Arc::clone(&home);
+        tokio::spawn(async move {
+            if let Ok(socket) = connect(transport, &token, &config).await {
+                background.serve(socket).await;
+            }
+        });
+        home
+    }
+
+    /// Delivers each message until the connection closes, then fails each pending request.
+    async fn serve(&self, socket: WebSocketStream<S>) {
+        let (sink, mut stream) = socket.split();
+        self.writer.lock().await.sink = Some(sink);
+        while let Some(Ok(message)) = stream.next().await {
+            if let Message::Text(text) = message {
+                self.deliver(&text);
+            }
+        }
+        // The writer lock stops new requests until `pending` is empty.
+        let mut writer = self.writer.lock().await;
+        writer.sink = None;
+        for (_, sender) in self.pending().drain() {
+            sender.send(Err(disconnected())).ok();
+        }
     }
 
     /// Loads the states, the registries, the configuration and the user of the token.
@@ -140,40 +150,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HaHome<S> {
     /// Sends the JSON object `command` with the next ID and waits for its result.
     async fn request(&self, mut command: Value) -> anyhow::Result<Value> {
         let exchange = async {
-            let (sender, mut receiver) = oneshot::channel();
+            let (sender, receiver) = oneshot::channel();
             let mut writer = self.writer.lock().await;
+            let Writer { sink, next_id } = &mut *writer;
+            let sink = sink.as_mut().ok_or_else(disconnected)?;
             let pending = Pending {
                 map: &self.pending,
-                id: writer.next_id,
+                id: *next_id,
             };
-            writer.next_id += 1;
+            *next_id += 1;
             self.pending().insert(pending.id, sender);
             command["id"] = Value::from(pending.id);
             let text = Message::text(command.to_string());
-            writer.sink.send(text).await.context("connection error")?;
+            sink.send(text).await.context("connection error")?;
             drop(writer);
-            self.wait(&mut receiver).await
+            receiver.await.context("connection error")?
         };
         time::timeout(self.deadline, exchange)
             .await
             .map_err(|_| anyhow::anyhow!("timeout error: no result within {:?}", self.deadline))?
-    }
-
-    /// Reads messages for all requests until `receiver` has its result.
-    async fn wait(
-        &self,
-        receiver: &mut oneshot::Receiver<anyhow::Result<Value>>,
-    ) -> anyhow::Result<Value> {
-        loop {
-            let read = std::pin::pin!(async { self.reader.lock().await.next().await });
-            match future::select(&mut *receiver, read).await {
-                Either::Left((result, _)) => return result.context("connection error")?,
-                Either::Right((Some(Ok(Message::Text(text))), _)) => self.deliver(&text),
-                Either::Right((Some(Ok(_)), _)) => {}
-                Either::Right((Some(Err(error)), _)) => Err(error).context("connection error")?,
-                Either::Right((None, _)) => anyhow::bail!("connection error: HA closed"),
-            }
-        }
     }
 
     /// Sends a `result` message to its pending request. Ignores other messages and IDs.
@@ -200,6 +195,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> HaHome<S> {
             .lock()
             .expect("no code panics while it holds the pending map")
     }
+}
+
+/// The error of a request while HA is disconnected.
+fn disconnected() -> anyhow::Error {
+    anyhow::anyhow!("connection error: HA disconnected")
 }
 
 /// Puts the aliases of `entries` into `fields`, and a name from `names` or the ID if it has none.
@@ -245,17 +245,29 @@ struct Envelope {
     kind: String,
 }
 
-/// Opens the WebSocket at `url` over the transport of `connector` and authenticates.
-async fn authenticate<S, F>(
-    connector: impl FnOnce() -> F,
+/// Authenticates with `token` over `transport` within `ha.request_timeout_ms`.
+///
+/// # Errors
+///
+/// A connection, authentication, protocol or timeout error.
+async fn connect<S: AsyncRead + AsyncWrite + Unpin>(
+    transport: impl Future<Output = io::Result<S>>,
+    token: &str,
+    config: &HaConfig,
+) -> anyhow::Result<WebSocketStream<S>> {
+    let deadline = Duration::from_millis(config.request_timeout_ms);
+    time::timeout(deadline, authenticate(transport, token, &config.url))
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout error: no auth_ok within {deadline:?}"))?
+}
+
+/// Opens the WebSocket at `url` over `transport` and authenticates.
+async fn authenticate<S: AsyncRead + AsyncWrite + Unpin>(
+    transport: impl Future<Output = io::Result<S>>,
     token: &str,
     url: &str,
-) -> anyhow::Result<WebSocketStream<S>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-    F: Future<Output = io::Result<S>>,
-{
-    let transport = connector().await.context("connection error")?;
+) -> anyhow::Result<WebSocketStream<S>> {
+    let transport = transport.await.context("connection error")?;
     let (mut socket, _) = tokio_tungstenite::client_async(url, transport)
         .await
         .context("connection error")?;
@@ -300,6 +312,7 @@ fn unexpected(kind: &str) -> String {
 mod tests {
     use super::*;
 
+    use futures::future;
     use serde_json::Value;
     use tokio::io::DuplexStream;
 
@@ -429,11 +442,8 @@ mod tests {
             .ha
     }
 
-    /// Connects with `token` to a `FakeHaServer` that `server` runs.
-    async fn connect<F>(
-        token: &str,
-        server: impl FnOnce(FakeHaServer) -> F + Send + 'static,
-    ) -> anyhow::Result<HaHome<DuplexStream>>
+    /// Opens a transport to a `FakeHaServer` that `server` runs.
+    fn open<F>(server: impl FnOnce(FakeHaServer) -> F + Send + 'static) -> DuplexStream
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -444,7 +454,18 @@ mod tests {
                 .expect("the WebSocket handshake succeeds");
             server(FakeHaServer { socket }).await;
         });
-        HaHome::connect(|| async { Ok(client) }, token, &config()).await
+        client
+    }
+
+    /// Connects with `token` to a `FakeHaServer` that `server` runs.
+    async fn connect<F>(
+        token: &str,
+        server: impl FnOnce(FakeHaServer) -> F + Send + 'static,
+    ) -> anyhow::Result<WebSocketStream<DuplexStream>>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        super::connect(async { Ok(open(server)) }, token, &config()).await
     }
 
     /// Returns the text of the error that `connect` gives.
@@ -522,20 +543,22 @@ mod tests {
         assert!(error.contains("timeout"), "not a timeout error: {error}");
     }
 
-    /// Connects to a `FakeHaServer` that accepts the token, then runs `server`.
+    /// Starts an adapter on a `FakeHaServer` that accepts the token, then runs `server`.
     async fn ready<F>(
         server: impl FnOnce(FakeHaServer) -> F + Send + 'static,
-    ) -> HaHome<DuplexStream>
+    ) -> Arc<HaHome<DuplexStream>>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        connect(TOKEN, |mut fake| async move {
+        let client = open(|mut fake| async move {
             fake.receive_auth().await;
             fake.send("auth_ok").await;
             server(fake).await;
-        })
-        .await
-        .expect("the token is correct")
+        });
+        let home = HaHome::start(|| async { Ok(client) }, TOKEN, &config());
+        // The paused clock advances only when every task waits, thus after `auth_ok`.
+        time::sleep(Duration::from_millis(1)).await;
+        home
     }
 
     /// An `echo` request with the number `n`.
@@ -629,5 +652,17 @@ mod tests {
         };
         assert_eq!(aliases(snapshot), aliases(expected));
         Ok(())
+    }
+
+    /// AC-2.4-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_2_4_1_close_with_pending_request_is_disconnect_error() {
+        let home = ready(|mut server| async move {
+            server.receive().await;
+        })
+        .await;
+        let error = home.request(echo(1)).await.expect_err("HA closes");
+        assert!(format!("{error}").contains("disconnected"), "{error}");
+        assert!(home.pending().is_empty(), "the ID is still pending");
     }
 }
