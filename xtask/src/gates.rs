@@ -1129,3 +1129,61 @@ fn ac_0_13_4_gpu_test_job_pauses_jarvis() {
         "gpu-test stops jarvis, runs the tests, then always starts jarvis: {order:?}"
     );
 }
+
+/// `release.yml` runs on `v*` tags, calls CI first and builds each target on its runner.
+#[test]
+fn ac_0_14_1_release_builds_targets_after_ci() {
+    let release = yaml(".github/workflows/release.yml");
+    let expected: serde_yaml::Value =
+        serde_yaml::from_str("{push: {tags: ['v*']}}").expect("the expected trigger is YAML");
+    assert_eq!(release["on"], expected, "the triggers");
+    let jobs = &release["jobs"];
+    assert_eq!(
+        jobs["ci"]["uses"].as_str(),
+        Some("./.github/workflows/ci.yml")
+    );
+    assert_eq!(jobs["build"]["needs"].as_str(), Some("ci"));
+    assert_eq!(
+        jobs["build"]["runs-on"].as_str(),
+        Some("${{ matrix.runner }}")
+    );
+    let targets: serde_yaml::Value = serde_yaml::from_str(
+        "[{target: x86_64-unknown-linux-gnu, runner: ubuntu-latest}, \
+         {target: x86_64-apple-darwin, runner: macos-15-intel}]",
+    )
+    .expect("the expected targets are YAML");
+    assert_eq!(
+        jobs["build"]["strategy"]["matrix"]["include"], targets,
+        "the targets and their runners"
+    );
+}
+
+/// Each build verifies its archive before the upload, and the release needs both builds.
+#[test]
+fn ac_0_14_2_release_verifies_archives() {
+    let release = yaml(".github/workflows/release.yml");
+    let steps = release["jobs"]["build"]["steps"]
+        .as_sequence()
+        .expect("the build job exists");
+    let verify = steps.iter().position(|step| {
+        step["run"]
+            .as_str()
+            .is_some_and(|run| run.contains("file jarvis") && run.contains("./jarvis"))
+    });
+    let upload = steps.iter().position(|step| {
+        step["uses"]
+            .as_str()
+            .is_some_and(|uses| uses.starts_with("actions/upload-artifact@"))
+    });
+    assert!(
+        matches!((verify, upload), (Some(verify), Some(upload)) if verify < upload),
+        "the build verifies the archive before the upload: {verify:?}, {upload:?}"
+    );
+    assert_eq!(release["jobs"]["release"]["needs"].as_str(), Some("build"));
+    assert!(
+        runs(&release, "release")
+            .iter()
+            .any(|run| run.starts_with("gh release create")),
+        "the release job runs gh release create"
+    );
+}
