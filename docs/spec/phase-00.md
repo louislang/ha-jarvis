@@ -23,7 +23,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - `justfile`: `test` (`cargo test --workspace --release`), `cov` (`cargo llvm-cov --workspace --release --fail-under-lines 80.01`), `workflow-lint` (`actionlint`), `check` (runs `workflow-lint`, then `cov`), `setup` (runs every `install-` recipe, then `pre-commit install --hook-type pre-commit`).
 - Tool versions (R23): the `justfile` has one variable for each tool version and one `install-<tool>` recipe for each tool. This sub-phase has `cargo-llvm-cov`, `actionlint` and `pre-commit`. Each later sub-phase that adds a tool adds its variable and its recipe. A CI job installs a tool only with its `install-` recipe. A `setup-node`, `setup-java` or `setup-python` step uses the version of its `justfile` variable.
 - `.pre-commit-config.yaml`: one `local` hook, `entry: just check`, `language: system`, `stages: [pre-commit]`, `pass_filenames: false`, `always_run: true`.
-- `ci.yml`: triggers `push`, `pull_request`, `workflow_call`. Jobs `rust-test` (`just cov`) and `workflow-lint` (`just workflow-lint`), on `ubuntu-latest`, with the cargo cache.
+- `ci.yml`: triggers `push` to `main`, `pull_request`, `workflow_call`. A push to another branch does not start CI, because its PR runs CI for `pull_request`. Jobs `rust-test` (`just cov`) and `workflow-lint` (`just workflow-lint`), on `ubuntu-latest`, with the cargo cache.
 - `xtask/src/gates.rs` is `#[cfg(test)]`. It has the helpers `fixture_crate(source)` (a temporary crate with the workspace lint settings) and `run(command) -> Output`, and the gate and structure tests of Phase 0.
 - Structure tests read `just --dump --dump-format json`, `.pre-commit-config.yaml` and the workflow files with `serde_yaml`. The file list test reads the table of `01-architecture.md` section 8 and `git ls-files`.
 
@@ -34,7 +34,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - AC-0.1-3: When a fixture crate has 10 lines of which 5 are covered, `cargo llvm-cov --fail-under-lines 80.01` exits with a non-zero code. When all lines are covered, it exits with code 0.
 - AC-0.1-4: When the `justfile` is dumped, `check` runs `workflow-lint` and `cov`, and `cov` has `--fail-under-lines 80.01`.
 - AC-0.1-5: When `.pre-commit-config.yaml` is parsed, it has exactly one hook, with `entry: just check`, `stages: [pre-commit]`, `always_run: true` and `pass_filenames: false`.
-- AC-0.1-6: When `ci.yml` is parsed, it has the triggers `push`, `pull_request` and `workflow_call`, a job `rust-test` that runs `just cov`, and a job `workflow-lint` that runs `just workflow-lint`.
+- AC-0.1-6: When `ci.yml` is parsed, it has the triggers `push` to `main` only, `pull_request` and `workflow_call`, a job `rust-test` that runs `just cov`, and a job `workflow-lint` that runs `just workflow-lint`.
 - AC-0.1-7: When `git check-ignore` runs for `target/`, `models/`, `.venv/`, `jarvis.local.toml`, `habits.json`, `voices.json`, `jarvis.db`, `generated.json`, `training.json`, `pools.json` and `learned.toml`, it lists each path.
 - AC-0.1-8: When `rust-toolchain.toml` is parsed, its channel is a fixed version `x.y.z`, and its components are `clippy`, `rustfmt` and `llvm-tools-preview`.
 - AC-0.1-9: When the `justfile` and `ci.yml` are parsed, each tool has a version variable and an `install-` recipe, `setup` runs every `install-` recipe, and each CI step that installs a tool runs its `install-` recipe or uses the version of its variable.

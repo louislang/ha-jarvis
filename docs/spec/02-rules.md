@@ -187,7 +187,7 @@ Every test gives the same result on every run with the same code.
 
 ### 7.3 Required Checks
 
-CI runs each check as a separate job. `just merge` requires all of them. `just check` runs the same checks in the pre-commit hook, as listed.
+CI runs each check as a separate job. "Push" is a push to `main`. `just merge` requires all of them. `just check` runs the same checks in the pre-commit hook, as listed.
 
 | Check | Command | CI | Pre-commit hook |
 |---|---|---|---|
