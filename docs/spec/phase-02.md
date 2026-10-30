@@ -45,6 +45,7 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 
 - Authentication states: `AwaitRequired -> SentAuth -> Ready | Rejected`. HA sends `auth_required`. Jarvis sends `auth` with the token. HA sends `auth_ok` or `auth_invalid`.
 - The handshake has the deadline `ha.request_timeout_ms`. A timeout closes the socket and returns a timeout error. This sub-phase adds `ha.request_timeout_ms`.
+- This sub-phase adds `Config::validate`. After the parse, `validate` checks the range of each field. `model.threshold`, `model.commit_threshold`, `model.next_threshold`, `train.holdout`, `dialog.choice_similarity`, `speaker.voice_threshold` and `speaker.enroll_threshold` are in `[0, 1]`. Every other number is more than 0. `validate` also checks these relations: `asr.vad_min_silence_ms < asr.early_commit_ms < asr.endpoint_ms < asr.max_utterance_ms`, `0.5 < model.threshold <= model.commit_threshold`, and `log.audio_days <= log.record_days`. Each later sub-phase adds the checks of the fields that it adds. `parse` calls `validate`.
 - `HaHome` opens its transport through a connector. `src/lib.rs` passes a TCP connector for `ha.url`. Tests pass a connector that returns one end of a `tokio::io::duplex` pair. Thus the adapter tests pause the clock with no real socket (`02-rules.md` section 6.2).
 - `FakeHaServer` (test block of `ha.rs`) serves the HA WebSocket protocol on the other end of the pair. It accepts one token, serves `house.json`, sends scripted events and records the messages it receives.
 
@@ -55,11 +56,13 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 - AC-2.2-3: When the server closes before `auth_required`, `connect` returns a connection error.
 - AC-2.2-4: When the server sends a message other than `auth_ok` or `auth_invalid` after `auth`, `connect` returns a protocol error that contains the message type.
 - AC-2.2-5: When the server keeps the socket open but sends no `auth_ok` within `request_timeout_ms`, `connect` returns a timeout error.
+- AC-2.2-6: When a field is out of its range (for example `ha.request_timeout_ms = 0`), `parse` returns an error that contains the field name and the range.
 
 **Proofs.**
 
 - P-2.2-1, P-2.2-2, P-2.2-5. Evidence: test.
 - P-2.2-3, P-2.2-4. Requires: the state is `AwaitRequired` or `SentAuth`. Ensures: only `auth_ok` reaches `Ready`. Argument: the handshake is a match on `(state, message type)`. `Ready` has one incoming transition, from `SentAuth` on `auth_ok`. Every other pair, and the end of the stream, returns an error.
+- P-2.2-6. Ensures: a field out of its range gives `Err` with the field name and the range. Argument: `parse` returns the first `Err` of `validate`, which compares each field with its range.
 
 ---
 
