@@ -9,17 +9,18 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 **Goal:** Add `src/ports.rs` with the `Home` port, its data types in the domain, and the reference house snapshot. Later sub-phases can now build the HA adapter, the cache and the fakes against one fixed contract.
 
 - **Implements:** G8, G10. **Depends on:** 1.2.
-- **Files:** create `src/ports.rs`, `src/domain/state.rs`, `src/testing/house.json`. Modify `src/lib.rs`.
+- **Files:** create `src/ports.rs`, `src/domain/state.rs`, `src/testing/house.json`. Modify `src/lib.rs`, `Cargo.toml`.
 
 **Model.**
 
 - `Home` has `snapshot() -> Result<Snapshot>`, `events() -> Stream<Event>` and `call(ServiceCall) -> Result<Option<Value>>`.
 - The data types are in `src/domain/state.rs`, because the domain cache uses them (`01-architecture.md` section 1).
-- `Snapshot`: `states`, `areas`, `devices`, `entities`, `config` (`time_zone`, `location_name`), `user_id` (the HA user of the token). `State`: `entity_id`, `state`, `attributes`, `last_updated`, `context`. `Context`: `id`, `user_id`, `parent_id`.
+- `Snapshot`: `states`, `areas`, `devices`, `entities`, `config` (`time_zone`, `location_name`), `user_id` (the HA user of the token). `State`: `entity_id`, `state`, `attributes`, `last_updated` (a `jiff::Timestamp`), `context`. `Context`: `id`, `user_id`, `parent_id`.
 - An entity entry has `entity_id`, `name`, `aliases`, `area_id`, `device_id`, `entity_category`, `hidden_by` and `disabled_by`. The device class of an entity is the `device_class` attribute of its state.
-- `Event`: `StateChanged { entity_id, old, new, context }` (`new` can be absent), `RegistryUpdated`, `Reconnected`.
+- `Event`: `StateChanged { entity_id, old, new, context }` (`old` and `new` can be absent: HA sends no old state for a new entity and no new state for a removed entity), `RegistryUpdated`, `Reconnected`.
 - `ServiceCall`: `domain`, `service`, `target` (entity IDs), `data`, `return_response`.
 - `house.json` is a `Snapshot` of the reference house (`01-architecture.md` section 11).
+- This sub-phase adds the crates `serde_json`, `futures`, `async-trait` and `jiff` (feature `serde`).
 
 **Acceptance criteria.**
 
