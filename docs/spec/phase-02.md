@@ -261,18 +261,18 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 
 ### 2.8 State Cache Queries
 
-**Goal:** Add the cache queries that selection and decisions need: area of a device, entities by area, domain and device class, and area by name or alias. The queries stay within an instruction budget with 2000 entities.
+**Goal:** Add the cache queries that selection and decisions need: area of a device or an entity, and entities by area, domain and device class.
 
 - **Implements:** G8, G9. **Depends on:** 2.7.
-- **Files:** create `benches/domain.rs`. Modify `src/domain/state.rs`, `Cargo.toml`, `justfile`, `.github/workflows/ci.yml`, `.github/pull_request_template.md`, `xtask/src/gates.rs`.
+- **Files:** modify `src/domain/state.rs`.
 
 **Model.**
 
-- `area_of_device(device_id) -> Option<AreaId>`.
-- `area_of_entity(entity_id)`: the entity area, else the area of its device.
-- `entities(area, domain, device_class: Option) -> Vec<EntityId>`.
-- `area_by_name(text) -> Option<AreaId>`: matches the name or an alias without case sensitivity.
-- `benches/domain.rs` is the first Gungraun benchmark file. It measures `state`, `entities` and `apply` (sub-phase 2.7). Each benchmark sets `Callgrind::hard_limits` with the budget of its criterion. `just bench` runs it, and the `bench` CI job runs `just bench` on `ubuntu-latest`. `check` runs `bench` only on Linux, because Valgrind does not run on macOS.
+- `AreaId` and `EntityId` are newtypes of `String` with `#[serde(transparent)]`. `Area.area_id`, `Device.area_id`, `Entity.area_id` and `Entity.entity_id` use them.
+- `StateCache.devices` is a map from the device ID to the device.
+- `area_of_device(device_id) -> Option<&AreaId>`.
+- `area_of_entity(entity_id) -> Option<&AreaId>`: the entity area, else the area of its device.
+- `entities(area, domain, device_class: Option) -> Vec<&EntityId>`.
 
 **Acceptance criteria.**
 
@@ -280,19 +280,53 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 - AC-2.8-2: When an entity has no area, `area_of_entity` returns the area of its device.
 - AC-2.8-3: When `entities(living_room, "fan", None)` runs, it returns only fan entities in the Living Room.
 - AC-2.8-4: When `entities` gets a device class, it returns only entities with that device class.
-- AC-2.8-5: When `area_by_name("living ROOM")` runs, it returns the Living Room. An alias also matches.
-- AC-2.8-6: When no area has the name or alias, `area_by_name` returns none.
-- AC-2.8-7 [Bench]: With 2000 entities, `state` uses 5,000 instructions or fewer, and `entities` and `apply` each use 1,000,000 instructions or fewer.
-- AC-2.8-8: When `ci.yml` is parsed, the job `bench` runs `just bench` on `ubuntu-latest`. When the `justfile` is dumped, `check` runs `bench` only on Linux.
 
 **Proofs.**
 
 - P-2.8-2 (AC-2.8-2). Ensures: `area_of_entity(e) = entity.area.or(area_of_device(entity.device))`. Argument: the function is this expression.
 - P-2.8-3, P-2.8-4. Ensures: every returned entity has the area, the domain and (if given) the device class. Argument: `entities` is a filter whose predicate is the conjunction of the three conditions.
-- P-2.8-5, P-2.8-6. Ensures: `Some(a)` if and only if the lowercase text equals the lowercase name or a lowercase alias of `a`. Argument: `area_by_name` is a `find` with that predicate. `find` returns `None` when no element matches.
 - P-2.8-1. Ensures: `area_of_device(d)` is the area of `d` in the device registry, or `None`. Argument: the function is one map lookup.
-- P-2.8-7. Evidence: benchmark.
-- P-2.8-8. Evidence: test.
+
+---
+
+### 2.8b Area Names
+
+**Goal:** Add `area_by_name`, so that a spoken area name or alias gives its area.
+
+- **Implements:** G8, G9. **Depends on:** 2.8.
+- **Files:** modify `src/domain/state.rs`.
+
+**Model.** `area_by_name(text) -> Option<&AreaId>`: matches the name or an alias without case sensitivity.
+
+**Acceptance criteria.**
+
+- AC-2.8b-1: When `area_by_name("living ROOM")` runs, it returns the Living Room. An alias also matches.
+- AC-2.8b-2: When no area has the name or alias, `area_by_name` returns none.
+
+**Proofs.**
+
+- P-2.8b-1, P-2.8b-2. Ensures: `Some(a)` if and only if the lowercase text equals the lowercase name or a lowercase alias of `a`. Argument: `area_by_name` is a `find` with that predicate. `find` returns `None` when no element matches.
+
+---
+
+### 2.8c Domain Benchmarks
+
+**Goal:** Keep the cache queries within an instruction budget with 2000 entities.
+
+- **Implements:** G8, G9. **Depends on:** 2.8b.
+- **Files:** create `benches/domain.rs`. Modify `Cargo.toml`, `justfile`, `.github/workflows/ci.yml`, `.github/pull_request_template.md`, `xtask/src/gates.rs`.
+
+**Model.** `benches/domain.rs` is the first Gungraun benchmark file. It measures `state`, `entities` and `apply` (sub-phase 2.7). Each benchmark sets `Callgrind::hard_limits` with the budget of its criterion. `just bench` runs it, and the `bench` CI job runs `just bench` on `ubuntu-latest`. `check` runs `bench` only on Linux, because Valgrind does not run on macOS.
+
+**Acceptance criteria.**
+
+- AC-2.8c-1 [Bench]: With 2000 entities, `state` uses 5,000 instructions or fewer, and `entities` and `apply` each use 1,000,000 instructions or fewer.
+- AC-2.8c-2: When `ci.yml` is parsed, the job `bench` runs `just bench` on `ubuntu-latest`. When the `justfile` is dumped, `check` runs `bench` only on Linux.
+
+**Proofs.**
+
+- P-2.8c-1. Evidence: benchmark.
+- P-2.8c-2. Evidence: test.
 
 ---
 
@@ -300,7 +334,7 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 
 **Goal:** Add the sync use case, which loads the snapshot, applies events and loads a new snapshot after a registry update or a reconnect. Add `FakeHome` and the conformance test against `cache_sync.qnt`.
 
-- **Implements:** G8, G19. **Depends on:** 2.8.
+- **Implements:** G8, G19. **Depends on:** 2.8c.
 - **Files:** create `src/app/background.rs`, `src/testing/fakes.rs`. Modify `src/lib.rs`, `Cargo.toml`.
 - **Quint:** `cache_sync.qnt` (conformance).
 

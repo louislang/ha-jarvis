@@ -140,7 +140,7 @@ This phase lets Jarvis ask questions. Jarvis asks when it does not understand, w
 - P-10.4-4, P-10.4-5. Argument: `handle` matches `(Ask, ctx.satellite_id)` with two arms.
 - P-10.4-7. Ensures: a missing template slot that is not `optional` and has no habit value gives `Ask` from `ask_<slot>`. Argument: `decide` checks each template slot of the intent against the prediction, `optional` and `habit_defaults` before it renders.
 - P-10.4-8. Requires: `AnnounceWhenIdle` (P-4.7-2). Argument: the question is an item of the announce queue, which waits for `idle` (P-4.9-2).
-- P-10.4-9. Ensures: a filled alias gives the area of the alias. Argument: the choices contain the aliases, and `decide` resolves the filled value with `area_by_name` (P-2.8-5).
+- P-10.4-9. Ensures: a filled alias gives the area of the alias. Argument: the choices contain the aliases, and `decide` resolves the filled value with `area_by_name` (P-2.8b-1).
 - P-10.4-3, P-10.4-6. Evidence: test.
 
 ---
