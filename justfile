@@ -8,6 +8,10 @@ jscpd_version := "5.4.2"
 quint_version := "0.33.0"
 quint_evaluator_version := "v0.7.0"
 verus_version := "0.2026.10.26.d17fbd0"
+# The apt package of `ubuntu-latest`.
+valgrind_version := "1:3.26.0-0ubuntu1"
+# The version of the `gungraun` library.
+gungraun_runner_version := "0.20.0"
 
 # Run the tests.
 test:
@@ -53,6 +57,10 @@ quint:
 verus:
     PATH="$HOME/.verus/{{ verus_version }}:$PATH" cargo verus verify -p jarvis
 
+# Check the instruction budgets of the benchmarks.
+bench:
+    cargo bench --bench domain
+
 # Run the `[GPU host]` tests on CUDA.
 gpu-test:
     JARVIS_DEVICE=cuda cargo test --workspace --release -- --ignored
@@ -71,10 +79,11 @@ workflow-lint:
 
 # Run the checks of the pre-commit hook.
 check: workflow-lint format lint complexity duplication architecture quint verus cov
+    {{ if os() == "linux" { "just bench" } else { "" } }}
     {{ if env("JARVIS_DEVICE", "") == "cuda" { "just gpu-test" } else { "" } }}
 
 # Install the tools and the pre-commit hook.
-setup: pre-push-hook install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint install-quint-evaluator install-verus
+setup: pre-push-hook install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint install-quint-evaluator install-verus install-valgrind install-gungraun-runner
     pre-commit install --hook-type pre-commit
     gh extension install github/gh-stack
 
@@ -125,3 +134,10 @@ install-verus:
     mv ~/.verus/verus-$platform "$folder"
     rm "$folder.zip"
     rustup toolchain install "$("$folder/verus" --version | sed -n 's/^ *Toolchain: \([^ ]*\).*/\1/p')"
+
+# Valgrind does not run on macOS.
+install-valgrind:
+    {{ if os() == "linux" { "sudo apt-get update && sudo apt-get install --yes valgrind=" + valgrind_version } else { "" } }}
+
+install-gungraun-runner:
+    cargo install gungraun-runner --version {{ gungraun_runner_version }} --locked

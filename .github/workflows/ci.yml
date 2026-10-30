@@ -74,6 +74,18 @@ jobs:
       - run: just install-verus
       - run: just cov
 
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: "1.59.0"
+      - uses: Swatinem/rust-cache@v2
+      - run: just install-valgrind
+      - run: just install-gungraun-runner
+      - run: just bench
+
   quint:
     runs-on: ubuntu-latest
     steps:

@@ -16,6 +16,7 @@
 - [ ] `quint`
 - [ ] `verus`
 - [ ] `rust-test`
+- [ ] `bench`
 - [ ] `workflow-lint`
 - [ ] `gpu-test`
 - [ ] `pr-size`

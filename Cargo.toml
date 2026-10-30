@@ -26,7 +26,12 @@ verify = true
 workspace = true
 
 [dev-dependencies]
+gungraun = "=0.20.0"
 tokio = { version = "1.54.1", features = ["macros", "rt", "test-util", "io-util"] }
+
+[[bench]]
+name = "domain"
+harness = false
 
 [workspace.lints.rust]
 warnings = "deny"

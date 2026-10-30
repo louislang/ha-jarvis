@@ -310,6 +310,17 @@ fn dependencies(justfile: &serde_json::Value, recipe: &str) -> Vec<String> {
         .collect()
 }
 
+/// Checks that the body of `check` has the line `condition`.
+fn assert_check_has_line(condition: &serde_json::Value) {
+    let check = &justfile()["recipes"]["check"]["body"];
+    assert!(
+        check
+            .as_array()
+            .is_some_and(|lines| lines.contains(&serde_json::json!([[condition]]))),
+        "check has the line {condition}: {check}"
+    );
+}
+
 /// The steps of all jobs of a workflow.
 fn steps(workflow: &serde_yaml::Value) -> Vec<&serde_yaml::Value> {
     let jobs = workflow["jobs"]
@@ -1107,11 +1118,7 @@ fn ac_0_13_2_check_runs_gpu_test_on_cuda() {
         "just gpu-test",
         ""
     ]);
-    assert_eq!(
-        justfile["recipes"]["check"]["body"],
-        serde_json::json!([[[condition]]]),
-        "check runs gpu-test only on CUDA"
-    );
+    assert_check_has_line(&condition);
 }
 
 /// `gpu-test` passes a crate with no ignored tests.
@@ -1594,4 +1601,21 @@ fn ac_0_18_8_check_and_ci_run_verus_gate() {
     }
     let template = read(".github/pull_request_template.md");
     assert!(template.contains("\n- [ ] `verus`\n"), "{template}");
+}
+
+/// The CI job `bench` runs `just bench` on `ubuntu-latest`, and `check` runs `bench` only on Linux.
+#[test]
+fn ac_2_8c_2_bench_runs_on_linux() {
+    let ci = yaml(".github/workflows/ci.yml");
+    assert_eq!(
+        ci["jobs"]["bench"]["runs-on"].as_str(),
+        Some("ubuntu-latest"),
+        "the bench runner"
+    );
+    assert!(
+        runs(&ci, "bench").contains(&"just bench"),
+        "bench runs just bench"
+    );
+    let condition = serde_json::json!(["if", ["==", ["call", "os"], "linux"], "just bench", ""]);
+    assert_check_has_line(&condition);
 }
