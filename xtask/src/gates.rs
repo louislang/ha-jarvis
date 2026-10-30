@@ -520,16 +520,14 @@ fn ac_0_1_5_hook_runs_check() {
     }
 }
 
-/// CI has the triggers and runs the checks of this sub-phase.
+/// CI has the triggers, with `push` on `main` only, and runs the checks of this sub-phase.
 #[test]
 fn ac_0_1_6_ci_runs_checks() {
     let ci = yaml(".github/workflows/ci.yml");
-    for trigger in ["push", "pull_request", "workflow_call"] {
-        assert!(
-            ci["on"].get(trigger).is_some(),
-            "ci.yml has the trigger {trigger}"
-        );
-    }
+    let expected: serde_yaml::Value =
+        serde_yaml::from_str("{push: {branches: [main]}, pull_request: null, workflow_call: null}")
+            .expect("the expected triggers are YAML");
+    assert_eq!(ci["on"], expected, "the triggers");
     assert!(
         runs(&ci, "rust-test").contains(&"just cov"),
         "rust-test runs just cov"
