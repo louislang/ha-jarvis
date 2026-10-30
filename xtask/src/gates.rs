@@ -9,7 +9,8 @@ use std::process::{Command, Output};
 use std::sync::Mutex;
 
 use syn::buffer::{Cursor, TokenBuffer};
-use syn::{Attribute, ImplItem, Item, ItemImpl, ItemMod};
+use syn::visit::{self, Visit};
+use syn::{Attribute, ImplItemFn, ItemFn, ItemImpl, ItemMod, ItemTrait, TraitItemFn};
 use tempfile::TempDir;
 
 /// The environment variables that a nested tool gets. The coverage settings of an outer `cargo llvm-cov` would change its result.
@@ -1269,22 +1270,20 @@ fn verus_function(attribute: &str, function: &str) -> String {
     format!("use vstd::prelude::*;\n\n#[{attribute}]\npub fn {function}\n")
 }
 
-/// A fixture domain file with one function without a Verus attribute.
+/// A fixture domain file with a function and a trait default method without a Verus attribute.
 const UNVERIFIED_DOMAIN: &str = "use vstd::prelude::*;
-
 pub fn unverified() {}
-
-pub struct Unit;
-
 #[verus_verify]
 impl Unit {
     pub fn method() {}
 }
-
+pub trait Increment {
+    fn increment(x: u32) -> u32 { x + 1 }
+    fn declared();
+}
 verus! {
     pub open spec fn double(x: int) -> int { 2 * x }
 }
-
 #[cfg(test)]
 mod tests {
     fn helper() {}
@@ -1293,15 +1292,12 @@ mod tests {
 
 /// A fixture domain file with three trusted items.
 const TRUSTED_DOMAIN: &str = "use vstd::prelude::*;
-
 verus! {
     pub assume_specification[ core::cmp::max::<u32> ](a: u32, b: u32) -> u32;
-
     proof fn lemma() {
         admit();
     }
 }
-
 #[verus_verify(external_body)]
 pub fn trusted() {}
 ";
@@ -1333,32 +1329,51 @@ fn is_cfg_test(attribute: &Attribute) -> bool {
             .is_ok_and(|argument| argument == "test")
 }
 
-/// The names of the functions of `items`, outside test modules and `verus!` blocks, without a Verus attribute on them or on their `impl` block.
-fn unverified(items: &[Item]) -> Vec<String> {
-    items.iter().flat_map(unverified_item).collect()
-}
+/// Collects the functions without a Verus attribute on them or on their `impl` or trait block, outside test modules and `verus!` blocks.
+#[derive(Default)]
+struct Unverified(Vec<String>);
 
-/// The names of the functions of `item` without a Verus attribute, as [`unverified`] gives them.
-fn unverified_item(item: &Item) -> Vec<String> {
-    match item {
-        Item::Fn(function) if !verified(&function.attrs) => vec![function.sig.ident.to_string()],
-        Item::Impl(block) if !verified(&block.attrs) => unverified_methods(block),
-        Item::Mod(ItemMod {
-            attrs,
-            content: Some((_, items)),
-            ..
-        }) if !attrs.iter().any(is_cfg_test) => unverified(items),
-        _ => Vec::new(),
+impl Unverified {
+    /// Records `name` when `attributes` has no Verus attribute.
+    fn check(&mut self, attributes: &[Attribute], name: &syn::Ident) {
+        if !verified(attributes) {
+            self.0.push(name.to_string());
+        }
     }
 }
 
-/// The names of the methods of `block` without a Verus attribute.
-fn unverified_methods(block: &ItemImpl) -> Vec<String> {
-    let methods = block.items.iter().filter_map(|item| match item {
-        ImplItem::Fn(method) if !verified(&method.attrs) => Some(&method.sig.ident),
-        _ => None,
-    });
-    methods.map(ToString::to_string).collect()
+impl Visit<'_> for Unverified {
+    fn visit_item_mod(&mut self, module: &ItemMod) {
+        if !module.attrs.iter().any(is_cfg_test) {
+            visit::visit_item_mod(self, module);
+        }
+    }
+
+    fn visit_item_fn(&mut self, function: &ItemFn) {
+        self.check(&function.attrs, &function.sig.ident);
+    }
+
+    fn visit_item_impl(&mut self, block: &ItemImpl) {
+        if !verified(&block.attrs) {
+            visit::visit_item_impl(self, block);
+        }
+    }
+
+    fn visit_impl_item_fn(&mut self, method: &ImplItemFn) {
+        self.check(&method.attrs, &method.sig.ident);
+    }
+
+    fn visit_item_trait(&mut self, block: &ItemTrait) {
+        if !verified(&block.attrs) {
+            visit::visit_item_trait(self, block);
+        }
+    }
+
+    fn visit_trait_item_fn(&mut self, method: &TraitItemFn) {
+        if method.default.is_some() {
+            self.check(&method.attrs, &method.sig.ident);
+        }
+    }
 }
 
 /// The inside of the attribute `#[...]` or `#![...]` at `cursor`, and the cursor after it.
@@ -1399,7 +1414,9 @@ fn verus_findings(files: &[PathBuf]) -> Vec<Finding> {
     let mut findings = Vec::new();
     for file in files {
         let source = fs::read_to_string(file).expect("the file exists");
-        let mut items = unverified(&syn::parse_file(&source).expect("the file is Rust").items);
+        let mut unverified = Unverified::default();
+        unverified.visit_file(&syn::parse_file(&source).expect("the file is Rust"));
+        let mut items = unverified.0;
         if !file.ends_with(CONTRACTS) {
             let tokens = TokenBuffer::new2(source.parse().expect("the file is Rust tokens"));
             add_trusted(tokens.begin(), false, &mut items);
@@ -1410,6 +1427,15 @@ fn verus_findings(files: &[PathBuf]) -> Vec<Finding> {
         }));
     }
     findings
+}
+
+/// The findings of `items` in `file`.
+fn findings(file: &Path, items: &[&str]) -> Vec<Finding> {
+    let finding = |item: &&str| Finding {
+        file: file.to_owned(),
+        item: (*item).to_owned(),
+    };
+    items.iter().map(finding).collect()
 }
 
 /// Writes `source` as `path` in a fixture folder and returns the folder and the file.
@@ -1427,21 +1453,16 @@ static VERUS: Mutex<()> = Mutex::new(());
 /// Runs the `verus` recipe on a fixture crate `jarvis` with `source`. The fixtures share one target folder, so `vstd` is verified once.
 fn verus_gate(source: &str) -> Output {
     let workspace: toml::Table = read("Cargo.toml").parse().expect("Cargo.toml is TOML");
-    let vstd = workspace["dependencies"]["vstd"]
-        .as_str()
-        .expect("a vstd version");
-    let target = root().join("target/verus-fixtures");
+    let vstd = &workspace["dependencies"]["vstd"];
     let (fixture, _) = domain_file("src/lib.rs", source);
     let manifest = format!(
-        "[package]\nname = \"jarvis\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nvstd = \"{vstd}\"\n\n[package.metadata.verus]\nverify = true\n"
+        "[package]\nname = \"jarvis\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\n[dependencies]\nvstd = {vstd}\n\n[package.metadata.verus]\nverify = true\n"
     );
     fs::write(fixture.path().join("Cargo.toml"), manifest).expect("the manifest is written");
     fs::create_dir(fixture.path().join(".cargo")).expect("the config folder is made");
-    fs::write(
-        fixture.path().join(".cargo/config.toml"),
-        format!("[build]\ntarget-dir = {:?}\n", target.display().to_string()),
-    )
-    .expect("the config is written");
+    let target = root().join("target/verus-fixtures");
+    let config = format!("[build]\ntarget-dir = {target:?}\n");
+    fs::write(fixture.path().join(".cargo/config.toml"), config).expect("the config is written");
     let _verus = VERUS.lock().expect("no test panics while it runs Verus");
     // Cargo reuses a passing build of the same source, which then prints no results.
     assert_passes(&run(Command::new("cargo")
@@ -1465,20 +1486,11 @@ fn verus_results(output: &Output) -> (Option<i32>, Vec<String>) {
     (output.status.code(), lines)
 }
 
-/// Checks that `output` is a failure whose output has `text`.
-fn assert_verus_fails_with(output: &Output, text: &str) {
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success() && stderr.contains(text),
-        "verus fails with {text}, its output is: {stderr}"
-    );
-}
-
 /// `cargo verus verify` fails an `ensures` clause that does not hold and names the function.
 #[test]
 fn ac_0_18_1_verus_fails_broken_ensures() {
     let broken = verus_function("verus_spec(result => ensures result == 2)", ONE);
-    assert_verus_fails_with(&verus_gate(&broken), "fn one");
+    assert_fails_with(&verus_gate(&broken), "fn one");
     let holds = verus_function("verus_spec(result => ensures result == 1)", ONE);
     assert_passes(&verus_gate(&holds));
 }
@@ -1486,7 +1498,7 @@ fn ac_0_18_1_verus_fails_broken_ensures() {
 /// `cargo verus verify` fails a sum that can overflow and passes it with a `requires` clause.
 #[test]
 fn ac_0_18_2_verus_fails_overflow() {
-    assert_verus_fails_with(&verus_gate(&verus_function("verus_verify", SUM)), "fn sum");
+    assert_fails_with(&verus_gate(&verus_function("verus_verify", SUM)), "fn sum");
     let bounded = verus_function("verus_spec(requires a < 1000, b < 1000)", SUM);
     assert_passes(&verus_gate(&bounded));
 }
@@ -1507,27 +1519,19 @@ fn ac_0_18_3_verus_is_deterministic() {
     }
 }
 
-/// `verus_findings` gives only the function without a Verus attribute.
+/// `verus_findings` gives only the functions without a Verus attribute.
 #[test]
 fn ac_0_18_4_findings_unverified_function() {
     let (_folder, file) = domain_file("src/domain/fixture.rs", UNVERIFIED_DOMAIN);
-    let expected = Finding {
-        file: file.clone(),
-        item: "unverified".to_owned(),
-    };
-    assert_eq!(verus_findings(&[file]), [expected]);
+    let expected = findings(&file, &["unverified", "increment"]);
+    assert_eq!(verus_findings(&[file]), expected);
 }
 
 /// `verus_findings` gives each trusted item outside `src/domain/contracts.rs` and none inside it.
 #[test]
 fn ac_0_18_5_findings_trusted_items() {
     let (_folder, file) = domain_file("src/domain/fixture.rs", TRUSTED_DOMAIN);
-    let expected: Vec<Finding> = ["assume_specification", "admit", "external_body"]
-        .map(|item| Finding {
-            file: file.clone(),
-            item: item.to_owned(),
-        })
-        .into();
+    let expected = findings(&file, &["assume_specification", "admit", "external_body"]);
     assert_eq!(verus_findings(&[file]), expected);
     let (_folder, contracts) = domain_file(CONTRACTS, TRUSTED_DOMAIN);
     assert_eq!(verus_findings(&[contracts]), []);
@@ -1548,12 +1552,10 @@ fn ac_0_18_6_domain_has_no_findings() {
 /// The toolchain of the installed Verus release is the channel of `rust-toolchain.toml`.
 #[test]
 fn ac_0_18_7_verus_toolchain_is_channel() {
-    let version = justfile()["assignments"]["verus_version"]["value"]
-        .as_str()
-        .expect("a Verus version")
-        .to_owned();
+    let justfile = justfile();
+    let version = justfile["assignments"]["verus_version"]["value"].as_str();
     let home = env::var("HOME").expect("HOME is set");
-    let verus = Path::new(&home).join(".verus").join(version).join("verus");
+    let verus = format!("{home}/.verus/{}/verus", version.expect("a Verus version"));
     let output = run(Command::new(verus).arg("--version"));
     let stdout = String::from_utf8_lossy(&output.stdout);
     let toolchain = stdout
