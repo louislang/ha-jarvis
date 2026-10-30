@@ -1549,12 +1549,13 @@ fn ac_0_18_5_findings_trusted_items() {
     assert_eq!(verus_findings(&[contracts]), []);
 }
 
-/// The domain has no function without a Verus attribute and no trusted item outside `src/domain/contracts.rs`.
+/// The tracked files of `src/domain/`, also in subfolders, have no function without a Verus attribute and no trusted item outside `src/domain/contracts.rs`.
 #[test]
 fn ac_0_18_6_domain_has_no_findings() {
-    let entries = fs::read_dir(root().join("src/domain")).expect("the domain folder exists");
-    let files: Vec<PathBuf> = entries
-        .map(|entry| entry.expect("a folder entry").path())
+    let tracked = stdout_in_root("git", &["ls-files", "src/domain"]);
+    let files: Vec<PathBuf> = tracked
+        .lines()
+        .map(|path| root().join(path))
         .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
         .collect();
     assert!(!files.is_empty(), "the domain has files");
