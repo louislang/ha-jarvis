@@ -5,12 +5,15 @@ use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::Weak;
 use std::time::Duration;
 
 use anyhow::Context;
 use futures::SinkExt;
 use futures::StreamExt;
 use futures::channel::oneshot;
+use futures::future::AbortHandle;
+use futures::future::Abortable;
 use futures::lock::Mutex as AsyncMutex;
 use futures::stream::SplitSink;
 use serde::Deserialize;
@@ -37,6 +40,14 @@ pub struct HaHome<S> {
     pending: Mutex<HashMap<u64, ResultSender>>,
     /// The deadline of each request.
     deadline: Duration,
+    /// Stops the connection task when the adapter drops.
+    task: AbortHandle,
+}
+
+impl<S> Drop for HaHome<S> {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// The send half and the next ID, under one lock: HA refuses an ID that does not increase.
@@ -70,6 +81,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
     where
         F: Future<Output = io::Result<S>> + Send + 'static,
     {
+        let (task, registration) = AbortHandle::new_pair();
         let home = Arc::new(Self {
             writer: AsyncMutex::new(Writer {
                 sink: None,
@@ -77,30 +89,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             }),
             pending: Mutex::new(HashMap::new()),
             deadline: Duration::from_millis(config.request_timeout_ms),
+            task,
         });
         let (transport, token, config) = (connector(), token.to_owned(), config.clone());
-        let background = Arc::clone(&home);
-        tokio::spawn(async move {
+        // A weak reference, so that the task does not keep the adapter alive.
+        let weak = Arc::downgrade(&home);
+        let connection = async move {
             if let Ok(socket) = connect(transport, &token, &config).await {
-                background.serve(socket).await;
+                Self::serve(&weak, socket).await;
             }
-        });
+        };
+        tokio::spawn(Abortable::new(connection, registration));
         home
     }
 
     /// Delivers each message until the connection closes, then fails each pending request.
-    async fn serve(&self, socket: WebSocketStream<S>) {
+    async fn serve(home: &Weak<Self>, socket: WebSocketStream<S>) {
         let (sink, mut stream) = socket.split();
-        self.writer.lock().await.sink = Some(sink);
+        let Some(adapter) = home.upgrade() else {
+            return;
+        };
+        adapter.writer.lock().await.sink = Some(sink);
+        drop(adapter);
         while let Some(Ok(message)) = stream.next().await {
-            if let Message::Text(text) = message {
-                self.deliver(&text);
+            if let (Message::Text(text), Some(adapter)) = (message, home.upgrade()) {
+                adapter.deliver(&text);
             }
         }
+        let Some(adapter) = home.upgrade() else {
+            return;
+        };
         // The writer lock stops new requests until `pending` is empty.
-        let mut writer = self.writer.lock().await;
+        let mut writer = adapter.writer.lock().await;
         writer.sink = None;
-        for (_, sender) in self.pending().drain() {
+        for (_, sender) in adapter.pending().drain() {
             sender.send(Err(disconnected())).ok();
         }
     }
