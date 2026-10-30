@@ -9,7 +9,11 @@ publish = false
 
 [dependencies]
 anyhow = "1.0.104"
+async-trait = "0.1.92"
+futures = "0.3.34"
+jiff = { version = "0.2.38", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 toml = "1.1.8"
 vstd = "=0.0.0-2026-10-25-0158"
 

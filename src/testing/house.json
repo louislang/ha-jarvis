@@ -1,0 +1,1531 @@
+{
+  "states": [
+    {
+      "entity_id": "assist_satellite.carson_bedroom",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Carson Bedroom Assist Satellite"
+      },
+      "last_updated": "2026-10-25T12:01:00.000000Z",
+      "context": {
+        "id": "C4D0A012B3D7F44BA6D57F2EC1",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "media_player.carson_bedroom",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Carson Bedroom",
+        "device_class": "speaker",
+        "volume_level": 0.3
+      },
+      "last_updated": "2026-10-25T12:02:00.000000Z",
+      "context": {
+        "id": "EE52D4ED8D5A56984237D7501C",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.bedroom_presence",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Bedroom Presence"
+      },
+      "last_updated": "2026-10-25T12:03:00.000000Z",
+      "context": {
+        "id": "E973CACDFBB231BAAF730504C1",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "sensor.bedroom_temperature",
+      "state": "63.5",
+      "attributes": {
+        "friendly_name": "Bedroom Temperature",
+        "device_class": "temperature",
+        "unit_of_measurement": "°F"
+      },
+      "last_updated": "2026-10-25T12:04:00.000000Z",
+      "context": {
+        "id": "91F98DE0C17C3C469FC751CA28",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "assist_satellite.carson_kitchen",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Carson Kitchen Assist Satellite"
+      },
+      "last_updated": "2026-10-25T12:05:00.000000Z",
+      "context": {
+        "id": "5ACE939A27EB08922400DE6487",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "media_player.carson_kitchen",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Carson Kitchen",
+        "device_class": "speaker",
+        "volume_level": 0.3
+      },
+      "last_updated": "2026-10-25T12:06:00.000000Z",
+      "context": {
+        "id": "1A15FDFB0CD236165A57CDB8F3",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.kitchen_presence",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Kitchen Presence"
+      },
+      "last_updated": "2026-10-25T12:07:00.000000Z",
+      "context": {
+        "id": "7AA45DCA6F09D8241A9B1A89BE",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "media_player.carson_kitchen_media_player",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Carson Kitchen Media Player",
+        "device_class": "speaker",
+        "volume_level": 0.3
+      },
+      "last_updated": "2026-10-25T12:08:00.000000Z",
+      "context": {
+        "id": "831C88B61872C066E451DB6B2D",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "assist_satellite.carson_living_room",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Carson Living Room Assist Satellite"
+      },
+      "last_updated": "2026-10-25T12:09:00.000000Z",
+      "context": {
+        "id": "179F20ACB204C65E43A262430E",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "media_player.carson_living_room",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Carson Living Room",
+        "device_class": "speaker",
+        "volume_level": 0.3
+      },
+      "last_updated": "2026-10-25T12:10:00.000000Z",
+      "context": {
+        "id": "10AAAB101A44E0B5AC420078F6",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.living_room_presence",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Living Room Presence"
+      },
+      "last_updated": "2026-10-25T12:11:00.000000Z",
+      "context": {
+        "id": "F7E9AEE090772A4DCC58E6DE45",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "sensor.living_room_temperature",
+      "state": "62.8",
+      "attributes": {
+        "friendly_name": "Living Room Temperature",
+        "device_class": "temperature",
+        "unit_of_measurement": "°F"
+      },
+      "last_updated": "2026-10-25T12:12:00.000000Z",
+      "context": {
+        "id": "71E2919AC0187FF396E5DC0B85",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "media_player.carson_living_room_media_player",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Carson Living Room Media Player",
+        "device_class": "speaker",
+        "volume_level": 0.3
+      },
+      "last_updated": "2026-10-25T12:13:00.000000Z",
+      "context": {
+        "id": "A7D513C083018767542C70A632",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "assist_satellite.carson_office",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Carson Office Assist Satellite"
+      },
+      "last_updated": "2026-10-25T12:14:00.000000Z",
+      "context": {
+        "id": "97682BEFC04CBC6E02E5B28924",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "media_player.carson_office",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Carson Office",
+        "device_class": "speaker",
+        "volume_level": 0.3
+      },
+      "last_updated": "2026-10-25T12:15:00.000000Z",
+      "context": {
+        "id": "F123FBB9C1E6E443E809E14399",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.office_presence",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Office Presence"
+      },
+      "last_updated": "2026-10-25T12:16:00.000000Z",
+      "context": {
+        "id": "DD7AF2001C72922AB25E2FBCEA",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "sensor.office_temperature",
+      "state": "76.6",
+      "attributes": {
+        "friendly_name": "Office Temperature",
+        "device_class": "temperature",
+        "unit_of_measurement": "°F"
+      },
+      "last_updated": "2026-10-25T12:17:00.000000Z",
+      "context": {
+        "id": "6810E1107F9B5B4D036173515A",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "media_player.carson_office_media_player",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Carson Office Media Player",
+        "device_class": "speaker",
+        "volume_level": 0.3
+      },
+      "last_updated": "2026-10-25T12:18:00.000000Z",
+      "context": {
+        "id": "6F91777ED5FF338A2258EABDDD",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "person.ali",
+      "state": "home",
+      "attributes": {
+        "friendly_name": "Ali",
+        "device_trackers": []
+      },
+      "last_updated": "2026-10-25T12:19:00.000000Z",
+      "context": {
+        "id": "72F143A796B6C4A54803D5547E",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "person.louis",
+      "state": "home",
+      "attributes": {
+        "friendly_name": "Louis",
+        "device_trackers": []
+      },
+      "last_updated": "2026-10-25T12:20:00.000000Z",
+      "context": {
+        "id": "2866DAFA4B1619DED3898B87EB",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "climate.thermostat",
+      "state": "heat",
+      "attributes": {
+        "friendly_name": "Thermostat",
+        "current_temperature": 63.5,
+        "temperature": 66.0,
+        "hvac_modes": [
+          "off",
+          "heat",
+          "cool",
+          "heat_cool"
+        ]
+      },
+      "last_updated": "2026-10-25T12:21:00.000000Z",
+      "context": {
+        "id": "9E3C1D15EEE544CB047076D88B",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "sensor.thermostat_current_temperature",
+      "state": "63.5",
+      "attributes": {
+        "friendly_name": "Thermostat Current Temperature",
+        "device_class": "temperature",
+        "unit_of_measurement": "°F"
+      },
+      "last_updated": "2026-10-25T12:22:00.000000Z",
+      "context": {
+        "id": "A4B7F796E35A6E600CC2A2C09A",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.thermostat_motion",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Thermostat Motion",
+        "device_class": "motion"
+      },
+      "last_updated": "2026-10-25T12:23:00.000000Z",
+      "context": {
+        "id": "3CBF30FEB926DED04C2B19702A",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "sensor.climate_sensor_air_temperature",
+      "state": "64.0",
+      "attributes": {
+        "friendly_name": "Climate Sensor Air temperature",
+        "device_class": "temperature",
+        "unit_of_measurement": "°F"
+      },
+      "last_updated": "2026-10-25T12:24:00.000000Z",
+      "context": {
+        "id": "67D0FE32447F04B1E202B1D5BA",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "fan.office_fan",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Office Fan",
+        "percentage": 66
+      },
+      "last_updated": "2026-10-25T12:25:00.000000Z",
+      "context": {
+        "id": "8BA5A2A24AB1CED4A800690852",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.office_fan_light",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Office Fan Light",
+        "brightness": 128
+      },
+      "last_updated": "2026-10-25T12:26:00.000000Z",
+      "context": {
+        "id": "CE4EDD956FB303BCDBB6CFCF34",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.bedroom_fan_light",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Bedroom Fan Light",
+        "brightness": 254
+      },
+      "last_updated": "2026-10-25T12:27:00.000000Z",
+      "context": {
+        "id": "6286F01BD91770E7ED7063B494",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.bedroom_lamp_left",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Bedroom Lamp Left"
+      },
+      "last_updated": "2026-10-25T12:28:00.000000Z",
+      "context": {
+        "id": "FD2592D379E06E3E00F1E38077",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.bedroom_lamp_right",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Bedroom Lamp Right"
+      },
+      "last_updated": "2026-10-25T12:29:00.000000Z",
+      "context": {
+        "id": "B410E46AEC1E96732C20AFBFA1",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.bedroom_corner_lamp",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Bedroom Corner Lamp"
+      },
+      "last_updated": "2026-10-25T12:30:00.000000Z",
+      "context": {
+        "id": "5CE97AB5335F417170777556F6",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.alis_living_room_lamp",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Ali's Living Room Lamp"
+      },
+      "last_updated": "2026-10-25T12:31:00.000000Z",
+      "context": {
+        "id": "3A84D296735213F3675BA86563",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.louiss_living_room_lamp",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Louis's Living Room Lamp"
+      },
+      "last_updated": "2026-10-25T12:32:00.000000Z",
+      "context": {
+        "id": "7E9819DF97836DDBA75947E4F3",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.living_room_corner_lamp",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Living Room Corner Lamp"
+      },
+      "last_updated": "2026-10-25T12:33:00.000000Z",
+      "context": {
+        "id": "C1C448D2432EF3667140D88222",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.living_room_overhead_light",
+      "state": "unavailable",
+      "attributes": {
+        "friendly_name": "Living Room Overhead Light"
+      },
+      "last_updated": "2026-10-25T12:34:00.000000Z",
+      "context": {
+        "id": "3A0CC57605A891C439CB0FF8BA",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.tv_lamp",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "TV Lamp"
+      },
+      "last_updated": "2026-10-25T12:35:00.000000Z",
+      "context": {
+        "id": "8EDBEC5F57A600D284D91A8758",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.kitchen",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Overhead Light"
+      },
+      "last_updated": "2026-10-25T12:36:00.000000Z",
+      "context": {
+        "id": "8E2A00DE3BD031E73B1702672C",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.strawberry_lamp",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Strawberry Lamp"
+      },
+      "last_updated": "2026-10-25T12:37:00.000000Z",
+      "context": {
+        "id": "E1375B519EE2B2D6BD53E4EA42",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.desk_led",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Desk LED",
+        "brightness": 255
+      },
+      "last_updated": "2026-10-25T12:38:00.000000Z",
+      "context": {
+        "id": "0F7B866954BB16283726AD338E",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.office_lamp",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Office Lamp",
+        "brightness": 254
+      },
+      "last_updated": "2026-10-25T12:39:00.000000Z",
+      "context": {
+        "id": "4B66FA8E9D5534CEF6780062D6",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.workbench_led",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Workbench LED",
+        "brightness": 255
+      },
+      "last_updated": "2026-10-25T12:40:00.000000Z",
+      "context": {
+        "id": "B3403529B5F33C0C0C873B43C9",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "light.front_porch_light",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Front Porch Light"
+      },
+      "last_updated": "2026-10-25T12:41:00.000000Z",
+      "context": {
+        "id": "42B44BAE9EB699EC8DAACD03A8",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "switch.garage_light",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Garage Light"
+      },
+      "last_updated": "2026-10-25T12:42:00.000000Z",
+      "context": {
+        "id": "72068DA90B8816A39B09059074",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "switch.living_room_fan",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Living Room Fan"
+      },
+      "last_updated": "2026-10-25T12:43:00.000000Z",
+      "context": {
+        "id": "E0F38318B9E4EA71C68001BE70",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "media_player.apple_tv",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Apple TV"
+      },
+      "last_updated": "2026-10-25T12:44:00.000000Z",
+      "context": {
+        "id": "B880AAA8CE206089D2816CCD80",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "media_player.office",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Office",
+        "device_class": "speaker",
+        "volume_level": 0.26
+      },
+      "last_updated": "2026-10-25T12:45:00.000000Z",
+      "context": {
+        "id": "E5F6E06F42F7B0D37AF16550BC",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "media_player.downstairs_speakers",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Downstairs Speakers",
+        "device_class": "speaker",
+        "volume_level": 0.37
+      },
+      "last_updated": "2026-10-25T12:46:00.000000Z",
+      "context": {
+        "id": "8AF5A95FE2BAD170573B46929F",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.bedroom_motion",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Bedroom Motion",
+        "device_class": "motion"
+      },
+      "last_updated": "2026-10-25T12:47:00.000000Z",
+      "context": {
+        "id": "EE85C537579200E41CD3AE2A33",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.living_room_motion",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Living Room Motion",
+        "device_class": "motion"
+      },
+      "last_updated": "2026-10-25T12:48:00.000000Z",
+      "context": {
+        "id": "BF399F4C2B34D7AEDCEE9E26DE",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.office_motion",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Office Motion",
+        "device_class": "motion"
+      },
+      "last_updated": "2026-10-25T12:49:00.000000Z",
+      "context": {
+        "id": "0B7CBF69F57B8C9891BB286D29",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.kitchen_keypad_motion",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Kitchen Keypad Motion",
+        "device_class": "motion"
+      },
+      "last_updated": "2026-10-25T12:50:00.000000Z",
+      "context": {
+        "id": "D826E5B73E5130EC45EE9886A2",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.back_gate_motion",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Back Gate Motion",
+        "device_class": "motion"
+      },
+      "last_updated": "2026-10-25T12:51:00.000000Z",
+      "context": {
+        "id": "EABC2BFA21B03CFC08C0256EB6",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.backyard_motion",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Backyard Motion",
+        "device_class": "motion"
+      },
+      "last_updated": "2026-10-25T12:52:00.000000Z",
+      "context": {
+        "id": "8B47FF531F528EC78E1BBA954D",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.middle_motion",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Middle Motion",
+        "device_class": "motion"
+      },
+      "last_updated": "2026-10-25T12:53:00.000000Z",
+      "context": {
+        "id": "19F9E4C1351E498F6A8AFE3D70",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.patio_motion",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Patio Motion",
+        "device_class": "motion"
+      },
+      "last_updated": "2026-10-25T12:54:00.000000Z",
+      "context": {
+        "id": "552C30AC6BC5E059460C57E11A",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "binary_sensor.side_porch_motion",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Side Porch Motion",
+        "device_class": "motion"
+      },
+      "last_updated": "2026-10-25T12:55:00.000000Z",
+      "context": {
+        "id": "85B0CFE865E0E43A1E11DEEA7E",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "event.front_door_motion",
+      "state": "2026-10-25T11:46:30.746+00:00",
+      "attributes": {
+        "friendly_name": "Front Door Motion",
+        "device_class": "motion"
+      },
+      "last_updated": "2026-10-25T12:56:00.000000Z",
+      "context": {
+        "id": "791ED0990A1A6E556D0024BDDA",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "cover.bathtub_blind",
+      "state": "closed",
+      "attributes": {
+        "friendly_name": "Bathtub Blind",
+        "current_position": 0
+      },
+      "last_updated": "2026-10-25T12:57:00.000000Z",
+      "context": {
+        "id": "B00FE60642A22A1F52ACD74A63",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "cover.water_closet_blinds",
+      "state": "closed",
+      "attributes": {
+        "friendly_name": "Water Closet Blinds",
+        "current_position": 0
+      },
+      "last_updated": "2026-10-25T12:58:00.000000Z",
+      "context": {
+        "id": "85967128A3FFD9E0BC55E3D4A8",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "scene.bedtime",
+      "state": "2026-09-11T05:51:38.367373+00:00",
+      "attributes": {
+        "friendly_name": "Bedtime"
+      },
+      "last_updated": "2026-10-25T12:59:00.000000Z",
+      "context": {
+        "id": "708DDFDD14083944B8DB7525D3",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "alarm_control_panel.spring_alarm",
+      "state": "armed_home",
+      "attributes": {
+        "friendly_name": "Spring Alarm"
+      },
+      "last_updated": "2026-10-25T13:00:00.000000Z",
+      "context": {
+        "id": "72804ED8FB2085FEB68D97C26C",
+        "user_id": null,
+        "parent_id": null
+      }
+    }
+  ],
+  "areas": [
+    {
+      "area_id": "bedroom",
+      "name": "Bedroom",
+      "aliases": []
+    },
+    {
+      "area_id": "kitchen",
+      "name": "Kitchen",
+      "aliases": []
+    },
+    {
+      "area_id": "living_room",
+      "name": "Living Room",
+      "aliases": []
+    },
+    {
+      "area_id": "office",
+      "name": "Office",
+      "aliases": []
+    },
+    {
+      "area_id": "bathroom",
+      "name": "Bathroom",
+      "aliases": []
+    },
+    {
+      "area_id": "garage",
+      "name": "Garage",
+      "aliases": []
+    },
+    {
+      "area_id": "outside",
+      "name": "Outside",
+      "aliases": []
+    }
+  ],
+  "devices": [
+    {
+      "id": "6a3812757f5f0043a18115e60036f9ab",
+      "area_id": "bedroom"
+    },
+    {
+      "id": "98f4aacf9c4152ffe32dff212df91521",
+      "area_id": "kitchen"
+    },
+    {
+      "id": "b80f5f77cdcc0c658356532eff4e844c",
+      "area_id": "living_room"
+    },
+    {
+      "id": "1c8aff5b3943869c175c09b3c12f63d4",
+      "area_id": "office"
+    },
+    {
+      "id": "02f265ee7f519667ac4f9c9a1c0ca079",
+      "area_id": "kitchen"
+    },
+    {
+      "id": "ad9170318501e9bc5ccb4959f82ca1a7",
+      "area_id": "office"
+    },
+    {
+      "id": "9327d9b80008c7b818e26e4a1adae45d",
+      "area_id": "office"
+    },
+    {
+      "id": "7a0233cd211f26d9f1379de753a01d1b",
+      "area_id": "bedroom"
+    },
+    {
+      "id": "01ecc49a02cf12267875ffc81a2e7b57",
+      "area_id": "living_room"
+    }
+  ],
+  "entities": [
+    {
+      "entity_id": "assist_satellite.carson_bedroom",
+      "name": "Carson Bedroom Assist Satellite",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "6a3812757f5f0043a18115e60036f9ab",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "media_player.carson_bedroom",
+      "name": "Carson Bedroom",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "6a3812757f5f0043a18115e60036f9ab",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.bedroom_presence",
+      "name": "Bedroom Presence",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "6a3812757f5f0043a18115e60036f9ab",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "sensor.bedroom_temperature",
+      "name": "Bedroom Temperature",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "6a3812757f5f0043a18115e60036f9ab",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "assist_satellite.carson_kitchen",
+      "name": "Carson Kitchen Assist Satellite",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "98f4aacf9c4152ffe32dff212df91521",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "media_player.carson_kitchen",
+      "name": "Carson Kitchen",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "98f4aacf9c4152ffe32dff212df91521",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.kitchen_presence",
+      "name": "Kitchen Presence",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "98f4aacf9c4152ffe32dff212df91521",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "media_player.carson_kitchen_media_player",
+      "name": "Carson Kitchen Media Player",
+      "aliases": [],
+      "area_id": "kitchen",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "assist_satellite.carson_living_room",
+      "name": "Carson Living Room Assist Satellite",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "b80f5f77cdcc0c658356532eff4e844c",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "media_player.carson_living_room",
+      "name": "Carson Living Room",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "b80f5f77cdcc0c658356532eff4e844c",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.living_room_presence",
+      "name": "Living Room Presence",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "b80f5f77cdcc0c658356532eff4e844c",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "sensor.living_room_temperature",
+      "name": "Living Room Temperature",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "b80f5f77cdcc0c658356532eff4e844c",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "media_player.carson_living_room_media_player",
+      "name": "Carson Living Room Media Player",
+      "aliases": [],
+      "area_id": "living_room",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "assist_satellite.carson_office",
+      "name": "Carson Office Assist Satellite",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "1c8aff5b3943869c175c09b3c12f63d4",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "media_player.carson_office",
+      "name": "Carson Office",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "1c8aff5b3943869c175c09b3c12f63d4",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.office_presence",
+      "name": "Office Presence",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "1c8aff5b3943869c175c09b3c12f63d4",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "sensor.office_temperature",
+      "name": "Office Temperature",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "1c8aff5b3943869c175c09b3c12f63d4",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "media_player.carson_office_media_player",
+      "name": "Carson Office Media Player",
+      "aliases": [],
+      "area_id": "office",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "person.ali",
+      "name": "Ali",
+      "aliases": [],
+      "area_id": null,
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "person.louis",
+      "name": "Louis",
+      "aliases": [],
+      "area_id": null,
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "climate.thermostat",
+      "name": "Thermostat",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "02f265ee7f519667ac4f9c9a1c0ca079",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "sensor.thermostat_current_temperature",
+      "name": "Thermostat Current Temperature",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "02f265ee7f519667ac4f9c9a1c0ca079",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.thermostat_motion",
+      "name": "Thermostat Motion",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "02f265ee7f519667ac4f9c9a1c0ca079",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "sensor.climate_sensor_air_temperature",
+      "name": "Climate Sensor Air temperature",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "ad9170318501e9bc5ccb4959f82ca1a7",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "fan.office_fan",
+      "name": "Office Fan",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "9327d9b80008c7b818e26e4a1adae45d",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.office_fan_light",
+      "name": "Office Fan Light",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "9327d9b80008c7b818e26e4a1adae45d",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.bedroom_fan_light",
+      "name": "Bedroom Fan Light",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "7a0233cd211f26d9f1379de753a01d1b",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.bedroom_lamp_left",
+      "name": "Bedroom Lamp Left",
+      "aliases": [],
+      "area_id": "bedroom",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.bedroom_lamp_right",
+      "name": "Bedroom Lamp Right",
+      "aliases": [],
+      "area_id": "bedroom",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.bedroom_corner_lamp",
+      "name": "Bedroom Corner Lamp",
+      "aliases": [],
+      "area_id": "bedroom",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.alis_living_room_lamp",
+      "name": "Ali's Living Room Lamp",
+      "aliases": [],
+      "area_id": "living_room",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.louiss_living_room_lamp",
+      "name": "Louis's Living Room Lamp",
+      "aliases": [],
+      "area_id": "living_room",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.living_room_corner_lamp",
+      "name": "Living Room Corner Lamp",
+      "aliases": [],
+      "area_id": "living_room",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.living_room_overhead_light",
+      "name": "Living Room Overhead Light",
+      "aliases": [],
+      "area_id": "living_room",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.tv_lamp",
+      "name": "TV Lamp",
+      "aliases": [],
+      "area_id": "living_room",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.kitchen",
+      "name": "Overhead Light",
+      "aliases": [],
+      "area_id": "kitchen",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.strawberry_lamp",
+      "name": "Strawberry Lamp",
+      "aliases": [],
+      "area_id": "kitchen",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.desk_led",
+      "name": "Desk LED",
+      "aliases": [],
+      "area_id": "office",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.office_lamp",
+      "name": "Office Lamp",
+      "aliases": [],
+      "area_id": "office",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.workbench_led",
+      "name": "Workbench LED",
+      "aliases": [],
+      "area_id": "office",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "light.front_porch_light",
+      "name": "Front Porch Light",
+      "aliases": [
+        "Porch Light"
+      ],
+      "area_id": "outside",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "switch.garage_light",
+      "name": "Garage Light",
+      "aliases": [],
+      "area_id": "garage",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "switch.living_room_fan",
+      "name": "Living Room Fan",
+      "aliases": [],
+      "area_id": "living_room",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "media_player.apple_tv",
+      "name": "Apple TV",
+      "aliases": [
+        "the TV",
+        "plex"
+      ],
+      "area_id": null,
+      "device_id": "01ecc49a02cf12267875ffc81a2e7b57",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "media_player.office",
+      "name": "Office",
+      "aliases": [],
+      "area_id": "office",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "media_player.downstairs_speakers",
+      "name": "Downstairs Speakers",
+      "aliases": [],
+      "area_id": null,
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.bedroom_motion",
+      "name": "Bedroom Motion",
+      "aliases": [],
+      "area_id": "bedroom",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.living_room_motion",
+      "name": "Living Room Motion",
+      "aliases": [],
+      "area_id": "living_room",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.office_motion",
+      "name": "Office Motion",
+      "aliases": [],
+      "area_id": "office",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.kitchen_keypad_motion",
+      "name": "Kitchen Keypad Motion",
+      "aliases": [],
+      "area_id": null,
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.back_gate_motion",
+      "name": "Back Gate Motion",
+      "aliases": [],
+      "area_id": null,
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.backyard_motion",
+      "name": "Backyard Motion",
+      "aliases": [],
+      "area_id": null,
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.middle_motion",
+      "name": "Middle Motion",
+      "aliases": [],
+      "area_id": null,
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.patio_motion",
+      "name": "Patio Motion",
+      "aliases": [],
+      "area_id": null,
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "binary_sensor.side_porch_motion",
+      "name": "Side Porch Motion",
+      "aliases": [],
+      "area_id": null,
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "event.front_door_motion",
+      "name": "Front Door Motion",
+      "aliases": [],
+      "area_id": "outside",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "cover.bathtub_blind",
+      "name": "Bathtub Blind",
+      "aliases": [],
+      "area_id": "bathroom",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "cover.water_closet_blinds",
+      "name": "Water Closet Blinds",
+      "aliases": [],
+      "area_id": "bathroom",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "scene.bedtime",
+      "name": "Bedtime",
+      "aliases": [],
+      "area_id": "bedroom",
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "alarm_control_panel.spring_alarm",
+      "name": "Spring Alarm",
+      "aliases": [
+        "alarm",
+        "ring alarm"
+      ],
+      "area_id": null,
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    }
+  ],
+  "config": {
+    "time_zone": "America/Chicago",
+    "location_name": "Home"
+  },
+  "user_id": "66509b3a4d6b5712c2dcce831f723833"
+}

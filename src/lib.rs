@@ -10,7 +10,10 @@ use serde::Deserialize;
 /// Pure rules.
 pub mod domain {
     pub mod contracts;
+    pub mod state;
 }
+
+pub mod ports;
 
 /// Runtime configuration from `jarvis.toml`.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
