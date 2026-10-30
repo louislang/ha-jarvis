@@ -190,4 +190,41 @@ pub fn ex_str_to_lowercase(text: &str) -> (lower: String)
     text.to_lowercase()
 }
 
+/// Checks if `c` is an ASCII decimal digit. <https://doc.rust-lang.org/std/primitive.char.html#method.is_ascii_digit>
+#[verifier::external_fn_specification]
+pub fn ex_char_is_ascii_digit(c: &char) -> (digit: bool)
+    ensures
+        digit == ('0' <= *c && *c <= '9'),
+{
+    c.is_ascii_digit()
+}
+
+/// Maps `A` to `Z` to `a` to `z` and gives other characters unchanged. <https://doc.rust-lang.org/std/primitive.char.html#method.to_ascii_lowercase>
+#[verifier::external_fn_specification]
+pub fn ex_char_to_ascii_lowercase(c: &char) -> (lower: char)
+    ensures
+        'A' <= *c && *c <= 'Z' ==> 'a' <= lower && lower <= 'z',
+        !('A' <= *c && *c <= 'Z') ==> lower == *c,
+{
+    c.to_ascii_lowercase()
+}
+
+/// True when `c` has the Unicode `Alphabetic` property.
+pub uninterp spec fn alphabetic(c: char) -> bool;
+
+/// Checks if `c` has the Unicode `Alphabetic` property. <https://doc.rust-lang.org/std/primitive.char.html#method.is_alphabetic>
+#[verifier::external_fn_specification]
+pub fn ex_char_is_alphabetic(c: char) -> (result: bool)
+    ensures
+        result == alphabetic(c),
+{
+    c.is_alphabetic()
+}
+
+/// The ASCII characters with the `Alphabetic` property are the letters `A` to `Z` and `a` to `z`. <https://www.unicode.org/Public/UCD/latest/ucd/DerivedCoreProperties.txt>
+pub broadcast axiom fn axiom_ascii_alphabetic(c: char)
+    ensures
+        c <= '\x7f' ==> (#[trigger] alphabetic(c) <==> ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z')),
+;
+
 } // verus!
