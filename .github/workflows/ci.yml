@@ -102,6 +102,8 @@ jobs:
         with:
           just-version: "1.59.0"
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: "false"
       - run: sudo systemctl stop jarvis
       - run: just gpu-test
       - if: always()
