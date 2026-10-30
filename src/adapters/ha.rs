@@ -17,7 +17,6 @@ use futures::channel::oneshot;
 use futures::future;
 use futures::future::AbortHandle;
 use futures::future::Abortable;
-use futures::future::Either;
 use futures::lock::Mutex as AsyncMutex;
 use futures::stream;
 use futures::stream::BoxStream;
@@ -99,9 +98,10 @@ impl Drop for Pending<'_> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
     /// Returns at once. A background task opens a transport with `connector`, authenticates
-    /// with `token`, subscribes to the events and reads the connection until it closes.
-    pub fn start<F>(connector: impl FnOnce() -> F, token: &str, config: &HaConfig) -> Arc<Self>
+    /// with `token`, serves the connection and connects again with backoff after each disconnect.
+    pub fn start<C, F>(connector: C, token: &str, config: &HaConfig) -> Arc<Self>
     where
+        C: Fn() -> F + Send + 'static,
         F: Future<Output = io::Result<S>> + Send + 'static,
     {
         let (task, registration) = AbortHandle::new_pair();
@@ -116,16 +116,34 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             deadline: Duration::from_millis(config.request_timeout_ms),
             task,
         });
-        let (transport, token, config) = (connector(), token.to_owned(), config.clone());
         // A weak reference, so that the task does not keep the adapter alive.
         let weak = Arc::downgrade(&home);
-        let connection = async move {
-            if let Ok(socket) = connect(transport, &token, &config).await {
-                Self::serve(&weak, socket, &sender).await;
-            }
-        };
-        tokio::spawn(Abortable::new(connection, registration));
+        let run = Self::run(weak, connector, token.to_owned(), config.clone(), sender);
+        tokio::spawn(Abortable::new(run, registration));
         home
+    }
+
+    /// Connects and serves each connection until it fails, then waits for the backoff delay.
+    async fn run<C, F>(
+        home: Weak<Self>,
+        connector: C,
+        token: String,
+        config: HaConfig,
+        events: Events,
+    ) where
+        C: Fn() -> F,
+        F: Future<Output = io::Result<S>>,
+    {
+        let ping = Duration::from_secs(config.ping_interval_s);
+        let mut attempt: u32 = 0;
+        loop {
+            if let Ok(socket) = connect(connector(), &token, &config).await {
+                attempt = 0;
+                Self::serve(&home, socket, &events, ping).await;
+            }
+            time::sleep(delay(attempt)).await;
+            attempt = attempt.saturating_add(1);
+        }
     }
 
     /// The changes in HA, in order, from the first subscription. Only the first call gets them.
@@ -134,9 +152,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         stream::iter(receiver).flatten().boxed()
     }
 
-    /// Delivers each message and subscribes until the connection closes, then fails each
-    /// pending request.
-    async fn serve(home: &Weak<Self>, socket: WebSocketStream<S>, events: &Events) {
+    /// Delivers each message, subscribes and pings every `ping` until the connection fails, then
+    /// fails each pending request.
+    async fn serve(home: &Weak<Self>, socket: WebSocketStream<S>, events: &Events, ping: Duration) {
         let (sink, stream) = socket.split();
         let Some(adapter) = home.upgrade() else {
             return;
@@ -144,12 +162,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         adapter.writer.lock().await.sink = Some(sink);
         drop(adapter);
         let read = pin::pin!(Self::read(home, stream, events));
-        // The subscriptions need the read loop for their results. A close stops them.
-        if let Either::Right(((), read)) =
-            future::select(read, pin::pin!(Self::subscribe(home, events))).await
-        {
-            read.await;
-        }
+        // The subscriptions and the pings need the read loop for their results.
+        future::select(read, pin::pin!(Self::control(home, events, ping))).await;
         let Some(adapter) = home.upgrade() else {
             return;
         };
@@ -170,16 +184,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         }
     }
 
-    /// Subscribes to [`EVENT_TYPES`], then gives `Reconnected`.
-    async fn subscribe(home: &Weak<Self>, events: &Events) {
-        let Some(adapter) = home.upgrade() else {
-            return;
-        };
-        let subscriptions = EVENT_TYPES
-            .map(|kind| adapter.request(json!({ "type": "subscribe_events", "event_type": kind })));
-        if future::try_join_all(subscriptions).await.is_ok() {
-            events.unbounded_send(Event::Reconnected).ok();
+    /// Subscribes to [`EVENT_TYPES`], gives `Reconnected`, then pings every `interval`.
+    ///
+    /// # Errors
+    ///
+    /// A subscription or a ping fails.
+    async fn control(home: &Weak<Self>, events: &Events, interval: Duration) -> anyhow::Result<()> {
+        let subscriptions = EVENT_TYPES.map(|kind| {
+            Self::send(
+                home,
+                json!({ "type": "subscribe_events", "event_type": kind }),
+            )
+        });
+        future::try_join_all(subscriptions).await?;
+        events.unbounded_send(Event::Reconnected).ok();
+        loop {
+            time::sleep(interval).await;
+            Self::send(home, json!({ "type": "ping" })).await?;
         }
+    }
+
+    /// Sends `command` with [`HaHome::request`] while the adapter exists.
+    async fn send(home: &Weak<Self>, command: Value) -> anyhow::Result<Value> {
+        home.upgrade()
+            .ok_or_else(disconnected)?
+            .request(command)
+            .await
     }
 
     /// Loads the states, the registries, the configuration and the user of the token.
@@ -248,8 +278,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             .map_err(|_| anyhow::anyhow!("timeout error: no result within {:?}", self.deadline))?
     }
 
-    /// Sends a result to its pending request and an event to `events`. Ignores other messages
-    /// and IDs.
+    /// Sends a result or a `pong` to its pending request and an event to `events`. Ignores
+    /// other messages and IDs.
     fn deliver(&self, text: &str, events: &Events) {
         let (id, result) = match serde_json::from_str(text) {
             Ok(Incoming::Result {
@@ -261,6 +291,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             Ok(Incoming::Result { id, error, .. }) => {
                 (id, Err(anyhow::anyhow!("HA error: {error}")))
             }
+            Ok(Incoming::Pong { id }) => (id, Ok(Value::Null)),
             Ok(Incoming::Event { event }) => {
                 events.unbounded_send(event.into()).ok();
                 return;
@@ -280,6 +311,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             .lock()
             .expect("no code panics while it holds the pending map")
     }
+}
+
+/// The wait before connection attempt `attempt + 1`: 100 ms, doubled each attempt, at most 2 s.
+fn delay(attempt: u32) -> Duration {
+    Duration::from_millis(100 << attempt.min(5)).min(Duration::from_secs(2))
 }
 
 /// The error of a request while HA is disconnected.
@@ -320,6 +356,11 @@ enum Incoming {
         /// The code and the message of the error when `success` is false.
         #[serde(default)]
         error: Value,
+    },
+    /// The answer to a `ping`.
+    Pong {
+        /// The request ID of the `ping`.
+        id: u64,
     },
     /// An event of a subscription.
     Event {
@@ -451,6 +492,7 @@ mod tests {
     use futures::future;
     use serde_json::Value;
     use tokio::io::DuplexStream;
+    use tokio::time::Instant;
 
     /// The only token that `FakeHaServer` accepts.
     const TOKEN: &str = "abc";
@@ -517,6 +559,14 @@ mod tests {
             let message =
                 json!({ "id": request["id"], "type": "result", "success": true, "result": result });
             self.send_json(&message).await;
+        }
+
+        /// Sends a failed result with the message "Entity not found." for `request`.
+        async fn fail(&mut self, request: &Value) {
+            let error = json!({ "code": "not_found", "message": "Entity not found." });
+            let failure =
+                json!({ "id": request["id"], "type": "result", "success": false, "error": error });
+            self.send_json(&failure).await;
         }
 
         /// Sends `event` as an event of a subscription.
@@ -698,22 +748,82 @@ mod tests {
         assert!(error.contains("timeout"), "not a timeout error: {error}");
     }
 
-    /// Starts an adapter on a `FakeHaServer` that accepts the token, then runs `server`.
+    /// The connections of one adapter, from the server side.
+    struct Network {
+        /// The virtual time of each connection attempt.
+        attempts: Arc<Mutex<Vec<Instant>>>,
+        /// The server end of each connection that the adapter opens.
+        servers: mpsc::UnboundedReceiver<FakeHaServer>,
+        /// The events of the adapter.
+        events: BoxStream<'static, Event>,
+    }
+
+    impl Network {
+        /// Receives the next connection and answers its token with `auth_ok`.
+        async fn authenticated(&mut self) -> FakeHaServer {
+            let mut server = self.servers.next().await.expect("the adapter connects");
+            server.receive_auth().await;
+            server.send("auth_ok").await;
+            server
+        }
+
+        /// Receives the next connection and answers its token and each subscription.
+        async fn accept(&mut self) -> FakeHaServer {
+            let mut server = self.authenticated().await;
+            server.subscribe().await;
+            server
+        }
+
+        /// The virtual time of connection attempt `n`, from 0.
+        fn attempt(&self, n: usize) -> Instant {
+            self.attempts.lock().expect("no test panics with the lock")[n]
+        }
+
+        /// The next event.
+        async fn event(&mut self) -> Event {
+            self.events.next().await.expect("the events continue")
+        }
+    }
+
+    /// Starts an adapter whose first `refusals` connection attempts fail.
+    fn start(refusals: usize) -> (Arc<HaHome<DuplexStream>>, Network) {
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let (sender, servers) = mpsc::unbounded();
+        let log = Arc::clone(&attempts);
+        let connector = move || {
+            let mut log = log.lock().expect("no test panics with the lock");
+            log.push(Instant::now());
+            let servers = sender.clone();
+            let accept = move |server| async move {
+                servers.unbounded_send(server).ok();
+            };
+            future::ready(if log.len() > refusals {
+                Ok(open(accept))
+            } else {
+                Err(io::ErrorKind::ConnectionRefused.into())
+            })
+        };
+        let home = HaHome::start(connector, TOKEN, &config());
+        let events = home.events();
+        let network = Network {
+            attempts,
+            servers,
+            events,
+        };
+        (home, network)
+    }
+
+    /// Starts an adapter, accepts its connection and runs `server` on it after `Reconnected`.
     async fn ready<F>(
         server: impl FnOnce(FakeHaServer) -> F + Send + 'static,
     ) -> Arc<HaHome<DuplexStream>>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let client = open(|mut fake| async move {
-            fake.receive_auth().await;
-            fake.send("auth_ok").await;
-            fake.subscribe().await;
-            server(fake).await;
-        });
-        let home = HaHome::start(|| async { Ok(client) }, TOKEN, &config());
-        // The paused clock advances only when every task waits, thus after the subscriptions.
-        time::sleep(Duration::from_millis(1)).await;
+        let (home, mut network) = start(0);
+        let fake = network.accept().await;
+        assert_eq!(network.event().await, Event::Reconnected);
+        tokio::spawn(server(fake));
         home
     }
 
@@ -773,10 +883,7 @@ mod tests {
     async fn ac_2_3_4_failure_is_error_with_ha_message() {
         let home = ready(|mut server| async move {
             let request = server.receive().await;
-            let error = json!({ "code": "not_found", "message": "Entity not found." });
-            let failure =
-                json!({ "id": request["id"], "type": "result", "success": false, "error": error });
-            server.send_json(&failure).await;
+            server.fail(&request).await;
             server.wait_close().await;
         })
         .await;
@@ -824,16 +931,11 @@ mod tests {
 
     /// Starts an adapter that receives `event` after `Reconnected`, and gives its next event.
     async fn next_event(event: Value) -> Event {
-        let home = ready(|mut server| async move {
-            // After `Reconnected`: the paused clock advances only when every task waits.
-            time::sleep(Duration::from_millis(1)).await;
-            server.send_event(event).await;
-            server.wait_close().await;
-        })
-        .await;
-        let mut events = home.events();
-        assert_eq!(events.next().await, Some(Event::Reconnected));
-        events.next().await.expect("the events continue")
+        let (_home, mut network) = start(0);
+        let mut server = network.accept().await;
+        assert_eq!(network.event().await, Event::Reconnected);
+        server.send_event(event).await;
+        network.event().await
     }
 
     /// AC-2.4b-1.
@@ -862,5 +964,79 @@ mod tests {
         let event =
             json!({ "event_type": "entity_registry_updated", "data": data, "context": context });
         assert_eq!(next_event(event).await, Event::RegistryUpdated);
+    }
+
+    /// AC-2.4c-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_2_4c_1_close_reconnects_after_first_delay() {
+        let (_home, mut network) = start(0);
+        let server = network.accept().await;
+        assert_eq!(network.event().await, Event::Reconnected);
+        let closed = Instant::now();
+        drop(server);
+        let _server = network.accept().await;
+        assert_eq!(network.event().await, Event::Reconnected);
+        assert_eq!(network.attempt(1) - closed, Duration::from_millis(100));
+    }
+
+    /// AC-2.4c-2.
+    #[test]
+    fn ac_2_4c_2_delays_double_up_to_two_seconds() {
+        let delays: Vec<Duration> = (0..6).map(delay).collect();
+        let expected: Vec<Duration> = [100, 200, 400, 800, 1600, 2000]
+            .map(Duration::from_millis)
+            .to_vec();
+        assert_eq!(delays, expected);
+    }
+
+    /// AC-2.4c-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_2_4c_3_ready_resets_backoff() {
+        let (_home, mut network) = start(3);
+        let server = network.accept().await;
+        let closed = Instant::now();
+        drop(server);
+        let _server = network.accept().await;
+        assert_eq!(network.attempt(4) - closed, Duration::from_millis(100));
+    }
+
+    /// AC-2.4c-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_2_4c_4_no_pong_reconnects_after_deadline() {
+        let (_home, mut network) = start(0);
+        let mut server = network.accept().await;
+        assert_eq!(network.event().await, Event::Reconnected);
+        let ping = server.receive().await;
+        assert_eq!(ping["type"], "ping");
+        server
+            .send_json(&json!({ "id": ping["id"], "type": "pong" }))
+            .await;
+        let _next = network.accept().await;
+        assert_eq!(network.event().await, Event::Reconnected);
+        let wait = network.attempt(1) - network.attempt(0);
+        assert_eq!(wait, Duration::from_millis(30_000 + 30_000 + 5000 + 100));
+        drop(server);
+    }
+
+    /// AC-2.4c-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_2_4c_5_start_without_server_reconnects_when_available() {
+        let (_home, mut network) = start(3);
+        let _server = network.accept().await;
+        assert_eq!(network.event().await, Event::Reconnected);
+    }
+
+    /// AC-2.4c-6.
+    #[tokio::test(start_paused = true)]
+    async fn ac_2_4c_6_failed_subscription_reconnects_after_first_delay() {
+        let (_home, mut network) = start(0);
+        let mut server = network.authenticated().await;
+        let subscription = server.receive().await;
+        server.fail(&subscription).await;
+        let failed = Instant::now();
+        let _next = network.accept().await;
+        assert_eq!(network.event().await, Event::Reconnected);
+        assert_eq!(network.attempt(1) - failed, Duration::from_millis(100));
+        drop(server);
     }
 }
