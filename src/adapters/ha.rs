@@ -81,15 +81,20 @@ where
     }
 }
 
-/// Receives the next message and gives its type.
+/// Receives the next message, after any `Ping` and `Pong` frames, and gives its type.
 async fn receive_type<S: AsyncRead + AsyncWrite + Unpin>(
     socket: &mut WebSocketStream<S>,
 ) -> anyhow::Result<String> {
-    match socket.next().await {
-        Some(Ok(Message::Text(text))) => Ok(serde_json::from_str::<Envelope>(&text)?.kind),
-        Some(Ok(Message::Close(_))) | None => anyhow::bail!("connection error: HA closed"),
-        Some(Ok(frame)) => anyhow::bail!("protocol error: unexpected frame {frame:?}"),
-        Some(Err(error)) => Err(error).context("connection error"),
+    loop {
+        match socket.next().await {
+            Some(Ok(Message::Text(text))) => {
+                return Ok(serde_json::from_str::<Envelope>(&text)?.kind);
+            }
+            Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+            Some(Ok(Message::Close(_))) | None => anyhow::bail!("connection error: HA closed"),
+            Some(Ok(frame)) => anyhow::bail!("protocol error: unexpected frame {frame:?}"),
+            Some(Err(error)) => return Err(error).context("connection error"),
+        }
     }
 }
 
@@ -125,15 +130,17 @@ mod tests {
                 .expect("the client is connected");
         }
 
-        /// Receives the next message.
+        /// Receives the next text message. Skips control frames.
         async fn receive(&mut self) -> Value {
-            let message = self.socket.next().await;
-            let text = message
-                .expect("the client is connected")
-                .expect("the frame is valid")
-                .into_text()
-                .expect("the frame is text");
-            serde_json::from_str(&text).expect("the message is JSON")
+            loop {
+                let message = self.socket.next().await;
+                let frame = message
+                    .expect("the client is connected")
+                    .expect("the frame is valid");
+                if let Message::Text(text) = frame {
+                    return serde_json::from_str(&text).expect("the message is JSON");
+                }
+            }
         }
 
         /// Sends `auth_required` and receives `auth`. Gives true when it has `TOKEN`.
@@ -201,7 +208,15 @@ mod tests {
     /// AC-2.2-1.
     #[tokio::test(start_paused = true)]
     async fn ac_2_2_1_correct_token_connects() -> anyhow::Result<()> {
-        connect(TOKEN, FakeHaServer::authenticate).await?;
+        connect(TOKEN, |mut server| async move {
+            server
+                .socket
+                .send(Message::Ping(Vec::new().into()))
+                .await
+                .expect("the client is connected");
+            server.authenticate().await;
+        })
+        .await?;
         Ok(())
     }
 
