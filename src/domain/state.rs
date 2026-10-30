@@ -361,6 +361,66 @@ impl StateCache {
             .get("device_class")?
             .as_str()
     }
+
+    /// The area whose name or alias is `text`, without case sensitivity.
+    #[verus_spec(area =>
+        ensures
+            match area {
+                Some(id) => exists|index: int| 0 <= index < self.areas@.len()
+                    && *id == #[trigger] self.areas@[index].area_id
+                    && named(self.areas@[index], crate::domain::contracts::lowercase(text@)),
+                None => forall|index: int| 0 <= index < self.areas@.len()
+                    ==> !named(#[trigger] self.areas@[index], crate::domain::contracts::lowercase(text@)),
+            },
+    )]
+    #[must_use]
+    pub fn area_by_name(&self, text: &str) -> Option<&AreaId> {
+        let lower = text.to_lowercase();
+        let mut index = 0;
+        #[cfg_attr(verus_only, verus_spec(
+            invariant
+                index <= self.areas@.len(),
+                lower@ == crate::domain::contracts::lowercase(text@),
+                forall|earlier: int| 0 <= earlier < index
+                    ==> !named(#[trigger] self.areas@[earlier], lower@),
+            decreases self.areas@.len() - index,
+        ))]
+        while index < self.areas.len() {
+            let area = &self.areas[index];
+            if has_name(area, &lower) {
+                return Some(&area.area_id);
+            }
+            index += 1;
+        }
+        None
+    }
+}
+
+/// True when the name or an alias of `area` is `lower` in lowercase.
+#[verus_spec(found =>
+    ensures
+        found == named(*area, lower@),
+)]
+fn has_name(area: &Area, lower: &str) -> bool {
+    if area.name.to_lowercase().as_str() == lower {
+        return true;
+    }
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= area.aliases@.len(),
+            crate::domain::contracts::lowercase(area.name@) != lower@,
+            forall|earlier: int| 0 <= earlier < index
+                ==> crate::domain::contracts::lowercase(#[trigger] area.aliases@[earlier]@) != lower@,
+        decreases area.aliases@.len() - index,
+    ))]
+    while index < area.aliases.len() {
+        if area.aliases[index].to_lowercase().as_str() == lower {
+            return true;
+        }
+        index += 1;
+    }
+    false
 }
 
 /// The devices by device ID.
@@ -517,6 +577,17 @@ pub open spec fn chosen(
     exists|index: int| 0 <= index < count
         && id == (#[trigger] cache.entities@[index]).entity_id
         && selected(cache, cache.entities@[index], area, domain, class)
+}
+
+/// True when the name or an alias of `area` is `lower` in lowercase.
+pub open spec fn named(area: Area, lower: Seq<char>) -> bool {
+    crate::domain::contracts::lowercase(area.name@) == lower || aliased(area.aliases@, lower)
+}
+
+/// True when an alias in `aliases` is `lower` in lowercase.
+pub open spec fn aliased(aliases: Seq<String>, lower: Seq<char>) -> bool {
+    exists|index: int| 0 <= index < aliases.len()
+        && crate::domain::contracts::lowercase(#[trigger] aliases[index]@) == lower
 }
 
 /// Unwrapping after an insert is an insert of the unwrapped state.
@@ -823,5 +894,29 @@ mod tests {
             cache.entities(&area("office"), "binary_sensor", Some("motion")),
             [&motion]
         );
+    }
+
+    /// AC-2.8b-1.
+    #[test]
+    fn ac_2_8b_1_area_by_name_or_alias() {
+        let mut house = house();
+        let garage = house
+            .areas
+            .iter_mut()
+            .find(|entry| entry.area_id == area("garage"))
+            .expect("the house has a garage");
+        garage.aliases.push("Workshop".to_owned());
+        let cache = StateCache::load(house);
+        assert_eq!(
+            cache.area_by_name("living ROOM"),
+            Some(&area("living_room"))
+        );
+        assert_eq!(cache.area_by_name("WORKSHOP"), Some(&area("garage")));
+    }
+
+    /// AC-2.8b-2.
+    #[test]
+    fn ac_2_8b_2_area_by_unknown_name() {
+        assert_eq!(StateCache::load(house()).area_by_name("attic"), None);
     }
 }
