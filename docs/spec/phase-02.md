@@ -153,6 +153,7 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 - When the first connection at `start` fails, the adapter tries again with the same backoff.
 - Every `ha.ping_interval_s`, the adapter sends `ping`. No `pong` within `ha.request_timeout_ms` is a disconnect. Thus a dead TCP connection does not leave the cache stale. This sub-phase adds `ha.ping_interval_s`.
 - A connection that reaches `Ready` resets the backoff attempt to 0.
+- A failed `subscribe_events` result is a disconnect.
 
 **Acceptance criteria.**
 
@@ -161,10 +162,11 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 - AC-2.4c-3: When a reconnect reaches `Ready` after three attempts and the connection closes again, the next delay is 100 ms.
 - AC-2.4c-4: When `FakeHaServer` stops answering `ping`, the adapter connects again after the `pong` deadline in virtual time, and `events` gives `Reconnected`.
 - AC-2.4c-5: When no server is available at `start`, `start` returns an adapter. When the server becomes available, `events` gives `Reconnected`.
+- AC-2.4c-6: When `FakeHaServer` answers a `subscribe_events` with an error, the adapter connects again after the first backoff delay in virtual time, and `events` gives `Reconnected`.
 
 **Proofs.**
 
-- P-2.4c-1, P-2.4c-4, P-2.4c-5. Evidence: test.
+- P-2.4c-1, P-2.4c-4 to P-2.4c-6. Evidence: test.
 - P-2.4c-3. Argument: `Ready` sets the attempt to 0, and `delay(0) = 100`.
 - P-2.4c-2 (AC-2.4c-2). Requires: attempt `k >= 0`. Ensures: `delay(k) = min(100 * 2^k, 2000)`. Argument: the function is this closed form. `100 * 2^5 = 3200 > 2000`, so the sixth delay is 2000.
 
