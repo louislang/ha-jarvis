@@ -39,7 +39,8 @@ pub struct Space {
     /// The nested spaces.
     pub spaces: Vec<Space>,
     /// The metrics of the space and its nested spaces, by group (`halstead`) and name (`volume`).
-    pub metrics: BTreeMap<String, BTreeMap<String, f64>>,
+    /// An average over no functions has no value.
+    pub metrics: BTreeMap<String, BTreeMap<String, Option<f64>>>,
 }
 
 /// One metric of one function above its limit.
@@ -123,7 +124,7 @@ fn function_violations(space: &Space, file: &str, python: bool, limits: &Limits)
 /// When `space` has no value for `metric`.
 fn value(space: &Space, metric: &str) -> f64 {
     let (group, name) = metric.split_once('.').expect("a metric is <group>.<name>");
-    space.metrics[group][name]
+    space.metrics[group][name].expect("a function has a value for each metric")
 }
 
 /// The units of the files in `path`, from `rust-code-analysis-cli`.
