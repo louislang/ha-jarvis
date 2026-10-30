@@ -14,6 +14,7 @@ use serde::Deserialize;
 pub mod domain {
     #[cfg(verus_only)]
     pub mod contracts;
+    pub mod intent;
     pub mod state;
 }
 
