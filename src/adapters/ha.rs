@@ -35,6 +35,7 @@ use tokio_tungstenite::tungstenite::Message;
 use crate::HaConfig;
 use crate::domain::state::Context;
 use crate::domain::state::Event;
+use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
 use crate::domain::state::State;
 
@@ -232,6 +233,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             "entities": entities, "config": config, "user_id": user["id"],
         });
         serde_json::from_value(snapshot).context("protocol error: the snapshot is not valid")
+    }
+
+    /// Calls a service. Gives the response data when `call.return_response` is true.
+    ///
+    /// # Errors
+    ///
+    /// A connection, HA or timeout error.
+    pub async fn call(&self, call: ServiceCall) -> anyhow::Result<Option<Value>> {
+        let command = json!({
+            "type": "call_service", "domain": call.domain, "service": call.service,
+            "target": { "entity_id": call.target }, "service_data": call.data,
+            "return_response": call.return_response,
+        });
+        let mut result = self.request(command).await?;
+        let response = || result.get_mut("response").map_or(Value::Null, Value::take);
+        Ok(call.return_response.then(response))
     }
 
     /// Completes each listed entity with its entry of `get_entries` and the names of `states`.
@@ -1038,5 +1055,68 @@ mod tests {
         assert_eq!(network.event().await, Event::Reconnected);
         assert_eq!(network.attempt(1) - failed, Duration::from_millis(100));
         drop(server);
+    }
+
+    /// A `light.turn_on` call of the kitchen light at half brightness.
+    fn turn_on(return_response: bool) -> ServiceCall {
+        ServiceCall {
+            domain: "light".to_owned(),
+            service: "turn_on".to_owned(),
+            target: vec!["light.kitchen".to_owned()],
+            data: Map::from_iter([("brightness_pct".to_owned(), json!(50))]),
+            return_response,
+        }
+    }
+
+    /// The response data of the fake service.
+    fn response() -> Value {
+        json!({ "light.kitchen": { "brightness": 128 } })
+    }
+
+    /// Runs `call` against a server that answers as HA does. Gives the request and the result.
+    async fn serve_call(call: ServiceCall) -> anyhow::Result<(Value, Option<Value>)> {
+        let (sender, receiver) = oneshot::channel();
+        let home = ready(|mut server| async move {
+            let request = server.receive().await;
+            let mut result = json!({ "context": { "id": "01K" } });
+            if request["return_response"] == true {
+                result["response"] = response();
+            }
+            server.reply(&request, result).await;
+            sender.send(request).ok();
+            server.wait_close().await;
+        })
+        .await;
+        let result = home.call(call).await?;
+        Ok((receiver.await?, result))
+    }
+
+    /// AC-2.5-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_2_5_1_call_sends_call_service_with_target_and_data() -> anyhow::Result<()> {
+        let (request, _) = serve_call(turn_on(false)).await?;
+        let expected = json!({
+            "id": request["id"], "type": "call_service", "domain": "light", "service": "turn_on",
+            "target": { "entity_id": ["light.kitchen"] }, "service_data": { "brightness_pct": 50 },
+            "return_response": false,
+        });
+        assert_eq!(request, expected);
+        Ok(())
+    }
+
+    /// AC-2.5-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_2_5_2_return_response_gives_response_data() -> anyhow::Result<()> {
+        let (_, result) = serve_call(turn_on(true)).await?;
+        assert_eq!(result, Some(response()));
+        Ok(())
+    }
+
+    /// AC-2.5-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_2_5_3_no_return_response_gives_none() -> anyhow::Result<()> {
+        let (_, result) = serve_call(turn_on(false)).await?;
+        assert_eq!(result, None);
+        Ok(())
     }
 }
