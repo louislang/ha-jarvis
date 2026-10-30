@@ -262,7 +262,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `xtask/src/rules.rs` | Tools | Checks the layer and modularity rules on the module graph. | 0.8 |
 | `xtask/src/mermaid.rs` | Tools | Draws the module graph in Mermaid, with change colors. | 0.9 |
 | `xtask/src/merge.rs` | Tools | The merge rules, the merge command and the pre-push guard. | 0.15 |
-| `benches/domain.rs` | Test | Gungraun benchmarks with absolute instruction budgets. | 2.8 |
+| `benches/domain.rs` | Test | Gungraun benchmarks with absolute instruction budgets. | 2.8c |
 | `jarvis.toml` | — | Runtime configuration. | 1.1 |
 | `intents.toml` | — | Intent catalog with seed examples. | 3.2 |
 | `responses.toml` | — | The source response pools. You edit it. Jarvis reads it and does not write it. | 4.1 |
