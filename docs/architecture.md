@@ -32,6 +32,7 @@ flowchart LR
     crate_app_background --> crate_ports
     crate_domain_contracts --> crate_domain_state
     crate_domain_intent --> crate_domain_contracts
+    crate_domain_intent --> crate_domain_intent
     crate_domain_state --> crate_domain_contracts
     crate_domain_state --> crate_domain_state
     crate_ports --> crate_domain_state
