@@ -362,7 +362,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - **Implements:** G3, G10. **Depends on:** 3.8.
 - **Files:** modify `justfile`, `.github/workflows/ci.yml`, `xtask/src/gates.rs`, `train/train.py`, `jarvis.toml`, `src/lib.rs`.
 
-**Model.** `fixture-model` first runs `jarvis dataset jarvis.toml target/fixture/train.json --house src/testing/house.json`. `fixture-stale <stamp>` exits with code 0 when `<stamp>` differs from the SHA-256 of `target/fixture/train.json` and the Git-tracked files in `train/`, or when a model file is missing. Thus a change that does not change the training set or the script does not train again. Untracked caches in `train/` do not change the hash. `fixture-model` runs `fixture-stale models/system-one/fixture/inputs.sha256`. If stale, it runs `train.py --device cpu` into `models/system-one/fixture/`, then writes the new stamp. Training uses fixed seeds and deterministic algorithms: `train.py` seeds Torch with 0 and turns on deterministic algorithms before it builds the model. It also sets `CUBLAS_WORKSPACE_CONFIG` to `:4096:8` when it is not set, because deterministic CUDA matrix multiplication needs it. The same code runs on `cpu` and `cuda`. This sub-phase sets the AdamW learning rate of `train` to 5e-5, because the default 1e-3 makes the fine-tuned model predict `unknown` for every example. It also changes the `train.base_model` default in `jarvis.toml` and in the AC-1.1-1 test to `sentence-transformers/all-MiniLM-L12-v2` (`01-architecture.md` section 3). `check` runs `fixture-model` before `cov`. The `rust-test` job sets up Python 3.12, installs `./train` and runs `jarvis dataset`. Then it restores `models/system-one/fixture/` from the CI cache with the hash as the key, and runs `just fixture-model` before `just cov`. `fixture-model` is a setup recipe: it can download `train.base_model`, and tests read only its output. CPU training gives different weights on different machines. Thus a criterion that uses the fixture model checks only examples that the model trained on.
+**Model.** `fixture-model` first runs `jarvis dataset jarvis.toml target/fixture/train.json --house src/testing/house.json`. `fixture-stale <stamp>` exits with code 0 when `<stamp>` differs from the SHA-256 of `target/fixture/train.json` and the Git-tracked files in `train/`, or when a model file is missing. Thus a change that does not change the training set or the script does not train again. Untracked caches in `train/` do not change the hash. `fixture-model` runs `fixture-stale models/system-one/fixture/inputs.sha256`. If stale, it runs `train.py --device cpu --epochs 20` into `models/system-one/fixture/`, then writes the new stamp. `--epochs` replaces the `epochs` of the training set. The seed set is small, so 8 epochs learn the intents but not the slot tags. Real training keeps `train.epochs`. Training uses fixed seeds and deterministic algorithms: `train.py` seeds Torch with 0 and turns on deterministic algorithms before it builds the model. It also sets `CUBLAS_WORKSPACE_CONFIG` to `:4096:8` when it is not set, because deterministic CUDA matrix multiplication needs it. The same code runs on `cpu` and `cuda`. This sub-phase sets the AdamW learning rate of `train` to 5e-5, because the default 1e-3 makes the fine-tuned model predict `unknown` for every example. It also changes the `train.base_model` default in `jarvis.toml` and in the AC-1.1-1 test to `sentence-transformers/all-MiniLM-L12-v2` (`01-architecture.md` section 3). `check` runs `fixture-model` before `cov`. The `rust-test` job sets up Python 3.12, installs `./train` and runs `jarvis dataset`. Then it restores `models/system-one/fixture/` from the CI cache with the hash as the key, and runs `just fixture-model` before `just cov`. `fixture-model` is a setup recipe: it can download `train.base_model`, and tests read only its output. CPU training gives different weights on different machines. Thus a criterion that uses the fixture model checks only examples that the model trained on.
 
 **Acceptance criteria.**
 
@@ -475,7 +475,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 ### 3.12 Classifier Port and ONNX Adapter
 
-**Goal:** Add the `Classifier` and `ModelLoader` ports and their ONNX Runtime adapter with the tokenizer. Jarvis can now load a model folder and predict on the CPU or the GPU.
+**Goal:** Add the `Classifier` and `ModelLoader` ports and their ONNX Runtime adapter with the tokenizer. Jarvis can now load a model folder and predict.
 
 - **Implements:** G3, G18. **Depends on:** 3.11c.
 - **Files:** create `src/adapters/onnx.rs`. Modify `src/ports.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `Cargo.toml`.
@@ -483,8 +483,8 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Model.**
 
 - `Classifier::predict(context, text) -> Result<Prediction>`. `ModelLoader::load(dir, device) -> Result<Arc<dyn Classifier>>`.
-- `OnnxClassifier` tokenizes `(context, text)` as a pair, runs the session, then calls `softmax`, `ranked` and `decode_bio` (sub-phases 3.11 to 3.11c).
-- `device = cuda` registers the CUDA execution provider. `device = cpu` registers only the CPU provider. Until sub-phase 6.2, `ort` uses the ONNX Runtime binaries that its build downloads.
+- `OnnxClassifier` tokenizes `(context, text)` as a pair, runs the session, then calls `softmax`, `ranked` and `decode_bio` (sub-phases 3.11 to 3.11c). `predict` returns the `decode_bio` error.
+- `load` reads `labels.json`, `tokenizer.json` and `model.onnx`. Until sub-phase 6.2, `ort` uses the ONNX Runtime binaries that its build downloads.
 - `FakeClassifier` returns scripted predictions and records each `(context, text)`. `FakeModelLoader` returns scripted classifiers.
 
 **Acceptance criteria.**
@@ -493,17 +493,54 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - AC-3.12-2: When the fixture model gets each seed example with an `area` span that is not held out, the slots contain that `area` value.
 - AC-3.12-3: When the fixture model gets each seed example with a `show` span that is not held out, the slots contain that `show` value.
 - AC-3.12-4: When the fixture model gets each `unknown` seed example that is not held out, the top label is `unknown`.
-- AC-3.12-5: When the folder has no `labels.json`, `load` returns an error that names the file.
-- AC-3.12-6: When `labels.json` has a different number of labels than `intent_logits`, `load` returns an error with both numbers. When it has a different number of tags than `slot_logits`, `load` returns an error with both numbers.
-- AC-3.12-7: When `device = cpu`, the session uses only the CPU execution provider.
-- AC-3.12-8 [GPU host]: With `device = cpu`, `predict` with 32 tokens has a p99 of less than 10 ms.
-- AC-3.12-9 [GPU host]: With `device = cuda`, the session uses the CUDA execution provider, and `predict` with 32 tokens has a p99 of less than 5 ms.
-- AC-3.12-10: When `labels.json` has a duplicate label or tag, `load` returns an error that names it.
 - AC-3.12-11: When the input has more tokens than the tokenizer maximum length, `predict` truncates the text and returns a prediction.
-- AC-3.12-12: When the session output is empty or not finite, `predict` returns an error before it calls `softmax`.
 
 **Proofs.**
 
-- P-3.12-1 to P-3.12-4, P-3.12-7 to P-3.12-9. Evidence: test.
-- P-3.12-5, P-3.12-6, P-3.12-10. Argument: `load` checks that `labels.json` exists, that its labels and tags are unique, and that their counts equal the last dimensions of `intent_logits` and `slot_logits`, before it returns `Ok`.
-- P-3.12-11, P-3.12-12. Evidence: test.
+- P-3.12-1 to P-3.12-4, P-3.12-11. Evidence: test.
+
+---
+
+### 3.12b Execution Providers and Output Checks
+
+**Goal:** Choose the execution provider from `device`, and reject a bad session output. Jarvis can now predict on the CPU or the GPU.
+
+- **Implements:** G3, G18. **Depends on:** 3.12.
+- **Files:** modify `src/adapters/onnx.rs`.
+
+**Model.**
+
+- `device = cuda` registers the CUDA execution provider. `device = cpu` registers only the CPU provider.
+- `predict` checks the session output before it calls `softmax`.
+
+**Acceptance criteria.**
+
+- AC-3.12b-1: When `device = cpu`, the session uses only the CPU execution provider.
+- AC-3.12b-2 [GPU host]: With `device = cpu`, `predict` with 32 tokens has a p99 of less than 10 ms.
+- AC-3.12b-3 [GPU host]: With `device = cuda`, the session uses the CUDA execution provider, and `predict` with 32 tokens has a p99 of less than 5 ms.
+- AC-3.12b-4: When the session output is empty or not finite, `predict` returns an error before it calls `softmax`.
+
+**Proofs.**
+
+- P-3.12b-1 to P-3.12b-4. Evidence: test.
+
+---
+
+### 3.12c Labels File Checks
+
+**Goal:** Make `load` reject a `labels.json` that does not match the model, so a bad model folder fails at startup.
+
+- **Implements:** G3, G18. **Depends on:** 3.12b.
+- **Files:** modify `src/adapters/onnx.rs`.
+
+**Model.** `load` checks that `labels.json` exists, that its labels and tags are unique, and that their counts equal the last dimensions of `intent_logits` and `slot_logits`.
+
+**Acceptance criteria.**
+
+- AC-3.12c-1: When the folder has no `labels.json`, `load` returns an error that names the file.
+- AC-3.12c-2: When `labels.json` has a different number of labels than `intent_logits`, `load` returns an error with both numbers. When it has a different number of tags than `slot_logits`, `load` returns an error with both numbers.
+- AC-3.12c-3: When `labels.json` has a duplicate label or tag, `load` returns an error that names it.
+
+**Proofs.**
+
+- P-3.12c-1 to P-3.12c-3. Argument: `load` checks that `labels.json` exists, that its labels and tags are unique, and that their counts equal the last dimensions of `intent_logits` and `slot_logits`, before it returns `Ok`.
