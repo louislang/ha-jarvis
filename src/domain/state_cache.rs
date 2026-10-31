@@ -157,7 +157,7 @@ impl StateCache {
     /// The IDs of the entities in `area` and `domain`, with `device_class` if given.
     #[verus_spec(found =>
         ensures
-            forall|position: int| 0 <= position < found@.len() ==> crate::domain::state::chosen(
+            forall|position: int| 0 <= position < found@.len() ==> chosen(
                 *self, *#[trigger] found@[position], self.entities@.len() as int,
                 *area, domain@, optional(device_class)),
     )]
@@ -173,7 +173,7 @@ impl StateCache {
         #[cfg_attr(verus_only, verus_spec(
             invariant
                 index <= self.entities@.len(),
-                forall|position: int| 0 <= position < found@.len() ==> crate::domain::state::chosen(
+                forall|position: int| 0 <= position < found@.len() ==> chosen(
                     *self, *#[trigger] found@[position], index as int,
                     *area, domain@, optional(device_class)),
             decreases self.entities@.len() - index,
@@ -191,7 +191,7 @@ impl StateCache {
     /// True when `entity` is in `area` and `domain`, with `device_class` if given.
     #[verus_spec(selects =>
         ensures
-            selects == crate::domain::state::selected(*self, *entity, *area, domain@, optional(device_class)),
+            selects == selected(*self, *entity, *area, domain@, optional(device_class)),
     )]
     fn selects(
         &self,
@@ -220,7 +220,7 @@ impl StateCache {
     /// The `device_class` attribute of the state of `entity_id`.
     #[verus_spec(class =>
         ensures
-            optional(class) == crate::domain::state::device_class(*self, entity_id@),
+            optional(class) == device_class(*self, entity_id@),
     )]
     fn device_class(&self, entity_id: &str) -> Option<&str> {
         self.states
@@ -400,6 +400,53 @@ pub open spec fn first(entities: Seq<Entity>, entity_id: Seq<char>, index: int) 
     &&& forall|earlier: int| 0 <= earlier < index ==> #[trigger] entities[earlier].entity_id.0@ != entity_id
 }
 
+/// True when the entity ID `entity_id` is `domain`, a dot and an object ID.
+pub open spec fn in_domain(entity_id: Seq<char>, domain: Seq<char>) -> bool {
+    let id = vstd::utf8::encode_utf8(entity_id);
+    let prefix = vstd::utf8::encode_utf8(domain);
+    prefix.len() < id.len() && id.take(prefix.len() as int) == prefix && id[prefix.len() as int] == b'.'
+}
+
+/// The `device_class` attribute of the state of `entity_id`.
+pub open spec fn device_class(cache: StateCache, entity_id: Seq<char>) -> Option<Seq<char>> {
+    let key = crate::domain::contracts::str_key(entity_id);
+    if cache.states@.contains_key(key) {
+        match crate::domain::contracts::attribute(cache.states@[key].attributes, "device_class") {
+            Some(value) => crate::domain::contracts::text(value),
+            None => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// True when `entity` is in `area` and `domain`, with `class` if given.
+pub open spec fn selected(
+    cache: StateCache,
+    entity: Entity,
+    area: AreaId,
+    domain: Seq<char>,
+    class: Option<Seq<char>>,
+) -> bool {
+    &&& in_domain(entity.entity_id.0@, domain)
+    &&& entity_area(cache, entity) matches Some(found) && found.0@ == area.0@
+    &&& class matches Some(wanted) ==> device_class(cache, entity.entity_id.0@) == Some(wanted)
+}
+
+/// True when `id` is the ID of a selected entity among the first `count` entities.
+pub open spec fn chosen(
+    cache: StateCache,
+    id: EntityId,
+    count: int,
+    area: AreaId,
+    domain: Seq<char>,
+    class: Option<Seq<char>>,
+) -> bool {
+    exists|index: int| 0 <= index < count
+        && id == (#[trigger] cache.entities@[index]).entity_id
+        && selected(cache, cache.entities@[index], area, domain, class)
+}
+
 /// True when the name or an alias of `area` is `lower` in lowercase.
 pub open spec fn named(area: Area, lower: Seq<char>) -> bool {
     crate::domain::contracts::lowercase(area.name@) == lower || aliased(area.aliases@, lower)
@@ -436,6 +483,15 @@ mod tests {
 
     /// The entity that the cache tests change.
     const KITCHEN: &str = "light.kitchen";
+
+    /// The entity of `snapshot` with the name `name`.
+    fn named<'snapshot>(snapshot: &'snapshot Snapshot, name: &str) -> &'snapshot Entity {
+        snapshot
+            .entities
+            .iter()
+            .find(|entity| entity.name == name)
+            .unwrap_or_else(|| panic!("no entity has the name {name}"))
+    }
 
     /// The state of `light.kitchen` in `snapshot`.
     fn kitchen(snapshot: &Snapshot) -> State {
@@ -535,5 +591,86 @@ mod tests {
         let older = changed(&cached, "off", -1);
         let cache = StateCache::load(house).apply(kitchen_changed(Some(older)));
         assert_eq!(cache.state(KITCHEN), Some(&cached));
+    }
+
+    /// The area `area_id`.
+    fn area(area_id: &str) -> AreaId {
+        AreaId(area_id.to_owned())
+    }
+
+    /// AC-2.8-1.
+    #[test]
+    fn ac_2_8_1_area_of_device() {
+        let cache = StateCache::load(house());
+        assert_eq!(
+            cache.area_of_device("6a3812757f5f0043a18115e60036f9ab"),
+            Some(&area("bedroom"))
+        );
+    }
+
+    /// AC-2.8-2.
+    #[test]
+    fn ac_2_8_2_area_of_entity_from_device() {
+        let house = house();
+        let sensor = "sensor.office_temperature";
+        assert!(
+            house
+                .entities
+                .iter()
+                .any(|entity| entity.entity_id.0 == sensor && entity.area_id.is_none()),
+            "{sensor} has an area"
+        );
+        assert_eq!(
+            StateCache::load(house).area_of_entity(sensor),
+            Some(&area("office"))
+        );
+    }
+
+    /// AC-2.8-3.
+    #[test]
+    fn ac_2_8_3_entities_of_area_and_domain() {
+        let mut house = house();
+        let fan = EntityId("fan.living_room_ceiling".to_owned());
+        house.entities.push(Entity {
+            entity_id: fan.clone(),
+            ..named(&house, "Living Room Fan").clone()
+        });
+        let cache = StateCache::load(house);
+        assert_eq!(cache.entities(&area("living_room"), "fan", None), [&fan]);
+    }
+
+    /// AC-2.8-4.
+    #[test]
+    fn ac_2_8_4_entities_with_device_class() {
+        let cache = StateCache::load(house());
+        let motion = EntityId("binary_sensor.office_motion".to_owned());
+        assert_eq!(
+            cache.entities(&area("office"), "binary_sensor", Some("motion")),
+            [&motion]
+        );
+    }
+
+    /// AC-2.8b-1.
+    #[test]
+    fn ac_2_8b_1_area_by_name_or_alias() {
+        let mut house = house();
+        let garage = house
+            .areas
+            .iter_mut()
+            .find(|entry| entry.area_id == area("garage"))
+            .expect("the house has a garage");
+        garage.aliases.push("Workshop".to_owned());
+        let cache = StateCache::load(house);
+        assert_eq!(
+            cache.area_by_name("living ROOM"),
+            Some(&area("living_room"))
+        );
+        assert_eq!(cache.area_by_name("WORKSHOP"), Some(&area("garage")));
+    }
+
+    /// AC-2.8b-2.
+    #[test]
+    fn ac_2_8b_2_area_by_unknown_name() {
+        assert_eq!(StateCache::load(house()).area_by_name("attic"), None);
     }
 }
