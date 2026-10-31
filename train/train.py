@@ -4,7 +4,7 @@
 import argparse
 import json
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict
@@ -12,10 +12,19 @@ from typing import NotRequired, TypedDict
 import torch
 from torch import nn
 from torch.nn import functional
-from transformers import PreTrainedModel
+from transformers import (
+    AutoModel,
+    AutoTokenizer,
+    BatchEncoding,
+    PreTrainedModel,
+    PreTrainedTokenizerFast,
+)
 
 IGNORE = -100
 """The label that the loss skips."""
+
+INPUTS = ["input_ids", "attention_mask", "token_type_ids"]
+"""The input names of the model, in `forward` order."""
 
 
 @dataclass(frozen=True)
@@ -68,9 +77,17 @@ Example = TypedDict(
 class TrainingSet(TypedDict):
     """The fields of the training set file that the script reads."""
 
+    base_model: str
+    epochs: int
+    batch_size: int
     labels: list[str]
     tags: list[str]
     examples: list[Example]
+
+
+def named_label(example: Example) -> str:
+    """Give the label that `intent` or `not` names."""
+    return example["intent"] if "intent" in example else example["not"]
 
 
 def load_set(path: Path) -> TrainingSet:
@@ -80,7 +97,7 @@ def load_set(path: Path) -> TrainingSet:
         if ("intent" in example) == ("not" in example):
             message = f"example {index} needs exactly one of intent and not"
             raise ValueError(message)
-        label = example.get("intent", example.get("not"))
+        label = named_label(example)
         if label not in training_set["labels"]:
             message = f"example {index} has the unknown label {label}"
             raise ValueError(message)
@@ -172,5 +189,121 @@ def loss(
     return slot_sum / tagged - picked.mean()
 
 
+def load_tokenizer(base_model: str) -> PreTrainedTokenizerFast:
+    """Load the fast tokenizer of the model `base_model`."""
+    # `AutoTokenizer.from_pretrained` has no type hints.
+    load: Callable[[str], PreTrainedTokenizerFast] = AutoTokenizer.from_pretrained
+    return load(base_model)
+
+
+def targets(
+    training_set: TrainingSet, examples: list[Example], encoding: BatchEncoding
+) -> Batch:
+    """Give the label, the `not` flag and the token tags of each of `examples`."""
+    device = encoding["input_ids"].device
+    rows = zip(
+        examples, encoding["offset_mapping"], encoding["token_type_ids"], strict=True
+    )
+    tags = [
+        align(
+            example["spans"], offsets.tolist(), segments.tolist(), training_set["tags"]
+        )
+        for example, offsets, segments in rows
+    ]
+    labels = [training_set["labels"].index(named_label(e)) for e in examples]
+    return {
+        "labels": torch.tensor(labels, device=device),
+        "negated": torch.tensor(["not" in e for e in examples], device=device),
+        "tags": torch.tensor(tags, device=device),
+    }
+
+
+def encode(
+    tokenizer: PreTrainedTokenizerFast,
+    training_set: TrainingSet,
+    examples: list[Example],
+    model: JointModel,
+) -> tuple[list[torch.Tensor], Batch]:
+    """Give the model inputs in `INPUTS` order and the targets of `examples`."""
+    encoding = tokenizer(
+        [example["context"] for example in examples],
+        [example["text"] for example in examples],
+        padding=True,
+        # Longer pairs exceed the position embeddings of the encoder.
+        truncation=True,
+        max_length=model.base.config.max_position_embeddings,
+        return_offsets_mapping=True,
+        return_tensors="pt",
+    ).to(model.intent_head.weight.device)
+    inputs = [encoding[name] for name in INPUTS]
+    return inputs, targets(training_set, examples, encoding)
+
+
+def limit_vram(device: str, max_vram_gb: float | None) -> None:
+    """Make PyTorch fail with "CUDA out of memory" above `max_vram_gb` on `cuda`."""
+    if device == "cuda" and max_vram_gb is not None:
+        total = torch.cuda.get_device_properties(device).total_memory
+        torch.cuda.set_per_process_memory_fraction(max_vram_gb * 2**30 / total)
+
+
+def train(
+    training_set: TrainingSet, device: str, max_vram_gb: float | None
+) -> JointModel:
+    """Fine-tune the base model on `training_set` with AdamW on `device`."""
+    limit_vram(device, max_vram_gb)
+    tokenizer = load_tokenizer(training_set["base_model"])
+    base = AutoModel.from_pretrained(training_set["base_model"])
+    labels, tags = training_set["labels"], training_set["tags"]
+    model = JointModel(base, len(labels), len(tags)).to(device)
+    optimizer = torch.optim.AdamW(model.parameters())
+    examples, batch_size = training_set["examples"], training_set["batch_size"]
+    batches = [
+        encode(tokenizer, training_set, examples[start : start + batch_size], model)
+        for start in range(0, len(examples), batch_size)
+    ]
+    epochs = training_set["epochs"]
+    model.train()
+    for _epoch in range(epochs):
+        for inputs, batch in batches:
+            intent_logits, slot_logits = model(*inputs)
+            torch.autograd.backward(loss(intent_logits, slot_logits, batch))
+            optimizer.step()
+            optimizer.zero_grad()
+    return model
+
+
+def export(
+    model: JointModel,
+    tokenizer: PreTrainedTokenizerFast,
+    training_set: TrainingSet,
+    out: Path,
+) -> None:
+    """Write `model.onnx`, `tokenizer.json` and `labels.json` to the folder `out`."""
+    out.mkdir(parents=True, exist_ok=True)
+    inputs, _ = encode(tokenizer, training_set, training_set["examples"][:1], model)
+    axes = {name: {0: "batch", 1: "sequence"} for name in [*INPUTS, "slot_logits"]}
+    model.eval()
+    torch.onnx.export(
+        model,
+        tuple(inputs),
+        out / "model.onnx",
+        input_names=INPUTS,
+        output_names=["intent_logits", "slot_logits"],
+        dynamic_axes=axes | {"intent_logits": {0: "batch"}},
+    )
+    tokenizer.backend_tokenizer.save(str(out / "tokenizer.json"))
+    labels = {"labels": training_set["labels"], "tags": training_set["tags"]}
+    (out / "labels.json").write_text(json.dumps(labels), encoding="utf-8")
+
+
+def main(argv: Sequence[str]) -> None:
+    """Train on the training set file of `argv` and write the model folder."""
+    args = parse_args(argv)
+    training_set = load_set(args.data)
+    model = train(training_set, args.device, args.max_vram_gb)
+    tokenizer = load_tokenizer(training_set["base_model"])
+    export(model, tokenizer, training_set, args.out)
+
+
 if __name__ == "__main__":
-    parse_args(sys.argv[1:])
+    main(sys.argv[1:])
