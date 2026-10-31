@@ -285,7 +285,8 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/main.rs` | Root | Binary entry point. `main` only calls `jarvis::main`. | 0.1 |
 | `src/ports.rs` | Ports | All port traits and their data types. | 2.1 |
 | `src/domain/contracts.rs` | Domain | Trusted Verus contracts and axioms for the `std` and domain crate functions that the domain calls. | 0.18 |
-| `src/domain/state.rs` | Domain | Hot cache data and queries. | 2.1 |
+| `src/domain/state.rs` | Domain | Home data: snapshot, states, registries, events and service calls. | 2.1 |
+| `src/domain/state_cache.rs` | Domain | `StateCache`: load, apply and queries. | — |
 | `src/domain/intent.rs` | Domain | Normalize and example markup. | 3.1 |
 | `src/domain/catalog.rs` | Domain | Intent catalog types and validation, labels, tag list. | 3.2 |
 | `src/domain/training.rs` | Domain | Training set, context samples, held-out split, accuracy, accept rule, change count. | 3.3 |
@@ -739,7 +740,7 @@ Each model has state variables, actions and named invariants. `02-rules.md` sect
 
 | Model | Component | Rust module | Invariants |
 |---|---|---|---|
-| `cache_sync.qnt` | Hot cache sync | `domain/state.rs`, `app/background.rs` | `CacheEqualsHomeWhenIdle`, `NoEventAfterDisconnect` |
+| `cache_sync.qnt` | Hot cache sync | `domain/state_cache.rs`, `app/background.rs` | `CacheEqualsHomeWhenIdle`, `NoEventAfterDisconnect` |
 | `announce.qnt` | Announce queue of one satellite | `app/conversation.rs` | `AnnounceWhenIdle`, `NoStaleAnnounce`, `SentencesInOrder` |
 | `commit.qnt` | Commit policy and VAD | `domain/speech.rs` | `CommitOnlyWhenAllowed`, `NoLateCommit`, `NoCommitDuringSpeech` |
 | `backfill.qnt` | Backfill | `app/background.rs` | `OneBackfillPerPool`, `PoolsChangeOnlyOnSuccess` |

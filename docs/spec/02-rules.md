@@ -121,7 +121,7 @@ Format:
 8. A sub-phase that writes domain code can also modify `src/domain/contracts.rs`, also when its Files list does not name it.
 9. Verus does not compute float values. A clause about floats states the expression that gives the result, or an order that the code compares (for example `p(top) >= threshold`). The test of the criterion checks a claim about a numeric value (for example `decayed(4.0, last, last + half_life, half_life) = 2.0`).
 10. Only Verus builds `src/domain/contracts.rs`: `src/lib.rs` declares it with `#[cfg(verus_only)]`. A normal build would report its functions as dead code. A loop invariant is a `#[cfg_attr(verus_only, verus_spec(...))]` attribute on the loop, and `src/lib.rs` has `#![cfg_attr(verus_only, feature(proc_macro_hygiene))]` for it.
-11. Verus does not instantiate an `exists` inside a `forall` when the `exists` is inline or inside an open spec function with other terms. Put the `exists` in its own spec function and call that function in the `forall` (for example `chosen` in `src/domain/state.rs`).
+11. Verus does not instantiate an `exists` inside a `forall` when the `exists` is inline or inside an open spec function with other terms. Put the `exists` in its own spec function and call that function in the `forall` (for example `chosen` in `src/domain/state_cache.rs`).
 
 ## 6. Test Rules
 
