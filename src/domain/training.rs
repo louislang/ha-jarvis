@@ -44,7 +44,21 @@ pub struct Settings {
 
 /// One labeled transcript with its model context.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(from = "ExampleFile", into = "ExampleFile")]
 pub struct Example {
+    /// Segment A of the model input.
+    pub context: String,
+    /// The normalized transcript.
+    pub text: String,
+    /// The intent of the example, or the intent that it is not.
+    pub label: Label,
+    /// The slot values in `text`, or `None` when the slots are not known.
+    pub spans: Option<Vec<Span>>,
+}
+
+/// An example in the training set file, with its spans in character offsets.
+#[derive(Deserialize, Serialize)]
+pub struct ExampleFile {
     /// Segment A of the model input.
     pub context: String,
     /// The normalized transcript.
@@ -53,7 +67,18 @@ pub struct Example {
     #[serde(flatten)]
     pub label: Label,
     /// The slot values in `text`, or `None` when the slots are not known.
-    pub spans: Option<Vec<Span>>,
+    pub spans: Option<Vec<SpanFile>>,
+}
+
+/// One slot value in the text of an example in the training set file.
+#[derive(Deserialize, Serialize)]
+pub struct SpanFile {
+    /// The slot name.
+    pub slot: String,
+    /// The character offset of the value.
+    pub start: usize,
+    /// The character offset after the value.
+    pub end: usize,
 }
 
 /// The label of an example.
@@ -64,6 +89,150 @@ pub enum Label {
     Intent(String),
     /// The example has any label except this one.
     Not(String),
+}
+
+#[verus_verify]
+impl From<Example> for ExampleFile {
+    /// The example with its spans in character offsets.
+    fn from(example: Example) -> Self {
+        let spans = example
+            .spans
+            .as_ref()
+            .map(|spans| to_chars(&example.text, spans));
+        Self {
+            context: example.context,
+            text: example.text,
+            label: example.label,
+            spans,
+        }
+    }
+}
+
+#[verus_verify]
+impl From<ExampleFile> for Example {
+    /// The example with its spans in byte offsets.
+    fn from(file: ExampleFile) -> Self {
+        let spans = file.spans.as_ref().map(|spans| to_bytes(&file.text, spans));
+        Self {
+            context: file.context,
+            text: file.text,
+            label: file.label,
+            spans,
+        }
+    }
+}
+
+/// The byte spans `spans` of `text` in character offsets.
+#[verus_spec(files =>
+    ensures
+        files@.len() == spans@.len(),
+        forall|index: int| #![trigger files@[index]] 0 <= index < spans@.len()
+            ==> in_chars(text@, spans@[index], files@[index]),
+)]
+fn to_chars(text: &str, spans: &[Span]) -> Vec<SpanFile> {
+    let mut files = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            prefix_in_chars(text@, spans@, files@, index as int),
+        decreases spans@.len() - index,
+    ))]
+    while index < spans.len() {
+        let span = &spans[index];
+        files.push(SpanFile {
+            slot: span.slot.clone(),
+            start: char_offset(text, span.start),
+            end: char_offset(text, span.end),
+        });
+        index += 1;
+    }
+    files
+}
+
+/// The character spans `files` of `text` in byte offsets.
+#[verus_spec(spans =>
+    ensures
+        spans@.len() == files@.len(),
+        forall|index: int| #![trigger spans@[index]] 0 <= index < files@.len()
+            ==> in_bytes(text@, files@[index], spans@[index]),
+)]
+fn to_bytes(text: &str, files: &[SpanFile]) -> Vec<Span> {
+    let mut spans = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            prefix_in_bytes(text@, files@, spans@, index as int),
+        decreases files@.len() - index,
+    ))]
+    while index < files.len() {
+        let file = &files[index];
+        spans.push(Span {
+            slot: file.slot.clone(),
+            start: byte_offset(text, file.start),
+            end: byte_offset(text, file.end),
+        });
+        index += 1;
+    }
+    spans
+}
+
+/// The number of characters of `text` before the byte offset `byte`.
+#[verus_spec(count =>
+    ensures
+        counts(text@, byte as int, count as int),
+)]
+fn char_offset(text: &str, byte: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let bytes = text.as_bytes();
+    let mut count = 0;
+    let mut offset = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            walked(text@, chars@, bytes@, count as int, offset as int),
+            count > 0 ==> bytes_before(text@, count - 1) < byte,
+        decreases chars@.len() - count,
+    ))]
+    while offset < byte && offset < bytes.len() {
+        proof! {
+            lemma_next(text@, count as int);
+        }
+        offset += chars[count].len_utf8();
+        count += 1;
+    }
+    proof! {
+        lemma_next(text@, count as int);
+        lemma_counted(text@, byte as int, count as int);
+    }
+    count
+}
+
+/// The number of bytes of the first `count` characters of `text`, or of all of `text`.
+#[verus_spec(byte =>
+    ensures
+        count <= text@.len() ==> byte == bytes_before(text@, count as int),
+)]
+fn byte_offset(text: &str, count: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let mut byte = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            walked(text@, chars@, bytes@, index as int, byte as int),
+            index <= count,
+        decreases chars@.len() - index,
+    ))]
+    while index < count && byte < bytes.len() {
+        proof! {
+            lemma_next(text@, index as int);
+        }
+        byte += chars[index].len_utf8();
+        index += 1;
+    }
+    proof! {
+        lemma_next(text@, index as int);
+    }
+    byte
 }
 
 /// Segment A of the model input: the area and the habit lines, or `none` for each that is absent.
@@ -252,6 +421,103 @@ pub fn held_out(text: &str, holdout: f64) -> bool {
 
 verus! {
 
+broadcast use vstd::utf8::encode_utf8_push;
+
+/// The number of bytes of the first `count` characters of `text`.
+pub open spec fn bytes_before(text: Seq<char>, count: int) -> int {
+    vstd::utf8::encode_utf8(text.take(count)).len() as int
+}
+
+/// True when `chars` is a character offset of `text`, and it is the number of characters before
+/// `byte` when a character ends at `byte`.
+pub open spec fn counts(text: Seq<char>, byte: int, chars: int) -> bool {
+    &&& chars <= text.len()
+    &&& forall|count: int| 0 <= count <= text.len() && #[trigger] bytes_before(text, count) == byte
+        ==> chars == count
+}
+
+/// True when `file` is the byte span `span` of `text` in character offsets.
+pub open spec fn in_chars(text: Seq<char>, span: Span, file: SpanFile) -> bool {
+    &&& file.slot == span.slot
+    &&& counts(text, span.start as int, file.start as int)
+    &&& counts(text, span.end as int, file.end as int)
+}
+
+/// True when `span` is the character span `file` of `text` in byte offsets.
+pub open spec fn in_bytes(text: Seq<char>, file: SpanFile, span: Span) -> bool {
+    &&& span.slot == file.slot
+    &&& file.start <= text.len() ==> span.start == bytes_before(text, file.start as int)
+    &&& file.end <= text.len() ==> span.end == bytes_before(text, file.end as int)
+}
+
+/// The loop invariant of `char_offset` and `byte_offset`: `offset` is the number of bytes of the
+/// first `count` characters of `text`, and `chars` and `bytes` are the characters and the bytes
+/// of `text`.
+spec fn walked(text: Seq<char>, chars: Seq<char>, bytes: Seq<u8>, count: int, offset: int) -> bool {
+    &&& chars == text
+    &&& bytes == vstd::utf8::encode_utf8(text)
+    &&& 0 <= count <= text.len()
+    &&& offset == bytes_before(text, count)
+}
+
+/// Before the end of `text`, the character at `count` adds its UTF-8 length to `bytes_before`,
+/// and the sum is at most the length of `text`.
+proof fn lemma_next(text: Seq<char>, count: int)
+    requires
+        0 <= count <= text.len(),
+    ensures
+        count < text.len() <==> bytes_before(text, count) < vstd::utf8::encode_utf8(text).len(),
+        count < text.len() ==> bytes_before(text, count + 1) == bytes_before(text, count)
+            + vstd::utf8::encode_scalar(text[count] as u32).len(),
+        count < text.len() ==> bytes_before(text, count + 1) <= vstd::utf8::encode_utf8(text).len(),
+{
+    assert(text.take(text.len() as int) =~= text);
+    if count < text.len() {
+        assert(text.take(count + 1) =~= text.take(count).push(text[count]));
+        vstd::utf8::lemma_encode_utf8_len_strictly_monotonic(text, count, text.len() as int);
+        if count + 1 < text.len() {
+            vstd::utf8::lemma_encode_utf8_len_strictly_monotonic(text, count + 1, text.len() as int);
+        }
+    }
+}
+
+/// When the loop of `char_offset` stops at `count`, `count` is the number of characters before
+/// `byte` if a character ends there.
+proof fn lemma_counted(text: Seq<char>, byte: int, count: int)
+    requires
+        0 <= count <= text.len(),
+        count > 0 ==> bytes_before(text, count - 1) < byte,
+        bytes_before(text, count) >= byte || count == text.len(),
+    ensures
+        counts(text, byte, count),
+{
+    assert forall|other: int| 0 <= other <= text.len() && #[trigger] bytes_before(text, other) == byte
+        implies count == other by {
+        if other < count - 1 {
+            vstd::utf8::lemma_encode_utf8_len_strictly_monotonic(text, other, count - 1);
+        }
+        if count < other {
+            vstd::utf8::lemma_encode_utf8_len_strictly_monotonic(text, count, other);
+        }
+    }
+}
+
+/// The loop invariant of `to_chars`: `files` is the first `index` spans of `spans`.
+spec fn prefix_in_chars(text: Seq<char>, spans: Seq<Span>, files: Seq<SpanFile>, index: int) -> bool {
+    &&& 0 <= index <= spans.len()
+    &&& files.len() == index
+    &&& forall|done: int| #![trigger files[done]] 0 <= done < index
+        ==> in_chars(text, spans[done], files[done])
+}
+
+/// The loop invariant of `to_bytes`: `spans` is the first `index` spans of `files`.
+spec fn prefix_in_bytes(text: Seq<char>, files: Seq<SpanFile>, spans: Seq<Span>, index: int) -> bool {
+    &&& 0 <= index <= files.len()
+    &&& spans.len() == index
+    &&& forall|done: int| #![trigger spans[done]] 0 <= done < index
+        ==> in_bytes(text, files[done], spans[done])
+}
+
 /// The text of `area`, or `none`.
 pub open spec fn shown(area: Option<&str>) -> Seq<char> {
     match area {
@@ -288,6 +554,30 @@ pub open spec fn seeds(intents: Seq<Intent>) -> int
     decreases intents.len(),
 {
     if intents.len() == 0 { 0 } else { seeds(intents.drop_last()) + intents.last().examples@.len() }
+}
+
+/// The conversion from `Example` has no spec function. Only Verus has this trait.
+#[cfg(verus_only)]
+impl vstd::std_specs::convert::FromSpecImpl<Example> for ExampleFile {
+    open spec fn obeys_from_spec() -> bool {
+        false
+    }
+
+    open spec fn from_spec(example: Example) -> Self {
+        arbitrary()
+    }
+}
+
+/// The conversion from `ExampleFile` has no spec function. Only Verus has this trait.
+#[cfg(verus_only)]
+impl vstd::std_specs::convert::FromSpecImpl<ExampleFile> for Example {
+    open spec fn obeys_from_spec() -> bool {
+        false
+    }
+
+    open spec fn from_spec(file: ExampleFile) -> Self {
+        arbitrary()
+    }
 }
 
 } // verus!
@@ -366,6 +656,24 @@ mod tests {
         let json = serde_json::to_string(&set).expect("a training set is JSON");
         let read: TrainingSet = serde_json::from_str(&json).expect("the JSON is a training set");
         assert_eq!(read, set);
+    }
+
+    /// AC-3.3c-1.
+    #[test]
+    fn ac_3_3c_1_json_spans_are_character_offsets() {
+        let markup = intent::parse_example("set the [café](area) lights").expect("valid markup");
+        let example = Example {
+            context: context_text(None, &[]),
+            text: markup.text,
+            label: Label::Intent("lights_on".to_owned()),
+            spans: Some(markup.spans),
+        };
+        let json = serde_json::to_value(&example).expect("an example is JSON");
+        let span = serde_json::json!([{ "slot": "area", "start": 8, "end": 12 }]);
+        assert_eq!(json["spans"], span);
+        let read: Example = serde_json::from_value(json).expect("the JSON is an example");
+        let spans = read.spans.expect("the example has spans");
+        assert_eq!((spans[0].start, spans[0].end), (8, 13));
     }
 
     /// AC-3.3-8.
