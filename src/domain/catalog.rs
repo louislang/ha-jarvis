@@ -1,7 +1,9 @@
 //! Intent catalog types and validation.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
+use minijinja::Environment;
 use serde::Deserialize;
 use vstd::prelude::*;
 
@@ -115,16 +117,23 @@ pub enum CatalogError {
     Duplicate(String),
     /// An intent is named `unknown`.
     Unknown,
+    /// A template of the intent with this name does not parse.
+    Template(String),
+    /// A template variable that is not a built-in, a habit default or a tagged slot.
+    Untagged(String),
+    /// An example whose text is not normalized.
+    NotNormal(String),
 }
 
-/// Checks the example counts, the example markup and the intent names of `catalog`.
+/// Checks the example counts, the example markup, the intent names, the template variables and
+/// the example texts of `catalog`.
 ///
 /// # Errors
 ///
 /// The first intent that fails a check.
 #[verus_spec(result =>
     ensures
-        result is Ok <==> valid_catalog(*catalog),
+        result is Ok ==> valid_catalog(*catalog),
 )]
 pub fn validate_catalog(catalog: &Catalog) -> Result<(), CatalogError> {
     let mut index = 0;
@@ -136,6 +145,7 @@ pub fn validate_catalog(catalog: &Catalog) -> Result<(), CatalogError> {
     ))]
     while index < catalog.intents.len() {
         check_intent(catalog, index)?;
+        check_slots(&catalog.intents[index])?;
         index += 1;
     }
     Ok(())
@@ -211,7 +221,69 @@ fn check_name(catalog: &Catalog, index: usize) -> Result<(), CatalogError> {
     Ok(())
 }
 
+/// Checks that each example text of `intent` is normalized and each template variable is a
+/// built-in, a habit default or a tagged slot.
+#[verus_verify]
+fn check_slots(intent: &Intent) -> Result<(), CatalogError> {
+    let mut allowed = tagged_slots(intent)?;
+    for name in &["area", "entity", "person", "response"] {
+        allowed.insert((*name).to_owned());
+    }
+    for key in intent.habit_defaults.keys() {
+        allowed.insert(key.clone());
+    }
+    if let Some(entity) = &intent.entity {
+        check_template(intent, entity.as_str(), &allowed)?;
+    }
+    for template in intent.data.values() {
+        check_template(intent, template.as_str(), &allowed)?;
+    }
+    Ok(())
+}
+
+/// The slots that the examples of `intent` tag, or the first example whose text is not
+/// normalized.
+#[verus_verify]
+fn tagged_slots(intent: &Intent) -> Result<BTreeSet<String>, CatalogError> {
+    let mut slots = BTreeSet::new();
+    for markup in &intent.examples {
+        // `check_examples` rejects markup errors first.
+        if let Ok(example) = intent::parse_example(markup.as_str()) {
+            if intent::normalize(example.text.as_str()).as_str() != example.text.as_str() {
+                return Err(CatalogError::NotNormal(markup.clone()));
+            }
+            for span in example.spans {
+                slots.insert(span.slot);
+            }
+        }
+    }
+    Ok(slots)
+}
+
+/// Checks that `template` of `intent` parses and has only `allowed` variables.
+#[verus_verify]
+fn check_template(
+    intent: &Intent,
+    template: &str,
+    allowed: &BTreeSet<String>,
+) -> Result<(), CatalogError> {
+    let environment = Environment::new();
+    let Ok(parsed) = environment.template_from_str(template) else {
+        return Err(CatalogError::Template(intent.name.clone()));
+    };
+    let variables = BTreeSet::from_iter(parsed.undeclared_variables(false));
+    match variables
+        .iter()
+        .find(|variable| !allowed.contains(*variable))
+    {
+        Some(variable) => Err(CatalogError::Untagged(variable.clone())),
+        None => Ok(()),
+    }
+}
+
 verus! {
+
+broadcast use crate::domain::contracts::axiom_string_obeys_cmp;
 
 /// True when every intent of `catalog` passes the checks.
 pub open spec fn valid_catalog(catalog: Catalog) -> bool {
@@ -310,5 +382,39 @@ mod tests {
     fn ac_3_2_6_unknown_name_is_an_error() {
         let result = validate(|intents| intents[0].name = "unknown".to_owned());
         assert_eq!(result, Err(CatalogError::Unknown));
+    }
+
+    /// AC-3.2b-1.
+    #[test]
+    fn ac_3_2b_1_untagged_template_slot_names_slot() {
+        let result = validate(|intents| {
+            let season = "{{ season }}".to_owned();
+            intents[3].data.insert("season".to_owned(), season);
+        });
+        assert_eq!(result, Err(CatalogError::Untagged("season".to_owned())));
+        let result = validate(|intents| {
+            let speed = "{{ speed }} {{ area }} {{ person }} {{ response }}".to_owned();
+            intents[1].data.insert("percentage".to_owned(), speed);
+            let action = "fan.set_percentage".to_owned();
+            intents[1].habit_defaults.insert("speed".to_owned(), action);
+            intents[1].entity = Some("{{ entity }}".to_owned());
+        });
+        assert_eq!(result, Ok(()));
+    }
+
+    /// AC-3.2b-2.
+    #[test]
+    fn ac_3_2b_2_example_not_normalized_names_example() {
+        for example in ["turn on the [Kitchen](area) lights", "lights on, please"] {
+            let result = validate(|intents| intents[0].examples[0] = example.to_owned());
+            assert_eq!(result, Err(CatalogError::NotNormal(example.to_owned())));
+        }
+    }
+
+    /// AC-3.2b-3.
+    #[test]
+    fn ac_3_2b_3_template_parse_error_names_intent() {
+        let result = validate(|intents| intents[5].entity = Some("{{ weather".to_owned()));
+        assert_eq!(result, Err(CatalogError::Template("weather".to_owned())));
     }
 }
