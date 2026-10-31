@@ -240,7 +240,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 |---|---|---|---|
 | `CLAUDE.md` | — | Working rules for code changes. | — |
 | `docs/spec/*.md` | — | This specification. | — |
-| `docs/architecture.md` | — | The full architecture diagram. CI writes it on each commit to `main`. | 0.9 |
+| `docs/architecture.md` | — | The full architecture diagram. The pre-commit hook of the PR author writes it (sub-phase 0.11). | 0.9 |
 | `.gitignore` | — | Ignore `target/`, `models/`, `.venv/`, `jarvis.local.toml`, the data files, and the Python caches and coverage data (`__pycache__/`, `train/.coverage`). | 0.1 |
 | `rust-toolchain.toml` | — | The fixed Rust version and its components. The version is the one that the pinned Verus release requires (sub-phase 0.18). | 0.1 |
 | `Cargo.toml` | — | Workspace (`jarvis`, `xtask`), crates, lint levels and the Verus settings. | 0.1 |
@@ -251,11 +251,11 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `.github/workflows/ci.yml` | — | The required checks for each push and PR. | 0.1 |
 | `.github/pull_request_template.md` | — | The PR description template. | 0.5 |
 | `.github/actionlint.yaml` | — | The `actionlint` configuration: the label `gpu` of the self-hosted runner. | 0.13 |
-| `.github/workflows/architecture.yml` | — | Diagram regeneration on each commit to `main`. | 0.11 |
+| `.github/workflows/architecture.yml` | — | Obsolete. The fix PR of sub-phase 0.11 deletes this file and this row. | 0.11 |
 | `.github/workflows/release.yml` | — | Release binaries and the training image for each `v*` tag. | 0.14 |
 | `xtask/Cargo.toml` | Tools | The `xtask` crate. | 0.1 |
 | `xtask/src/main.rs` | Tools | Command line: `complexity`, `pr-size`, `rules`, `diagram`, `merge`, `guard-push`. | 0.1 |
-| `xtask/src/gates.rs` | Tools | `#[cfg(test)]` only. Gate tests (real tools on fixtures) and structure tests (hook, `justfile`, workflows, PR template, tool versions, the file list of this section, the Verus attributes and the trusted code of the domain). | 0.1 |
+| `xtask/src/gates.rs` | Tools | `#[cfg(test)]` only. Gate tests (real tools on fixtures) and structure tests (hook, `justfile`, workflows, PR template, tool versions, the file list of this section, the current diagram, the Verus attributes and the trusted code of the domain). | 0.1 |
 | `xtask/src/complexity.rs` | Tools | Reads `rust-code-analysis-cli` JSON and applies the limits. | 0.3 |
 | `xtask/src/pr_size.rs` | Tools | Counts the changed lines of a PR without the excluded files. | 0.6 |
 | `xtask/src/graph.rs` | Tools | Builds the module graph from the source with `syn`. | 0.7 |
