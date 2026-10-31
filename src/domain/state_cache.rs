@@ -6,6 +6,7 @@ use std::sync::Arc;
 use vstd::prelude::*;
 
 use crate::domain::state::Area;
+use crate::domain::state::AreaId;
 use crate::domain::state::Device;
 use crate::domain::state::Entity;
 use crate::domain::state::Event;
@@ -103,6 +104,66 @@ impl StateCache {
     pub fn state(&self, entity_id: &str) -> Option<&State> {
         self.states.get(entity_id).map(|state| &**state)
     }
+
+    /// The area whose name or alias is `text`, without case sensitivity.
+    #[verus_spec(area =>
+        ensures
+            match area {
+                Some(id) => exists|index: int| 0 <= index < self.areas@.len()
+                    && *id == #[trigger] self.areas@[index].area_id
+                    && named(self.areas@[index], crate::domain::contracts::lowercase(text@)),
+                None => forall|index: int| 0 <= index < self.areas@.len()
+                    ==> !named(#[trigger] self.areas@[index], crate::domain::contracts::lowercase(text@)),
+            },
+    )]
+    #[must_use]
+    pub fn area_by_name(&self, text: &str) -> Option<&AreaId> {
+        let lower = text.to_lowercase();
+        let mut index = 0;
+        #[cfg_attr(verus_only, verus_spec(
+            invariant
+                index <= self.areas@.len(),
+                lower@ == crate::domain::contracts::lowercase(text@),
+                forall|earlier: int| 0 <= earlier < index
+                    ==> !named(#[trigger] self.areas@[earlier], lower@),
+            decreases self.areas@.len() - index,
+        ))]
+        while index < self.areas.len() {
+            let area = &self.areas[index];
+            if has_name(area, &lower) {
+                return Some(&area.area_id);
+            }
+            index += 1;
+        }
+        None
+    }
+}
+
+/// True when the name or an alias of `area` is `lower` in lowercase.
+#[verus_spec(found =>
+    ensures
+        found == named(*area, lower@),
+)]
+fn has_name(area: &Area, lower: &str) -> bool {
+    if area.name.to_lowercase().as_str() == lower {
+        return true;
+    }
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= area.aliases@.len(),
+            crate::domain::contracts::lowercase(area.name@) != lower@,
+            forall|earlier: int| 0 <= earlier < index
+                ==> crate::domain::contracts::lowercase(#[trigger] area.aliases@[earlier]@) != lower@,
+        decreases area.aliases@.len() - index,
+    ))]
+    while index < area.aliases.len() {
+        if area.aliases[index].to_lowercase().as_str() == lower {
+            return true;
+        }
+        index += 1;
+    }
+    false
 }
 
 /// The devices by device ID.
@@ -170,6 +231,17 @@ pub open spec fn applied(before: StateCache, event: Event, cache: StateCache) ->
     }
 }
 
+/// True when the name or an alias of `area` is `lower` in lowercase.
+pub open spec fn named(area: Area, lower: Seq<char>) -> bool {
+    crate::domain::contracts::lowercase(area.name@) == lower || aliased(area.aliases@, lower)
+}
+
+/// True when an alias in `aliases` is `lower` in lowercase.
+pub open spec fn aliased(aliases: Seq<String>, lower: Seq<char>) -> bool {
+    exists|index: int| 0 <= index < aliases.len()
+        && crate::domain::contracts::lowercase(#[trigger] aliases[index]@) == lower
+}
+
 /// Unwrapping after an insert is an insert of the unwrapped state.
 pub proof fn lemma_unwrapped_insert(
     states: Map<Arc<str>, Arc<State>>,
@@ -183,3 +255,116 @@ pub proof fn lemma_unwrapped_insert(
 }
 
 } // verus!
+
+/// Tests of the hot cache.
+#[cfg(test)]
+mod tests {
+    use jiff::SignedDuration;
+
+    use super::*;
+    use crate::domain::state::Context;
+    use crate::testing::fakes::house;
+
+    /// The entity that the cache tests change.
+    const KITCHEN: &str = "light.kitchen";
+
+    /// The state of `light.kitchen` in `snapshot`.
+    fn kitchen(snapshot: &Snapshot) -> State {
+        snapshot
+            .states
+            .iter()
+            .find(|state| state.entity_id == KITCHEN)
+            .cloned()
+            .expect("the house has light.kitchen")
+    }
+
+    /// `state` with the value `value`, `seconds` after its last change.
+    fn changed(state: &State, value: &str, seconds: i64) -> State {
+        State {
+            state: value.to_owned(),
+            last_updated: state.last_updated + SignedDuration::from_secs(seconds),
+            ..state.clone()
+        }
+    }
+
+    /// A change of `light.kitchen` to `new`.
+    fn kitchen_changed(new: Option<State>) -> Event {
+        Event::StateChanged {
+            entity_id: KITCHEN.to_owned(),
+            old: None,
+            new: new.map(Box::new),
+            context: Context {
+                id: "change".to_owned(),
+                user_id: None,
+                parent_id: None,
+            },
+        }
+    }
+
+    /// AC-2.7-1.
+    #[test]
+    fn ac_2_7_1_load_gives_snapshot_state() {
+        let house = house();
+        let kitchen = kitchen(&house);
+        assert_eq!(StateCache::load(house).state(KITCHEN), Some(&kitchen));
+    }
+
+    /// AC-2.7-2.
+    #[test]
+    fn ac_2_7_2_apply_sets_new_state() {
+        let house = house();
+        let new = changed(&kitchen(&house), "off", 1);
+        let cache = StateCache::load(house).apply(kitchen_changed(Some(new.clone())));
+        assert_eq!(cache.state(KITCHEN), Some(&new));
+    }
+
+    /// AC-2.7-3.
+    #[test]
+    fn ac_2_7_3_apply_without_new_state_removes() {
+        let cache = StateCache::load(house()).apply(kitchen_changed(None));
+        assert_eq!(cache.state(KITCHEN), None);
+    }
+
+    /// AC-2.7-4.
+    #[test]
+    fn ac_2_7_4_apply_keeps_other_entities() {
+        let house = house();
+        let new = changed(&kitchen(&house), "off", 1);
+        let before = StateCache::load(house);
+        for event in [kitchen_changed(Some(new)), kitchen_changed(None)] {
+            let mut after = before.clone().apply(event).states;
+            let mut expected = before.states.clone();
+            after.remove(KITCHEN);
+            expected.remove(KITCHEN);
+            assert_eq!(after, expected);
+        }
+    }
+
+    /// AC-2.7-5.
+    #[test]
+    fn ac_2_7_5_load_replaces_all_states() {
+        let first = house();
+        let new = changed(&kitchen(&first), "off", 1);
+        let second = Snapshot {
+            states: vec![new.clone()],
+            ..first.clone()
+        };
+        let mut cache = StateCache::load(first.clone());
+        assert_eq!(cache.state(KITCHEN), Some(&kitchen(&first)));
+        cache = StateCache::load(second);
+        for state in &first.states {
+            assert_ne!(cache.state(&state.entity_id), Some(state));
+        }
+        assert_eq!(cache.state(KITCHEN), Some(&new));
+    }
+
+    /// AC-2.7-6.
+    #[test]
+    fn ac_2_7_6_apply_keeps_newer_cached_state() {
+        let house = house();
+        let cached = kitchen(&house);
+        let older = changed(&cached, "off", -1);
+        let cache = StateCache::load(house).apply(kitchen_changed(Some(older)));
+        assert_eq!(cache.state(KITCHEN), Some(&cached));
+    }
+}
