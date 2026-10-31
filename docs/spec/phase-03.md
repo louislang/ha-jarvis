@@ -105,7 +105,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 **Proofs.**
 
-- P-3.2b-1 to P-3.2b-3. Ensures: `validate_catalog` returns `Ok` if and only if checks 1 to 5 pass and every template parses. Argument: the function runs the checks in sequence and returns the first `Err`. Each check is a `for` loop over a finite list.
+- P-3.2b-1 to P-3.2b-3. Evidence: test. Verus keeps the clause of P-3.2 for checks 1 to 3. The `ensures` of `parse_example` (P-3.1b-1) does not state the text or the slot names of an example, so a Verus clause cannot connect checks 4 and 5 to the markup.
 
 ---
 
