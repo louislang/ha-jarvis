@@ -315,7 +315,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - **Implements:** G20. **Depends on:** 0.8.
 - **Files:** create `xtask/src/mermaid.rs`, `docs/architecture.md`. Modify `xtask/src/main.rs`, `justfile`.
 
-**Model.** `render(graph) -> String`: `flowchart LR`, one `subgraph` per layer, one node per module. The node ID is the path with `::` replaced by `_`. The label is the last segment. One arrow for each distinct `(from, to)` with `test = false`. Nodes and arrows are sorted. `docs/architecture.md` has a title, one line that says CI generates it, and the Mermaid block. `just diagram` writes it.
+**Model.** `render(graph) -> String`: `flowchart LR`, one `subgraph` per layer, one node per module. The node ID is the path with `::` replaced by `_`. The label is the last segment. One arrow for each distinct `(from, to)` with `test = false`. Nodes and arrows are sorted. `docs/architecture.md` has a title, one line that says the pre-commit hook writes it, and the Mermaid block. `just diagram` writes it.
 
 **Acceptance criteria.**
 
@@ -324,7 +324,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - AC-0.9-3: When an edge has `test = true`, the output has no arrow for it.
 - AC-0.9-4: When the graph has modules in four layers, the output has four subgraphs.
 - AC-0.9-5: When a module path is `crate::domain::intent`, its node ID is `crate_domain_intent`.
-- AC-0.9-6: When `just diagram` runs on the repository, it writes `docs/architecture.md` with the title, the CI line and one Mermaid block. A PR does not update this file. CI writes it on `main` (sub-phase 0.11).
+- AC-0.9-6: When `just diagram` runs on the repository, it writes `docs/architecture.md` with the title, the hook line and one Mermaid block.
 
 **Proofs.**
 
@@ -369,24 +369,28 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 
 ---
 
-### 0.11 Diagram on `main`
+### 0.11 Diagram in Each PR
 
-**Goal:** Add the workflow that writes the full diagram to `docs/architecture.md` on each commit to `main`.
+**Goal:** Keep `docs/architecture.md` current in each PR. The pre-commit hook writes the full diagram, and `rust-test` fails when the committed file is stale.
 
-- **Implements:** G20. **Depends on:** 0.10.
-- **Files:** create `.github/workflows/architecture.yml`. Modify `xtask/src/gates.rs`.
+- **Implements:** G20, G22. **Depends on:** 0.10.
+- **Files:** modify `justfile`, `docs/architecture.md`, `xtask/src/gates.rs`.
 
-**Model.** Trigger: `push` to `main`. Permission: `contents: write`. The workflow has `concurrency: architecture` with `cancel-in-progress: false`, so two runs never push at the same time. The job runs `just diagram`. If `docs/architecture.md` changed, it commits only that file with the message `Update the architecture diagram` and the body `CI regenerated docs/architecture.md from main.`, and pushes with `GITHUB_TOKEN`. A push made with `GITHUB_TOKEN` does not start new workflow runs.
+**Model.**
+
+- `check` runs `diagram` after `architecture`. `just diagram` writes `docs/architecture.md` from the source of the commit.
+- When `just diagram` changes the file, `pre-commit` fails the hook, because the hook changed a file. The author adds the file and commits again. Thus each PR commits its own diagram.
+- A structure test in `xtask/src/gates.rs` compares `docs/architecture.md` with `mermaid::document` of the graph of the repository. Thus `rust-test` fails in CI when a commit has a stale diagram.
+- CI makes no commits. Only `just merge` changes `main`.
 
 **Acceptance criteria.**
 
-- AC-0.11-1: When `architecture.yml` is parsed, it runs on `push` to `main` only, has `contents: write` and the concurrency group `architecture`, runs `just diagram`, and commits only `docs/architecture.md`.
-- AC-0.11-2: When the workflow step script runs on a clean working tree, it makes no commit.
+- AC-0.11-3: When the `justfile` is dumped, `check` runs `diagram` after `architecture`. This replaces AC-0.11-1.
+- AC-0.11-4: When `docs/architecture.md` of the repository is read, it equals `mermaid::document` of the graph of the repository. This replaces AC-0.11-2.
 
 **Proofs.**
 
-- P-0.11-2. Requires: `render` depends only on `src/` (P-0.9-1). Ensures: the workflow commits at most once for each push to `main`. Argument: the commit step is guarded by `git diff --quiet docs/architecture.md`. The CI commit does not start a new run, a rerun on the same source renders the same file, and the concurrency group runs one workflow at a time.
-- P-0.11-1. Evidence: test.
+- P-0.11-3, P-0.11-4. Evidence: test.
 
 ---
 
@@ -537,7 +541,7 @@ Each build makes `jarvis-<tag>-<target>.tar.gz` with the binary and its shared l
 
 ### 0.17 Pre-Push Guard
 
-**Goal:** Add the pre-push guard, which refuses a push to `main` from a local repository. Only `just merge` and the CI diagram commit change `main`.
+**Goal:** Add the pre-push guard, which refuses a push to `main` from a local repository. Only `just merge` changes `main`.
 
 - **Implements:** G17, G22. **Depends on:** 0.16.
 - **Files:** modify `xtask/src/merge.rs`, `xtask/src/main.rs`, `justfile`, `xtask/src/gates.rs`.

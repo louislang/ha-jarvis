@@ -185,7 +185,7 @@ Every test gives the same result on every run with the same code.
 1. Each commit passes the pre-commit hook. The pre-push hook refuses a push to `main`.
 2. Each merged layer is one squash commit on `main`. Its message is the PR title, a blank line and the PR summary.
 3. No "Co-Authored-By" line. No AI attribution.
-4. The only commits that CI makes are diagram updates on `main` (sub-phase 0.11).
+4. CI makes no commits. Each PR commits its own `docs/architecture.md` (sub-phase 0.11).
 
 ### 7.3 Required Checks
 
@@ -207,3 +207,5 @@ CI runs each check as a separate job. "Push" is a push to `main`. `just merge` r
 | `gpu-test` | `just gpu-test` on the self-hosted GPU runner | Push, PR | On the GPU host only (`JARVIS_DEVICE=cuda`) |
 | `pr-size` | `xtask pr-size --base origin/<base branch> --limit 400` | PR | No (needs the PR base) |
 | `diagram` | `xtask diagram --base origin/<base branch>`, posted on the PR | PR | No (needs the PR base) |
+
+`check` also runs `just diagram`, which writes `docs/architecture.md`. A structure test in `rust-test` fails when the committed file is stale (sub-phase 0.11).
