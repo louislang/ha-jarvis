@@ -2,6 +2,8 @@
 
 use std::mem;
 
+use serde::Deserialize;
+use serde::Serialize;
 use vstd::prelude::*;
 
 /// A seed example without its slot markup.
@@ -15,8 +17,7 @@ pub struct Example {
 }
 
 /// One slot value in the text of an example.
-#[verus_verify]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Span {
     /// The slot name.
     pub slot: String,
