@@ -5,6 +5,7 @@ The pre-commit hook writes this file from the module graph.
 ```mermaid
 flowchart LR
     subgraph adapters
+        crate_adapters_files[files]
         crate_adapters_ha[ha]
         crate_adapters_onnx[onnx]
     end
@@ -34,6 +35,8 @@ flowchart LR
     crate --> crate_domain_catalog
     crate --> crate_domain_state
     crate --> crate_domain_training
+    crate_adapters_files --> crate_adapters_files
+    crate_adapters_files --> crate_ports
     crate_adapters_ha --> crate
     crate_adapters_ha --> crate_adapters_ha
     crate_adapters_ha --> crate_domain_state
