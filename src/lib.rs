@@ -25,6 +25,7 @@ pub mod domain {
     #[cfg(verus_only)]
     pub mod contracts;
     pub mod intent;
+    pub mod model;
     pub mod state;
     pub mod state_cache;
     pub mod training;
