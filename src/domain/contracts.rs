@@ -8,6 +8,11 @@ use jiff::Timestamp;
 use serde_json::Map;
 use serde_json::Value;
 
+use crate::domain::catalog::Catalog;
+use crate::domain::catalog::Filter;
+use crate::domain::catalog::Intent;
+use crate::domain::catalog::Kind;
+use crate::domain::catalog::Target;
 use crate::domain::state::Area;
 use crate::domain::state::AreaId;
 use crate::domain::state::Context;
@@ -85,6 +90,29 @@ pub struct ExEntityId(EntityId);
 #[verifier::external_type_specification]
 #[verifier::external_body]
 pub struct ExHomeConfig(HomeConfig);
+
+/// The intent catalog of `intents.toml`.
+#[verifier::external_type_specification]
+pub struct ExCatalog(Catalog);
+
+/// One action that Jarvis can take.
+#[verifier::external_type_specification]
+pub struct ExIntent(Intent);
+
+/// How Jarvis replies to an intent and acts on it.
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExKind(Kind);
+
+/// The entities that the service of an intent gets.
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExTarget(Target);
+
+/// An entity filter of `select`.
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExFilter(Filter);
 
 /// The number of nanoseconds from the Unix epoch to `timestamp`.
 pub uninterp spec fn nanosecond(timestamp: Timestamp) -> i128;

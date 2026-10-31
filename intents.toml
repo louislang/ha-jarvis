@@ -1,0 +1,51 @@
+min_examples = 3
+unknown_examples = ["what is the meaning of life", "tell me about rome", "how far away is the moon", "write a poem about cats", "who won the game last night"]
+
+[[intent]]
+name = "lights_on"
+kind = "command"
+examples = ["turn on the lights", "turn on the [kitchen](area) lights", "lights on", "switch the lights on in the [living room](area)", "can you turn the [office](area) lights on"]
+service = "homeassistant.turn_on"
+target = "entities"
+select = [{ domain = "light" }, { domain = "switch", name = "light" }]
+
+[[intent]]
+name = "fan_on"
+kind = "command"
+examples = ["turn on the fan", "turn on the [office](area) fan", "fan on please", "start the fan"]
+service = "homeassistant.turn_on"
+target = "entity"
+select = [{ domain = "fan" }, { domain = "switch", name = "fan" }]
+
+[[intent]]
+name = "climate_down"
+kind = "command"
+examples = ["turn the air down", "turn the ac down", "make it cooler", "lower the temperature"]
+service = "climate.set_temperature"
+target = "entity"
+select = [{ domain = "climate" }]
+data = { temperature = "{{ entity.attributes.temperature - 2 }}" }
+
+[[intent]]
+name = "tv_show"
+kind = "command"
+examples = ["put the tv on [the office](show)", "play [bluey](show) on the tv", "turn the tv to [jeopardy](show)"]
+service = "media_player.play_media"
+target = "entity"
+select = [{ domain = "media_player", name = "tv" }]
+data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "shuffle": 1}' }
+
+[[intent]]
+name = "temperature_query"
+kind = "query"
+examples = ["what is the temperature", "what is the temperature in the [bedroom](area)", "how warm is it in here"]
+select = [{ domain = "sensor", device_class = "temperature" }]
+
+[[intent]]
+name = "weather"
+kind = "fetch"
+examples = ["what is the weather like", "will it rain today", "what is the forecast"]
+service = "weather.get_forecasts"
+target = "entity"
+entity = "weather.home"
+data = { type = "daily" }
