@@ -23,6 +23,8 @@ jobs:
         with:
           just-version: "1.59.0"
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: "false"
       - run: just diagram
       - run: |
           if git diff --quiet docs/architecture.md; then
