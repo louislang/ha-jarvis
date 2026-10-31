@@ -215,9 +215,9 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Goal:** Add `jarvis dataset <config> <out> [--house <snapshot.json>]`, which writes the training set from the current data. The fixture model and debugging now have one command that produces the contract file.
 
 - **Implements:** G3. **Depends on:** 3.3c.
-- **Files:** modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
+- **Files:** modify `src/lib.rs`, `src/main.rs`, `jarvis.toml`, `Cargo.toml`.
 
-**Model.** `clap` parses the command line of `jarvis`. The command reads the configuration file `<config>` (`[train]`: `base_model`, `epochs`, `batch_size`) and the catalog file that its key `intents` names. This sub-phase adds `intents`. With `--house`, the areas come from that snapshot. Without it, the area list is empty. It writes the result of `seed_set` as JSON, without the held-out examples. Thus the fixture model never trains on a held-out seed, and the first comparison in sub-phase 13.9 is fair. The RNG has the fixed seed 1, so two runs give the same file.
+**Model.** `clap` parses the command line of `jarvis`. The command reads the configuration file `<config>` (`[train]`: `base_model`, `epochs`, `batch_size`) and the catalog file that its key `intents` names. This sub-phase adds `intents`. With `--house`, the areas come from that snapshot. Without it, the area list is empty. It writes the result of `seed_set` as JSON, without the held-out examples. Thus the fixture model never trains on a held-out seed, and the first comparison in sub-phase 13.9 is fair. The RNG has the fixed seed 1, so two runs give the same file. `jarvis::main` returns an `ExitCode`, and `src/main.rs` returns it, so a failed command exits with a failure code.
 
 **Acceptance criteria.**
 
