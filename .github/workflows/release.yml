@@ -26,13 +26,24 @@ jobs:
       ARCHIVE: jarvis-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
     steps:
       - uses: actions/checkout@v7
+      # Until 6.2, the Linux archive holds the ONNX Runtime libraries, which `jarvis` loads from its own folder.
       - run: cargo build --release --target ${{ matrix.target }}
-      - run: tar -czf "$ARCHIVE" -C target/${{ matrix.target }}/release jarvis
+        env:
+          RUSTFLAGS: ${{ runner.os == 'Linux' && '-C link-arg=-Wl,-rpath,$ORIGIN' || '' }}
+      - run: |
+          shopt -s nullglob
+          cd target/${{ matrix.target }}/release
+          tar -czhf "$GITHUB_WORKSPACE/$ARCHIVE" jarvis libonnxruntime*.so*
       - run: |
           mkdir verify
           tar -xzf "$ARCHIVE" -C verify
           cd verify
           file jarvis | grep -E 'ELF 64-bit LSB .*executable, x86-64|Mach-O 64-bit executable x86_64'
+          if [ "$RUNNER_OS" = Linux ]; then
+            test -f libonnxruntime_providers_cuda.so
+            libraries=$(ldd ./jarvis)
+            if grep 'not found' <<< "$libraries"; then exit 1; fi
+          fi
           ./jarvis
       - uses: actions/upload-artifact@v7
         with:
