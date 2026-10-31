@@ -392,4 +392,16 @@ pub fn ex_xxh3_64(input: &[u8]) -> (hash: u64)
     xxhash_rust::xxh3::xxh3_64(input)
 }
 
+/// True when `power` is a value that `f32::exp` can give for `exponent`.
+pub uninterp spec fn exp_ensures(exponent: f32, power: f32) -> bool;
+
+/// Gives `e^exponent`, with a precision that can change between calls. <https://doc.rust-lang.org/std/primitive.f32.html#method.exp>
+#[verifier::external_fn_specification]
+pub fn ex_f32_exp(exponent: f32) -> (power: f32)
+    ensures
+        exp_ensures(exponent, power),
+{
+    exponent.exp()
+}
+
 } // verus!
