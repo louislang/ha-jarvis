@@ -135,9 +135,9 @@ install-verus:
     rm "$folder.zip"
     rustup toolchain install "$("$folder/verus" --version | sed -n 's/^ *Toolchain: \([^ ]*\).*/\1/p')"
 
-# Valgrind does not run on macOS.
+# Valgrind does not run on macOS. The self-hosted runner has no sudo, so an installed pinned version skips apt.
 install-valgrind:
-    {{ if os() == "linux" { "sudo apt-get update && sudo apt-get install --yes valgrind=" + valgrind_version } else { "" } }}
+    {{ if os() == "linux" { "dpkg-query --show --showformat='${Version}' valgrind 2>/dev/null | grep --quiet --line-regexp --fixed-strings " + valgrind_version + " || (sudo apt-get update && sudo apt-get install --yes valgrind=" + valgrind_version + ")" } else { "" } }}
 
 install-gungraun-runner:
     cargo install gungraun-runner --version {{ gungraun_runner_version }} --locked
