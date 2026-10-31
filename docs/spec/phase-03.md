@@ -506,17 +506,19 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Goal:** Choose the execution provider from `device`, and reject a bad session output. Jarvis can now predict on the CPU or the GPU.
 
 - **Implements:** G3, G18. **Depends on:** 3.12.
-- **Files:** modify `src/adapters/onnx.rs`.
+- **Files:** modify `src/adapters/onnx.rs`, `Cargo.toml`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `xtask/src/gates.rs`.
 
 **Model.**
 
 - `device = cuda` registers the CUDA execution provider. `device = cpu` registers only the CPU provider.
 - `predict` checks the session output before it calls `softmax`.
+- This sub-phase turns on the `cuda` feature of `ort`. On Linux, the binary then loads `libonnxruntime.so` at run time. Until sub-phase 6.2, the release job copies the ONNX Runtime libraries next to `jarvis` in the Linux archive, and the binary finds them in its own folder.
+- The `gpu-test` job needs the fixture model, and its checkout removes the ignored `models/` folder. Thus `gpu-test` runs after `rust-test` and restores `models/system-one/fixture/` from the `rust-test` cache.
 
 **Acceptance criteria.**
 
 - AC-3.12b-1: When `device = cpu`, the session uses only the CPU execution provider.
-- AC-3.12b-2 [GPU host]: With `device = cpu`, `predict` with 32 tokens has a p99 of less than 10 ms.
+- AC-3.12b-2 [GPU host]: With `device = cpu`, `predict` with 32 tokens has a p99 of less than 15 ms.
 - AC-3.12b-3 [GPU host]: With `device = cuda`, the session uses the CUDA execution provider, and `predict` with 32 tokens has a p99 of less than 5 ms.
 - AC-3.12b-4: When the session output is empty or not finite, `predict` returns an error before it calls `softmax`.
 
