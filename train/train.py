@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -250,6 +251,8 @@ def train(
     training_set: TrainingSet, device: str, max_vram_gb: float | None
 ) -> JointModel:
     """Fine-tune the base model on `training_set` with AdamW on `device`."""
+    # Deterministic cuBLAS matrix products need a fixed workspace before CUDA starts.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     limit_vram(device, max_vram_gb)
     torch.manual_seed(0)
     torch.use_deterministic_algorithms(mode=True)
