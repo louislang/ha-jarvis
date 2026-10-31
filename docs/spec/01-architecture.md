@@ -241,7 +241,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `CLAUDE.md` | — | Working rules for code changes. | — |
 | `docs/spec/*.md` | — | This specification. | — |
 | `docs/architecture.md` | — | The full architecture diagram. CI writes it on each commit to `main`. | 0.9 |
-| `.gitignore` | — | Ignore `target/`, `models/`, `.venv/`, `jarvis.local.toml` and the data files. | 0.1 |
+| `.gitignore` | — | Ignore `target/`, `models/`, `.venv/`, `jarvis.local.toml`, the data files, and the Python caches and coverage data (`__pycache__/`, `train/.coverage`). | 0.1 |
 | `rust-toolchain.toml` | — | The fixed Rust version and its components. The version is the one that the pinned Verus release requires (sub-phase 0.18). | 0.1 |
 | `Cargo.toml` | — | Workspace (`jarvis`, `xtask`), crates, lint levels and the Verus settings. | 0.1 |
 | `Cargo.lock` | — | Locked crate versions. | 0.1 |
