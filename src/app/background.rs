@@ -7,7 +7,7 @@ use arc_swap::ArcSwap;
 use futures::StreamExt;
 
 use crate::domain::state::Event;
-use crate::domain::state::StateCache;
+use crate::domain::state_cache::StateCache;
 use crate::ports::Home;
 
 /// Keeps `cache` equal to the states and the registries of `home` until the event stream ends.

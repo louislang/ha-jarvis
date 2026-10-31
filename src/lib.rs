@@ -17,6 +17,7 @@ pub mod domain {
     pub mod contracts;
     pub mod intent;
     pub mod state;
+    pub mod state_cache;
 }
 
 pub mod ports;

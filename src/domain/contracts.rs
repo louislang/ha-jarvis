@@ -23,7 +23,7 @@ use crate::domain::state::Event;
 use crate::domain::state::HomeConfig;
 use crate::domain::state::Snapshot;
 use crate::domain::state::State;
-use crate::domain::state::StateCache;
+use crate::domain::state_cache::StateCache;
 use vstd::prelude::*;
 
 verus! {
