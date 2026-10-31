@@ -88,7 +88,10 @@ NOT_LIGHTS: list[Example] = [
 TEN = LIGHTS + UNKNOWN + NOT_LIGHTS
 
 PASSES = 2
-"""The epochs of the set of `set_path`, which has 3 batches of at most 4."""
+"""The epochs of the set of `set_path`."""
+
+BATCHES = 3
+"""The batches of at most 4 in the set of `set_path`."""
 
 SPECIAL_TOKENS = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
 
@@ -168,7 +171,7 @@ def exported(
 
 def test_ac_3_5_1_parse_args_returns_values() -> None:
     """The three options give their values."""
-    assert parse_args(REQUIRED) == Args(Path("a.json"), Path("m"), "cpu", None)
+    assert parse_args(REQUIRED) == Args(Path("a.json"), Path("m"), "cpu", None, None)
 
 
 def test_ac_3_5_2_parse_args_rejects_gpu() -> None:
@@ -180,7 +183,7 @@ def test_ac_3_5_2_parse_args_rejects_gpu() -> None:
 def test_ac_3_5_9_parse_args_reads_max_vram() -> None:
     """`--max-vram-gb` gives its number, and its absence gives `None`."""
     args = parse_args([*REQUIRED, "--max-vram-gb", "1.0"])
-    assert args == Args(Path("a.json"), Path("m"), "cpu", 1.0)
+    assert args == Args(Path("a.json"), Path("m"), "cpu", 1.0, None)
     assert parse_args(REQUIRED).max_vram_gb is None
 
 
@@ -330,10 +333,8 @@ def test_ac_3_8_3_labels_file_keeps_set_order(
     assert content == {"labels": training_set["labels"], "tags": training_set["tags"]}
 
 
-def test_ac_3_8_4_two_epochs_run_two_passes(
-    set_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With 2 epochs, the loop gives the loss of each of the 3 batches twice."""
+def record_batches(monkeypatch: pytest.MonkeyPatch) -> list[Batch]:
+    """Make `train` record each batch that it gives to `loss`, and give the list."""
     batches: list[Batch] = []
 
     def counted(
@@ -344,5 +345,33 @@ def test_ac_3_8_4_two_epochs_run_two_passes(
         return loss(intent_logits, slot_logits, batch)
 
     monkeypatch.setattr("train.loss", counted)
+    return batches
+
+
+def test_ac_3_8_4_two_epochs_run_two_passes(
+    set_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With 2 epochs, the loop gives the loss of each of the 3 batches twice."""
+    batches = record_batches(monkeypatch)
     train(load_set(set_path), "cpu", None)
-    assert len(batches) == PASSES * 3
+    assert len(batches) == PASSES * BATCHES
+
+
+def test_epochs_option_replaces_set_epochs(
+    set_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With `--epochs 1`, a set with 2 epochs gives the loss of each batch once."""
+    batches = record_batches(monkeypatch)
+    main(
+        [
+            "--data",
+            str(set_path),
+            "--out",
+            str(tmp_path),
+            "--device",
+            "cpu",
+            "--epochs",
+            "1",
+        ]
+    )
+    assert len(batches) == BATCHES
