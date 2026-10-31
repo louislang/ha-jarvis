@@ -11,6 +11,8 @@ use jiff::Timestamp;
 use minijinja::Environment;
 use minijinja::Error;
 use minijinja::Template;
+use minijinja::UndefinedBehavior;
+use minijinja::value::Serde;
 use rand::Rng;
 use rand::TryRng;
 use rand::rngs::StdRng;
@@ -116,12 +118,10 @@ pub struct ExIntent(Intent);
 
 /// How Jarvis replies to an intent and acts on it.
 #[verifier::external_type_specification]
-#[verifier::external_body]
 pub struct ExKind(Kind);
 
 /// The entities that the service of an intent gets.
 #[verifier::external_type_specification]
-#[verifier::external_body]
 pub struct ExTarget(Target);
 
 /// An entity filter of `select`.
@@ -190,6 +190,42 @@ pub fn ex_template_undeclared_variables<'env, 'source>(
     nested: bool,
 ) -> std::collections::hash_set::HashSet<String> {
     template.undeclared_variables(nested)
+}
+
+/// How a template handles undefined values. <https://docs.rs/minijinja/3/minijinja/enum.UndefinedBehavior.html>
+#[verifier::external_type_specification]
+pub struct ExUndefinedBehavior(UndefinedBehavior);
+
+/// A value that converts to a template value through Serde. <https://docs.rs/minijinja/3/minijinja/value/struct.Serde.html>
+#[verifier::external_type_specification]
+#[verifier::reject_recursive_types(T)]
+pub struct ExSerde<T>(Serde<T>);
+
+/// A template value. <https://docs.rs/minijinja/3/minijinja/value/struct.Value.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExTemplateValue(minijinja::Value);
+
+/// Sets how templates handle undefined values. <https://docs.rs/minijinja/3/minijinja/struct.Environment.html#method.set_undefined_behavior>
+#[verifier::external_fn_specification]
+pub fn ex_environment_set_undefined_behavior<'source>(environment: &mut Environment<'source>, behavior: UndefinedBehavior) {
+    environment.set_undefined_behavior(behavior)
+}
+
+/// Turns debug mode on or off. <https://docs.rs/minijinja/3/minijinja/struct.Environment.html#method.set_debug>
+#[verifier::external_fn_specification]
+pub fn ex_environment_set_debug<'source>(environment: &mut Environment<'source>, enabled: bool) {
+    environment.set_debug(enabled)
+}
+
+/// Compiles and renders `source` with `context`. <https://docs.rs/minijinja/3/minijinja/struct.Environment.html#method.render_str>
+#[verifier::external_fn_specification]
+pub fn ex_environment_render_str<'source, Context: Into<minijinja::Value>>(
+    environment: &Environment<'source>,
+    source: &str,
+    context: Context,
+) -> Result<String, Error> {
+    environment.render_str(source, context)
 }
 
 /// The number of nanoseconds from the Unix epoch to `timestamp`.

@@ -262,7 +262,7 @@ fn check_normal(intent: &Intent) -> Result<(), CatalogError> {
 
 /// Adds the slots that the examples of `intent` tag to `slots`.
 #[verus_verify]
-fn insert_slots(intent: &Intent, slots: &mut BTreeSet<String>) {
+pub fn insert_slots(intent: &Intent, slots: &mut BTreeSet<String>) {
     for markup in &intent.examples {
         if let Ok(example) = intent::parse_example(markup.as_str()) {
             for span in example.spans {
@@ -279,17 +279,32 @@ fn check_template(
     template: &str,
     allowed: &BTreeSet<String>,
 ) -> Result<(), CatalogError> {
+    match unknown_variable(template, allowed) {
+        Err(_) => Err(CatalogError::Template(intent.name.clone())),
+        Ok(Some(variable)) => Err(CatalogError::Untagged(variable)),
+        Ok(None) => Ok(()),
+    }
+}
+
+/// The first variable of `template` in sorted order that is not in `allowed`.
+///
+/// # Errors
+///
+/// `template` does not parse.
+#[verus_verify]
+pub fn unknown_variable(
+    template: &str,
+    allowed: &BTreeSet<String>,
+) -> Result<Option<String>, minijinja::Error> {
     let environment = Environment::new();
-    let Ok(parsed) = environment.template_from_str(template) else {
-        return Err(CatalogError::Template(intent.name.clone()));
-    };
+    let parsed = environment.template_from_str(template)?;
     let variables = BTreeSet::from_iter(parsed.undeclared_variables(false));
     match variables
         .iter()
         .find(|variable| !allowed.contains(*variable))
     {
-        Some(variable) => Err(CatalogError::Untagged(variable.clone())),
-        None => Ok(()),
+        Some(variable) => Ok(Some(variable.clone())),
+        None => Ok(None),
     }
 }
 
