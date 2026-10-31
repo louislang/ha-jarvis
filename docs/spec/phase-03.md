@@ -403,35 +403,73 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 ---
 
-### 3.11 Model Output Functions
+### 3.11 Softmax
 
-**Goal:** Add the pure functions that turn model outputs into a prediction: softmax, BIO decoding and ranking. The ONNX adapter stays thin, and the logic is testable without a model.
+**Goal:** Add `softmax`, the first pure function that turns model outputs into a prediction. The ONNX adapter stays thin, and the logic is testable without a model.
 
 - **Implements:** G3. **Depends on:** 3.10.
 - **Files:** create `src/domain/model.rs`. Modify `src/lib.rs`.
 
-**Model.**
-
-- `softmax(logits) -> Vec<f32>` (subtracts the maximum first).
-- `decode_bio(text, offsets, tag_ids, tags) -> Vec<Slot>`: `B-x` starts a span of slot `x`. `I-x` continues a span of `x`, or starts one when the previous tag is not `B-x` or `I-x`. `O` ends a span. The value is `text[start of first token .. end of last token]`.
-- `ranked(labels, probabilities) -> Vec<(String, f32)>`: sorted by probability, highest first. Equal values keep label order.
-- `Prediction { ranked, slots }`.
+**Model.** `softmax(logits) -> Vec<f32>` subtracts the maximum first. The maximum starts from the first logit, because Verus does not support `f32::NEG_INFINITY`. With no logits, the result is empty.
 
 **Acceptance criteria.**
 
-- AC-3.11-1: When `softmax` runs on one or more finite logits, every value is in `[0, 1]` and the sum is within 0.0001 of 1. The ONNX adapter returns an error for an empty or non-finite output before it calls `softmax`.
+- AC-3.11-1: When `softmax` runs on one or more finite logits, every value is in `[0, 1]` and the sum is within 0.0001 of 1.
 - AC-3.11-2: When the logits are `[1000, 0]`, `softmax` returns finite values.
-- AC-3.11-3: When the tags are `B-area I-area O` over "living room lights", `decode_bio` returns `area = living room`.
-- AC-3.11-4: When `I-area` follows `O`, `decode_bio` starts a new span.
-- AC-3.11-5: When `ranked` runs, each probability is greater than or equal to the next one.
-- AC-3.11-6: When two labels have the same probability, `ranked` keeps their label order.
 
 **Proofs.**
 
 - P-3.11-1 (AC-3.11-1). Claim (real numbers): `softmax(x)_i = e^(x_i - m) / Σ_j e^(x_j - m)` is in `(0, 1]` and sums to 1. Argument: each term is positive, and the denominator is the sum of the numerators. Floating-point rounding gives the 0.0001 margin.
-- P-3.11-2 (AC-3.11-2). Ensures: for finite logits, every output value is finite. Argument: after subtracting `m = max(x)`, every exponent is `<= 0`, so every `e^(x_i - m)` is in `(0, 1]`, and the largest is exactly 1. There is no overflow, and the denominator is at least 1.
-- P-3.11-3, P-3.11-4. Ensures: each slot is a maximal run of tokens that starts with `B-x`, or with `I-x` after a tag of another slot or `O`, and continues with `I-x`. Argument: `decode_bio` is one pass with a state "open span of slot `x` or none". Each tag maps to exactly one transition, as listed in the model. `I-x` with state none, or with another slot, takes the "start" transition.
-- P-3.11-5, P-3.11-6 (AC-3.11-5, AC-3.11-6). Ensures: the probabilities are non-increasing, and equal probabilities keep the label order. Argument: `ranked` uses a stable sort with a descending comparison. A sort gives a non-increasing order, and a stable sort keeps the input order of equal keys.
+- P-3.11-2 (AC-3.11-2). Ensures: the result is the expression that the code computes: `m` is the maximum that the code's comparisons find, each power is `exp(x_i - m)`, the sum adds the powers from the left, and each value is its power divided by the sum (rule 5.1.9). The test is the evidence that the values are finite. Argument: after subtracting `m`, every exponent is `<= 0`, so every power is in `(0, 1]`, and the largest is exactly 1. There is no overflow, and the denominator is at least 1.
+
+---
+
+### 3.11b BIO Decoding
+
+**Goal:** Add `decode_bio`, which turns the slot tags of the model into slot values.
+
+- **Implements:** G3. **Depends on:** 3.11.
+- **Files:** modify `src/domain/model.rs`.
+
+**Model.**
+
+- `decode_bio(text, offsets, tag_ids, tags) -> Result<Vec<Slot>>`: `offsets` are the byte `(start, end)` pairs of the segment B tokens, and `tag_ids` are their tag indexes. `B-x` starts a span of slot `x`. `I-x` continues a span of `x`, or starts one when the previous tag is not `B-x` or `I-x`. `O` ends a span. The value is `text[start of first token .. end of last token]`.
+- `decode_bio` returns an error when `offsets` and `tag_ids` have different lengths, when a tag ID is not an index of `tags`, or when a span is not a valid character range of `text`. The adapter (sub-phase 3.12) returns that error from `predict`.
+
+**Acceptance criteria.**
+
+- AC-3.11b-1: When the tags are `B-area I-area O` over "living room lights", `decode_bio` returns `area = living room`.
+- AC-3.11b-2: When `I-area` follows `O`, `decode_bio` starts a new span.
+- AC-3.11b-3: When `offsets` and `tag_ids` have different lengths, when a tag ID is not in `tags`, or when a span is not a valid character range of `text`, `decode_bio` returns an error.
+
+**Proofs.**
+
+- P-3.11b-1, P-3.11b-2. Ensures: each slot is a maximal run of tokens that starts with `B-x`, or with `I-x` after a tag of another slot or `O`, and continues with `I-x`. Argument: `decode_bio` is one pass with a state "open span of slot `x` or none". Each tag maps to exactly one transition, as listed in the model. `I-x` with state none, or with another slot, takes the "start" transition.
+- P-3.11b-3 (AC-3.11b-3). Ensures: `Ok` only when the lengths are equal, every tag ID is an index of `tags` and every span is a valid character range of `text`. Argument: the function checks the lengths first, and each step checks the tag ID and the span before it reads them.
+
+---
+
+### 3.11c Ranking
+
+**Goal:** Add `ranked` and `Prediction`. The model outputs now give a ranked list of labels with their slots.
+
+- **Implements:** G3. **Depends on:** 3.11b.
+- **Files:** modify `src/domain/model.rs`.
+
+**Model.**
+
+- `ranked(labels, probabilities) -> Vec<(String, f32)>`: sorted by probability, highest first. Equal values keep label order.
+- `Prediction { ranked, slots }`.
+- `ranked` uses `slice::sort_by` with `f32::total_cmp`. `src/domain/contracts.rs` has a contract for `sort_by` that requires a total-order comparator and ensures a sorted, stable result, and an axiom that `total_cmp` is a total order (IEEE totalOrder), as their documentation states.
+
+**Acceptance criteria.**
+
+- AC-3.11c-1: When `ranked` runs, each probability is greater than or equal to the next one.
+- AC-3.11c-2: When two labels have the same probability, `ranked` keeps their label order.
+
+**Proofs.**
+
+- P-3.11c-1, P-3.11c-2 (AC-3.11c-1, AC-3.11c-2). Ensures: the probabilities are non-increasing, and equal probabilities keep the label order. Argument: `ranked` uses a stable sort with a descending comparison. A sort gives a non-increasing order, and a stable sort keeps the input order of equal keys.
 
 ---
 
@@ -439,13 +477,13 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 **Goal:** Add the `Classifier` and `ModelLoader` ports and their ONNX Runtime adapter with the tokenizer. Jarvis can now load a model folder and predict on the CPU or the GPU.
 
-- **Implements:** G3, G18. **Depends on:** 3.11.
+- **Implements:** G3, G18. **Depends on:** 3.11c.
 - **Files:** create `src/adapters/onnx.rs`. Modify `src/ports.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `Cargo.toml`.
 
 **Model.**
 
 - `Classifier::predict(context, text) -> Result<Prediction>`. `ModelLoader::load(dir, device) -> Result<Arc<dyn Classifier>>`.
-- `OnnxClassifier` tokenizes `(context, text)` as a pair, runs the session, then calls `softmax`, `ranked` and `decode_bio` (sub-phase 3.11).
+- `OnnxClassifier` tokenizes `(context, text)` as a pair, runs the session, then calls `softmax`, `ranked` and `decode_bio` (sub-phases 3.11 to 3.11c).
 - `device = cuda` registers the CUDA execution provider. `device = cpu` registers only the CPU provider. Until sub-phase 6.2, `ort` uses the ONNX Runtime binaries that its build downloads.
 - `FakeClassifier` returns scripted predictions and records each `(context, text)`. `FakeModelLoader` returns scripted classifiers.
 
@@ -462,9 +500,10 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - AC-3.12-9 [GPU host]: With `device = cuda`, the session uses the CUDA execution provider, and `predict` with 32 tokens has a p99 of less than 5 ms.
 - AC-3.12-10: When `labels.json` has a duplicate label or tag, `load` returns an error that names it.
 - AC-3.12-11: When the input has more tokens than the tokenizer maximum length, `predict` truncates the text and returns a prediction.
+- AC-3.12-12: When the session output is empty or not finite, `predict` returns an error before it calls `softmax`.
 
 **Proofs.**
 
 - P-3.12-1 to P-3.12-4, P-3.12-7 to P-3.12-9. Evidence: test.
 - P-3.12-5, P-3.12-6, P-3.12-10. Argument: `load` checks that `labels.json` exists, that its labels and tags are unique, and that their counts equal the last dimensions of `intent_logits` and `slot_logits`, before it returns `Ok`.
-- P-3.12-11. Evidence: test.
+- P-3.12-11, P-3.12-12. Evidence: test.
