@@ -6,3 +6,6 @@ url = "ws://homeassistant.local:8123/api/websocket"
 token_env = "HA_TOKEN"
 request_timeout_ms = 5000
 ping_interval_s = 30
+
+[train]
+holdout = 0.1

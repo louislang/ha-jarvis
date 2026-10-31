@@ -1,6 +1,7 @@
 //! Trusted Verus contracts and axioms for the `std` and domain crate functions that the domain calls.
 
 use std::borrow::Borrow;
+use std::convert::Infallible;
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -8,6 +9,9 @@ use jiff::Timestamp;
 use minijinja::Environment;
 use minijinja::Error;
 use minijinja::Template;
+use rand::Rng;
+use rand::TryRng;
+use rand::rngs::StdRng;
 use serde_json::Map;
 use serde_json::Value;
 
@@ -311,5 +315,51 @@ pub broadcast axiom fn axiom_ascii_alphabetic(c: char)
     ensures
         c <= '\x7f' ==> (#[trigger] alphabetic(c) <==> ('A' <= c && c <= 'Z') || ('a' <= c && c <= 'z')),
 ;
+
+/// The standard RNG. <https://docs.rs/rand/0.10/rand/rngs/struct.StdRng.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExStdRng(StdRng);
+
+/// An error value. <https://doc.rust-lang.org/std/error/trait.Error.html>
+#[verifier::external_trait_specification]
+pub trait ExStdError: std::fmt::Debug + std::fmt::Display {
+    /// The trait that this specification is for.
+    type ExternalTraitSpecificationFor: std::error::Error;
+}
+
+/// A random number generator that can fail. <https://docs.rs/rand_core/0.10/rand_core/trait.TryRng.html>
+#[verifier::external_trait_specification]
+pub trait ExTryRng {
+    /// The trait that this specification is for.
+    type ExternalTraitSpecificationFor: TryRng;
+
+    /// The type of a generator error.
+    type Error: std::error::Error;
+}
+
+/// The value that `next_u32` gives in the state `rng`.
+pub uninterp spec fn next<Random: ?Sized>(rng: &Random) -> u32;
+
+/// Gives the next random `u32`. A seeded RNG gives the same sequence. <https://docs.rs/rand_core/0.10/rand_core/trait.SeedableRng.html>
+#[verifier::external_fn_specification]
+pub fn ex_rng_next_u32<Random: TryRng<Error = Infallible> + ?Sized>(rng: &mut Random) -> (value: u32)
+    ensures
+        value == next(&*old(rng)),
+{
+    rng.next_u32()
+}
+
+/// The XXH3 64-bit hash of `bytes` with the default seed.
+pub uninterp spec fn xxh3(bytes: Seq<u8>) -> u64;
+
+/// Gives the XXH3 64-bit hash of `input`. <https://docs.rs/xxhash-rust/0.8/xxhash_rust/xxh3/fn.xxh3_64.html>
+#[verifier::external_fn_specification]
+pub fn ex_xxh3_64(input: &[u8]) -> (hash: u64)
+    ensures
+        hash == xxh3(input@),
+{
+    xxhash_rust::xxh3::xxh3_64(input)
+}
 
 } // verus!
