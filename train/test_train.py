@@ -3,11 +3,20 @@
 
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+import onnxruntime
 import pytest
 import torch
 from torch.nn import functional
-from transformers import AutoConfig, BertModel, PreTrainedModel
+from transformers import (
+    AutoConfig,
+    BertModel,
+    BertTokenizerFast,
+    PretrainedConfig,
+    PreTrainedModel,
+    PreTrainedTokenizerFast,
+)
 
 from train import (
     IGNORE,
@@ -17,10 +26,17 @@ from train import (
     JointModel,
     Span,
     align,
+    export,
     load_set,
+    load_tokenizer,
     loss,
+    main,
     parse_args,
+    train,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 REQUIRED = ["--data", "a.json", "--out", "m", "--device", "cpu"]
 
@@ -45,6 +61,37 @@ OFFSETS = [
 SEGMENT_IDS = [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1]
 LIVING_ROOM: list[Span] = [{"slot": "area", "start": 12, "end": 23}]
 
+INPUTS = ["input_ids", "attention_mask", "token_type_ids"]
+
+OFFICE = "area: office | habits: none"
+
+LIGHTS: list[Example] = [
+    {
+        "context": f"area: {area} | habits: none",
+        "text": f"turn on the {area} lights",
+        "intent": "lights_on",
+        "spans": [{"slot": "area", "start": 12, "end": 12 + len(area)}],
+    }
+    for area in ["kitchen", "office", "bedroom", "living room"]
+]
+
+UNKNOWN: list[Example] = [
+    {"context": OFFICE, "text": text, "intent": "unknown", "spans": None}
+    for text in ["what time is it", "tell me a joke", "hello there"]
+]
+
+NOT_LIGHTS: list[Example] = [
+    {"context": OFFICE, "text": text, "not": "lights_on", "spans": []}
+    for text in ["turn on the fan", "play some music", "open the garage"]
+]
+
+TEN = LIGHTS + UNKNOWN + NOT_LIGHTS
+
+PASSES = 2
+"""The epochs of the set of `set_path`, which has 3 batches of at most 4."""
+
+SPECIAL_TOKENS = ["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]"]
+
 torch.manual_seed(0)
 torch.use_deterministic_algorithms(mode=True)
 
@@ -66,6 +113,57 @@ def write_set(tmp_path: Path, examples: list[Example]) -> Path:
     path = tmp_path / "set.json"
     path.write_text(json.dumps(training_set(examples)), encoding="utf-8")
     return path
+
+
+def tiny_config(vocab_size: int) -> PretrainedConfig:
+    """Give the configuration of a BERT with one small layer."""
+    config: PretrainedConfig = AutoConfig.for_model(
+        "bert",
+        vocab_size=vocab_size,
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        intermediate_size=8,
+    )
+    return config
+
+
+@pytest.fixture(scope="module")
+def set_path(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Write a random tiny BERT, a WordPiece tokenizer of `TEN` and a set of `TEN`."""
+    folder = tmp_path_factory.mktemp("base")
+    (folder / "vocab.txt").write_text("\n".join(SPECIAL_TOKENS), encoding="utf-8")
+    empty: PreTrainedTokenizerFast = BertTokenizerFast.from_pretrained(folder)
+    # `train_new_from_iterator` has no type hints.
+    retrain: Callable[[list[str], int], PreTrainedTokenizerFast] = (
+        empty.train_new_from_iterator
+    )
+    tokenizer = retrain([f"{e['context']} {e['text']}" for e in TEN], 1000)
+    tokenizer.save_pretrained(folder)
+    # The base class gives the typed constructor that `BertModel` lacks.
+    encoder: type[PreTrainedModel] = BertModel
+    encoder(tiny_config(len(tokenizer))).save_pretrained(folder)
+    path = folder / "set.json"
+    content = training_set(TEN) | {
+        "base_model": str(folder),
+        "epochs": PASSES,
+        "batch_size": 4,
+    }
+    path.write_text(json.dumps(content), encoding="utf-8")
+    return path
+
+
+@pytest.fixture(scope="module")
+def exported(
+    set_path: Path, tmp_path_factory: pytest.TempPathFactory
+) -> tuple[JointModel, PreTrainedTokenizerFast, Path]:
+    """Train on the set of `set_path`, export it and give the model folder."""
+    training_set = load_set(set_path)
+    model = train(training_set, "cpu", None)
+    tokenizer = load_tokenizer(training_set["base_model"])
+    out = tmp_path_factory.mktemp("model")
+    export(model, tokenizer, training_set, out)
+    return model, tokenizer, out
 
 
 def test_ac_3_5_1_parse_args_returns_values() -> None:
@@ -160,17 +258,8 @@ def intent_loss(logit: float, *, negated: bool) -> float:
 
 def test_ac_3_7_1_model_gives_head_shapes() -> None:
     """A batch of 2 gives logits for 5 labels and for 7 tags on each token."""
-    config = AutoConfig.for_model(
-        "bert",
-        vocab_size=16,
-        hidden_size=8,
-        num_hidden_layers=1,
-        num_attention_heads=1,
-        intermediate_size=8,
-    )
-    # The base class gives the typed constructor that `BertModel` lacks.
     encoder: type[PreTrainedModel] = BertModel
-    model = JointModel(encoder(config), 5, 7)
+    model = JointModel(encoder(tiny_config(16)), 5, 7)
     input_ids = torch.randint(16, (2, 4))
     intent_logits, slot_logits = model(
         input_ids, torch.ones_like(input_ids), torch.zeros_like(input_ids)
@@ -201,3 +290,59 @@ def test_ac_3_7_3_ignored_tags_add_no_slot_loss() -> None:
 def test_ac_3_7_4_intent_loss_falls_as_probability_rises() -> None:
     """A higher `p(k)` gives a lower loss for an example with `intent = k`."""
     assert intent_loss(1.0, negated=False) < intent_loss(-1.0, negated=False)
+
+
+def test_ac_3_8_1_main_writes_model_folder(set_path: Path, tmp_path: Path) -> None:
+    """A CPU run of the script writes exactly the three model files."""
+    main(["--data", str(set_path), "--out", str(tmp_path), "--device", "cpu"])
+    names = sorted(path.name for path in tmp_path.iterdir())
+    assert names == ["labels.json", "model.onnx", "tokenizer.json"]
+
+
+def test_ac_3_8_2_onnx_matches_torch(
+    exported: tuple[JointModel, PreTrainedTokenizerFast, Path],
+) -> None:
+    """ONNX Runtime and PyTorch give the same logits within 0.0001."""
+    model, tokenizer, out = exported
+    # A pair longer than the export sample also checks the dynamic sequence axis.
+    encoding = tokenizer(
+        ["area: kitchen | habits: none"] * 2,
+        ["turn on the kitchen lights now", "hi"],
+        padding=True,
+        return_tensors="np",
+    )
+    session = onnxruntime.InferenceSession(out / "model.onnx")
+    actual = session.run(None, {name: encoding[name] for name in INPUTS})
+    with torch.no_grad():
+        expected = model(*(torch.from_numpy(encoding[name]) for name in INPUTS))
+    for onnx_logits, torch_logits in zip(actual, expected, strict=True):
+        torch.testing.assert_close(
+            torch.from_numpy(onnx_logits), torch_logits, atol=1e-4, rtol=0
+        )
+
+
+def test_ac_3_8_3_labels_file_keeps_set_order(
+    set_path: Path, exported: tuple[JointModel, PreTrainedTokenizerFast, Path]
+) -> None:
+    """`labels.json` has the labels and the tags of the set, in order."""
+    training_set = load_set(set_path)
+    content = json.loads((exported[2] / "labels.json").read_text(encoding="utf-8"))
+    assert content == {"labels": training_set["labels"], "tags": training_set["tags"]}
+
+
+def test_ac_3_8_4_two_epochs_run_two_passes(
+    set_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With 2 epochs, the loop gives the loss of each of the 3 batches twice."""
+    batches: list[Batch] = []
+
+    def counted(
+        intent_logits: torch.Tensor, slot_logits: torch.Tensor, batch: Batch
+    ) -> torch.Tensor:
+        """Record `batch` and give its loss."""
+        batches.append(batch)
+        return loss(intent_logits, slot_logits, batch)
+
+    monkeypatch.setattr("train.loss", counted)
+    train(load_set(set_path), "cpu", None)
+    assert len(batches) == PASSES * 3
