@@ -145,6 +145,8 @@ jobs:
   gpu-test:
     # The repository is public: a fork pull request must not run code on the GPU host.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    # The fixture model comes from the cache that `rust-test` writes.
+    needs: rust-test
     runs-on: [self-hosted, linux, gpu]
     steps:
       - uses: actions/checkout@v7
@@ -154,6 +156,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: "false"
+      - run: mkdir -p target/fixture && cargo run --release -- dataset jarvis.toml target/fixture/train.json --house src/testing/house.json
+      - uses: actions/cache/restore@v6
+        with:
+          path: models/system-one/fixture
+          key: fixture-model-${{ hashFiles('target/fixture/train.json', 'train/**') }}
+          fail-on-cache-miss: true
       - run: sudo systemctl stop jarvis
       - run: just gpu-test
       - if: always()

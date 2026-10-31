@@ -7,8 +7,11 @@ use std::sync::Mutex;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use ort::execution_providers::CPUExecutionProvider;
+use ort::execution_providers::CUDAExecutionProvider;
 use ort::session::Session;
 use ort::session::SessionOutputs;
+use ort::session::builder::SessionBuilder;
 use ort::value::Tensor;
 use serde::Deserialize;
 use tokenizers::Encoding;
@@ -25,9 +28,10 @@ pub struct OnnxLoader;
 
 #[async_trait]
 impl ModelLoader for OnnxLoader {
-    async fn load(&self, dir: &Path, _device: Device) -> anyhow::Result<Arc<dyn Classifier>> {
+    async fn load(&self, dir: &Path, device: Device) -> anyhow::Result<Arc<dyn Classifier>> {
         let dir = dir.to_owned();
-        let model = tokio::task::spawn_blocking(move || Model::open(&dir)).await??;
+        let model =
+            tokio::task::spawn_blocking(move || Model::open(&dir, builder(device)?)).await??;
         Ok(Arc::new(OnnxClassifier(Arc::new(model))))
     }
 }
@@ -64,17 +68,17 @@ struct Model {
 }
 
 impl Model {
-    /// Opens the model folder `dir`.
+    /// Opens the model folder `dir` with the session options of `builder`.
     ///
     /// # Errors
     ///
     /// A file cannot be read or parsed.
-    fn open(dir: &Path) -> anyhow::Result<Self> {
+    fn open(dir: &Path, builder: SessionBuilder) -> anyhow::Result<Self> {
         let path = dir.join("labels.json");
         let text =
             fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
         let labels: Labels = serde_json::from_str(&text)?;
-        let session = Session::builder()?.commit_from_file(dir.join("model.onnx"))?;
+        let session = builder.commit_from_file(dir.join("model.onnx"))?;
         let tokenizer =
             Tokenizer::from_file(dir.join("tokenizer.json")).map_err(anyhow::Error::from_boxed)?;
         Ok(Self {
@@ -116,7 +120,7 @@ impl Model {
     ///
     /// # Errors
     ///
-    /// `decode_bio` fails.
+    /// The logits are empty or not finite, or `decode_bio` fails.
     fn prediction(
         &self,
         encoding: &Encoding,
@@ -124,6 +128,10 @@ impl Model {
         intent_logits: &[f32],
         slot_logits: &[f32],
     ) -> anyhow::Result<Prediction> {
+        anyhow::ensure!(
+            valid(intent_logits) && valid(slot_logits),
+            "the session output is empty or not finite"
+        );
         let ranked = model::ranked(&self.labels.labels, &model::softmax(intent_logits));
         let tokens = encoding
             .get_sequence_ids()
@@ -142,6 +150,24 @@ impl Model {
             .map_err(|error| anyhow::anyhow!("cannot decode the slots: {error:?}"))?;
         Ok(Prediction { ranked, slots })
     }
+}
+
+/// A session builder that registers the execution provider of `device`.
+///
+/// # Errors
+///
+/// ONNX Runtime cannot register the provider.
+fn builder(device: Device) -> ort::Result<SessionBuilder> {
+    let provider = match device {
+        Device::Cuda => CUDAExecutionProvider::default().build(),
+        Device::Cpu => CPUExecutionProvider::default().build(),
+    };
+    Session::builder()?.with_execution_providers([provider.error_on_failure()])
+}
+
+/// Whether `logits` is not empty and has only finite values.
+fn valid(logits: &[f32]) -> bool {
+    !logits.is_empty() && logits.iter().all(|logit| logit.is_finite())
 }
 
 /// The input tensor of shape `[1, n]` with the `n` token values `values`.
@@ -181,12 +207,69 @@ fn top(logits: &[f32]) -> usize {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+    use std::time::Instant;
+
     use crate::domain::model::Slot;
     use crate::domain::training::Example;
     use crate::domain::training::Label;
 
     /// The fixture model folder.
     const FIXTURE: &str = "models/system-one/fixture";
+
+    /// A context that gives 32 tokens with `TEXT`.
+    const CONTEXT: &str = "area: kitchen | habits: none";
+
+    /// A text that gives 32 tokens with `CONTEXT`.
+    const TEXT: &str = "turn on the lights in the kitchen and the living room and set the brightness to fifty percent in the office now";
+
+    /// Serializes the latency tests, so that one test does not slow the other.
+    static LATENCY: Mutex<()> = Mutex::new(());
+
+    /// The fixture model on `device`.
+    fn fixture(device: Device) -> anyhow::Result<Model> {
+        Model::open(Path::new(FIXTURE), builder(device)?)
+    }
+
+    /// The encoding of `CONTEXT` and `TEXT` by the tokenizer of `model`.
+    fn encoding(model: &Model) -> anyhow::Result<Encoding> {
+        let encoding = model.tokenizer.encode((CONTEXT, TEXT), true);
+        encoding.map_err(anyhow::Error::from_boxed)
+    }
+
+    /// The execution providers of the nodes that one prediction on `device` runs.
+    fn providers(device: Device) -> anyhow::Result<BTreeSet<String>> {
+        let folder = tempfile::tempdir()?;
+        let builder = builder(device)?.with_profiling(folder.path().join("profile"))?;
+        let mut model = Model::open(Path::new(FIXTURE), builder)?;
+        model.predict(CONTEXT, TEXT)?;
+        let session = model.session.get_mut().expect("no run panicked");
+        let profile = fs::read_to_string(session.end_profiling()?)?;
+        let events: Vec<serde_json::Value> = serde_json::from_str(&profile)?;
+        let providers = events
+            .iter()
+            .filter_map(|event| event["args"]["provider"].as_str());
+        Ok(providers.map(str::to_owned).collect())
+    }
+
+    /// The p99 time of `predict` on `device` with 32 tokens, after a warm-up.
+    fn p99(device: Device) -> anyhow::Result<Duration> {
+        let _only = LATENCY.lock().expect("no latency test panicked");
+        let model = fixture(device)?;
+        assert_eq!(encoding(&model)?.len(), 32, "token count of the input");
+        for _ in 0..100 {
+            model.predict(CONTEXT, TEXT)?;
+        }
+        let mut times = Vec::new();
+        for _ in 0..1000 {
+            let start = Instant::now();
+            model.predict(CONTEXT, TEXT)?;
+            times.push(start.elapsed());
+        }
+        times.sort_unstable();
+        Ok(times[989])
+    }
 
     /// Each seed example that is not held out, with its prediction by the fixture model.
     async fn predictions() -> anyhow::Result<Vec<(Example, Prediction)>> {
@@ -270,6 +353,60 @@ mod tests {
         classifier
             .predict("area: none | habits: none", text.trim_end())
             .await?;
+        Ok(())
+    }
+
+    /// AC-3.12b-1.
+    #[test]
+    fn ac_3_12b_1_cpu_uses_only_the_cpu_provider() -> anyhow::Result<()> {
+        let expected = BTreeSet::from(["CPUExecutionProvider".to_owned()]);
+        assert_eq!(providers(Device::Cpu)?, expected);
+        Ok(())
+    }
+
+    /// AC-3.12b-2.
+    #[test]
+    #[ignore = "GPU host"]
+    fn ac_3_12b_2_cpu_p99_is_less_than_10_ms() -> anyhow::Result<()> {
+        let p99 = p99(Device::Cpu)?;
+        assert!(p99 < Duration::from_millis(10), "CPU p99 is {p99:?}");
+        Ok(())
+    }
+
+    /// AC-3.12b-3.
+    #[test]
+    #[ignore = "GPU host"]
+    fn ac_3_12b_3_cuda_uses_cuda_and_p99_is_less_than_5_ms() -> anyhow::Result<()> {
+        let providers = providers(Device::Cuda)?;
+        assert!(
+            providers.contains("CUDAExecutionProvider"),
+            "providers are {providers:?}"
+        );
+        let p99 = p99(Device::Cuda)?;
+        assert!(p99 < Duration::from_millis(5), "CUDA p99 is {p99:?}");
+        Ok(())
+    }
+
+    /// AC-3.12b-4.
+    #[test]
+    fn ac_3_12b_4_bad_output_is_an_error() -> anyhow::Result<()> {
+        let model = fixture(Device::Cpu)?;
+        let encoding = encoding(&model)?;
+        let intent = vec![0.0; model.labels.labels.len()];
+        let slots = vec![0.0; encoding.len() * model.labels.tags.len()];
+        let bad = [
+            vec![],
+            vec![f32::NAN; slots.len()],
+            vec![f32::INFINITY; slots.len()],
+        ];
+        for logits in &bad {
+            for (intent, slots) in [(logits, &slots), (&intent, logits)] {
+                let error = model.prediction(&encoding, TEXT, intent, slots);
+                let error = error.err().map(|error| error.to_string());
+                let expected = "the session output is empty or not finite";
+                assert_eq!(error.as_deref(), Some(expected), "{intent:?} and {slots:?}");
+            }
+        }
         Ok(())
     }
 }
