@@ -46,7 +46,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 **Proofs.**
 
-- P-3.1b-1, P-3.1b-2 (AC-3.1b-1, AC-3.1b-2). Ensures: for each span, `text[start..end] == value`, and the spans are ordered and do not overlap. Argument: the parser copies characters to `text` from left to right. When it reads a slot, it records `start = len(text)`, copies `value`, and records `end = len(text)`. Offsets only grow, so spans are ordered and disjoint.
+- P-3.1b-1, P-3.1b-2 (AC-3.1b-1, AC-3.1b-2). Ensures: each span is inside the bytes of `text`, and the spans are ordered and do not overlap. Argument: the parser copies characters to `text` from left to right. When it reads a slot, it records `start = len(text)`, copies `value`, and records `end = len(text)`. Offsets only grow, so spans are ordered and disjoint. The tests are the evidence for `text[start..end] == value`.
 - P-3.1b-3, P-3.1b-4 (AC-3.1b-3, AC-3.1b-4). Ensures: a `[` without a closing `](slot)`, or an empty slot name, gives `Err`. Argument: the parser is a small state machine (`Text`, `Value`, `Close`, `Slot`). At the end of input, any state other than `Text` is an error. An empty slot name is rejected when `Slot` ends.
 
 ---
