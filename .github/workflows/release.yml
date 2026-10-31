@@ -51,3 +51,25 @@ jobs:
       - env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" jarvis-*.tar.gz --repo "$GITHUB_REPOSITORY"
+
+  train-image:
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/jarvis-train:${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build -t "$IMAGE" train
+      - run: |
+          installed=$(docker run --rm "$IMAGE" pip list --format=freeze)
+          dev=$(sed -n '/^dev = \[/,/^\]/s/^ *"\(.*\)==.*/\1/p' train/pyproject.toml)
+          test -n "$dev"
+          if cut -d= -f1 <<< "$installed" | grep -ixF "$dev"; then exit 1; fi
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+      - run: docker push "$IMAGE"
+      - run: docker manifest inspect "$IMAGE"
