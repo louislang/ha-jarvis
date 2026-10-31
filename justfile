@@ -98,7 +98,7 @@ fixture-model:
     cargo run --release --quiet -- dataset jarvis.toml target/fixture/train.json --house src/testing/house.json
     stamp=models/system-one/fixture/inputs.sha256
     if hash=$({{ just_executable() }} fixture-stale "$stamp"); then
-        {{ venv }}/python train/train.py --data target/fixture/train.json --out models/system-one/fixture --device cpu
+        {{ venv }}/python train/train.py --data target/fixture/train.json --out models/system-one/fixture --device cpu --epochs 20
         echo "$hash" > "$stamp"
     fi
 
