@@ -1,4 +1,6 @@
-//! Softmax and BIO decoding of model outputs.
+//! Softmax, BIO decoding and ranking of model outputs.
+
+use std::cmp::Ordering;
 
 use vstd::prelude::*;
 
@@ -35,6 +37,16 @@ pub enum BioError {
         /// The byte offset after the span.
         end: usize,
     },
+}
+
+/// The ranked labels and the slots of a transcript.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Prediction {
+    /// Each label with its probability, highest first.
+    pub ranked: Vec<(String, f32)>,
+    /// The slot values.
+    pub slots: Vec<Slot>,
 }
 
 /// The probabilities of `logits`: `e^(x - max) / sum` for each logit `x`.
@@ -286,6 +298,42 @@ fn values(text: &str, spans: &[Span]) -> Result<Vec<Slot>, BioError> {
     Ok(slots)
 }
 
+/// Each of `labels` with its probability, highest first, with equal probabilities in label order.
+#[verus_spec(pairs =>
+    ensures
+        crate::domain::contracts::sorted_stable(zipped(labels@, probabilities@), pairs@, by_probability()),
+)]
+#[must_use]
+pub fn ranked(labels: &[String], probabilities: &[f32]) -> Vec<(String, f32)> {
+    let mut pairs = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            zipping(labels@, probabilities@, index as int, pairs@),
+        decreases labels@.len() - index,
+    ))]
+    while index < labels.len() && index < probabilities.len() {
+        pairs.push((labels[index].clone(), probabilities[index]));
+        index += 1;
+    }
+    proof! {
+        assert(pairs@ =~= zipped(labels@, probabilities@));
+        crate::domain::contracts::axiom_total_order_is_total();
+        assert(crate::domain::contracts::total(by_probability()));
+    }
+    pairs.sort_by(descending);
+    pairs
+}
+
+/// The order of `left` and `right` by probability, highest first, in IEEE 754 totalOrder.
+#[verus_spec(ordering =>
+    ensures
+        ordering == by_probability()(*left, *right),
+)]
+fn descending(left: &(String, f32), right: &(String, f32)) -> Ordering {
+    right.1.total_cmp(&left.1)
+}
+
 verus! {
 
 broadcast use {
@@ -477,6 +525,24 @@ pub open spec fn softmaxed(logits: Seq<f32>, values: Seq<f32>) -> bool {
     exists|max: f32, powers: Seq<f32>, sum: f32| #[trigger] softmax_of(logits, max, powers, sum, values)
 }
 
+/// Each label of `labels` with the probability of `probabilities` at the same index.
+pub open spec fn zipped(labels: Seq<String>, probabilities: Seq<f32>) -> Seq<(String, f32)> {
+    Seq::new(vstd::math::min(labels.len() as int, probabilities.len() as int) as nat, |index: int| (labels[index], probabilities[index]))
+}
+
+/// The loop invariant of `ranked`: `pairs` holds the first `index` pairs of `labels` and
+/// `probabilities`.
+spec fn zipping(labels: Seq<String>, probabilities: Seq<f32>, index: int, pairs: Seq<(String, f32)>) -> bool {
+    &&& 0 <= index <= labels.len()
+    &&& index <= probabilities.len()
+    &&& pairs =~= zipped(labels, probabilities).take(index)
+}
+
+/// The order of two pairs by probability, highest first, in IEEE 754 totalOrder.
+pub open spec fn by_probability() -> spec_fn((String, f32), (String, f32)) -> Ordering {
+    |left: (String, f32), right: (String, f32)| crate::domain::contracts::total_order()(right.1, left.1)
+}
+
 } // verus!
 
 /// Tests of softmax.
@@ -557,6 +623,35 @@ mod tests {
         assert_eq!(
             decode_bio("café", &[(0, 4)], &[1], &tags),
             Err(BioError::Span { start: 0, end: 4 })
+        );
+    }
+
+    /// The labels `a`, `b` and `c`.
+    fn labels() -> Vec<String> {
+        vec!["a".to_owned(), "b".to_owned(), "c".to_owned()]
+    }
+
+    /// AC-3.11c-1.
+    #[test]
+    fn ac_3_11c_1_ranked_probabilities_do_not_increase() {
+        let pairs = ranked(&labels(), &[0.2, 0.5, 0.3]);
+        assert!(
+            pairs.len() == 3 && pairs.windows(2).all(|pair| pair[0].1 >= pair[1].1),
+            "{pairs:?}"
+        );
+    }
+
+    /// AC-3.11c-2.
+    #[test]
+    fn ac_3_11c_2_equal_probabilities_keep_label_order() {
+        let pairs = ranked(&labels(), &[0.3, 0.4, 0.3]);
+        assert_eq!(
+            pairs,
+            [
+                ("b".to_owned(), 0.4),
+                ("a".to_owned(), 0.3),
+                ("c".to_owned(), 0.3)
+            ]
         );
     }
 }

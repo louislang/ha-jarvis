@@ -1,6 +1,7 @@
 //! Trusted Verus contracts and axioms for the `std` and domain crate functions that the domain calls.
 
 use std::borrow::Borrow;
+use std::cmp::Ordering;
 use std::convert::Infallible;
 use std::hash::Hash;
 use std::slice::SliceIndex;
@@ -418,5 +419,71 @@ pub fn ex_f32_exp(exponent: f32) -> (power: f32)
 {
     exponent.exp()
 }
+
+/// True when `order` is a total order: `a < b` exactly when `b > a`, and `<`, `==` and `>` are
+/// each transitive. <https://doc.rust-lang.org/std/cmp/trait.Ord.html#how-can-i-implement-ord>
+pub open spec fn total<T>(order: spec_fn(T, T) -> Ordering) -> bool {
+    &&& forall|a: T, b: T| (#[trigger] order(a, b) == Ordering::Less) == (order(b, a) == Ordering::Greater)
+    &&& forall|a: T, b: T, c: T| #[trigger] order(a, b) == #[trigger] order(b, c) ==> order(a, c) == order(a, b)
+}
+
+/// True when every call of `compare` on `a` and `b` can run and gives `order(a, b)`.
+pub open spec fn gives<T, Compare: FnMut(&T, &T) -> Ordering>(compare: Compare, order: spec_fn(T, T) -> Ordering) -> bool {
+    &&& forall|a: &T, b: &T| #[trigger] call_requires(compare, (a, b))
+    &&& forall|a: &T, b: &T, ordering: Ordering| #[trigger] call_ensures(compare, (a, b), ordering) ==> ordering == order(*a, *b)
+}
+
+/// True when `compare` gives a total order.
+pub open spec fn total_comparator<T, Compare: FnMut(&T, &T) -> Ordering>(compare: Compare) -> bool {
+    exists|order: spec_fn(T, T) -> Ordering| #[trigger] total(order) && gives(compare, order)
+}
+
+/// True when `new[index]` is `old[places[index]]`, each index of `old` is in `places` once, `new`
+/// is in the order `order`, and equal elements of `new` keep the order of their places.
+pub open spec fn placed<T>(old: Seq<T>, new: Seq<T>, order: spec_fn(T, T) -> Ordering, places: Seq<int>) -> bool {
+    &&& new.len() == old.len()
+    &&& places.len() == old.len()
+    &&& forall|index: int| 0 <= index < new.len() ==> 0 <= #[trigger] places[index] < old.len() && new[index] == old[places[index]]
+    &&& forall|first: int, second: int| #![trigger places[first], places[second]] 0 <= first < second < new.len() ==> {
+        &&& places[first] != places[second]
+        &&& order(new[first], new[second]) != Ordering::Greater
+        &&& order(new[first], new[second]) == Ordering::Equal ==> places[first] < places[second]
+    }
+}
+
+/// True when `new` is `old` sorted by `order` with a stable sort.
+pub open spec fn sorted_stable<T>(old: Seq<T>, new: Seq<T>, order: spec_fn(T, T) -> Ordering) -> bool {
+    exists|places: Seq<int>| #[trigger] placed(old, new, order, places)
+}
+
+/// Sorts `slice` with `compare` and keeps the order of equal elements. `compare` must give a total
+/// order. <https://doc.rust-lang.org/std/primitive.slice.html#method.sort_by>
+#[verifier::external_fn_specification]
+pub fn ex_slice_sort_by<T, Compare: FnMut(&T, &T) -> Ordering>(slice: &mut [T], compare: Compare)
+    requires
+        total_comparator(compare),
+    ensures
+        forall|order: spec_fn(T, T) -> Ordering| #[trigger] gives(compare, order) ==> sorted_stable(old(slice)@, final(slice)@, order),
+{
+    slice.sort_by(compare)
+}
+
+/// The IEEE 754 totalOrder of two floats.
+pub uninterp spec fn total_order() -> spec_fn(f32, f32) -> Ordering;
+
+/// Gives the IEEE 754 totalOrder of `left` and `right`. <https://doc.rust-lang.org/std/primitive.f32.html#method.total_cmp>
+#[verifier::external_fn_specification]
+pub fn ex_f32_total_cmp(left: &f32, right: &f32) -> (ordering: Ordering)
+    ensures
+        ordering == total_order()(*left, *right),
+{
+    left.total_cmp(right)
+}
+
+/// IEEE 754 totalOrder is a total order. <https://doc.rust-lang.org/std/primitive.f32.html#method.total_cmp>
+pub axiom fn axiom_total_order_is_total()
+    ensures
+        total(total_order()),
+;
 
 } // verus!
