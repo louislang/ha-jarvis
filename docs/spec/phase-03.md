@@ -35,7 +35,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - **Implements:** G3. **Depends on:** 3.1.
 - **Files:** modify `src/domain/intent.rs`.
 
-**Model.** `parse_example(markup) -> Result<Example>`: `Example { text, spans: Vec<Span> }`. `Span { slot, start, end }` are byte offsets into `text`. All Rust code uses byte offsets. Only the training set file uses character offsets (sub-phase 3.3). The text is the markup with each `[value](slot)` replaced by `value`.
+**Model.** `parse_example(markup) -> Result<Example>`: `Example { text, spans: Vec<Span> }`. `Span { slot, start, end }` are byte offsets into `text`. All Rust code uses byte offsets. Only the training set file uses character offsets (sub-phase 3.3c). The text is the markup with each `[value](slot)` replaced by `value`.
 
 **Acceptance criteria.**
 
@@ -133,32 +133,25 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 ---
 
-### 3.3 Seed Training Set
+### 3.3 Context Samples and Held-Out Split
 
-**Goal:** Add the training set types and `seed_set`, which turns the seed examples into labeled examples with a model context. This fixes the JSON contract between Jarvis and the training script.
+**Goal:** Add the model context and the held-out split to the domain. Every training example gets a context, and the same text always falls on the same side of the split.
 
 - **Implements:** G3, G16. **Depends on:** 3.2c.
 - **Files:** create `src/domain/training.rs`. Modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
 
 **Model.**
 
-- `TrainingSet { base_model, epochs, batch_size, labels, tags, examples }` (JSON in `01-architecture.md` section 9).
-- `Example { context, text, label: Intent(name) | Not(name), spans: Option<Vec<Span>> }`.
 - `context_text(area, habit_lines) -> String`: `"area: <area or none> | habits: <lines joined by '; ' or none>"`.
 - `sample_context(areas, rng) -> String`: `context_text` of a random area and no habit lines. Sub-phase 13.1 adds habit lines.
-- `seed_set(catalog, areas, rng, settings) -> TrainingSet`: one `Intent` example for each seed example and one `unknown` example for each unknown seed. Each example gets `sample_context`.
-- The JSON writer converts each span from byte offsets to character offsets, and the reader converts them back (`01-architecture.md` section 9).
 - `held_out(text, holdout) -> bool = xxh3(normalize(text)) mod 10000 < holdout * 10000`. This sub-phase adds `train.holdout`.
+- This sub-phase adds `rand` and `xxhash-rust` (`01-architecture.md` section 7).
 
 **Acceptance criteria.**
 
 - AC-3.3-1: When `context_text("kitchen", [])` runs, it returns `"area: kitchen | habits: none"`.
 - AC-3.3-2: When `context_text(None, ["a", "b"])` runs, it returns `"area: none | habits: a; b"`.
 - AC-3.3-3: When `sample_context` gets the same seed, it returns the same context.
-- AC-3.3-4: When `seed_set` runs, the number of examples equals the number of seed examples plus the number of unknown examples.
-- AC-3.3-5: When `seed_set` runs, the labels equal `labels(catalog)` and the tags equal `tags(catalog)`.
-- AC-3.3-6: When a training set is written to JSON and read again, it is equal.
-- AC-3.3-7: When the example is `"set the [café](area) lights"`, the JSON span is 8 to 12 (characters), and the Rust span is 8 to 13 (bytes).
 - AC-3.3-8: When `held_out` runs two times for the same text, it returns the same value.
 - AC-3.3-9: When `held_out` runs for 1,000 different texts with `holdout = 0.1`, between 70 and 130 are held out.
 
@@ -166,12 +159,54 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 - P-3.3-1, P-3.3-2. Ensures: the result is `area: <area or none> | habits: <lines joined by "; " or none>`. Argument: `context_text` is a `format!` with two branches for empty values.
 - P-3.3-3 (AC-3.3-3). Ensures: the same areas and the same seed give the same context. Argument: `sample_context` reads only `rng` and `areas`. A seeded RNG gives the same sequence.
-- P-3.3-4 (AC-3.3-4). Ensures: the number of examples is the number of seed examples plus the number of unknown seeds. Argument: `seed_set` maps each seed example to one example and each unknown seed to one example, then concatenates. Map keeps length.
-- P-3.3-5. Ensures: the labels equal `labels(catalog)` and the tags equal `tags(catalog)`. Argument: `seed_set` calls `labels` and `tags` (P-3.2c-1, P-3.2c-2).
-- P-3.3-7 (AC-3.3-7). Ensures: a byte span `[b, e)` becomes the character span `[chars(text[..b]), chars(text[..e]))`, and the reader gives the byte span back. Argument: the writer counts the characters before each byte offset, and the reader counts the bytes of that many characters. `é` is 2 bytes and 1 character, so the end 13 becomes 12.
-- P-3.3-6. Evidence: test (`serde_json`).
-- P-3.3-8. Ensures: `held_out(t, h)` depends only on `normalize(t)` and `h`. Argument: `xxh3` with a fixed seed is a pure function, and `normalize` is pure.
+- P-3.3-8. Evidence: test. Argument: `xxh3` with a fixed seed is a pure function, and `normalize` is pure. Verus cannot state the claim, because the `ensures` of `normalize` does not define its output and `vstd` does not interpret `f64` multiplication and comparison.
 - P-3.3-9. Evidence: test (statistical property of the hash on this input set).
+
+---
+
+### 3.3b Seed Training Set
+
+**Goal:** Add the training set types and `seed_set`, which turns the seed examples into labeled examples with a model context. This fixes the JSON contract between Jarvis and the training script.
+
+- **Implements:** G3, G16. **Depends on:** 3.3.
+- **Files:** modify `src/domain/training.rs`.
+
+**Model.**
+
+- `TrainingSet { base_model, epochs, batch_size, labels, tags, examples }` (JSON in `01-architecture.md` section 9).
+- `Example { context, text, label: Intent(name) | Not(name), spans: Option<Vec<Span>> }`. An `unknown` example has an empty span list.
+- `seed_set(catalog, areas, rng, settings) -> TrainingSet`: one `Intent` example for each seed example and one `unknown` example for each unknown seed. Each example gets `sample_context`. `settings` gives `base_model`, `epochs` and `batch_size`.
+
+**Acceptance criteria.**
+
+- AC-3.3b-1: When `seed_set` runs, the number of examples equals the number of seed examples plus the number of unknown examples.
+- AC-3.3b-2: When `seed_set` runs, the labels equal `labels(catalog)` and the tags equal `tags(catalog)`.
+- AC-3.3b-3: When a training set is written to JSON and read again, it is equal.
+
+**Proofs.**
+
+- P-3.3b-1 (AC-3.3b-1). Requires: `validate_catalog(catalog)` is `Ok`. Ensures: the number of examples is the number of seed examples plus the number of unknown seeds. Argument: `seed_set` maps each seed example to one example and each unknown seed to one example, then concatenates. Map keeps length. The precondition makes each `parse_example` call `Ok`.
+- P-3.3b-2. Ensures: the labels equal `labels(catalog)`. Argument: `seed_set` calls `labels` (P-3.2c-2). The tests are the evidence for the tags, because the `ensures` of `parse_example` does not state the slot names (P-3.2c-1).
+- P-3.3b-3. Evidence: test (`serde_json`).
+
+---
+
+### 3.3c Character Offsets in the Training Set File
+
+**Goal:** Write the spans of the training set file in character offsets, so that the training script reads them without UTF-8 byte arithmetic.
+
+- **Implements:** G3, G16. **Depends on:** 3.3b.
+- **Files:** modify `src/domain/training.rs`.
+
+**Model.** The JSON writer converts each span from byte offsets to character offsets, and the reader converts them back (`01-architecture.md` section 9).
+
+**Acceptance criteria.**
+
+- AC-3.3c-1: When the example is `"set the [café](area) lights"`, the JSON span is 8 to 12 (characters), and the Rust span is 8 to 13 (bytes).
+
+**Proofs.**
+
+- P-3.3c-1 (AC-3.3c-1). Ensures: a byte span `[b, e)` becomes the character span `[chars(text[..b]), chars(text[..e]))`, and the reader gives the byte span back. Argument: the writer counts the characters before each byte offset, and the reader counts the bytes of that many characters. `é` is 2 bytes and 1 character, so the end 13 becomes 12.
 
 ---
 
@@ -179,7 +214,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 **Goal:** Add `jarvis dataset <config> <out> [--house <snapshot.json>]`, which writes the training set from the current data. The fixture model and debugging now have one command that produces the contract file.
 
-- **Implements:** G3. **Depends on:** 3.3.
+- **Implements:** G3. **Depends on:** 3.3c.
 - **Files:** modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
 
 **Model.** `clap` parses the command line of `jarvis`. The command reads the configuration file `<config>` (`[train]`: `base_model`, `epochs`, `batch_size`) and the catalog file that its key `intents` names. This sub-phase adds `intents`. With `--house`, the areas come from that snapshot. Without it, the area list is empty. It writes the result of `seed_set` as JSON, without the held-out examples. Thus the fixture model never trains on a held-out seed, and the first comparison in sub-phase 13.9 is fair. The RNG has the fixed seed 1, so two runs give the same file.
