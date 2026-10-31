@@ -1,5 +1,6 @@
 listen = "0.0.0.0:10700"
 device = "cuda"
+intents = "intents.toml"
 
 [ha]
 url = "ws://homeassistant.local:8123/api/websocket"
@@ -8,4 +9,7 @@ request_timeout_ms = 5000
 ping_interval_s = 30
 
 [train]
+base_model = "microsoft/MiniLM-L12-H384-uncased"
+epochs = 8
+batch_size = 8
 holdout = 0.1

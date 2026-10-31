@@ -6,9 +6,18 @@
 use std::fs;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::Context;
+use clap::Parser;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use serde::Deserialize;
+
+use crate::domain::catalog::Catalog;
+use crate::domain::state::Snapshot;
+use crate::domain::training::Settings;
 
 /// Pure rules.
 pub mod domain {
@@ -47,6 +56,8 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Where the models run.
     pub device: Device,
+    /// The intent catalog file.
+    pub intents: PathBuf,
     /// Home Assistant connection.
     pub ha: HaConfig,
     /// Training.
@@ -96,9 +107,7 @@ impl Config {
     ///
     /// The file cannot be read, or [`Config::parse`] fails.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let text =
-            fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
-        Self::parse(&text)
+        Self::parse(&read(path)?)
     }
 }
 
@@ -130,6 +139,12 @@ pub struct HaConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TrainConfig {
+    /// The model to fine-tune.
+    pub base_model: String,
+    /// The number of passes over the examples.
+    pub epochs: usize,
+    /// The number of examples in one step.
+    pub batch_size: usize,
     /// The share of the examples in the held-out split.
     pub holdout: f64,
 }
@@ -159,8 +174,115 @@ impl Secrets {
     }
 }
 
-/// Entry point of Jarvis.
-pub fn main() {}
+/// The command line of `jarvis`.
+#[derive(Debug, Parser)]
+enum Command {
+    /// Writes the training set of the seed examples, without the held-out examples.
+    Dataset {
+        /// The configuration file.
+        config: PathBuf,
+        /// The training set file to write.
+        out: PathBuf,
+        /// The snapshot whose areas the contexts name. Without it, no context names an area.
+        #[arg(long)]
+        house: Option<PathBuf>,
+    },
+}
+
+impl Command {
+    /// Runs the command.
+    ///
+    /// # Errors
+    ///
+    /// The command fails.
+    fn run(self) -> anyhow::Result<()> {
+        match self {
+            Self::Dataset { config, out, house } => dataset(&config, &out, house.as_deref()),
+        }
+    }
+}
+
+/// Reads the text file at `path`.
+///
+/// # Errors
+///
+/// The file cannot be read. The error names the path.
+fn read(path: &Path) -> anyhow::Result<String> {
+    fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))
+}
+
+/// Writes to `out` the seed training set of the configuration file `config`, without the
+/// held-out examples. The contexts name the areas of the snapshot file `house`.
+///
+/// # Errors
+///
+/// A file cannot be read, parsed or written, or the catalog is not valid.
+fn dataset(config: &Path, out: &Path, house: Option<&Path>) -> anyhow::Result<()> {
+    let config = Config::load(config)?;
+    let catalog = load_catalog(&config.intents)?;
+    let areas = match house {
+        Some(path) => area_names(path)?,
+        None => Vec::new(),
+    };
+    let train = config.train;
+    let settings = Settings {
+        base_model: train.base_model,
+        epochs: train.epochs,
+        batch_size: train.batch_size,
+    };
+    let mut set =
+        domain::training::seed_set(&catalog, &areas, &mut StdRng::seed_from_u64(1), settings);
+    set.examples
+        .retain(|example| !domain::training::held_out(&example.text, train.holdout));
+    fs::write(out, serde_json::to_string_pretty(&set)?)
+        .with_context(|| format!("cannot write {}", out.display()))
+}
+
+/// Reads and validates the intent catalog file at `path`.
+///
+/// # Errors
+///
+/// The file cannot be read or parsed, or `validate_catalog` fails.
+fn load_catalog(path: &Path) -> anyhow::Result<Catalog> {
+    let catalog: Catalog = toml::from_str(&read(path)?)?;
+    domain::catalog::validate_catalog(&catalog)
+        .map_err(|error| anyhow::anyhow!("{} is not valid: {error:?}", path.display()))?;
+    Ok(catalog)
+}
+
+/// Reads the area names of the snapshot file at `path`.
+///
+/// # Errors
+///
+/// The file cannot be read or is not a snapshot.
+fn area_names(path: &Path) -> anyhow::Result<Vec<String>> {
+    let snapshot: Snapshot = serde_json::from_str(&read(path)?)?;
+    Ok(snapshot.areas.into_iter().map(|area| area.name).collect())
+}
+
+/// Entry point of Jarvis: runs the command of the command line.
+#[must_use]
+pub fn main() -> ExitCode {
+    let command = match Command::try_parse() {
+        Ok(command) => command,
+        Err(error) => {
+            // `--help` is an error of `try_parse` too, and prints to stdout.
+            let _ = error.print();
+            return if error.use_stderr() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            };
+        }
+    };
+    match command.run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("{error:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
 
 /// Tests of the entry point and the configuration.
 #[cfg(test)]
@@ -168,6 +290,11 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeMap;
+    use std::ffi::OsStr;
+
+    use crate::domain::training;
+    use crate::domain::training::TrainingSet;
+    use crate::testing::fakes;
 
     /// A valid configuration with every field.
     const VALID: &str = include_str!("../jarvis.toml");
@@ -182,7 +309,7 @@ mod tests {
     /// AC-0.1-2.
     #[test]
     fn ac_0_1_2_main_returns() {
-        super::main();
+        let _ = super::main();
     }
 
     /// AC-1.1-1.
@@ -191,13 +318,19 @@ mod tests {
         let expected = Config {
             listen: SocketAddr::from(([0, 0, 0, 0], 10700)),
             device: Device::Cuda,
+            intents: PathBuf::from("intents.toml"),
             ha: HaConfig {
                 url: "ws://homeassistant.local:8123/api/websocket".to_owned(),
                 token_env: "HA_TOKEN".to_owned(),
                 request_timeout_ms: 5000,
                 ping_interval_s: 30,
             },
-            train: TrainConfig { holdout: 0.1 },
+            train: TrainConfig {
+                base_model: "microsoft/MiniLM-L12-H384-uncased".to_owned(),
+                epochs: 8,
+                batch_size: 8,
+                holdout: 0.1,
+            },
         };
         assert_eq!(Config::parse(VALID)?, expected);
         Ok(())
@@ -289,5 +422,88 @@ mod tests {
     fn ac_1_2_3_empty_token_names_variable() {
         let error = resolve_error(&[("HA_TOKEN", "")]);
         assert!(error.contains("HA_TOKEN"), "error has no variable: {error}");
+    }
+
+    /// Runs `jarvis dataset jarvis.toml <out> <options>` and returns the text of `<out>`.
+    fn dataset(options: &[&str]) -> anyhow::Result<String> {
+        let folder = tempfile::tempdir()?;
+        let out = folder.path().join("out.json");
+        let start = ["jarvis", "dataset", "jarvis.toml"].map(OsStr::new);
+        let line = start
+            .into_iter()
+            .chain([out.as_os_str()])
+            .chain(options.iter().map(OsStr::new));
+        Command::try_parse_from(line)?.run()?;
+        Ok(fs::read_to_string(out)?)
+    }
+
+    /// Returns the contexts of the training set that `dataset(options)` writes.
+    fn contexts(options: &[&str]) -> anyhow::Result<Vec<String>> {
+        let set: TrainingSet = serde_json::from_str(&dataset(options)?)?;
+        Ok(set
+            .examples
+            .into_iter()
+            .map(|example| example.context)
+            .collect())
+    }
+
+    /// The options that give the areas of the reference house.
+    const HOUSE: [&str; 2] = ["--house", "src/testing/house.json"];
+
+    /// AC-3.4-1.
+    #[test]
+    fn ac_3_4_1_house_dataset_is_a_training_set() -> anyhow::Result<()> {
+        let set: TrainingSet = serde_json::from_str(&dataset(&HOUSE)?)?;
+        assert!(!set.examples.is_empty(), "the training set has no examples");
+        Ok(())
+    }
+
+    /// AC-3.4-2.
+    #[test]
+    fn ac_3_4_2_each_context_names_a_house_area() -> anyhow::Result<()> {
+        let expected: Vec<String> = fakes::house()
+            .areas
+            .iter()
+            .map(|area| training::context_text(Some(area.name.as_str()), &[]))
+            .collect();
+        for context in contexts(&HOUSE)? {
+            assert!(
+                expected.contains(&context),
+                "{context} names no area of {expected:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// AC-3.4-3.
+    #[test]
+    fn ac_3_4_3_without_house_each_context_is_none() -> anyhow::Result<()> {
+        let contexts = contexts(&[])?;
+        assert!(!contexts.is_empty(), "the training set has no examples");
+        for context in contexts {
+            assert_eq!(context, "area: none | habits: none");
+        }
+        Ok(())
+    }
+
+    /// AC-3.4-4.
+    #[test]
+    fn ac_3_4_4_two_runs_write_equal_files() -> anyhow::Result<()> {
+        assert_eq!(dataset(&HOUSE)?, dataset(&HOUSE)?);
+        Ok(())
+    }
+
+    /// AC-3.4-5.
+    #[test]
+    fn ac_3_4_5_no_example_is_held_out() -> anyhow::Result<()> {
+        let set: TrainingSet = serde_json::from_str(&dataset(&HOUSE)?)?;
+        for example in set.examples {
+            assert!(
+                !training::held_out(&example.text, 0.1),
+                "{} is held out",
+                example.text
+            );
+        }
+        Ok(())
     }
 }
