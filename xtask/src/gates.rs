@@ -933,43 +933,20 @@ fn ac_0_10_7_ci_posts_diagram_on_pull_requests() {
     }
 }
 
-/// The script of the `architecture.yml` step that commits the diagram.
-fn commit_script(workflow: &serde_yaml::Value) -> &str {
-    steps(workflow)
-        .into_iter()
-        .filter_map(|step| step["run"].as_str())
-        .find(|run| run.contains("git commit"))
-        .expect("a step commits the diagram")
+/// `check` writes the diagram after the architecture gate.
+#[test]
+fn ac_0_11_3_check_writes_diagram() {
+    assert_check_runs_after("architecture", "diagram");
 }
 
-/// `architecture.yml` runs on `push` to `main` only, draws the diagram and commits only `docs/architecture.md`.
+/// The committed diagram is the document of the graph of the repository.
 #[test]
-fn ac_0_11_1_workflow_commits_diagram_on_main() {
-    let workflow = yaml(".github/workflows/architecture.yml");
-    let expected: serde_yaml::Value =
-        serde_yaml::from_str("{push: {branches: [main]}}").expect("the expected trigger is YAML");
-    assert_eq!(workflow["on"], expected, "the triggers");
-    assert_eq!(workflow["permissions"]["contents"].as_str(), Some("write"));
+fn ac_0_11_4_committed_diagram_is_current() {
+    let graph = crate::graph::build(root()).expect("the graph builds");
     assert_eq!(
-        workflow["concurrency"]["group"].as_str(),
-        Some("architecture")
-    );
-    assert_eq!(
-        workflow["concurrency"]["cancel-in-progress"].as_bool(),
-        Some(false)
-    );
-    assert!(
-        runs(&workflow, "diagram").contains(&"just diagram"),
-        "the job runs just diagram"
-    );
-    let script = commit_script(&workflow);
-    let commits: Vec<&str> = script
-        .lines()
-        .filter(|line| line.starts_with("git commit") || line.starts_with("git add"))
-        .collect();
-    assert!(
-        matches!(commits.as_slice(), [commit] if commit.ends_with(" -- docs/architecture.md")),
-        "one commit of docs/architecture.md only, the script runs {commits:?}"
+        read("docs/architecture.md"),
+        crate::mermaid::document(&graph),
+        "docs/architecture.md is stale: run just diagram"
     );
 }
 
@@ -980,28 +957,6 @@ fn git(repository: &Path, arguments: &[&str]) -> Output {
         .args(["-c", "commit.gpgsign=false"])
         .args(arguments)
         .current_dir(repository))
-}
-
-/// The commit step makes no commit on a clean working tree.
-#[test]
-fn ac_0_11_2_clean_tree_makes_no_commit() {
-    let repository = TempDir::new().expect("a temporary folder");
-    fs::create_dir(repository.path().join("docs")).expect("the docs folder is made");
-    fs::write(repository.path().join("docs/architecture.md"), "graph TD\n")
-        .expect("the diagram is written");
-    for arguments in [
-        &["init", "--quiet"][..],
-        &["add", "docs/architecture.md"],
-        &["commit", "--quiet", "-m", "Initial"],
-    ] {
-        assert_passes(&git(repository.path(), arguments));
-    }
-    let workflow = yaml(".github/workflows/architecture.yml");
-    assert_passes(&run(Command::new("bash")
-        .args(["-eo", "pipefail", "-c", commit_script(&workflow)])
-        .current_dir(repository.path())));
-    let count = git(repository.path(), &["rev-list", "--count", "HEAD"]);
-    assert_eq!(String::from_utf8_lossy(&count.stdout).trim(), "1");
 }
 
 /// A fixture Quint model with a counter that `next` updates, the invariant `count < 3` and one `run` test.
