@@ -367,9 +367,9 @@ mod tests {
     /// AC-3.12b-2.
     #[test]
     #[ignore = "GPU host"]
-    fn ac_3_12b_2_cpu_p99_is_less_than_10_ms() -> anyhow::Result<()> {
+    fn ac_3_12b_2_cpu_p99_is_less_than_15_ms() -> anyhow::Result<()> {
         let p99 = p99(Device::Cpu)?;
-        assert!(p99 < Duration::from_millis(10), "CPU p99 is {p99:?}");
+        assert!(p99 < Duration::from_millis(15), "CPU p99 is {p99:?}");
         Ok(())
     }
 

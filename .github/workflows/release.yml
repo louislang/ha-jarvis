@@ -27,12 +27,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - run: cargo build --release --target ${{ matrix.target }}
-      - run: tar -czf "$ARCHIVE" -C target/${{ matrix.target }}/release jarvis
+      # Until 6.2, the Linux archive holds the CUDA providers of ONNX Runtime, which `jarvis` loads from its own folder.
+      - run: |
+          shopt -s nullglob
+          cd target/${{ matrix.target }}/release
+          tar -czhf "$GITHUB_WORKSPACE/$ARCHIVE" jarvis libonnxruntime*.so
       - run: |
           mkdir verify
           tar -xzf "$ARCHIVE" -C verify
           cd verify
           file jarvis | grep -E 'ELF 64-bit LSB .*executable, x86-64|Mach-O 64-bit executable x86_64'
+          if [ "$RUNNER_OS" = Linux ]; then test -f libonnxruntime_providers_cuda.so; fi
           ./jarvis
       - uses: actions/upload-artifact@v7
         with:
