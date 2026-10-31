@@ -8,10 +8,13 @@ jscpd_version := "5.4.2"
 quint_version := "0.33.0"
 quint_evaluator_version := "v0.7.0"
 verus_version := "0.2026.10.26.d17fbd0"
+python_version := "3.12"
 # The apt package of `ubuntu-latest`.
 valgrind_version := "1:3.26.0-0ubuntu1"
 # The version of the `gungraun` library.
 gungraun_runner_version := "0.20.0"
+# The tools of the `python` recipe.
+venv := justfile_directory() / ".venv/bin"
 
 # Run the tests.
 test:
@@ -31,11 +34,11 @@ lint:
 
 # Check the complexity limits of each function.
 complexity:
-    cargo run -p xtask -- complexity src xtask
+    cargo run -p xtask -- complexity src xtask train
 
 # Check the duplication limit.
 duplication:
-    jscpd --threshold 3 --min-tokens 50 --format rust,python --ignore "**/target/**" src xtask
+    jscpd --threshold 3 --min-tokens 50 --format rust,python --ignore "**/target/**" src xtask train
 
 # Check the layer and modularity rules.
 architecture:
@@ -52,6 +55,16 @@ quint:
         quint run --seed=1 --invariant=allInvariants --max-samples=10000 --max-steps=30 "$model"
         quint verify --invariant=allInvariants --max-steps=10 "$model"
     done
+
+# Check the Python code with the tools of `02-rules.md` section 3.
+[working-directory("train")]
+python:
+    {{ venv }}/ruff format --check
+    {{ venv }}/ruff check
+    {{ venv }}/mypy --strict .
+    {{ venv }}/vulture --min-confidence 60 --ignore-names forward .
+    {{ venv }}/interrogate --fail-under 100 .
+    {{ venv }}/pytest --cov --cov-fail-under=80.01
 
 # Prove the Verus proofs of the domain.
 verus:
@@ -78,12 +91,12 @@ workflow-lint:
     actionlint
 
 # Run the checks of the pre-commit hook.
-check: workflow-lint format lint complexity duplication architecture quint verus cov
+check: workflow-lint format lint complexity duplication architecture quint python verus cov
     {{ if os() == "linux" { "just bench" } else { "" } }}
     {{ if env("JARVIS_DEVICE", "") == "cuda" { "just gpu-test" } else { "" } }}
 
 # Install the tools and the pre-commit hook.
-setup: pre-push-hook install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint install-quint-evaluator install-verus install-valgrind install-gungraun-runner
+setup: pre-push-hook install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint install-quint-evaluator install-verus install-valgrind install-gungraun-runner install-python
     pre-commit install --hook-type pre-commit
     gh extension install github/gh-stack
 
@@ -141,3 +154,8 @@ install-valgrind:
 
 install-gungraun-runner:
     cargo install gungraun-runner --version {{ gungraun_runner_version }} --locked
+
+# Make `.venv` with the training script and its pinned packages.
+install-python:
+    python{{ python_version }} -m venv .venv
+    {{ venv }}/pip install './train[dev]'

@@ -14,6 +14,7 @@
 - [ ] `duplication`
 - [ ] `architecture`
 - [ ] `quint`
+- [ ] `python`
 - [ ] `verus`
 - [ ] `rust-test`
 - [ ] `bench`

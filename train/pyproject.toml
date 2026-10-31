@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling==1.33.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "train"
+version = "0.1.0"
+description = "Fine-tunes the System One model and exports it to ONNX."
+requires-python = ">=3.12,<3.13"
+# torch 2.2.2 is the last release with Intel macOS wheels. It needs numpy 1.
+dependencies = [
+    "torch==2.2.2",
+    "numpy==1.26.4",
+    "transformers==4.57.6",
+    "onnx==1.23.2",
+    "onnxruntime==1.23.2",
+    "runpod==1.12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.2.0",
+    "pytest-cov==7.1.0",
+    "ruff==0.17.3",
+    "mypy==2.4.1",
+    "vulture==2.16",
+    "interrogate==1.7.0",
+]
+
+[tool.ruff.lint]
+select = ["ALL"]
+# COM812 and ISC001 conflict with the formatter. D203 and D213 conflict with D211 and D212.
+ignore = ["COM812", "ISC001", "D203", "D213"]
+
+[tool.ruff.lint.per-file-ignores]
+"test_*.py" = ["S101"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.coverage.run]
+# Measure every production module, also one that no test imports, and not the tests.
+source = ["."]
+omit = ["test_*.py"]
+
+[[tool.mypy.overrides]]
+# These packages have no type information.
+module = ["onnxruntime", "onnxruntime.*", "runpod", "runpod.*"]
+ignore_missing_imports = true
