@@ -39,13 +39,13 @@ This phase selects responses, selects entities and decides the action from a pre
 **Goal:** Add `render` with `minijinja` in strict mode and `validate_pools`. Responses and service data now share one template syntax, and a missing variable or a missing pool fails at startup.
 
 - **Implements:** G4. **Depends on:** 4.1.
-- **Files:** modify `src/domain/responses.rs`, `Cargo.toml`.
+- **Files:** modify `src/domain/responses.rs`, `src/domain/catalog.rs`, `Cargo.toml`.
 
 **Model.**
 
-- `render(template, context) -> Result<String>`. Undefined variables are errors.
+- `render(template, context) -> Result<String>`. Undefined variables are errors. The environment uses `UndefinedBehavior::Strict` and debug mode, because `minijinja` names the undefined variable only in debug mode. `Cargo.toml` turns on the `serde` feature of `minijinja`, so the context is a `serde_json` value.
 - `validate_pools(pools, catalog) -> Result<()>`: each intent has a pool, the `filler`, `failure` and `fallback` pools exist, each pool has one or more responses, every template parses, and every template uses only the variables of its pool (`minijinja` `undeclared_variables`).
-- Template variables of an intent pool: `area` (the area name in lowercase), the slots and the `habit_defaults` keys of its intent, `entity` when the intent has `target = "entity"`, `response` when it has `kind = "fetch"`, and `person` when it has `needs_speaker` (sub-phase 15.7). A pool that is not an intent pool uses no variable. Thus a template that validates also renders.
+- Template variables of an intent pool: `area` (the area name in lowercase), the slots and the `habit_defaults` keys of its intent, `entity` when the intent has `target = "entity"`, `response` when it has `kind = "fetch"`, and `person` when it has `needs_speaker` (sub-phase 15.7). A pool that is not an intent pool uses no variable. Thus a template that validates also renders. The slots of an intent come from the same function that check 4 of `validate_catalog` uses (sub-phase 3.2b), so `catalog.rs` makes it public.
 
 **Acceptance criteria.**
 
@@ -61,8 +61,9 @@ This phase selects responses, selects entities and decides the action from a pre
 **Proofs.**
 
 - P-4.2-1. Evidence: test (`minijinja`).
-- P-4.2-2. Ensures: a template with a variable that the context does not have gives `Err` that names the variable. Argument: the environment uses `UndefinedBehavior::Strict`, which turns every undefined lookup into an error.
-- P-4.2-3 to P-4.2-8. Ensures: `validate_pools` returns `Ok` if and only if every check passes, and else the first failure. Argument: `validate_pools` checks each intent name, each pool size, each template and its variables against the variable set of its pool, and each required pool name in loops, and returns the first failure.
+- P-4.2-2. Evidence: test. The error and its text come from `minijinja` (`UndefinedBehavior::Strict` and debug mode), which Verus cannot see.
+- P-4.2-3, P-4.2-5, P-4.2-7. Ensures: when `validate_pools` returns `Ok`, each intent has a pool, the `filler`, `failure` and `fallback` pools exist, and each pool has one or more responses. Argument: `validate_pools` checks the intents, then the required pools, then the size and the templates of each pool in loops, and returns the first failure.
+- P-4.2-4, P-4.2-6, P-4.2-8. Evidence: test. The template checks depend on `minijinja` `template_from_str` and `undeclared_variables`, and on the slot names, which the `ensures` of `parse_example` does not state (P-3.2b).
 
 ---
 
