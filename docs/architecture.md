@@ -6,6 +6,7 @@ The pre-commit hook writes this file from the module graph.
 flowchart LR
     subgraph adapters
         crate_adapters_ha[ha]
+        crate_adapters_onnx[onnx]
     end
     subgraph app
         crate_app_background[background]
@@ -35,6 +36,10 @@ flowchart LR
     crate_adapters_ha --> crate
     crate_adapters_ha --> crate_adapters_ha
     crate_adapters_ha --> crate_domain_state
+    crate_adapters_onnx --> crate
+    crate_adapters_onnx --> crate_adapters_onnx
+    crate_adapters_onnx --> crate_domain_model
+    crate_adapters_onnx --> crate_ports
     crate_app_background --> crate_domain_state
     crate_app_background --> crate_domain_state_cache
     crate_app_background --> crate_ports
@@ -54,5 +59,7 @@ flowchart LR
     crate_domain_state_cache --> crate_domain_state_cache
     crate_domain_training --> crate_domain_catalog
     crate_domain_training --> crate_domain_intent
+    crate_ports --> crate
+    crate_ports --> crate_domain_model
     crate_ports --> crate_domain_state
 ```

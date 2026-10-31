@@ -1,6 +1,8 @@
 //! A fake for each port.
 
 use std::collections::VecDeque;
+use std::path::Path;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::atomic::AtomicUsize;
@@ -13,10 +15,14 @@ use futures::channel::oneshot;
 use futures::stream::BoxStream;
 use serde_json::Value;
 
+use crate::Device;
+use crate::domain::model::Prediction;
 use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
+use crate::ports::Classifier;
 use crate::ports::Home;
+use crate::ports::ModelLoader;
 
 /// The reference house snapshot.
 #[must_use]
@@ -116,5 +122,58 @@ impl Home for FakeHome {
     async fn call(&self, _call: ServiceCall) -> anyhow::Result<Option<Value>> {
         self.wait().await?;
         Ok(None)
+    }
+}
+
+/// A `Classifier` that gives scripted predictions in order and records each `(context, text)`.
+#[derive(Default)]
+pub struct FakeClassifier {
+    /// The predictions of the next calls, in order.
+    predictions: Mutex<VecDeque<Prediction>>,
+    /// The `(context, text)` of each call, in order.
+    calls: Mutex<Vec<(String, String)>>,
+}
+
+impl FakeClassifier {
+    /// Makes the next call without an earlier scripted prediction give `prediction`.
+    pub fn script(&self, prediction: Prediction) {
+        lock(&self.predictions).push_back(prediction);
+    }
+
+    /// The `(context, text)` of each call, in order.
+    #[must_use]
+    pub fn calls(&self) -> Vec<(String, String)> {
+        lock(&self.calls).clone()
+    }
+}
+
+#[async_trait]
+impl Classifier for FakeClassifier {
+    async fn predict(&self, context: &str, text: &str) -> anyhow::Result<Prediction> {
+        lock(&self.calls).push((context.to_owned(), text.to_owned()));
+        let prediction = lock(&self.predictions).pop_front();
+        prediction.ok_or_else(|| anyhow::anyhow!("no scripted prediction for {text}"))
+    }
+}
+
+/// A `ModelLoader` that gives scripted classifiers in order.
+#[derive(Default)]
+pub struct FakeModelLoader {
+    /// The classifiers of the next loads, in order.
+    classifiers: Mutex<VecDeque<Arc<dyn Classifier>>>,
+}
+
+impl FakeModelLoader {
+    /// Makes the next load without an earlier scripted classifier give `classifier`.
+    pub fn script(&self, classifier: Arc<dyn Classifier>) {
+        lock(&self.classifiers).push_back(classifier);
+    }
+}
+
+#[async_trait]
+impl ModelLoader for FakeModelLoader {
+    async fn load(&self, dir: &Path, _device: Device) -> anyhow::Result<Arc<dyn Classifier>> {
+        let classifier = lock(&self.classifiers).pop_front();
+        classifier.ok_or_else(|| anyhow::anyhow!("no scripted classifier for {}", dir.display()))
     }
 }

@@ -18,6 +18,7 @@ use serde::Deserialize;
 use crate::domain::catalog::Catalog;
 use crate::domain::state::Snapshot;
 use crate::domain::training::Settings;
+use crate::domain::training::TrainingSet;
 
 /// Pure rules.
 pub mod domain {
@@ -41,6 +42,7 @@ pub mod app {
 /// Port implementations, one technology each.
 pub mod adapters {
     pub mod ha;
+    pub mod onnx;
 }
 
 /// Shared test code.
@@ -219,6 +221,18 @@ fn read(path: &Path) -> anyhow::Result<String> {
 ///
 /// A file cannot be read, parsed or written, or the catalog is not valid.
 fn dataset(config: &Path, out: &Path, house: Option<&Path>) -> anyhow::Result<()> {
+    let set = seed_examples(config, house)?;
+    fs::write(out, serde_json::to_string_pretty(&set)?)
+        .with_context(|| format!("cannot write {}", out.display()))
+}
+
+/// The seed training set of the configuration file `config`, without the held-out examples.
+/// The contexts name the areas of the snapshot file `house`.
+///
+/// # Errors
+///
+/// A file cannot be read or parsed, or the catalog is not valid.
+fn seed_examples(config: &Path, house: Option<&Path>) -> anyhow::Result<TrainingSet> {
     let config = Config::load(config)?;
     let catalog = load_catalog(&config.intents)?;
     let areas = match house {
@@ -235,8 +249,7 @@ fn dataset(config: &Path, out: &Path, house: Option<&Path>) -> anyhow::Result<()
         domain::training::seed_set(&catalog, &areas, &mut StdRng::seed_from_u64(1), settings);
     set.examples
         .retain(|example| !domain::training::held_out(&example.text, train.holdout));
-    fs::write(out, serde_json::to_string_pretty(&set)?)
-        .with_context(|| format!("cannot write {}", out.display()))
+    Ok(set)
 }
 
 /// Reads and validates the intent catalog file at `path`.
@@ -294,7 +307,6 @@ mod tests {
     use std::ffi::OsStr;
 
     use crate::domain::training;
-    use crate::domain::training::TrainingSet;
     use crate::testing::fakes;
 
     /// A valid configuration with every field.
