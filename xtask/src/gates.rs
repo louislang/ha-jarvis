@@ -1088,7 +1088,7 @@ fn ac_0_12_5_check_and_ci_run_quint_gate() {
     );
 }
 
-/// CI runs `gpu-test` on the self-hosted GPU runner.
+/// CI runs `gpu-test` on the self-hosted GPU runner, but not for a fork pull request.
 #[test]
 fn ac_0_13_1_ci_runs_gpu_test_on_gpu_runner() {
     let ci = yaml(".github/workflows/ci.yml");
@@ -1101,6 +1101,14 @@ fn ac_0_13_1_ci_runs_gpu_test_on_gpu_runner() {
     assert!(
         runs(&ci, "gpu-test").contains(&"just gpu-test"),
         "gpu-test runs just gpu-test"
+    );
+    assert_eq!(
+        ci["jobs"]["gpu-test"]["if"].as_str(),
+        Some(
+            "github.event_name != 'pull_request' || \
+             github.event.pull_request.head.repo.full_name == github.repository"
+        ),
+        "gpu-test skips fork pull requests"
     );
 }
 
