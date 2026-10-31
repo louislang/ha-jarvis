@@ -24,7 +24,7 @@ use jarvis::domain::state::Event;
 use jarvis::domain::state::HomeConfig;
 use jarvis::domain::state::Snapshot;
 use jarvis::domain::state::State;
-use jarvis::domain::state::StateCache;
+use jarvis::domain::state_cache::StateCache;
 use jiff::Timestamp;
 
 /// Entities in the benchmark cache.
