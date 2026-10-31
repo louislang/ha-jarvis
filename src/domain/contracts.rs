@@ -5,6 +5,9 @@ use std::hash::Hash;
 use std::sync::Arc;
 
 use jiff::Timestamp;
+use minijinja::Environment;
+use minijinja::Error;
+use minijinja::Template;
 use serde_json::Map;
 use serde_json::Value;
 
@@ -114,6 +117,45 @@ pub struct ExTarget(Target);
 #[verifier::external_body]
 pub struct ExFilter(Filter);
 
+/// A template environment. <https://docs.rs/minijinja/3/minijinja/struct.Environment.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExEnvironment<'source>(Environment<'source>);
+
+/// A compiled template. <https://docs.rs/minijinja/3/minijinja/struct.Template.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExTemplate<'env: 'source, 'source>(Template<'env, 'source>);
+
+/// A template error. <https://docs.rs/minijinja/3/minijinja/struct.Error.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExError(Error);
+
+/// Creates an environment with the default filters, tests and globals. <https://docs.rs/minijinja/3/minijinja/struct.Environment.html#method.new>
+#[verifier::external_fn_specification]
+pub fn ex_environment_new<'source>() -> Environment<'source> {
+    Environment::new()
+}
+
+/// Compiles `source` into a template. <https://docs.rs/minijinja/3/minijinja/struct.Environment.html#method.template_from_str>
+#[verifier::external_fn_specification]
+pub fn ex_environment_template_from_str<'source, 'env>(
+    environment: &'env Environment<'source>,
+    source: &'source str,
+) -> Result<Template<'env, 'source>, Error> {
+    environment.template_from_str(source)
+}
+
+/// Gives the variables that the template reads and does not set. <https://docs.rs/minijinja/3/minijinja/struct.Template.html#method.undeclared_variables>
+#[verifier::external_fn_specification]
+pub fn ex_template_undeclared_variables<'env, 'source>(
+    template: &Template<'env, 'source>,
+    nested: bool,
+) -> std::collections::hash_set::HashSet<String> {
+    template.undeclared_variables(nested)
+}
+
 /// The number of nanoseconds from the Unix epoch to `timestamp`.
 pub uninterp spec fn nanosecond(timestamp: Timestamp) -> i128;
 
@@ -162,6 +204,12 @@ pub broadcast axiom fn axiom_arc_str_maps_borrowed_key<Item>(map: vstd::map::Map
     ensures
         #[trigger] vstd::std_specs::btree::maps_borrowed_key_to_value::<Arc<str>, Item, str>(map, key, item)
             <==> map.contains_key(str_key(key@)) && map[str_key(key@)] == item,
+;
+
+/// `String` has a total order. <https://doc.rust-lang.org/std/string/struct.String.html#impl-Ord-for-String>
+pub broadcast axiom fn axiom_string_obeys_cmp()
+    ensures
+        #[trigger] vstd::laws_cmp::obeys_cmp::<String>(),
 ;
 
 /// The value of `key` in the JSON object `map`.
