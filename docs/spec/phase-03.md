@@ -128,7 +128,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 **Proofs.**
 
-- P-3.2c-1 (AC-3.2c-1). Ensures: `tags` is determined by the set of slot names. Argument: the slot names go into a `BTreeSet`, which iterates in sorted order. The output is `O` followed by two entries for each element.
+- P-3.2c-1 (AC-3.2c-1). Ensures: `tags` is determined by the set of slot names. Argument: the slot names go into a `BTreeSet`, which iterates in sorted order. The output is `O` followed by two entries for each element. The Verus clause is on the helper that builds the tags from the slot set, because the `ensures` of `parse_example` does not state the slot names (P-3.2b).
 - P-3.2c-2 (AC-3.2c-2). Ensures: `labels(c) = [unknown] ++ names(c.intents)`, in file order. Argument: `labels` prepends `unknown` to a map over the intent list, which keeps the order.
 
 ---
