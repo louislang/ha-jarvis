@@ -326,7 +326,7 @@ mod tests {
                 ping_interval_s: 30,
             },
             train: TrainConfig {
-                base_model: "microsoft/MiniLM-L12-H384-uncased".to_owned(),
+                base_model: "sentence-transformers/all-MiniLM-L12-v2".to_owned(),
                 epochs: 8,
                 batch_size: 8,
                 holdout: 0.1,

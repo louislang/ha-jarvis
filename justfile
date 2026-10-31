@@ -90,8 +90,32 @@ merge pr:
 workflow-lint:
     actionlint
 
+# Train the fixture model on the CPU when its inputs change.
+fixture-model:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p target/fixture
+    cargo run --release --quiet -- dataset jarvis.toml target/fixture/train.json --house src/testing/house.json
+    stamp=models/system-one/fixture/inputs.sha256
+    if hash=$({{ just_executable() }} fixture-stale "$stamp"); then
+        {{ venv }}/python train/train.py --data target/fixture/train.json --out models/system-one/fixture --device cpu
+        echo "$hash" > "$stamp"
+    fi
+
+# Print the hash of the training set file and the tracked files of `train/`. Exit with code 0 when it differs from the file `stamp` or a model file next to `stamp` is missing.
+fixture-stale stamp:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    hash=$(cat target/fixture/train.json $(git ls-files train) | shasum -a 256 | cut -d ' ' -f 1)
+    echo "$hash"
+    folder=$(dirname "{{ stamp }}")
+    for file in model.onnx tokenizer.json labels.json; do
+        [ -f "$folder/$file" ] || exit 0
+    done
+    [ "$hash" != "$(cat "{{ stamp }}" 2> /dev/null)" ]
+
 # Run the checks of the pre-commit hook.
-check: workflow-lint format lint complexity duplication architecture quint python verus cov
+check: workflow-lint format lint complexity duplication architecture quint python verus fixture-model cov
     {{ if os() == "linux" { "just bench" } else { "" } }}
     {{ if env("JARVIS_DEVICE", "") == "cuda" { "just gpu-test" } else { "" } }}
 

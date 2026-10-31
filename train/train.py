@@ -251,11 +251,13 @@ def train(
 ) -> JointModel:
     """Fine-tune the base model on `training_set` with AdamW on `device`."""
     limit_vram(device, max_vram_gb)
+    torch.manual_seed(0)
+    torch.use_deterministic_algorithms(mode=True)
     tokenizer = load_tokenizer(training_set["base_model"])
     base = AutoModel.from_pretrained(training_set["base_model"])
     labels, tags = training_set["labels"], training_set["tags"]
     model = JointModel(base, len(labels), len(tags)).to(device)
-    optimizer = torch.optim.AdamW(model.parameters())
+    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
     examples, batch_size = training_set["examples"], training_set["batch_size"]
     batches = [
         encode(tokenizer, training_set, examples[start : start + batch_size], model)
