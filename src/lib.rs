@@ -12,6 +12,7 @@ use serde::Deserialize;
 
 /// Pure rules.
 pub mod domain {
+    pub mod catalog;
     #[cfg(verus_only)]
     pub mod contracts;
     pub mod intent;
