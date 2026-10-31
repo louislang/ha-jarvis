@@ -225,7 +225,9 @@ fn check_name(catalog: &Catalog, index: usize) -> Result<(), CatalogError> {
 /// built-in, a habit default or a tagged slot.
 #[verus_verify]
 fn check_slots(intent: &Intent) -> Result<(), CatalogError> {
-    let mut allowed = tagged_slots(intent)?;
+    check_normal(intent)?;
+    let mut allowed = BTreeSet::new();
+    insert_slots(intent, &mut allowed);
     for name in &["area", "entity", "person", "response"] {
         allowed.insert((*name).to_owned());
     }
@@ -241,23 +243,33 @@ fn check_slots(intent: &Intent) -> Result<(), CatalogError> {
     Ok(())
 }
 
-/// The slots that the examples of `intent` tag, or the first example whose text is not
-/// normalized.
+/// Checks that the text of each example of `intent` is normalized.
 #[verus_verify]
-fn tagged_slots(intent: &Intent) -> Result<BTreeSet<String>, CatalogError> {
-    let mut slots = BTreeSet::new();
+fn check_normal(intent: &Intent) -> Result<(), CatalogError> {
     for markup in &intent.examples {
         // `check_examples` rejects markup errors first.
-        if let Ok(example) = intent::parse_example(markup.as_str()) {
-            if intent::normalize(example.text.as_str()).as_str() != example.text.as_str() {
+        match intent::parse_example(markup.as_str()) {
+            Ok(example)
+                if intent::normalize(example.text.as_str()).as_str() != example.text.as_str() =>
+            {
                 return Err(CatalogError::NotNormal(markup.clone()));
             }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Adds the slots that the examples of `intent` tag to `slots`.
+#[verus_verify]
+fn insert_slots(intent: &Intent, slots: &mut BTreeSet<String>) {
+    for markup in &intent.examples {
+        if let Ok(example) = intent::parse_example(markup.as_str()) {
             for span in example.spans {
                 slots.insert(span.slot);
             }
         }
     }
-    Ok(slots)
 }
 
 /// Checks that `template` of `intent` parses and has only `allowed` variables.
@@ -279,6 +291,87 @@ fn check_template(
         Some(variable) => Err(CatalogError::Untagged(variable.clone())),
         None => Ok(()),
     }
+}
+
+/// The System One labels of `catalog`: `unknown`, then the intent names in file order.
+#[verus_spec(result =>
+    ensures
+        views(result@) == seq!["unknown"@] + names(catalog.intents@),
+)]
+#[must_use]
+pub fn labels(catalog: &Catalog) -> Vec<String> {
+    let mut labels = Vec::new();
+    labels.push("unknown".to_owned());
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= catalog.intents@.len(),
+            views(labels@) == seq!["unknown"@] + names(catalog.intents@.take(index as int)),
+        decreases catalog.intents@.len() - index,
+    ))]
+    while index < catalog.intents.len() {
+        proof! {
+            lemma_named(labels@, catalog.intents@, index as int);
+        }
+        labels.push(catalog.intents[index].name.clone());
+        index += 1;
+    }
+    proof! {
+        assert(catalog.intents@.take(index as int) =~= catalog.intents@);
+    }
+    labels
+}
+
+/// The slot tags of `catalog`: `O`, then `B-<slot>` and `I-<slot>` for each slot name in sorted
+/// order.
+#[verus_verify]
+#[must_use]
+pub fn tags(catalog: &Catalog) -> Vec<String> {
+    let mut slots = BTreeSet::new();
+    for intent in &catalog.intents {
+        insert_slots(intent, &mut slots);
+    }
+    bio_tags(&slots)
+}
+
+/// `O`, then `B-<slot>` and `I-<slot>` for each element of `slots` in sorted order.
+#[verus_spec(result =>
+    ensures
+        tagged(slots@, views(result@)),
+)]
+fn bio_tags(slots: &BTreeSet<String>) -> Vec<String> {
+    let mut tags = Vec::new();
+    tags.push("O".to_owned());
+    let sorted = slots.iter();
+    proof! {
+        lemma_sorted(slots@, vstd::std_specs::iter::IteratorSpec::remaining(&sorted));
+    }
+    #[cfg_attr(verus_only, verus_spec(slot_iter =>
+        invariant
+            sorts(slot_iter.seq().unref(), slots@),
+            views(tags@) == bio(slot_iter.seq().unref(), slot_iter.index()),
+        ensures
+            tagged(slots@, views(tags@)),
+    ))]
+    for slot in sorted {
+        proof! {
+            lemma_tagged(tags@, slot_iter.seq().unref(), slot_iter.index());
+        }
+        tags.push(tag("B-", slot));
+        tags.push(tag("I-", slot));
+    }
+    tags
+}
+
+/// `prefix` followed by `slot`.
+#[verus_spec(tag =>
+    ensures
+        tag@ == prefix@ + slot@,
+)]
+fn tag(prefix: &str, slot: &str) -> String {
+    let mut tag = prefix.to_owned();
+    tag.push_str(slot);
+    tag
 }
 
 verus! {
@@ -316,6 +409,88 @@ pub open spec fn named_once(intents: Seq<Intent>, index: int) -> bool {
 /// True when none of the first `count` intents has the name of the intent at `index`.
 pub open spec fn distinct(intents: Seq<Intent>, index: int, count: int) -> bool {
     forall|earlier: int| 0 <= earlier < count ==> #[trigger] intents[earlier].name@ != intents[index].name@
+}
+
+
+/// The texts of `strings`.
+pub open spec fn views(strings: Seq<String>) -> Seq<Seq<char>> {
+    strings.map_values(|string: String| string@)
+}
+
+/// The names of `intents`.
+pub open spec fn names(intents: Seq<Intent>) -> Seq<Seq<char>> {
+    intents.map_values(|intent: Intent| intent.name@)
+}
+
+/// True when `tags` is `bio` of the elements of `slots` in sorted order.
+pub open spec fn tagged(slots: Set<String>, tags: Seq<Seq<char>>) -> bool {
+    exists|sorted: Seq<String>| #[trigger] sorts(sorted, slots) && tags == bio(sorted, sorted.len() as int)
+}
+
+/// True when `sorted` has the elements of `slots` in increasing order.
+pub open spec fn sorts(sorted: Seq<String>, slots: Set<String>) -> bool {
+    &&& sorted.to_set() == slots
+    &&& forall|first: int, second: int| 0 <= first < second < sorted.len()
+        ==> vstd::std_specs::cmp::OrdSpec::cmp_spec(&#[trigger] sorted[first], &#[trigger] sorted[second]) is Less
+}
+
+/// Pushing the name of the intent at `index` extends the labels of the first `index` intents.
+proof fn lemma_named(labels: Seq<String>, intents: Seq<Intent>, index: int)
+    requires
+        0 <= index < intents.len(),
+        views(labels) == seq!["unknown"@] + names(intents.take(index)),
+    ensures
+        views(labels.push(intents[index].name)) == seq!["unknown"@] + names(intents.take(index + 1)),
+{
+    let name = intents[index].name;
+    assert(names(intents.take(index + 1)) =~= names(intents.take(index)).push(name@));
+    assert(views(labels.push(name)) =~= views(labels).push(name@));
+    assert(seq!["unknown"@] + names(intents.take(index + 1))
+        =~= (seq!["unknown"@] + names(intents.take(index))).push(name@));
+}
+
+/// The keys of a `BTreeSet` iterator sort the elements of its set.
+proof fn lemma_sorted(slots: Set<String>, keys: Seq<&String>)
+    requires
+        keys.unref().to_set() == slots,
+        vstd::std_specs::btree::increasing_seq(keys),
+    ensures
+        sorts(keys.unref(), slots),
+{
+    assert(vstd::laws_cmp::obeys_cmp::<&String>());
+    assert forall|first: int, second: int| 0 <= first < second < keys.len()
+        implies vstd::std_specs::cmp::OrdSpec::cmp_spec(&#[trigger] keys.unref()[first], &#[trigger] keys.unref()[second]) is Less by {
+        assert(vstd::std_specs::cmp::OrdSpec::cmp_spec(&keys[first], &keys[second]) is Less);
+    }
+}
+
+/// Pushing the tags of the slot at `count` extends the tags of the first `count` slots.
+proof fn lemma_tagged(tags: Seq<String>, sorted: Seq<String>, count: int)
+    requires
+        0 <= count < sorted.len(),
+        views(tags) == bio(sorted, count),
+    ensures
+        forall|begin: String, inside: String|
+            begin@ == "B-"@ + sorted[count]@ && inside@ == "I-"@ + sorted[count]@
+            ==> views(#[trigger] tags.push(begin).push(inside)) == bio(sorted, count + 1),
+{
+    assert forall|begin: String, inside: String|
+        begin@ == "B-"@ + sorted[count]@ && inside@ == "I-"@ + sorted[count]@
+        implies views(#[trigger] tags.push(begin).push(inside)) == bio(sorted, count + 1) by {
+        assert(views(tags.push(begin).push(inside)) =~= views(tags) + seq![begin@, inside@]);
+    }
+}
+
+/// `O`, then `B-<slot>` and `I-<slot>` for each of the first `count` slots of `sorted`.
+pub open spec fn bio(sorted: Seq<String>, count: int) -> Seq<Seq<char>>
+    decreases count,
+{
+    if count <= 0 {
+        seq!["O"@]
+    } else {
+        let slot = sorted[count - 1]@;
+        bio(sorted, count - 1) + seq!["B-"@ + slot, "I-"@ + slot]
+    }
 }
 
 } // verus!
@@ -416,5 +591,19 @@ mod tests {
     fn ac_3_2b_3_template_parse_error_names_intent() {
         let result = validate(|intents| intents[5].entity = Some("{{ weather".to_owned()));
         assert_eq!(result, Err(CatalogError::Template("weather".to_owned())));
+    }
+
+    /// AC-3.2c-1.
+    #[test]
+    fn ac_3_2c_1_tags_are_o_then_bio_of_sorted_slots() {
+        let expected = ["O", "B-area", "I-area", "B-show", "I-show"];
+        assert_eq!(tags(&catalog()), expected);
+    }
+
+    /// AC-3.2c-2.
+    #[test]
+    fn ac_3_2c_2_labels_are_unknown_then_intent_names() {
+        let expected = "unknown lights_on fan_on climate_down tv_show temperature_query weather";
+        assert_eq!(labels(&catalog()).join(" "), expected);
     }
 }
