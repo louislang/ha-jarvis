@@ -18,6 +18,7 @@ pub mod domain {
     pub mod intent;
     pub mod state;
     pub mod state_cache;
+    pub mod training;
 }
 
 pub mod ports;
@@ -48,6 +49,8 @@ pub struct Config {
     pub device: Device,
     /// Home Assistant connection.
     pub ha: HaConfig,
+    /// Training.
+    pub train: TrainConfig,
 }
 
 impl Config {
@@ -79,6 +82,11 @@ impl Config {
                 "{name} = {value} is out of range: it must be more than 0"
             );
         }
+        let holdout = self.train.holdout;
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&holdout),
+            "train.holdout = {holdout} is out of range: it must be in [0, 1]"
+        );
         Ok(())
     }
 
@@ -116,6 +124,14 @@ pub struct HaConfig {
     pub request_timeout_ms: u64,
     /// Time between two pings.
     pub ping_interval_s: u64,
+}
+
+/// The `[train]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TrainConfig {
+    /// The share of the examples in the held-out split.
+    pub holdout: f64,
 }
 
 /// Secrets from the environment variables that [`Config`] names.
@@ -181,6 +197,7 @@ mod tests {
                 request_timeout_ms: 5000,
                 ping_interval_s: 30,
             },
+            train: TrainConfig { holdout: 0.1 },
         };
         assert_eq!(Config::parse(VALID)?, expected);
         Ok(())
