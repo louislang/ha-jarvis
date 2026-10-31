@@ -38,6 +38,11 @@ ignore = ["COM812", "ISC001", "D203", "D213"]
 [tool.ruff.lint.mccabe]
 max-complexity = 10
 
+[tool.coverage.run]
+# Measure every production module, also one that no test imports, and not the tests.
+source = ["."]
+omit = ["test_*.py"]
+
 [[tool.mypy.overrides]]
 # These packages have no type information.
 module = ["onnxruntime", "onnxruntime.*", "runpod", "runpod.*"]
