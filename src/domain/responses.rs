@@ -1,10 +1,20 @@
-//! Response pools: select and record use.
+//! Response pools: select, render, record use and validation.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
+use minijinja::Environment;
+use minijinja::UndefinedBehavior;
+use minijinja::value::Serde;
 use rand::Rng;
 use rand::rngs::StdRng;
+use serde_json::Value;
 use vstd::prelude::*;
+
+use crate::domain::catalog;
+use crate::domain::catalog::Catalog;
+use crate::domain::catalog::Kind;
+use crate::domain::catalog::Target;
 
 /// The response pools by pool name.
 pub type Pools = BTreeMap<String, Pool>;
@@ -27,6 +37,26 @@ pub struct Response {
     pub text: String,
     /// The number of times that Jarvis used the response.
     pub uses: u64,
+}
+
+/// A failed pool check.
+#[verus_verify]
+#[must_use]
+#[derive(Clone, Debug, PartialEq)]
+pub enum PoolError {
+    /// The pool with this name does not exist.
+    Missing(String),
+    /// The pool with this name has no responses.
+    Empty(String),
+    /// A template of the pool with this name does not parse.
+    Template(String),
+    /// A template of a pool uses a variable that the pool does not have.
+    Variable {
+        /// The pool name.
+        pool: String,
+        /// The variable name.
+        variable: String,
+    },
 }
 
 /// The index of a random response of `pool` with the lowest use count, other than the last
@@ -130,6 +160,145 @@ pub fn record_use(mut pools: Pools, name: &str, index: usize) -> Pools {
     pools
 }
 
+/// `template` rendered with the variables of `context`. An undefined value is an error.
+///
+/// # Errors
+///
+/// `template` does not parse, or it uses a value that `context` does not have.
+#[verus_verify]
+pub fn render(
+    template: &str,
+    context: &serde_json::Map<String, Value>,
+) -> Result<String, minijinja::Error> {
+    let mut environment = Environment::new();
+    environment.set_undefined_behavior(UndefinedBehavior::Strict);
+    // Without debug mode, an undefined error does not name the variable.
+    environment.set_debug(true);
+    environment.render_str(template, Serde(context))
+}
+
+/// Checks that each intent of `catalog` and each required pool has a pool, and that each pool has
+/// responses whose templates parse and use only the variables of the pool.
+///
+/// # Errors
+///
+/// The first check that fails.
+#[verus_spec(result =>
+    ensures
+        result is Ok ==> valid_pools(pools@, *catalog),
+)]
+pub fn validate_pools(pools: &Pools, catalog: &Catalog) -> Result<(), PoolError> {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= catalog.intents@.len(),
+            pooled(pools@, *catalog, index as int),
+        decreases catalog.intents@.len() - index,
+    ))]
+    while index < catalog.intents.len() {
+        require(pools, catalog.intents[index].name.as_str())?;
+        index += 1;
+    }
+    require(pools, "filler")?;
+    require(pools, "failure")?;
+    require(pools, "fallback")?;
+    check_pools(pools, catalog)
+}
+
+/// Checks each pool of `pools` with `check_pool`.
+#[verus_spec(result =>
+    ensures
+        result is Ok ==> filled(pools@),
+)]
+fn check_pools(pools: &Pools, catalog: &Catalog) -> Result<(), PoolError> {
+    let entries = pools.iter();
+    proof_decl! {
+        let ghost all = vstd::std_specs::iter::IteratorSpec::remaining(&entries);
+    }
+    #[cfg_attr(verus_only, verus_spec(entry_iter =>
+        invariant
+            entry_iter.seq() == all,
+            forall|name: String| #[trigger] pools@.contains_key(name) ==> all.contains((&name, &pools@[name])),
+            forall|seen: int| 0 <= seen < entry_iter.index() ==> (#[trigger] all[seen]).1.responses.len() > 0,
+        ensures
+            forall|seen: int| 0 <= seen < all.len() ==> (#[trigger] all[seen]).1.responses.len() > 0,
+    ))]
+    for (name, pool) in entries {
+        check_pool(name, pool, catalog)?;
+    }
+    Ok(())
+}
+
+/// Checks that `pools` has the pool `name`.
+#[verus_spec(result =>
+    ensures
+        result is Ok ==> pools@.contains_key(crate::domain::contracts::string_key(name@)),
+)]
+fn require(pools: &Pools, name: &str) -> Result<(), PoolError> {
+    if pools.contains_key(name) {
+        Ok(())
+    } else {
+        Err(PoolError::Missing(name.to_owned()))
+    }
+}
+
+/// Checks that the pool `name` has responses whose templates parse and use only its variables.
+#[verus_spec(result =>
+    ensures
+        result is Ok ==> pool.responses.len() > 0,
+)]
+fn check_pool(name: &str, pool: &Pool, catalog: &Catalog) -> Result<(), PoolError> {
+    if pool.responses.is_empty() {
+        return Err(PoolError::Empty(name.to_owned()));
+    }
+    let allowed = variables(name, catalog);
+    for response in &pool.responses {
+        check_template(name, response.text.as_str(), &allowed)?;
+    }
+    Ok(())
+}
+
+/// The template variables of the pool `name`: none when no intent of `catalog` has the name.
+#[verus_verify]
+fn variables(name: &str, catalog: &Catalog) -> BTreeSet<String> {
+    let mut variables = BTreeSet::new();
+    let Some(intent) = catalog
+        .intents
+        .iter()
+        .find(|intent| intent.name.as_str() == name)
+    else {
+        return variables;
+    };
+    catalog::insert_slots(intent, &mut variables);
+    for key in intent.habit_defaults.keys() {
+        variables.insert(key.clone());
+    }
+    variables.insert("area".to_owned());
+    if intent.target == Target::Entity {
+        variables.insert("entity".to_owned());
+    }
+    if intent.kind == Kind::Fetch {
+        variables.insert("response".to_owned());
+    }
+    if intent.needs_speaker {
+        variables.insert("person".to_owned());
+    }
+    variables
+}
+
+/// Checks that `template` of the pool `pool` parses and uses only `allowed` variables.
+#[verus_verify]
+fn check_template(pool: &str, template: &str, allowed: &BTreeSet<String>) -> Result<(), PoolError> {
+    match catalog::unknown_variable(template, allowed) {
+        Err(_) => Err(PoolError::Template(pool.to_owned())),
+        Ok(Some(variable)) => Err(PoolError::Variable {
+            pool: pool.to_owned(),
+            variable,
+        }),
+        Ok(None) => Ok(()),
+    }
+}
+
 verus! {
 
 broadcast use {
@@ -139,6 +308,27 @@ broadcast use {
     crate::domain::contracts::axiom_string_maps_borrowed_key,
     crate::domain::contracts::axiom_string_removes_borrowed_key,
 };
+
+/// True when each intent of `catalog` before `count` has a pool in `pools`.
+pub open spec fn pooled(pools: Map<String, Pool>, catalog: Catalog, count: int) -> bool {
+    forall|index: int| 0 <= index < count
+        ==> pools.contains_key(crate::domain::contracts::string_key(#[trigger] catalog.intents@[index].name@))
+}
+
+/// True when each intent of `catalog` has a pool, the `filler`, `failure` and `fallback` pools
+/// exist, and each pool has one or more responses.
+pub open spec fn valid_pools(pools: Map<String, Pool>, catalog: Catalog) -> bool {
+    &&& pooled(pools, catalog, catalog.intents@.len() as int)
+    &&& pools.contains_key(crate::domain::contracts::string_key("filler"@))
+    &&& pools.contains_key(crate::domain::contracts::string_key("failure"@))
+    &&& pools.contains_key(crate::domain::contracts::string_key("fallback"@))
+    &&& filled(pools)
+}
+
+/// True when each pool of `pools` has one or more responses.
+pub open spec fn filled(pools: Map<String, Pool>) -> bool {
+    forall|name: String| #[trigger] pools.contains_key(name) ==> pools[name].responses.len() > 0
+}
 
 /// True when `select` can give the response at `index` of `pool`.
 pub open spec fn allowed(pool: Pool, index: int) -> bool {
@@ -269,6 +459,53 @@ mod tests {
 
     use super::*;
 
+    /// The pools of the repository.
+    const RESPONSES: &str = include_str!("../../responses.toml");
+
+    /// The intent catalog of the repository.
+    const INTENTS: &str = include_str!("../../intents.toml");
+
+    /// The result of `validate_pools` for the repository files after `change`.
+    fn validate(change: impl FnOnce(&mut Pools, &mut Catalog)) -> Result<(), PoolError> {
+        let file: toml::Table = toml::from_str(RESPONSES).expect("responses.toml is TOML");
+        let mut pools = Pools::new();
+        for (name, pool) in file["pools"].as_table().expect("pools is a table") {
+            let texts = pool["responses"].as_array().expect("responses is an array");
+            let responses = texts.iter().map(|text| Response {
+                text: text.as_str().expect("a response is a string").to_owned(),
+                uses: 0,
+            });
+            let pool = Pool {
+                responses: responses.collect(),
+                last: None,
+            };
+            pools.insert(name.clone(), pool);
+        }
+        let mut catalog = toml::from_str(INTENTS).expect("intents.toml is a catalog");
+        change(&mut pools, &mut catalog);
+        validate_pools(&pools, &catalog)
+    }
+
+    /// Sets the responses of the pool `name` of `pools` to `texts`.
+    fn set(pools: &mut Pools, name: &str, texts: &[&str]) {
+        let pool = pools.get_mut(name).expect("the pool exists");
+        pool.responses = texts
+            .iter()
+            .map(|text| Response {
+                text: (*text).to_owned(),
+                uses: 0,
+            })
+            .collect();
+    }
+
+    /// The error of a template of the pool `pool` that uses `variable`.
+    fn unknown(pool: &str, variable: &str) -> Result<(), PoolError> {
+        Err(PoolError::Variable {
+            pool: pool.to_owned(),
+            variable: variable.to_owned(),
+        })
+    }
+
     /// A pool with one response for each of `uses` and the last response `last`.
     fn pool(uses: &[u64], last: Option<usize>) -> Pool {
         let responses: Vec<Response> = uses
@@ -339,5 +576,85 @@ mod tests {
     #[test]
     fn ac_4_1_5_one_response_is_selected() {
         assert_eq!(selected(&pool(&[3], Some(0)), 0..20), [0; 20]);
+    }
+
+    /// AC-4.2-1.
+    #[test]
+    fn ac_4_2_1_render_substitutes_area() {
+        let context = serde_json::Map::from_iter([("area".to_owned(), Value::from("kitchen"))]);
+        let text = render("Powering up the {{ area }} lights.", &context);
+        assert_eq!(
+            text.ok().as_deref(),
+            Some("Powering up the kitchen lights.")
+        );
+    }
+
+    /// AC-4.2-2.
+    #[test]
+    fn ac_4_2_2_undefined_variable_names_it() {
+        let context = serde_json::Map::from_iter([("area".to_owned(), Value::from("kitchen"))]);
+        let result = render("Playing {{ show }} in the {{ area }}.", &context);
+        let error = result.expect_err("show is undefined").to_string();
+        assert!(error.contains("`show`"), "{error}");
+    }
+
+    /// AC-4.2-3.
+    #[test]
+    fn ac_4_2_3_intent_without_pool_names_intent() {
+        assert_eq!(validate(|_, _| {}), Ok(()));
+        let result = validate(|pools, _| _ = pools.remove("fan_on"));
+        assert_eq!(result, Err(PoolError::Missing("fan_on".to_owned())));
+    }
+
+    /// AC-4.2-4.
+    #[test]
+    fn ac_4_2_4_template_syntax_error_names_pool() {
+        let result = validate(|pools, _| set(pools, "tv_show", &["Playing {{ show"]));
+        assert_eq!(result, Err(PoolError::Template("tv_show".to_owned())));
+    }
+
+    /// AC-4.2-5.
+    #[test]
+    fn ac_4_2_5_missing_required_pool_names_it() {
+        for name in ["filler", "failure", "fallback"] {
+            let result = validate(|pools, _| _ = pools.remove(name));
+            assert_eq!(result, Err(PoolError::Missing(name.to_owned())));
+        }
+    }
+
+    /// AC-4.2-6.
+    #[test]
+    fn ac_4_2_6_unknown_variable_names_pool_and_variable() {
+        let result = validate(|pools, _| set(pools, "tv_show", &["{{ show }} in {{ season }}."]));
+        assert_eq!(result, unknown("tv_show", "season"));
+        let result = validate(|pools, catalog| {
+            let speed = ("speed".to_owned(), "fan.set_percentage".to_owned());
+            catalog.intents[1].habit_defaults.extend([speed]);
+            catalog.intents[1].needs_speaker = true;
+            set(
+                pools,
+                "fan_on",
+                &["{{ speed }} {{ area }} {{ entity }} {{ person }}"],
+            );
+        });
+        assert_eq!(result, Ok(()));
+    }
+
+    /// AC-4.2-7.
+    #[test]
+    fn ac_4_2_7_empty_pool_names_pool() {
+        let result = validate(|pools, _| set(pools, "fallback", &[]));
+        assert_eq!(result, Err(PoolError::Empty("fallback".to_owned())));
+    }
+
+    /// AC-4.2-8.
+    #[test]
+    fn ac_4_2_8_unavailable_built_in_names_pool_and_variable() {
+        let result = validate(|pools, _| set(pools, "lights_on", &["{{ entity.state }}"]));
+        assert_eq!(result, unknown("lights_on", "entity"));
+        let result = validate(|pools, _| set(pools, "fan_on", &["{{ response }}"]));
+        assert_eq!(result, unknown("fan_on", "response"));
+        let result = validate(|pools, _| set(pools, "filler", &["One moment, {{ area }}."]));
+        assert_eq!(result, unknown("filler", "area"));
     }
 }
