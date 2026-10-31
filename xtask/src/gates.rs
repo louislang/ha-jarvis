@@ -409,6 +409,17 @@ fn branchy_function() -> String {
     )
 }
 
+/// Runs `xtask complexity` on `path`, built in its own target folder.
+fn complexity_gate(path: &Path) -> Output {
+    let target = TempDir::new().expect("a temporary folder");
+    run(Command::new("cargo")
+        .args(["run", "--quiet", "--package", "xtask", "--target-dir"])
+        .arg(target.path())
+        .args(["--", "complexity"])
+        .arg(path)
+        .current_dir(root()))
+}
+
 /// Writes `source` to a temporary folder as `name`.
 fn fixture_file(name: &str, source: &str) -> TempDir {
     let folder = TempDir::new().expect("a temporary folder");
@@ -711,13 +722,7 @@ fn ac_0_2_7_check_and_ci_run_lint_gates() {
 #[test]
 fn ac_0_3_8_complexity_fails_branchy_function() {
     let fixture = fixture_file("branchy.rs", &branchy_function());
-    let target = TempDir::new().expect("a temporary folder");
-    let output = run(Command::new("cargo")
-        .args(["run", "--quiet", "--package", "xtask", "--target-dir"])
-        .arg(target.path())
-        .args(["--", "complexity"])
-        .arg(fixture.path().join("branchy.rs"))
-        .current_dir(root()));
+    let output = complexity_gate(&fixture.path().join("branchy.rs"));
     let report = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         output.status.code(),
@@ -1626,4 +1631,149 @@ fn ac_2_8c_2_bench_runs_on_linux() {
     );
     let condition = serde_json::json!(["if", ["==", ["call", "os"], "linux"], "just bench", ""]);
     assert_check_has_line(&condition);
+}
+
+/// The first lines of a Python fixture: the copyright notice that `CPY001` requires and the module docstring.
+const PYTHON_HEADER: &str = "# Copyright 2026 Louis Lang\n\"\"\"Fixture.\"\"\"\n\n\n";
+
+/// A Python fixture function without type annotations.
+const UNANNOTATED: &str = r#"def double(value):
+    """Double `value`."""
+    return value * 2
+"#;
+
+/// A Python fixture function that returns a type other than its annotation.
+const WRONG_RETURN_TYPE: &str = r#"def double(value: int) -> str:
+    """Double `value`."""
+    return value * 2
+"#;
+
+/// A Python fixture with a private function without a docstring, which `ruff` does not report.
+const UNDOCUMENTED_PRIVATE: &str = r#"def double(value: int) -> int:
+    """Double `value`."""
+    return _twice(value)
+
+
+def _twice(value: int) -> int:
+    return value * 2
+
+
+__all__ = ["double"]
+"#;
+
+/// A Python fixture function that is not used.
+const UNUSED_PYTHON_FUNCTION: &str = r#"def unused() -> int:
+    """Return one."""
+    return 1
+"#;
+
+/// Runs the `python` recipe on a copy of `train/pyproject.toml` and a fixture module with `body`.
+fn python_gate(body: &str) -> Output {
+    let folder = TempDir::new().expect("a temporary folder");
+    let train = folder.path().join("train");
+    fs::create_dir(&train).expect("the train folder is made");
+    fs::copy(
+        root().join("train/pyproject.toml"),
+        train.join("pyproject.toml"),
+    )
+    .expect("pyproject.toml is copied");
+    fs::write(train.join("fixture.py"), format!("{PYTHON_HEADER}{body}"))
+        .expect("the fixture is written");
+    recipe_in(folder.path(), "python")
+}
+
+/// Checks that `output` is a failure whose tool output has `text`.
+fn assert_python_fails_with(output: &Output, text: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !output.status.success() && stdout.contains(text),
+        "python fails with {text}, its output is: {stdout}"
+    );
+}
+
+/// A Python fixture with four functions. Each is above one limit of `xtask complexity`.
+fn python_metrics_fixture() -> String {
+    let numbers: Vec<String> = (1..=48)
+        .map(|number| format!("        {number},\n"))
+        .collect();
+    let branches: Vec<String> = (1..=10)
+        .map(|branch| format!("    if value == {branch}:\n        return {branch}\n"))
+        .collect();
+    let products: Vec<String> = (1..=40)
+        .map(|factor| format!("    total = total * {factor} + {factor}\n"))
+        .collect();
+    let sums = "    total = total + total\n".repeat(15);
+    format!(
+        "def long() -> list[int]:\n    return [\n{}    ]\n\n\
+         def branchy(value: int) -> int:\n{}    return 0\n\n\
+         def voluminous(total: int) -> int:\n{}    return total\n\n\
+         def difficult(total: int) -> int:\n{sums}    return total\n",
+        numbers.concat(),
+        branches.concat(),
+        products.concat(),
+    )
+}
+
+/// `just python` passes on `train/`, `check` runs `python` after `quint`, and CI runs it.
+#[test]
+fn ac_3_5_3_python_passes() {
+    assert_passes(&recipe_in(root(), "python"));
+    assert_check_and_ci_run_after("quint", "python");
+}
+
+/// `ruff check` fails a function without type annotations, and `mypy` fails a wrong return type.
+#[test]
+fn ac_3_5_4_python_fails_missing_and_wrong_types() {
+    assert_python_fails_with(&python_gate(UNANNOTATED), "ANN001");
+    assert_python_fails_with(&python_gate(WRONG_RETURN_TYPE), "[return-value]");
+}
+
+/// `interrogate` fails a private function without a docstring.
+#[test]
+fn ac_3_5_5_interrogate_fails_missing_docstring() {
+    assert_python_fails_with(&python_gate(UNDOCUMENTED_PRIVATE), "RESULT: FAILED");
+}
+
+/// `vulture` fails a function that is not used and names it.
+#[test]
+fn ac_3_5_6_vulture_fails_unused_function() {
+    assert_python_fails_with(
+        &python_gate(UNUSED_PYTHON_FUNCTION),
+        "unused function 'unused'",
+    );
+}
+
+/// `xtask complexity` fails each Python function above a limit and names it with the metric.
+#[test]
+fn ac_3_5_7_complexity_fails_python_functions() {
+    let fixture = fixture_file("metrics.py", &python_metrics_fixture());
+    let output = complexity_gate(&fixture.path().join("metrics.py"));
+    let report = String::from_utf8_lossy(&output.stdout);
+    let named: Vec<(&str, &str)> = report
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace().skip(1);
+            Some((words.next()?, words.next()?))
+        })
+        .collect();
+    assert_eq!(output.status.code(), Some(1), "the exit code: {report}");
+    assert_eq!(
+        named,
+        [
+            ("long", "loc.ploc"),
+            ("branchy", "cyclomatic.sum"),
+            ("voluminous", "halstead.volume"),
+            ("difficult", "halstead.difficulty"),
+        ]
+    );
+}
+
+/// The `complexity` and `duplication` recipes run on `train`.
+#[test]
+fn ac_3_5_8_complexity_and_duplication_run_on_train() {
+    let justfile = justfile();
+    for recipe in ["complexity", "duplication"] {
+        let body = justfile["recipes"][recipe]["body"].to_string();
+        assert!(body.contains("src xtask train"), "{recipe}: {body}");
+    }
 }

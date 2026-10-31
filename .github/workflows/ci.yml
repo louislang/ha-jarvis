@@ -72,6 +72,10 @@ jobs:
       - run: just install-quint
       - run: just install-quint-evaluator
       - run: just install-verus
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: just install-python
       - run: just cov
 
   bench:
@@ -97,6 +101,19 @@ jobs:
       - run: just install-quint
       - run: just install-quint-evaluator
       - run: just quint
+
+  python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: "1.59.0"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: just install-python
+      - run: just python
 
   verus:
     runs-on: ubuntu-latest
