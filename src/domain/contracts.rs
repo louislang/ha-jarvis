@@ -33,7 +33,9 @@ use crate::domain::state::Snapshot;
 use crate::domain::state::State;
 use crate::domain::state_cache::StateCache;
 use crate::domain::training::Example;
+use crate::domain::training::ExampleFile;
 use crate::domain::training::Label;
+use crate::domain::training::SpanFile;
 use crate::domain::training::TrainingSet;
 use vstd::prelude::*;
 
@@ -140,6 +142,14 @@ pub struct ExExample(Example);
 /// The label of an example.
 #[verifier::external_type_specification]
 pub struct ExLabel(Label);
+
+/// An example in the training set file.
+#[verifier::external_type_specification]
+pub struct ExExampleFile(ExampleFile);
+
+/// One slot value in the text of an example in the training set file.
+#[verifier::external_type_specification]
+pub struct ExSpanFile(SpanFile);
 
 /// A template environment. <https://docs.rs/minijinja/3/minijinja/struct.Environment.html>
 #[verifier::external_type_specification]
