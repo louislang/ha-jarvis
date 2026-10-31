@@ -194,7 +194,7 @@ The interaction record gets the speaker and the source. This sub-phase adds `spe
 **Goal:** Add `needs_speaker`, the `person` template variable, `next_date` and the `ask_person` question. "Add dentist to my calendar for Monday" adds the event to the speaker's calendar.
 
 - **Implements:** G12, G13. **Depends on:** 15.6.
-- **Files:** modify `src/domain/intent.rs`, `src/domain/responses.rs`, `src/domain/decide.rs`, `src/app/conversation.rs`, `intents.toml`, `responses.toml`, `src/lib.rs`, `jarvis.toml`.
+- **Files:** modify `src/domain/catalog.rs`, `src/domain/responses.rs`, `src/domain/decide.rs`, `src/app/conversation.rs`, `intents.toml`, `responses.toml`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.** An intent with `needs_speaker = true` waits up to `speaker.wait_ms` for the embedding, then calls `identify`. The `person` variable has the name and the fields of its `[[people]]` entry. No speaker gives `Ask` from `ask_person`. `next_date(day, plus_days)`: the ISO date of the next `day` (a day name, `today` or `tomorrow`) plus `plus_days`. An empty `day` is today. Another value is an error that gives `Fallback`. This sub-phase adds `speaker.wait_ms`.
 

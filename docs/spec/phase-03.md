@@ -53,42 +53,83 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 ### 3.2 Intent Catalog
 
-**Goal:** Add `intents.toml` and `parse_catalog`, which validates the intents and their seed examples and gives the slot tag list. The catalog is now the single source of the System One labels.
+**Goal:** Add `intents.toml`, the catalog types and `validate_catalog`, which checks the example counts, the example markup and the intent names. The catalog is now the single source of the System One intents.
 
 - **Implements:** G3. **Depends on:** 3.1b.
-- **Files:** create `intents.toml`. Modify `src/domain/intent.rs`.
+- **Files:** create `intents.toml`, `src/domain/catalog.rs`. Modify `src/lib.rs`.
 
 **Model.**
 
-- `Catalog { min_examples, unknown_examples, intents: Vec<Intent> }`. `Intent` has the fields of `01-architecture.md` section 9.
-- `parse_catalog(toml) -> Result<Catalog>` checks:
+- `Catalog { min_examples, unknown_examples, intents: Vec<Intent> }`. `Intent` has the fields of `01-architecture.md` section 9. `examples` are the markup strings. The catalog types derive `Deserialize`.
+- The domain does not read TOML, because `toml` is not a domain crate. The caller parses `intents.toml` with `toml::from_str` (sub-phase 5.4). The tests do the same.
+- `validate_catalog(catalog) -> Result<(), CatalogError>` checks:
   1. Each intent has `min_examples` examples or more.
   2. Each example parses (`parse_example`).
-  3. Each template variable that is not a built-in (`area`, `entity`, `person`, `response`) and not a `habit_defaults` key is tagged in one or more examples of the intent.
-  4. Names are unique, and no name is `unknown`.
-  5. The text of each example (after the markup) equals its `normalize` result.
-- `tags(catalog) -> Vec<String>`: `O`, then `B-<slot>` and `I-<slot>` for each slot name in sorted order.
-- `labels(catalog) -> Vec<String>`: `unknown`, then the intent names in file order.
+  3. Names are unique, and no name is `unknown`.
 - The first `intents.toml` has `lights_on`, `fan_on`, `climate_down`, `tv_show`, `temperature_query` and `weather` from `01-architecture.md` section 9. Sub-phases 11.6, 13.11 and 15.7 add `tv_on`, `start_training` and `calendar_add`.
 
 **Acceptance criteria.**
 
-- AC-3.2-1: When `intents.toml` is parsed, the result has every intent in the file.
-- AC-3.2-2: When an intent has fewer than `min_examples` examples, the parse returns an error that contains the intent name.
-- AC-3.2-3: When an example has a markup error, the parse returns an error that contains the intent name.
-- AC-3.2-4: When a template uses a slot that no example of the intent tags, the parse returns an error that contains the slot name. A `habit_defaults` key and a built-in variable give no error.
-- AC-3.2-5: When two intents have the same name, the parse returns an error that contains the name.
-- AC-3.2-6: When an intent is named `unknown`, the parse returns an error.
-- AC-3.2-7: When the slots are `show` and `area`, `tags` returns `O, B-area, I-area, B-show, I-show`.
-- AC-3.2-8: When `labels` runs, the first label is `unknown` and the others are the intent names in file order.
-- AC-3.2-9: When the text of an example is not normalized (for example it has a capital letter or a comma), the parse returns an error that contains the example.
+- AC-3.2-1: When `intents.toml` is parsed, the catalog has every intent in the file, and `validate_catalog` returns `Ok`.
+- AC-3.2-2: When an intent has fewer than `min_examples` examples, `validate_catalog` returns an error that contains the intent name.
+- AC-3.2-3: When an example has a markup error, `validate_catalog` returns an error that contains the intent name.
+- AC-3.2-5: When two intents have the same name, `validate_catalog` returns an error that contains the name.
+- AC-3.2-6: When an intent is named `unknown`, `validate_catalog` returns an error.
 
 **Proofs.**
 
-- P-3.2-2 to P-3.2-6, P-3.2-9. Ensures: `parse_catalog` returns `Ok` if and only if checks 1 to 5 pass. Argument: the function runs the five checks in sequence and returns the first `Err`. Each check is a `for` loop over a finite list with one comparison.
-- P-3.2-7 (AC-3.2-7). Ensures: `tags` is determined by the set of slot names. Argument: the slot names go into a `BTreeSet`, which iterates in sorted order. The output is `O` followed by two entries for each element.
-- P-3.2-8 (AC-3.2-8). Ensures: `labels(c) = [unknown] ++ names(c.intents)`, in file order. Argument: `labels` prepends `unknown` to a map over the intent list, which keeps the order.
+- P-3.2-2, P-3.2-3, P-3.2-5, P-3.2-6. Ensures: `validate_catalog` returns `Ok` if and only if checks 1 to 3 pass. Argument: the function runs the checks in sequence and returns the first `Err`. Each check is a `for` loop over a finite list with one comparison.
 - P-3.2-1. Evidence: test.
+
+---
+
+### 3.2b Template Slots and Normalized Examples
+
+**Goal:** Add two checks to `validate_catalog`: every template variable comes from a slot, and every example is normalized.
+
+- **Implements:** G3. **Depends on:** 3.2.
+- **Files:** modify `src/domain/catalog.rs`, `Cargo.toml`.
+
+**Model.**
+
+- This sub-phase adds `minijinja` (`01-architecture.md` section 7). Sub-phase 4.2 uses the same crate.
+- `validate_catalog` adds these checks:
+  4. Each variable of a template (the `entity` field and the `data` values) that is not a built-in (`area`, `entity`, `person`, `response`) and not a `habit_defaults` key is tagged in one or more examples of the intent. The check gets the variables from `minijinja` `undeclared_variables` and collects them into a `BTreeSet`. A template that does not parse gives an error.
+  5. The text of each example (after the markup) equals its `normalize` result.
+
+**Acceptance criteria.**
+
+- AC-3.2b-1: When a template uses a slot that no example of the intent tags, `validate_catalog` returns an error that contains the slot name. A `habit_defaults` key and a built-in variable give no error.
+- AC-3.2b-2: When the text of an example is not normalized (for example it has a capital letter or a comma), `validate_catalog` returns an error that contains the example.
+- AC-3.2b-3: When a template does not parse, `validate_catalog` returns an error that contains the intent name.
+
+**Proofs.**
+
+- P-3.2b-1 to P-3.2b-3. Ensures: `validate_catalog` returns `Ok` if and only if checks 1 to 5 pass and every template parses. Argument: the function runs the checks in sequence and returns the first `Err`. Each check is a `for` loop over a finite list.
+
+---
+
+### 3.2c Labels and Tags
+
+**Goal:** Add `labels` and `tags`. The catalog is now the single source of the System One labels.
+
+- **Implements:** G3. **Depends on:** 3.2b.
+- **Files:** modify `src/domain/catalog.rs`.
+
+**Model.**
+
+- `tags(catalog) -> Vec<String>`: `O`, then `B-<slot>` and `I-<slot>` for each slot name in sorted order.
+- `labels(catalog) -> Vec<String>`: `unknown`, then the intent names in file order.
+
+**Acceptance criteria.**
+
+- AC-3.2c-1: When the slots are `show` and `area`, `tags` returns `O, B-area, I-area, B-show, I-show`.
+- AC-3.2c-2: When `labels` runs, the first label is `unknown` and the others are the intent names in file order.
+
+**Proofs.**
+
+- P-3.2c-1 (AC-3.2c-1). Ensures: `tags` is determined by the set of slot names. Argument: the slot names go into a `BTreeSet`, which iterates in sorted order. The output is `O` followed by two entries for each element.
+- P-3.2c-2 (AC-3.2c-2). Ensures: `labels(c) = [unknown] ++ names(c.intents)`, in file order. Argument: `labels` prepends `unknown` to a map over the intent list, which keeps the order.
 
 ---
 
@@ -96,7 +137,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 **Goal:** Add the training set types and `seed_set`, which turns the seed examples into labeled examples with a model context. This fixes the JSON contract between Jarvis and the training script.
 
-- **Implements:** G3, G16. **Depends on:** 3.2.
+- **Implements:** G3, G16. **Depends on:** 3.2c.
 - **Files:** create `src/domain/training.rs`. Modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
 
 **Model.**
@@ -126,7 +167,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - P-3.3-1, P-3.3-2. Ensures: the result is `area: <area or none> | habits: <lines joined by "; " or none>`. Argument: `context_text` is a `format!` with two branches for empty values.
 - P-3.3-3 (AC-3.3-3). Ensures: the same areas and the same seed give the same context. Argument: `sample_context` reads only `rng` and `areas`. A seeded RNG gives the same sequence.
 - P-3.3-4 (AC-3.3-4). Ensures: the number of examples is the number of seed examples plus the number of unknown seeds. Argument: `seed_set` maps each seed example to one example and each unknown seed to one example, then concatenates. Map keeps length.
-- P-3.3-5. Ensures: the labels equal `labels(catalog)` and the tags equal `tags(catalog)`. Argument: `seed_set` calls `labels` and `tags` (P-3.2-7, P-3.2-8).
+- P-3.3-5. Ensures: the labels equal `labels(catalog)` and the tags equal `tags(catalog)`. Argument: `seed_set` calls `labels` and `tags` (P-3.2c-1, P-3.2c-2).
 - P-3.3-7 (AC-3.3-7). Ensures: a byte span `[b, e)` becomes the character span `[chars(text[..b]), chars(text[..e]))`, and the reader gives the byte span back. Argument: the writer counts the characters before each byte offset, and the reader counts the bytes of that many characters. `é` is 2 bytes and 1 character, so the end 13 becomes 12.
 - P-3.3-6. Evidence: test (`serde_json`).
 - P-3.3-8. Ensures: `held_out(t, h)` depends only on `normalize(t)` and `h`. Argument: `xxh3` with a fixed seed is a pure function, and `normalize` is pure.

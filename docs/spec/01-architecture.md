@@ -286,7 +286,8 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/ports.rs` | Ports | All port traits and their data types. | 2.1 |
 | `src/domain/contracts.rs` | Domain | Trusted Verus contracts and axioms for the `std` and domain crate functions that the domain calls. | 0.18 |
 | `src/domain/state.rs` | Domain | Hot cache data and queries. | 2.1 |
-| `src/domain/intent.rs` | Domain | Normalize, example markup, catalog parse and validation, tag list. | 3.1 |
+| `src/domain/intent.rs` | Domain | Normalize and example markup. | 3.1 |
+| `src/domain/catalog.rs` | Domain | Intent catalog types and validation, labels, tag list. | 3.2 |
 | `src/domain/training.rs` | Domain | Training set, context samples, held-out split, accuracy, accept rule, change count. | 3.3 |
 | `src/domain/model.rs` | Domain | Softmax, BIO decode, prediction ranking. | 3.11 |
 | `src/domain/responses.rs` | Domain | Pools: select, render, record use, backfill policy, validation. | 4.1 |
