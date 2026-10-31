@@ -15,6 +15,7 @@ from torch.nn import functional
 from transformers import (
     AutoModel,
     AutoTokenizer,
+    BatchEncoding,
     PreTrainedModel,
     PreTrainedTokenizerFast,
 )
@@ -195,20 +196,11 @@ def load_tokenizer(base_model: str) -> PreTrainedTokenizerFast:
     return load(base_model)
 
 
-def encode(
-    tokenizer: PreTrainedTokenizerFast,
-    training_set: TrainingSet,
-    examples: list[Example],
-    device: str,
-) -> tuple[list[torch.Tensor], Batch]:
-    """Give the model inputs in `INPUTS` order and the targets of `examples`."""
-    encoding = tokenizer(
-        [example["context"] for example in examples],
-        [example["text"] for example in examples],
-        padding=True,
-        return_offsets_mapping=True,
-        return_tensors="pt",
-    ).to(device)
+def targets(
+    training_set: TrainingSet, examples: list[Example], encoding: BatchEncoding
+) -> Batch:
+    """Give the label, the `not` flag and the token tags of each of `examples`."""
+    device = encoding["input_ids"].device
     rows = zip(
         examples, encoding["offset_mapping"], encoding["token_type_ids"], strict=True
     )
@@ -219,12 +211,32 @@ def encode(
         for example, offsets, segments in rows
     ]
     labels = [training_set["labels"].index(named_label(e)) for e in examples]
-    targets: Batch = {
+    return {
         "labels": torch.tensor(labels, device=device),
         "negated": torch.tensor(["not" in e for e in examples], device=device),
         "tags": torch.tensor(tags, device=device),
     }
-    return [encoding[name] for name in INPUTS], targets
+
+
+def encode(
+    tokenizer: PreTrainedTokenizerFast,
+    training_set: TrainingSet,
+    examples: list[Example],
+    model: JointModel,
+) -> tuple[list[torch.Tensor], Batch]:
+    """Give the model inputs in `INPUTS` order and the targets of `examples`."""
+    encoding = tokenizer(
+        [example["context"] for example in examples],
+        [example["text"] for example in examples],
+        padding=True,
+        # Longer pairs exceed the position embeddings of the encoder.
+        truncation=True,
+        max_length=model.base.config.max_position_embeddings,
+        return_offsets_mapping=True,
+        return_tensors="pt",
+    ).to(model.intent_head.weight.device)
+    inputs = [encoding[name] for name in INPUTS]
+    return inputs, targets(training_set, examples, encoding)
 
 
 def limit_vram(device: str, max_vram_gb: float | None) -> None:
@@ -246,7 +258,7 @@ def train(
     optimizer = torch.optim.AdamW(model.parameters())
     examples, batch_size = training_set["examples"], training_set["batch_size"]
     batches = [
-        encode(tokenizer, training_set, examples[start : start + batch_size], device)
+        encode(tokenizer, training_set, examples[start : start + batch_size], model)
         for start in range(0, len(examples), batch_size)
     ]
     epochs = training_set["epochs"]
@@ -268,14 +280,12 @@ def export(
 ) -> None:
     """Write `model.onnx`, `tokenizer.json` and `labels.json` to the folder `out`."""
     out.mkdir(parents=True, exist_ok=True)
-    example = training_set["examples"][0]
-    sample = tokenizer(example["context"], example["text"], return_tensors="pt")
-    sample = sample.to(model.intent_head.weight.device)
+    inputs, _ = encode(tokenizer, training_set, training_set["examples"][:1], model)
     axes = {name: {0: "batch", 1: "sequence"} for name in [*INPUTS, "slot_logits"]}
     model.eval()
     torch.onnx.export(
         model,
-        tuple(sample[name] for name in INPUTS),
+        tuple(inputs),
         out / "model.onnx",
         input_names=INPUTS,
         output_names=["intent_logits", "slot_logits"],
