@@ -388,7 +388,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - **Implements:** G16, G17. **Depends on:** 3.9.
 - **Files:** create `train/Dockerfile`. Modify `.github/workflows/release.yml`, `xtask/src/gates.rs`.
 
-**Model.** The image starts from a CUDA 12 PyTorch base, installs `./train` (runtime packages only) and runs `python train.py`. Sub-phase 13.8 changes the command to `python train.py --serve`. The release job `train-image` builds it and pushes `ghcr.io/<owner>/jarvis-train:<tag>`.
+**Model.** The image starts from a Python 3.12 base and installs `./train` (runtime packages only). The pinned `torch` wheel brings CUDA 12 through its `nvidia-*-cu12` packages, the same install as the GPU host. No CUDA 12 PyTorch base image has Python 3.12 with the pinned `torch`. The image and runs `python train.py`. Sub-phase 13.8 changes the command to `python train.py --serve`. The release job `train-image` builds it and pushes `ghcr.io/<owner>/jarvis-train:<tag>`.
 
 **Acceptance criteria.**
 
