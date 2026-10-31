@@ -1918,3 +1918,62 @@ fn ac_3_9_6_source_change_keeps_model() {
     fs::write(repository.path().join("src/lib.rs"), "changed").expect("the source is written");
     assert_eq!(fixture_stale(repository.path()), (Some(1), hash));
 }
+
+/// `train-image` builds the image after CI, pushes it, then inspects its manifest.
+#[test]
+fn ac_3_10_1_train_image_is_pushed_and_inspected() {
+    let release = yaml(".github/workflows/release.yml");
+    let job = &release["jobs"]["train-image"];
+    assert_eq!(job["needs"].as_str(), Some("ci"));
+    assert_eq!(
+        job["env"]["IMAGE"].as_str(),
+        Some("ghcr.io/${{ github.repository_owner }}/jarvis-train:${{ github.ref_name }}")
+    );
+    let runs = runs(&release, "train-image");
+    let position = |command: &str| runs.iter().position(|run| run.contains(command));
+    let order = [
+        position("docker build"),
+        position("docker push \"$IMAGE\""),
+        position("docker manifest inspect \"$IMAGE\""),
+    ];
+    assert!(
+        order.iter().all(Option::is_some) && order.is_sorted(),
+        "train-image builds, pushes, then inspects: {order:?}"
+    );
+}
+
+/// Runs `check` with a fake `docker` that prints `packages` for `pip list`.
+fn dev_package_check(check: &str, packages: &str) -> Output {
+    use std::os::unix::fs::PermissionsExt;
+    let folder = TempDir::new().expect("a temporary folder");
+    let docker = folder.path().join("docker");
+    fs::write(&docker, format!("#!/bin/sh\nprintf '{packages}'\n")).expect("the fake is written");
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755))
+        .expect("the fake is executable");
+    let path = env::var("PATH").expect("PATH is set");
+    Command::new("bash")
+        .args(["-e", "-c", check])
+        .env("PATH", format!("{}:{path}", folder.path().display()))
+        .current_dir(root())
+        .output()
+        .expect("bash starts")
+}
+
+/// The `pip list` step of `train-image` runs in the image and fails only when a `dev` package is present.
+#[test]
+fn ac_3_10_2_train_image_has_no_dev_packages() {
+    let release = yaml(".github/workflows/release.yml");
+    let check = runs(&release, "train-image")
+        .into_iter()
+        .find(|run| run.contains("docker run --rm \"$IMAGE\" pip list"))
+        .expect("a step runs pip list in the image");
+    assert_passes(&dev_package_check(
+        check,
+        "torch==2.2.2\\nruff-lsp==0.0.1\\n",
+    ));
+    let failed = dev_package_check(check, "torch==2.2.2\\nPytest-Cov==7.1.0\\n");
+    assert!(
+        !failed.status.success() && String::from_utf8_lossy(&failed.stdout).contains("Pytest-Cov"),
+        "the check fails and names the dev package: {failed:?}"
+    );
+}
