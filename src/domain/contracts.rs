@@ -3,6 +3,7 @@
 use std::borrow::Borrow;
 use std::convert::Infallible;
 use std::hash::Hash;
+use std::slice::SliceIndex;
 use std::sync::Arc;
 
 use jiff::Timestamp;
@@ -295,6 +296,20 @@ pub fn ex_string_len(text: &String) -> (len: usize)
         len == vstd::utf8::encode_utf8(text@).len(),
 {
     text.len()
+}
+
+/// Gives the subslice of `text` at `index`, or `None` when indexing would panic: the range is out
+/// of bounds or does not start and end on character boundaries. <https://doc.rust-lang.org/std/primitive.str.html#method.get>
+#[verifier::external_fn_specification]
+pub fn ex_str_get<Index: SliceIndex<str>>(text: &str, index: Index) -> (part: Option<&Index::Output>)
+    ensures
+        match part {
+            Some(part) => vstd::slice::SliceIndexSpec::in_bounds(&index, text)
+                && vstd::slice::SliceIndexSpec::index_postcondition(&index, text, part),
+            None => !vstd::slice::SliceIndexSpec::in_bounds(&index, text),
+        },
+{
+    text.get(index)
 }
 
 /// The lowercase form of `text`.
