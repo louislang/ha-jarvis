@@ -1,5 +1,6 @@
 //! `Classifier` and `ModelLoader` with ONNX Runtime and a Hugging Face tokenizer.
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -57,6 +58,33 @@ struct Labels {
     tags: Vec<String>,
 }
 
+impl Labels {
+    /// Checks that the labels and the tags are unique and match the outputs of `session`.
+    ///
+    /// # Errors
+    ///
+    /// A count is not the last dimension of its output, or a name occurs twice.
+    fn check(&self, session: &Session) -> anyhow::Result<()> {
+        let lists = [
+            ("labels", &self.labels, "intent_logits"),
+            ("tags", &self.tags, "slot_logits"),
+        ];
+        for (kind, names, output) in lists {
+            let width = width(session, output)?;
+            anyhow::ensure!(
+                i64::try_from(names.len()) == Ok(width),
+                "labels.json has {} {kind}, but {output} has {width}",
+                names.len()
+            );
+            let mut seen = BTreeSet::new();
+            if let Some(name) = names.iter().find(|name| !seen.insert(name.as_str())) {
+                anyhow::bail!("labels.json has {name} twice in {kind}");
+            }
+        }
+        Ok(())
+    }
+}
+
 /// One model folder: the session, the tokenizer, the labels and the tags.
 struct Model {
     /// The ONNX Runtime session. A run needs exclusive access.
@@ -79,6 +107,7 @@ impl Model {
             fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
         let labels: Labels = serde_json::from_str(&text)?;
         let session = builder.commit_from_file(dir.join("model.onnx"))?;
+        labels.check(&session)?;
         let tokenizer =
             Tokenizer::from_file(dir.join("tokenizer.json")).map_err(anyhow::Error::from_boxed)?;
         Ok(Self {
@@ -170,6 +199,19 @@ fn valid(logits: &[f32]) -> bool {
     !logits.is_empty() && logits.iter().all(|logit| logit.is_finite())
 }
 
+/// The last dimension of the output `name` of `session`.
+///
+/// # Errors
+///
+/// The output is absent or is not a tensor.
+fn width(session: &Session, name: &str) -> anyhow::Result<i64> {
+    let output = session.outputs.iter().find(|output| output.name == name);
+    let shape = output.and_then(|output| output.output_type.tensor_shape());
+    shape
+        .and_then(|shape| shape.last().copied())
+        .context(format!("no tensor output {name}"))
+}
+
 /// The input tensor of shape `[1, n]` with the `n` token values `values`.
 ///
 /// # Errors
@@ -207,7 +249,6 @@ fn top(logits: &[f32]) -> usize {
 mod tests {
     use super::*;
 
-    use std::collections::BTreeSet;
     use std::time::Duration;
     use std::time::Instant;
 
@@ -406,6 +447,83 @@ mod tests {
                 let expected = "the session output is empty or not finite";
                 assert_eq!(error.as_deref(), Some(expected), "{intent:?} and {slots:?}");
             }
+        }
+        Ok(())
+    }
+
+    /// The `load` error for a folder with links to the fixture model and tokenizer and `labels`.
+    ///
+    /// The folder has no `labels.json` when `labels` is `None`.
+    async fn load_error(labels: Option<serde_json::Value>) -> anyhow::Result<String> {
+        let folder = tempfile::tempdir()?;
+        for file in ["model.onnx", "tokenizer.json"] {
+            let target = fs::canonicalize(Path::new(FIXTURE).join(file))?;
+            std::os::unix::fs::symlink(target, folder.path().join(file))?;
+        }
+        if let Some(labels) = labels {
+            fs::write(folder.path().join("labels.json"), labels.to_string())?;
+        }
+        let result = OnnxLoader.load(folder.path(), Device::Cpu).await;
+        Ok(result
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default())
+    }
+
+    /// The fixture labels and tags.
+    fn fixture_labels() -> anyhow::Result<(Vec<String>, Vec<String>)> {
+        let labels = fixture(Device::Cpu)?.labels;
+        Ok((labels.labels, labels.tags))
+    }
+
+    /// AC-3.12c-1.
+    #[tokio::test]
+    async fn ac_3_12c_1_missing_labels_file_is_an_error() -> anyhow::Result<()> {
+        let error = load_error(None).await?;
+        assert!(error.contains("labels.json"), "error is {error:?}");
+        Ok(())
+    }
+
+    /// AC-3.12c-2.
+    #[tokio::test]
+    async fn ac_3_12c_2_count_mismatch_is_an_error() -> anyhow::Result<()> {
+        let (labels, tags) = fixture_labels()?;
+        let cases = [
+            (&labels[1..], &tags[..], labels.len()),
+            (&labels[..], &tags[1..], tags.len()),
+        ];
+        for (labels, tags, expected) in cases {
+            let json = serde_json::json!({ "labels": labels, "tags": tags });
+            let error = load_error(Some(json)).await?;
+            for count in [expected - 1, expected] {
+                assert!(
+                    error.contains(&count.to_string()),
+                    "{count} is not in {error:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// AC-3.12c-3.
+    #[tokio::test]
+    async fn ac_3_12c_3_duplicate_is_an_error() -> anyhow::Result<()> {
+        let (labels, tags) = fixture_labels()?;
+        let mut duplicate_label = labels.clone();
+        duplicate_label[2] = labels[1].clone();
+        let mut duplicate_tag = tags.clone();
+        duplicate_tag[2] = tags[1].clone();
+        let cases = [
+            (&duplicate_label, &tags, &labels[1]),
+            (&labels, &duplicate_tag, &tags[1]),
+        ];
+        for (labels, tags, duplicate) in cases {
+            let json = serde_json::json!({ "labels": labels, "tags": tags });
+            let error = load_error(Some(json)).await?;
+            assert!(
+                error.contains(duplicate.as_str()),
+                "{duplicate} is not in {error:?}"
+            );
         }
         Ok(())
     }
