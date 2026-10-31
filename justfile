@@ -115,7 +115,7 @@ fixture-stale stamp:
     [ "$hash" != "$(cat "{{ stamp }}" 2> /dev/null)" ]
 
 # Run the checks of the pre-commit hook.
-check: workflow-lint format lint complexity duplication architecture quint python verus fixture-model cov
+check: workflow-lint format lint complexity duplication architecture diagram quint python verus fixture-model cov
     {{ if os() == "linux" { "just bench" } else { "" } }}
     {{ if env("JARVIS_DEVICE", "") == "cuda" { "just gpu-test" } else { "" } }}
 

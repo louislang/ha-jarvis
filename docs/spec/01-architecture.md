@@ -251,7 +251,6 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `.github/workflows/ci.yml` | — | The required checks for each push and PR. | 0.1 |
 | `.github/pull_request_template.md` | — | The PR description template. | 0.5 |
 | `.github/actionlint.yaml` | — | The `actionlint` configuration: the label `gpu` of the self-hosted runner. | 0.13 |
-| `.github/workflows/architecture.yml` | — | Obsolete. The fix PR of sub-phase 0.11 deletes this file and this row. | 0.11 |
 | `.github/workflows/release.yml` | — | Release binaries and the training image for each `v*` tag. | 0.14 |
 | `xtask/Cargo.toml` | Tools | The `xtask` crate. | 0.1 |
 | `xtask/src/main.rs` | Tools | Command line: `complexity`, `pr-size`, `rules`, `diagram`, `merge`, `guard-push`. | 0.1 |

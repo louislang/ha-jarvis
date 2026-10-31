@@ -129,11 +129,11 @@ fn node_id(module: &str) -> String {
     module.replace("::", "_")
 }
 
-/// The content of `docs/architecture.md`: a title, the CI line and the Mermaid block of `graph`.
+/// The content of `docs/architecture.md`: a title, the hook line and the Mermaid block of `graph`.
 #[must_use]
 pub fn document(graph: &Graph) -> String {
     format!(
-        "# Architecture\n\nCI writes this file from the module graph on each commit to `main`.\n\n```mermaid\n{}```\n",
+        "# Architecture\n\nThe pre-commit hook writes this file from the module graph.\n\n```mermaid\n{}```\n",
         render(graph, graph)
     )
 }
@@ -294,7 +294,7 @@ mod tests {
         );
     }
 
-    /// The diagram of the repository has the title, the CI line and one Mermaid block.
+    /// The diagram of the repository has the title, the hook line and one Mermaid block.
     #[test]
     fn ac_0_9_6_diagram_writes_document() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -311,8 +311,8 @@ mod tests {
             "no title: {content}"
         );
         assert!(
-            content.contains("CI writes this file"),
-            "no CI line: {content}"
+            content.contains("The pre-commit hook writes this file"),
+            "no hook line: {content}"
         );
         assert_eq!(content.matches("```mermaid\n").count(), 1, "{content}");
         assert!(
