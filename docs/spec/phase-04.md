@@ -8,7 +8,7 @@ This phase selects responses, selects entities and decides the action from a pre
 
 **Goal:** Add response pools with `select` and `record_use`. Jarvis now varies its replies: it never repeats the last response and prefers the least used one.
 
-- **Implements:** G4. **Depends on:** 3.12.
+- **Implements:** G4. **Depends on:** 3.12c.
 - **Files:** create `src/domain/responses.rs`, `responses.toml`. Modify `src/lib.rs`.
 
 **Model.**

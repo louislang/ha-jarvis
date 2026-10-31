@@ -698,7 +698,7 @@ VRAM budget on the GPU host (6 GB):
 | Reserve (not usable on a 6 GB card) | 0.5 GB |
 | **Total** | **6.0 GB** |
 
-The model budgets assume fp16 weights. The int8 models use less. The usable budget is 5.5 GB, below the 5.8 GB limit of AC-13.10-5. GPU host tests measure the real peak and check that each model runs on the CUDA execution provider (AC-3.12-9, AC-6.2-2, AC-6.6-9, AC-6.7-5, AC-15.3-7). The process trainer limits the PyTorch memory of a local run to `train.max_vram_gb` (`torch.cuda.set_per_process_memory_fraction`), so a run cannot take the memory of the live models. If a local run fails with "CUDA out of memory", the run moves to RunPod (decision 12). Live STT never stops for training.
+The model budgets assume fp16 weights. The int8 models use less. The usable budget is 5.5 GB, below the 5.8 GB limit of AC-13.10-5. GPU host tests measure the real peak and check that each model runs on the CUDA execution provider (AC-3.12b-3, AC-6.2-2, AC-6.6-9, AC-6.7-5, AC-15.3-7). The process trainer limits the PyTorch memory of a local run to `train.max_vram_gb` (`torch.cuda.set_per_process_memory_fraction`), so a run cannot take the memory of the live models. If a local run fails with "CUDA out of memory", the run moves to RunPod (decision 12). Live STT never stops for training.
 
 The GPU host needs the NVIDIA driver, CUDA 12, cuDNN 9, and a Python 3.12 virtual environment in `.venv` with `pip install ./train`.
 
