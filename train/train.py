@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict
 
+import torch
+from torch import nn
+from torch.nn import functional
+from transformers import PreTrainedModel
+
 IGNORE = -100
 """The label that the loss skips."""
 
@@ -107,6 +112,64 @@ def align(
         labels.append(tags.index(f"{prefix}-{slot}"))
         tagged = current
     return labels
+
+
+class JointModel(nn.Module):
+    """The encoder with an intent head on the first token and a slot head on each."""
+
+    def __init__(self, base: PreTrainedModel, label_count: int, tag_count: int) -> None:
+        """Put heads for `label_count` labels and `tag_count` tags on `base`."""
+        super().__init__()
+        self.base = base
+        self.intent_head = nn.Linear(base.config.hidden_size, label_count)
+        self.slot_head = nn.Linear(base.config.hidden_size, tag_count)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        token_type_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Give the intent logits and the slot logits of each token."""
+        hidden: torch.Tensor = self.base(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+        ).last_hidden_state
+        intent_logits: torch.Tensor = self.intent_head(hidden[:, 0])
+        slot_logits: torch.Tensor = self.slot_head(hidden)
+        return intent_logits, slot_logits
+
+
+class Batch(TypedDict):
+    """The targets of a group of examples."""
+
+    labels: torch.Tensor
+    """The label index of each example."""
+    negated: torch.Tensor
+    """`True` for a `not` example."""
+    tags: torch.Tensor
+    """The tag index of each token, or `IGNORE`."""
+
+
+def loss(
+    intent_logits: torch.Tensor, slot_logits: torch.Tensor, batch: Batch
+) -> torch.Tensor:
+    """Give the mean intent loss plus the mean slot loss over the tokens with a tag."""
+    log_probabilities = intent_logits.log_softmax(-1)
+    chosen = functional.one_hot(batch["labels"], intent_logits.shape[-1]).bool()
+    # log(1 - p(k)) as the log of the sum of the others, which is finite at p(k) = 1.
+    others = log_probabilities.masked_fill(chosen, -torch.inf).logsumexp(-1)
+    picked = torch.where(batch["negated"], others, log_probabilities[chosen])
+    slot_sum = functional.cross_entropy(
+        slot_logits.flatten(0, 1),
+        batch["tags"].flatten(),
+        ignore_index=IGNORE,
+        reduction="sum",
+    )
+    # The mean over no tagged token is 0, not NaN.
+    tagged = (batch["tags"] != IGNORE).sum().clamp(min=1)
+    return slot_sum / tagged - picked.mean()
 
 
 if __name__ == "__main__":
