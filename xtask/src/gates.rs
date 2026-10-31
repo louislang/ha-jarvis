@@ -1169,7 +1169,7 @@ fn ac_0_14_1_release_builds_targets_after_ci() {
         Some("${{ matrix.runner }}")
     );
     let targets: serde_yaml::Value = serde_yaml::from_str(
-        "[{target: x86_64-unknown-linux-gnu, runner: ubuntu-latest}, \
+        "[{target: x86_64-unknown-linux-gnu, runner: [self-hosted, linux]}, \
          {target: x86_64-apple-darwin, runner: macos-15-intel}]",
     )
     .expect("the expected targets are YAML");
@@ -1603,15 +1603,13 @@ fn ac_0_18_8_check_and_ci_run_verus_gate() {
     assert!(template.contains("\n- [ ] `verus`\n"), "{template}");
 }
 
-/// The CI job `bench` runs `just bench` on `ubuntu-latest`, and `check` runs `bench` only on Linux.
+/// The CI job `bench` runs `just bench` on the self-hosted Linux runner, and `check` runs `bench` only on Linux.
 #[test]
 fn ac_2_8c_2_bench_runs_on_linux() {
     let ci = yaml(".github/workflows/ci.yml");
-    assert_eq!(
-        ci["jobs"]["bench"]["runs-on"].as_str(),
-        Some("ubuntu-latest"),
-        "the bench runner"
-    );
+    let labels: serde_yaml::Value =
+        serde_yaml::from_str("[self-hosted, linux]").expect("the expected labels are YAML");
+    assert_eq!(ci["jobs"]["bench"]["runs-on"], labels, "the bench runner");
     assert!(
         runs(&ci, "bench").contains(&"just bench"),
         "bench runs just bench"

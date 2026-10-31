@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   diagram:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux]
     steps:
       # The head of `main`, not the pushed commit: a queued run then includes the diagram commit of the run before it.
       - uses: actions/checkout@v7
