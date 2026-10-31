@@ -116,7 +116,7 @@ This phase adds the driving port and the Wyoming adapter. HA can use Jarvis as i
 - P-5.4-1. Argument: `run` calls `Config::load` and `Secrets::resolve` first and returns on `Err`, before the server binds.
 - P-5.4-3. Argument: `ModelLoader::load` returns `Err` with the folder (P-3.12-5), and `run` returns it before the server binds.
 - P-5.4-4 (AC-5.4-4). Ensures: each `handle` uses exactly one classifier, the one that was current when it loaded the pointer. Argument: `handle` calls `load()` on the `ArcSwap` once. `store` replaces the pointer atomically, so a later `load()` returns the new one.
-- P-5.4-7. Argument: `run` calls `parse_catalog` and `validate_pools` (P-4.2-6) before the server binds.
+- P-5.4-7. Argument: `run` calls `validate_catalog` and `validate_pools` (P-4.2-6) before the server binds.
 - P-5.4-2, P-5.4-5, P-5.4-6. Evidence: test.
 
 **Field log.** On the GPU host, let the firewall accept port 10700 only from the HA host (`01-architecture.md` section 10). Record that another host cannot connect.
