@@ -76,6 +76,12 @@ jobs:
         with:
           python-version: "3.12"
       - run: just install-python
+      - run: mkdir -p target/fixture && cargo run --release -- dataset jarvis.toml target/fixture/train.json --house src/testing/house.json
+      - uses: actions/cache@v6
+        with:
+          path: models/system-one/fixture
+          key: fixture-model-${{ hashFiles('target/fixture/train.json', 'train/**') }}
+      - run: just fixture-model
       - run: just cov
 
   bench:

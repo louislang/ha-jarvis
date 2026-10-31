@@ -9,7 +9,7 @@ request_timeout_ms = 5000
 ping_interval_s = 30
 
 [train]
-base_model = "microsoft/MiniLM-L12-H384-uncased"
+base_model = "sentence-transformers/all-MiniLM-L12-v2"
 epochs = 8
 batch_size = 8
 holdout = 0.1

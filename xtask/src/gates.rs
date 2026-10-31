@@ -247,19 +247,19 @@ fn long_function(lines: usize) -> String {
     )
 }
 
-/// Runs the `justfile` recipe `recipe` in `folder`.
-fn recipe_in(folder: &Path, recipe: &str) -> Output {
+/// Runs the `justfile` recipe and the recipe arguments of `arguments` in `folder`.
+fn recipe_in(folder: &Path, arguments: &[&str]) -> Output {
     run(Command::new("just")
         .arg("--justfile")
         .arg(root().join("justfile"))
         .arg("--working-directory")
         .arg(folder)
-        .arg(recipe))
+        .args(arguments))
 }
 
 /// Runs the `justfile` recipe `recipe` on a fixture crate with `source`.
 fn recipe_on_fixture(recipe: &str, source: &str) -> Output {
-    recipe_in(fixture_crate(source).path(), recipe)
+    recipe_in(fixture_crate(source).path(), &[recipe])
 }
 
 /// Checks that `output` is a failure that names `lint`. Rustc writes lint names with `-`, Clippy with `_`.
@@ -427,14 +427,19 @@ fn fixture_file(name: &str, source: &str) -> TempDir {
     folder
 }
 
-/// Checks that `check` runs `recipe` after `before`, and that the CI job `recipe` runs `just <recipe>`.
-fn assert_check_and_ci_run_after(before: &str, recipe: &str) {
+/// Checks that `check` runs `recipe` after `before`.
+fn assert_check_runs_after(before: &str, recipe: &str) {
     let check = dependencies(&justfile(), "check");
     let position = |name: &str| check.iter().position(|dependency| dependency == name);
     assert!(
         matches!((position(before), position(recipe)), (Some(first), Some(second)) if first < second),
         "check runs {recipe} after {before}, it runs {check:?}"
     );
+}
+
+/// Checks that `check` runs `recipe` after `before`, and that the CI job `recipe` runs `just <recipe>`.
+fn assert_check_and_ci_run_after(before: &str, recipe: &str) {
+    assert_check_runs_after(before, recipe);
     let command = format!("just {recipe}");
     assert!(
         runs(&yaml(".github/workflows/ci.yml"), recipe).contains(&command.as_str()),
@@ -1026,7 +1031,7 @@ fn quint_gate(model: Option<&str>) -> Output {
         fs::write(models.join("fixture.qnt"), model).expect("the model is written");
     }
     let _apalache = APALACHE.lock().expect("no test panics while it runs Quint");
-    recipe_in(fixture.path(), "quint")
+    recipe_in(fixture.path(), &["quint"])
 }
 
 /// The exit code and the result lines of a `quint` output: test results, trace states and verdicts, without timings.
@@ -1258,7 +1263,7 @@ fn repository_with_hook() -> TempDir {
     ] {
         assert_passes(&git(repository.path(), arguments));
     }
-    assert_passes(&recipe_in(repository.path(), "pre-push-hook"));
+    assert_passes(&recipe_in(repository.path(), &["pre-push-hook"]));
     repository
 }
 
@@ -1497,7 +1502,7 @@ fn verus_gate(source: &str) -> Output {
     assert_passes(&run(Command::new("cargo")
         .args(["clean", "--quiet", "-p", "jarvis"])
         .current_dir(fixture.path())));
-    recipe_in(fixture.path(), "verus")
+    recipe_in(fixture.path(), &["verus"])
 }
 
 /// The exit code and the result lines of a `verus` output: the errors and their places, and the counts of the fixture crate.
@@ -1679,7 +1684,7 @@ fn python_gate(body: &str) -> Output {
     .expect("pyproject.toml is copied");
     fs::write(train.join("fixture.py"), format!("{PYTHON_HEADER}{body}"))
         .expect("the fixture is written");
-    recipe_in(folder.path(), "python")
+    recipe_in(folder.path(), &["python"])
 }
 
 /// Checks that `output` is a failure whose tool output has `text`.
@@ -1717,7 +1722,7 @@ fn python_metrics_fixture() -> String {
 /// `just python` passes on `train/`, `check` runs `python` after `quint`, and CI runs it.
 #[test]
 fn ac_3_5_3_python_passes() {
-    assert_passes(&recipe_in(root(), "python"));
+    assert_passes(&recipe_in(root(), &["python"]));
     assert_check_and_ci_run_after("quint", "python");
 }
 
@@ -1776,4 +1781,140 @@ fn ac_3_5_8_complexity_and_duplication_run_on_train() {
         let body = justfile["recipes"][recipe]["body"].to_string();
         assert!(body.contains("src xtask train"), "{recipe}: {body}");
     }
+}
+
+/// The folder of the fixture model.
+const FIXTURE_FOLDER: &str = "models/system-one/fixture";
+
+/// The stamp file of the fixture model: the hash of the inputs of its last training.
+const STAMP: &str = "models/system-one/fixture/inputs.sha256";
+
+/// The files of the fixture model that `train.py` writes.
+const MODEL_FILES: [&str; 3] = ["model.onnx", "tokenizer.json", "labels.json"];
+
+/// Makes a Git repository with a training set file, the model files and the tracked files `train/train.py` and `src/lib.rs`.
+fn fixture_repository() -> TempDir {
+    let repository = TempDir::new().expect("a temporary folder");
+    let models = MODEL_FILES.map(|file| format!("{FIXTURE_FOLDER}/{file}"));
+    let inputs = ["target/fixture/train.json", "train/train.py", "src/lib.rs"];
+    for file in models.iter().map(String::as_str).chain(inputs) {
+        let path = repository.path().join(file);
+        fs::create_dir_all(path.parent().expect("the file is in a folder"))
+            .expect("the folder is made");
+        fs::write(path, file).expect("the file is written");
+    }
+    assert_passes(&git(repository.path(), &["init", "--quiet"]));
+    assert_passes(&git(repository.path(), &["add", "train", "src"]));
+    repository
+}
+
+/// Runs `just fixture-stale` with `STAMP` in `repository` and returns its exit code and the hash that it prints.
+fn fixture_stale(repository: &Path) -> (Option<i32>, String) {
+    let output = recipe_in(repository, &["fixture-stale", STAMP]);
+    let hash = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (output.status.code(), hash)
+}
+
+/// Writes the hash of the inputs of `repository` to its stamp file and returns the hash.
+fn write_stamp(repository: &Path) -> String {
+    let (_, hash) = fixture_stale(repository);
+    fs::write(repository.join(STAMP), format!("{hash}\n")).expect("the stamp is written");
+    hash
+}
+
+/// Whether the CI step `step` restores the fixture model with the hash of the training set as the key.
+fn restores_fixture_model(step: &serde_yaml::Value) -> bool {
+    let key = step["with"]["key"].as_str().unwrap_or_default();
+    step["with"]["path"].as_str() == Some(FIXTURE_FOLDER)
+        && key.contains("hashFiles('target/fixture/train.json'")
+}
+
+/// The fixture model folder has the three model files and the stamp after `just fixture-model`.
+#[test]
+fn ac_3_9_1_fixture_model_writes_model_files() {
+    let folder = root().join(FIXTURE_FOLDER);
+    for file in [MODEL_FILES.as_slice(), &["inputs.sha256"]].concat() {
+        assert!(folder.join(file).is_file(), "{file} is in {FIXTURE_FOLDER}");
+    }
+}
+
+/// A second `just fixture-model` without changes keeps the bytes and the modification time of `model.onnx`.
+#[test]
+fn ac_3_9_2_second_run_keeps_model() {
+    let model = root().join(FIXTURE_FOLDER).join("model.onnx");
+    let state = || {
+        let modified = fs::metadata(&model).and_then(|metadata| metadata.modified());
+        let bytes = fs::read(&model).expect("the model is read");
+        (bytes, modified.expect("the model has a modification time"))
+    };
+    let before = state();
+    assert_passes(&recipe_in(root(), &["fixture-model"]));
+    assert!(
+        state() == before,
+        "model.onnx keeps its bytes and modification time"
+    );
+}
+
+/// `fixture-stale` exits with code 0 for a stamp that differs from the hash of the inputs and with code 1 for the matching stamp.
+#[test]
+fn ac_3_9_3_stamp_decides_staleness() {
+    let repository = fixture_repository();
+    fs::write(repository.path().join(STAMP), "0\n").expect("the stamp is written");
+    let (code, _) = fixture_stale(repository.path());
+    assert_eq!(code, Some(0), "a different stamp is stale");
+    let hash = write_stamp(repository.path());
+    assert_eq!(fixture_stale(repository.path()), (Some(1), hash));
+    fs::write(repository.path().join("target/fixture/train.json"), "{}")
+        .expect("the training set is written");
+    let (code, _) = fixture_stale(repository.path());
+    assert_eq!(code, Some(0), "a new training set is stale");
+}
+
+/// `fixture-stale` exits with code 0 when `model.onnx` is missing, and an untracked file in `train/` keeps the hash.
+#[test]
+fn ac_3_9_4_missing_model_is_stale_and_untracked_file_keeps_hash() {
+    let repository = fixture_repository();
+    let hash = write_stamp(repository.path());
+    let model = repository.path().join(FIXTURE_FOLDER).join("model.onnx");
+    fs::remove_file(model).expect("the model is removed");
+    assert_eq!(fixture_stale(repository.path()), (Some(0), hash.clone()));
+    fs::write(repository.path().join("train/cache.pyc"), "cache").expect("the cache is written");
+    assert_eq!(fixture_stale(repository.path()), (Some(0), hash));
+}
+
+/// `check` runs `fixture-model` before `cov`, and the CI job `rust-test` installs `./train`, runs `jarvis dataset`, restores the fixture model with the hash of the training set as the key and runs `just fixture-model` before `just cov`.
+#[test]
+fn ac_3_9_5_ci_restores_fixture_model() {
+    assert_check_runs_after("fixture-model", "cov");
+    let install = justfile()["recipes"]["install-python"]["body"].to_string();
+    assert!(install.contains("./train"), "{install}");
+    let ci = yaml(".github/workflows/ci.yml");
+    let steps = ci["jobs"]["rust-test"]["steps"]
+        .as_sequence()
+        .expect("the job exists");
+    let position = |text: &str| {
+        let runs =
+            |step: &serde_yaml::Value| step["run"].as_str().is_some_and(|run| run.contains(text));
+        steps.iter().position(runs)
+    };
+    let positions = [
+        position("just install-python"),
+        position("dataset jarvis.toml target/fixture/train.json"),
+        steps.iter().position(restores_fixture_model),
+        position("just fixture-model"),
+        position("just cov"),
+    ];
+    assert!(
+        positions.iter().all(Option::is_some) && positions.is_sorted(),
+        "the step positions: {positions:?}"
+    );
+}
+
+/// `fixture-stale` exits with code 1 when only `src/lib.rs` changes.
+#[test]
+fn ac_3_9_6_source_change_keeps_model() {
+    let repository = fixture_repository();
+    let hash = write_stamp(repository.path());
+    fs::write(repository.path().join("src/lib.rs"), "changed").expect("the source is written");
+    assert_eq!(fixture_stale(repository.path()), (Some(1), hash));
 }
