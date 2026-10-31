@@ -169,12 +169,12 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Goal:** Add the training set types and `seed_set`, which turns the seed examples into labeled examples with a model context. This fixes the JSON contract between Jarvis and the training script.
 
 - **Implements:** G3, G16. **Depends on:** 3.3.
-- **Files:** modify `src/domain/training.rs`.
+- **Files:** modify `src/domain/training.rs`, `src/domain/intent.rs`.
 
 **Model.**
 
 - `TrainingSet { base_model, epochs, batch_size, labels, tags, examples }` (JSON in `01-architecture.md` section 9).
-- `Example { context, text, label: Intent(name) | Not(name), spans: Option<Vec<Span>> }`. An `unknown` example has an empty span list.
+- `Example { context, text, label: Intent(name) | Not(name), spans: Option<Vec<Span>> }`. An `unknown` example has an empty span list. `Span` derives the serde traits for the JSON.
 - `seed_set(catalog, areas, rng, settings) -> TrainingSet`: one `Intent` example for each seed example and one `unknown` example for each unknown seed. Each example gets `sample_context`. `settings` gives `base_model`, `epochs` and `batch_size`.
 
 **Acceptance criteria.**
