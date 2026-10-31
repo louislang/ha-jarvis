@@ -20,6 +20,7 @@ use crate::domain::catalog::Filter;
 use crate::domain::catalog::Intent;
 use crate::domain::catalog::Kind;
 use crate::domain::catalog::Target;
+use crate::domain::intent::Span;
 use crate::domain::state::Area;
 use crate::domain::state::AreaId;
 use crate::domain::state::Context;
@@ -31,6 +32,9 @@ use crate::domain::state::HomeConfig;
 use crate::domain::state::Snapshot;
 use crate::domain::state::State;
 use crate::domain::state_cache::StateCache;
+use crate::domain::training::Example;
+use crate::domain::training::Label;
+use crate::domain::training::TrainingSet;
 use vstd::prelude::*;
 
 verus! {
@@ -120,6 +124,22 @@ pub struct ExTarget(Target);
 #[verifier::external_type_specification]
 #[verifier::external_body]
 pub struct ExFilter(Filter);
+
+/// One slot value in the text of an example.
+#[verifier::external_type_specification]
+pub struct ExSpan(Span);
+
+/// The training set file.
+#[verifier::external_type_specification]
+pub struct ExTrainingSet(TrainingSet);
+
+/// One labeled transcript with its model context.
+#[verifier::external_type_specification]
+pub struct ExExample(Example);
+
+/// The label of an example.
+#[verifier::external_type_specification]
+pub struct ExLabel(Label);
 
 /// A template environment. <https://docs.rs/minijinja/3/minijinja/struct.Environment.html>
 #[verifier::external_type_specification]
