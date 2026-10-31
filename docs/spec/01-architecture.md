@@ -112,7 +112,7 @@ Rules:
 2. Slot tags use the BIO scheme (`O`, `B-area`, `I-area`, ...). Only segment B tokens get tags.
 3. `labels.json` in the model folder lists the labels and the tags in output order.
 4. When the top label is `unknown`, or the top intent probability is less than `model.threshold`, the request goes to System Two.
-5. The base model is `train.base_model`. The default is `sentence-transformers/all-MiniLM-L12-v2`, which has `model.safetensors`. The pinned `transformers` does not load a `pytorch_model.bin` with the pinned `torch` (CVE-2025-32434). It predicts in less than 10 ms on the CPU and in less than 5 ms on the GPU host.
+5. The base model is `train.base_model`. The default is `sentence-transformers/all-MiniLM-L12-v2`, which has `model.safetensors`. The pinned `transformers` does not load a `pytorch_model.bin` with the pinned `torch` (CVE-2025-32434). It predicts in less than 15 ms on the CPU and in less than 5 ms on the GPU host.
 6. Real training runs use the GPU of the GPU host. When local training fails, they use a RunPod GPU. The training script runs on the CPU only for the fixture model and the script tests.
 
 ## 4. Request Flow
