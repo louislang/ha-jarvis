@@ -5,8 +5,6 @@ use serde::Deserialize;
 use serde_json::Value;
 use vstd::prelude::*;
 
-use crate::domain::state_cache::StateCache;
-
 /// The states, registries and configuration of HA at one time.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Snapshot {
@@ -145,133 +143,6 @@ pub struct ServiceCall {
     pub return_response: bool,
 }
 
-#[verus_verify]
-impl StateCache {
-    /// The area of the device `device_id`.
-    #[verus_spec(area =>
-        ensures
-            owned(area) == device_area(self.devices@, device_id@),
-    )]
-    #[must_use]
-    pub fn area_of_device(&self, device_id: &str) -> Option<&AreaId> {
-        self.devices.get(device_id)?.area_id.as_ref()
-    }
-
-    /// The area of `entity_id`, else the area of its device.
-    #[verus_spec(area =>
-        ensures
-            forall|index: int| #[trigger] first(self.entities@, entity_id@, index)
-                ==> owned(area) == entity_area(*self, self.entities@[index]),
-    )]
-    #[must_use]
-    pub fn area_of_entity(&self, entity_id: &str) -> Option<&AreaId> {
-        let mut index = 0;
-        #[cfg_attr(verus_only, verus_spec(
-            invariant
-                index <= self.entities@.len(),
-                forall|earlier: int| 0 <= earlier < index
-                    ==> #[trigger] self.entities@[earlier].entity_id.0@ != entity_id@,
-            decreases self.entities@.len() - index,
-        ))]
-        while index < self.entities.len() {
-            let entity = &self.entities[index];
-            if entity.entity_id.0.as_str() == entity_id {
-                return self.entity_area(entity);
-            }
-            index += 1;
-        }
-        None
-    }
-
-    /// The area of `entity`, else the area of its device.
-    #[verus_spec(area =>
-        ensures
-            owned(area) == entity_area(*self, *entity),
-    )]
-    fn entity_area<'cache>(&'cache self, entity: &'cache Entity) -> Option<&'cache AreaId> {
-        match &entity.area_id {
-            Some(area) => Some(area),
-            None => self.area_of_device(entity.device_id.as_ref()?),
-        }
-    }
-
-    /// The IDs of the entities in `area` and `domain`, with `device_class` if given.
-    #[verus_spec(found =>
-        ensures
-            forall|position: int| 0 <= position < found@.len() ==> chosen(
-                *self, *#[trigger] found@[position], self.entities@.len() as int,
-                *area, domain@, optional(device_class)),
-    )]
-    #[must_use]
-    pub fn entities(
-        &self,
-        area: &AreaId,
-        domain: &str,
-        device_class: Option<&str>,
-    ) -> Vec<&EntityId> {
-        let mut found: Vec<&EntityId> = Vec::new();
-        let mut index = 0;
-        #[cfg_attr(verus_only, verus_spec(
-            invariant
-                index <= self.entities@.len(),
-                forall|position: int| 0 <= position < found@.len() ==> chosen(
-                    *self, *#[trigger] found@[position], index as int,
-                    *area, domain@, optional(device_class)),
-            decreases self.entities@.len() - index,
-        ))]
-        while index < self.entities.len() {
-            let entity = &self.entities[index];
-            if self.selects(entity, area, domain, device_class) {
-                found.push(&entity.entity_id);
-            }
-            index += 1;
-        }
-        found
-    }
-
-    /// True when `entity` is in `area` and `domain`, with `device_class` if given.
-    #[verus_spec(selects =>
-        ensures
-            selects == selected(*self, *entity, *area, domain@, optional(device_class)),
-    )]
-    fn selects(
-        &self,
-        entity: &Entity,
-        area: &AreaId,
-        domain: &str,
-        device_class: Option<&str>,
-    ) -> bool {
-        let id = entity.entity_id.0.as_bytes();
-        let prefix = domain.as_bytes();
-        let in_domain =
-            prefix.len() < id.len() && id.starts_with(prefix) && id[prefix.len()] == b'.';
-        proof! {
-            if prefix.len() < id.len() {
-                assert(id@.take(prefix@.len() as int) =~= prefix@ <==> id.starts_with(prefix));
-            }
-        }
-        in_domain
-            && matches!(self.entity_area(entity), Some(found) if found.0.as_str() == area.0.as_str())
-            && match device_class {
-                Some(class) => self.device_class(&entity.entity_id.0) == Some(class),
-                None => true,
-            }
-    }
-
-    /// The `device_class` attribute of the state of `entity_id`.
-    #[verus_spec(class =>
-        ensures
-            optional(class) == device_class(*self, entity_id@),
-    )]
-    fn device_class(&self, entity_id: &str) -> Option<&str> {
-        self.states
-            .get(entity_id)?
-            .attributes
-            .get("device_class")?
-            .as_str()
-    }
-}
-
 verus! {
 
 broadcast use {
@@ -281,50 +152,6 @@ broadcast use {
     crate::domain::contracts::axiom_arc_str_maps_borrowed_key,
 };
 
-/// The value that `value` points to.
-pub open spec fn owned<Item>(value: Option<&Item>) -> Option<Item> {
-    match value {
-        Some(item) => Some(*item),
-        None => None,
-    }
-}
-
-/// The text of `value`.
-pub open spec fn optional<Text: View<V = Seq<char>>>(value: Option<Text>) -> Option<Seq<char>> {
-    match value {
-        Some(text) => Some(text@),
-        None => None,
-    }
-}
-
-/// The area of the device `device_id` in `devices`.
-pub open spec fn device_area(devices: Map<std::sync::Arc<str>, Device>, device_id: Seq<char>) -> Option<AreaId> {
-    let key = crate::domain::contracts::str_key(device_id);
-    if devices.contains_key(key) {
-        devices[key].area_id
-    } else {
-        None
-    }
-}
-
-/// The area of `entity`, else the area of its device.
-pub open spec fn entity_area(cache: StateCache, entity: Entity) -> Option<AreaId> {
-    match entity.area_id {
-        Some(area) => Some(area),
-        None => match entity.device_id {
-            Some(device) => device_area(cache.devices@, device@),
-            None => None,
-        },
-    }
-}
-
-/// True when `index` is the first entity of `entities` with the ID `entity_id`.
-pub open spec fn first(entities: Seq<Entity>, entity_id: Seq<char>, index: int) -> bool {
-    &&& 0 <= index < entities.len()
-    &&& entities[index].entity_id.0@ == entity_id
-    &&& forall|earlier: int| 0 <= earlier < index ==> #[trigger] entities[earlier].entity_id.0@ != entity_id
-}
-
 /// True when the entity ID `entity_id` is `domain`, a dot and an object ID.
 pub open spec fn in_domain(entity_id: Seq<char>, domain: Seq<char>) -> bool {
     let id = vstd::utf8::encode_utf8(entity_id);
@@ -333,7 +160,7 @@ pub open spec fn in_domain(entity_id: Seq<char>, domain: Seq<char>) -> bool {
 }
 
 /// The `device_class` attribute of the state of `entity_id`.
-pub open spec fn device_class(cache: StateCache, entity_id: Seq<char>) -> Option<Seq<char>> {
+pub open spec fn device_class(cache: crate::domain::state_cache::StateCache, entity_id: Seq<char>) -> Option<Seq<char>> {
     let key = crate::domain::contracts::str_key(entity_id);
     if cache.states@.contains_key(key) {
         match crate::domain::contracts::attribute(cache.states@[key].attributes, "device_class") {
@@ -347,20 +174,20 @@ pub open spec fn device_class(cache: StateCache, entity_id: Seq<char>) -> Option
 
 /// True when `entity` is in `area` and `domain`, with `class` if given.
 pub open spec fn selected(
-    cache: StateCache,
+    cache: crate::domain::state_cache::StateCache,
     entity: Entity,
     area: AreaId,
     domain: Seq<char>,
     class: Option<Seq<char>>,
 ) -> bool {
     &&& in_domain(entity.entity_id.0@, domain)
-    &&& entity_area(cache, entity) matches Some(found) && found.0@ == area.0@
+    &&& crate::domain::state_cache::entity_area(cache, entity) matches Some(found) && found.0@ == area.0@
     &&& class matches Some(wanted) ==> device_class(cache, entity.entity_id.0@) == Some(wanted)
 }
 
 /// True when `id` is the ID of a selected entity among the first `count` entities.
 pub open spec fn chosen(
-    cache: StateCache,
+    cache: crate::domain::state_cache::StateCache,
     id: EntityId,
     count: int,
     area: AreaId,
@@ -378,6 +205,7 @@ pub open spec fn chosen(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::state_cache::StateCache;
 
     /// The reference house snapshot.
     fn house() -> Snapshot {
