@@ -1,0 +1,26 @@
+[pools.lights_on]
+responses = ["I am turning the lights on.", "I will turn on the lights.", "Powering up the {{ area }} lights."]
+
+[pools.fan_on]
+responses = ["I am turning the fan on.", "Starting the {{ area }} fan."]
+
+[pools.climate_down]
+responses = ["I am turning the air down.", "Making it cooler."]
+
+[pools.tv_show]
+responses = ["Putting {{ show }} on the TV.", "Playing {{ show }}."]
+
+[pools.temperature_query]
+responses = ["It is {{ entity.state }} degrees in the {{ area }}."]
+
+[pools.weather]
+responses = ["Today will be {{ response['weather.home'].forecast[0].condition }}."]
+
+[pools.filler]
+responses = ["I will check on that for you.", "Let me look into that.", "One moment."]
+
+[pools.failure]
+responses = ["Sorry, I could not do that."]
+
+[pools.fallback]
+responses = ["Sorry, I could not find that."]

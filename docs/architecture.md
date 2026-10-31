@@ -16,6 +16,7 @@ flowchart LR
         crate_domain_contracts[contracts]
         crate_domain_intent[intent]
         crate_domain_model[model]
+        crate_domain_responses[responses]
         crate_domain_state[state]
         crate_domain_state_cache[state_cache]
         crate_domain_training[training]
@@ -54,6 +55,7 @@ flowchart LR
     crate_domain_intent --> crate_domain_intent
     crate_domain_model --> crate_domain_contracts
     crate_domain_model --> crate_domain_intent
+    crate_domain_responses --> crate_domain_contracts
     crate_domain_state_cache --> crate_domain_contracts
     crate_domain_state_cache --> crate_domain_state
     crate_domain_state_cache --> crate_domain_state_cache

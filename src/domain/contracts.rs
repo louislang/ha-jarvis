@@ -248,6 +248,36 @@ pub broadcast axiom fn axiom_string_obeys_cmp()
         #[trigger] vstd::laws_cmp::obeys_cmp::<String>(),
 ;
 
+/// The `String` key with the text `text`.
+pub uninterp spec fn string_key(text: Seq<char>) -> String;
+
+/// `String` borrows as `str` with the same order. <https://doc.rust-lang.org/std/string/struct.String.html#impl-Borrow%3Cstr%3E-for-String>
+pub broadcast axiom fn axiom_string_borrow()
+    ensures
+        #[trigger] vstd::std_specs::btree::borrowed_key_ordering_matches::<String, str>(),
+;
+
+/// `String` borrows as its text, so a lookup by `&str` finds the key with that text. <https://doc.rust-lang.org/std/string/struct.String.html#impl-Borrow%3Cstr%3E-for-String>
+pub broadcast axiom fn axiom_string_contains_borrowed_key<Item>(map: vstd::map::Map<String, Item>, key: &str)
+    ensures
+        #[trigger] vstd::std_specs::btree::contains_borrowed_key::<String, Item, str>(map, key)
+            <==> map.contains_key(string_key(key@)),
+;
+
+/// `String` borrows as its text, so a lookup by `&str` gives the value of the key with that text. <https://doc.rust-lang.org/std/string/struct.String.html#impl-Borrow%3Cstr%3E-for-String>
+pub broadcast axiom fn axiom_string_maps_borrowed_key<Item>(map: vstd::map::Map<String, Item>, key: &str, item: Item)
+    ensures
+        #[trigger] vstd::std_specs::btree::maps_borrowed_key_to_value::<String, Item, str>(map, key, item)
+            <==> map.contains_key(string_key(key@)) && map[string_key(key@)] == item,
+;
+
+/// `String` borrows as its text, so a removal by `&str` removes the key with that text. <https://doc.rust-lang.org/std/string/struct.String.html#impl-Borrow%3Cstr%3E-for-String>
+pub broadcast axiom fn axiom_string_removes_borrowed_key<Item>(old: vstd::map::Map<String, Item>, new: vstd::map::Map<String, Item>, key: &str)
+    ensures
+        #[trigger] vstd::std_specs::btree::borrowed_key_removed::<String, Item, str>(old, new, key)
+            <==> new == old.remove(string_key(key@)),
+;
+
 /// The value of `key` in the JSON object `map`.
 pub uninterp spec fn attribute<Key: ?Sized>(map: Map<String, Value>, key: &Key) -> Option<Value>;
 
