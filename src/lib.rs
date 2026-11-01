@@ -77,6 +77,8 @@ pub struct Config {
     pub ha: HaConfig,
     /// System One model.
     pub model: ModelConfig,
+    /// Announces.
+    pub announce: AnnounceConfig,
     /// Training.
     pub train: TrainConfig,
 }
@@ -166,6 +168,16 @@ pub struct HaConfig {
 pub struct ModelConfig {
     /// The least top probability that System One acts on.
     pub threshold: f32,
+}
+
+/// The `[announce]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AnnounceConfig {
+    /// The wait after the satellite becomes idle and before an announce.
+    pub margin_ms: u64,
+    /// The deadline for the satellite to become idle. After it, the announce is dropped.
+    pub idle_wait_s: u64,
 }
 
 /// The `[train]` section.
@@ -382,6 +394,10 @@ mod tests {
                 ping_interval_s: 30,
             },
             model: ModelConfig { threshold: 0.6 },
+            announce: AnnounceConfig {
+                margin_ms: 300,
+                idle_wait_s: 30,
+            },
             train: TrainConfig {
                 base_model: "sentence-transformers/all-MiniLM-L12-v2".to_owned(),
                 epochs: 8,

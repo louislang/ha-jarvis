@@ -14,6 +14,10 @@ ping_interval_s = 30
 [model]
 threshold = 0.6
 
+[announce]
+margin_ms = 300
+idle_wait_s = 30
+
 [train]
 base_model = "sentence-transformers/all-MiniLM-L12-v2"
 epochs = 8

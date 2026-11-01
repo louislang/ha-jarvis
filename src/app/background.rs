@@ -1,17 +1,18 @@
 //! Hot cache sync.
 
 use std::future;
-use std::sync::Arc;
+use std::mem;
 
-use arc_swap::ArcSwap;
 use futures::StreamExt;
+use tokio::sync::watch;
 
 use crate::domain::state::Event;
 use crate::domain::state_cache::StateCache;
 use crate::ports::Home;
 
 /// Keeps `cache` equal to the states and the registries of `home` until the event stream ends.
-pub async fn sync(home: &dyn Home, cache: &ArcSwap<StateCache>) {
+/// Publishes each new cache to the receivers of `cache`.
+pub async fn sync(home: &dyn Home, cache: &watch::Sender<StateCache>) {
     let mut events = home.events();
     if load(home, cache).await.is_err() {
         events = events
@@ -21,8 +22,7 @@ pub async fn sync(home: &dyn Home, cache: &ArcSwap<StateCache>) {
     while let Some(event) = events.next().await {
         match event {
             Event::StateChanged { .. } => {
-                let next = StateCache::clone(&cache.load()).apply(event);
-                cache.store(Arc::new(next));
+                cache.send_modify(|cache| *cache = mem::take(cache).apply(event));
             }
             // A failed load keeps the old cache: the adapter sends `Reconnected` after it connects again.
             Event::RegistryUpdated | Event::Reconnected => load(home, cache).await.unwrap_or(()),
@@ -31,9 +31,9 @@ pub async fn sync(home: &dyn Home, cache: &ArcSwap<StateCache>) {
 }
 
 /// Replaces `cache` with a new snapshot of `home`.
-async fn load(home: &dyn Home, cache: &ArcSwap<StateCache>) -> anyhow::Result<()> {
+async fn load(home: &dyn Home, cache: &watch::Sender<StateCache>) -> anyhow::Result<()> {
     let snapshot = home.snapshot().await?;
-    cache.store(Arc::new(StateCache::load(snapshot)));
+    cache.send_replace(StateCache::load(snapshot));
     Ok(())
 }
 
@@ -42,6 +42,7 @@ async fn load(home: &dyn Home, cache: &ArcSwap<StateCache>) -> anyhow::Result<()
 mod tests {
     use std::collections::BTreeMap;
     use std::collections::VecDeque;
+    use std::sync::Arc;
     use std::time::Duration;
 
     use futures::channel::oneshot;
@@ -65,11 +66,11 @@ mod tests {
     const KITCHEN: &str = "light.kitchen";
 
     /// Starts sync of a new cache with `home` and waits until it waits.
-    async fn start(home: FakeHome) -> (Arc<FakeHome>, Arc<ArcSwap<StateCache>>) {
+    async fn start(home: FakeHome) -> (Arc<FakeHome>, watch::Receiver<StateCache>) {
         let home = Arc::new(home);
-        let cache = Arc::new(ArcSwap::from_pointee(StateCache::default()));
-        let (task_home, task_cache) = (Arc::clone(&home), Arc::clone(&cache));
-        tokio::spawn(async move { sync(task_home.as_ref(), &task_cache).await });
+        let (sender, cache) = watch::channel(StateCache::default());
+        let task_home = Arc::clone(&home);
+        tokio::spawn(async move { sync(task_home.as_ref(), &sender).await });
         settle().await;
         (home, cache)
     }
@@ -102,7 +103,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_2_9_1_start_loads_snapshot() {
         let (_home, cache) = start(FakeHome::default()).await;
-        assert_eq!(**cache.load(), StateCache::load(house()));
+        assert_eq!(*cache.borrow(), StateCache::load(house()));
     }
 
     /// AC-2.9-2.
@@ -112,7 +113,7 @@ mod tests {
         let before = Instant::now();
         home.send(changed(KITCHEN, "off"));
         tokio::task::yield_now().await;
-        assert_eq!(cache.load().state(KITCHEN), Some(&state(KITCHEN, "off")));
+        assert_eq!(cache.borrow().state(KITCHEN), Some(&state(KITCHEN, "off")));
         assert_eq!(Instant::now(), before, "virtual time advanced");
     }
 
@@ -135,7 +136,7 @@ mod tests {
         home.set_snapshot(next.clone());
         home.send(Event::Reconnected);
         settle().await;
-        assert_eq!(**cache.load(), StateCache::load(next));
+        assert_eq!(*cache.borrow(), StateCache::load(next));
     }
 
     /// AC-2.9-6.
@@ -148,7 +149,7 @@ mod tests {
         settle().await;
         gate.send(()).expect("the snapshot call waits");
         settle().await;
-        assert_eq!(cache.load().state(KITCHEN), Some(&state(KITCHEN, "off")));
+        assert_eq!(cache.borrow().state(KITCHEN), Some(&state(KITCHEN, "off")));
     }
 
     /// AC-2.9-7.
@@ -159,7 +160,7 @@ mod tests {
         let (home, cache) = start(home).await;
         home.send(Event::Reconnected);
         settle().await;
-        assert_eq!(**cache.load(), StateCache::load(house()));
+        assert_eq!(*cache.borrow(), StateCache::load(house()));
     }
 
     /// The model state that the conformance test compares.
@@ -173,8 +174,9 @@ mod tests {
         /// The cache after every task waits.
         fn from_driver(driver: &CacheSyncDriver) -> anyhow::Result<Self> {
             driver.runtime.block_on(settle());
-            let states = &driver.cache.load().states;
-            let values = states
+            let synced = driver.cache.borrow();
+            let values = synced
+                .states
                 .iter()
                 .map(|(id, state)| Ok((id.to_string(), state.state.parse()?)));
             let cache: anyhow::Result<_> = values.collect();
@@ -189,7 +191,7 @@ mod tests {
         /// HA.
         home: Arc<FakeHome>,
         /// The cache that sync keeps.
-        cache: Arc<ArcSwap<StateCache>>,
+        cache: watch::Receiver<StateCache>,
         /// The HA state of each entity.
         states: BTreeMap<String, i64>,
         /// The changes that HA sent on the open connection and sync did not receive yet.
