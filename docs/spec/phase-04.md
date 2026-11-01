@@ -443,7 +443,7 @@ This phase selects responses, selects entities and decides the action from a pre
 - The sync use case publishes each new cache through a `tokio::sync::watch` channel. The channel replaces the `ArcSwap<StateCache>` of sub-phase 2.9.
 - Each satellite has a generation number and one announce queue. The queue can increase the generation of a satellite. Sub-phase 4.9c increases it for each dispatch.
 - An item of the queue has a text and a generation. The items of one satellite run one at a time, in order: the waiters for the turn of the satellite are the queue.
-- When an item has the turn, it waits until the watch channel shows the satellite entity `idle`. This wait has the deadline `announce.idle_wait_s`. When the satellite is not idle within it, the item is dropped and logged. Then the item waits `announce.margin_ms`. Then it compares its generation with the generation of the satellite. When they are equal, it announces. Else it makes no announce.
+- When an item has the turn, it waits until the watch channel shows the satellite entity `idle`. This wait has the deadline `announce.idle_wait_s`. When the satellite is not idle within it, the item is dropped and logged. Then the item waits `announce.margin_ms`. When the watch channel then does not show the satellite `idle`, the item waits for `idle` and the margin again, within the same deadline. Then it compares its generation with the generation of the satellite. When they are equal, it announces. Else it makes no announce.
 - The queue compares the generation only before an announce. It does not cancel a service call.
 - This sub-phase adds `[announce]` with `margin_ms` and `idle_wait_s`. It adds the `tokio` feature `sync` (`watch` and an async mutex) and the `tracing` crate (the logs) to `Cargo.toml`.
 - The conformance driver maps the model to the queue:
@@ -457,10 +457,12 @@ This phase selects responses, selects entities and decides the action from a pre
 
 - AC-4.9b-2: When `quint-connect` replays 100 traces of `announce.qnt`, the announces that `FakeHome` records match the model `started` after each step.
 - AC-4.9b-5: When an item is in the queue and the satellite is not idle within `idle_wait_s`, `FakeHome` records no announce, and the item ends.
+- AC-4.9b-6: When the satellite leaves `idle` during the margin and becomes idle again 1 s later, `FakeHome` records the announce at that time plus `margin_ms`, and not before.
 
 **Proofs.**
 
 - P-4.9b-5 (AC-4.9b-5). Argument: the wait for `idle` has the deadline `idle_wait_s`, and its timeout arm drops the item.
+- P-4.9b-6 (AC-4.9b-6). Argument: after the margin, the item reads the watch channel again and announces only when it shows `idle`. Else it repeats the wait for `idle` and the margin.
 - P-4.9b-2. Evidence: test.
 
 ---
