@@ -143,7 +143,7 @@ Format:
 
 Every test gives the same result on every run with the same code.
 
-1. Time: application tests use `#[tokio::test(start_paused = true)]` and `FakeClock`. No test sleeps on the wall clock. A timing criterion is written as an order of events in virtual time ("returns before virtual time advances"). A paused clock jumps to the next timer when all tasks wait, also when a task waits for a real socket. Thus no timer runs while code waits for a real socket in a test with a paused clock. An adapter that has such timers connects to its fake server through an in-memory stream (`tokio::io::duplex`). An adapter over a real local socket (`wiremock`) checks its deadlines between requests.
+1. Time: application tests use `#[tokio::test(start_paused = true)]` and `FakeClock`. No test sleeps on the wall clock. A timing criterion is written as an order of events in virtual time ("returns before virtual time advances"). A paused clock jumps to the next timer when all tasks wait, also when a task waits for a real socket. Thus no timer runs while code waits for a real socket in a test with a paused clock. An adapter that has such timers connects to its fake server through an in-memory stream (`tokio::io::duplex`). An adapter over a real local socket (`wiremock`) checks its deadlines between requests. Tokio does not advance a paused clock while a `spawn_blocking` task runs. The pools task of sub-phase 4.8 runs in `spawn_blocking` until its last sender drops. Thus an application test with timers uses a pools task with no blocking thread.
 2. Randomness: every random source takes a seed. Tests use fixed seeds.
 3. Network: tests use only local servers (`wiremock`, the fake HA server) and in-memory stores.
 4. Files: tests write only to temporary folders.

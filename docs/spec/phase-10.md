@@ -139,7 +139,7 @@ This phase lets Jarvis ask questions. Jarvis asks when it does not understand, w
 - P-10.4-1, P-10.4-2. Ensures: a missing area, or an area slot that matches no area, gives `Ask` from `ask_area` with the area names and aliases as choices. Argument: the two `Fallback` returns of sub-phase 4.5b become `Ask { ask_area, choices }`. No other branch changes.
 - P-10.4-4, P-10.4-5. Argument: `handle` matches `(Ask, ctx.satellite_id)` with two arms.
 - P-10.4-7. Ensures: a missing template slot that is not `optional` and has no habit value gives `Ask` from `ask_<slot>`. Argument: `decide` checks each template slot of the intent against the prediction, `optional` and `habit_defaults` before it renders.
-- P-10.4-8. Requires: `AnnounceWhenIdle` (P-4.7-2). Argument: the question is an item of the announce queue, which waits for `idle` (P-4.9b-1).
+- P-10.4-8. Requires: `AnnounceWhenIdle` (P-4.7-2). Argument: the question is an item of the announce queue, which waits for `idle` (P-4.9c-1).
 - P-10.4-9. Ensures: a filled alias gives the area of the alias. Argument: the choices contain the aliases, and `decide` resolves the filled value with `area_by_name` (P-2.8b-1).
 - P-10.4-3, P-10.4-6. Evidence: test.
 
@@ -165,7 +165,7 @@ This phase lets Jarvis ask questions. Jarvis asks when it does not understand, w
 
 A choice is a closed set, so step 2 comes before step 3. Free text can be anything, so step 3 comes before step 4.
 
-`close` increases the generation of the key, as each new request on a satellite does (sub-phase 4.9b). A deferred job keeps the generation of its key when it starts. Before each announce, question or call, it compares the generation. When the generation changed, the job stops and makes no announce, no question and no further call. A call that already started is not undone.
+`close` increases the generation of the key, as each new request on a satellite does (sub-phase 4.9c). A deferred job keeps the generation of its key when it starts. Before each announce, question or call, it compares the generation. When the generation changed, the job stops and makes no announce, no question and no further call. A call that already started is not undone.
 
 **Acceptance criteria.**
 

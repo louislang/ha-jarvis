@@ -432,22 +432,22 @@ This phase selects responses, selects entities and decides the action from a pre
 
 ### 4.9b Announce Queue
 
-**Goal:** Add the announce queue of each satellite. Jarvis announces an answer only when the satellite is idle, and a new request stops the announces of an older one.
+**Goal:** Add the announce queue of each satellite. Jarvis announces a text only when the satellite is idle, and a newer generation of the satellite drops the older items.
 
 - **Implements:** G6, G19. **Depends on:** 4.9.
-- **Files:** modify `src/app/conversation.rs`, `src/app/background.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `jarvis.toml`, `Cargo.toml`.
+- **Files:** modify `src/app/conversation.rs`, `src/app/background.rs`, `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
 - **Quint:** `announce.qnt` (conformance).
 
 **Model.**
 
-- The sync use case publishes each new cache through a `tokio::sync::watch` channel.
-- `dispatch(decision, satellite)` gets the satellite of the request, or none. Text from the HA UI, for example, has no satellite.
-- Each satellite has a generation number and one announce queue. A dispatch with a satellite increases the generation of that satellite. `handle` does not exist until sub-phase 5.3, so `dispatch` increases it. A deferred job keeps the generation of its request. Before each announce or call, the job compares the generation. When the generation changed, the job stops and makes no announce and no further call.
-- An item of the queue waits until the watch channel shows the satellite entity `idle`. Then it waits `announce.margin_ms` and announces. When the satellite is not idle within `announce.idle_wait_s`, the item is dropped and logged. The items of one satellite run one at a time, in order.
-- When the call of a `Reply` fails, `after` logs the error. With a satellite, it also puts an answer from `failure` in the queue. Jarvis does not retry a failed call.
-- Without a satellite, dispatch returns the reply text as in sub-phase 4.8 and puts nothing in a queue.
+- The sync use case publishes each new cache through a `tokio::sync::watch` channel. The channel replaces the `ArcSwap<StateCache>` of sub-phase 2.9.
+- Each satellite has a generation number and one announce queue. The queue can increase the generation of a satellite. Sub-phase 4.9c increases it for each dispatch.
+- An item of the queue has a text and a generation. The items of one satellite run one at a time, in order: the waiters for the turn of the satellite are the queue.
+- When an item has the turn, it waits until the watch channel shows the satellite entity `idle`. This wait has the deadline `announce.idle_wait_s`. When the satellite is not idle within it, the item is dropped and logged. Then the item waits `announce.margin_ms`. Then it compares its generation with the generation of the satellite. When they are equal, it announces. Else it makes no announce.
+- The queue compares the generation only before an announce. It does not cancel a service call.
 - This sub-phase adds `[announce]` with `margin_ms` and `idle_wait_s`. It adds the `tokio` feature `sync` (`watch` and an async mutex) and the `tracing` crate (the logs) to `Cargo.toml`.
 - The conformance driver maps the model to the queue:
+  - `request(r)` increases the generation of the satellite and sets the satellite entity to `responding`. `pipelineEnd` sets it to `idle`.
   - `arrive(r, s)` puts the text "r s" in the queue directly, with the generation of request `r`. The driver does not call `dispatch`, because a fetch has one answer and the model permits two sentences.
   - `start` advances virtual time by `margin_ms`.
   - `idle_wait_s` is large, so it never ends in a trace.
@@ -455,43 +455,67 @@ This phase selects responses, selects entities and decides the action from a pre
 
 **Acceptance criteria.**
 
-- AC-4.9b-1: When a failed `Reply` call puts an answer in the queue and the satellite becomes idle 1.5 s after the reply, the announce starts at 1.5 s plus `margin_ms`, and not before.
 - AC-4.9b-2: When `quint-connect` replays 100 traces of `announce.qnt`, the announces that `FakeHome` records match the model `started` after each step.
-- AC-4.9b-3: When `FakeHome` returns an error for the call of a `Reply` with a satellite, `FakeHome` records an announce from `failure` and no second call.
-- AC-4.9b-4: When a second dispatch for the satellite runs before the `failure` answer of the first is announced, `FakeHome` records no announce of the first.
-- AC-4.9b-5: When the satellite is not idle within `idle_wait_s`, `FakeHome` records no announce, and the job ends.
+- AC-4.9b-5: When an item is in the queue and the satellite is not idle within `idle_wait_s`, `FakeHome` records no announce, and the item ends.
 
 **Proofs.**
 
-- P-4.9b-1 (AC-4.9b-1). Requires: `AnnounceWhenIdle` (P-4.7-2). Argument: the item waits for `idle` on the watch channel and then for `margin_ms` before it calls `announce`, which matches the `start` guard of the model.
-- P-4.9b-4. Requires: `NoStaleAnnounce` (P-4.7-4). Argument: the job compares its generation before the announce, and the second dispatch increased it.
-- P-4.9b-5. Argument: the wait for `idle` has the deadline `idle_wait_s`, and its timeout arm drops the item.
-- P-4.9b-2, P-4.9b-3. Evidence: test.
+- P-4.9b-5 (AC-4.9b-5). Argument: the wait for `idle` has the deadline `idle_wait_s`, and its timeout arm drops the item.
+- P-4.9b-2. Evidence: test.
 
 ---
 
-### 4.9c Dispatch Fetches
+### 4.9c Failed Reply Announce
+
+**Goal:** Announce a `failure` answer when the service call of a reply fails. The user hears that the command did not work.
+
+- **Implements:** G6, G19. **Depends on:** 4.9b.
+- **Files:** modify `src/app/conversation.rs`.
+
+**Model.**
+
+- `dispatch(decision, satellite)` gets the satellite of the request, or none. Text from the HA UI, for example, has no satellite.
+- A dispatch with a satellite increases the generation of that satellite. `handle` does not exist until sub-phase 5.3, so `dispatch` increases it. The `after` work of a `Reply` keeps this generation.
+- When the call of a `Reply` fails, `after` logs the error. With a satellite, it also puts an answer from `failure` in the queue of the satellite (sub-phase 4.9b), with the generation of its request. `responses::select` picks the answer from the current pools. Jarvis does not retry a failed call.
+- The service call of a `Reply` is never cancelled. The generation compare runs only before an announce and before the steps of a deferred job (sub-phase 4.9d), not before the call of a `Reply`. Thus a quick second request does not stop the call of the first command.
+- Without a satellite, dispatch returns the reply text as in sub-phase 4.8. A failed call only logs the error and puts nothing in a queue.
+
+**Acceptance criteria.**
+
+- AC-4.9c-1: When a failed `Reply` call puts an answer in the queue and the satellite becomes idle 1.5 s after the reply, the announce starts at 1.5 s plus `margin_ms`, and not before.
+- AC-4.9c-2: When `FakeHome` returns an error for the call of a `Reply` with a satellite, `FakeHome` records an announce from `failure` and no second call.
+- AC-4.9c-3: When a second dispatch for the satellite runs before the `failure` answer of the first is announced, `FakeHome` records no announce of the first.
+
+**Proofs.**
+
+- P-4.9c-1 (AC-4.9c-1). Requires: `AnnounceWhenIdle` (P-4.7-2). Argument: the `failure` answer is an item of the announce queue. The item waits for `idle` on the watch channel and then for `margin_ms` before it calls `announce` (sub-phase 4.9b), which matches the `start` guard of the model.
+- P-4.9c-3 (AC-4.9c-3). Requires: `NoStaleAnnounce` (P-4.7-4). Argument: the item compares its generation before the announce (sub-phase 4.9b), and the second dispatch increased it.
+- P-4.9c-2. Evidence: test.
+
+---
+
+### 4.9d Dispatch Fetches
 
 **Goal:** Add the dispatch of fetch jobs. Jarvis speaks a filler, fetches the data in the background, and announces the answer when the satellite is idle again.
 
-- **Implements:** G6, G19. **Depends on:** 4.9b.
+- **Implements:** G6, G19. **Depends on:** 4.9c.
 - **Files:** modify `src/app/conversation.rs`, `src/testing/fakes.rs`.
 
 **Model.**
 
 - `Defer(Fetch)`: return the filler. `after` calls the service, renders the answer pool with `response`, and puts the answer in the queue of the satellite (sub-phase 4.9b). On error, it puts an answer from `failure` in the queue.
-- The fetch job keeps the generation of its request. It compares the generation before the call and before the announce (sub-phase 4.9b).
+- The fetch job keeps the generation of its request (sub-phase 4.9c). It compares the generation before the call and before the announce (sub-phase 4.9b).
 - Without a satellite, `after` logs the answer or the failure and does not announce it.
 - `FakeHome` can give response data for a call.
 
 **Acceptance criteria.**
 
-- AC-4.9c-1: When dispatch gets `Defer` with `Job::Fetch`, `FakeHome` records the call with `return_response`.
-- AC-4.9c-2: When the fetch result arrives and the satellite becomes idle, `FakeHome` records an announce with the rendered answer and `preannounce = false`.
-- AC-4.9c-3: When the fetch fails, `FakeHome` records an announce from `failure`.
+- AC-4.9d-1: When dispatch gets `Defer` with `Job::Fetch`, `FakeHome` records the call with `return_response`.
+- AC-4.9d-2: When the fetch result arrives and the satellite becomes idle, `FakeHome` records an announce with the rendered answer and `preannounce = false`.
+- AC-4.9d-3: When the fetch fails, `FakeHome` records an announce from `failure`.
 
 **Proofs.**
 
-- P-4.9c-2 (AC-4.9c-2). Requires: `AnnounceWhenIdle` (P-4.7-2). Argument: the answer goes through the announce queue, which waits for `idle` and `margin_ms` (P-4.9b-1).
-- P-4.9c-3. Argument: the error branch of the fetch selects from `failure`.
-- P-4.9c-1. Evidence: test.
+- P-4.9d-2 (AC-4.9d-2). Requires: `AnnounceWhenIdle` (P-4.7-2). Argument: the answer goes through the announce queue, which waits for `idle` and `margin_ms` (P-4.9c-1).
+- P-4.9d-3. Argument: the error branch of the fetch selects from `failure`.
+- P-4.9d-1. Evidence: test.
