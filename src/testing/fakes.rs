@@ -15,6 +15,7 @@ use futures::channel::oneshot;
 use futures::stream::BoxStream;
 use jiff::Timestamp;
 use serde_json::Value;
+use serde_json::json;
 
 use crate::Device;
 use crate::domain::model::Prediction;
@@ -39,7 +40,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// A `Home` with a settable snapshot, scripted events, a count of snapshot calls, recorded calls
-/// and delayed calls.
+/// and announces, and delayed calls.
 pub(crate) struct FakeHome {
     /// The snapshot that `snapshot` returns.
     snapshot: Mutex<Snapshot>,
@@ -51,7 +52,7 @@ pub(crate) struct FakeHome {
     receiver: Mutex<Option<mpsc::UnboundedReceiver<Event>>>,
     /// The gates of the next delayed calls, in order.
     gates: Mutex<VecDeque<oneshot::Receiver<()>>>,
-    /// The service calls, in order.
+    /// The service calls, in order. An announce is its `assist_satellite.announce` call.
     calls: Mutex<Vec<ServiceCall>>,
 }
 
@@ -136,6 +137,21 @@ impl Home for FakeHome {
         lock(&self.calls).push(call);
         self.wait().await?;
         Ok(None)
+    }
+
+    async fn announce(&self, satellite: &str, text: &str) -> anyhow::Result<()> {
+        let data = [("message", json!(text)), ("preannounce", json!(false))];
+        lock(&self.calls).push(ServiceCall {
+            domain: "assist_satellite".to_owned(),
+            service: "announce".to_owned(),
+            target: vec![satellite.to_owned()],
+            data: data
+                .map(|(key, value)| (key.to_owned(), value))
+                .into_iter()
+                .collect(),
+            return_response: false,
+        });
+        Ok(())
     }
 }
 

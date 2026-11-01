@@ -102,6 +102,7 @@ impl Config {
     fn validate(&self) -> anyhow::Result<()> {
         let positive = [
             ("ha.request_timeout_ms", self.ha.request_timeout_ms),
+            ("ha.announce_timeout_s", self.ha.announce_timeout_s),
             ("ha.ping_interval_s", self.ha.ping_interval_s),
         ];
         for (name, value) in positive {
@@ -151,8 +152,10 @@ pub struct HaConfig {
     pub url: String,
     /// Environment variable that holds the HA token.
     pub token_env: String,
-    /// Deadline of the authentication and of each request.
+    /// Deadline of the authentication and of each request except an announce.
     pub request_timeout_ms: u64,
+    /// Deadline of an announce. HA answers after the satellite plays the audio.
+    pub announce_timeout_s: u64,
     /// Time between two pings.
     pub ping_interval_s: u64,
 }
@@ -375,6 +378,7 @@ mod tests {
                 url: "ws://homeassistant.local:8123/api/websocket".to_owned(),
                 token_env: "HA_TOKEN".to_owned(),
                 request_timeout_ms: 5000,
+                announce_timeout_s: 60,
                 ping_interval_s: 30,
             },
             model: ModelConfig { threshold: 0.6 },

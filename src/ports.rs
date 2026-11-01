@@ -25,6 +25,10 @@ pub trait Home: Send + Sync {
 
     /// Calls a service. Gives the response data when `call.return_response` is true.
     async fn call(&self, call: ServiceCall) -> anyhow::Result<Option<Value>>;
+
+    /// Speaks `text` on the satellite entity `satellite` with no preannounce sound. Returns
+    /// after the satellite plays the audio.
+    async fn announce(&self, satellite: &str, text: &str) -> anyhow::Result<()>;
 }
 
 /// The System One model.

@@ -8,6 +8,7 @@ pools = "pools.json"
 url = "ws://homeassistant.local:8123/api/websocket"
 token_env = "HA_TOKEN"
 request_timeout_ms = 5000
+announce_timeout_s = 60     # announce and ask: HA answers after the audio plays
 ping_interval_s = 30
 
 [model]

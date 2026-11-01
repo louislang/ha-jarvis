@@ -61,8 +61,10 @@ pub struct HaHome<S> {
     pending: Mutex<HashMap<u64, ResultSender>>,
     /// The events, until [`HaHome::events`] takes them.
     events: Mutex<Option<mpsc::UnboundedReceiver<Event>>>,
-    /// The deadline of each request.
+    /// The deadline of each request except an announce.
     deadline: Duration,
+    /// The deadline of an announce, which HA answers after the satellite plays the audio.
+    announce_deadline: Duration,
     /// Stops the connection task when the adapter drops.
     task: AbortHandle,
 }
@@ -115,6 +117,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             pending: Mutex::new(HashMap::new()),
             events: Mutex::new(Some(receiver)),
             deadline: Duration::from_millis(config.request_timeout_ms),
+            announce_deadline: Duration::from_secs(config.announce_timeout_s),
             task,
         });
         // A weak reference, so that the task does not keep the adapter alive.
@@ -251,6 +254,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         Ok(call.return_response.then(response))
     }
 
+    /// Speaks `text` on the satellite entity `satellite` with `assist_satellite.announce` and no
+    /// preannounce sound. HA returns after the satellite plays the audio.
+    ///
+    /// # Errors
+    ///
+    /// A connection, HA or timeout error.
+    pub async fn announce(&self, satellite: &str, text: &str) -> anyhow::Result<()> {
+        let command = json!({
+            "type": "call_service", "domain": "assist_satellite", "service": "announce",
+            "target": { "entity_id": [satellite] },
+            "service_data": { "message": text, "preannounce": false },
+        });
+        self.request_within(command, self.announce_deadline).await?;
+        Ok(())
+    }
+
     /// Completes each listed entity with its entry of `get_entries` and the names of `states`.
     async fn complete(&self, entities: &mut Value, states: &Value) -> anyhow::Result<()> {
         let listed = entities.as_array_mut().context("protocol error")?;
@@ -272,7 +291,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
     }
 
     /// Sends the JSON object `command` with the next ID and waits for its result.
-    async fn request(&self, mut command: Value) -> anyhow::Result<Value> {
+    async fn request(&self, command: Value) -> anyhow::Result<Value> {
+        self.request_within(command, self.deadline).await
+    }
+
+    /// Sends the JSON object `command` with the next ID and waits `deadline` for its result.
+    async fn request_within(
+        &self,
+        mut command: Value,
+        deadline: Duration,
+    ) -> anyhow::Result<Value> {
         let exchange = async {
             let (sender, receiver) = oneshot::channel();
             let mut writer = self.writer.lock().await;
@@ -290,9 +318,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             drop(writer);
             receiver.await.context("connection error")?
         };
-        time::timeout(self.deadline, exchange)
+        time::timeout(deadline, exchange)
             .await
-            .map_err(|_| anyhow::anyhow!("timeout error: no result within {:?}", self.deadline))?
+            .map_err(|_| anyhow::anyhow!("timeout error: no result within {deadline:?}"))?
     }
 
     /// Sends a result or a `pong` to its pending request and an event to `events`. Ignores
@@ -1073,11 +1101,15 @@ mod tests {
         json!({ "light.kitchen": { "brightness": 128 } })
     }
 
-    /// Runs `call` against a server that answers as HA does. Gives the request and the result.
-    async fn serve_call(call: ServiceCall) -> anyhow::Result<(Value, Option<Value>)> {
+    /// Starts an adapter whose server answers the first request as HA does after `delay`. The
+    /// receiver gives that request.
+    async fn answer_after(
+        delay: Duration,
+    ) -> (Arc<HaHome<DuplexStream>>, oneshot::Receiver<Value>) {
         let (sender, receiver) = oneshot::channel();
-        let home = ready(|mut server| async move {
+        let home = ready(move |mut server| async move {
             let request = server.receive().await;
+            time::sleep(delay).await;
             let mut result = json!({ "context": { "id": "01K" } });
             if request["return_response"] == true {
                 result["response"] = response();
@@ -1087,8 +1119,14 @@ mod tests {
             server.wait_close().await;
         })
         .await;
+        (home, receiver)
+    }
+
+    /// Runs `call` against a server that answers as HA does. Gives the request and the result.
+    async fn serve_call(call: ServiceCall) -> anyhow::Result<(Value, Option<Value>)> {
+        let (home, request) = answer_after(Duration::ZERO).await;
         let result = home.call(call).await?;
-        Ok((receiver.await?, result))
+        Ok((request.await?, result))
     }
 
     /// AC-2.5-1.
@@ -1118,5 +1156,29 @@ mod tests {
         let (_, result) = serve_call(turn_on(false)).await?;
         assert_eq!(result, None);
         Ok(())
+    }
+
+    /// AC-4.9-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_4_9_5_announce_sends_announce_for_satellite() -> anyhow::Result<()> {
+        let (home, request) = answer_after(Duration::ZERO).await;
+        home.announce("assist_satellite.kitchen", "It is sunny.")
+            .await?;
+        let request = request.await?;
+        let expected = json!({
+            "id": request["id"], "type": "call_service", "domain": "assist_satellite",
+            "service": "announce", "target": { "entity_id": ["assist_satellite.kitchen"] },
+            "service_data": { "message": "It is sunny.", "preannounce": false },
+        });
+        assert_eq!(request, expected);
+        Ok(())
+    }
+
+    /// AC-4.9-8.
+    #[tokio::test(start_paused = true)]
+    async fn ac_4_9_8_result_after_ten_seconds_is_ok() -> anyhow::Result<()> {
+        let (home, _request) = answer_after(Duration::from_secs(10)).await;
+        home.announce("assist_satellite.kitchen", "It is sunny.")
+            .await
     }
 }
