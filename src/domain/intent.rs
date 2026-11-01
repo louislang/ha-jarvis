@@ -45,6 +45,7 @@ pub enum MarkupError {
 /// digits and single inner spaces.
 #[verus_spec(normal =>
     ensures
+        normal@ == normalized(text@),
         is_normal(normal@),
         is_normal(text@) ==> normal@ == text@,
 )]
@@ -88,6 +89,7 @@ pub fn normalize(text: &str) -> String {
     requires
         index < chars@.len(),
     ensures
+        kept == keep(chars@, index as int),
         keeps(chars@, index as int, kept),
 )]
 fn kept(chars: &[char], index: usize) -> char {
@@ -326,6 +328,37 @@ spec fn begun(text: Seq<char>, index: int) -> bool {
         && (index + 1 < text.len() ==> digit(text[index + 1]))
 }
 
+/// The character at `index` of `text` in normalized text, before spaces collapse.
+pub open spec fn keep(text: Seq<char>, index: int) -> char {
+    let c = text[index];
+    if crate::domain::contracts::alphabetic(c) || digit(c) || c == '\''
+        || (c == '.' && 0 < index < text.len() - 1 && digit(text[index - 1]) && digit(text[index + 1])) {
+        crate::domain::contracts::ascii_lowercase(c)
+    } else {
+        ' '
+    }
+}
+
+/// The first `count` characters of `text` after `keep`, with runs of spaces collapsed and no
+/// leading space.
+pub open spec fn collapsed(text: Seq<char>, count: int) -> Seq<char>
+    decreases count,
+{
+    if count <= 0 {
+        Seq::empty()
+    } else {
+        let before = collapsed(text, count - 1);
+        let c = keep(text, count - 1);
+        if c == ' ' && (before.len() == 0 || before.last() == ' ') { before } else { before.push(c) }
+    }
+}
+
+/// `text` normalized: `collapsed` without a trailing space.
+pub open spec fn normalized(text: Seq<char>) -> Seq<char> {
+    let all = collapsed(text, text.len() as int);
+    if all.len() > 0 && all.last() == ' ' { all.drop_last() } else { all }
+}
+
 /// True when `kept` is the character at `index` of `text` in normalized text.
 spec fn keeps(text: Seq<char>, index: int, kept: char) -> bool {
     &&& allowed(kept)
@@ -338,6 +371,7 @@ spec fn keeps(text: Seq<char>, index: int, kept: char) -> bool {
 /// of `text`, and `space` is true when it is empty or ends with a space.
 spec fn building(text: Seq<char>, normal: Seq<char>, index: int, space: bool) -> bool {
     &&& 0 <= index <= text.len()
+    &&& normal == collapsed(text, index)
     &&& space == (normal.len() == 0 || normal.last() == ' ')
     &&& forall|position: int| 0 <= position < normal.len() ==> #[trigger] begun(normal, position)
     &&& normal.len() > 0 && normal.last() == '.' ==> index < text.len() && digit(text[index])
@@ -351,6 +385,7 @@ proof fn lemma_pushed(text: Seq<char>, normal: Seq<char>, index: int, space: boo
     requires
         index < text.len(),
         building(text, normal, index, space),
+        kept == keep(text, index),
         keeps(text, index, kept),
     ensures
         building(

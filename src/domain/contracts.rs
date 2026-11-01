@@ -399,12 +399,16 @@ pub fn ex_char_is_ascii_digit(c: &char) -> (digit: bool)
     c.is_ascii_digit()
 }
 
+/// `c` with `A` to `Z` mapped to `a` to `z`. <https://doc.rust-lang.org/std/primitive.char.html#method.to_ascii_lowercase>
+pub open spec fn ascii_lowercase(c: char) -> char {
+    if 'A' <= c && c <= 'Z' { ((c as u32 + 32) as u32) as char } else { c }
+}
+
 /// Maps `A` to `Z` to `a` to `z` and gives other characters unchanged. <https://doc.rust-lang.org/std/primitive.char.html#method.to_ascii_lowercase>
 #[verifier::external_fn_specification]
 pub fn ex_char_to_ascii_lowercase(c: &char) -> (lower: char)
     ensures
-        'A' <= *c && *c <= 'Z' ==> 'a' <= lower && lower <= 'z',
-        !('A' <= *c && *c <= 'Z') ==> lower == *c,
+        lower == ascii_lowercase(*c),
 {
     c.to_ascii_lowercase()
 }
