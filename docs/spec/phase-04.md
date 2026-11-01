@@ -116,7 +116,7 @@ This phase selects responses, selects entities and decides the action from a pre
 **Proofs.**
 
 - P-4.4-7 (AC-4.4-7). Ensures: every result entity matches a filter and is not excluded. Argument: the result draws only from `matching = filter(cache, filters) \ exclude`.
-- P-4.4-1 (AC-4.4-1). Ensures: for `target = "entities"` and a `matching ∩ area` that is not empty, the result is `matching ∩ area`. Argument: `select` returns that set without a further filter.
+- P-4.4-1 (AC-4.4-1). Ensures: for `target = "entities"` and a `matching ∩ area` that is not empty, every result entity is in `matching ∩ area`, and every entity of `matching ∩ area` that a filter without a `name` matches is in the result. From sub-phase 4.4b, the tests are the evidence for the entities that only a filter with a `name` matches, because the `ensures` of `normalize` does not state its output (P-4.4b-3). Argument: `select` returns that set without a further filter.
 
 ---
 
