@@ -1,6 +1,8 @@
 listen = "0.0.0.0:10700"
 device = "cuda"
 intents = "intents.toml"
+responses = "responses.toml"
+pools = "pools.json"
 
 [ha]
 url = "ws://homeassistant.local:8123/api/websocket"

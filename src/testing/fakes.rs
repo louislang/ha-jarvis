@@ -13,6 +13,7 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::channel::oneshot;
 use futures::stream::BoxStream;
+use jiff::Timestamp;
 use serde_json::Value;
 
 use crate::Device;
@@ -21,8 +22,10 @@ use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
 use crate::ports::Classifier;
+use crate::ports::Clock;
 use crate::ports::Home;
 use crate::ports::ModelLoader;
+use crate::ports::Store;
 
 /// The reference house snapshot.
 #[must_use]
@@ -35,7 +38,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().expect("no test panics with the lock")
 }
 
-/// A `Home` with a settable snapshot, scripted events, a count of snapshot calls and delayed calls.
+/// A `Home` with a settable snapshot, scripted events, a count of snapshot calls, recorded calls
+/// and delayed calls.
 pub(crate) struct FakeHome {
     /// The snapshot that `snapshot` returns.
     snapshot: Mutex<Snapshot>,
@@ -47,6 +51,8 @@ pub(crate) struct FakeHome {
     receiver: Mutex<Option<mpsc::UnboundedReceiver<Event>>>,
     /// The gates of the next delayed calls, in order.
     gates: Mutex<VecDeque<oneshot::Receiver<()>>>,
+    /// The service calls, in order.
+    calls: Mutex<Vec<ServiceCall>>,
 }
 
 impl FakeHome {
@@ -60,6 +66,7 @@ impl FakeHome {
             sender,
             receiver: Mutex::new(Some(receiver)),
             gates: Mutex::default(),
+            calls: Mutex::default(),
         }
     }
 
@@ -86,6 +93,12 @@ impl FakeHome {
     #[must_use]
     pub(crate) fn snapshots(&self) -> usize {
         self.snapshots.load(Ordering::SeqCst)
+    }
+
+    /// The service calls, in order.
+    #[must_use]
+    pub(crate) fn calls(&self) -> Vec<ServiceCall> {
+        lock(&self.calls).clone()
     }
 
     /// Waits for the gate of this call, if `delay` gave one.
@@ -119,7 +132,8 @@ impl Home for FakeHome {
         receiver.expect("events is called once").boxed()
     }
 
-    async fn call(&self, _call: ServiceCall) -> anyhow::Result<Option<Value>> {
+    async fn call(&self, call: ServiceCall) -> anyhow::Result<Option<Value>> {
+        lock(&self.calls).push(call);
         self.wait().await?;
         Ok(None)
     }
@@ -175,5 +189,51 @@ impl ModelLoader for FakeModelLoader {
     async fn load(&self, dir: &Path, _device: Device) -> anyhow::Result<Arc<dyn Classifier>> {
         let classifier = lock(&self.classifiers).pop_front();
         classifier.ok_or_else(|| anyhow::anyhow!("no scripted classifier for {}", dir.display()))
+    }
+}
+
+/// A `Store` in memory that records each save.
+pub(crate) struct FakeStore<T> {
+    /// The saved value.
+    value: Mutex<Option<T>>,
+    /// The saved values, in order.
+    saves: Mutex<Vec<T>>,
+}
+
+impl<T: Clone> FakeStore<T> {
+    /// A store whose saved value is `value`.
+    #[must_use]
+    pub(crate) fn new(value: Option<T>) -> Self {
+        Self {
+            value: Mutex::new(value),
+            saves: Mutex::default(),
+        }
+    }
+
+    /// The saved values, in order.
+    #[must_use]
+    pub(crate) fn saves(&self) -> Vec<T> {
+        lock(&self.saves).clone()
+    }
+}
+
+impl<T: Clone + Send> Store<T> for FakeStore<T> {
+    fn load(&self) -> anyhow::Result<Option<T>> {
+        Ok(lock(&self.value).clone())
+    }
+
+    fn save(&self, value: &T) -> anyhow::Result<()> {
+        *lock(&self.value) = Some(value.clone());
+        lock(&self.saves).push(value.clone());
+        Ok(())
+    }
+}
+
+/// A `Clock` that always gives one time.
+pub struct FakeClock(pub Timestamp);
+
+impl Clock for FakeClock {
+    fn now(&self) -> Timestamp {
+        self.0
     }
 }
