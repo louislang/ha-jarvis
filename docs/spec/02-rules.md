@@ -137,7 +137,7 @@ Format:
 4. A sub-phase is complete only when all of its acceptance tests pass in the required checks of section 7.3.
 5. A phase is complete only when the acceptance tests of all of its sub-phases pass on `main`.
 6. Field log steps are not tests and gate nothing. A tool behavior or a file structure is never a field log step: it is a gate test or a structure test in `xtask/src/gates.rs`.
-7. When a criterion replaces an earlier one ("This replaces AC-4.5-6"), the sub-phase changes or deletes the old test in the same PR. The old ID is not used again.
+7. When a criterion replaces an earlier one ("This replaces AC-4.5b-4"), the sub-phase changes or deletes the old test in the same PR. The old ID is not used again.
 
 ### 6.2 Determinism
 
