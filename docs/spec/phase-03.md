@@ -14,6 +14,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Model.**
 
 - `normalize(text) -> String`: lowercase the ASCII letters `A` to `Z`, replace each character that is not a letter, a digit, a space or an apostrophe with a space (a `.` between two digits stays), collapse runs of spaces, trim. A letter that is not ASCII stays unchanged, because Verus cannot prove that Unicode lowercase is idempotent. Jarvis uses `normalize` for comparisons (choices, feedback keys, correlation, the held-out split, seed equality). The model also gets the normalized transcript, because speech-to-text adds capitals and punctuation that the training examples do not have. Slot spans and slots are byte offsets in the normalized text.
+- `normalized(text)` is the Verus spec function of this model. Each character becomes its ASCII lowercase form, stays unchanged or becomes a space. Then runs of spaces collapse to one space, and the outer spaces go. Normal text is a text that `normalized` keeps unchanged: it has only lowercase ASCII letters, other letters, digits, apostrophes, dots between two digits and single inner spaces, with no outer spaces.
 
 **Acceptance criteria.**
 
@@ -23,7 +24,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 **Proofs.**
 
-- P-3.1-2 (AC-3.1-2). Claim: `normalize(normalize(t)) = normalize(t)`. Argument: after one pass, the text has only lowercase ASCII letters, other letters, digits, apostrophes, dots between digits and single inner spaces, with no outer spaces. Each step maps such a text to itself, so the second pass changes nothing.
+- P-3.1-2 (AC-3.1-2). Ensures: `normalize(t) = normalized(t)`, `normalized(t)` is normal text, and `normalized(t) = t` when `t` is normal text. Thus `normalize(normalize(t)) = normalize(t)`. Argument: the loop invariant states that the output so far is the collapsed text of the characters read so far. After the loop, `normalize` removes the last space, as `normalized` does. Each step maps normal text to itself, so the second pass changes nothing. The fix PR `Fix: Full normalize Spec` adds the clause `normalize(t) = normalized(t)` to the code (sub-phase 4.4b).
 - P-3.1-1, P-3.1-7. Evidence: test.
 
 ---
@@ -159,7 +160,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 - P-3.3-1, P-3.3-2. Ensures: the result is `area: <area or none> | habits: <lines joined by "; " or none>`. Argument: `context_text` is a `format!` with two branches for empty values.
 - P-3.3-3 (AC-3.3-3). Ensures: the same areas and the same seed give the same context. Argument: `sample_context` reads only `rng` and `areas`. A seeded RNG gives the same sequence.
-- P-3.3-8. Evidence: test. Argument: `xxh3` with a fixed seed is a pure function, and `normalize` is pure. Verus cannot state the claim, because the `ensures` of `normalize` does not define its output and `vstd` does not interpret `f64` multiplication and comparison.
+- P-3.3-8. Evidence: test. Argument: `xxh3` with a fixed seed is a pure function, and `normalize` is pure. Verus cannot state the claim, because `vstd` does not interpret `f64` multiplication and comparison.
 - P-3.3-9. Evidence: test (statistical property of the hash on this input set).
 
 ---
