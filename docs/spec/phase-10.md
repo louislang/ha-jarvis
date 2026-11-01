@@ -115,7 +115,7 @@ This phase lets Jarvis ask questions. Jarvis asks when it does not understand, w
 
 **Model.**
 
-- `Decision::Ask { question: Chosen, pending }`. A missing `area`, a missing `person`, or a missing template slot that is not `optional` and has no habit value gives `Ask` from the pool `ask_<slot>`. These cases replace the `Fallback` of sub-phase 4.5b for a missing area and of sub-phase 4.5c for a missing slot. Jarvis asks for one missing value at a time, in this order: `area`, `person`, then the other slots in name order.
+- `Decision::Ask { question: Chosen, pending }`. A missing `area`, a missing `person`, or a missing template slot that is not `optional` and has no habit value gives `Ask` from the pool `ask_<slot>`. These cases replace the `Fallback` of sub-phase 4.5b for a missing area and of sub-phase 4.5d for a missing slot. Jarvis asks for one missing value at a time, in this order: `area`, `person`, then the other slots in name order.
 - The choices for `area` are the area names and their aliases. `decide` maps a filled alias to its area with `area_by_name`. The choices for `person` are the names of the `person` entities in the cache. Other slots have no choices.
 - `Home::ask(satellite, question)` calls `start_conversation` with `preannounce = false` and the deadline `ha.announce_timeout_s`.
 - With a `satellite_id`, `handle` returns empty text and puts the question in the announce queue of the satellite (sub-phase 4.9), which calls `ask` when the satellite is idle. HA cancels a running pipeline when a question starts, so the question waits. Without a `satellite_id`, `handle` returns the question text.
@@ -130,7 +130,7 @@ This phase lets Jarvis ask questions. Jarvis asks when it does not understand, w
 - AC-10.4-4: When the result is `Ask` and the context has a `satellite_id`, `handle` returns empty text and `FakeHome` records `ask` with the question.
 - AC-10.4-5: When the result is `Ask` and the context has no `satellite_id`, `handle` returns the question text.
 - AC-10.4-6: When `HaHome::ask` runs, `FakeHaServer` receives `assist_satellite.start_conversation` with the question and `preannounce = false`.
-- AC-10.4-7: When an intent has a template slot that is not `optional` and the prediction does not have it, `decide` returns `Ask` from `ask_<slot>` with no choices. This replaces the second sentence of AC-4.5c-3.
+- AC-10.4-7: When an intent has a template slot that is not `optional` and the prediction does not have it, `decide` returns `Ask` from `ask_<slot>` with no choices. This replaces the second sentence of AC-4.5d-3.
 - AC-10.4-8: When `decide` returns `Ask` with a `satellite_id`, `FakeHome` records `ask` after the satellite state becomes idle, and not before.
 - AC-10.4-9: When the user answers with an area alias, `decide` uses the area of that alias.
 
