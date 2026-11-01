@@ -336,6 +336,24 @@ pub fn ex_map_get<'map, Key>(map: &'map Map<String, Value>, key: &Key) -> (value
     map.get(key)
 }
 
+/// Makes an empty JSON object. <https://docs.rs/serde_json/1/serde_json/struct.Map.html#method.new>
+#[verifier::external_fn_specification]
+pub fn ex_map_new() -> Map<String, Value> {
+    Map::new()
+}
+
+/// Inserts `value` at `key` and gives the old value of `key`. <https://docs.rs/serde_json/1/serde_json/struct.Map.html#method.insert>
+#[verifier::external_fn_specification]
+pub fn ex_map_insert(map: &mut Map<String, Value>, key: String, value: Value) -> Option<Value> {
+    map.insert(key, value)
+}
+
+/// Makes the JSON string `text`. <https://docs.rs/serde_json/1/serde_json/enum.Value.html#impl-From%3CString%3E-for-Value>
+#[verifier::external_fn_specification]
+pub fn ex_value_from_string(text: String) -> Value {
+    <Value as From<String>>::from(text)
+}
+
 /// The text of the JSON string `value`, or `None` for another JSON type.
 pub uninterp spec fn text(value: Value) -> Option<Seq<char>>;
 
