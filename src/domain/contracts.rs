@@ -5,6 +5,7 @@ use std::cmp::Ordering;
 use std::convert::Infallible;
 use std::hash::Hash;
 use std::slice::SliceIndex;
+use std::str::pattern::Pattern;
 use std::sync::Arc;
 
 use jiff::Timestamp;
@@ -354,6 +355,18 @@ pub fn ex_value_from_string(text: String) -> Value {
     <Value as From<String>>::from(text)
 }
 
+/// Copies the JSON object `map`. <https://docs.rs/serde_json/1/serde_json/struct.Map.html#impl-Clone-for-Map%3CString,+Value%3E>
+#[verifier::external_fn_specification]
+pub fn ex_map_clone(map: &Map<String, Value>) -> Map<String, Value> {
+    map.clone()
+}
+
+/// Makes the JSON object `map`. <https://docs.rs/serde_json/1/serde_json/enum.Value.html#impl-From%3CMap%3CString,+Value%3E%3E-for-Value>
+#[verifier::external_fn_specification]
+pub fn ex_value_from_map(map: Map<String, Value>) -> Value {
+    <Value as From<Map<String, Value>>>::from(map)
+}
+
 /// The text of the JSON string `value`, or `None` for another JSON type.
 pub uninterp spec fn text(value: Value) -> Option<Seq<char>>;
 
@@ -399,6 +412,28 @@ pub fn ex_str_get<Index: SliceIndex<str>>(text: &str, index: Index) -> (part: Op
         },
 {
     text.get(index)
+}
+
+/// The character that the pattern `delimiter` matches, or `None` for another pattern.
+pub uninterp spec fn pattern_char<Delimiter>(delimiter: Delimiter) -> Option<char>;
+
+/// A `char` pattern matches that character. <https://doc.rust-lang.org/std/str/pattern/trait.Pattern.html>
+pub broadcast axiom fn axiom_char_pattern(c: char)
+    ensures
+        #[trigger] pattern_char(c) == Some(c),
+;
+
+/// Splits `text` at the first match of `delimiter` and gives the text before and after it, or
+/// `None` when `text` has no match. <https://doc.rust-lang.org/std/primitive.str.html#method.split_once>
+#[verifier::external_fn_specification]
+pub fn ex_str_split_once<Delimiter: Pattern>(text: &str, delimiter: Delimiter) -> (parts: Option<(&str, &str)>)
+    ensures
+        pattern_char(delimiter) matches Some(c) ==> match parts {
+            Some((before, after)) => text@ == before@ + seq![c] + after@ && !before@.contains(c),
+            None => !text@.contains(c),
+        },
+{
+    text.split_once(delimiter)
 }
 
 /// The lowercase form of `text`.

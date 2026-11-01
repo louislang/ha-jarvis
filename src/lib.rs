@@ -1,7 +1,8 @@
 //! Voice-controlled home automation for Home Assistant.
 
-// Verus reads loop invariants from attributes on loops.
-#![cfg_attr(verus_only, feature(proc_macro_hygiene))]
+// Verus reads loop invariants from attributes on loops, and the `split_once` contract names a
+// `Pattern`.
+#![cfg_attr(verus_only, feature(proc_macro_hygiene, pattern))]
 
 use std::fs;
 use std::net::SocketAddr;
