@@ -124,7 +124,7 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 - `Defer(Llm)`: return the filler. The `after` work consumes `answer`: each `Sentence` goes to the announce queue of sub-phase 4.9b. Each `Call` runs through `Home` before the next step. An error announces from `failure`.
 - The use case waits at most `openai.timeout_ms` for each step of `answer`. A longer wait is a timeout error.
 - A `Call` runs only when its service domain and the domain of each target entity are in `openai.allowed_domains`, and each target entity is in the hot cache. Else the consumer sends the tool error "not permitted" and makes no call. A misheard request thus cannot unlock a door. Leave `switch` out of the list when a switch drives a door, a gate or a lock. This sub-phase adds `openai.allowed_domains`.
-- Without a `satellite_id`, there is no satellite for an announce. `handle` then waits for the job and returns the joined sentences as the text, with no filler. A fetch job (sub-phase 4.9c) works the same way. The wait ends with the `timeout_ms` error.
+- Without a `satellite_id`, there is no satellite for an announce. `handle` then waits for the job and returns the joined sentences as the text, with no filler. A fetch job (sub-phase 4.9d) works the same way. The wait ends with the `timeout_ms` error.
 
 **Acceptance criteria.**
 
