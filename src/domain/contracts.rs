@@ -11,12 +11,14 @@ use std::sync::Arc;
 use jiff::Timestamp;
 use minijinja::Environment;
 use minijinja::Error;
+use minijinja::Expression;
 use minijinja::Template;
 use minijinja::UndefinedBehavior;
 use minijinja::value::Serde;
 use rand::Rng;
 use rand::TryRng;
 use rand::rngs::StdRng;
+use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
 
@@ -223,6 +225,47 @@ pub fn ex_environment_set_debug<'source>(environment: &mut Environment<'source>,
     environment.set_debug(enabled)
 }
 
+/// A compiled expression. <https://docs.rs/minijinja/3/minijinja/struct.Expression.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExExpression<'env, 'source>(Expression<'env, 'source>);
+
+/// Compiles the expression `source`. <https://docs.rs/minijinja/3/minijinja/struct.Environment.html#method.compile_expression>
+#[verifier::external_fn_specification]
+pub fn ex_environment_compile_expression<'source, 'env>(
+    environment: &'env Environment<'source>,
+    source: &'source str,
+) -> Result<Expression<'env, 'source>, Error> {
+    environment.compile_expression(source)
+}
+
+/// Evaluates `expression` with `context` and gives its result. <https://docs.rs/minijinja/3/minijinja/struct.Expression.html#method.eval>
+#[verifier::external_fn_specification]
+pub fn ex_expression_eval<'env, 'source, Context: Into<minijinja::Value>>(
+    expression: &Expression<'env, 'source>,
+    context: Context,
+) -> Result<minijinja::Value, Error> {
+    expression.eval(context)
+}
+
+/// A JSON error. <https://docs.rs/serde_json/1/serde_json/struct.Error.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExJsonError(serde_json::Error);
+
+/// A type that serializes with Serde. <https://docs.rs/serde/1/serde/trait.Serialize.html>
+#[verifier::external_trait_specification]
+pub trait ExSerialize {
+    /// The trait that this specification is for.
+    type ExternalTraitSpecificationFor: Serialize;
+}
+
+/// Converts `value` to a JSON value. <https://docs.rs/serde_json/1/serde_json/fn.to_value.html>
+#[verifier::external_fn_specification]
+pub fn ex_to_value<T: Serialize>(value: T) -> Result<Value, serde_json::Error> {
+    serde_json::to_value(value)
+}
+
 /// Compiles and renders `source` with `context`. <https://docs.rs/minijinja/3/minijinja/struct.Environment.html#method.render_str>
 #[verifier::external_fn_specification]
 pub fn ex_environment_render_str<'source, Context: Into<minijinja::Value>>(
@@ -345,14 +388,22 @@ pub fn ex_map_new() -> Map<String, Value> {
 
 /// Inserts `value` at `key` and gives the old value of `key`. <https://docs.rs/serde_json/1/serde_json/struct.Map.html#method.insert>
 #[verifier::external_fn_specification]
-pub fn ex_map_insert(map: &mut Map<String, Value>, key: String, value: Value) -> Option<Value> {
+pub fn ex_map_insert(map: &mut Map<String, Value>, key: String, value: Value) -> Option<Value>
+    ensures
+        attribute(*final(map), &key) == Some(value),
+        forall|other: String| other != key
+            ==> #[trigger] attribute(*final(map), &other) == attribute(*old(map), &other),
+{
     map.insert(key, value)
 }
 
 /// Makes the JSON string `text`. <https://docs.rs/serde_json/1/serde_json/enum.Value.html#impl-From%3CString%3E-for-Value>
 #[verifier::external_fn_specification]
-pub fn ex_value_from_string(text: String) -> Value {
-    <Value as From<String>>::from(text)
+pub fn ex_value_from_string(string: String) -> (value: Value)
+    ensures
+        text(value) == Some(string@),
+{
+    <Value as From<String>>::from(string)
 }
 
 /// Copies the JSON object `map`. <https://docs.rs/serde_json/1/serde_json/struct.Map.html#impl-Clone-for-Map%3CString,+Value%3E>
@@ -423,6 +474,15 @@ pub broadcast axiom fn axiom_char_pattern(c: char)
         #[trigger] pattern_char(c) == Some(c),
 ;
 
+/// The text that the pattern `delimiter` matches, or `None` for another pattern.
+pub uninterp spec fn pattern_text<Delimiter>(delimiter: Delimiter) -> Option<Seq<char>>;
+
+/// A `&str` pattern matches that text. <https://doc.rust-lang.org/std/str/pattern/trait.Pattern.html>
+pub broadcast axiom fn axiom_str_pattern(text: &str)
+    ensures
+        #[trigger] pattern_text(text) == Some(text@),
+;
+
 /// Splits `text` at the first match of `delimiter` and gives the text before and after it, or
 /// `None` when `text` has no match. <https://doc.rust-lang.org/std/primitive.str.html#method.split_once>
 #[verifier::external_fn_specification]
@@ -432,6 +492,8 @@ pub fn ex_str_split_once<Delimiter: Pattern>(text: &str, delimiter: Delimiter) -
             Some((before, after)) => text@ == before@ + seq![c] + after@ && !before@.contains(c),
             None => !text@.contains(c),
         },
+        pattern_text(delimiter) matches Some(found)
+            ==> (parts matches Some((before, after)) ==> text@ == before@ + found + after@),
 {
     text.split_once(delimiter)
 }

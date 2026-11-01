@@ -1,10 +1,16 @@
 //! `decide`: a prediction and a request to a decision.
 
+use std::collections::BTreeSet;
+
+use minijinja::Environment;
+use minijinja::UndefinedBehavior;
+use minijinja::value::Serde;
 use rand::rngs::StdRng;
 use serde_json::Map;
 use serde_json::Value;
 use vstd::prelude::*;
 
+use crate::domain::catalog;
 use crate::domain::catalog::Catalog;
 use crate::domain::catalog::Intent;
 use crate::domain::catalog::Kind;
@@ -150,20 +156,23 @@ fn command(
         },
         None => request.area.as_ref(),
     };
+    let Some(context) = context(intent, prediction, area, cache) else {
+        return fallback(pools, rng);
+    };
     match (&intent.service, area) {
-        (None, _) => respond(intent, area, &[], None, cache, pools, rng),
+        (None, _) => respond(intent, &context, None, pools, rng),
         (Some(service), Some(area)) => {
             proof! {
                 assert(located(*prediction, *request, *cache, *area));
             }
-            call(intent, service.as_str(), area, cache, pools, rng)
+            call(intent, service.as_str(), area, context, cache, pools, rng)
         }
         (Some(_), None) => fallback(pools, rng),
     }
 }
 
-/// The reply and the call of `service` on the selection of `intent` in `area`, or `Fallback`
-/// when `service` has no dot, the selection is empty or the reply does not render.
+/// The reply and the call of `service` with the data of `intent` on its selection in `area`, or
+/// `Fallback` when `service` has no dot, the selection is empty or a template does not render.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
@@ -172,12 +181,14 @@ fn command(
     ensures
         decision is Fallback || (decision matches Decision::Reply { call: Some(made), .. }
             && made.target@.len() > 0 && served(service@, made)
-            && targeted(*intent, *cache, *area, entity_ids(made.target@))),
+            && targeted(*intent, *cache, *area, entity_ids(made.target@))
+            && stringed(*intent, made.data)),
 )]
 fn call(
     intent: &Intent,
     service: &str,
     area: &AreaId,
+    mut context: Map<String, Value>,
     cache: &StateCache,
     pools: &Pools,
     rng: &mut StdRng,
@@ -185,30 +196,127 @@ fn call(
     let Some((domain, name)) = service.split_once('.') else {
         return fallback(pools, rng);
     };
-    let selection = select::select(intent, area, cache);
-    if selection.is_empty() {
+    let Some(selection) = selection(intent, area, &context, cache) else {
         return fallback(pools, rng);
+    };
+    if let (Target::Entity, Some(id)) = (intent.target, selection.first()) {
+        let Some(entity) = entity(cache, id) else {
+            return fallback(pools, rng);
+        };
+        context.insert("entity".to_owned(), entity);
     }
+    let Some(data) = data(intent, &context) else {
+        return fallback(pools, rng);
+    };
     let call = ServiceCall {
         domain: domain.to_owned(),
         service: name.to_owned(),
         target: texts(&selection),
-        data: Map::new(),
+        data,
         return_response: false,
     };
-    respond(
-        intent,
-        Some(area),
-        &selection,
-        Some(call),
-        cache,
-        pools,
-        rng,
-    )
+    respond(intent, &context, Some(call), pools, rng)
 }
 
-/// `Reply` with `call` and the reply of `intent` rendered for `area` and `selection`, or
-/// `Fallback` when the reply does not render.
+/// The selection of `intent` in `area`, with the `entity` text rendered with `context`, or
+/// `None` when the selection is empty or the `entity` text does not render.
+#[verus_spec(selected =>
+    ensures
+        selected matches Some(selected)
+            ==> selected@.len() > 0 && targeted(*intent, *cache, *area, selected@),
+)]
+fn selection(
+    intent: &Intent,
+    area: &AreaId,
+    context: &Map<String, Value>,
+    cache: &StateCache,
+) -> Option<Vec<EntityId>> {
+    let selected = match (intent.target, &intent.entity) {
+        (Target::Entity, Some(entity)) => {
+            vec![EntityId(responses::render(entity.as_str(), context).ok()?)]
+        }
+        _ => select::select(intent, area, cache),
+    };
+    if selected.is_empty() {
+        None
+    } else {
+        Some(selected)
+    }
+}
+
+/// The `data` of `intent` rendered with `context`, or `None` when a value does not render.
+#[verus_spec(data =>
+    ensures
+        data matches Some(data) ==> stringed(*intent, data),
+)]
+fn data(intent: &Intent, context: &Map<String, Value>) -> Option<Map<String, Value>> {
+    let mut data = Map::new();
+    let entries = intent.data.iter();
+    proof_decl! {
+        let ghost all = vstd::std_specs::iter::IteratorSpec::remaining(&entries);
+    }
+    #[cfg_attr(verus_only, verus_spec(entry_iter =>
+        invariant
+            entry_iter.seq() == all,
+            listed(*intent, all),
+            forall|seen: int| 0 <= seen < entry_iter.index() ==> strung(data, #[trigger] all[seen]),
+    ))]
+    for (key, template) in entries {
+        data.insert(key.clone(), rendered(template.as_str(), context)?);
+    }
+    proof! {
+        lemma_stringed(*intent, all, data);
+    }
+    Some(data)
+}
+
+/// `template` rendered with `context`: the result of one `{{ expression }}` with its type, else
+/// the rendered text. `None` when `template` does not render.
+#[verus_spec(result =>
+    ensures
+        result matches Some(value)
+            ==> (!braced(template@) ==> crate::domain::contracts::text(value) is Some),
+)]
+fn rendered(template: &str, context: &Map<String, Value>) -> Option<Value> {
+    if let Some(source) = expression(template) {
+        return evaluate(source, context);
+    }
+    match responses::render(template, context) {
+        Ok(text) => Some(Value::from(text)),
+        Err(_) => None,
+    }
+}
+
+/// The text between `{{` at the start and `}}` at the end of `template`, when it has no other `}}`.
+#[verus_spec(source =>
+    ensures
+        source is Some ==> braced(template@),
+)]
+fn expression(template: &str) -> Option<&str> {
+    let (before, rest) = template.split_once("{{")?;
+    let (source, after) = rest.split_once("}}")?;
+    if before.is_empty() && after.is_empty() {
+        proof! {
+            assert(template@ =~= ("{{"@ + source@) + "}}"@);
+        }
+        Some(source)
+    } else {
+        None
+    }
+}
+
+/// The result of the expression `source` with `context`, or `None` when it does not compile or
+/// evaluate.
+#[verus_verify]
+fn evaluate(source: &str, context: &Map<String, Value>) -> Option<Value> {
+    let mut environment = Environment::new();
+    environment.set_undefined_behavior(UndefinedBehavior::Strict);
+    let expression = environment.compile_expression(source).ok()?;
+    serde_json::to_value(expression.eval(Serde(context)).ok()?).ok()
+}
+
+/// `Reply` with `call` and the reply of `intent` rendered with `context`, or `Fallback` when the
+/// reply does not render.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
@@ -219,34 +327,29 @@ fn call(
 )]
 fn respond(
     intent: &Intent,
-    area: Option<&AreaId>,
-    selection: &[EntityId],
+    context: &Map<String, Value>,
     call: Option<ServiceCall>,
-    cache: &StateCache,
     pools: &Pools,
     rng: &mut StdRng,
 ) -> Decision {
     let mut reply = choose(pools, intent.name.as_str(), rng);
-    let Some(context) = context(intent, area, selection, cache) else {
-        return fallback(pools, rng);
-    };
-    let Ok(text) = responses::render(reply.text.as_str(), &context) else {
+    let Ok(text) = responses::render(reply.text.as_str(), context) else {
         return fallback(pools, rng);
     };
     reply.text = text;
     Decision::Reply { reply, call }
 }
 
-/// The template context of a reply of `intent`: the name of `area` in lowercase, and the first
-/// entity of `selection` for `target = "entity"`. `None` when the cache has no state for it.
+/// The template context of `intent`: the name of `area` in lowercase and the slots of
+/// `prediction`, or `None` when a slot is missing.
 #[verus_verify]
 fn context(
     intent: &Intent,
+    prediction: &Prediction,
     area: Option<&AreaId>,
-    selection: &[EntityId],
     cache: &StateCache,
 ) -> Option<Map<String, Value>> {
-    let mut context = Map::new();
+    let mut context = slots(intent, prediction)?;
     let found = match area {
         Some(area) => cache.areas.iter().find(|known| known.area_id.0 == area.0),
         None => None,
@@ -254,10 +357,27 @@ fn context(
     if let Some(found) = found {
         context.insert("area".to_owned(), Value::from(found.name.to_lowercase()));
     }
-    if let (Target::Entity, Some(id)) = (intent.target, selection.first()) {
-        context.insert("entity".to_owned(), entity(cache, id)?);
-    }
     Some(context)
+}
+
+/// The value in `prediction` of each slot of `intent` except `area`, with an empty string for a
+/// missing `optional` slot, or `None` when another slot is missing.
+#[verus_verify]
+fn slots(intent: &Intent, prediction: &Prediction) -> Option<Map<String, Value>> {
+    let mut names = BTreeSet::new();
+    catalog::insert_slots(intent, &mut names);
+    names.remove("area");
+    let mut slots = Map::new();
+    let names = names.iter();
+    for name in names {
+        let value = match prediction.slots.iter().find(|slot| slot.name == *name) {
+            Some(slot) => slot.value.clone(),
+            None if intent.optional.contains(name) => String::new(),
+            None => return None,
+        };
+        slots.insert(name.clone(), Value::from(value));
+    }
+    Some(slots)
 }
 
 /// The state, the attributes and the name of the entity `id`, or `None` when the cache has no
@@ -422,6 +542,7 @@ broadcast use {
     crate::domain::contracts::axiom_string_contains_borrowed_key,
     crate::domain::contracts::axiom_string_maps_borrowed_key,
     crate::domain::contracts::axiom_char_pattern,
+    crate::domain::contracts::axiom_str_pattern,
 };
 
 /// True when `catalog` has an intent with the name `name`.
@@ -457,7 +578,47 @@ pub open spec fn acted(intent: Intent, prediction: Prediction, request: Request,
         ==> (decision is Fallback || decision matches Decision::Reply { call: None, .. })
     &&& decision matches Decision::Reply { call: Some(made), .. } ==> made.target@.len() > 0
         && (intent.service matches Some(service) && served(service@, made))
-        && aimed(intent, prediction, request, cache, made)
+        && aimed(intent, prediction, request, cache, made) && stringed(intent, made.data)
+}
+
+/// True when each `data` value of `intent` that is not braced is a JSON string in `data`.
+pub open spec fn stringed(intent: Intent, data: Map<String, Value>) -> bool {
+    forall|key: String| #[trigger] intent.data@.contains_key(key)
+        ==> strung(data, (&key, &intent.data@[key]))
+}
+
+/// True when each key of `intent.data` is in `all` with its value, and each entry of `all` is an
+/// entry of `intent.data`.
+pub open spec fn listed(intent: Intent, all: Seq<(&String, &String)>) -> bool {
+    &&& forall|key: String| #[trigger] intent.data@.contains_key(key)
+        ==> all.contains((&key, &intent.data@[key]))
+    &&& forall|seen: int| 0 <= seen < all.len()
+        ==> intent.data@[*(#[trigger] all[seen]).0] == *all[seen].1
+}
+
+/// True when the value of `entry` is braced, or `data` has a JSON string at the key of `entry`.
+pub open spec fn strung(data: Map<String, Value>, entry: (&String, &String)) -> bool {
+    !braced(entry.1@) ==> (crate::domain::contracts::attribute(data, entry.0) matches Some(value)
+        && crate::domain::contracts::text(value) is Some)
+}
+
+/// `stringed` holds when each entry of `all` is strung and `all` lists `intent.data`.
+pub proof fn lemma_stringed(intent: Intent, all: Seq<(&String, &String)>, data: Map<String, Value>)
+    requires
+        listed(intent, all),
+        forall|seen: int| 0 <= seen < all.len() ==> strung(data, #[trigger] all[seen]),
+    ensures
+        stringed(intent, data),
+{
+    assert forall|key: String| #[trigger] intent.data@.contains_key(key)
+        implies strung(data, (&key, &intent.data@[key])) by {
+        let seen = choose|seen: int| 0 <= seen < all.len() && all[seen] == (&key, &intent.data@[key]);
+    }
+}
+
+/// True when `template` is `{{`, a text and `}}`.
+pub open spec fn braced(template: Seq<char>) -> bool {
+    exists|inner: Seq<char>| template == #[trigger] ("{{"@ + inner) + "}}"@
 }
 
 /// True when the target of `call` is the selection of `intent` in the area of the request.
@@ -572,30 +733,30 @@ mod tests {
             .collect()
     }
 
-    /// The decision of `catalog` in the reference house for the top label and probability `top`,
-    /// the area slot `slot` and `request`.
+    /// The decision of `catalog` in `cache` for the top label and probability `top`, the slot
+    /// names and values `slots` and `request`.
     fn decided_for(
         catalog: &Catalog,
         top: (&str, f32),
-        slot: Option<&str>,
+        slots: &[(&str, &str)],
         request: &Request,
+        cache: &StateCache,
     ) -> Decision {
-        let slots = slot.map(|value| Slot {
-            name: "area".to_owned(),
-            value: value.to_owned(),
+        let slots = slots.iter().map(|(name, value)| Slot {
+            name: (*name).to_owned(),
+            value: (*value).to_owned(),
         });
         let prediction = Prediction {
             ranked: vec![(top.0.to_owned(), top.1), ("fan_on".to_owned(), 0.01)],
-            slots: slots.into_iter().collect(),
+            slots: slots.collect(),
         };
-        let cache = StateCache::load(house());
         let mut rng = StdRng::seed_from_u64(1);
         let pools = pools(catalog);
         decide(
             &prediction,
             request,
             catalog,
-            &cache,
+            cache,
             &pools,
             THRESHOLD,
             &mut rng,
@@ -609,7 +770,8 @@ mod tests {
             transcript: transcript.to_owned(),
             area: Some(AreaId("kitchen".to_owned())),
         };
-        decided_for(&catalog(), (label, probability), None, &request)
+        let cache = StateCache::load(house());
+        decided_for(&catalog(), (label, probability), &[], &request, &cache)
     }
 
     /// The decision of `catalog` for `label` with the area slot `slot` and the satellite in `area`.
@@ -623,7 +785,9 @@ mod tests {
             transcript: String::new(),
             area: area.map(|area| AreaId(area.to_owned())),
         };
-        decided_for(catalog, (label, 0.89), slot, &request)
+        let slots: Vec<(&str, &str)> = slot.map(|value| ("area", value)).into_iter().collect();
+        let cache = StateCache::load(house());
+        decided_for(catalog, (label, 0.89), &slots, &request, &cache)
     }
 
     /// The decision that defers `transcript` to System Two with the filler.
@@ -670,6 +834,30 @@ mod tests {
             index: 0,
         };
         Decision::Fallback { reply }
+    }
+
+    /// The data of the call of `decision`.
+    fn data(decision: Decision) -> Map<String, Value> {
+        match decision {
+            Decision::Reply {
+                call: Some(call), ..
+            } => call.data,
+            other => panic!("the decision makes a call: {other:?}"),
+        }
+    }
+
+    /// The `media_content_id` of the `tv_show` call of `catalog` with `slots` in the office.
+    fn content_id(catalog: &Catalog, slots: &[(&str, &str)]) -> String {
+        let request = Request {
+            transcript: String::new(),
+            area: Some(AreaId("office".to_owned())),
+        };
+        let cache = StateCache::load(house());
+        let decision = decided_for(catalog, ("tv_show", 0.89), slots, &request, &cache);
+        let id = &data(decision)["media_content_id"];
+        id.as_str()
+            .expect("media_content_id is a string")
+            .to_owned()
     }
 
     /// AC-4.5-2.
@@ -752,6 +940,51 @@ mod tests {
     fn ac_4_5c_3_empty_selection_falls_back() {
         let decision = decided_in(&catalog(), "lights_on", None, Some("bathroom"));
         assert_eq!(decision, fallback());
+    }
+
+    /// AC-4.5d-1.
+    #[test]
+    fn ac_4_5d_1_climate_down_sends_number() {
+        let mut snapshot = house();
+        let thermostat = snapshot
+            .states
+            .iter_mut()
+            .find(|state| state.entity_id == "climate.thermostat");
+        let thermostat = thermostat.expect("the house has a thermostat");
+        thermostat
+            .attributes
+            .insert("temperature".to_owned(), Value::from(72));
+        let request = Request {
+            transcript: String::new(),
+            area: Some(AreaId("office".to_owned())),
+        };
+        let cache = StateCache::load(snapshot);
+        let decision = decided_for(&catalog(), ("climate_down", 0.89), &[], &request, &cache);
+        assert_eq!(data(decision)["temperature"], Value::from(70));
+    }
+
+    /// AC-4.5d-2.
+    #[test]
+    fn ac_4_5d_2_show_slot_renders_string() {
+        let id = content_id(&catalog(), &[("show", "24")]);
+        assert!(
+            id.contains(r#""show_name": "24""#),
+            "media_content_id is {id}"
+        );
+    }
+
+    /// AC-4.5d-3.
+    #[test]
+    fn ac_4_5d_3_missing_slots() {
+        let mut catalog = catalog();
+        let decision = decided_in(&catalog, "tv_show", None, Some("office"));
+        assert_eq!(decision, fallback());
+        catalog.intents[3].optional = vec!["show".to_owned()];
+        let id = content_id(&catalog, &[]);
+        assert!(
+            id.contains(r#""show_name": """#),
+            "media_content_id is {id}"
+        );
     }
 
     /// A `service` without a dot, an unregistered area or an entity without a state gives
