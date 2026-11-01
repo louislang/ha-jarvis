@@ -129,7 +129,7 @@ This phase selects responses, selects entities and decides the action from a pre
 
 **Model.**
 
-- A filter `name` matches an entity when its words appear among the words of `normalize(name)` or of `normalize(alias)` (sub-phase 3.1), for the entity name or one alias. Thus the match is on whole words, without case sensitivity. "Kitchen-Light" has the words "kitchen" and "light". `fan` matches "Office Fan", not "Infant Monitor".
+- A filter `name` matches an entity when each of its words is a word of `normalize(name)` or of `normalize(alias)` (sub-phase 3.1), for the entity name or one alias. The words can be in any order. Thus the match is on whole words, without case sensitivity. "Kitchen-Light" has the words "kitchen" and "light". `fan` matches "Office Fan", not "Infant Monitor".
 - `select` skips an entity that has an entity category, that is hidden or disabled, or that is on a satellite device (a device with an `assist_satellite` entity). Thus "turn on the lights" does not switch on the LED of a satellite, and a query does not read the warm sensor of a satellite.
 - `matching` is now `filter(cache, filters) \ (exclude ∪ skipped)`, where `filter` applies the `name` of each filter.
 
@@ -143,9 +143,9 @@ This phase selects responses, selects entities and decides the action from a pre
 
 **Proofs.**
 
-- P-4.4b-2, P-4.4b-5 (AC-4.4b-2, AC-4.4b-5). Ensures: every result entity matches a filter with its `name`, is not excluded and is not skipped. Argument: the result draws only from `matching = filter(cache, filters) \ (exclude ∪ skipped)`. "Living Room Fan" does not have the word "light", so the filter `{ domain = "switch", name = "light" }` does not match it.
-- P-4.4b-1 (AC-4.4b-1). Ensures: a `switch` whose name has the word "light" matches `lights_on`. Argument: the second filter of `lights_on` is `{ domain = "switch", name = "light" }`, and "Garage Light" has the whole word "light".
-- P-4.4b-3, P-4.4b-4 (AC-4.4b-3, AC-4.4b-4). Ensures: `name` matches when its words are words of `normalize(name)` or `normalize(alias)`. Argument: `normalize("the TV")` is "the tv", which has the word "tv". The words of `normalize("Infant Monitor")` are "infant" and "monitor", and neither is "fan".
+- P-4.4b-2, P-4.4b-5 (AC-4.4b-2, AC-4.4b-5). Ensures: every result entity has the domain and the device class of a filter, is not excluded and is not skipped. The tests are the evidence for the `name` part. Argument: the result draws only from `matching = filter(cache, filters) \ (exclude ∪ skipped)`. "Living Room Fan" does not have the word "light", so the filter `{ domain = "switch", name = "light" }` does not match it.
+- P-4.4b-1. Evidence: test. Argument: the second filter of `lights_on` is `{ domain = "switch", name = "light" }`, and "Garage Light" has the whole word "light".
+- P-4.4b-3, P-4.4b-4. Evidence: test. The `ensures` of `normalize` (P-3.1-2) does not state its output for a text that is not normal, so a Verus clause cannot state the words of `normalize(name)`. Argument: `normalize("the TV")` is "the tv", which has the word "tv". The words of `normalize("Infant Monitor")` are "infant" and "monitor", and neither is "fan".
 
 ---
 
