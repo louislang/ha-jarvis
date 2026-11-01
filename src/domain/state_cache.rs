@@ -147,7 +147,8 @@ impl StateCache {
         ensures
             owned(area) == entity_area(*self, *entity),
     )]
-    fn entity_area<'cache>(&'cache self, entity: &'cache Entity) -> Option<&'cache AreaId> {
+    #[must_use]
+    pub fn entity_area<'cache>(&'cache self, entity: &'cache Entity) -> Option<&'cache AreaId> {
         match &entity.area_id {
             Some(area) => Some(area),
             None => self.area_of_device(entity.device_id.as_ref()?),
@@ -200,16 +201,7 @@ impl StateCache {
         domain: &str,
         device_class: Option<&str>,
     ) -> bool {
-        let id = entity.entity_id.0.as_bytes();
-        let prefix = domain.as_bytes();
-        let in_domain =
-            prefix.len() < id.len() && id.starts_with(prefix) && id[prefix.len()] == b'.';
-        proof! {
-            if prefix.len() < id.len() {
-                assert(id@.take(prefix@.len() as int) =~= prefix@ <==> id.starts_with(prefix));
-            }
-        }
-        in_domain
+        Self::in_domain(&entity.entity_id.0, domain)
             && matches!(self.entity_area(entity), Some(found) if found.0.as_str() == area.0.as_str())
             && match device_class {
                 Some(class) => self.device_class(&entity.entity_id.0) == Some(class),
@@ -217,12 +209,30 @@ impl StateCache {
             }
     }
 
+    /// True when the entity ID `entity_id` is `domain`, a dot and an object ID.
+    #[verus_spec(found =>
+        ensures
+            found == in_domain(entity_id@, domain@),
+    )]
+    #[must_use]
+    pub fn in_domain(entity_id: &str, domain: &str) -> bool {
+        let id = entity_id.as_bytes();
+        let prefix = domain.as_bytes();
+        proof! {
+            if prefix.len() < id.len() {
+                assert(id@.take(prefix@.len() as int) =~= prefix@ <==> id.starts_with(prefix));
+            }
+        }
+        prefix.len() < id.len() && id.starts_with(prefix) && id[prefix.len()] == b'.'
+    }
+
     /// The `device_class` attribute of the state of `entity_id`.
     #[verus_spec(class =>
         ensures
             optional(class) == device_class(*self, entity_id@),
     )]
-    fn device_class(&self, entity_id: &str) -> Option<&str> {
+    #[must_use]
+    pub fn device_class(&self, entity_id: &str) -> Option<&str> {
         self.states
             .get(entity_id)?
             .attributes

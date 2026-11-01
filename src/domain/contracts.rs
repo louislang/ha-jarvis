@@ -126,7 +126,6 @@ pub struct ExTarget(Target);
 
 /// An entity filter of `select`.
 #[verifier::external_type_specification]
-#[verifier::external_body]
 pub struct ExFilter(Filter);
 
 /// One slot value in the text of an example.

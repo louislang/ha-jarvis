@@ -28,6 +28,7 @@ pub mod domain {
     pub mod intent;
     pub mod model;
     pub mod responses;
+    pub mod select;
     pub mod state;
     pub mod state_cache;
     pub mod training;
