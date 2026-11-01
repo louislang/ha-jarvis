@@ -102,6 +102,11 @@ impl Config {
                 "{name} = {value} is out of range: it must be more than 0"
             );
         }
+        let threshold = self.model.threshold;
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&threshold),
+            "model.threshold = {threshold} is out of range: it must be in [0, 1]"
+        );
         let holdout = self.train.holdout;
         anyhow::ensure!(
             (0.0..=1.0).contains(&holdout),
@@ -413,6 +418,19 @@ mod tests {
             error.contains("ha.request_timeout_ms") && error.contains("more than 0"),
             "error has no field or range: {error}"
         );
+    }
+
+    /// AC-4.5-13.
+    #[test]
+    fn ac_4_5_13_threshold_out_of_range_names_field_and_range() {
+        for threshold in ["-0.1", "1.1"] {
+            let text = VALID.replace("threshold = 0.6", &format!("threshold = {threshold}"));
+            let error = parse_error(&text);
+            assert!(
+                error.contains("model.threshold") && error.contains("[0, 1]"),
+                "error for {threshold} has no field or range: {error}"
+            );
+        }
     }
 
     /// Resolves the secrets of `VALID` from an environment with `variables`.
