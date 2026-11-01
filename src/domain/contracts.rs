@@ -232,20 +232,20 @@ pub struct ExExpression<'env, 'source>(Expression<'env, 'source>);
 
 /// Compiles the expression `source`. <https://docs.rs/minijinja/3/minijinja/struct.Environment.html#method.compile_expression>
 #[verifier::external_fn_specification]
-pub fn ex_environment_compile_expression<'source, 'env>(
-    environment: &'env Environment<'source>,
-    source: &'source str,
-) -> Result<Expression<'env, 'source>, Error> {
+pub fn ex_environment_compile_expression<'source, 'env>(environment: &'env Environment<'source>, source: &'source str) -> Result<Expression<'env, 'source>, Error> {
     environment.compile_expression(source)
 }
 
 /// Evaluates `expression` with `context` and gives its result. <https://docs.rs/minijinja/3/minijinja/struct.Expression.html#method.eval>
 #[verifier::external_fn_specification]
-pub fn ex_expression_eval<'env, 'source, Context: Into<minijinja::Value>>(
-    expression: &Expression<'env, 'source>,
-    context: Context,
-) -> Result<minijinja::Value, Error> {
+pub fn ex_expression_eval<'env, 'source, Context: Into<minijinja::Value>>(expression: &Expression<'env, 'source>, context: Context) -> Result<minijinja::Value, Error> {
     expression.eval(context)
+}
+
+/// True when `value` is undefined. <https://docs.rs/minijinja/3/minijinja/value/struct.Value.html#method.is_undefined>
+#[verifier::external_fn_specification]
+pub fn ex_template_value_is_undefined(value: &minijinja::Value) -> bool {
+    value.is_undefined()
 }
 
 /// A JSON error. <https://docs.rs/serde_json/1/serde_json/struct.Error.html>
@@ -391,8 +391,7 @@ pub fn ex_map_new() -> Map<String, Value> {
 pub fn ex_map_insert(map: &mut Map<String, Value>, key: String, value: Value) -> Option<Value>
     ensures
         attribute(*final(map), &key) == Some(value),
-        forall|other: String| other != key
-            ==> #[trigger] attribute(*final(map), &other) == attribute(*old(map), &other),
+        forall|other: String| other != key ==> #[trigger] attribute(*final(map), &other) == attribute(*old(map), &other),
 {
     map.insert(key, value)
 }
@@ -492,8 +491,7 @@ pub fn ex_str_split_once<Delimiter: Pattern>(text: &str, delimiter: Delimiter) -
             Some((before, after)) => text@ == before@ + seq![c] + after@ && !before@.contains(c),
             None => !text@.contains(c),
         },
-        pattern_text(delimiter) matches Some(found)
-            ==> (parts matches Some((before, after)) ==> text@ == before@ + found + after@),
+        pattern_text(delimiter) matches Some(found) ==> (parts matches Some((before, after)) ==> text@ == before@ + found + after@),
 {
     text.split_once(delimiter)
 }

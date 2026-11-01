@@ -306,13 +306,17 @@ fn expression(template: &str) -> Option<&str> {
 }
 
 /// The result of the expression `source` with `context`, or `None` when it does not compile or
-/// evaluate.
+/// evaluate, or its result is undefined.
 #[verus_verify]
 fn evaluate(source: &str, context: &Map<String, Value>) -> Option<Value> {
     let mut environment = Environment::new();
     environment.set_undefined_behavior(UndefinedBehavior::Strict);
     let expression = environment.compile_expression(source).ok()?;
-    serde_json::to_value(expression.eval(Serde(context)).ok()?).ok()
+    let value = expression.eval(Serde(context)).ok()?;
+    if value.is_undefined() {
+        return None;
+    }
+    serde_json::to_value(value).ok()
 }
 
 /// `Reply` with `call` and the reply of `intent` rendered with `context`, or `Fallback` when the
