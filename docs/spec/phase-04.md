@@ -93,45 +93,88 @@ This phase selects responses, selects entities and decides the action from a pre
 
 ---
 
-### 4.4 Entity Selection
+### 4.4 Entity Filters
 
-**Goal:** Add entity selection for an intent and an area, with filters, exclusions and the single-entity house fallback. "Turn on the lights" now finds the right lights, including switches named as lights.
+**Goal:** Add entity selection for an intent and an area, with domain and device class filters and the `exclude` list. "Turn on the lights" now finds the lights in the area.
 
 - **Implements:** G9. **Depends on:** 4.3.
-- **Files:** create `src/domain/select.rs`. Modify `src/lib.rs`.
+- **Files:** create `src/domain/select.rs`. Modify `src/domain/state_cache.rs`, `src/lib.rs`.
 
 **Model.**
 
-- A filter has `domain`, optional `name` (matches whole words of the entity name or an alias, without case sensitivity) and optional `device_class`. An entity matches when one filter matches and it is not in `exclude`.
-- `select` skips an entity that has an entity category, that is hidden or disabled, or that is on a satellite device (a device with an `assist_satellite` entity). Thus "turn on the lights" does not switch on the LED of a satellite, and a query does not read the warm sensor of a satellite.
+- A filter has `domain`, optional `name` and optional `device_class`. A filter matches an entity in its `domain` with its `device_class`, if it has one. An entity matches when one filter matches and the entity is not in `exclude`. Until sub-phase 4.4b, `select` does not apply the `name` of a filter.
 - `select(intent, area, cache) -> Vec<EntityId>`:
   - `target = "entities"`: all matching entities in the area.
-  - `target = "entity"`: the fixed `entity`, else the matching entity in the area with the lowest entity ID (sub-phase 11.6 uses the highest habit score).
-  - If the area has no match and the house has exactly one match, the result is that entity.
+  - Until sub-phase 4.4c, `select` does not read `target` and gives this result for each intent.
+- `src/domain/state_cache.rs` makes its functions `in_domain`, `device_class` and `entity_area` public. `select.rs` uses them and does not repeat them.
 
 **Acceptance criteria.**
 
 - AC-4.4-1: When the intent is `lights_on` and the area is the Kitchen, the result is all kitchen lights.
-- AC-4.4-2: When the intent is `lights_on` in the Garage, the result includes the switch "Garage Light".
-- AC-4.4-3: When the intent is `lights_on` in the Living Room, the result does not include the switch "Living Room Fan".
-- AC-4.4-4: When the intent is `fan_on` in the Living Room, the result is the switch "Living Room Fan".
-- AC-4.4-5: When the intent is `climate_down` in the Bedroom and the only climate entity is in the Kitchen, the result is that entity.
-- AC-4.4-6: When a filter has `name = "tv"`, an entity with the alias "the TV" matches.
 - AC-4.4-7: When an entity is in `exclude`, it is never in the result.
-- AC-4.4-8: When the area has no match and the house has two matches, the result is empty.
-- AC-4.4-9: When a filter has `name = "fan"`, an entity named "Infant Monitor" does not match.
-- AC-4.4-10: When two entities in the area match a `target = "entity"` intent, the result is the one with the lowest entity ID.
-- AC-4.4-11: When a Kitchen light has an entity category, is hidden, is disabled or is on a satellite device, `select` for `lights_on` in the Kitchen does not return it.
 
 **Proofs.**
 
-- P-4.4-3, P-4.4-7, P-4.4-11 (AC-4.4-3, AC-4.4-7, AC-4.4-11). Ensures: every result entity matches a filter, is not excluded and is not skipped. Argument: both `target` branches and the fallback draw only from `matching = filter(cache, filters) \ (exclude ∪ skipped)`.
-- P-4.4-5, P-4.4-8 (AC-4.4-5, AC-4.4-8). Ensures: the fallback applies if and only if `matching ∩ area = ∅` and `|matching| = 1`. Argument: the fallback branch is guarded by these two conditions.
-- P-4.4-1 (AC-4.4-1). Ensures: for `target = "entities"` and a `matching ∩ area` that is not empty, the result is `matching ∩ area`. Argument: the `entities` branch returns that set without a further filter. The house fallback applies only when the set is empty.
-- P-4.4-2 (AC-4.4-2). Ensures: a `switch` whose name has the word "light" matches `lights_on`. Argument: the second filter of `lights_on` is `{ domain = "switch", name = "light" }`, and "Garage Light" has the whole word "light".
-- P-4.4-4 (AC-4.4-4). Ensures: `fan_on` in the Living Room gives "Living Room Fan". Argument: the second filter of `fan_on` is `{ domain = "switch", name = "fan" }`. "Living Room Fan" is the only match in the area, and the `entity` branch returns the only match.
-- P-4.4-6, P-4.4-9 (AC-4.4-6, AC-4.4-9). Ensures: `name` matches when a lowercase word of the name or of an alias equals the lowercase filter word. Argument: the alias "the TV" has the word "tv". The words of "Infant Monitor" are "infant" and "monitor", and neither equals "fan".
-- P-4.4-10 (AC-4.4-10). Ensures: with two or more matches in the area, `target = "entity"` gives the lowest entity ID. Argument: the `entity` branch takes the minimum of `matching ∩ area` by entity ID.
+- P-4.4-7 (AC-4.4-7). Ensures: every result entity matches a filter and is not excluded. Argument: the result draws only from `matching = filter(cache, filters) \ exclude`.
+- P-4.4-1 (AC-4.4-1). Ensures: for `target = "entities"` and a `matching ∩ area` that is not empty, the result is `matching ∩ area`. Argument: `select` returns that set without a further filter.
+
+---
+
+### 4.4b Name Words and Skipped Entities
+
+**Goal:** Match the `name` of a filter to whole words of the entity name or an alias, and skip entities that are not for voice control. "Turn on the lights" now finds switches named as lights and does not switch on the LED of a satellite.
+
+- **Implements:** G9. **Depends on:** 4.4.
+- **Files:** modify `src/domain/select.rs`.
+
+**Model.**
+
+- A filter `name` matches an entity when its words appear among the words of `normalize(name)` or of `normalize(alias)` (sub-phase 3.1), for the entity name or one alias. Thus the match is on whole words, without case sensitivity. "Kitchen-Light" has the words "kitchen" and "light". `fan` matches "Office Fan", not "Infant Monitor".
+- `select` skips an entity that has an entity category, that is hidden or disabled, or that is on a satellite device (a device with an `assist_satellite` entity). Thus "turn on the lights" does not switch on the LED of a satellite, and a query does not read the warm sensor of a satellite.
+- `matching` is now `filter(cache, filters) \ (exclude ∪ skipped)`, where `filter` applies the `name` of each filter.
+
+**Acceptance criteria.**
+
+- AC-4.4b-1: When the intent is `lights_on` in the Garage, the result includes the switch "Garage Light".
+- AC-4.4b-2: When the intent is `lights_on` in the Living Room, the result does not include the switch "Living Room Fan".
+- AC-4.4b-3: When a filter has `name = "tv"`, an entity with the alias "the TV" matches.
+- AC-4.4b-4: When a filter has `name = "fan"`, an entity named "Infant Monitor" does not match.
+- AC-4.4b-5: When a Kitchen light has an entity category, is hidden, is disabled or is on a satellite device, `select` for `lights_on` in the Kitchen does not return it.
+
+**Proofs.**
+
+- P-4.4b-2, P-4.4b-5 (AC-4.4b-2, AC-4.4b-5). Ensures: every result entity matches a filter with its `name`, is not excluded and is not skipped. Argument: the result draws only from `matching = filter(cache, filters) \ (exclude ∪ skipped)`. "Living Room Fan" does not have the word "light", so the filter `{ domain = "switch", name = "light" }` does not match it.
+- P-4.4b-1 (AC-4.4b-1). Ensures: a `switch` whose name has the word "light" matches `lights_on`. Argument: the second filter of `lights_on` is `{ domain = "switch", name = "light" }`, and "Garage Light" has the whole word "light".
+- P-4.4b-3, P-4.4b-4 (AC-4.4b-3, AC-4.4b-4). Ensures: `name` matches when its words are words of `normalize(name)` or `normalize(alias)`. Argument: `normalize("the TV")` is "the tv", which has the word "tv". The words of `normalize("Infant Monitor")` are "infant" and "monitor", and neither is "fan".
+
+---
+
+### 4.4c Single Entity and House Fallback
+
+**Goal:** Select one entity for `target = "entity"`, and use the only match in the house when the area has no match. "Turn the air down" now finds the one thermostat of the house from any area.
+
+- **Implements:** G9. **Depends on:** 4.4b.
+- **Files:** modify `src/domain/select.rs`.
+
+**Model.**
+
+- `target = "entity"`: the `entity` of the intent, else the matching entity in the area with the lowest entity ID (sub-phase 11.6 uses the highest habit score).
+- `entity` is a template, for example `{{ person.calendar }}`. `select` returns the `entity` text unrendered. `decide` (sub-phase 4.5) renders it with its context before it uses the result.
+- If the area has no match and the house has exactly one match, the result is that entity.
+
+**Acceptance criteria.**
+
+- AC-4.4c-1: When the intent is `fan_on` in the Living Room, the result is the switch "Living Room Fan".
+- AC-4.4c-2: When the intent is `climate_down` in the Bedroom and the only climate entity is in the Kitchen, the result is that entity.
+- AC-4.4c-3: When the area has no match and the house has two matches, the result is empty.
+- AC-4.4c-4: When two entities in the area match a `target = "entity"` intent, the result is the one with the lowest entity ID.
+
+**Proofs.**
+
+- P-4.4c-2, P-4.4c-3 (AC-4.4c-2, AC-4.4c-3). Ensures: the fallback applies if and only if `matching ∩ area = ∅` and `|matching| = 1`. Argument: these two conditions guard the fallback branch. The fallback applies only when `matching ∩ area` is empty, so P-4.4-1 still holds. The fallback and the `entity` branch draw only from `matching`, so P-4.4-7 and P-4.4b-2 still hold for an intent without `entity`.
+- P-4.4c-1 (AC-4.4c-1). Ensures: `fan_on` in the Living Room gives "Living Room Fan". Argument: the second filter of `fan_on` is `{ domain = "switch", name = "fan" }`. "Living Room Fan" is the only match in the area, and the `entity` branch returns the only match.
+- P-4.4c-4 (AC-4.4c-4). Ensures: for an intent without `entity` and two or more matches in the area, `target = "entity"` gives the lowest entity ID. Argument: the `entity` branch takes the minimum of `matching ∩ area` by entity ID.
+
 
 ---
 
@@ -139,7 +182,7 @@ This phase selects responses, selects entities and decides the action from a pre
 
 **Goal:** Add `decide` for command intents and the System Two threshold. A confident prediction now becomes a reply and a service call, and an uncertain or `unknown` one becomes a deferred System Two job.
 
-- **Implements:** G3, G7, G9. **Depends on:** 4.4.
+- **Implements:** G3, G7, G9. **Depends on:** 4.4c.
 - **Files:** create `src/domain/decide.rs`. Modify `src/lib.rs`, `jarvis.toml`.
 
 **Model.**
@@ -148,7 +191,7 @@ This phase selects responses, selects entities and decides the action from a pre
 - `decide(prediction, context, catalog, cache, pools, rng)`:
   1. If the top label is `unknown`, is not in the catalog, or its probability is less than `model.threshold`, return `Defer` with a filler and `Job::Llm`. A label of the model that the catalog no longer has (an intent removed before a retrain) thus goes to System Two.
   2. The area is the area slot if present, else the satellite area. An area slot that matches no area gives `Fallback`.
-  3. A command needs an area when `target = "entities"`. No area gives `Fallback`. An empty selection (sub-phase 4.4) gives `Fallback`. A missing slot that is not `optional` gives `Fallback`, and a missing `optional` slot is an empty string.
+  3. A command needs an area when `target = "entities"`. No area gives `Fallback`. When the intent has `entity`, render the text that `select` returns with the context (sub-phase 4.4c). An empty selection (sub-phases 4.4 to 4.4c) gives `Fallback`. A missing slot that is not `optional` gives `Fallback`, and a missing `optional` slot is an empty string.
   4. Render the service data. A data value that is one `{{ expression }}` keeps the type of the result (`minijinja` `compile_expression`). Other values render as strings. Return `Reply` with a pool response and the call.
 - This sub-phase adds `[model]` with `threshold` to `jarvis.toml`.
 
@@ -203,7 +246,7 @@ This phase selects responses, selects entities and decides the action from a pre
 - P-4.6-3. Ensures: a fetch intent gives `Defer` with `Job::Fetch` and `return_response = true`. Argument: the fetch branch builds the call with `return_response = true`.
 - P-4.6-4. Ensures: a query gives `Reply` with `call = None`. Argument: the query branch constructs `Reply { call: None }`.
 - P-4.6-1 (AC-4.6-1). Ensures: the text is the pool template rendered with `entity` and `area`. Argument: the query branch renders "It is {{ entity.state }} degrees in the {{ area }}." with `entity.state = 21` and `area = kitchen`.
-- P-4.6-5 (AC-4.6-5). Ensures: the query reads the lowest entity ID of the sensors that are not skipped and not excluded. Argument: the query uses `select` with `target = "entity"` (P-4.4-10, P-4.4-11).
+- P-4.6-5 (AC-4.6-5). Ensures: the query reads the lowest entity ID of the sensors that are not skipped and not excluded. Argument: the query uses `select` with `target = "entity"` (P-4.4c-4, P-4.4b-5).
 
 ---
 
