@@ -4,17 +4,19 @@ use vstd::prelude::*;
 
 use crate::domain::catalog::Filter;
 use crate::domain::catalog::Intent;
+use crate::domain::catalog::Target;
 use crate::domain::intent;
 use crate::domain::state::AreaId;
 use crate::domain::state::Entity;
 use crate::domain::state::EntityId;
 use crate::domain::state_cache::StateCache;
 
-/// The IDs of the entities in `area` that match a filter of `intent`, are not excluded and are
-/// not skipped.
+/// The entities that `intent` acts on in `area`: the `entity` template of the intent, the
+/// matches in `area`, the match in `area` with the lowest entity ID, or the only match of the
+/// house.
 #[verus_spec(selected =>
     ensures
-        forall|position: int| 0 <= position < selected@.len()
+        !fixed(*intent) ==> forall|position: int| 0 <= position < selected@.len()
             ==> #[trigger] picked(*intent, *cache, selected@[position]),
         intent.target is Entities && any_local(*intent, *cache, *area) ==> (forall|position: int|
             0 <= position < selected@.len()
@@ -22,30 +24,97 @@ use crate::domain::state_cache::StateCache;
             && forall|index: int| 0 <= index < cache.entities@.len()
                 && local_match(*intent, *cache, *area, #[trigger] cache.entities@[index])
                 ==> selected@.contains(cache.entities@[index].entity_id),
+        !fixed(*intent) && !any_local(*intent, *cache, *area) ==> selected@.len() <= 1
+            && (selected@.len() == 1 <==> count(*intent, *cache, cache.entities@.len() as int) == 1),
+        intent.target is Entity && intent.entity is None && any_local(*intent, *cache, *area)
+            ==> selected@.len() == 1 && picked_local(*intent, *cache, *area, selected@[0])
+                && forall|index: int| 0 <= index < cache.entities@.len()
+                    && local_match(*intent, *cache, *area, #[trigger] cache.entities@[index])
+                    ==> !lower(cache.entities@[index].entity_id.0, selected@[0].0),
 )]
 #[must_use]
 pub fn select(intent: &Intent, area: &AreaId, cache: &StateCache) -> Vec<EntityId> {
     let mut selected = Vec::new();
+    if let (Target::Entity, Some(entity)) = (intent.target, &intent.entity) {
+        selected.push(EntityId(entity.clone()));
+        return selected;
+    }
+    let local = local_matches(intent, area, cache);
+    if local.is_empty() {
+        let house = house_matches(intent, cache);
+        return if house.len() == 1 { house } else { selected };
+    }
+    if let Target::Entities = intent.target {
+        return local;
+    }
+    selected.push(lowest(&local));
+    selected
+}
+
+/// The IDs of the entities in `area` that fit a filter of `intent`, are not excluded and are not
+/// skipped.
+#[verus_spec(local =>
+    ensures
+        forall|position: int| 0 <= position < local@.len()
+            ==> picked(*intent, *cache, #[trigger] local@[position])
+                && picked_local(*intent, *cache, *area, local@[position]),
+        forall|index: int| 0 <= index < cache.entities@.len()
+            && local_match(*intent, *cache, *area, #[trigger] cache.entities@[index])
+            ==> local@.contains(cache.entities@[index].entity_id),
+        local@.len() > 0 ==> any_local(*intent, *cache, *area),
+)]
+fn local_matches(intent: &Intent, area: &AreaId, cache: &StateCache) -> Vec<EntityId> {
+    let mut local = Vec::new();
     let mut index = 0;
     #[cfg_attr(verus_only, verus_spec(
         invariant
             index <= cache.entities@.len(),
-            forall|position: int| 0 <= position < selected@.len()
-                ==> picked(*intent, *cache, #[trigger] selected@[position])
-                    && picked_local(*intent, *cache, *area, selected@[position]),
+            forall|position: int| 0 <= position < local@.len()
+                ==> picked(*intent, *cache, #[trigger] local@[position])
+                    && picked_local(*intent, *cache, *area, local@[position]),
             forall|earlier: int| 0 <= earlier < index
                 && local_match(*intent, *cache, *area, #[trigger] cache.entities@[earlier])
-                ==> selected@.contains(cache.entities@[earlier].entity_id),
+                ==> local@.contains(cache.entities@[earlier].entity_id),
+            local@.len() > 0 ==> any_local(*intent, *cache, *area),
         decreases cache.entities@.len() - index,
     ))]
     while index < cache.entities.len() {
         let entity = &cache.entities[index];
         if is_local(intent, area, cache, entity) {
-            selected.push(EntityId(entity.entity_id.0.clone()));
+            local.push(EntityId(entity.entity_id.0.clone()));
         }
         index += 1;
     }
-    selected
+    local
+}
+
+/// The IDs of the entities of the house that fit a filter of `intent`, are not excluded and are
+/// not skipped.
+#[verus_spec(house =>
+    ensures
+        house@.len() == count(*intent, *cache, cache.entities@.len() as int),
+        forall|position: int| 0 <= position < house@.len()
+            ==> #[trigger] picked(*intent, *cache, house@[position]),
+)]
+fn house_matches(intent: &Intent, cache: &StateCache) -> Vec<EntityId> {
+    let mut house = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= cache.entities@.len(),
+            house@.len() == count(*intent, *cache, index as int),
+            forall|position: int| 0 <= position < house@.len()
+                ==> #[trigger] picked(*intent, *cache, house@[position]),
+        decreases cache.entities@.len() - index,
+    ))]
+    while index < cache.entities.len() {
+        let entity = &cache.entities[index];
+        if is_candidate(intent, cache, entity) {
+            house.push(EntityId(entity.entity_id.0.clone()));
+        }
+        index += 1;
+    }
+    house
 }
 
 /// True when `entity` is in `area`, fits a filter of `intent`, is not excluded and is not skipped.
@@ -54,10 +123,53 @@ pub fn select(intent: &Intent, area: &AreaId, cache: &StateCache) -> Vec<EntityI
         found == local_match(*intent, *cache, *area, *entity),
 )]
 fn is_local(intent: &Intent, area: &AreaId, cache: &StateCache, entity: &Entity) -> bool {
+    is_candidate(intent, cache, entity)
+        && matches!(cache.entity_area(entity), Some(found) if found.0.as_str() == area.0.as_str())
+}
+
+/// True when `entity` fits a filter of `intent`, is not excluded and is not skipped.
+#[verus_spec(found =>
+    ensures
+        found == candidate(*intent, *cache, *entity),
+)]
+fn is_candidate(intent: &Intent, cache: &StateCache, entity: &Entity) -> bool {
     is_filtered(cache, &intent.select, entity)
         && !is_listed(&intent.exclude, entity.entity_id.0.as_str())
         && !is_skipped(cache, entity)
-        && matches!(cache.entity_area(entity), Some(found) if found.0.as_str() == area.0.as_str())
+}
+
+/// The lowest entity ID of `ids`.
+#[verus_spec(lowest =>
+    requires
+        ids@.len() > 0,
+    ensures
+        ids@.contains(lowest),
+        forall|id: EntityId| #[trigger] ids@.contains(id) ==> !lower(id.0, lowest.0),
+)]
+fn lowest(ids: &[EntityId]) -> EntityId {
+    let mut best = 0;
+    let mut position = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            best < ids@.len(),
+            position <= ids@.len(),
+            forall|earlier: int| 0 <= earlier < position
+                ==> !lower(#[trigger] ids@[earlier].0, ids@[best as int].0),
+        decreases ids@.len() - position,
+    ))]
+    while position < ids.len() {
+        proof! {
+            lemma_string_order();
+        }
+        if ids[position].0 < ids[best].0 {
+            proof! {
+                assert(lower(ids@[position as int].0, ids@[best as int].0));
+            }
+            best = position;
+        }
+        position += 1;
+    }
+    EntityId(ids[best].0.clone())
 }
 
 /// True when `entity` has an entity category, is hidden or disabled, or is on a satellite device.
@@ -385,6 +497,43 @@ pub open spec fn local_match(intent: Intent, cache: StateCache, area: AreaId, en
     filtered(cache, intent.select@, entity) && kept(intent, cache, area, entity)
 }
 
+/// True when `intent` names its one entity with a template instead of filters.
+pub open spec fn fixed(intent: Intent) -> bool {
+    intent.target is Entity && intent.entity is Some
+}
+
+/// The number of candidates of `intent` among the first `prefix` entities of `cache`.
+pub open spec fn count(intent: Intent, cache: StateCache, prefix: int) -> int
+    decreases prefix,
+{
+    if prefix <= 0 {
+        0
+    } else {
+        count(intent, cache, prefix - 1)
+            + if candidate(intent, cache, cache.entities@[prefix - 1]) { 1int } else { 0int }
+    }
+}
+
+/// True when `left` is before `right` in the order of `String`.
+pub open spec fn lower(left: String, right: String) -> bool {
+    vstd::std_specs::cmp::PartialOrdSpec::partial_cmp_spec(&left, &right)
+        == Some(std::cmp::Ordering::Less)
+}
+
+/// `String` comparisons give its order, which is irreflexive and transitive.
+proof fn lemma_string_order()
+    ensures
+        <String as vstd::std_specs::cmp::PartialOrdSpec>::obeys_partial_cmp_spec(),
+        forall|text: String| !#[trigger] lower(text, text),
+        forall|first: String, second: String, third: String|
+            #[trigger] lower(first, second) && #[trigger] lower(second, third) ==> lower(first, third),
+{
+    broadcast use crate::domain::contracts::axiom_string_obeys_cmp;
+    assert(vstd::laws_cmp::obeys_cmp::<String>());
+    reveal(vstd::laws_cmp::obeys_cmp_partial_ord);
+    reveal(vstd::laws_cmp::obeys_partial_cmp_spec_properties);
+}
+
 /// True when an entity of `cache` is a candidate of `intent` in `area`.
 pub open spec fn any_local(intent: Intent, cache: StateCache, area: AreaId) -> bool {
     exists|index: int| 0 <= index < cache.entities@.len()
@@ -490,6 +639,8 @@ mod tests {
     /// AC-4.4b-3.
     #[test]
     fn ac_4_4b_3_alias_word() {
+        let mut tv_show = intent("tv_show");
+        tv_show.target = Target::Entities;
         let house = with(
             house(),
             "media_player.apple_tv",
@@ -499,7 +650,7 @@ mod tests {
             },
         );
         assert_eq!(
-            selected(&intent("tv_show"), "living_room", house),
+            selected(&tv_show, "living_room", house),
             ["media_player.apple_tv", "media_player.box"]
         );
     }
@@ -546,5 +697,37 @@ mod tests {
             selected(&intent("lights_on"), "kitchen", house),
             ["light.kitchen", "light.strawberry_lamp"]
         );
+    }
+
+    /// AC-4.4c-1.
+    #[test]
+    fn ac_4_4c_1_fan_switch() {
+        assert_eq!(
+            selected(&intent("fan_on"), "living_room", house()),
+            ["switch.living_room_fan"]
+        );
+    }
+
+    /// AC-4.4c-2.
+    #[test]
+    fn ac_4_4c_2_only_climate_of_house() {
+        assert_eq!(
+            selected(&intent("climate_down"), "bedroom", house()),
+            ["climate.thermostat"]
+        );
+    }
+
+    /// AC-4.4c-3.
+    #[test]
+    fn ac_4_4c_3_two_matches_in_house() {
+        let ids = selected(&intent("fan_on"), "bedroom", house());
+        assert!(ids.is_empty(), "{ids:?}");
+    }
+
+    /// AC-4.4c-4.
+    #[test]
+    fn ac_4_4c_4_lowest_entity_id() {
+        let house = with(house(), "fan.office_fan", "fan.desk", |_| {});
+        assert_eq!(selected(&intent("fan_on"), "office", house), ["fan.desk"]);
     }
 }

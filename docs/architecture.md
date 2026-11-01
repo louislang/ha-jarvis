@@ -62,9 +62,11 @@ flowchart LR
     crate_domain_responses --> crate_domain_catalog
     crate_domain_responses --> crate_domain_contracts
     crate_domain_select --> crate_domain_catalog
+    crate_domain_select --> crate_domain_contracts
     crate_domain_select --> crate_domain_intent
     crate_domain_select --> crate_domain_state
     crate_domain_select --> crate_domain_state_cache
+    crate_domain_select --> crate_testing_fakes
     crate_domain_state_cache --> crate_domain_contracts
     crate_domain_state_cache --> crate_domain_state
     crate_domain_state_cache --> crate_domain_state_cache
