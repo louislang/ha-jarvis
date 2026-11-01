@@ -20,7 +20,7 @@ use crate::domain::state_cache::StateCache;
             0 <= position < selected@.len()
                 ==> #[trigger] picked_local(*intent, *cache, *area, selected@[position]))
             && forall|index: int| 0 <= index < cache.entities@.len()
-                && plain_local(*intent, *cache, *area, #[trigger] cache.entities@[index])
+                && local_match(*intent, *cache, *area, #[trigger] cache.entities@[index])
                 ==> selected@.contains(cache.entities@[index].entity_id),
 )]
 #[must_use]
@@ -34,7 +34,7 @@ pub fn select(intent: &Intent, area: &AreaId, cache: &StateCache) -> Vec<EntityI
                 ==> picked(*intent, *cache, #[trigger] selected@[position])
                     && picked_local(*intent, *cache, *area, selected@[position]),
             forall|earlier: int| 0 <= earlier < index
-                && plain_local(*intent, *cache, *area, #[trigger] cache.entities@[earlier])
+                && local_match(*intent, *cache, *area, #[trigger] cache.entities@[earlier])
                 ==> selected@.contains(cache.entities@[earlier].entity_id),
         decreases cache.entities@.len() - index,
     ))]
@@ -51,8 +51,7 @@ pub fn select(intent: &Intent, area: &AreaId, cache: &StateCache) -> Vec<EntityI
 /// True when `entity` is in `area`, fits a filter of `intent`, is not excluded and is not skipped.
 #[verus_spec(found =>
     ensures
-        found ==> local_match(*intent, *cache, *area, *entity),
-        plain_local(*intent, *cache, *area, *entity) ==> found,
+        found == local_match(*intent, *cache, *area, *entity),
 )]
 fn is_local(intent: &Intent, area: &AreaId, cache: &StateCache, entity: &Entity) -> bool {
     is_filtered(cache, &intent.select, entity)
@@ -124,16 +123,15 @@ fn is_listed(items: &[String], text: &str) -> bool {
 /// True when `entity` fits a filter of `filters`.
 #[verus_spec(found =>
     ensures
-        found ==> filtered(*cache, filters@, *entity),
-        plain(*cache, filters@, *entity) ==> found,
+        found == filtered(*cache, filters@, *entity),
 )]
 fn is_filtered(cache: &StateCache, filters: &[Filter], entity: &Entity) -> bool {
     let mut index = 0;
     #[cfg_attr(verus_only, verus_spec(
         invariant
             index <= filters@.len(),
-            forall|earlier: int| 0 <= earlier < index ==> !(filters@[earlier].name is None
-                && fits(*cache, #[trigger] filters@[earlier], *entity)),
+            forall|earlier: int| 0 <= earlier < index
+                ==> !fits(*cache, #[trigger] filters@[earlier], *entity),
         decreases filters@.len() - index,
     ))]
     while index < filters.len() {
@@ -148,8 +146,7 @@ fn is_filtered(cache: &StateCache, filters: &[Filter], entity: &Entity) -> bool 
 /// True when `entity` has the domain, the device class and the name words of `filter`.
 #[verus_spec(found =>
     ensures
-        found ==> fits(*cache, *filter, *entity),
-        filter.name is None ==> found == fits(*cache, *filter, *entity),
+        found == fits(*cache, *filter, *entity),
 )]
 fn fits_filter(cache: &StateCache, filter: &Filter, entity: &Entity) -> bool {
     let id = entity.entity_id.0.as_str();
@@ -166,7 +163,10 @@ fn fits_filter(cache: &StateCache, filter: &Filter, entity: &Entity) -> bool {
 
 /// True when each word of `name` is a word of the normalized name or of a normalized alias of
 /// `entity`.
-#[verus_verify]
+#[verus_spec(found =>
+    ensures
+        found == named(*entity, name@),
+)]
 fn is_named(entity: &Entity, name: &str) -> bool {
     let wanted = words(&intent::normalize(name));
     if has_words(&words(&intent::normalize(entity.name.as_str())), &wanted) {
@@ -176,6 +176,10 @@ fn is_named(entity: &Entity, name: &str) -> bool {
     #[cfg_attr(verus_only, verus_spec(
         invariant
             index <= entity.aliases@.len(),
+            views(wanted@) == split(intent::normalized(name@)),
+            !names(entity.name@, name@),
+            forall|earlier: int| 0 <= earlier < index
+                ==> !names(#[trigger] entity.aliases@[earlier]@, name@),
         decreases entity.aliases@.len() - index,
     ))]
     while index < entity.aliases.len() {
@@ -189,15 +193,24 @@ fn is_named(entity: &Entity, name: &str) -> bool {
 }
 
 /// True when each of `wanted` is in `words`.
-#[verus_verify]
+#[verus_spec(found =>
+    ensures
+        found == has_all(views(words@), views(wanted@)),
+)]
 fn has_words(words: &[String], wanted: &[String]) -> bool {
     let mut index = 0;
     #[cfg_attr(verus_only, verus_spec(
         invariant
             index <= wanted@.len(),
+            forall|earlier: int| 0 <= earlier < index
+                ==> views(words@).contains(#[trigger] views(wanted@)[earlier]),
         decreases wanted@.len() - index,
     ))]
     while index < wanted.len() {
+        proof! {
+            lemma_listed(words@, wanted@[index as int]@);
+            assert(views(wanted@)[index as int] == wanted@[index as int]@);
+        }
         if !is_listed(words, wanted[index].as_str()) {
             return false;
         }
@@ -207,7 +220,10 @@ fn has_words(words: &[String], wanted: &[String]) -> bool {
 }
 
 /// The parts of `text` between spaces.
-#[verus_verify]
+#[verus_spec(words =>
+    ensures
+        views(words@) == split(text@),
+)]
 fn words(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut words = Vec::new();
@@ -216,9 +232,14 @@ fn words(text: &str) -> Vec<String> {
     #[cfg_attr(verus_only, verus_spec(
         invariant
             index <= chars@.len(),
+            chars@ == text@,
+            views(words@).push(word@) == split(text@.take(index as int)),
         decreases chars@.len() - index,
     ))]
     while index < chars.len() {
+        proof! {
+            lemma_words(text@, index as int, words@, word);
+        }
         if chars[index] == ' ' {
             words.push(word);
             word = String::new();
@@ -226,6 +247,9 @@ fn words(text: &str) -> Vec<String> {
             word.push(chars[index]);
         }
         index += 1;
+    }
+    proof! {
+        lemma_words(text@, index as int, words@, word);
     }
     words.push(word);
     words
@@ -235,22 +259,86 @@ verus! {
 
 broadcast use vstd::seq_lib::lemma_seq_contains_after_push;
 
-/// True when `entity` has the domain and the device class of `filter`.
+/// True when `entity` has the domain, the device class and the name words of `filter`.
 pub open spec fn fits(cache: StateCache, filter: Filter, entity: Entity) -> bool {
     &&& crate::domain::state_cache::in_domain(entity.entity_id.0@, filter.domain@)
     &&& filter.device_class matches Some(class)
         ==> crate::domain::state_cache::device_class(cache, entity.entity_id.0@) == Some(class@)
+    &&& filter.name matches Some(name) ==> named(entity, name@)
+}
+
+/// The texts of `items`.
+pub open spec fn views(items: Seq<String>) -> Seq<Seq<char>> {
+    items.map_values(|item: String| item@)
+}
+
+/// The parts of `text` between spaces.
+pub open spec fn split(text: Seq<char>) -> Seq<Seq<char>>
+    decreases text.len(),
+{
+    if text.len() == 0 {
+        seq![Seq::empty()]
+    } else {
+        let before = split(text.drop_last());
+        if text.last() == ' ' {
+            before.push(Seq::empty())
+        } else {
+            before.update(before.len() - 1, before.last().push(text.last()))
+        }
+    }
+}
+
+/// True when each of `wanted` is in `words`.
+pub open spec fn has_all(words: Seq<Seq<char>>, wanted: Seq<Seq<char>>) -> bool {
+    forall|index: int| 0 <= index < wanted.len() ==> words.contains(#[trigger] wanted[index])
+}
+
+/// True when each word of the normalized `name` is a word of the normalized `text`.
+pub open spec fn names(text: Seq<char>, name: Seq<char>) -> bool {
+    has_all(split(intent::normalized(text)), split(intent::normalized(name)))
+}
+
+/// True when each word of the normalized `name` is a word of one normalized alias of `entity`.
+pub open spec fn aliased(entity: Entity, name: Seq<char>) -> bool {
+    exists|index: int| 0 <= index < entity.aliases@.len() && names(#[trigger] entity.aliases@[index]@, name)
+}
+
+/// True when each word of the normalized `name` is a word of the normalized name or of one
+/// normalized alias of `entity`.
+pub open spec fn named(entity: Entity, name: Seq<char>) -> bool {
+    names(entity.name@, name) || aliased(entity, name)
+}
+
+/// The facts about `text` and `words` that the loop of `words` needs at `index`.
+proof fn lemma_words(text: Seq<char>, index: int, words: Seq<String>, word: String)
+    requires
+        0 <= index <= text.len(),
+    ensures
+        views(words.push(word)) == views(words).push(word@),
+        index < text.len() ==> text.take(index + 1).drop_last() == text.take(index),
+        index == text.len() ==> text.take(index) == text,
+{
+    assert(views(words.push(word)) =~= views(words).push(word@));
+    assert(text.take(text.len() as int) =~= text);
+    if index < text.len() {
+        assert(text.take(index + 1).drop_last() =~= text.take(index));
+    }
+}
+
+/// `listed` is `contains` on the texts of `items`.
+proof fn lemma_listed(items: Seq<String>, text: Seq<char>)
+    ensures
+        listed(items, text) == views(items).contains(text),
+{
+    if listed(items, text) {
+        let index = choose|index: int| 0 <= index < items.len() && #[trigger] items[index]@ == text;
+        assert(views(items)[index] == text);
+    }
 }
 
 /// True when `entity` fits a filter of `filters`.
 pub open spec fn filtered(cache: StateCache, filters: Seq<Filter>, entity: Entity) -> bool {
     exists|index: int| 0 <= index < filters.len() && fits(cache, #[trigger] filters[index], entity)
-}
-
-/// True when `entity` fits a filter of `filters` that has no name.
-pub open spec fn plain(cache: StateCache, filters: Seq<Filter>, entity: Entity) -> bool {
-    exists|index: int| 0 <= index < filters.len() && filters[index].name is None
-        && fits(cache, #[trigger] filters[index], entity)
 }
 
 /// True when `text` is in `items`.
@@ -295,11 +383,6 @@ pub open spec fn candidate(intent: Intent, cache: StateCache, entity: Entity) ->
 /// True when `entity` is a candidate of `intent` in `area`.
 pub open spec fn local_match(intent: Intent, cache: StateCache, area: AreaId, entity: Entity) -> bool {
     filtered(cache, intent.select@, entity) && kept(intent, cache, area, entity)
-}
-
-/// True when `entity` fits a filter of `intent` that has no name, and is kept in `area`.
-pub open spec fn plain_local(intent: Intent, cache: StateCache, area: AreaId, entity: Entity) -> bool {
-    plain(cache, intent.select@, entity) && kept(intent, cache, area, entity)
 }
 
 /// True when an entity of `cache` is a candidate of `intent` in `area`.
