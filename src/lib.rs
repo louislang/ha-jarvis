@@ -12,6 +12,7 @@ use std::process::ExitCode;
 
 use anyhow::Context;
 use clap::Parser;
+use jiff::Timestamp;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::Deserialize;
@@ -20,6 +21,7 @@ use crate::domain::catalog::Catalog;
 use crate::domain::state::Snapshot;
 use crate::domain::training::Settings;
 use crate::domain::training::TrainingSet;
+use crate::ports::Clock;
 
 /// Pure rules.
 pub mod domain {
@@ -41,6 +43,7 @@ pub mod ports;
 /// Use cases.
 pub mod app {
     pub mod background;
+    pub mod conversation;
 }
 
 /// Port implementations, one technology each.
@@ -66,6 +69,10 @@ pub struct Config {
     pub device: Device,
     /// The intent catalog file.
     pub intents: PathBuf,
+    /// The source response pools file.
+    pub responses: PathBuf,
+    /// The saved pools file: use counts and generated responses.
+    pub pools: PathBuf,
     /// Home Assistant connection.
     pub ha: HaConfig,
     /// System One model.
@@ -170,6 +177,16 @@ pub struct TrainConfig {
     pub batch_size: usize,
     /// The share of the examples in the held-out split.
     pub holdout: f64,
+}
+
+/// The `Clock` of the system time.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Timestamp {
+        Timestamp::now()
+    }
 }
 
 /// Secrets from the environment variables that [`Config`] names.
@@ -352,6 +369,8 @@ mod tests {
             listen: SocketAddr::from(([0, 0, 0, 0], 10700)),
             device: Device::Cuda,
             intents: PathBuf::from("intents.toml"),
+            responses: PathBuf::from("responses.toml"),
+            pools: PathBuf::from("pools.json"),
             ha: HaConfig {
                 url: "ws://homeassistant.local:8123/api/websocket".to_owned(),
                 token_env: "HA_TOKEN".to_owned(),

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
+use jiff::Timestamp;
 use serde_json::Value;
 
 use crate::Device;
@@ -55,4 +56,10 @@ pub trait Store<T>: Send + Sync {
     ///
     /// The value cannot be serialized or written.
     fn save(&self, value: &T) -> anyhow::Result<()>;
+}
+
+/// The current time.
+pub trait Clock: Send + Sync {
+    /// The time now.
+    fn now(&self) -> Timestamp;
 }
