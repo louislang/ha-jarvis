@@ -8,7 +8,7 @@ This phase adds the driving port and the Wyoming adapter. HA can use Jarvis as i
 
 **Goal:** Add the `Assistant` driving port and the Wyoming TCP server that answers `describe` with `info`. HA can now discover Jarvis as a Wyoming service.
 
-- **Implements:** G10. **Depends on:** 4.9.
+- **Implements:** G10. **Depends on:** 4.9c.
 - **Files:** create `src/adapters/wyoming.rs`. Modify `src/ports.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `Cargo.toml`.
 
 **Model.**

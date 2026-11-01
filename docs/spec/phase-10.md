@@ -55,7 +55,7 @@ This phase lets Jarvis ask questions. Jarvis asks when it does not understand, w
 **Model.**
 
 - `Pending`: `Slot { intent, slots, missing, choices }`, `Llm { response_id, call_id }`.
-- `Dialog { pending, turns, asked }`. `asked` is the time of the last question. `Dialogs: Map<Key, Dialog>` and a generation number for each key. `Key` is the `satellite_id`, else the `conversation_id`. The generations of sub-phase 4.9 now use `Key`, so a conversation without a satellite also has one.
+- `Dialog { pending, turns, asked }`. `asked` is the time of the last question. `Dialogs: Map<Key, Dialog>` and a generation number for each key. `Key` is the `satellite_id`, else the `conversation_id`. The generations of sub-phase 4.9b now use `Key`, so a conversation without a satellite also has one.
 - `open(key, pending, now)`, `take(key, now) -> Option<Dialog>` (removes it; `None` when `now - asked >= timeout_s`), `next_turn(dialog, max_turns, now) -> Option<Dialog>` (`turns + 1` and `asked := now`), `close(key)` (removes the dialog and increases the generation of the key).
 - `turns` counts the questions of one dialog: questions for later missing slots and System Two questions also count.
 - This sub-phase adds `[dialog]` (`max_turns`, `timeout_s`).
@@ -118,7 +118,7 @@ This phase lets Jarvis ask questions. Jarvis asks when it does not understand, w
 - `Decision::Ask { question: Chosen, pending }`. A missing `area`, a missing `person`, or a missing template slot that is not `optional` and has no habit value gives `Ask` from the pool `ask_<slot>`. These cases replace the `Fallback` of sub-phase 4.5b for a missing area and of sub-phase 4.5d for a missing slot. Jarvis asks for one missing value at a time, in this order: `area`, `person`, then the other slots in name order.
 - The choices for `area` are the area names and their aliases. `decide` maps a filled alias to its area with `area_by_name`. The choices for `person` are the names of the `person` entities in the cache. Other slots have no choices.
 - `Home::ask(satellite, question)` calls `start_conversation` with `preannounce = false` and the deadline `ha.announce_timeout_s`.
-- With a `satellite_id`, `handle` returns empty text and puts the question in the announce queue of the satellite (sub-phase 4.9), which calls `ask` when the satellite is idle. HA cancels a running pipeline when a question starts, so the question waits. Without a `satellite_id`, `handle` returns the question text.
+- With a `satellite_id`, `handle` returns empty text and puts the question in the announce queue of the satellite (sub-phase 4.9b), which calls `ask` when the satellite is idle. HA cancels a running pipeline when a question starts, so the question waits. Without a `satellite_id`, `handle` returns the question text.
 - `validate_pools` checks that each slot that can be missing has an `ask_<slot>` pool.
 - HA does not send an empty transcript to `handle` (`stt-no-text-recognized`), so Jarvis has no dialog for empty input.
 
@@ -139,7 +139,7 @@ This phase lets Jarvis ask questions. Jarvis asks when it does not understand, w
 - P-10.4-1, P-10.4-2. Ensures: a missing area, or an area slot that matches no area, gives `Ask` from `ask_area` with the area names and aliases as choices. Argument: the two `Fallback` returns of sub-phase 4.5b become `Ask { ask_area, choices }`. No other branch changes.
 - P-10.4-4, P-10.4-5. Argument: `handle` matches `(Ask, ctx.satellite_id)` with two arms.
 - P-10.4-7. Ensures: a missing template slot that is not `optional` and has no habit value gives `Ask` from `ask_<slot>`. Argument: `decide` checks each template slot of the intent against the prediction, `optional` and `habit_defaults` before it renders.
-- P-10.4-8. Requires: `AnnounceWhenIdle` (P-4.7-2). Argument: the question is an item of the announce queue, which waits for `idle` (P-4.9-2).
+- P-10.4-8. Requires: `AnnounceWhenIdle` (P-4.7-2). Argument: the question is an item of the announce queue, which waits for `idle` (P-4.9b-1).
 - P-10.4-9. Ensures: a filled alias gives the area of the alias. Argument: the choices contain the aliases, and `decide` resolves the filled value with `area_by_name` (P-2.8b-1).
 - P-10.4-3, P-10.4-6. Evidence: test.
 
@@ -165,7 +165,7 @@ This phase lets Jarvis ask questions. Jarvis asks when it does not understand, w
 
 A choice is a closed set, so step 2 comes before step 3. Free text can be anything, so step 3 comes before step 4.
 
-`close` increases the generation of the key, as each new request on a satellite does (sub-phase 4.9). A deferred job keeps the generation of its key when it starts. Before each announce, question or call, it compares the generation. When the generation changed, the job stops and makes no announce, no question and no further call. A call that already started is not undone.
+`close` increases the generation of the key, as each new request on a satellite does (sub-phase 4.9b). A deferred job keeps the generation of its key when it starts. Before each announce, question or call, it compares the generation. When the generation changed, the job stops and makes no announce, no question and no further call. A call that already started is not undone.
 
 **Acceptance criteria.**
 
@@ -197,7 +197,7 @@ A choice is a closed set, so step 2 comes before step 3. Free text can be anythi
 - **Implements:** G7, G13. **Depends on:** 10.5.
 - **Files:** modify `src/ports.rs`, `src/adapters/openai.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`.
 
-**Model.** `Step::Ask { question, response_id, call_id }`. The consumer puts the question in the announce queue (sub-phase 4.9), so it asks when the satellite is idle after the filler. It opens a dialog with `Pending::Llm { response_id, call_id }`. An answer to that dialog sends a `Question` with `previous_response_id` and one `function_call_output` item with `call_id` and the answer text. Each request sets `parallel_tool_calls = false`, so one response has at most one open tool call. When the dialog times out or is cancelled, Jarvis sends nothing for the open call.
+**Model.** `Step::Ask { question, response_id, call_id }`. The consumer puts the question in the announce queue (sub-phase 4.9b), so it asks when the satellite is idle after the filler. It opens a dialog with `Pending::Llm { response_id, call_id }`. An answer to that dialog sends a `Question` with `previous_response_id` and one `function_call_output` item with `call_id` and the answer text. Each request sets `parallel_tool_calls = false`, so one response has at most one open tool call. When the dialog times out or is cancelled, Jarvis sends nothing for the open call.
 
 **Acceptance criteria.**
 
