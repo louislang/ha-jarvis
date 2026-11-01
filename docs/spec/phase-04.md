@@ -347,7 +347,7 @@ This phase selects responses, selects entities and decides the action from a pre
 - Actions:
   - `request(r)` (when `r > newest`): a user starts request `r`. `newest := r`, `idle := false`, `busy := false` (a new pipeline stops a playing announce).
   - `pipelineEnd`: `idle := true`. HA ended the reply or the filler.
-  - `arrive(r, s)`: append `(r, s)` to `arrived` and to `queue`.
+  - `arrive(r, s)` (when `r <= newest` and `s` is the next sentence number of `r`): append `(r, s)` to `arrived` and to `queue`. A request has answer sentences only after it starts, and its sentences arrive in order.
   - `start` (when `idle`, `not busy` and `queue` is not empty): remove the head. If its request is `newest`, append it with `newest` to `started` and set `busy`. Else drop it.
   - `finish`: `busy := false`.
 - Invariants:
