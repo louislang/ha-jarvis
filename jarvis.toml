@@ -8,6 +8,9 @@ token_env = "HA_TOKEN"
 request_timeout_ms = 5000
 ping_interval_s = 30
 
+[model]
+threshold = 0.6
+
 [train]
 base_model = "sentence-transformers/all-MiniLM-L12-v2"
 epochs = 8

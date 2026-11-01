@@ -25,6 +25,7 @@ pub mod domain {
     pub mod catalog;
     #[cfg(verus_only)]
     pub mod contracts;
+    pub mod decide;
     pub mod intent;
     pub mod model;
     pub mod responses;
@@ -66,6 +67,8 @@ pub struct Config {
     pub intents: PathBuf,
     /// Home Assistant connection.
     pub ha: HaConfig,
+    /// System One model.
+    pub model: ModelConfig,
     /// Training.
     pub train: TrainConfig,
 }
@@ -139,6 +142,14 @@ pub struct HaConfig {
     pub request_timeout_ms: u64,
     /// Time between two pings.
     pub ping_interval_s: u64,
+}
+
+/// The `[model]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModelConfig {
+    /// The least top probability that System One acts on.
+    pub threshold: f32,
 }
 
 /// The `[train]` section.
@@ -341,6 +352,7 @@ mod tests {
                 request_timeout_ms: 5000,
                 ping_interval_s: 30,
             },
+            model: ModelConfig { threshold: 0.6 },
             train: TrainConfig {
                 base_model: "sentence-transformers/all-MiniLM-L12-v2".to_owned(),
                 epochs: 8,

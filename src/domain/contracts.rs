@@ -33,6 +33,7 @@ use crate::domain::state::Entity;
 use crate::domain::state::EntityId;
 use crate::domain::state::Event;
 use crate::domain::state::HomeConfig;
+use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
 use crate::domain::state::State;
 use crate::domain::state_cache::StateCache;
@@ -102,6 +103,10 @@ pub struct ExAreaId(AreaId);
 /// The ID of an entity.
 #[verifier::external_type_specification]
 pub struct ExEntityId(EntityId);
+
+/// An HA service call.
+#[verifier::external_type_specification]
+pub struct ExServiceCall(ServiceCall);
 
 /// The HA configuration that Jarvis uses.
 #[verifier::external_type_specification]
