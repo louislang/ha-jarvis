@@ -42,6 +42,7 @@ pub mod app {
 
 /// Port implementations, one technology each.
 pub mod adapters {
+    pub mod files;
     pub mod ha;
     pub mod onnx;
 }

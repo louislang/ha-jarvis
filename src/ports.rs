@@ -39,3 +39,20 @@ pub trait ModelLoader: Send + Sync {
     /// The classifier of the model folder `dir`, run on `device`.
     async fn load(&self, dir: &Path, device: Device) -> anyhow::Result<Arc<dyn Classifier>>;
 }
+
+/// A value that survives a restart.
+pub trait Store<T>: Send + Sync {
+    /// The saved value, or `None` when no value is saved.
+    ///
+    /// # Errors
+    ///
+    /// The value cannot be read or parsed.
+    fn load(&self) -> anyhow::Result<Option<T>>;
+
+    /// Saves `value`. A stop during the save keeps the last saved value.
+    ///
+    /// # Errors
+    ///
+    /// The value cannot be serialized or written.
+    fn save(&self, value: &T) -> anyhow::Result<()>;
+}
