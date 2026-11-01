@@ -288,7 +288,7 @@ This phase selects responses, selects entities and decides the action from a pre
 
 - Step 3 also reads the slots of the intent (`catalog::insert_slots`, sub-phase 4.2). The `area` slot is not part of this check, because step 3 already gives the area or `Fallback`. Another missing slot that is not `optional` gives `Fallback`. A missing `optional` slot is an empty string. The render context of steps 4, 7 and 8 gets each other slot. Its `area` stays the area name.
 - Step 7: when the intent has `entity`, `decide` renders the text that `select` returns with the context (sub-phase 4.4c). The rendered text is the selected entity. An `entity` template that does not render gives `Fallback`.
-- Step 8 also renders the `data` of the intent. A data value that is one `{{ expression }}` keeps the type of the result (`minijinja` `compile_expression`). Other values render as strings. A data value that does not render gives `Fallback`. The call gets the rendered data.
+- Step 8 also renders the `data` of the intent. A data value that is one `{{ expression }}` keeps the type of the result (`minijinja` `compile_expression`). One `{{ expression }}` is a value that starts with `{{`, ends with `}}`, and has no other `}}`. Thus a `}}` inside a string literal of the expression is not supported, and such a value renders as a string. An expression with an undefined result gives `Fallback`. Other values render as strings. A data value that does not render gives `Fallback`. The call gets the rendered data.
 
 **Acceptance criteria.**
 

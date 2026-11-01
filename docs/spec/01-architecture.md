@@ -593,7 +593,7 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 - `next_date(day, plus_days)` returns the ISO date of the next `day` plus `plus_days`. An empty `day` means today. A `day` that is not a day name, `today` or `tomorrow` gives an error.
 - Template variables are the built-ins `area` (the area name in lowercase), `entity`, `person` and `response`, the slots of the intent, and the keys of `habit_defaults`.
 - A slot that the prediction does not have is missing, unless the intent lists it in `optional`. A missing optional slot is an empty string. A missing `habit_defaults` key uses the habit value. Phase 10 makes Jarvis ask for any other missing slot, and for a missing `area` or `person`. Before Phase 10, a missing slot gives `Fallback`.
-- A data value that is one `{{ expression }}` keeps the type of the expression result. Other data values render as strings.
+- A data value that is one `{{ expression }}` keeps the type of the expression result. One `{{ expression }}` starts with `{{`, ends with `}}`, and has no other `}}`. Other data values render as strings.
 
 `responses.toml` (example entries):
 
