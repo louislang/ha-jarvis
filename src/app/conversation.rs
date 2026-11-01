@@ -1,17 +1,24 @@
-//! Dispatch of decisions and the pools task.
+//! Dispatch of decisions, the announce queues and the pools task.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::domain::decide::Chosen;
 use crate::domain::decide::Decision;
 use crate::domain::responses;
 use crate::domain::responses::Pools;
+use crate::domain::state_cache::StateCache;
 use crate::ports::Home;
 use crate::ports::Store;
 
@@ -67,6 +74,95 @@ impl Conversation {
             .boxed()
         });
         Handled { text, after }
+    }
+}
+
+/// The announce queue and the generation of one satellite.
+#[derive(Default)]
+struct Queue {
+    /// The generation of the satellite.
+    generation: AtomicU64,
+    /// The turn to announce. Its waiters are the items of the queue, in order.
+    turn: tokio::sync::Mutex<()>,
+}
+
+/// The announce queue of each satellite.
+pub struct Queues {
+    /// The house.
+    home: Arc<dyn Home>,
+    /// The hot cache.
+    cache: watch::Receiver<StateCache>,
+    /// The wait after the satellite becomes idle.
+    margin: Duration,
+    /// The deadline for the satellite to become idle.
+    idle_wait: Duration,
+    /// The queue of each satellite entity.
+    satellites: Mutex<BTreeMap<String, Arc<Queue>>>,
+}
+
+impl Queues {
+    /// Queues that announce on `home` `margin` after `cache` shows the satellite idle, and drop
+    /// an item when the satellite is not idle within `idle_wait`.
+    #[must_use]
+    pub fn new(
+        home: Arc<dyn Home>,
+        cache: watch::Receiver<StateCache>,
+        margin: Duration,
+        idle_wait: Duration,
+    ) -> Self {
+        Self {
+            home,
+            cache,
+            margin,
+            idle_wait,
+            satellites: Mutex::default(),
+        }
+    }
+
+    /// The queue of `satellite`.
+    fn queue(&self, satellite: &str) -> Arc<Queue> {
+        let mut satellites = self.satellites.lock().expect("no lock holder panics");
+        Arc::clone(satellites.entry(satellite.to_owned()).or_default())
+    }
+
+    /// Increases the generation of `satellite` and returns it.
+    pub fn next_generation(&self, satellite: &str) -> u64 {
+        self.queue(satellite)
+            .generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
+    }
+
+    /// Announces `text` on `satellite` after the earlier items of its queue, `margin` after the
+    /// satellite is idle. Drops it when the satellite is not idle within `idle_wait`, or when
+    /// the generation of the satellite is no longer `generation`.
+    ///
+    /// # Errors
+    ///
+    /// The announce fails.
+    pub async fn announce(
+        &self,
+        satellite: &str,
+        generation: u64,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let queue = self.queue(satellite);
+        let _turn = queue.turn.lock().await;
+        let mut cache = self.cache.clone();
+        let idle = cache.wait_for(|cache| {
+            cache
+                .state(satellite)
+                .is_some_and(|state| state.state == "idle")
+        });
+        if !matches!(tokio::time::timeout(self.idle_wait, idle).await, Ok(Ok(_))) {
+            tracing::warn!("{satellite} is not idle, so the announce of {text:?} is dropped");
+            return Ok(());
+        }
+        tokio::time::sleep(self.margin).await;
+        if queue.generation.load(Ordering::SeqCst) != generation {
+            return Ok(());
+        }
+        self.home.announce(satellite, text).await
     }
 }
 
@@ -133,6 +229,13 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use quint_connect::Driver;
+    use quint_connect::State as ModelState;
+    use quint_connect::Step;
+    use quint_connect::quint_run;
+    use quint_connect::switch;
+    use serde::Deserialize;
+    use tokio::runtime::Runtime;
     use tokio::time::Instant;
 
     use super::*;
@@ -141,6 +244,16 @@ mod tests {
     use crate::domain::state::ServiceCall;
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeStore;
+    use crate::testing::fakes::house;
+
+    /// The satellite entity of the tests.
+    const SATELLITE: &str = "assist_satellite.carson_kitchen";
+
+    /// The `announce.margin_ms` of the tests.
+    const MARGIN: Duration = Duration::from_millis(300);
+
+    /// The `announce.idle_wait_s` of the tests. No conformance trace runs this long.
+    const IDLE_WAIT: Duration = Duration::from_secs(3600);
 
     /// The pool `lights_on` with the responses and use counts `lights`, and the pool `fallback`
     /// with one response used `fallback` times.
@@ -295,5 +408,133 @@ mod tests {
         assert_eq!(**task.pools.load(), expected);
         assert_eq!(source.saves(), [], "responses.toml changed");
         Ok(())
+    }
+
+    /// Sets the state of the satellite in `cache` to `value`.
+    fn set(cache: &watch::Sender<StateCache>, value: &str) {
+        cache.send_modify(|cache| {
+            let state = cache.states.get_mut(SATELLITE).expect("the house has it");
+            Arc::make_mut(state).state = value.to_owned();
+        });
+    }
+
+    /// Queues on `home` and the hot cache of the reference house, with the satellite in the
+    /// state `value`.
+    fn queues(home: &Arc<FakeHome>, value: &str) -> (watch::Sender<StateCache>, Queues) {
+        let (cache, receiver) = watch::channel(StateCache::load(house()));
+        set(&cache, value);
+        let queues = Queues::new(Arc::clone(home) as _, receiver, MARGIN, IDLE_WAIT);
+        (cache, queues)
+    }
+
+    /// The texts that `home` announced, in order.
+    fn announces(home: &FakeHome) -> Vec<String> {
+        let calls = home.calls();
+        let texts = calls
+            .iter()
+            .filter_map(|call| call.data.get("message")?.as_str());
+        texts.map(str::to_owned).collect()
+    }
+
+    /// AC-4.9b-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_4_9b_5_busy_satellite_drops_announce() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (_cache, queues) = queues(&home, "responding");
+        let generation = queues.next_generation(SATELLITE);
+        let start = Instant::now();
+        queues.announce(SATELLITE, generation, "Done.").await?;
+        assert_eq!(Instant::now() - start, IDLE_WAIT, "the item ended early");
+        assert_eq!(announces(&home), [] as [&str; 0]);
+        Ok(())
+    }
+
+    /// Runs the tasks of `runtime` while its paused clock advances by `duration`. The clock
+    /// advances only when every task waits.
+    fn advance(runtime: &Runtime, duration: Duration) {
+        runtime.block_on(async { tokio::time::sleep(duration).await });
+    }
+
+    /// The model state that the conformance test compares.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Announce {
+        /// The started announces: request, sentence and the newest request at the start.
+        started: Vec<(i64, i64, i64)>,
+    }
+
+    impl ModelState<AnnounceDriver> for Announce {
+        /// The announces after every task waits. `NoStaleAnnounce` makes the newest request at
+        /// the start the request of the announce.
+        fn from_driver(driver: &AnnounceDriver) -> anyhow::Result<Self> {
+            advance(&driver.runtime, Duration::from_millis(1));
+            let started = announces(&driver.home).into_iter().map(|text| {
+                let (request, sentence) = text.split_once(' ').expect("the text is \"r s\"");
+                let request = request.parse()?;
+                Ok((request, sentence.parse()?, request))
+            });
+            Ok(Self {
+                started: started.collect::<anyhow::Result<_>>()?,
+            })
+        }
+    }
+
+    /// Replays `announce.qnt` against the queue of one satellite, with `FakeHome` as HA.
+    struct AnnounceDriver {
+        /// The paused runtime that runs the items.
+        runtime: Runtime,
+        /// HA.
+        home: Arc<FakeHome>,
+        /// The hot cache.
+        cache: watch::Sender<StateCache>,
+        /// The queues.
+        queues: Arc<Queues>,
+        /// The generation of each request.
+        generations: BTreeMap<i64, u64>,
+    }
+
+    impl AnnounceDriver {
+        /// A driver with an idle satellite, on a new runtime.
+        fn new() -> Self {
+            let mut runtime = tokio::runtime::Builder::new_current_thread();
+            let runtime = runtime.enable_time().start_paused(true).build();
+            let home = Arc::new(FakeHome::default());
+            let (cache, queues) = queues(&home, "idle");
+            Self {
+                runtime: runtime.expect("the runtime builds"),
+                home,
+                cache,
+                queues: Arc::new(queues),
+                generations: BTreeMap::new(),
+            }
+        }
+    }
+
+    impl Driver for AnnounceDriver {
+        type State = Announce;
+
+        fn step(&mut self, step: &Step) -> anyhow::Result<()> {
+            switch!(step {
+                init => *self = Self::new(),
+                request(r: i64) => {
+                    self.generations.insert(r, self.queues.next_generation(SATELLITE));
+                    set(&self.cache, "responding");
+                },
+                pipelineEnd => set(&self.cache, "idle"),
+                arrive(r: i64, s: i64) => {
+                    // Generations start at 1, so a request that never started has an older one.
+                    let generation = self.generations.get(&r).copied().unwrap_or(0);
+                    let (queues, text) = (Arc::clone(&self.queues), format!("{r} {s}"));
+                    self.runtime.spawn(async move { queues.announce(SATELLITE, generation, &text).await });
+                },
+                start => advance(&self.runtime, MARGIN),
+                finish => {},
+            })
+        }
+    }
+
+    /// AC-4.9b-2. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/announce.qnt", max_steps = 30, seed = "1")]
+    fn ac_4_9b_2_conformance() -> impl Driver {
+        AnnounceDriver::new()
     }
 }
