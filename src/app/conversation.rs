@@ -133,9 +133,9 @@ impl Queues {
             + 1
     }
 
-    /// Announces `text` on `satellite` after the earlier items of its queue, `margin` after the
-    /// satellite is idle. Drops it when the satellite is not idle within `idle_wait`, or when
-    /// the generation of the satellite is no longer `generation`.
+    /// Announces `text` on `satellite` after the earlier items of its queue, when the satellite
+    /// is still idle `margin` after it became idle. Drops it when the satellite is not idle
+    /// within `idle_wait`, or when the generation of the satellite is no longer `generation`.
     ///
     /// # Errors
     ///
@@ -149,16 +149,23 @@ impl Queues {
         let queue = self.queue(satellite);
         let _turn = queue.turn.lock().await;
         let mut cache = self.cache.clone();
-        let idle = cache.wait_for(|cache| {
+        let idle = |cache: &StateCache| {
             cache
                 .state(satellite)
                 .is_some_and(|state| state.state == "idle")
-        });
-        if !matches!(tokio::time::timeout(self.idle_wait, idle).await, Ok(Ok(_))) {
-            tracing::warn!("{satellite} is not idle, so the announce of {text:?} is dropped");
-            return Ok(());
+        };
+        let deadline = tokio::time::Instant::now() + self.idle_wait;
+        loop {
+            let wait = tokio::time::timeout_at(deadline, cache.wait_for(idle));
+            if !matches!(wait.await, Ok(Ok(_))) {
+                tracing::warn!("{satellite} is not idle, so the announce of {text:?} is dropped");
+                return Ok(());
+            }
+            tokio::time::sleep(self.margin).await;
+            if idle(&cache.borrow()) {
+                break;
+            }
         }
-        tokio::time::sleep(self.margin).await;
         if queue.generation.load(Ordering::SeqCst) != generation {
             return Ok(());
         }
@@ -453,6 +460,30 @@ mod tests {
     /// advances only when every task waits.
     fn advance(runtime: &Runtime, duration: Duration) {
         runtime.block_on(async { tokio::time::sleep(duration).await });
+    }
+
+    /// AC-4.9b-6.
+    #[tokio::test(start_paused = true)]
+    async fn ac_4_9b_6_busy_during_margin_waits_again() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (cache, queues) = queues(&home, "idle");
+        let generation = queues.next_generation(SATELLITE);
+        let (start, busy_for) = (Instant::now(), Duration::from_secs(1));
+        let busy = async {
+            tokio::time::sleep(MARGIN / 3).await;
+            set(&cache, "responding");
+            tokio::time::sleep(busy_for).await;
+            assert_eq!(
+                announces(&home),
+                [] as [&str; 0],
+                "an announce came while busy"
+            );
+            set(&cache, "idle");
+        };
+        tokio::join!(queues.announce(SATELLITE, generation, "Done."), busy).0?;
+        assert_eq!(Instant::now() - start, MARGIN / 3 + busy_for + MARGIN);
+        assert_eq!(announces(&home), ["Done."]);
+        Ok(())
     }
 
     /// The model state that the conformance test compares.
