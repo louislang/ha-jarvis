@@ -15,7 +15,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 - `ort` uses the features `load-dynamic` and `cuda`. It loads the `libonnxruntime` that `ORT_DYLIB_PATH` names (decision 27).
 - `just models` downloads the sherpa-onnx 2.0.1 CPU shared libraries for the host system into one library folder in `models/`. The recipe lists one SHA-256 for each archive that it downloads, and one for each `.onnx` file and each `tokens.txt` file in it. It checks each listed file and downloads only a missing or wrong file. `models` is a setup recipe: `check` and the `rust-test` job run it before the tests, and tests do not download. CI caches `models/`.
-- `gpu-models` downloads the Nemotron 160 ms model, the Parakeet Unified offline model and the sherpa-onnx 2.0.1 `cuda-12.x-cudnn-9.x-onnxruntime1.28.2` `linux-x64-gpu` libraries.
+- `gpu-models` downloads the Parakeet Unified offline model and the sherpa-onnx 2.0.1 `cuda-12.x-cudnn-9.x-onnxruntime1.28.2` `linux-x64-gpu` libraries.
 - `test` and `cov` set `ORT_DYLIB_PATH` to the `libonnxruntime` in the CPU library folder, and `LD_LIBRARY_PATH` (`DYLD_LIBRARY_PATH` on macOS) to the folder. CI sets them in the same way.
 - `gpu-test` (sub-phase 0.13) now runs `gpu-models` first and sets `ORT_DYLIB_PATH` and `LD_LIBRARY_PATH` to the CUDA library folder.
 - The Linux release archive has the CUDA libraries. The macOS archive has the CPU libraries. The verification step sets `ORT_DYLIB_PATH` and `LD_LIBRARY_PATH` (`DYLD_LIBRARY_PATH` on macOS) to the extracted folder. The `jarvis` unit sets them in its environment file (`01-architecture.md` section 10).
@@ -48,7 +48,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - `TextToSpeech::synth(text) -> Result<Audio>`. `Audio { samples: Vec<i16>, rate }` is in `src/domain/speech.rs`.
 - `SherpaTts` wraps `OfflineTts` with the Supertonic-3 model in `[tts].model_dir`, the speaker ID `[tts].voice` and `[tts].num_steps`. The adapter fixes `lang = "en"` and `seed = 1`. Thus the same text gives bit-identical samples on every run. The model rate is 44.1 kHz.
 - `sherpa-onnx` is `=2.0.1` with feature `shared`. Each recipe and CI job that builds `jarvis` sets `SHERPA_ONNX_LIB_DIR` to the library folder of sub-phase 6.1, so no build downloads. `gpu-test` and the Linux release job set it to the CUDA library folder.
-- `just models` also downloads the 20M zipformer and the Supertonic-3 model `sherpa-onnx-supertonic-3-tts-int8-2026-05-11` into `models/`. `gpu-test` runs `models` and `gpu-models`, so the GPU host has the Supertonic-3 model too.
+- `just models` also downloads the Nemotron 160 ms model (sub-phase 6.6) and the Supertonic-3 model `sherpa-onnx-supertonic-3-tts-int8-2026-05-11` into `models/`. `gpu-test` runs `models` and `gpu-models`, so the GPU host has the Supertonic-3 model too.
 - `device` selects the provider for `SherpaTts`.
 - sherpa-onnx falls back to the CPU with only a log line when the CUDA provider does not load. Thus a test checks the CUDA provider of a sherpa-onnx model by the GPU memory of the test process (`nvidia-smi`): the memory grows when the model loads.
 
@@ -189,27 +189,58 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 **Goal:** Add the `SpeechToText` port with the streaming first pass and its sherpa-onnx adapter. Jarvis now has partial text while the user speaks.
 
 - **Implements:** G2. **Depends on:** 6.5.
-- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `justfile`, `jarvis.toml`, `Cargo.toml`.
+- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `justfile`, `jarvis.toml`, `Cargo.toml`, `xtask/src/gates.rs`.
 
-**Model.** `SpeechToText::stream() -> Box<dyn SttStream>`. `SttStream`: `accept(samples)`, `partial() -> Partial { text, voice_end_ms: Option, vad_ms }`, `reset()`. `SherpaStt` wraps `OnlineRecognizer` with `[asr].model_dir`, and the sherpa-onnx Silero VAD with `[asr].vad_model`, `vad_threshold` and `vad_min_silence_ms` on the same samples. `vad_ms` is the end of the audio that the VAD has decided: audio that the VAD still holds to decide the start or the end of a segment is not decided. `voice_end_ms` is the audio position of the end of the last voiced frame, and `None` before any speech. While the VAD is in a speech segment, `voice_end_ms = vad_ms`. This sub-phase adds `asr.model_dir`, `asr.vad_model`, `asr.vad_threshold` and `asr.vad_min_silence_ms`. `just models` also downloads the Silero VAD model. `FakeStt` returns scripted partials with voice end times. `speech(text)` in `fakes.rs` synthesizes text with `SherpaTts`, resamples it from 44.1 kHz to 16 kHz with `rubato`, and adds 500 ms of silence. The fixed TTS seed makes `speech(text)` bit-identical on every run. `FakeStt` returns scripted partial texts.
+**Model.**
+
+- `SpeechToText::stream() -> Box<dyn SttStream>`. `SttStream`: `accept(samples)`, `partial() -> Partial { text }`, `reset()`.
+- `SherpaStt` wraps `OnlineRecognizer` with the streaming transducer in `[asr].model_dir`. This sub-phase adds `asr.model_dir`.
+- CPU machines and the GPU host use the same first-pass model: Nemotron 160 ms int8. The 20M zipformer does not recognize the first word of `speech(text)`. `just models` downloads the Nemotron model, and `gpu-models` does not. `just models` does not download the 20M zipformer. The structure test of AC-6.2-1 checks the Nemotron folder.
+- `FakeStt` returns scripted partials.
+- `speech(text)` in `fakes.rs` synthesizes text with `SherpaTts`, resamples it from 44.1 kHz to 16 kHz with `rubato`, and adds 500 ms of silence. The fixed TTS seed makes `speech(text)` bit-identical on every run.
 
 **Acceptance criteria.**
 
 - AC-6.6-1: When `SherpaStt` gets `speech("turn on the kitchen lights")` in 20 ms chunks, the normalized final partial is "turn on the kitchen lights".
 - AC-6.6-2: When `SherpaStt` gets the audio in 20 ms chunks, it gives a non-empty partial before the last chunk.
-- AC-6.6-3: When `reset` runs, `partial` returns an empty text and no voice end.
-- AC-6.6-4 [GPU host]: With `device = cpu`, the real-time factor of the 20M zipformer is less than 0.3.
-- AC-6.6-5 [GPU host]: With the Nemotron model, the normalized final partial of `speech("turn on the kitchen lights")` is "turn on the kitchen lights".
-- AC-6.6-6 [GPU host]: With the Nemotron model, the last word is in the partial less than 200 ms after the last voiced sample.
-- AC-6.6-7 [GPU host]: With the Nemotron model, the real-time factor is less than 0.1.
-- AC-6.6-8: When `SherpaStt` gets 500 ms of silence and then `speech("lights on")`, `voice_end_ms` is `None` during the silence and within 100 ms of the last voiced sample at the end.
-- AC-6.6-9 [GPU host]: With `device = cuda`, the first pass runs on the CUDA execution provider.
-- AC-6.6-10: When `SherpaStt` gets `speech("turn on the kitchen lights")`, `vad_ms - voice_end_ms` stays less than `early_commit_ms` until the last voiced sample.
+- AC-6.6-3: When `reset` runs, `partial` returns an empty text.
 
 **Proofs.**
 
 - P-6.6-3. Argument: `reset` creates a new recognizer stream, which has no decoded tokens.
-- P-6.6-1, P-6.6-2, P-6.6-4 to P-6.6-10. Evidence: test.
+- P-6.6-1, P-6.6-2. Evidence: test.
+
+---
+
+### 6.6b First-Pass Voice Activity
+
+**Goal:** Add the Silero VAD to the first pass, with the voice end and the decided audio in each partial, and check the first pass on the GPU host. The commit policy can now measure silence.
+
+- **Implements:** G2, G18. **Depends on:** 6.6.
+- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `justfile`, `jarvis.toml`.
+
+**Model.**
+
+- `Partial { text, voice_end_ms: Option, vad_ms }`. `SherpaStt` runs the sherpa-onnx Silero VAD with `[asr].vad_model`, `vad_threshold` and `vad_min_silence_ms` on the same samples. Each stream has its own VAD, and the VAD can fail to load. Thus `stream()` returns `Result<Box<dyn SttStream>>`.
+- `vad_ms` is the end of the audio that the VAD has decided: audio that the VAD still holds to decide the start or the end of a segment is not decided. `voice_end_ms` is the audio position of the end of the last voiced frame, and `None` before any speech. While the VAD is in a speech segment, `voice_end_ms = vad_ms`.
+- This sub-phase adds `asr.vad_model`, `asr.vad_threshold` and `asr.vad_min_silence_ms`.
+- `just models` also downloads the Silero VAD model `silero_vad.onnx`. It is one file, not an archive. Thus `fetch` extracts only `.tar.bz2` archives and checks a single file by its SHA-256.
+- `FakeStt` returns scripted partials with voice end times.
+
+**Acceptance criteria.**
+
+- AC-6.6b-1: When `SherpaStt` gets 500 ms of silence and then `speech("lights on")`, `voice_end_ms` is `None` during the silence and within 100 ms of the last voiced sample at the end.
+- AC-6.6b-2: When `SherpaStt` gets `speech("turn on the kitchen lights")`, `vad_ms - voice_end_ms` stays less than `early_commit_ms` until the last voiced sample.
+- AC-6.6b-3: When `reset` runs, `partial` returns no voice end.
+- AC-6.6b-4 [GPU host]: With `device = cuda`, the normalized final partial of `speech("turn on the kitchen lights")` is "turn on the kitchen lights".
+- AC-6.6b-5 [GPU host]: With `device = cuda`, the last word is in the partial less than 200 ms after the last voiced sample.
+- AC-6.6b-6 [GPU host]: With `device = cuda`, the real-time factor of the first pass is less than 0.1.
+- AC-6.6b-7 [GPU host]: With `device = cuda`, the first pass runs on the CUDA execution provider.
+
+**Proofs.**
+
+- P-6.6b-3. Argument: `reset` resets the VAD and sets the voice end to `None`.
+- P-6.6b-1, P-6.6b-2, P-6.6b-4 to P-6.6b-7. Evidence: test.
 
 ---
 
@@ -217,7 +248,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 **Goal:** Add `transcribe`, the offline second pass with Parakeet Unified. At commit, Jarvis can decode the whole utterance again for a more accurate transcript.
 
-- **Implements:** G2, G18. **Depends on:** 6.6.
+- **Implements:** G2, G18. **Depends on:** 6.6b.
 - **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.** `SpeechToText::transcribe(samples) -> Result<Option<String>>`. `SherpaStt` holds an optional `OfflineRecognizer` from `[asr].second_pass_dir`. Without it, `transcribe` returns `Ok(None)`. `FakeStt` returns a scripted second-pass text.
