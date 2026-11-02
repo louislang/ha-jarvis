@@ -21,8 +21,23 @@ sherpa_onnx := "https://github.com/k2-fsa/sherpa-onnx/releases/download"
 cpu_libraries := justfile_directory() / "models" / ("sherpa-onnx-v2.0.1-" + (if os() == "macos" { "osx" } else { "linux" }) + "-x64-shared-lib") / "lib"
 # The library folder of the sherpa-onnx 2.0.1 CUDA 12 shared libraries.
 cuda_libraries := justfile_directory() / "models/sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu/lib"
-# The SHA-256 of each file of `models`.
+# The SHA-256 of each file of `models`, one list for each archive.
 cpu_sums := if os() == "macos" { "be9042971c5d1b14da76a960534d2a8cdb6f0e5e02f5e1dc8bddff8576359bdd  sherpa-onnx-v2.0.1-osx-x64-shared-lib.tar.bz2" } else { "532c45bbd41036d83cd70606797529aa8086c2053395a58967736c727625b120  sherpa-onnx-v2.0.1-linux-x64-shared-lib.tar.bz2" }
+zipformer_sums := """
+    9c559283e8498d3fe95913c79ca1cb454bb26281ac2b102b41306c7d752765d9  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17.tar.bz2
+    21e2a2acd961b3ac72f55be2f10f1a285e1b0b0ba010d7c0b6eab141411b163c  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/decoder-epoch-99-avg-1.int8.onnx
+    45a7f940ecfb53d89fa270ad11b88b961e53a317203eb24b1c8e95ed208b0f30  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/decoder-epoch-99-avg-1.onnx
+    3810755ce7c3ab26b42a8bcf39d191308fa27fb0f53358823ba46141d03b7eb3  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/encoder-epoch-99-avg-1.int8.onnx
+    f77a22f4ff94604e1afb2aeb13504d7699363528c047c97d3436087c95c9b659  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/encoder-epoch-99-avg-1.onnx
+    e085d73b593cf9b0707f370dbd656d58327d3fe36d80d849202ef81df02cb01e  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/joiner-epoch-99-avg-1.int8.onnx
+    343e17dffa4f386ca206e00d3c406908f68f473c3d35968d6c3cddd5b8559a94  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/joiner-epoch-99-avg-1.onnx
+    49e3c2646595fd907228b3c6787069658f67b17377c60aeb8619c4551b2316fb  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/tokens.txt"""
+supertonic_sums := """
+    82fa96f91c4ef8abaae3a14a3f4153facf88bed821d1f7331cec2700f432c427  sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2
+    c3eb91414d5ff8a7a239b7fe9e34e7e2bf8a8140d8375ffb14718b1c639325db  sherpa-onnx-supertonic-3-tts-int8-2026-05-11/duration_predictor.int8.onnx
+    c7befd5ea8c3119769e8a6c1486c4edc6a3bc8365c67621c881bbb774b9902ff  sherpa-onnx-supertonic-3-tts-int8-2026-05-11/text_encoder.int8.onnx
+    20cd86fa5c6effedfda0e7cffe5b0569ca401c440a0c3a1d72bf39286c0db3fd  sherpa-onnx-supertonic-3-tts-int8-2026-05-11/vector_estimator.int8.onnx
+    e923d60f53f95eb1ce235f1dc33ec56d9c057823c96fa6f8acf98f32b0da6152  sherpa-onnx-supertonic-3-tts-int8-2026-05-11/vocoder.int8.onnx"""
 # The SHA-256 of each file of `gpu-models`, one list for each archive.
 cuda_sums := "2aa541a65c1e7d921a053283419b70b30c1f6ae0a0f52f64b947ebe88c5f2a77  sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu.tar.bz2"
 nemotron_sums := """
@@ -37,6 +52,8 @@ parakeet_sums := """
     a5e223392c90e75f8144cdb5eb95af7625db389e39edef2bd1a9c872b3298fe6  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming/decoder.int8.onnx
     869f43f7d24595c55581ad3bf249a935fb8a71389fbdaa7504b9f46f93140f8a  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming/joiner.int8.onnx
     dc0b4584ab2e4ddbf888425c076c61b736e7356a015250db7d307e6f1a8188ff  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming/tokens.txt"""
+# Each build links the sherpa-onnx libraries of this folder, so no build downloads them.
+export SHERPA_ONNX_LIB_DIR := cpu_libraries
 # The environment that loads the ONNX Runtime of `cpu_libraries`.
 cpu_runtime := "ORT_DYLIB_PATH=" + quote(cpu_libraries / "libonnxruntime." + if os() == "macos" { "dylib" } else { "so" }) + (if os() == "macos" { " DYLD_LIBRARY_PATH=" } else { " LD_LIBRARY_PATH=" }) + quote(cpu_libraries)
 
@@ -49,7 +66,7 @@ cov:
     {{ cpu_runtime }} cargo llvm-cov --workspace --release --fail-under-lines 80.01
 
 # Download the CPU libraries and models.
-models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums)
+models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums) (fetch sherpa_onnx + "/asr-models" zipformer_sums) (fetch sherpa_onnx + "/tts-models" supertonic_sums)
 
 # Download the GPU models and the CUDA libraries.
 gpu-models: (fetch sherpa_onnx + "/v2.0.1" cuda_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/asr-models" parakeet_sums)
@@ -121,8 +138,8 @@ bench:
     cargo bench --bench domain
 
 # Run the `[GPU host]` tests on CUDA.
-gpu-test: gpu-models
-    JARVIS_DEVICE=cuda ORT_DYLIB_PATH={{ quote(cuda_libraries / "libonnxruntime.so") }} LD_LIBRARY_PATH={{ quote(cuda_libraries) }} cargo test --workspace --release -- --ignored
+gpu-test: models gpu-models
+    JARVIS_DEVICE=cuda SHERPA_ONNX_LIB_DIR={{ quote(cuda_libraries) }} ORT_DYLIB_PATH={{ quote(cuda_libraries / "libonnxruntime.so") }} LD_LIBRARY_PATH={{ quote(cuda_libraries) }} cargo test --workspace --release -- --ignored
 
 # Write the architecture diagram.
 diagram:
@@ -161,7 +178,7 @@ fixture-stale stamp:
     [ "$hash" != "$(cat "{{ stamp }}" 2> /dev/null)" ]
 
 # Run the checks of the pre-commit hook.
-check: workflow-lint format lint complexity duplication architecture diagram quint python verus models fixture-model cov
+check: models workflow-lint format lint complexity duplication architecture diagram quint python verus fixture-model cov
     {{ if os() == "linux" { "just bench" } else { "" } }}
     {{ if env("JARVIS_DEVICE", "") == "cuda" { "just gpu-test" } else { "" } }}
 

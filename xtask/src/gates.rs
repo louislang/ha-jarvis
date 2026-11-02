@@ -15,12 +15,13 @@ use syn::{Attribute, ImplItemFn, ItemFn, ItemImpl, ItemMod, ItemTrait, Meta, Tok
 use tempfile::TempDir;
 
 /// The environment variables that a nested tool gets. The coverage settings of an outer `cargo llvm-cov` would change its result.
-const KEPT_VARIABLES: [&str; 5] = [
+const KEPT_VARIABLES: [&str; 6] = [
     "PATH",
     "HOME",
     "CARGO_HOME",
     "RUSTUP_HOME",
     "RUSTUP_TOOLCHAIN",
+    "SHERPA_ONNX_LIB_DIR",
 ];
 
 /// A fixture crate with 10 lines, of which its test covers 5.
@@ -1939,16 +1940,36 @@ fn evaluate(name: &str) -> String {
     stdout_in_root("just", &["--evaluate", name])
 }
 
+/// Checks that `models` fetches the archive of the `justfile` variable `sums`, that its folder exists in `models/` and that each file of `sums` has its SHA-256.
+fn assert_fetched(sums: &str) {
+    let dependencies = justfile()["recipes"]["models"]["dependencies"].to_string();
+    let argument = format!("[\"variable\",\"{sums}\"]");
+    assert!(
+        dependencies.contains(&argument),
+        "models fetches {sums}: {dependencies}"
+    );
+    let sums = evaluate(sums);
+    let archive = sums
+        .split_whitespace()
+        .nth(1)
+        .expect("the first line names the archive");
+    let folder = root()
+        .join("models")
+        .join(archive.trim_end_matches(".tar.bz2"));
+    assert!(folder.is_dir(), "{} exists", folder.display());
+    let file = fixture_file("models.sha256", &sums);
+    assert_passes(&run(Command::new("shasum")
+        .args(["-a", "256", "--check"])
+        .arg(file.path().join("models.sha256"))
+        .current_dir(root().join("models"))));
+}
+
 /// After `just models`, the library folder exists and each file of `cpu_sums` has its SHA-256, and `check` and `rust-test` run `models` before `cov`.
 #[test]
 fn ac_6_1_1_models_writes_library_folder() {
     let folder = evaluate("cpu_libraries");
     assert!(Path::new(&folder).is_dir(), "{folder} exists");
-    let sums = fixture_file("models.sha256", &evaluate("cpu_sums"));
-    assert_passes(&run(Command::new("shasum")
-        .args(["-a", "256", "--check"])
-        .arg(sums.path().join("models.sha256"))
-        .current_dir(root().join("models"))));
+    assert_fetched("cpu_sums");
     assert_check_runs_after("models", "cov");
     let ci = yaml(".github/workflows/ci.yml");
     let runs = runs(&ci, "rust-test");
@@ -1983,4 +2004,11 @@ fn ac_6_1_4_linux_archive_has_cuda_libraries() {
         positions.iter().all(Option::is_some) && positions.is_sorted(),
         "the Linux branch has {parts:?} in order: {linux}"
     );
+}
+
+/// After `just models`, the STT and TTS model folders exist and each file of their sums has its SHA-256.
+#[test]
+fn ac_6_2_1_models_writes_stt_and_tts_folders() {
+    assert_fetched("zipformer_sums");
+    assert_fetched("supertonic_sums");
 }

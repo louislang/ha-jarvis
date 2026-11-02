@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::Device;
 use crate::domain::model::Prediction;
+use crate::domain::speech::Audio;
 use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
@@ -87,6 +88,13 @@ pub trait Classifier: Send + Sync {
 pub trait ModelLoader: Send + Sync {
     /// The classifier of the model folder `dir`, run on `device`.
     async fn load(&self, dir: &Path, device: Device) -> anyhow::Result<Arc<dyn Classifier>>;
+}
+
+/// Text to speech.
+#[async_trait]
+pub trait TextToSpeech: Send + Sync {
+    /// The audio of `text`. Empty text gives no samples.
+    async fn synth(&self, text: &str) -> anyhow::Result<Audio>;
 }
 
 /// A value that survives a restart.

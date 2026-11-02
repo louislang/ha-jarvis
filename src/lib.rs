@@ -68,6 +68,7 @@ pub mod domain {
     pub mod model;
     pub mod responses;
     pub mod select;
+    pub mod speech;
     pub mod state;
     pub mod state_cache;
     pub mod training;
@@ -86,6 +87,7 @@ pub mod adapters {
     pub mod files;
     pub mod ha;
     pub mod onnx;
+    pub mod sherpa;
     pub mod wyoming;
 }
 
@@ -113,6 +115,8 @@ pub struct Config {
     pub ha: HaConfig,
     /// System One model.
     pub model: ModelConfig,
+    /// Text to speech.
+    pub tts: TtsConfig,
     /// Announces.
     pub announce: AnnounceConfig,
     /// Training.
@@ -206,6 +210,18 @@ pub struct ModelConfig {
     pub dir: PathBuf,
     /// The least top probability that System One acts on.
     pub threshold: f32,
+}
+
+/// The `[tts]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TtsConfig {
+    /// The folder of the Supertonic-3 model.
+    pub model_dir: PathBuf,
+    /// The speaker ID of the voice style.
+    pub voice: i32,
+    /// The number of denoising steps.
+    pub num_steps: i32,
 }
 
 /// The `[announce]` section.
@@ -660,6 +676,7 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::adapters::onnx::OnnxLoader;
+    use crate::adapters::sherpa::SherpaTts;
     use crate::app::conversation::Queues;
     use crate::domain::responses::Pool;
     use crate::domain::responses::Pools;
@@ -667,6 +684,7 @@ mod tests {
     use crate::domain::state_cache::StateCache;
     use crate::domain::training;
     use crate::ports::ModelLoader;
+    use crate::ports::TextToSpeech;
     use crate::testing::fakes;
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeHome;
@@ -708,6 +726,11 @@ mod tests {
             model: ModelConfig {
                 dir: PathBuf::from("models/system-one"),
                 threshold: 0.6,
+            },
+            tts: TtsConfig {
+                model_dir: PathBuf::from("models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11"),
+                voice: 6,
+                num_steps: 4,
             },
             announce: AnnounceConfig {
                 margin_ms: 300,
@@ -1229,5 +1252,81 @@ mod tests {
             "run waits up to 5 s for the open connection"
         );
         Ok(())
+    }
+
+    /// Runs one prediction of `classifier` and one synthesis of `tts`.
+    async fn predict_and_synth(classifier: &dyn Classifier, tts: &SherpaTts) -> anyhow::Result<()> {
+        classifier
+            .predict("area: kitchen | habits: none", "turn on the lights")
+            .await?;
+        let audio = tts.synth("Hello").await?;
+        anyhow::ensure!(!audio.samples.is_empty(), "the audio has no samples");
+        Ok(())
+    }
+
+    /// The `SherpaTts` of `VALID` on `device`.
+    fn voice(device: Device) -> anyhow::Result<SherpaTts> {
+        SherpaTts::try_new(&Config::parse(VALID)?.tts, device)
+    }
+
+    /// The GPU memory in MiB that `nvidia-smi` reports for this process.
+    fn gpu_memory() -> anyhow::Result<u64> {
+        let query = [
+            "--query-compute-apps=pid,used_memory",
+            "--format=csv,noheader,nounits",
+        ];
+        let output = std::process::Command::new("nvidia-smi")
+            .args(query)
+            .output()?;
+        anyhow::ensure!(output.status.success(), "nvidia-smi fails: {output:?}");
+        let pid = std::process::id().to_string();
+        let mut total = 0;
+        for line in String::from_utf8(output.stdout)?.lines() {
+            if let Some((process, memory)) = line.split_once(',')
+                && process.trim() == pid
+            {
+                total += memory.trim().parse::<u64>()?;
+            }
+        }
+        Ok(total)
+    }
+
+    /// AC-6.2-4.
+    #[tokio::test]
+    async fn ac_6_2_4_classifier_and_tts_run_in_one_process() -> anyhow::Result<()> {
+        let classifier = OnnxLoader
+            .load(Path::new("models/system-one/fixture"), Device::Cpu)
+            .await?;
+        predict_and_synth(classifier.as_ref(), &voice(Device::Cpu)?).await
+    }
+
+    /// AC-6.2-5. sherpa-onnx falls back to the CPU with only a log line, so the GPU memory of
+    /// this process shows that each model loads on CUDA. The other GPU tests change the memory
+    /// of their process, so the test runs again alone in a child process.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn ac_6_2_5_cuda_runs_classifier_and_tts_in_one_process() -> anyhow::Result<()> {
+        let alone = "JARVIS_ALONE";
+        if env::var_os(alone).is_none() {
+            let name = "tests::ac_6_2_5_cuda_runs_classifier_and_tts_in_one_process";
+            let status = std::process::Command::new(env::current_exe()?)
+                .args(["--ignored", "--exact", name])
+                .env(alone, "1")
+                .status()?;
+            anyhow::ensure!(status.success(), "the test fails alone: {status}");
+            return Ok(());
+        }
+        let start = gpu_memory()?;
+        let classifier = OnnxLoader
+            .load(Path::new("models/system-one/fixture"), Device::Cuda)
+            .await?;
+        let middle = gpu_memory()?;
+        let tts = voice(Device::Cuda)?;
+        let end = gpu_memory()?;
+        assert!(
+            start < middle && middle < end,
+            "GPU memory in MiB: {start} at the start, {middle} after the classifier, {end} after the TTS"
+        );
+        predict_and_synth(classifier.as_ref(), &tts).await
     }
 }

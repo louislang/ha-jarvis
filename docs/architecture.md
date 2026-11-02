@@ -8,6 +8,7 @@ flowchart LR
         crate_adapters_files[files]
         crate_adapters_ha[ha]
         crate_adapters_onnx[onnx]
+        crate_adapters_sherpa[sherpa]
         crate_adapters_wyoming[wyoming]
     end
     subgraph app
@@ -22,6 +23,7 @@ flowchart LR
         crate_domain_model[model]
         crate_domain_responses[responses]
         crate_domain_select[select]
+        crate_domain_speech[speech]
         crate_domain_state[state]
         crate_domain_state_cache[state_cache]
         crate_domain_training[training]
@@ -57,6 +59,10 @@ flowchart LR
     crate_adapters_onnx --> crate_adapters_onnx
     crate_adapters_onnx --> crate_domain_model
     crate_adapters_onnx --> crate_ports
+    crate_adapters_sherpa --> crate
+    crate_adapters_sherpa --> crate_adapters_sherpa
+    crate_adapters_sherpa --> crate_domain_speech
+    crate_adapters_sherpa --> crate_ports
     crate_adapters_wyoming --> crate_ports
     crate_app_background --> crate_domain_state
     crate_app_background --> crate_domain_state_cache
@@ -105,5 +111,6 @@ flowchart LR
     crate_domain_training --> crate_domain_intent
     crate_ports --> crate
     crate_ports --> crate_domain_model
+    crate_ports --> crate_domain_speech
     crate_ports --> crate_domain_state
 ```
