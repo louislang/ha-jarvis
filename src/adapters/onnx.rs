@@ -185,12 +185,14 @@ impl Model {
 ///
 /// # Errors
 ///
-/// ONNX Runtime cannot register the provider.
+/// ONNX Runtime cannot create its environment or register the provider.
 fn builder(device: Device) -> ort::Result<SessionBuilder> {
     let provider = match device {
         Device::Cuda => CUDAExecutionProvider::default().build(),
         Device::Cpu => CPUExecutionProvider::default().build(),
     };
+    // The CUDA provider of ort 2.0.0-rc.10 needs the environment but does not create it.
+    ort::environment::get_environment()?;
     Session::builder()?.with_execution_providers([provider.error_on_failure()])
 }
 
@@ -488,6 +490,25 @@ mod tests {
             providers.contains("CUDAExecutionProvider"),
             "providers are {providers:?}"
         );
+        Ok(())
+    }
+
+    /// The first session of a process opens the fixture model on CUDA.
+    ///
+    /// The test runs itself again in a child process, so that no earlier session exists.
+    #[test]
+    #[ignore = "GPU host"]
+    fn fix_first_cuda_session_creates_the_environment() -> anyhow::Result<()> {
+        if std::env::var_os("JARVIS_FRESH_PROCESS").is_some() {
+            fixture(Device::Cuda)?;
+            return Ok(());
+        }
+        let name = "adapters::onnx::tests::fix_first_cuda_session_creates_the_environment";
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args([name, "--exact", "--ignored"])
+            .env("JARVIS_FRESH_PROCESS", "1")
+            .status()?;
+        assert!(status.success(), "the child process exits with {status}");
         Ok(())
     }
 
