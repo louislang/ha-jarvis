@@ -91,10 +91,12 @@ fn vad(config: &AsrConfig, device: Device) -> VadModelConfig {
         model: Some(config.vad_model.to_string_lossy().into_owned()),
         threshold: config.vad_threshold,
         min_silence_duration: seconds(config.vad_min_silence_ms),
+        // sherpa-onnx replaces 0 with 0.25 s. One frame confirms the speech start, and
+        // `SherpaStream::track` holds that frame.
+        min_speech_duration: seconds(u64::from(WINDOW) * 1000 / u64::from(RATE)),
         window_size: i32::from(WINDOW),
         // An utterance commits at `max_utterance_ms`, so the VAD never splits a segment.
         max_speech_duration: seconds(config.max_utterance_ms),
-        ..SileroVadModelConfig::default()
     };
     VadModelConfig {
         silero_vad,
@@ -139,7 +141,7 @@ struct SherpaStream {
 }
 
 impl SherpaStream {
-    /// Updates the VAD positions after `count` more samples.
+    /// Updates the VAD positions after `count` more samples of at most one frame.
     fn track(&mut self, count: usize) {
         self.fed += count as u64;
         while let Some(segment) = self.vad.front() {
@@ -176,8 +178,11 @@ impl SttStream for SherpaStream {
         while self.recognizer.is_ready(&self.stream) {
             self.recognizer.decode(&self.stream);
         }
-        self.vad.accept_waveform(&wave);
-        self.track(samples.len());
+        // The VAD gives one decision for all frames of one call.
+        for window in wave.chunks(usize::from(WINDOW)) {
+            self.vad.accept_waveform(window);
+            self.track(window.len());
+        }
     }
 
     fn partial(&self) -> Partial {
