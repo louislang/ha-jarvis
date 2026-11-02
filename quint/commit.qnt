@@ -10,7 +10,7 @@ module commit {
   pure val ENDPOINT = 6
 
   /// The utterance length that always commits, in 100 ms chunks.
-  pure val MAX = 20
+  pure val MAX = 8
 
   /// The number of chunks that the VAD can decide late.
   pure val LAG = 2
