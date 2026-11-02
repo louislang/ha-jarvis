@@ -36,6 +36,7 @@ flowchart LR
         crate_testing_fakes[fakes]
     end
     crate --> crate
+    crate --> crate_app_conversation
     crate --> crate_domain_catalog
     crate --> crate_domain_state
     crate --> crate_domain_training
@@ -54,10 +55,14 @@ flowchart LR
     crate_app_background --> crate_domain_state_cache
     crate_app_background --> crate_ports
     crate_app_conversation --> crate_app_conversation
+    crate_app_conversation --> crate_domain_catalog
     crate_app_conversation --> crate_domain_decide
+    crate_app_conversation --> crate_domain_intent
+    crate_app_conversation --> crate_domain_model
     crate_app_conversation --> crate_domain_responses
     crate_app_conversation --> crate_domain_state
     crate_app_conversation --> crate_domain_state_cache
+    crate_app_conversation --> crate_domain_training
     crate_app_conversation --> crate_ports
     crate_domain_catalog --> crate_domain_contracts
     crate_domain_catalog --> crate_domain_intent

@@ -1,4 +1,4 @@
-//! Dispatch of decisions, the announce queues and the pools task.
+//! The `handle` use case, dispatch of decisions, the announce queues and the pools task.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -16,13 +16,21 @@ use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::domain::catalog::Catalog;
+use crate::domain::decide;
 use crate::domain::decide::Chosen;
 use crate::domain::decide::Decision;
 use crate::domain::decide::Job;
+use crate::domain::decide::Request;
+use crate::domain::intent;
+use crate::domain::model::Prediction;
 use crate::domain::responses;
 use crate::domain::responses::Pools;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
+use crate::domain::training;
+use crate::ports::Classifier;
+use crate::ports::Context;
 use crate::ports::Handled;
 use crate::ports::Home;
 use crate::ports::Store;
@@ -31,35 +39,91 @@ use crate::ports::Work;
 /// One change to the pools, applied by the pools task.
 pub type Change = Box<dyn FnOnce(Pools) -> Pools + Send>;
 
-/// Dispatches decisions to the home, the announce queues and the pools task.
+/// Decides requests with System One and dispatches the decisions to the home, the announce
+/// queues and the pools task.
 #[derive(Clone)]
 pub struct Conversation {
     /// The current pools.
     pools: Arc<ArcSwap<Pools>>,
     /// The sender of the changes to the pools task.
     changes: mpsc::Sender<Change>,
-    /// The announce queues and their house.
+    /// The announce queues, their house and the hot cache.
     queues: Arc<Queues>,
-    /// The random source of the answers that background work selects.
+    /// The random source of the response selection.
     rng: Arc<Mutex<StdRng>>,
+    /// The System One model.
+    classifier: Arc<dyn Classifier>,
+    /// The intent catalog.
+    catalog: Arc<Catalog>,
+    /// The least top probability that System One acts on.
+    threshold: f32,
 }
 
 impl Conversation {
-    /// Dispatches to `queues`, their house and the pools task of `pools` and `changes`. Selects
-    /// the answers of background work with `rng`.
+    /// Decides with `classifier`, `catalog` and `threshold`. Dispatches to `queues`, their house
+    /// and the pools task of `pools` and `changes`. Selects the responses with `rng`.
     #[must_use]
     pub fn new(
         pools: Arc<ArcSwap<Pools>>,
         changes: mpsc::Sender<Change>,
         queues: Arc<Queues>,
         rng: StdRng,
+        classifier: Arc<dyn Classifier>,
+        catalog: Arc<Catalog>,
+        threshold: f32,
     ) -> Self {
         Self {
             pools,
             changes,
             queues,
             rng: Arc::new(Mutex::new(rng)),
+            classifier,
+            catalog,
+            threshold,
         }
+    }
+
+    /// The reply to the transcript `text` in `context` and its work: the System One prediction
+    /// of the normalized text in the area of the satellite device, its decision and its dispatch.
+    ///
+    /// # Errors
+    ///
+    /// The prediction fails. The error text is a `failure` answer.
+    pub async fn handle(&self, text: &str, context: Context) -> anyhow::Result<Handled> {
+        let cache = &self.queues.cache;
+        let area = (context.device_id.as_deref())
+            .and_then(|device| cache.borrow().area_of_device(device).cloned());
+        let model_context = training::context_text(area.as_ref().map(|area| area.0.as_str()), &[]);
+        let prediction = self
+            .classifier
+            .predict(&model_context, &intent::normalize(text))
+            .await
+            .map_err(|error| {
+                tracing::warn!("the prediction failed: {error:#}");
+                anyhow::anyhow!(self.pick("failure"))
+            })?;
+        let request = Request {
+            transcript: text.to_owned(),
+            area,
+        };
+        let decision = self.decide(&prediction, &request);
+        Ok(self.dispatch(decision, context.satellite_id.as_deref()))
+    }
+
+    /// The decision for `prediction` of `request` in the current hot cache and pools.
+    fn decide(&self, prediction: &Prediction, request: &Request) -> Decision {
+        let (cache, pools) = (self.queues.cache.borrow(), self.pools.load());
+        let rng = &mut self.rng.lock().expect("no lock holder panics");
+        let catalog = &self.catalog;
+        decide::decide(
+            prediction,
+            request,
+            catalog,
+            &cache,
+            &pools,
+            self.threshold,
+            rng,
+        )
     }
 
     /// The reply or filler of `decision` and its service call or fetch as background work.
@@ -342,6 +406,7 @@ mod tests {
     use crate::domain::responses::Pool;
     use crate::domain::responses::Response;
     use crate::domain::state::ServiceCall;
+    use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::house;
@@ -354,6 +419,30 @@ mod tests {
 
     /// The `announce.idle_wait_s` of the tests. No conformance trace runs this long.
     const IDLE_WAIT: Duration = Duration::from_secs(3600);
+
+    /// The device of the kitchen satellite.
+    const KITCHEN: &str = "98f4aacf9c4152ffe32dff212df91521";
+
+    /// A conversation with `pools`, `changes`, `queues` and `classifier`, the catalog of
+    /// `intents.toml` and the `model.threshold` of `jarvis.toml`.
+    fn conversation(
+        pools: Arc<ArcSwap<Pools>>,
+        changes: mpsc::Sender<Change>,
+        queues: Queues,
+        classifier: Arc<dyn Classifier>,
+    ) -> Conversation {
+        let catalog = toml::from_str(include_str!("../../intents.toml")).expect("it is a catalog");
+        let (rng, queues) = (StdRng::seed_from_u64(1), Arc::new(queues));
+        Conversation::new(
+            pools,
+            changes,
+            queues,
+            rng,
+            classifier,
+            Arc::new(catalog),
+            0.6,
+        )
+    }
 
     /// The pool `lights_on` with the responses and use counts `lights`, the pool `fallback` with
     /// one response used `fallback` times, and the pool `failure`.
@@ -417,9 +506,9 @@ mod tests {
     fn start(home: &Arc<FakeHome>) -> anyhow::Result<Started> {
         let store = Arc::new(FakeStore::new(None));
         let task = start_pools(&FakeStore::new(Some(unused())), Arc::clone(&store) as _)?;
-        let queues = Arc::new(queues(home, "idle").1);
         let (pools, changes) = (Arc::clone(&task.pools), task.changes.clone());
-        let conversation = Conversation::new(pools, changes, queues, StdRng::seed_from_u64(1));
+        let classifier = Arc::new(FakeClassifier::default());
+        let conversation = conversation(pools, changes, queues(home, "idle").1, classifier);
         Ok((task, store, conversation))
     }
 
@@ -587,12 +676,13 @@ mod tests {
         Ok(())
     }
 
-    /// A conversation on `home` with the queues of `queues(home, value)`, the pools `unused()`
-    /// and the receiver of its changes. It has no pools task, because a running blocking task
-    /// stops the paused clock.
-    fn still(
+    /// A conversation on `home` and `classifier` with the queues of `queues(home, value)`, the
+    /// pools `unused()` and the receiver of its changes. It has no pools task, because a running
+    /// blocking task stops the paused clock.
+    fn still_with(
         home: &Arc<FakeHome>,
         value: &str,
+        classifier: Arc<dyn Classifier>,
     ) -> (
         watch::Sender<StateCache>,
         mpsc::Receiver<Change>,
@@ -601,9 +691,20 @@ mod tests {
         let (cache, queues) = queues(home, value);
         let pools = Arc::new(ArcSwap::from_pointee(unused()));
         let (changes, receiver) = mpsc::channel();
-        let rng = StdRng::seed_from_u64(1);
-        let conversation = Conversation::new(pools, changes, Arc::new(queues), rng);
+        let conversation = conversation(pools, changes, queues, classifier);
         (cache, receiver, conversation)
+    }
+
+    /// `still_with` and a classifier that gives no prediction.
+    fn still(
+        home: &Arc<FakeHome>,
+        value: &str,
+    ) -> (
+        watch::Sender<StateCache>,
+        mpsc::Receiver<Change>,
+        Conversation,
+    ) {
+        still_with(home, value, Arc::new(FakeClassifier::default()))
     }
 
     /// The work of a dispatch of `decision` on `satellite`.
@@ -746,6 +847,83 @@ mod tests {
         fetch(&conversation, Some(SATELLITE))?.await?;
         assert_eq!(announces(&home), ["Failed."]);
         Ok(())
+    }
+
+    /// The result of `handle` for `text` from the satellite device `device` when the classifier
+    /// gives `label` with 0.9, or fails without `label`. Also the `(context, text)` of each
+    /// prediction.
+    async fn handled(
+        label: Option<&str>,
+        text: &str,
+        device: Option<&str>,
+    ) -> (anyhow::Result<Handled>, Vec<(String, String)>) {
+        let classifier = Arc::new(FakeClassifier::default());
+        if let Some(label) = label {
+            let ranked = vec![(label.to_owned(), 0.9)];
+            classifier.script(Prediction {
+                ranked,
+                slots: Vec::new(),
+            });
+        }
+        let home = Arc::new(FakeHome::default());
+        let (_cache, _changes, conversation) =
+            still_with(&home, "idle", Arc::clone(&classifier) as _);
+        let context = Context {
+            device_id: device.map(str::to_owned),
+            ..Context::default()
+        };
+        let result = conversation.handle(text, context).await;
+        (result, classifier.calls())
+    }
+
+    /// AC-5.3-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_5_3_1_lights_on_in_the_kitchen_gives_a_lights_on_reply() -> anyhow::Result<()> {
+        let (handled, _) = handled(Some("lights_on"), "turn on the lights", Some(KITCHEN)).await;
+        let text = handled?.text;
+        let replies = &unused()["lights_on"].responses;
+        assert!(
+            replies.iter().any(|reply| reply.text == text),
+            "{text:?} is not a lights_on reply"
+        );
+        Ok(())
+    }
+
+    /// AC-5.3-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_5_3_2_kitchen_device_gives_the_kitchen_context() {
+        let (_, calls) = handled(Some("lights_on"), "turn on the lights", Some(KITCHEN)).await;
+        assert_eq!(calls[0].0, "area: kitchen | habits: none");
+    }
+
+    /// AC-5.3-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_5_3_3_no_device_gives_no_area() {
+        let (_, calls) = handled(Some("lights_on"), "turn on the lights", None).await;
+        assert_eq!(calls[0].0, "area: none | habits: none");
+    }
+
+    /// AC-5.3-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_5_3_4_defer_gives_a_filler() -> anyhow::Result<()> {
+        let (handled, _) = handled(Some("unknown"), "tell me a joke", Some(KITCHEN)).await;
+        assert_eq!(handled?.text, "One moment.");
+        Ok(())
+    }
+
+    /// AC-5.3-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_5_3_5_failed_prediction_gives_a_failure_error() {
+        let (handled, _) = handled(None, "turn on the lights", Some(KITCHEN)).await;
+        let error = handled.err().expect("the prediction fails");
+        assert_eq!(error.to_string(), "Failed.");
+    }
+
+    /// AC-5.3-7.
+    #[tokio::test(start_paused = true)]
+    async fn ac_5_3_7_prediction_gets_the_normalized_text() {
+        let (_, calls) = handled(Some("lights_on"), "Turn on the Lights.", Some(KITCHEN)).await;
+        assert_eq!(calls[0].1, "turn on the lights");
     }
 
     /// The model state that the conformance test compares.

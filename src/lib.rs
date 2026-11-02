@@ -11,17 +11,22 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::Context;
+use async_trait::async_trait;
 use clap::Parser;
 use jiff::Timestamp;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::Deserialize;
 
+use crate::app::conversation::Conversation;
 use crate::domain::catalog::Catalog;
 use crate::domain::state::Snapshot;
 use crate::domain::training::Settings;
 use crate::domain::training::TrainingSet;
+use crate::ports::Assistant;
 use crate::ports::Clock;
+use crate::ports::Handled;
+use crate::ports::Info;
 
 /// Pure rules.
 pub mod domain {
@@ -205,6 +210,26 @@ impl Clock for SystemClock {
     }
 }
 
+/// The `Assistant` of Jarvis. It delegates each request to its use case.
+pub struct App {
+    /// The `handle` use case.
+    conversation: Conversation,
+}
+
+#[async_trait]
+impl Assistant for App {
+    fn info(&self) -> Info {
+        Info {
+            name: env!("CARGO_PKG_NAME").to_owned(),
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        }
+    }
+
+    async fn handle(&self, text: &str, context: ports::Context) -> anyhow::Result<Handled> {
+        self.conversation.handle(text, context).await
+    }
+}
+
 /// Secrets from the environment variables that [`Config`] names.
 #[derive(Clone)]
 pub struct Secrets {
@@ -358,9 +383,26 @@ mod tests {
 
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use std::time::Instant;
 
+    use serde_json::json;
+    use tokio::net::TcpListener;
+    use tokio::sync::watch;
+
+    use crate::adapters::onnx::OnnxLoader;
+    use crate::app::conversation::Queues;
+    use crate::domain::responses::Pool;
+    use crate::domain::responses::Pools;
+    use crate::domain::responses::Response;
+    use crate::domain::state_cache::StateCache;
     use crate::domain::training;
+    use crate::ports::ModelLoader;
     use crate::testing::fakes;
+    use crate::testing::fakes::FakeHome;
+    use crate::testing::fakes::FakeStore;
+    use crate::testing::fakes::FakeWyomingClient;
 
     /// A valid configuration with every field.
     const VALID: &str = include_str!("../jarvis.toml");
@@ -591,6 +633,93 @@ mod tests {
                 example.text
             );
         }
+        Ok(())
+    }
+
+    /// One response for each intent of `catalog` and each answer pool.
+    fn pools(catalog: &Catalog) -> Pools {
+        let names = catalog.intents.iter().map(|intent| intent.name.as_str());
+        let pool = |name: &str| {
+            let response = Response {
+                text: "Done.".to_owned(),
+                uses: 0,
+            };
+            let responses = vec![response];
+            (
+                name.to_owned(),
+                Pool {
+                    responses,
+                    last: None,
+                },
+            )
+        };
+        let names = names.chain(["filler", "failure", "fallback"]);
+        names.map(pool).collect()
+    }
+
+    /// Queues on `FakeHome` and the hot cache of the reference house.
+    fn queues() -> Arc<Queues> {
+        let (_cache, receiver) = watch::channel(StateCache::load(fakes::house()));
+        let wait = Duration::from_secs(1);
+        let home = Arc::new(FakeHome::default());
+        Arc::new(Queues::new(home, receiver, wait, wait))
+    }
+
+    /// The app of `VALID` with the fixture model, the reference house and `pools`.
+    async fn fixture_app() -> anyhow::Result<App> {
+        let config = Config::parse(VALID)?;
+        let fixture = Path::new("models/system-one/fixture");
+        let classifier = OnnxLoader.load(fixture, config.device).await?;
+        let catalog = load_catalog(&config.intents)?;
+        let source = FakeStore::new(Some(pools(&catalog)));
+        let task = app::conversation::start_pools(&source, Arc::new(FakeStore::new(None)))?;
+        let (rng, threshold) = (StdRng::seed_from_u64(1), config.model.threshold);
+        let (pools, changes, catalog) = (task.pools, task.changes, Arc::new(catalog));
+        let conversation = Conversation::new(
+            pools,
+            changes,
+            queues(),
+            rng,
+            classifier,
+            catalog,
+            threshold,
+        );
+        Ok(App { conversation })
+    }
+
+    /// The time from each of `count` kitchen `transcript` events to its `handled` event, through
+    /// a Wyoming server of `fixture_app()`.
+    async fn round_trips(count: usize) -> anyhow::Result<Vec<Duration>> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let app = Arc::new(fixture_app().await?);
+        tokio::spawn(adapters::wyoming::serve(listener, app));
+        let mut client = FakeWyomingClient::connect(address).await?;
+        let kitchen = "98f4aacf9c4152ffe32dff212df91521";
+        let data = json!({ "text": "turn on the lights", "context": { "device_id": kitchen } });
+        let mut times = Vec::new();
+        for _ in 0..count {
+            let start = Instant::now();
+            client.send("transcript", &data).await?;
+            let event = client.receive().await?.map(|(event, _)| event);
+            times.push(start.elapsed());
+            anyhow::ensure!(
+                event.as_deref() == Some("handled"),
+                "the reply is {event:?}"
+            );
+        }
+        Ok(times)
+    }
+
+    /// AC-5.3-6.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn ac_5_3_6_transcript_to_handled_p95_is_less_than_20_ms() -> anyhow::Result<()> {
+        // The first 100 requests warm up the model.
+        let mut times = round_trips(1100).await?.split_off(100);
+        times.sort();
+        let p95 = times[times.len() * 95 / 100];
+        assert!(p95 < Duration::from_millis(20), "p95 is {p95:?}");
         Ok(())
     }
 }
