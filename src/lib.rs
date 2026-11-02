@@ -495,7 +495,10 @@ where
         .strip_prefix("ws://")
         .and_then(|rest| rest.split('/').next());
     let address = authority.and_then(|authority| authority.rsplit_once(':'));
-    let Some((host, Ok(port))) = address.map(|(host, port)| (host.to_owned(), port.parse())) else {
+    // TCP takes an IPv6 host without the brackets of the URL.
+    let host_port =
+        |(host, port): (&str, &str)| (host.trim_matches(['[', ']']).to_owned(), port.parse());
+    let Some((host, Ok(port))) = address.map(host_port) else {
         anyhow::bail!(
             "ha.url = {url} is not valid: Jarvis has no TLS, so it must be ws://host:port/..."
         );
