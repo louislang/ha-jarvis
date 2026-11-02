@@ -349,19 +349,13 @@ pub struct PoolsTask {
     pub task: JoinHandle<()>,
 }
 
-/// Starts the pools task with the pools of `source` merged into the pools of `store`. The task
+/// Starts the pools task with the pools `source` merged into the pools of `store`. The task
 /// applies each change in order, publishes the result and saves it to `store`.
 ///
 /// # Errors
 ///
-/// A store cannot load, or `source` has no pools.
-pub fn start_pools(
-    source: &dyn Store<Pools>,
-    store: Arc<dyn Store<Pools>>,
-) -> anyhow::Result<PoolsTask> {
-    let source = source
-        .load()?
-        .ok_or_else(|| anyhow::anyhow!("the source has no pools"))?;
+/// `store` cannot load.
+pub fn start_pools(source: Pools, store: Arc<dyn Store<Pools>>) -> anyhow::Result<PoolsTask> {
     let saved = store.load()?.unwrap_or_default();
     let pools = Arc::new(ArcSwap::from_pointee(merge(source, &saved)));
     let (changes, receiver) = mpsc::channel::<Change>();
@@ -515,7 +509,7 @@ mod tests {
     /// Starts the pools task of `unused()` and a conversation with `home`.
     fn start(home: &Arc<FakeHome>) -> anyhow::Result<Started> {
         let store = Arc::new(FakeStore::new(None));
-        let task = start_pools(&FakeStore::new(Some(unused())), Arc::clone(&store) as _)?;
+        let task = start_pools(unused(), Arc::clone(&store) as _)?;
         let (pools, changes) = (Arc::clone(&task.pools), task.changes.clone());
         let classifier = Arc::new(FakeClassifier::default());
         let conversation = conversation(pools, changes, queues(home, "idle").1, classifier);
@@ -608,12 +602,11 @@ mod tests {
     /// AC-4.8-7.
     #[tokio::test(start_paused = true)]
     async fn ac_4_8_7_merge_keeps_counts_of_source_responses() -> anyhow::Result<()> {
-        let source = FakeStore::new(Some(pools(&[("Lights on.", 0), ("New.", 0)], 0)));
+        let source = pools(&[("Lights on.", 0), ("New.", 0)], 0);
         let saved = pools(&[("Lights on.", 3), ("Done.", 2)], 5);
-        let task = start_pools(&source, Arc::new(FakeStore::new(Some(saved))))?;
+        let task = start_pools(source, Arc::new(FakeStore::new(Some(saved))))?;
         let expected = pools(&[("Lights on.", 3), ("New.", 0)], 5);
         assert_eq!(**task.pools.load(), expected);
-        assert_eq!(source.saves(), [], "responses.toml changed");
         Ok(())
     }
 

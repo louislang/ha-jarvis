@@ -10,6 +10,7 @@ use std::sync::Weak;
 use std::time::Duration;
 
 use anyhow::Context as _;
+use async_trait::async_trait;
 use futures::SinkExt;
 use futures::StreamExt;
 use futures::channel::mpsc;
@@ -38,6 +39,7 @@ use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
 use crate::domain::state::State;
+use crate::ports::Home;
 
 /// The sender of the events of all connections.
 type Events = mpsc::UnboundedSender<Event>;
@@ -355,6 +357,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         self.pending
             .lock()
             .expect("no code panics while it holds the pending map")
+    }
+}
+
+#[async_trait]
+impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Home for HaHome<S> {
+    async fn snapshot(&self) -> anyhow::Result<Snapshot> {
+        HaHome::snapshot(self).await
+    }
+
+    fn events(&self) -> BoxStream<'static, Event> {
+        HaHome::events(self)
+    }
+
+    async fn call(&self, call: ServiceCall) -> anyhow::Result<Option<Value>> {
+        HaHome::call(self, call).await
+    }
+
+    async fn announce(&self, satellite: &str, text: &str) -> anyhow::Result<()> {
+        HaHome::announce(self, satellite, text).await
     }
 }
 

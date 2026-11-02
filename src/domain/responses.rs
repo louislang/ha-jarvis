@@ -8,6 +8,8 @@ use minijinja::UndefinedBehavior;
 use minijinja::value::Serde;
 use rand::Rng;
 use rand::rngs::StdRng;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use vstd::prelude::*;
 
@@ -20,8 +22,7 @@ use crate::domain::catalog::Target;
 pub type Pools = BTreeMap<String, Pool>;
 
 /// The responses of one intent or one filler type.
-#[verus_verify]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Pool {
     /// The response templates.
     pub responses: Vec<Response>,
@@ -30,8 +31,7 @@ pub struct Pool {
 }
 
 /// One response template and its use count.
-#[verus_verify]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Response {
     /// The template text.
     pub text: String,

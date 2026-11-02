@@ -4,29 +4,55 @@
 // `Pattern`.
 #![cfg_attr(verus_only, feature(proc_macro_hygiene, pattern))]
 
+use std::collections::BTreeMap;
+use std::env;
+use std::ffi::OsString;
 use std::fs;
+use std::future;
+use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use clap::Parser;
+use clap::error::ErrorKind;
 use jiff::Timestamp;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::Deserialize;
+use tokio::io::AsyncRead;
+use tokio::io::AsyncWrite;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+use tokio::sync::watch;
 
+use crate::adapters::files::FileStore;
+use crate::adapters::ha::HaHome;
+use crate::adapters::onnx::OnnxLoader;
 use crate::app::conversation::Conversation;
+use crate::app::conversation::Queues;
 use crate::domain::catalog::Catalog;
+use crate::domain::model::Prediction;
+use crate::domain::responses::Pool;
+use crate::domain::responses::Pools;
+use crate::domain::responses::Response;
 use crate::domain::state::Snapshot;
+use crate::domain::state_cache::StateCache;
 use crate::domain::training::Settings;
 use crate::domain::training::TrainingSet;
 use crate::ports::Assistant;
+use crate::ports::Classifier;
 use crate::ports::Clock;
 use crate::ports::Handled;
+use crate::ports::Home;
 use crate::ports::Info;
+use crate::ports::ModelLoader;
 
 /// Pure rules.
 pub mod domain {
@@ -172,6 +198,8 @@ pub struct HaConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
+    /// The folder of the System One model folders.
+    pub dir: PathBuf,
     /// The least top probability that System One acts on.
     pub threshold: f32,
 }
@@ -230,6 +258,18 @@ impl Assistant for App {
     }
 }
 
+/// The System One model of the conversation. A swap affects the next `predict`.
+pub struct CurrentClassifier(pub ArcSwap<Arc<dyn Classifier>>);
+
+#[async_trait]
+impl Classifier for CurrentClassifier {
+    async fn predict(&self, context: &str, text: &str) -> anyhow::Result<Prediction> {
+        // One load, so that one prediction uses one classifier.
+        let classifier = self.0.load_full();
+        classifier.predict(context, text).await
+    }
+}
+
 /// Secrets from the environment variables that [`Config`] names.
 #[derive(Clone)]
 pub struct Secrets {
@@ -268,6 +308,11 @@ enum Command {
         #[arg(long)]
         house: Option<PathBuf>,
     },
+    /// Runs Jarvis: the HA connection, the sync and the Wyoming server.
+    Serve {
+        /// The configuration file.
+        config: PathBuf,
+    },
 }
 
 impl Command {
@@ -279,6 +324,7 @@ impl Command {
     fn run(self) -> anyhow::Result<()> {
         match self {
             Self::Dataset { config, out, house } => dataset(&config, &out, house.as_deref()),
+            Self::Serve { config } => serve(&config),
         }
     }
 }
@@ -342,6 +388,42 @@ fn load_catalog(path: &Path) -> anyhow::Result<Catalog> {
     Ok(catalog)
 }
 
+/// The file `responses.toml`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesFile {
+    /// The pools by pool name.
+    pools: BTreeMap<String, PoolFile>,
+}
+
+/// One pool of `responses.toml`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PoolFile {
+    /// The response templates.
+    responses: Vec<String>,
+}
+
+/// Reads the pools of the `responses.toml` file at `path`, with no uses, and validates them
+/// against `catalog`.
+///
+/// # Errors
+///
+/// The file cannot be read or parsed, or `validate_pools` fails.
+fn load_pools(path: &Path, catalog: &Catalog) -> anyhow::Result<Pools> {
+    let file: ResponsesFile = toml::from_str(&read(path)?)?;
+    let mut pools = Pools::new();
+    for (name, file) in file.pools {
+        let texts = file.responses.into_iter();
+        let responses = texts.map(|text| Response { text, uses: 0 }).collect();
+        let last = None;
+        pools.insert(name, Pool { responses, last });
+    }
+    domain::responses::validate_pools(&pools, catalog)
+        .map_err(|error| anyhow::anyhow!("{} is not valid: {error:?}", path.display()))?;
+    Ok(pools)
+}
+
 /// Reads the area names of the snapshot file at `path`.
 ///
 /// # Errors
@@ -352,18 +434,146 @@ fn area_names(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(snapshot.areas.into_iter().map(|area| area.name).collect())
 }
 
+/// The outside world of [`run`].
+pub struct Startup<Lookup, Connector, Shutdown> {
+    /// Gives the value of an environment variable.
+    pub lookup: Lookup,
+    /// Opens a transport to HA at a host and a port.
+    pub connector: Connector,
+    /// Completes when Jarvis must stop.
+    pub shutdown: Shutdown,
+}
+
+/// Starts Jarvis with the configuration file `config` and the outside world `startup`: HA,
+/// the sync, the System One model and the Wyoming server. Returns when `startup.shutdown`
+/// completes.
+///
+/// # Errors
+///
+/// A file cannot be read or is not valid, a secret is not set, the model cannot load, or the
+/// server cannot bind or accept.
+pub async fn run<Lookup, Connector, Transport, Stream>(
+    config: &Path,
+    startup: Startup<Lookup, Connector, impl Future<Output = ()>>,
+) -> anyhow::Result<()>
+where
+    Lookup: Fn(&str) -> Option<String>,
+    Connector: Fn(&str, u16) -> Transport + Send + 'static,
+    Transport: Future<Output = io::Result<Stream>> + Send + 'static,
+    Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let config = Config::load(config)?;
+    let secrets = Secrets::resolve(&config, startup.lookup)?;
+    let catalog = load_catalog(&config.intents)?;
+    let pools = load_pools(&config.responses, &catalog)?;
+    let home = start_home(&config.ha, &secrets.ha_token, startup.connector)?;
+    let conversation = conversation(&config, catalog, pools, home).await?;
+    let listener = TcpListener::bind(config.listen).await?;
+    tokio::select! {
+        result = adapters::wyoming::serve(listener, Arc::new(App { conversation })) => result,
+        () = startup.shutdown => Ok(()),
+    }
+}
+
+/// Starts `HaHome` with `token` and `connector` on the host and the port of `ha.url`.
+///
+/// # Errors
+///
+/// `ha.url` is not `ws://host:port/...`. Jarvis has no TLS, so a `wss://` URL is an error too.
+fn start_home<Connector, Transport, Stream>(
+    ha: &HaConfig,
+    token: &str,
+    connector: Connector,
+) -> anyhow::Result<Arc<dyn Home>>
+where
+    Connector: Fn(&str, u16) -> Transport + Send + 'static,
+    Transport: Future<Output = io::Result<Stream>> + Send + 'static,
+    Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let url = &ha.url;
+    let authority = url
+        .strip_prefix("ws://")
+        .and_then(|rest| rest.split('/').next());
+    let address = authority.and_then(|authority| authority.rsplit_once(':'));
+    // TCP takes an IPv6 host without the brackets of the URL.
+    let host_port =
+        |(host, port): (&str, &str)| (host.trim_matches(['[', ']']).to_owned(), port.parse());
+    let Some((host, Ok(port))) = address.map(host_port) else {
+        anyhow::bail!(
+            "ha.url = {url} is not valid: Jarvis has no TLS, so it must be ws://host:port/..."
+        );
+    };
+    Ok(HaHome::start(move || connector(&host, port), token, ha))
+}
+
+/// The conversation of `config`, `catalog` and the source pools `pools` on `home`. Starts the
+/// pools task and the sync, and loads the System One model.
+///
+/// # Errors
+///
+/// The saved pools or the model cannot load.
+async fn conversation(
+    config: &Config,
+    catalog: Catalog,
+    pools: Pools,
+    home: Arc<dyn Home>,
+) -> anyhow::Result<Conversation> {
+    let store = Arc::new(FileStore::try_new(config.pools.clone())?);
+    let task = app::conversation::start_pools(pools, store)?;
+    let queues = start_sync(home, &config.announce);
+    let dir = config.model.dir.join("fixture");
+    let model = OnnxLoader.load(&dir, config.device).await?;
+    let classifier = Arc::new(CurrentClassifier(ArcSwap::from_pointee(model)));
+    let rng = StdRng::seed_from_u64(SystemClock.now().as_millisecond().unsigned_abs());
+    let (catalog, threshold) = (Arc::new(catalog), config.model.threshold);
+    let (pools, changes) = (task.pools, task.changes);
+    Ok(Conversation::new(
+        pools, changes, queues, rng, classifier, catalog, threshold,
+    ))
+}
+
+/// Starts the sync of a hot cache with `home`. Gives the announce queues of `announce` on it.
+fn start_sync(home: Arc<dyn Home>, announce: &AnnounceConfig) -> Arc<Queues> {
+    let (cache, receiver) = watch::channel(StateCache::default());
+    let sync = Arc::clone(&home);
+    tokio::spawn(async move { app::background::sync(sync.as_ref(), &cache).await });
+    let margin = Duration::from_millis(announce.margin_ms);
+    let idle_wait = Duration::from_secs(announce.idle_wait_s);
+    Arc::new(Queues::new(home, receiver, margin, idle_wait))
+}
+
+/// Runs Jarvis with the configuration file `config`, the environment and TCP, until it fails.
+///
+/// # Errors
+///
+/// `run` fails.
+fn serve(config: &Path) -> anyhow::Result<()> {
+    let startup = Startup {
+        lookup: |name: &str| env::var(name).ok(),
+        connector: |host: &str, port: u16| TcpStream::connect((host.to_owned(), port)),
+        shutdown: future::pending(),
+    };
+    tokio::runtime::Runtime::new()?.block_on(run(config, startup))
+}
+
 /// Entry point of Jarvis: runs the command of the command line.
 #[must_use]
 pub fn main() -> ExitCode {
-    let command = match Command::try_parse() {
+    start(env::args_os())
+}
+
+/// Runs the command of the command line `args`. Without a command, prints the usage.
+fn start(args: impl IntoIterator<Item = OsString>) -> ExitCode {
+    let command = match Command::try_parse_from(args) {
         Ok(command) => command,
         Err(error) => {
             // `--help` is an error of `try_parse` too, and prints to stdout.
             let _ = error.print();
-            return if error.use_stderr() {
-                ExitCode::FAILURE
-            } else {
+            let usage = error.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand;
+            return if usage || !error.use_stderr() {
                 ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
             };
         }
     };
@@ -388,6 +598,7 @@ mod tests {
     use std::time::Instant;
 
     use serde_json::json;
+    use tokio::io::DuplexStream;
     use tokio::net::TcpListener;
     use tokio::sync::watch;
 
@@ -400,6 +611,7 @@ mod tests {
     use crate::domain::training;
     use crate::ports::ModelLoader;
     use crate::testing::fakes;
+    use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeWyomingClient;
@@ -436,7 +648,10 @@ mod tests {
                 announce_timeout_s: 60,
                 ping_interval_s: 30,
             },
-            model: ModelConfig { threshold: 0.6 },
+            model: ModelConfig {
+                dir: PathBuf::from("models/system-one"),
+                threshold: 0.6,
+            },
             announce: AnnounceConfig {
                 margin_ms: 300,
                 idle_wait_s: 30,
@@ -665,14 +880,11 @@ mod tests {
         Arc::new(Queues::new(home, receiver, wait, wait))
     }
 
-    /// The app of `VALID` with the fixture model, the reference house and `pools`.
-    async fn fixture_app() -> anyhow::Result<App> {
+    /// The app of `VALID` with `classifier`, the reference house and `pools`.
+    fn app_with(classifier: Arc<dyn Classifier>) -> anyhow::Result<App> {
         let config = Config::parse(VALID)?;
-        let fixture = Path::new("models/system-one/fixture");
-        let classifier = OnnxLoader.load(fixture, config.device).await?;
         let catalog = load_catalog(&config.intents)?;
-        let source = FakeStore::new(Some(pools(&catalog)));
-        let task = app::conversation::start_pools(&source, Arc::new(FakeStore::new(None)))?;
+        let task = app::conversation::start_pools(pools(&catalog), Arc::new(FakeStore::new(None)))?;
         let (rng, threshold) = (StdRng::seed_from_u64(1), config.model.threshold);
         let (pools, changes, catalog) = (task.pools, task.changes, Arc::new(catalog));
         let conversation = Conversation::new(
@@ -685,6 +897,13 @@ mod tests {
             threshold,
         );
         Ok(App { conversation })
+    }
+
+    /// The app of `VALID` with the fixture model, the reference house and `pools`.
+    async fn fixture_app() -> anyhow::Result<App> {
+        let fixture = Path::new("models/system-one/fixture");
+        let device = Config::parse(VALID)?.device;
+        app_with(OnnxLoader.load(fixture, device).await?)
     }
 
     /// The time from each of `count` kitchen `transcript` events to its `handled` event, through
@@ -720,6 +939,93 @@ mod tests {
         times.sort();
         let p95 = times[times.len() * 95 / 100];
         assert!(p95 < Duration::from_millis(20), "p95 is {p95:?}");
+        Ok(())
+    }
+
+    /// The error of `run` for the configuration `text`, with no HA.
+    async fn run_error(text: &str) -> anyhow::Result<String> {
+        let folder = tempfile::tempdir()?;
+        let config = folder.path().join("jarvis.toml");
+        fs::write(&config, text)?;
+        let startup = Startup {
+            lookup: |_: &str| Some("token".to_owned()),
+            connector: |_: &str, _: u16| async {
+                Err::<DuplexStream, _>(io::Error::other("HA is not available"))
+            },
+            shutdown: future::pending(),
+        };
+        let error = run(&config, startup).await.err().context("run succeeded")?;
+        Ok(format!("{error:#}"))
+    }
+
+    /// `VALID` with the file `pools.json` in `folder`.
+    fn with_pools_in(folder: &Path) -> String {
+        let pools = folder.join("pools.json");
+        VALID.replace("\"pools.json\"", &format!("\"{}\"", pools.display()))
+    }
+
+    /// AC-5.4-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_5_4_1_invalid_configuration_fails_before_a_port_opens() -> anyhow::Result<()> {
+        let cases = [
+            ("= 5000", "= 0", "ha.request_timeout_ms"),
+            ("ws:", "wss:", "ha.url"),
+        ];
+        for (from, to, field) in cases {
+            let error = run_error(&VALID.replace(from, to)).await?;
+            assert!(error.contains(field), "the error has no {field}: {error}");
+        }
+        Ok(())
+    }
+
+    /// AC-5.4-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_5_4_3_missing_model_folder_is_named() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let models = folder.path().join("models");
+        let text = with_pools_in(folder.path()).replace("\"cuda\"", "\"cpu\"");
+        let text = text.replace("models/system-one", &models.display().to_string());
+        let error = run_error(&text).await?;
+        let fixture = models.join("fixture").display().to_string();
+        assert!(error.contains(&fixture), "no folder: {error}");
+        Ok(())
+    }
+
+    /// AC-5.4-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_5_4_4_swap_gives_the_next_handle_the_new_classifier() -> anyhow::Result<()> {
+        let (old, new): (Arc<FakeClassifier>, Arc<FakeClassifier>) = Default::default();
+        let current = Arc::new(CurrentClassifier(ArcSwap::from_pointee(old.clone() as _)));
+        let app = app_with(Arc::clone(&current) as _)?;
+        let handle = || app.handle("turn on the lights", ports::Context::default());
+        let _ = handle().await;
+        current.0.store(Arc::new(new.clone() as _));
+        let _ = handle().await;
+        assert_eq!((old.calls().len(), new.calls().len()), (1, 1));
+        Ok(())
+    }
+
+    /// AC-5.4-5.
+    #[test]
+    fn ac_5_4_5_no_command_prints_the_usage_and_succeeds() {
+        let error = Command::try_parse_from(["jarvis"]).expect_err("there is no command");
+        let text = error.render().to_string();
+        assert!(text.contains("Usage: jarvis <COMMAND>"), "no usage: {text}");
+        assert_eq!(start([OsString::from("jarvis")]), ExitCode::SUCCESS);
+    }
+
+    /// AC-5.4-7.
+    #[tokio::test(start_paused = true)]
+    async fn ac_5_4_7_unusable_variable_names_the_pool_before_a_port_opens() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let responses = folder.path().join("responses.toml");
+        let text =
+            read(Path::new("responses.toml"))?.replace("{{ area }} lights", "{{ show }} lights");
+        fs::write(&responses, text)?;
+        let path = format!("\"{}\"", responses.display());
+        let error =
+            run_error(&with_pools_in(folder.path()).replace("\"responses.toml\"", &path)).await?;
+        assert!(error.contains("lights_on"), "no pool: {error}");
         Ok(())
     }
 }
