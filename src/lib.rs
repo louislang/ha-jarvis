@@ -8,11 +8,11 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs;
-use std::future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -30,7 +30,11 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::signal::unix;
+use tokio::signal::unix::SignalKind;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
+use tokio_util::task::TaskTracker;
 
 use crate::adapters::files::FileStore;
 use crate::adapters::ha::HaHome;
@@ -434,6 +438,10 @@ fn area_names(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(snapshot.areas.into_iter().map(|area| area.name).collect())
 }
 
+/// The longest wait of [`run`] for the running tasks and the saves after the shutdown future
+/// completes.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
+
 /// The outside world of [`run`].
 pub struct Startup<Lookup, Connector, Shutdown> {
     /// Gives the value of an environment variable.
@@ -445,8 +453,9 @@ pub struct Startup<Lookup, Connector, Shutdown> {
 }
 
 /// Starts Jarvis with the configuration file `config` and the outside world `startup`: HA,
-/// the sync, the System One model and the Wyoming server. Returns when `startup.shutdown`
-/// completes.
+/// the sync, the System One model and the Wyoming server. When `startup.shutdown` completes,
+/// stops the start, or stops accepting connections and waits up to [`SHUTDOWN_WAIT`] for the
+/// running connections, the work after their replies and the saves of the stores.
 ///
 /// # Errors
 ///
@@ -467,12 +476,40 @@ where
     let catalog = load_catalog(&config.intents)?;
     let pools = load_pools(&config.responses, &catalog)?;
     let home = start_home(&config.ha, &secrets.ha_token, startup.connector)?;
-    let conversation = conversation(&config, catalog, pools, home).await?;
-    let listener = TcpListener::bind(config.listen).await?;
-    tokio::select! {
-        result = adapters::wyoming::serve(listener, Arc::new(App { conversation })) => result,
-        () = startup.shutdown => Ok(()),
-    }
+    let mut shutdown = pin::pin!(startup.shutdown);
+    // The model can load for a long time, so a shutdown stops the start too.
+    let (conversation, pools_task) = tokio::select! {
+        started = conversation(&config, catalog, pools, home) => started?,
+        () = &mut shutdown => return Ok(()),
+    };
+    serve_until(config.listen, App { conversation }, pools_task, shutdown).await
+}
+
+/// Serves `app` on `listen` until `shutdown` completes. Then waits up to [`SHUTDOWN_WAIT`] for
+/// the connection tasks, the work after their replies and `pools_task`.
+///
+/// # Errors
+///
+/// The server cannot bind or accept, or the pools task panicked.
+async fn serve_until(
+    listen: SocketAddr,
+    app: App,
+    pools_task: JoinHandle<()>,
+    shutdown: impl Future<Output = ()>,
+) -> anyhow::Result<()> {
+    let (listener, tracker) = (TcpListener::bind(listen).await?, TaskTracker::new());
+    adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await?;
+    tracker.close();
+    // The pools task saves each change. It ends when the tracked tasks drop the last sender.
+    let saved = async {
+        tracker.wait().await;
+        pools_task.await
+    };
+    let Ok(ended) = tokio::time::timeout(SHUTDOWN_WAIT, saved).await else {
+        tracing::warn!("tasks still run after {SHUTDOWN_WAIT:?}");
+        return Ok(());
+    };
+    Ok(ended?)
 }
 
 /// Starts `HaHome` with `token` and `connector` on the host and the port of `ha.url`.
@@ -506,8 +543,8 @@ where
     Ok(HaHome::start(move || connector(&host, port), token, ha))
 }
 
-/// The conversation of `config`, `catalog` and the source pools `pools` on `home`. Starts the
-/// pools task and the sync, and loads the System One model.
+/// The conversation of `config`, `catalog` and the source pools `pools` on `home`, and its pools
+/// task. Starts the pools task and the sync, and loads the System One model.
 ///
 /// # Errors
 ///
@@ -517,7 +554,7 @@ async fn conversation(
     catalog: Catalog,
     pools: Pools,
     home: Arc<dyn Home>,
-) -> anyhow::Result<Conversation> {
+) -> anyhow::Result<(Conversation, JoinHandle<()>)> {
     let store = Arc::new(FileStore::try_new(config.pools.clone())?);
     let task = app::conversation::start_pools(pools, store)?;
     let queues = start_sync(home, &config.announce);
@@ -527,9 +564,9 @@ async fn conversation(
     let rng = StdRng::seed_from_u64(SystemClock.now().as_millisecond().unsigned_abs());
     let (catalog, threshold) = (Arc::new(catalog), config.model.threshold);
     let (pools, changes) = (task.pools, task.changes);
-    Ok(Conversation::new(
-        pools, changes, queues, rng, classifier, catalog, threshold,
-    ))
+    let conversation =
+        Conversation::new(pools, changes, queues, rng, classifier, catalog, threshold);
+    Ok((conversation, task.task))
 }
 
 /// Starts the sync of a hot cache with `home`. Gives the announce queues of `announce` on it.
@@ -542,18 +579,33 @@ fn start_sync(home: Arc<dyn Home>, announce: &AnnounceConfig) -> Arc<Queues> {
     Arc::new(Queues::new(home, receiver, margin, idle_wait))
 }
 
-/// Runs Jarvis with the configuration file `config`, the environment and TCP, until it fails.
+/// Runs Jarvis with the configuration file `config`, the environment and TCP, until it fails
+/// or gets SIGINT or SIGTERM.
 ///
 /// # Errors
 ///
-/// `run` fails.
+/// A signal handler cannot be registered, or `run` fails.
 fn serve(config: &Path) -> anyhow::Result<()> {
-    let startup = Startup {
-        lookup: |name: &str| env::var(name).ok(),
-        connector: |host: &str, port: u16| TcpStream::connect((host.to_owned(), port)),
-        shutdown: future::pending(),
-    };
-    tokio::runtime::Runtime::new()?.block_on(run(config, startup))
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(async {
+        let mut interrupt = unix::signal(SignalKind::interrupt())?;
+        let mut terminate = unix::signal(SignalKind::terminate())?;
+        let startup = Startup {
+            lookup: |name: &str| env::var(name).ok(),
+            connector: |host: &str, port: u16| TcpStream::connect((host.to_owned(), port)),
+            shutdown: async move {
+                tokio::select! {
+                    _ = interrupt.recv() => {}
+                    _ = terminate.recv() => {}
+                }
+            },
+        };
+        run(config, startup).await
+    });
+    // `run` waited up to 5 s. A drop of the runtime would wait for the blocking tasks with no
+    // limit, and the pools task blocks until its last sender drops.
+    runtime.shutdown_background();
+    result
 }
 
 /// Entry point of Jarvis: runs the command of the command line.
@@ -593,7 +645,10 @@ mod tests {
 
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
+    use std::future;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU16;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
     use std::time::Instant;
 
@@ -601,6 +656,7 @@ mod tests {
     use tokio::io::DuplexStream;
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
+    use tokio::sync::oneshot;
     use tokio::sync::watch;
 
     use crate::adapters::onnx::OnnxLoader;
@@ -907,13 +963,21 @@ mod tests {
         app_with(OnnxLoader.load(fixture, device).await?)
     }
 
+    /// Serves `app` on `listener` in its own task, with no shutdown.
+    fn spawn_server(listener: TcpListener, app: Arc<App>) {
+        let tracker = TaskTracker::new();
+        tokio::spawn(async move {
+            adapters::wyoming::serve(listener, app, &tracker, future::pending()).await
+        });
+    }
+
     /// The time from each of `count` kitchen `transcript` events to its `handled` event, through
     /// a Wyoming server of `fixture_app()`.
     async fn round_trips(count: usize) -> anyhow::Result<Vec<Duration>> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let app = Arc::new(fixture_app().await?);
-        tokio::spawn(adapters::wyoming::serve(listener, app));
+        spawn_server(listener, app);
         let mut client = FakeWyomingClient::connect(address).await?;
         let kitchen = "98f4aacf9c4152ffe32dff212df91521";
         let data = json!({ "text": "turn on the lights", "context": { "device_id": kitchen } });
@@ -1044,13 +1108,35 @@ mod tests {
         Ok(())
     }
 
+    /// The next port that `free_address` tries.
+    static NEXT_PORT: AtomicU16 = AtomicU16::new(20000);
+
+    /// A free local address. `run` binds the fixed address of `listen`, so the port is free only
+    /// until then. The port is below the ephemeral ranges of Linux and macOS, so no client socket
+    /// takes it in that time.
+    fn free_address() -> SocketAddr {
+        loop {
+            let address =
+                SocketAddr::from(([127, 0, 0, 1], NEXT_PORT.fetch_add(1, Ordering::Relaxed)));
+            if std::net::TcpListener::bind(address).is_ok() {
+                return address;
+            }
+        }
+    }
+
+    /// A configuration in `folder` with a server address on a free local port, and the address.
+    fn listening_config(folder: &Path) -> anyhow::Result<(PathBuf, SocketAddr)> {
+        let address = free_address();
+        let text = with_pools_in(folder).replace("\"cuda\"", "\"cpu\"");
+        let text = text.replace("0.0.0.0:10700", &address.to_string());
+        Ok((config_in(folder, &text)?, address))
+    }
+
     /// Connects to the Wyoming server at `address` once it listens, sends `describe` and gives
-    /// the type of the answer. Waits for an HA connection attempt on `attempts`, advances past
-    /// the backoff and waits for the next one.
-    async fn describe_without_ha(
+    /// the client and the type of the answer.
+    async fn describe_when_listening(
         address: SocketAddr,
-        attempts: &mut mpsc::UnboundedReceiver<()>,
-    ) -> anyhow::Result<Option<String>> {
+    ) -> anyhow::Result<(FakeWyomingClient, Option<String>)> {
         let mut client = loop {
             if let Ok(client) = FakeWyomingClient::connect(address).await {
                 break client;
@@ -1059,6 +1145,17 @@ mod tests {
         };
         client.send("describe", &json!({})).await?;
         let event = client.receive().await?.map(|(event, _)| event);
+        Ok((client, event))
+    }
+
+    /// Sends `describe` to the Wyoming server at `address` once it listens and gives the type of
+    /// the answer. Waits for an HA connection attempt on `attempts`, advances past the backoff
+    /// and waits for the next one.
+    async fn describe_without_ha(
+        address: SocketAddr,
+        attempts: &mut mpsc::UnboundedReceiver<()>,
+    ) -> anyhow::Result<Option<String>> {
+        let (_client, event) = describe_when_listening(address).await?;
         attempts.recv().await;
         // The longest backoff delay of `HaHome`.
         tokio::time::advance(Duration::from_secs(2)).await;
@@ -1071,13 +1168,7 @@ mod tests {
     async fn ac_5_4b_1_without_ha_the_server_accepts_and_the_sync_tries_again() -> anyhow::Result<()>
     {
         let folder = tempfile::tempdir()?;
-        // A free port, because `run` binds the fixed address of `listen`.
-        let address = TcpListener::bind("127.0.0.1:0").await?.local_addr()?;
-        let text = with_pools_in(folder.path()).replace("\"cuda\"", "\"cpu\"");
-        let config = config_in(
-            folder.path(),
-            &text.replace("0.0.0.0:10700", &address.to_string()),
-        )?;
+        let (config, address) = listening_config(folder.path())?;
         let (attempt, mut attempts) = mpsc::unbounded_channel();
         let startup = Startup {
             lookup: |_: &str| Some("token".to_owned()),
@@ -1090,6 +1181,53 @@ mod tests {
                 assert_eq!(event?.as_deref(), Some("info"));
             }
         }
+        Ok(())
+    }
+    /// Holds a connection to the Wyoming server at `address` and stops `run` with `stop`. Then
+    /// checks that a new connection fails and advances virtual time by 5 s.
+    async fn stop_while_connected(
+        address: SocketAddr,
+        stop: oneshot::Sender<()>,
+    ) -> anyhow::Result<()> {
+        let (_client, event) = describe_when_listening(address).await?;
+        anyhow::ensure!(event.as_deref() == Some("info"), "the answer is {event:?}");
+        stop.send(())
+            .map_err(|()| anyhow::anyhow!("run dropped the shutdown future"))?;
+        // `run` comes first in the biased `select!`, so it sees the stop before the next connect.
+        tokio::task::yield_now().await;
+        let connected = TcpStream::connect(address).await;
+        anyhow::ensure!(connected.is_err(), "the server accepts after the stop");
+        tokio::time::advance(Duration::from_secs(5)).await;
+        Ok(())
+    }
+
+    /// AC-5.4c-1. The open connection keeps its task running, so `run` waits the full 5 s.
+    #[tokio::test(start_paused = true)]
+    async fn ac_5_4c_1_shutdown_stops_accepting_and_returns_within_5_s() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let (config, address) = listening_config(folder.path())?;
+        let (stop, stopped) = oneshot::channel();
+        let startup = Startup {
+            lookup: |_: &str| Some("token".to_owned()),
+            connector: no_ha(mpsc::unbounded_channel().0),
+            shutdown: async {
+                let _ = stopped.await;
+            },
+        };
+        let start = tokio::time::Instant::now();
+        tokio::select! {
+            biased;
+            result = run(&config, startup) => result?,
+            result = stop_while_connected(address, stop) => {
+                anyhow::bail!("run did not return after 5 s: {result:?}");
+            }
+        }
+        let waited = start.elapsed();
+        assert_eq!(
+            waited,
+            Duration::from_secs(5),
+            "run waits up to 5 s for the open connection"
+        );
         Ok(())
     }
 }

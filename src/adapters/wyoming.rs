@@ -1,6 +1,7 @@
 //! The Wyoming TCP server. It calls `Assistant`.
 
 use std::mem;
+use std::pin;
 use std::sync::Arc;
 
 use serde::Deserialize;
@@ -14,6 +15,7 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::net::TcpListener;
+use tokio_util::task::TaskTracker;
 
 use crate::ports::Assistant;
 use crate::ports::Context;
@@ -47,24 +49,35 @@ struct Transcript {
     context: Context,
 }
 
-/// Accepts connections on `listener` and serves each one in its own task.
+/// Accepts connections on `listener` until `shutdown` completes. Serves each one in its own
+/// task on `tracker`.
 ///
 /// # Errors
 ///
 /// A connection cannot be accepted.
-pub async fn serve(listener: TcpListener, assistant: Arc<dyn Assistant>) -> anyhow::Result<()> {
+pub async fn serve(
+    listener: TcpListener,
+    assistant: Arc<dyn Assistant>,
+    tracker: &TaskTracker,
+    shutdown: impl Future<Output = ()>,
+) -> anyhow::Result<()> {
+    let mut shutdown = pin::pin!(shutdown);
     loop {
-        let (stream, _) = listener.accept().await?;
-        let assistant = Arc::clone(&assistant);
-        tokio::spawn(async move {
-            if let Err(error) = connection(stream, assistant.as_ref()).await {
+        let (stream, _) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            () = &mut shutdown => return Ok(()),
+        };
+        let (assistant, tasks) = (Arc::clone(&assistant), tracker.clone());
+        tracker.spawn(async move {
+            if let Err(error) = connection(stream, assistant.as_ref(), &tasks).await {
                 tracing::warn!("Wyoming connection closed: {error:#}");
             }
         });
     }
 }
 
-/// Answers the events of one connection until the client closes it.
+/// Answers the events of one connection until the client closes it. Runs the work of each
+/// reply on `tracker`.
 ///
 /// # Errors
 ///
@@ -72,6 +85,7 @@ pub async fn serve(listener: TcpListener, assistant: Arc<dyn Assistant>) -> anyh
 async fn connection(
     stream: impl AsyncRead + AsyncWrite + Unpin,
     assistant: &dyn Assistant,
+    tracker: &TaskTracker,
 ) -> anyhow::Result<()> {
     let mut stream = BufReader::new(stream);
     let mut line = String::new();
@@ -81,7 +95,7 @@ async fn connection(
         let data = data(&mut stream, &mut header).await?;
         match header.event_type.as_str() {
             "describe" => write(&mut stream, "info", &info_data(&assistant.info())).await?,
-            "transcript" => transcript(&mut stream, assistant, data).await?,
+            "transcript" => transcript(&mut stream, assistant, data, tracker).await?,
             _ => {}
         }
     }
@@ -89,7 +103,7 @@ async fn connection(
 }
 
 /// Answers the `transcript` data `data` with `handled` or `not-handled`. Starts the work of a
-/// reply after the write and the flush.
+/// reply on `tracker` after the write and the flush.
 ///
 /// # Errors
 ///
@@ -98,6 +112,7 @@ async fn transcript(
     stream: &mut (impl AsyncWrite + Unpin),
     assistant: &dyn Assistant,
     data: Map<String, Value>,
+    tracker: &TaskTracker,
 ) -> anyhow::Result<()> {
     let Transcript { text, context } = serde_json::from_value(Value::Object(data))?;
     match assistant.handle(&text, context).await {
@@ -105,7 +120,7 @@ async fn transcript(
             write(stream, "handled", &json!({ "text": text })).await?;
             stream.flush().await?;
             if let Some(after) = after {
-                tokio::spawn(async move {
+                tracker.spawn(async move {
                     if let Err(error) = after.await {
                         tracing::warn!("the work after the reply failed: {error:#}");
                     }
@@ -194,7 +209,10 @@ mod tests {
     async fn start() -> anyhow::Result<SocketAddr> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        tokio::spawn(serve(listener, Arc::new(FakeAssistant::default())));
+        let assistant = Arc::new(FakeAssistant::default());
+        tokio::spawn(async move {
+            serve(listener, assistant, &TaskTracker::new(), future::pending()).await
+        });
         Ok(address)
     }
 
@@ -203,7 +221,9 @@ mod tests {
     fn open(assistant: &Arc<FakeAssistant>) -> FakeWyomingClient<DuplexStream> {
         let (client, server) = tokio::io::duplex(16);
         let assistant = Arc::clone(assistant);
-        tokio::spawn(async move { connection(server, assistant.as_ref()).await });
+        tokio::spawn(
+            async move { connection(server, assistant.as_ref(), &TaskTracker::new()).await },
+        );
         FakeWyomingClient::new(client)
     }
 
