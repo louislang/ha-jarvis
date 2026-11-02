@@ -29,6 +29,7 @@ use tokio::net::TcpStream;
 
 use crate::Device;
 use crate::domain::model::Prediction;
+use crate::domain::speech::Audio;
 use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
@@ -41,6 +42,7 @@ use crate::ports::Home;
 use crate::ports::Info;
 use crate::ports::ModelLoader;
 use crate::ports::Store;
+use crate::ports::TextToSpeech;
 
 /// The reference house snapshot.
 #[must_use]
@@ -227,6 +229,32 @@ impl ModelLoader for FakeModelLoader {
     async fn load(&self, dir: &Path, _device: Device) -> anyhow::Result<Arc<dyn Classifier>> {
         let classifier = lock(&self.classifiers).pop_front();
         classifier.ok_or_else(|| anyhow::anyhow!("no scripted classifier for {}", dir.display()))
+    }
+}
+
+/// A `TextToSpeech` that gives audio with no samples and records each text.
+#[derive(Default)]
+pub(crate) struct FakeTts {
+    /// The text of each call, in order.
+    texts: Mutex<Vec<String>>,
+}
+
+impl FakeTts {
+    /// The text of each call, in order.
+    #[must_use]
+    pub(crate) fn texts(&self) -> Vec<String> {
+        lock(&self.texts).clone()
+    }
+}
+
+#[async_trait]
+impl TextToSpeech for FakeTts {
+    async fn synth(&self, text: &str) -> anyhow::Result<Audio> {
+        lock(&self.texts).push(text.to_owned());
+        Ok(Audio {
+            samples: Vec::new(),
+            rate: 16_000,
+        })
     }
 }
 

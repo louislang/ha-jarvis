@@ -29,6 +29,7 @@ toml = "1.1.8"
 tracing = "0.1.44"
 vstd = "=0.0.0-2026-10-25-0158"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+dashmap = "6.2.1"
 
 [package.metadata.verus]
 verify = true
