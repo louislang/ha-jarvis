@@ -224,6 +224,7 @@ jobs:
           for file in encoder.data decoder.onnx joiner.onnx tokens.txt; do
             ln -f "models/$prefix-160ms-2026-04-25/$file" "models/$prefix-80ms-2026-04-25/$file"
           done
+          printf 'cudnn_conv_algo_search=EXHAUSTIVE\ncudnn_conv_use_max_workspace=1\n' > models/exhaustive.config
           du -sh models/*
           df -h .
       - run: just gpu-models

@@ -482,15 +482,8 @@ mod tests {
     const INT8_160: &str =
         "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25";
 
-    /// The Nemotron int8 export with 80 ms chunks.
-    const INT8_80: &str =
-        "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25";
-
     /// The Nemotron float32 export with 160 ms chunks.
     const FP32_160: &str = "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-2026-04-25";
-
-    /// The Nemotron float32 export with 80 ms chunks.
-    const FP32_80: &str = "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-2026-04-25";
 
     /// One first-pass model, provider and thread count of the GPU host measurements.
     #[derive(Clone)]
@@ -544,8 +537,10 @@ mod tests {
             let model = self
                 .dir
                 .trim_start_matches("models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-");
-            let provider = self.provider.split(':').next().unwrap_or_default();
-            format!("{model}/{provider}/threads={}", self.threads)
+            format!(
+                "{model}{}/{}/threads={}",
+                self.infix, self.provider, self.threads
+            )
         }
     }
 
@@ -695,16 +690,14 @@ mod tests {
         audio: &Audio,
     ) -> anyhow::Result<()> {
         let voiced = last_voiced_ms(audio);
-        for after in [0, 132] {
-            for pad_ms in [0, 160, 320, 480, 640] {
-                for finished in [false, true] {
-                    let (time, text) = flush(recognizer, audio, voiced + after, pad_ms, finished)?;
-                    let complete = intent::normalize(&text) == REQUEST;
-                    println!(
-                        "MEASURE flush {name} cut=voiced+{after}ms pad={pad_ms}ms finished={finished} complete={complete} flush_ms={:.1} text={text:?}",
-                        ms(time)
-                    );
-                }
+        for after in [0, 32, 64, 100, 132] {
+            for pad_ms in [400, 480, 560, 640, 720, 800] {
+                let (time, text) = flush(recognizer, audio, voiced + after, pad_ms, false)?;
+                let complete = intent::normalize(&text) == REQUEST;
+                println!(
+                    "MEASURE flush {name} cut=voiced+{after}ms pad={pad_ms}ms complete={complete} flush_ms={:.1} text={text:?}",
+                    ms(time)
+                );
             }
         }
         Ok(())
@@ -757,7 +750,10 @@ mod tests {
         let paced = pass(&recognizer, audio, true)?;
         print_speed(&name, &warm, &fast, audio);
         print_latency(&name, &fast, &paced, audio);
-        print_flushes(&name, &recognizer, audio)
+        if setup.threads == 4 {
+            print_flushes(&name, &recognizer, audio)?;
+        }
+        Ok(())
     }
 
     /// The kernel time in µs of each execution provider and operator in the profiles in
@@ -877,30 +873,38 @@ mod tests {
         Ok(())
     }
 
+    /// Prints the peak of each 20 ms window of `audio` from 1300 ms to 2300 ms, in thousandths
+    /// of full scale.
+    fn print_envelope(audio: &Audio) {
+        let windows: Vec<&[i16]> = speech::chunks(audio, CHUNK);
+        let peaks: Vec<u32> = windows[65..115]
+            .iter()
+            .map(|window| {
+                let peak = window.iter().map(|sample| sample.unsigned_abs()).max();
+                u32::from(peak.unwrap_or_default()) * 1000 / u32::from(u16::MAX / 2)
+            })
+            .collect();
+        println!("MEASURE envelope from_ms=1300 step_ms=20 peaks={peaks:?}");
+    }
+
     /// Measures the `SherpaStt` of `jarvis.toml` and its VAD on the GPU host.
     #[tokio::test]
     #[ignore = "GPU host"]
     async fn measure_a_production() -> anyhow::Result<()> {
         let audio = fakes::speech(REQUEST).await?;
+        print_envelope(&audio);
         print_production(Device::Cpu, &audio)?;
         print_production(Device::Cuda, &audio)
     }
 
     /// The folder, file infix, provider and thread count of each measured setup.
-    const SETUPS: [(&str, &str, &str, i32); 13] = [
+    const SETUPS: [(&str, &str, &str, i32); 6] = [
+        (INT8_160, ".int8", "cpu", 1),
+        (INT8_160, ".int8", "cpu", 2),
+        (INT8_160, ".int8", "cpu", 3),
         (INT8_160, ".int8", "cpu", 4),
-        (INT8_160, ".int8", "cpu", 6),
-        (INT8_160, ".int8", "cpu", 8),
-        (INT8_80, ".int8", "cpu", 4),
-        (INT8_80, ".int8", "cpu", 8),
-        (INT8_160, ".int8", "cuda", 4),
-        (INT8_160, ".int8", "cuda", 8),
-        (INT8_80, ".int8", "cuda", 4),
         (FP32_160, "", "cuda", 4),
-        (FP32_80, "", "cuda", 4),
-        (FP32_160, "", "cpu", 4),
-        (FP32_160, "", "cpu", 8),
-        (FP32_80, "", "cpu", 8),
+        (FP32_160, "", "cuda:models/exhaustive.config", 4),
     ];
 
     /// Measures each Nemotron export, provider and thread count on the GPU host.
@@ -921,12 +925,6 @@ mod tests {
     #[ignore = "GPU host"]
     async fn measure_c_placement() -> anyhow::Result<()> {
         let audio = fakes::speech(REQUEST).await?;
-        for setup in [
-            Setup::new(INT8_160, ".int8", "cuda", 4),
-            Setup::new(FP32_160, "", "cuda", 4),
-        ] {
-            print_placement(&setup, &audio)?;
-        }
-        Ok(())
+        print_placement(&Setup::new(FP32_160, "", "cuda", 4), &audio)
     }
 }
