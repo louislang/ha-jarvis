@@ -12,6 +12,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::path::PathBuf;
+use std::pin;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -453,8 +454,8 @@ pub struct Startup<Lookup, Connector, Shutdown> {
 
 /// Starts Jarvis with the configuration file `config` and the outside world `startup`: HA,
 /// the sync, the System One model and the Wyoming server. When `startup.shutdown` completes,
-/// stops accepting connections, waits up to [`SHUTDOWN_WAIT`] for the running connections, the
-/// work after their replies and the saves of the stores, and returns.
+/// stops the start, or stops accepting connections and waits up to [`SHUTDOWN_WAIT`] for the
+/// running connections, the work after their replies and the saves of the stores.
 ///
 /// # Errors
 ///
@@ -475,24 +476,28 @@ where
     let catalog = load_catalog(&config.intents)?;
     let pools = load_pools(&config.responses, &catalog)?;
     let home = start_home(&config.ha, &secrets.ha_token, startup.connector)?;
-    let (conversation, pools_task) = conversation(&config, catalog, pools, home).await?;
-    let listener = TcpListener::bind(config.listen).await?;
-    serve_until(listener, App { conversation }, pools_task, startup.shutdown).await
+    let mut shutdown = pin::pin!(startup.shutdown);
+    // The model can load for a long time, so a shutdown stops the start too.
+    let (conversation, pools_task) = tokio::select! {
+        started = conversation(&config, catalog, pools, home) => started?,
+        () = &mut shutdown => return Ok(()),
+    };
+    serve_until(config.listen, App { conversation }, pools_task, shutdown).await
 }
 
-/// Serves `app` on `listener` until `shutdown` completes. Then waits up to [`SHUTDOWN_WAIT`] for
+/// Serves `app` on `listen` until `shutdown` completes. Then waits up to [`SHUTDOWN_WAIT`] for
 /// the connection tasks, the work after their replies and `pools_task`.
 ///
 /// # Errors
 ///
-/// The server cannot accept, or the pools task panicked.
+/// The server cannot bind or accept, or the pools task panicked.
 async fn serve_until(
-    listener: TcpListener,
+    listen: SocketAddr,
     app: App,
     pools_task: JoinHandle<()>,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    let tracker = TaskTracker::new();
+    let (listener, tracker) = (TcpListener::bind(listen).await?, TaskTracker::new());
     adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await?;
     tracker.close();
     // The pools task saves each change. It ends when the tracked tasks drop the last sender.
