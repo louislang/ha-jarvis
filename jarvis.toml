@@ -18,6 +18,9 @@ commit_threshold = 0.9
 
 [asr]
 model_dir = "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25"
+vad_model = "models/silero_vad.onnx"
+vad_threshold = 0.5
+vad_min_silence_ms = 100
 early_commit_ms = 200
 endpoint_ms = 600
 max_utterance_ms = 8000

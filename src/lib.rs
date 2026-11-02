@@ -151,6 +151,7 @@ impl Config {
             ("ha.request_timeout_ms", self.ha.request_timeout_ms),
             ("ha.announce_timeout_s", self.ha.announce_timeout_s),
             ("ha.ping_interval_s", self.ha.ping_interval_s),
+            ("asr.vad_min_silence_ms", asr.vad_min_silence_ms),
             ("asr.early_commit_ms", asr.early_commit_ms),
             ("asr.endpoint_ms", asr.endpoint_ms),
             ("asr.max_utterance_ms", asr.max_utterance_ms),
@@ -171,6 +172,11 @@ impl Config {
                 "{name} = {value} is out of range: it must be in [0, 1]"
             );
         }
+        let vad_threshold = asr.vad_threshold;
+        anyhow::ensure!(
+            vad_threshold > 0.0,
+            "asr.vad_threshold = {vad_threshold} is out of range: it must be more than 0"
+        );
         let holdout = self.train.holdout;
         anyhow::ensure!(
             (0.0..=1.0).contains(&holdout),
@@ -187,6 +193,12 @@ impl Config {
     fn validate_relations(&self) -> anyhow::Result<()> {
         let asr = &self.asr;
         let ordered = [
+            (
+                "asr.vad_min_silence_ms",
+                asr.vad_min_silence_ms,
+                "asr.early_commit_ms",
+                asr.early_commit_ms,
+            ),
             (
                 "asr.early_commit_ms",
                 asr.early_commit_ms,
@@ -272,6 +284,12 @@ pub struct ModelConfig {
 pub struct AsrConfig {
     /// The folder of the streaming transducer of the first pass.
     pub model_dir: PathBuf,
+    /// The Silero VAD model file.
+    pub vad_model: PathBuf,
+    /// The least VAD speech probability of a voiced frame.
+    pub vad_threshold: f32,
+    /// The silence that ends a VAD speech segment.
+    pub vad_min_silence_ms: u64,
     /// The silence after a confident partial that commits.
     pub early_commit_ms: u64,
     /// The silence after any partial that commits.
@@ -800,6 +818,9 @@ mod tests {
                 model_dir: PathBuf::from(
                     "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25",
                 ),
+                vad_model: PathBuf::from("models/silero_vad.onnx"),
+                vad_threshold: 0.5,
+                vad_min_silence_ms: 100,
                 early_commit_ms: 200,
                 endpoint_ms: 600,
                 max_utterance_ms: 8000,
@@ -867,12 +888,25 @@ mod tests {
     /// AC-2.2-6.
     #[test]
     fn ac_2_2_6_out_of_range_names_field_and_range() {
-        let error =
-            parse_error(&VALID.replace("request_timeout_ms = 5000", "request_timeout_ms = 0"));
-        assert!(
-            error.contains("ha.request_timeout_ms") && error.contains("more than 0"),
-            "error has no field or range: {error}"
-        );
+        let cases = [
+            (
+                "request_timeout_ms = 5000",
+                "request_timeout_ms = 0",
+                "ha.request_timeout_ms",
+            ),
+            (
+                "vad_threshold = 0.5",
+                "vad_threshold = 0.0",
+                "asr.vad_threshold",
+            ),
+        ];
+        for (field, broken, name) in cases {
+            let error = parse_error(&VALID.replace(field, broken));
+            assert!(
+                error.contains(name) && error.contains("more than 0"),
+                "error for {broken} has no field or range: {error}"
+            );
+        }
     }
 
     /// AC-4.5-13.
@@ -901,6 +935,11 @@ mod tests {
                 "commit_threshold = 0.9",
                 "commit_threshold = 0.5",
                 ["model.commit_threshold", "model.threshold"],
+            ),
+            (
+                "vad_min_silence_ms = 100",
+                "vad_min_silence_ms = 200",
+                ["asr.early_commit_ms", "asr.vad_min_silence_ms"],
             ),
             (
                 "max_utterance_ms = 8000",

@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -17,6 +18,9 @@ use sherpa_onnx::OnlineRecognizer;
 use sherpa_onnx::OnlineRecognizerConfig;
 use sherpa_onnx::OnlineStream;
 use sherpa_onnx::OnlineTransducerModelConfig;
+use sherpa_onnx::SileroVadModelConfig;
+use sherpa_onnx::VadModelConfig;
+use sherpa_onnx::VoiceActivityDetector;
 
 use crate::AsrConfig;
 use crate::Device;
@@ -27,10 +31,20 @@ use crate::ports::SpeechToText;
 use crate::ports::SttStream;
 use crate::ports::TextToSpeech;
 
-/// A `SpeechToText` with a streaming transducer.
+/// The sample rate of the first pass in Hz.
+const RATE: u16 = 16_000;
+
+/// The samples of one Silero VAD frame.
+const WINDOW: u16 = 512;
+
+/// A `SpeechToText` with a streaming transducer and the Silero VAD.
 pub struct SherpaStt {
     /// The streaming recognizer.
     recognizer: Arc<OnlineRecognizer>,
+    /// The VAD of each stream.
+    vad: VadModelConfig,
+    /// The silence in samples that ends a VAD speech segment.
+    min_silence: u64,
 }
 
 impl SherpaStt {
@@ -40,6 +54,8 @@ impl SherpaStt {
     ///
     /// The model cannot load.
     pub fn try_new(config: &AsrConfig, device: Device) -> anyhow::Result<Self> {
+        let vad = vad(config, device);
+        let min_silence = config.vad_min_silence_ms * u64::from(RATE) / 1000;
         let dir = &config.model_dir;
         let file = |name: &str| Some(file(dir, name));
         let transducer = OnlineTransducerModelConfig {
@@ -51,6 +67,7 @@ impl SherpaStt {
             transducer,
             tokens: file("tokens.txt"),
             provider: Some(provider(device)),
+            num_threads: 4,
             ..OnlineModelConfig::default()
         };
         let config = OnlineRecognizerConfig {
@@ -61,25 +78,94 @@ impl SherpaStt {
             .with_context(|| format!("cannot load the STT model in {}", dir.display()))?;
         Ok(Self {
             recognizer: Arc::new(recognizer),
+            vad,
+            min_silence,
         })
+    }
+}
+
+/// The Silero VAD configuration of `config` on `device`.
+fn vad(config: &AsrConfig, device: Device) -> VadModelConfig {
+    let seconds = |ms: u64| Duration::from_millis(ms).as_secs_f32();
+    let silero_vad = SileroVadModelConfig {
+        model: Some(config.vad_model.to_string_lossy().into_owned()),
+        threshold: config.vad_threshold,
+        min_silence_duration: seconds(config.vad_min_silence_ms),
+        // sherpa-onnx replaces 0 with 0.25 s. One frame confirms the speech start, and
+        // `SherpaStream::track` holds that frame.
+        min_speech_duration: seconds(u64::from(WINDOW) * 1000 / u64::from(RATE)),
+        window_size: i32::from(WINDOW),
+        // An utterance commits at `max_utterance_ms`, so the VAD never splits a segment.
+        max_speech_duration: seconds(config.max_utterance_ms),
+    };
+    VadModelConfig {
+        silero_vad,
+        sample_rate: i32::from(RATE),
+        num_threads: 1,
+        provider: Some(provider(device)),
+        ..VadModelConfig::default()
     }
 }
 
 impl SpeechToText for SherpaStt {
-    fn stream(&self) -> Box<dyn SttStream> {
-        Box::new(SherpaStream {
+    fn stream(&self) -> anyhow::Result<Box<dyn SttStream>> {
+        let vad = VoiceActivityDetector::create(&self.vad, 30.0).context("cannot load the VAD")?;
+        Ok(Box::new(SherpaStream {
             stream: self.recognizer.create_stream(),
             recognizer: Arc::clone(&self.recognizer),
-        })
+            vad,
+            min_silence: self.min_silence,
+            fed: 0,
+            decided: 0,
+            voice_end: None,
+        }))
     }
 }
 
-/// The recognizer stream of one utterance.
+/// The recognizer stream and the VAD of one utterance, with audio positions in samples.
 struct SherpaStream {
     /// The recognizer of `stream`.
     recognizer: Arc<OnlineRecognizer>,
     /// The decoded audio.
     stream: OnlineStream,
+    /// The VAD of the same audio.
+    vad: VoiceActivityDetector,
+    /// The silence that ends a VAD speech segment.
+    min_silence: u64,
+    /// The number of samples so far.
+    fed: u64,
+    /// The end of the audio that the VAD has decided.
+    decided: u64,
+    /// The end of the last voiced frame, or `None` before any speech.
+    voice_end: Option<u64>,
+}
+
+impl SherpaStream {
+    /// Updates the VAD positions after `count` more samples of at most one frame.
+    fn track(&mut self, count: usize) {
+        self.fed += count as u64;
+        while let Some(segment) = self.vad.front() {
+            let end = segment.start().unsigned_abs() + u64::from(segment.n().unsigned_abs());
+            self.voice_end = Some(end);
+            self.vad.pop();
+        }
+        let detected = self.vad.detected();
+        // In a segment, the VAD holds the frames that can end it. Out of one, it holds the frame
+        // that can start one.
+        let held = if detected {
+            self.min_silence
+        } else {
+            u64::from(WINDOW)
+        };
+        let run = self.fed - self.fed % u64::from(WINDOW);
+        self.decided = self
+            .decided
+            .max(run.saturating_sub(held))
+            .max(self.voice_end.unwrap_or(0));
+        if detected {
+            self.voice_end = Some(self.decided);
+        }
+    }
 }
 
 impl SttStream for SherpaStream {
@@ -88,22 +174,32 @@ impl SttStream for SherpaStream {
             .iter()
             .map(|&sample| f32::from(sample) / f32::from(i16::MAX))
             .collect();
-        self.stream.accept_waveform(16_000, &wave);
+        self.stream.accept_waveform(i32::from(RATE), &wave);
         while self.recognizer.is_ready(&self.stream) {
             self.recognizer.decode(&self.stream);
+        }
+        // The VAD gives one decision for all frames of one call.
+        for window in wave.chunks(usize::from(WINDOW)) {
+            self.vad.accept_waveform(window);
+            self.track(window.len());
         }
     }
 
     fn partial(&self) -> Partial {
         let result = self.recognizer.get_result(&self.stream);
+        let ms = |samples: u64| samples * 1000 / u64::from(RATE);
         Partial {
             text: result.map(|result| result.text).unwrap_or_default(),
+            voice_end_ms: self.voice_end.map(ms),
+            vad_ms: ms(self.decided),
         }
     }
 
-    /// Makes a new recognizer stream, which has no decoded tokens.
+    /// Makes a new recognizer stream, which has no decoded tokens, and resets the VAD.
     fn reset(&mut self) {
         self.stream = self.recognizer.create_stream();
+        self.vad.reset();
+        (self.fed, self.decided, self.voice_end) = (0, 0, None);
     }
 }
 
@@ -214,8 +310,8 @@ fn pcm(value: f32) -> i16 {
     (value * f32::from(i16::MAX)) as i16
 }
 
-/// Tests of the STT adapter with the Nemotron model and of the TTS adapter with the Supertonic-3
-/// model.
+/// Tests of the STT adapter with the Nemotron model and the Silero VAD, and of the TTS adapter
+/// with the Supertonic-3 model.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +322,9 @@ mod tests {
 
     /// The request of the STT tests.
     const REQUEST: &str = "turn on the kitchen lights";
+
+    /// The 20 ms chunks of 16 kHz audio.
+    const CHUNK: usize = 320;
 
     /// The configuration of `jarvis.toml`.
     fn config() -> anyhow::Result<Config> {
@@ -239,19 +338,41 @@ mod tests {
 
     /// A new first pass of the `SherpaStt` of `jarvis.toml` on the CPU.
     fn first_pass() -> anyhow::Result<Box<dyn SttStream>> {
-        Ok(SherpaStt::try_new(&config()?.asr, Device::Cpu)?.stream())
+        SherpaStt::try_new(&config()?.asr, Device::Cpu)?.stream()
     }
 
     /// The partial after each 20 ms chunk of `speech(REQUEST)`.
     async fn partials() -> anyhow::Result<Vec<Partial>> {
-        let audio = fakes::speech(REQUEST).await?;
+        partials_of(&fakes::speech(REQUEST).await?)
+    }
+
+    /// The partial after each 20 ms chunk of `audio`.
+    fn partials_of(audio: &Audio) -> anyhow::Result<Vec<Partial>> {
         let mut stream = first_pass()?;
-        let chunks = speech::chunks(&audio, 320);
+        let chunks = speech::chunks(audio, CHUNK);
         let decode = |chunk: &[i16]| {
             stream.accept(chunk);
             stream.partial()
         };
         Ok(chunks.into_iter().map(decode).collect())
+    }
+
+    /// The partial of `speech("lights on")`, then the partial after `reset`.
+    async fn reset_partials() -> anyhow::Result<(Partial, Partial)> {
+        let audio = fakes::speech("lights on").await?;
+        let mut stream = first_pass()?;
+        stream.accept(&audio.samples);
+        let before = stream.partial();
+        stream.reset();
+        Ok((before, stream.partial()))
+    }
+
+    /// The position in ms of the last voiced sample of `audio`: the last sample above 1% of full
+    /// scale. Supertonic adds quiet audio after the speech.
+    fn last_voiced_ms(audio: &Audio) -> u64 {
+        let voiced = |sample: &i16| sample.unsigned_abs() > u16::MAX / 200;
+        let last = audio.samples.iter().rposition(voiced).unwrap_or_default();
+        last as u64 * 1000 / u64::from(audio.rate)
     }
 
     /// AC-6.6-1.
@@ -280,13 +401,58 @@ mod tests {
     /// AC-6.6-3.
     #[tokio::test]
     async fn ac_6_6_3_reset_drops_the_text() -> anyhow::Result<()> {
-        let audio = fakes::speech("lights on").await?;
-        let mut stream = first_pass()?;
-        stream.accept(&audio.samples);
-        let before = stream.partial();
+        let (before, after) = reset_partials().await?;
         assert!(!before.text.is_empty(), "the audio gives text: {before:?}");
-        stream.reset();
-        assert_eq!(stream.partial(), Partial::default());
+        assert_eq!(after, Partial::default());
+        Ok(())
+    }
+
+    /// AC-6.6b-1.
+    #[tokio::test]
+    async fn ac_6_6b_1_voice_end_after_silence_and_speech() -> anyhow::Result<()> {
+        let lights = fakes::speech("lights on").await?;
+        let mut samples = vec![0; 8000];
+        samples.extend(&lights.samples);
+        let audio = Audio { samples, ..lights };
+        let partials = partials_of(&audio)?;
+        let silence = &partials[..8000 / CHUNK];
+        assert!(
+            silence.iter().all(|partial| partial.voice_end_ms.is_none()),
+            "a partial of the silence has a voice end: {silence:?}"
+        );
+        let end = partials.last().and_then(|partial| partial.voice_end_ms);
+        let voiced = last_voiced_ms(&audio);
+        assert!(
+            end.is_some_and(|end| end.abs_diff(voiced) < 100),
+            "voice end {end:?}, last voiced sample {voiced} ms"
+        );
+        Ok(())
+    }
+
+    /// AC-6.6b-2.
+    #[tokio::test]
+    async fn ac_6_6b_2_silence_stays_short_until_the_last_voiced_sample() -> anyhow::Result<()> {
+        let audio = fakes::speech(REQUEST).await?;
+        let early_commit_ms = config()?.asr.early_commit_ms;
+        let partials = partials_of(&audio)?;
+        let count = usize::try_from(last_voiced_ms(&audio))? / 20;
+        for partial in &partials[..count] {
+            if let Some(voice_end) = partial.voice_end_ms {
+                assert!(partial.vad_ms - voice_end < early_commit_ms, "{partial:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// AC-6.6b-3.
+    #[tokio::test]
+    async fn ac_6_6b_3_reset_drops_the_voice_end() -> anyhow::Result<()> {
+        let (before, after) = reset_partials().await?;
+        assert!(
+            before.voice_end_ms.is_some(),
+            "the audio is voiced: {before:?}"
+        );
+        assert_eq!(after.voice_end_ms, None);
         Ok(())
     }
 
