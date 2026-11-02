@@ -4,8 +4,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use jiff::Timestamp;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::Device;
@@ -23,10 +25,37 @@ pub struct Info {
     pub version: String,
 }
 
+/// Background work that the caller starts after it sends the reply.
+pub type Work = BoxFuture<'static, anyhow::Result<()>>;
+
+/// The reply to a request and the work after it.
+#[must_use]
+pub struct Handled {
+    /// The text to speak.
+    pub text: String,
+    /// The background work, if any.
+    pub after: Option<Work>,
+}
+
+/// The IDs that HA sends with a transcript.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Context {
+    /// The HA conversation.
+    pub conversation_id: Option<String>,
+    /// The HA device of the satellite.
+    pub device_id: Option<String>,
+    /// The satellite entity.
+    pub satellite_id: Option<String>,
+}
+
 /// The driving port that the Wyoming server calls.
+#[async_trait]
 pub trait Assistant: Send + Sync {
     /// The name and the version of the conversation agent.
     fn info(&self) -> Info;
+
+    /// The reply to the transcript `text` in `context` and the work after it.
+    async fn handle(&self, text: &str, context: Context) -> anyhow::Result<Handled>;
 }
 
 /// The house: HA states, registries, events and service calls.

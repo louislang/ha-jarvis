@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures::FutureExt;
-use futures::future::BoxFuture;
 use rand::rngs::StdRng;
 use serde_json::Map;
 use serde_json::Value;
@@ -24,23 +23,13 @@ use crate::domain::responses;
 use crate::domain::responses::Pools;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
+use crate::ports::Handled;
 use crate::ports::Home;
 use crate::ports::Store;
-
-/// Background work that the caller starts after it sends the reply.
-pub type Work = BoxFuture<'static, anyhow::Result<()>>;
+use crate::ports::Work;
 
 /// One change to the pools, applied by the pools task.
 pub type Change = Box<dyn FnOnce(Pools) -> Pools + Send>;
-
-/// The reply to a decision and the work after it.
-#[must_use]
-pub struct Handled {
-    /// The text to speak.
-    pub text: String,
-    /// The background work, if any.
-    pub after: Option<Work>,
-}
 
 /// Dispatches decisions to the home, the announce queues and the pools task.
 #[derive(Clone)]
