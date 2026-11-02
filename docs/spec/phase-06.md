@@ -226,6 +226,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - This sub-phase adds `asr.vad_model`, `asr.vad_threshold` and `asr.vad_min_silence_ms`.
 - `just models` also downloads the Silero VAD model `silero_vad.onnx`. It is one file, not an archive. Thus `fetch` extracts only `.tar.bz2` archives and checks a single file by its SHA-256.
 - `FakeStt` returns scripted partials with voice end times.
+- The first pass uses 4 threads. On the CPU, a real-time factor of less than 0.5 lets each 160 ms chunk decode in less than 80 ms, so the VAD, the speculative prediction and the early commit keep up.
 
 **Acceptance criteria.**
 
@@ -236,11 +237,12 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - AC-6.6b-5 [GPU host]: With `device = cuda`, the last word is in the partial less than 200 ms after the last voiced sample.
 - AC-6.6b-6 [GPU host]: With `device = cuda`, the real-time factor of the first pass is less than 0.1.
 - AC-6.6b-7 [GPU host]: With `device = cuda`, the first pass runs on the CUDA execution provider.
+- AC-6.6b-8 [GPU host]: With `device = cpu`, the real-time factor of the first pass is less than 0.5.
 
 **Proofs.**
 
 - P-6.6b-3. Argument: `reset` resets the VAD and sets the voice end to `None`.
-- P-6.6b-1, P-6.6b-2, P-6.6b-4 to P-6.6b-7. Evidence: test.
+- P-6.6b-1, P-6.6b-2, P-6.6b-4 to P-6.6b-8. Evidence: test.
 
 ---
 
