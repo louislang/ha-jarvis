@@ -64,12 +64,12 @@ This phase adds the driving port and the Wyoming adapter. HA can use Jarvis as i
 - **Implements:** G1, G3, G9. **Depends on:** 5.2.
 - **Files:** modify `src/app/conversation.rs`, `src/lib.rs`.
 
-**Model.** `handle(text, ctx)`: the satellite area is `area_of_device(ctx.device_id)`. The context is `context_text(area, [])`. Then `predict` with `normalize(text)` (in `spawn_blocking`, decision 29), `decide` and dispatch. An error from `predict` or `decide` gives `Err` with a `failure` text. `App` in `src/lib.rs` delegates `Assistant::handle` to this use case.
+**Model.** `handle(text, ctx)`: the satellite area is `area_of_device(ctx.device_id)`. The context is `context_text(name, [])`, where `name` is the name of that area in the hot cache. The training set uses the area names too (sub-phase 3.4), so the model sees the same text at inference. `Request.area` keeps the area ID for targeting. Then `predict` with `normalize(text)` (in `spawn_blocking`, decision 29), `decide` and dispatch. An error from `predict` or `decide` gives `Err` with a `failure` text. `App` in `src/lib.rs` delegates `Assistant::handle` to this use case.
 
 **Acceptance criteria.**
 
 - AC-5.3-1: When `handle` gets "turn on the lights" with a Kitchen `device_id` and `FakeClassifier` gives `lights_on` 0.9, it returns a `lights_on` response.
-- AC-5.3-2: When `handle` runs with a Kitchen `device_id`, `FakeClassifier` records the context `"area: kitchen | habits: none"`.
+- AC-5.3-2: When `handle` runs with a Kitchen `device_id`, `FakeClassifier` records the context `"area: Kitchen | habits: none"`.
 - AC-5.3-3: When the context has no `device_id`, the recorded context has `area: none`.
 - AC-5.3-4: When the decision is `Defer`, `handle` returns a filler text.
 - AC-5.3-5: When `predict` returns an error, `handle` returns `Err` with a `failure` text.
@@ -78,7 +78,7 @@ This phase adds the driving port and the Wyoming adapter. HA can use Jarvis as i
 
 **Proofs.**
 
-- P-5.3-2, P-5.3-3. Argument: the context is `context_text(area_of_device(id), [])`. With no ID, the area is `None`, and `context_text` writes `none` (P-3.3-2).
+- P-5.3-2, P-5.3-3. Argument: the context is `context_text` of the name of the area `area_of_device(id)`. With no ID, the area is `None`, and `context_text` writes `none` (P-3.3-2).
 - P-5.3-7. Argument: `handle` passes `normalize(text)` to `predict` (P-3.1-1).
 - P-5.3-5. Argument: errors from `predict` and `decide` go through one `map_err` to the failure response.
 - P-5.3-1, P-5.3-4, P-5.3-6. Evidence: test.
