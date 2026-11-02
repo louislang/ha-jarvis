@@ -144,7 +144,7 @@ Format:
 Every test gives the same result on every run with the same code.
 
 1. Time: application tests use `#[tokio::test(start_paused = true)]` and `FakeClock`. No test sleeps on the wall clock. A timing criterion is written as an order of events in virtual time ("returns before virtual time advances"). A paused clock jumps to the next timer when all tasks wait, also when a task waits for a real socket. Thus no timer runs while code waits for a real socket in a test with a paused clock. An adapter that has such timers connects to its fake server through an in-memory stream (`tokio::io::duplex`). An adapter over a real local socket (`wiremock`) checks its deadlines between requests. Tokio does not advance a paused clock while a `spawn_blocking` task runs. The pools task of sub-phase 4.8 runs in `spawn_blocking` until its last sender drops. Thus an application test with timers uses a pools task with no blocking thread.
-2. Randomness: every random source takes a seed. Tests use fixed seeds.
+2. Randomness: every random source takes a seed. Tests use fixed seeds. The TTS adapter fixes the Supertonic seed to 1, so `synth` and `speech(text)` give bit-identical audio for the same text.
 3. Network: tests use only local servers (`wiremock`, the fake HA server) and in-memory stores.
 4. Files: tests write only to temporary folders.
 5. Python: tests set `torch.manual_seed`, call `torch.use_deterministic_algorithms(True)` and run on the CPU.
@@ -154,7 +154,7 @@ Every test gives the same result on every run with the same code.
 ### 6.3 Test Structure
 
 1. Domain tests use no fakes. Application tests use port fakes, with no network and no models. Adapter tests use local servers, in-memory object stores or the models in `models/`.
-2. `just models` downloads the CPU models. `just gpu-models` downloads the GPU models and libraries. `just fixture-model` trains the fixture model.
+2. `just models` downloads the CPU models and libraries. `just gpu-models` downloads the GPU models and libraries. `just fixture-model` trains the fixture model.
 3. Coverage is more than 80% for all code written, from the first commit. Sub-phase 0.1 puts the coverage gate in the pre-commit hook and in CI before any other code.
 
 ## 7. PR, Commit and Required Check Rules

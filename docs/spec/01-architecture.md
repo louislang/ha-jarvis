@@ -155,7 +155,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 24. **Audio correlation.** HA sends the audio (`asr`) and the transcript (`handle`) on different connections with no shared ID. The speech use case keeps each committed utterance (text, audio, time) for `log.correlate_s`. For a voice request (a context with a `satellite_id`), the conversation use case finds the one utterance with the same normalized text and removes it. An ambiguous match gives no audio. Speaker identification uses the same correlation.
 25. **Logging is not on the critical path.** Jarvis writes the interaction after it returns `Handled`. Later announces and questions update the same record.
 26. **Feedback rules.** A bad action blocks that decision (intent and targets) for that normalized text at once. `decide` then uses the next entity candidate, then the next intent with enough probability. Else it sends the request to System Two with the bad action as a correction. A bad response leaves its pool. The next training run learns from all marks and corrections.
-27. **One ONNX Runtime, GPU or CPU.** `sherpa-onnx` (feature `shared`) and `ort` (feature `load-dynamic`) load the same ONNX Runtime 1.28 shared library. On the GPU host, it is the CUDA 12 and cuDNN 9 build from the sherpa-onnx `linux-x64-gpu` release. On other machines, it is the CPU build. Thus the two crates cannot conflict, and `device` selects the CUDA or the CPU execution provider for all models.
+27. **One ONNX Runtime, GPU or CPU.** `sherpa-onnx` (feature `shared`) and `ort` (feature `load-dynamic`) load the same ONNX Runtime 1.28.2 shared library from sherpa-onnx 2.0.1. On the GPU host, it is the CUDA 12 and cuDNN 9 build from the sherpa-onnx `linux-x64-gpu` release. On other machines, it is the CPU build. Thus the two crates cannot conflict, and `device` selects the CUDA or the CPU execution provider for all models.
 28. **Two-pass STT.** The first pass streams, so Jarvis knows the words while the user speaks. It uses NVIDIA Nemotron Speech Streaming EN 0.6B with 160 ms chunks on the GPU host. A 160 ms chunk is shorter than `early_commit_ms`, so the last words arrive inside the silence wait. At commit, the second pass decodes the whole utterance with NVIDIA Parakeet Unified EN 0.6B in offline mode. The second pass has full context, so it is more accurate. On the Open ASR Leaderboard sets, the average word error rate goes from 7.67% to 5.91%, and on LibriSpeech test-clean from 2.56% to 1.63%. HA receives the second-pass text. Both models are official sherpa-onnx exports. Cloud streaming APIs take about 250 ms to 300 ms to give the final text, so they cannot meet G1. CPU machines use the 20M zipformer for the first pass and have no second pass.
 29. **Blocking work off the async workers.** STT decoding, the second pass, `predict`, TTS synthesis, voice embedding and SQLite calls run in `tokio::task::spawn_blocking`. The async workers only move bytes and wait. Thus a decode for one satellite does not delay `handle` for another.
 
@@ -195,8 +195,8 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `futures` | Ports, application, adapters | `Stream` for events, partial transcripts and sentences. |
 | `async-trait` | Ports, application, adapters, root | Async methods on port traits behind `Arc<dyn Port>`. |
 | `tokio-tungstenite`, `futures-util` | Adapter | HA WebSocket API. |
-| `sherpa-onnx` (feature `shared`) | Adapter | Streaming STT (`OnlineRecognizer`), TTS (`OfflineTts`, Piper VITS models), voice identification (`SpeakerEmbeddingExtractor`, `SpeakerEmbeddingManager`). CUDA or CPU provider. |
-| `ort` (feature `load-dynamic`), `tokenizers` | Adapter | System One model prediction with ONNX Runtime (CUDA or CPU execution provider). Tokenizer from `tokenizer.json`. |
+| `sherpa-onnx` (`=2.0.1`, feature `shared`) | Adapter | Streaming STT (`OnlineRecognizer`), TTS (`OfflineTts`, Supertonic-3 model), voice identification (`SpeakerEmbeddingExtractor`, `SpeakerEmbeddingManager`). CUDA or CPU provider. |
+| `ort` (features `load-dynamic`, `cuda`), `tokenizers` | Adapter | System One model prediction with ONNX Runtime (CUDA or CPU execution provider). Tokenizer from `tokenizer.json`. |
 | `reqwest` | Adapter | RunPod serverless REST API. |
 | `object_store` (feature `aws`) | Adapter | RunPod network volume through its S3-compatible API. |
 | `async-openai` | Adapter | OpenAI Responses API: streaming, tools, structured output, `previous_response_id`. |
@@ -205,7 +205,7 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `hound` | Adapter | WAV encode for audio playback. |
 | `toml`, `tempfile` | Adapter, root | File stores with atomic write. Configuration. |
 | `wiremock` (dev) | Adapter tests | Mock OpenAI and RunPod servers. |
-| `rubato` (dev) | Test | Resample TTS audio to 16 kHz in `speech(text)`. |
+| `rubato` (dev) | Test | Resample TTS audio from 44.1 kHz to 16 kHz in `speech(text)`. |
 | `cargo-llvm-cov` (tool) | — | Coverage gate. |
 | `rust-code-analysis-cli` (tool) | — | Cyclomatic complexity, Halstead and Python function length metrics. `xtask complexity` reads its JSON output. |
 | `pre-commit` (tool) | — | Git hook manager. |
@@ -230,7 +230,7 @@ Python packages for `train/` (pinned in `train/pyproject.toml`):
 
 Jarvis does not use the `wyoming` crate. Version 0.2.1 turns on the `serde_json` feature `arbitrary_precision` for the whole build, and then a template no longer reads an HA number as a number (AC-4.5d-1). `adapters/wyoming.rs` reads the event type as a string and defines the data of each event that Jarvis uses with `serde`.
 
-`ort` and `sherpa-onnx` load one shared ONNX Runtime library (decision 27). `SHERPA_ONNX_LIB_DIR` points to the sherpa-onnx CUDA build on the GPU host and in the Linux release job. `ORT_DYLIB_PATH` points to the `libonnxruntime` in the same folder. Sub-phase 6.1 proves that both work in one process.
+`ort` and `sherpa-onnx` load one shared ONNX Runtime library (decision 27). One library folder holds `libonnxruntime` and the sherpa-onnx libraries: the CPU build from `just models`, or the CUDA build from `just gpu-models` on the GPU host and in the Linux release job. Every build sets `SHERPA_ONNX_LIB_DIR` to this folder, so no build downloads. At run time, `ORT_DYLIB_PATH` points to the `libonnxruntime` in the folder, and `LD_LIBRARY_PATH` (`DYLD_LIBRARY_PATH` on macOS) points to the folder. The recipes `test`, `cov` and `gpu-test`, CI and the environment file of the `jarvis` unit set these variables. Sub-phase 6.1 adds the folder. Sub-phase 6.2 proves that both crates work in one process.
 
 ## 8. Files
 
@@ -293,7 +293,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/domain/responses.rs` | Domain | Pools: select, render, record use, backfill policy, validation. | 4.1 |
 | `src/domain/select.rs` | Domain | Entity selection for an intent and an area. | 4.4 |
 | `src/domain/decide.rs` | Domain | `decide`: prediction and context to `Decision`. | 4.5 |
-| `src/domain/speech.rs` | Domain | Audio type, commit policy, audio chunks, sentence split, audio correlation. | 6.1 |
+| `src/domain/speech.rs` | Domain | Audio type, commit policy, audio chunks, sentence split, audio correlation. | 6.2 |
 | `src/domain/dialog.rs` | Domain | Dialog state, answer fill, cancel, turn limit. | 10.2 |
 | `src/domain/habits.rs` | Domain | Habit model: source, buckets, decay, scores, summary. | 11.1 |
 | `src/domain/feedback.rs` | Domain | Marks, corrections, feedback rules. | 12.3 |
@@ -308,7 +308,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/adapters/onnx.rs` | Adapter | `Classifier` and `ModelLoader` with ONNX Runtime. | 3.12 |
 | `src/adapters/files.rs` | Adapter | `Store<T>` with TOML or JSON files and atomic write. | 4.3 |
 | `src/adapters/wyoming.rs` | Driving adapter | Wyoming TCP server. It calls `Assistant`. | 5.1 |
-| `src/adapters/sherpa.rs` | Adapter | `SpeechToText` (first and second pass), `TextToSpeech`, `VoiceEmbedder`, `VoiceProfiles` with sherpa-onnx. | 6.1 |
+| `src/adapters/sherpa.rs` | Adapter | `SpeechToText` (first and second pass), `TextToSpeech`, `VoiceEmbedder`, `VoiceProfiles` with sherpa-onnx. | 6.2 |
 | `src/adapters/openai.rs` | Adapter | `Reasoner` with OpenAI. Prompt builders. | 7.1 |
 | `src/adapters/sqlite.rs` | Adapter | `InteractionLog` with SQLite. | 12.4 |
 | `src/adapters/web.rs` | Driving adapter | Review web server with token auth. It calls `Review`. | 12.8 |
@@ -363,7 +363,9 @@ endpoint_ms = 600
 max_utterance_ms = 8000
 
 [tts]
-model_dir = "models/vits-piper-en_US-lessac-medium"
+model_dir = "models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
+voice = 6     # speaker ID of the Supertonic voice style
+num_steps = 4 # denoising steps
 
 [openai]
 api_key_env = "OPENAI_API_KEY"
@@ -682,7 +684,7 @@ Training set file (the contract between Jarvis and `train/train.py`):
 | CI | `ubuntu-latest` | `cpu` | 20M zipformer | `just check`. |
 | RunPod | RunPod serverless | GPU | — | Training fallback. |
 
-The GPU host runs Jarvis as the systemd unit `jarvis`: `jarvis serve jarvis.toml` in a checkout of the release tag. An environment file of the unit holds the secrets and `ORT_DYLIB_PATH`, which points to the `libonnxruntime` in the release folder. The release binary finds the other shared libraries in its own folder (sub-phase 6.2). Port 10700 (Wyoming) has no authentication, so the host firewall accepts it only from the HA host.
+The GPU host runs Jarvis as the systemd unit `jarvis`: `jarvis serve jarvis.toml` in a checkout of the release tag. An environment file of the unit holds the secrets, `ORT_DYLIB_PATH`, which points to the `libonnxruntime` in the release folder, and `LD_LIBRARY_PATH`, which points to the release folder (sub-phase 6.1). Port 10700 (Wyoming) has no authentication, so the host firewall accepts it only from the HA host.
 
 VRAM budget on the GPU host (6 GB):
 
@@ -691,13 +693,13 @@ VRAM budget on the GPU host (6 GB):
 | STT first pass (Nemotron 0.6B) | 1.5 GB |
 | STT second pass (Parakeet Unified 0.6B) | 1.5 GB |
 | System One model | 0.3 GB |
-| TTS (Piper VITS) and voice identification (CAM++) | 0.4 GB |
+| TTS (Supertonic-3) and voice identification (CAM++) | 0.4 GB |
 | ONNX Runtime arenas and CUDA context | 0.8 GB |
 | Local training run (MiniLM, fp16, `batch_size = 8`) | 1.0 GB |
 | Reserve (not usable on a 6 GB card) | 0.5 GB |
 | **Total** | **6.0 GB** |
 
-The model budgets assume fp16 weights. The int8 models use less. The usable budget is 5.5 GB, below the 5.8 GB limit of AC-13.10-5. GPU host tests measure the real peak and check that each model runs on the CUDA execution provider (AC-3.12b-3, AC-6.2-2, AC-6.6-9, AC-6.7-5, AC-15.3-7). The process trainer limits the PyTorch memory of a local run to `train.max_vram_gb` (`torch.cuda.set_per_process_memory_fraction`), so a run cannot take the memory of the live models. If a local run fails with "CUDA out of memory", the run moves to RunPod (decision 12). Live STT never stops for training.
+The model budgets assume fp16 weights. The int8 models use less. The usable budget is 5.5 GB, below the 5.8 GB limit of AC-13.10-5. GPU host tests measure the real peak and check that each model runs on the CUDA execution provider (AC-3.12b-3, AC-6.1-3, AC-6.2-5, AC-6.6-9, AC-6.7-5, AC-15.3-7). The process trainer limits the PyTorch memory of a local run to `train.max_vram_gb` (`torch.cuda.set_per_process_memory_fraction`), so a run cannot take the memory of the live models. If a local run fails with "CUDA out of memory", the run moves to RunPod (decision 12). Live STT never stops for training.
 
 The GPU host needs the NVIDIA driver, CUDA 12, cuDNN 9, and a Python 3.12 virtual environment in `.venv` with `pip install ./train`.
 
