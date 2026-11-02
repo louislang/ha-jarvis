@@ -478,7 +478,7 @@ This phase selects responses, selects entities and decides the action from a pre
 
 - `dispatch(decision, satellite)` gets the satellite of the request, or none. Text from the HA UI, for example, has no satellite.
 - A dispatch with a satellite increases the generation of that satellite. `handle` does not exist until sub-phase 5.3, so `dispatch` increases it. The `after` work of a `Reply` keeps this generation.
-- When the call of a `Reply` fails, `after` logs the error. With a satellite, it also puts an answer from `failure` in the queue of the satellite (sub-phase 4.9b), with the generation of its request. `responses::select` picks the answer from the current pools. Jarvis does not retry a failed call.
+- When the call of a `Reply` fails, `after` logs the error. With a satellite, it also puts an answer from `failure` in the queue of the satellite (sub-phase 4.9b), with the generation of its request. `responses::select` picks the answer from the current pools. Each answer that `after` picks sends `record_use` to the pools task, as dispatch does for its `Chosen` (sub-phase 4.8). Thus the next `failure` answer is not the same. Jarvis does not retry a failed call.
 - The service call of a `Reply` is never cancelled. The generation compare runs only before an announce and before the steps of a deferred job (sub-phase 4.9d), not before the call of a `Reply`. Thus a quick second request does not stop the call of the first command.
 - Without a satellite, dispatch returns the reply text as in sub-phase 4.8. A failed call only logs the error and puts nothing in a queue.
 
@@ -487,12 +487,13 @@ This phase selects responses, selects entities and decides the action from a pre
 - AC-4.9c-1: When a failed `Reply` call puts an answer in the queue and the satellite becomes idle 1.5 s after the reply, the announce starts at 1.5 s plus `margin_ms`, and not before.
 - AC-4.9c-2: When `FakeHome` returns an error for the call of a `Reply` with a satellite, `FakeHome` records an announce from `failure` and no second call.
 - AC-4.9c-3: When a second dispatch for the satellite runs before the `failure` answer of the first is announced, `FakeHome` records no announce of the first.
+- AC-4.9c-4: When a failed `Reply` call puts a `failure` answer in the queue, the pools task gets `record_use` for `failure` and the index of that answer.
 
 **Proofs.**
 
 - P-4.9c-1 (AC-4.9c-1). Requires: `AnnounceWhenIdle` (P-4.7-2). Argument: the `failure` answer is an item of the announce queue. The item waits for `idle` on the watch channel and then for `margin_ms` before it calls `announce` (sub-phase 4.9b), which matches the `start` guard of the model.
 - P-4.9c-3 (AC-4.9c-3). Requires: `NoStaleAnnounce` (P-4.7-4). Argument: the item compares its generation before the announce (sub-phase 4.9b), and the second dispatch increased it.
-- P-4.9c-2. Evidence: test.
+- P-4.9c-2 and P-4.9c-4. Evidence: test.
 
 ---
 
