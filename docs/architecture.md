@@ -54,6 +54,7 @@ flowchart LR
     crate_app_conversation --> crate_app_conversation
     crate_app_conversation --> crate_domain_decide
     crate_app_conversation --> crate_domain_responses
+    crate_app_conversation --> crate_domain_state
     crate_app_conversation --> crate_domain_state_cache
     crate_app_conversation --> crate_ports
     crate_domain_catalog --> crate_domain_contracts

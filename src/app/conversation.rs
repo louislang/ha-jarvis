@@ -11,6 +11,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use rand::rngs::StdRng;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -18,6 +19,7 @@ use crate::domain::decide::Chosen;
 use crate::domain::decide::Decision;
 use crate::domain::responses;
 use crate::domain::responses::Pools;
+use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
 use crate::ports::Home;
 use crate::ports::Store;
@@ -37,44 +39,85 @@ pub struct Handled {
     pub after: Option<Work>,
 }
 
-/// Dispatches decisions to the home and the pools task.
+/// Dispatches decisions to the home, the announce queues and the pools task.
 pub struct Conversation {
-    /// The house.
-    home: Arc<dyn Home>,
+    /// The current pools.
+    pools: Arc<ArcSwap<Pools>>,
     /// The sender of the changes to the pools task.
     changes: mpsc::Sender<Change>,
+    /// The announce queues and their house.
+    queues: Arc<Queues>,
+    /// The random source of the `failure` answers.
+    rng: Arc<Mutex<StdRng>>,
 }
 
 impl Conversation {
-    /// Dispatches to `home` and to the pools task of `changes`.
+    /// Dispatches to `queues`, their house and the pools task of `pools` and `changes`. Selects
+    /// the `failure` answers with `rng`.
     #[must_use]
-    pub fn new(home: Arc<dyn Home>, changes: mpsc::Sender<Change>) -> Self {
-        Self { home, changes }
+    pub fn new(
+        pools: Arc<ArcSwap<Pools>>,
+        changes: mpsc::Sender<Change>,
+        queues: Arc<Queues>,
+        rng: StdRng,
+    ) -> Self {
+        Self {
+            pools,
+            changes,
+            queues,
+            rng: Arc::new(Mutex::new(rng)),
+        }
     }
 
     /// The reply of `decision` and its service call as background work. Records the use of the
-    /// reply.
-    pub fn dispatch(&self, decision: Decision) -> Handled {
+    /// reply. Increases the generation of `satellite`, the satellite entity of the request.
+    pub fn dispatch(&self, decision: Decision, satellite: Option<&str>) -> Handled {
         let (chosen, call) = match decision {
             Decision::Reply { reply, call } => (reply, call),
             Decision::Defer { filler, .. } => (filler, None),
             Decision::Fallback { reply } => (reply, None),
         };
         let Chosen { text, pool, index } = chosen;
-        // The task holds the receiver until every sender drops, so the send fails only after a panic.
-        let _ = self.changes.send(Box::new(move |pools| {
-            responses::record_use(pools, &pool, index)
-        }));
-        let after = call.map(|call| {
-            let home = Arc::clone(&self.home);
-            async move {
-                home.call(call).await?;
-                Ok(())
-            }
-            .boxed()
-        });
+        record_use(&self.changes, pool, index);
+        let request = satellite
+            .map(|satellite| (satellite.to_owned(), self.queues.next_generation(satellite)));
+        let after = call.map(|call| self.after(call, request));
         Handled { text, after }
     }
+
+    /// Makes `call`. When it fails, logs the error, queues a `failure` answer on the satellite
+    /// of `request` with the generation of `request`, and records its use.
+    fn after(&self, call: ServiceCall, request: Option<(String, u64)>) -> Work {
+        let (pools, queues) = (Arc::clone(&self.pools), Arc::clone(&self.queues));
+        let (changes, rng) = (self.changes.clone(), Arc::clone(&self.rng));
+        async move {
+            let Err(error) = queues.home.call(call).await else {
+                return Ok(());
+            };
+            tracing::warn!("the call failed: {error:#}");
+            let Some((satellite, generation)) = request else {
+                return Ok(());
+            };
+            let (text, index) = {
+                let pools = pools.load();
+                let pool = pools.get("failure").expect("valid pools have failure");
+                let index =
+                    responses::select(pool, &mut rng.lock().expect("no lock holder panics"));
+                (pool.responses[index].text.clone(), index)
+            };
+            record_use(&changes, "failure".to_owned(), index);
+            queues.announce(&satellite, generation, &text).await
+        }
+        .boxed()
+    }
+}
+
+/// Sends the use of the response at `index` of the pool `pool` to the pools task of `changes`.
+fn record_use(changes: &mpsc::Sender<Change>, pool: String, index: usize) {
+    // The task holds the receiver until every sender drops, so the send fails only after a panic.
+    let _ = changes.send(Box::new(move |pools| {
+        responses::record_use(pools, &pool, index)
+    }));
 }
 
 /// The announce queue and the generation of one satellite.
@@ -241,6 +284,7 @@ mod tests {
     use quint_connect::Step;
     use quint_connect::quint_run;
     use quint_connect::switch;
+    use rand::SeedableRng;
     use serde::Deserialize;
     use tokio::runtime::Runtime;
     use tokio::time::Instant;
@@ -262,8 +306,8 @@ mod tests {
     /// The `announce.idle_wait_s` of the tests. No conformance trace runs this long.
     const IDLE_WAIT: Duration = Duration::from_secs(3600);
 
-    /// The pool `lights_on` with the responses and use counts `lights`, and the pool `fallback`
-    /// with one response used `fallback` times.
+    /// The pool `lights_on` with the responses and use counts `lights`, the pool `fallback` with
+    /// one response used `fallback` times, and the pool `failure`.
     fn pools(lights: &[(&str, u64)], fallback: u64) -> Pools {
         let pool = |texts: &[(&str, u64)]| {
             let responses = texts.iter().map(|&(text, uses)| Response {
@@ -279,6 +323,7 @@ mod tests {
         Pools::from([
             ("lights_on".to_owned(), lights),
             ("fallback".to_owned(), fallback),
+            ("failure".to_owned(), pool(&[("Failed.", 0)])),
         ])
     }
 
@@ -318,7 +363,9 @@ mod tests {
     fn start(home: &Arc<FakeHome>) -> anyhow::Result<Started> {
         let store = Arc::new(FakeStore::new(None));
         let task = start_pools(&FakeStore::new(Some(unused())), Arc::clone(&store) as _)?;
-        let conversation = Conversation::new(Arc::clone(home) as _, task.changes.clone());
+        let queues = Arc::new(queues(home, "idle").1);
+        let (pools, changes) = (Arc::clone(&task.pools), task.changes.clone());
+        let conversation = Conversation::new(pools, changes, queues, StdRng::seed_from_u64(1));
         Ok((task, store, conversation))
     }
 
@@ -341,7 +388,7 @@ mod tests {
         });
         let (_task, _store, conversation) = start(&home)?;
         let start = Instant::now();
-        let handled = conversation.dispatch(reply(Some(call())));
+        let handled = conversation.dispatch(reply(Some(call())), None);
         assert_eq!(Instant::now(), start, "dispatch waited for the call");
         assert!(handled.after.is_some(), "the call is not in after");
         Ok(())
@@ -352,7 +399,7 @@ mod tests {
     async fn ac_4_8_2_call_only_after_start() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
         let (_task, _store, conversation) = start(&home)?;
-        let after = conversation.dispatch(reply(Some(call()))).after;
+        let after = conversation.dispatch(reply(Some(call())), None).after;
         assert_eq!(home.calls(), [], "a call came before the start");
         after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
         assert_eq!(home.calls(), [call()]);
@@ -363,7 +410,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_4_8_3_store_receives_new_use_count() -> anyhow::Result<()> {
         let started = start(&Arc::new(FakeHome::default()))?;
-        let _ = started.2.dispatch(reply(Some(call())));
+        let _ = started.2.dispatch(reply(Some(call())), None);
         let expected = responses::record_use(unused(), "lights_on", 1);
         assert_eq!(last_save(started).await?, expected);
         Ok(())
@@ -374,7 +421,7 @@ mod tests {
     async fn ac_4_8_4_reply_without_call_makes_no_call() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
         let (_task, _store, conversation) = start(&home)?;
-        let handled = conversation.dispatch(reply(None));
+        let handled = conversation.dispatch(reply(None), None);
         assert!(handled.after.is_none(), "a reply with no call has work");
         assert_eq!(home.calls(), []);
         Ok(())
@@ -385,7 +432,7 @@ mod tests {
     async fn ac_4_8_5_fallback_has_text_and_no_after() -> anyhow::Result<()> {
         let (_task, _store, conversation) = start(&Arc::new(FakeHome::default()))?;
         let reply = chosen("fallback", 0);
-        let handled = conversation.dispatch(Decision::Fallback { reply });
+        let handled = conversation.dispatch(Decision::Fallback { reply }, None);
         assert_eq!(handled.text, "Sorry.");
         assert!(handled.after.is_none(), "a fallback has work");
         Ok(())
@@ -397,7 +444,7 @@ mod tests {
         let started = start(&Arc::new(FakeHome::default()))?;
         thread::scope(|scope| {
             for _ in 0..100 {
-                scope.spawn(|| started.2.dispatch(reply(None)));
+                scope.spawn(|| started.2.dispatch(reply(None), None));
             }
         });
         let saved = last_save(started).await?;
@@ -483,6 +530,88 @@ mod tests {
         tokio::join!(queues.announce(SATELLITE, generation, "Done."), busy).0?;
         assert_eq!(Instant::now() - start, MARGIN / 3 + busy_for + MARGIN);
         assert_eq!(announces(&home), ["Done."]);
+        Ok(())
+    }
+
+    /// A conversation on `home` with the queues of `queues(home, value)`, the pools `unused()`
+    /// and the receiver of its changes. It has no pools task, because a running blocking task
+    /// stops the paused clock.
+    fn still(
+        home: &Arc<FakeHome>,
+        value: &str,
+    ) -> (
+        watch::Sender<StateCache>,
+        mpsc::Receiver<Change>,
+        Conversation,
+    ) {
+        let (cache, queues) = queues(home, value);
+        let pools = Arc::new(ArcSwap::from_pointee(unused()));
+        let (changes, receiver) = mpsc::channel();
+        let rng = StdRng::seed_from_u64(1);
+        let conversation = Conversation::new(pools, changes, Arc::new(queues), rng);
+        (cache, receiver, conversation)
+    }
+
+    /// The work of a dispatch on the satellite of a reply with `call()`, whose call fails.
+    fn failed(home: &FakeHome, conversation: &Conversation) -> anyhow::Result<Work> {
+        drop(home.delay());
+        let handled = conversation.dispatch(reply(Some(call())), Some(SATELLITE));
+        handled.after.ok_or_else(|| anyhow::anyhow!("no after"))
+    }
+
+    /// AC-4.9c-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_4_9c_1_failure_announce_starts_margin_after_idle() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (cache, _changes, conversation) = still(&home, "responding");
+        let (start, busy_for) = (Instant::now(), Duration::from_millis(1500));
+        let after = failed(&home, &conversation)?;
+        let idle = async {
+            tokio::time::sleep(busy_for).await;
+            set(&cache, "idle");
+        };
+        tokio::join!(after, idle).0?;
+        assert_eq!(Instant::now() - start, busy_for + MARGIN);
+        assert_eq!(announces(&home), ["Failed."]);
+        Ok(())
+    }
+
+    /// AC-4.9c-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_4_9c_2_failed_call_announces_failure_once() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (_cache, _changes, conversation) = still(&home, "idle");
+        failed(&home, &conversation)?.await?;
+        let calls = home.calls();
+        assert_eq!(calls.len(), 2, "not one call and one announce: {calls:?}");
+        assert_eq!(calls[0], call());
+        assert_eq!(announces(&home), ["Failed."]);
+        Ok(())
+    }
+
+    /// AC-4.9c-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_4_9c_3_new_dispatch_drops_old_failure() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (_cache, _changes, conversation) = still(&home, "idle");
+        let first = failed(&home, &conversation)?;
+        let _ = conversation.dispatch(reply(None), Some(SATELLITE));
+        first.await?;
+        assert_eq!(announces(&home), [] as [&str; 0]);
+        Ok(())
+    }
+
+    /// AC-4.9c-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_4_9c_4_failure_answer_records_use() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (_cache, changes, conversation) = still(&home, "idle");
+        failed(&home, &conversation)?.await?;
+        let applied = changes
+            .try_iter()
+            .fold(unused(), |pools, change| change(pools));
+        let reply = responses::record_use(unused(), "lights_on", 1);
+        assert_eq!(applied, responses::record_use(reply, "failure", 0));
         Ok(())
     }
 
