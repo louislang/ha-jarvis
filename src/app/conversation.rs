@@ -26,6 +26,7 @@ use crate::domain::intent;
 use crate::domain::model::Prediction;
 use crate::domain::responses;
 use crate::domain::responses::Pools;
+use crate::domain::state::AreaId;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
 use crate::domain::training;
@@ -84,16 +85,15 @@ impl Conversation {
     }
 
     /// The reply to the transcript `text` in `context` and its work: the System One prediction
-    /// of the normalized text in the area of the satellite device, its decision and its dispatch.
+    /// of the normalized text in the area name of the satellite device, its decision and its
+    /// dispatch.
     ///
     /// # Errors
     ///
     /// The prediction fails. The error text is a `failure` answer.
     pub async fn handle(&self, text: &str, context: Context) -> anyhow::Result<Handled> {
-        let cache = &self.queues.cache;
-        let area = (context.device_id.as_deref())
-            .and_then(|device| cache.borrow().area_of_device(device).cloned());
-        let model_context = training::context_text(area.as_ref().map(|area| area.0.as_str()), &[]);
+        let (area, name) = self.area(context.device_id.as_deref());
+        let model_context = training::context_text(name.as_deref(), &[]);
         let prediction = self
             .classifier
             .predict(&model_context, &intent::normalize(text))
@@ -108,6 +108,16 @@ impl Conversation {
         };
         let decision = self.decide(&prediction, &request);
         Ok(self.dispatch(decision, context.satellite_id.as_deref()))
+    }
+
+    /// The ID and the name of the area of the device `device` in the hot cache.
+    fn area(&self, device: Option<&str>) -> (Option<AreaId>, Option<String>) {
+        let cache = self.queues.cache.borrow();
+        let Some(id) = device.and_then(|device| cache.area_of_device(device)) else {
+            return (None, None);
+        };
+        let area = cache.areas.iter().find(|area| &area.area_id == id);
+        (Some(id.clone()), area.map(|area| area.name.clone()))
     }
 
     /// The decision for `prediction` of `request` in the current hot cache and pools.
@@ -893,7 +903,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_5_3_2_kitchen_device_gives_the_kitchen_context() {
         let (_, calls) = handled(Some("lights_on"), "turn on the lights", Some(KITCHEN)).await;
-        assert_eq!(calls[0].0, "area: kitchen | habits: none");
+        assert_eq!(calls[0].0, "area: Kitchen | habits: none");
     }
 
     /// AC-5.3-3.
