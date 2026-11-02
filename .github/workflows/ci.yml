@@ -82,6 +82,15 @@ jobs:
           path: models/system-one/fixture
           key: fixture-model-${{ hashFiles('target/fixture/train.json', 'train/**') }}
       - run: just fixture-model
+      # The fixture model has its own cache.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            models
+            !models/system-one
+          key: models-${{ runner.os }}-${{ hashFiles('justfile') }}
+          restore-keys: models-${{ runner.os }}-
+      - run: just models
       - run: just cov
 
   bench:
@@ -150,6 +159,9 @@ jobs:
     runs-on: [self-hosted, linux, gpu]
     steps:
       - uses: actions/checkout@v7
+        # Keeps the files of `just gpu-models` between runs.
+        with:
+          clean: false
       - uses: extractions/setup-just@v4
         with:
           just-version: "1.59.0"

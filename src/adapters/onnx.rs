@@ -249,6 +249,7 @@ fn top(logits: &[f32]) -> usize {
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
     use std::time::Duration;
     use std::time::Instant;
 
@@ -448,6 +449,45 @@ mod tests {
                 assert_eq!(error.as_deref(), Some(expected), "{intent:?} and {slots:?}");
             }
         }
+        Ok(())
+    }
+
+    /// The `libonnxruntime` that `ORT_DYLIB_PATH` names.
+    ///
+    /// # Panics
+    ///
+    /// `ORT_DYLIB_PATH` is not set or does not name a `libonnxruntime` in `models/`.
+    fn runtime() -> anyhow::Result<PathBuf> {
+        let library = PathBuf::from(std::env::var("ORT_DYLIB_PATH")?);
+        assert!(
+            library.file_stem() == Some("libonnxruntime".as_ref())
+                && fs::canonicalize(&library)?.starts_with(fs::canonicalize("models")?),
+            "ORT_DYLIB_PATH is {}",
+            library.display()
+        );
+        Ok(library)
+    }
+
+    /// AC-6.1-2.
+    #[tokio::test]
+    async fn ac_6_1_2_tests_load_the_library_folder() -> anyhow::Result<()> {
+        runtime()?;
+        let classifier = OnnxLoader.load(Path::new(FIXTURE), Device::Cpu).await?;
+        classifier.predict(CONTEXT, TEXT).await?;
+        Ok(())
+    }
+
+    /// AC-6.1-3.
+    #[test]
+    #[ignore = "GPU host"]
+    fn ac_6_1_3_cuda_runs_on_the_shared_library() -> anyhow::Result<()> {
+        let provider = runtime()?.with_file_name("libonnxruntime_providers_cuda.so");
+        assert!(provider.is_file(), "{} is missing", provider.display());
+        let providers = providers(Device::Cuda)?;
+        assert!(
+            providers.contains("CUDAExecutionProvider"),
+            "providers are {providers:?}"
+        );
         Ok(())
     }
 

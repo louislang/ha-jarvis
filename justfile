@@ -15,14 +15,60 @@ valgrind_version := "1:3.26.0-0ubuntu1"
 gungraun_runner_version := "0.20.0"
 # The tools of the `python` recipe.
 venv := justfile_directory() / ".venv/bin"
+# The release downloads of sherpa-onnx.
+sherpa_onnx := "https://github.com/k2-fsa/sherpa-onnx/releases/download"
+# The library folder of the sherpa-onnx 2.0.1 CPU shared libraries for the host system.
+cpu_libraries := justfile_directory() / "models" / ("sherpa-onnx-v2.0.1-" + (if os() == "macos" { "osx" } else { "linux" }) + "-x64-shared-lib") / "lib"
+# The library folder of the sherpa-onnx 2.0.1 CUDA 12 shared libraries.
+cuda_libraries := justfile_directory() / "models/sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu/lib"
+# The SHA-256 of each file of `models`.
+cpu_sums := if os() == "macos" { "be9042971c5d1b14da76a960534d2a8cdb6f0e5e02f5e1dc8bddff8576359bdd  sherpa-onnx-v2.0.1-osx-x64-shared-lib.tar.bz2" } else { "532c45bbd41036d83cd70606797529aa8086c2053395a58967736c727625b120  sherpa-onnx-v2.0.1-linux-x64-shared-lib.tar.bz2" }
+# The SHA-256 of each file of `gpu-models`, one list for each archive.
+cuda_sums := "2aa541a65c1e7d921a053283419b70b30c1f6ae0a0f52f64b947ebe88c5f2a77  sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu.tar.bz2"
+nemotron_sums := """
+    0ae73a41cd51599dc7cac9ac083d9d35de53d762ca45923505fde47a3751814b  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25.tar.bz2
+    71111f61b18e1e65e01e369434a5c0434868d2f44892742ae54240600c681209  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/encoder.int8.onnx
+    0be9702c2f427a2b6bb241d298e0d3836a558de1f5b9fd3018f1cce6e2b3fa98  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/decoder.int8.onnx
+    a35eac38a22ebceb04d230ed7afe0d68f446ba6914a036b97f14fece95967e23  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/joiner.int8.onnx
+    dc0b4584ab2e4ddbf888425c076c61b736e7356a015250db7d307e6f1a8188ff  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/tokens.txt"""
+parakeet_sums := """
+    99f63605b3a85a54c250c0869670a687b7d6598a47bf2421515e1f839a76e150  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming.tar.bz2
+    6716910b7a0833997fec7a410494c995d70124001a0e9b66d6370d6aced577e0  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming/encoder.int8.onnx
+    a5e223392c90e75f8144cdb5eb95af7625db389e39edef2bd1a9c872b3298fe6  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming/decoder.int8.onnx
+    869f43f7d24595c55581ad3bf249a935fb8a71389fbdaa7504b9f46f93140f8a  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming/joiner.int8.onnx
+    dc0b4584ab2e4ddbf888425c076c61b736e7356a015250db7d307e6f1a8188ff  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming/tokens.txt"""
+# The environment that loads the ONNX Runtime of `cpu_libraries`.
+cpu_runtime := "ORT_DYLIB_PATH=" + quote(cpu_libraries / "libonnxruntime." + if os() == "macos" { "dylib" } else { "so" }) + (if os() == "macos" { " DYLD_LIBRARY_PATH=" } else { " LD_LIBRARY_PATH=" }) + quote(cpu_libraries)
 
 # Run the tests.
 test:
-    cargo test --workspace --release
+    {{ cpu_runtime }} cargo test --workspace --release
 
 # Run the tests with the coverage gate.
 cov:
-    cargo llvm-cov --workspace --release --fail-under-lines 80.01
+    {{ cpu_runtime }} cargo llvm-cov --workspace --release --fail-under-lines 80.01
+
+# Download the CPU libraries and models.
+models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums)
+
+# Download the GPU models and the CUDA libraries.
+gpu-models: (fetch sherpa_onnx + "/v2.0.1" cuda_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/asr-models" parakeet_sums)
+
+# Download the archive of the first line of `sums` from `release` and extract it in `models/`, unless its folder exists and each file of `sums` has its SHA-256.
+fetch release sums:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    mkdir -p models
+    cd models
+    line=$(head -n 1 <<< "{{ sums }}")
+    archive=${line#*  }
+    if [ -d "${archive%.tar.bz2}" ] && shasum -a 256 --check --status <<< "{{ sums }}" 2> /dev/null; then exit 0; fi
+    if ! shasum -a 256 --check --status <<< "$line" 2> /dev/null; then
+        curl -sSfL -o "$archive" "{{ release }}/$archive"
+        shasum -a 256 --check --quiet <<< "$line"
+    fi
+    tar -xjf "$archive"
+    shasum -a 256 --check --quiet <<< "{{ sums }}"
 
 # Check the format of the Rust code.
 format:
@@ -75,8 +121,8 @@ bench:
     cargo bench --bench domain
 
 # Run the `[GPU host]` tests on CUDA.
-gpu-test:
-    JARVIS_DEVICE=cuda cargo test --workspace --release -- --ignored
+gpu-test: gpu-models
+    JARVIS_DEVICE=cuda ORT_DYLIB_PATH={{ quote(cuda_libraries / "libonnxruntime.so") }} LD_LIBRARY_PATH={{ quote(cuda_libraries) }} cargo test --workspace --release -- --ignored
 
 # Write the architecture diagram.
 diagram:
@@ -115,7 +161,7 @@ fixture-stale stamp:
     [ "$hash" != "$(cat "{{ stamp }}" 2> /dev/null)" ]
 
 # Run the checks of the pre-commit hook.
-check: workflow-lint format lint complexity duplication architecture diagram quint python verus fixture-model cov
+check: workflow-lint format lint complexity duplication architecture diagram quint python verus models fixture-model cov
     {{ if os() == "linux" { "just bench" } else { "" } }}
     {{ if env("JARVIS_DEVICE", "") == "cuda" { "just gpu-test" } else { "" } }}
 

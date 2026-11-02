@@ -1097,7 +1097,8 @@ fn ac_0_13_2_check_runs_gpu_test_on_cuda() {
 /// `gpu-test` passes a crate with no ignored tests.
 #[test]
 fn ac_0_13_3_gpu_test_passes_no_ignored_tests() {
-    assert_passes(&recipe_on_fixture("gpu-test", HALF_COVERED));
+    let fixture = fixture_crate(HALF_COVERED);
+    assert_passes(&recipe_in(fixture.path(), &["--no-deps", "gpu-test"]));
 }
 
 /// The `gpu-test` job stops `jarvis` before the tests and always starts it again after them.
@@ -1930,5 +1931,56 @@ fn ac_3_10_2_train_image_has_no_dev_packages() {
     assert!(
         !failed.status.success() && String::from_utf8_lossy(&failed.stdout).contains("Pytest-Cov"),
         "the check fails and names the dev package: {failed:?}"
+    );
+}
+
+/// The value of the `justfile` variable `name`.
+fn evaluate(name: &str) -> String {
+    stdout_in_root("just", &["--evaluate", name])
+}
+
+/// After `just models`, the library folder exists and each file of `cpu_sums` has its SHA-256, and `check` and `rust-test` run `models` before `cov`.
+#[test]
+fn ac_6_1_1_models_writes_library_folder() {
+    let folder = evaluate("cpu_libraries");
+    assert!(Path::new(&folder).is_dir(), "{folder} exists");
+    let sums = fixture_file("models.sha256", &evaluate("cpu_sums"));
+    assert_passes(&run(Command::new("shasum")
+        .args(["-a", "256", "--check"])
+        .arg(sums.path().join("models.sha256"))
+        .current_dir(root().join("models"))));
+    assert_check_runs_after("models", "cov");
+    let ci = yaml(".github/workflows/ci.yml");
+    let runs = runs(&ci, "rust-test");
+    let position = |command: &str| runs.iter().position(|run| *run == command);
+    assert!(
+        matches!((position("just models"), position("just cov")), (Some(models), Some(cov)) if models < cov),
+        "rust-test runs just models before just cov: {runs:?}"
+    );
+}
+
+/// The verification step of the Linux build checks `libonnxruntime`, the CUDA provider and `ldd` with `LD_LIBRARY_PATH` set to the extracted folder.
+#[test]
+fn ac_6_1_4_linux_archive_has_cuda_libraries() {
+    let release = yaml(".github/workflows/release.yml");
+    let verify = runs(&release, "build")
+        .into_iter()
+        .find(|run| run.contains("./jarvis"))
+        .expect("a step verifies the archive");
+    let (_, linux) = verify
+        .split_once("if [ \"$RUNNER_OS\" = Linux ]; then")
+        .expect("the step has a Linux branch");
+    let (linux, _) = linux.split_once("else").expect("the Linux branch ends");
+    let parts = [
+        "LD_LIBRARY_PATH=\"$PWD\"",
+        "test -f libonnxruntime.so",
+        "test -f libonnxruntime_providers_cuda.so",
+        "libraries=$(ldd ./jarvis)",
+        "if grep 'not found' <<< \"$libraries\"; then exit 1; fi",
+    ];
+    let positions: Vec<Option<usize>> = parts.iter().map(|part| linux.find(part)).collect();
+    assert!(
+        positions.iter().all(Option::is_some) && positions.is_sorted(),
+        "the Linux branch has {parts:?} in order: {linux}"
     );
 }
