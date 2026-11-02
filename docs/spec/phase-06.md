@@ -48,7 +48,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - `TextToSpeech::synth(text) -> Result<Audio>`. `Audio { samples: Vec<i16>, rate }` is in `src/domain/speech.rs`.
 - `SherpaTts` wraps `OfflineTts` with the Supertonic-3 model in `[tts].model_dir`, the speaker ID `[tts].voice` and `[tts].num_steps`. The adapter fixes `lang = "en"` and `seed = 1`. Thus the same text gives bit-identical samples on every run. The model rate is 44.1 kHz.
 - `sherpa-onnx` is `=2.0.1` with feature `shared`. Each recipe and CI job that builds `jarvis` sets `SHERPA_ONNX_LIB_DIR` to the library folder of sub-phase 6.1, so no build downloads. `gpu-test` and the Linux release job set it to the CUDA library folder.
-- `just models` also downloads the 20M zipformer and the Supertonic-3 model `sherpa-onnx-supertonic-3-tts-int8-2026-05-11` into `models/`.
+- `just models` also downloads the 20M zipformer and the Supertonic-3 model `sherpa-onnx-supertonic-3-tts-int8-2026-05-11` into `models/`. `gpu-test` runs `models` and `gpu-models`, so the GPU host has the Supertonic-3 model too.
 - `device` selects the provider for `SherpaTts`.
 - sherpa-onnx falls back to the CPU with only a log line when the CUDA provider does not load. Thus a test checks the CUDA provider of a sherpa-onnx model by the GPU memory of the test process (`nvidia-smi`): the memory grows when the model loads.
 
@@ -67,38 +67,58 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 ---
 
-### 6.3 Audio Cache and Speak
+### 6.3 Audio Chunks and Duration
 
-**Goal:** Add the speech use case with `speak` and the audio cache, and pre-render every pool response at startup. A TTS request for a known response is now a memory read.
+**Goal:** Add `chunks` and `duration` to the speech domain. The Wyoming adapter can later send audio in chunks of a fixed size.
 
-- **Implements:** G1, G4. **Depends on:** 6.2.
-- **Files:** create `src/app/speech.rs`. Modify `src/domain/speech.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `benches/domain.rs`.
+- **Implements:** G1. **Depends on:** 6.2.
+- **Files:** modify `src/domain/speech.rs`, `src/domain/contracts.rs`.
+
+**Model.**
+
+- `chunks(audio, size) -> Vec<&[i16]>` and `duration(audio) -> Duration` are in `domain/speech.rs`.
+
+**Acceptance criteria.**
+
+- AC-6.3-4: When `chunks(audio, 1024)` runs, the joined chunks equal the original audio, and every chunk except the last has 1024 samples.
+- AC-6.3-5: When `duration` gets 22050 samples at 22050 Hz, it returns 1 s.
+
+**Proofs.**
+
+- P-6.3-4 (AC-6.3-4). Ensures: the concatenation of the chunks is the audio, and each chunk except the last has `size` samples. Argument: `chunks` is `samples.chunks(size)`, which partitions the slice in order into pieces of `size` with a shorter last piece. Concatenation of a partition gives the slice.
+- P-6.3-5. Ensures: `duration(audio) = len(samples) / rate`. Argument: the function is this division. 22050 samples at 22050 Hz give 1 s.
+
+---
+
+### 6.3b Audio Cache and Speak
+
+**Goal:** Add the speech use case with `speak`, the audio cache and `prerender`. A TTS request for a known response is now a memory read.
+
+- **Implements:** G1, G4. **Depends on:** 6.3.
+- **Files:** create `src/app/speech.rs`. Modify `src/testing/fakes.rs`, `benches/domain.rs`, `Cargo.toml`.
 
 **Model.**
 
 - `AudioCache: DashMap<text, Audio>`. `speak(text)`: a hit returns the cached audio. A miss calls `synth` and returns the result without a store. Only `prerender` (and the prefetch of sub-phase 14.10, which replaces the old answer) adds audio, so the cache does not grow with dynamic texts.
-- `prerender(pools, areas)`: for each template whose only variable is `area` (or no variable), render it for each area and synthesize it.
-- `chunks(audio, size) -> Vec<&[i16]>` and `duration(audio) -> Duration` are in `domain/speech.rs`.
+- `prerender(pools, areas)`: for each template whose only variable is `area` (or no variable), render it for each area and synthesize it. The `area` variable is the area name in lowercase, as in the replies of `decide`, so the cache keys match the reply texts.
+- This sub-phase adds the use case and its tests only. Sub-phase 6.10 connects it to `run`.
+- This sub-phase adds the crate `dashmap` to `Cargo.toml`.
 - `FakeTts` records each text.
 
 **Acceptance criteria.**
 
-- AC-6.3-1: When the text is in the cache, `speak` returns the cached audio and `FakeTts` records no call.
-- AC-6.3-2: When startup completes, the cache contains each such pool text for each area name.
-- AC-6.3-3: When a template uses a variable other than `area`, startup does not synthesize it.
-- AC-6.3-4: When `chunks(audio, 1024)` runs, the joined chunks equal the original audio, and every chunk except the last has 1024 samples.
-- AC-6.3-5: When `duration` gets 22050 samples at 22050 Hz, it returns 1 s.
-- AC-6.3-6 [Bench]: A cache hit for a response of 2 s uses 100,000 instructions or fewer.
-- AC-6.3-7: When `speak` gets a text that is not in the cache, `FakeTts` records one call and the cache size does not change.
+- AC-6.3b-1: When the text is in the cache, `speak` returns the cached audio and `FakeTts` records no call.
+- AC-6.3b-2: When `prerender` runs with the pools and the area names, the cache contains each such pool text for each area name.
+- AC-6.3b-3: When a template uses a variable other than `area`, `prerender` does not synthesize it.
+- AC-6.3b-4 [Bench]: A cache hit for a response of 2 s uses 100,000 instructions or fewer.
+- AC-6.3b-5: When `speak` gets a text that is not in the cache, `FakeTts` records one call and the cache size does not change.
 
 **Proofs.**
 
-- P-6.3-1. Argument: `speak` returns from the hit branch before the `synth` branch.
-- P-6.3-3. Argument: `prerender` filters templates by their variable set, which must be a subset of `{area}`.
-- P-6.3-4 (AC-6.3-4). Ensures: the concatenation of the chunks is the audio, and each chunk except the last has `size` samples. Argument: `chunks` is `samples.chunks(size)`, which partitions the slice in order into pieces of `size` with a shorter last piece. Concatenation of a partition gives the slice.
-- P-6.3-5. Ensures: `duration(audio) = len(samples) / rate`. Argument: the function is this division. 22050 samples at 22050 Hz give 1 s.
-- P-6.3-2, P-6.3-7. Evidence: test.
-- P-6.3-6. Evidence: benchmark.
+- P-6.3b-1. Argument: `speak` returns from the hit branch before the `synth` branch.
+- P-6.3b-3. Argument: `prerender` filters templates by their variable set, which must be a subset of `{area}`.
+- P-6.3b-2, P-6.3b-5. Evidence: test.
+- P-6.3b-4. Evidence: benchmark.
 
 ---
 
@@ -106,7 +126,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 **Goal:** Add `quint/commit.qnt`, the model of the commit policy over time, with a VAD that decides each chunk late. It proves that Jarvis commits only when a rule allows it, never waits past that point, and never counts undecided speech as silence.
 
-- **Implements:** G1, G2, G19. **Depends on:** 6.3.
+- **Implements:** G1, G2, G19. **Depends on:** 6.3b.
 - **Files:** create `quint/commit.qnt`.
 - **Quint:** `commit.qnt`.
 
@@ -290,6 +310,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 **Model.**
 
+- `run` builds `SherpaTts` and the speech use case of sub-phase 6.3b. After the first snapshot, a background task runs `prerender` with the area names of the hot cache. `serve` does not wait for it.
 - `synthesize` calls `speak(text)`. The adapter sends `audio-start`, one `audio-chunk` for each chunk of 1024 samples, and `audio-stop`. `info` lists `asr`, `handle` and `tts`.
 - HA caches TTS audio by text, so HA does not send `synthesize` for each filler. Thus the announce queue waits for the satellite state, not for `synthesize` (sub-phase 4.9b).
 
