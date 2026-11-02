@@ -314,6 +314,11 @@ fn pcm(value: f32) -> i16 {
 /// with the Supertonic-3 model.
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::thread;
+    use std::time::Instant;
+
     use super::*;
     use crate::Config;
     use crate::domain::intent;
@@ -470,6 +475,458 @@ mod tests {
     async fn ac_6_2_3_empty_text_gives_no_samples() -> anyhow::Result<()> {
         let audio = voice()?.synth("").await?;
         assert_eq!(audio.samples, Vec::<i16>::new());
+        Ok(())
+    }
+
+    /// The Nemotron int8 export with 160 ms chunks.
+    const INT8_160: &str =
+        "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25";
+
+    /// The Nemotron int8 export with 80 ms chunks.
+    const INT8_80: &str =
+        "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-int8-2026-04-25";
+
+    /// The Nemotron float32 export with 160 ms chunks.
+    const FP32_160: &str = "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-2026-04-25";
+
+    /// The Nemotron float32 export with 80 ms chunks.
+    const FP32_80: &str = "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-80ms-2026-04-25";
+
+    /// One first-pass model, provider and thread count of the GPU host measurements.
+    #[derive(Clone)]
+    struct Setup {
+        /// The model folder.
+        dir: &'static str,
+        /// The infix of the model file names: `.int8` or empty.
+        infix: &'static str,
+        /// The execution provider, with an optional `:config` file.
+        provider: String,
+        /// The number of threads.
+        threads: i32,
+    }
+
+    impl Setup {
+        /// The setup of `dir` with the file infix `infix` on `provider` with `threads` threads.
+        fn new(dir: &'static str, infix: &'static str, provider: &str, threads: i32) -> Self {
+            let provider = provider.to_owned();
+            Self {
+                dir,
+                infix,
+                provider,
+                threads,
+            }
+        }
+
+        /// The recognizer of the setup.
+        fn recognizer(&self) -> anyhow::Result<OnlineRecognizer> {
+            let file = |name: &str| Some(format!("{}/{name}{}.onnx", self.dir, self.infix));
+            let transducer = OnlineTransducerModelConfig {
+                encoder: file("encoder"),
+                decoder: file("decoder"),
+                joiner: file("joiner"),
+            };
+            let model_config = OnlineModelConfig {
+                transducer,
+                tokens: Some(format!("{}/tokens.txt", self.dir)),
+                provider: Some(self.provider.clone()),
+                num_threads: self.threads,
+                ..OnlineModelConfig::default()
+            };
+            let config = OnlineRecognizerConfig {
+                model_config,
+                ..OnlineRecognizerConfig::default()
+            };
+            OnlineRecognizer::create(&config).with_context(|| format!("cannot load {}", self.dir))
+        }
+
+        /// The name of the setup in the printed lines.
+        fn name(&self) -> String {
+            let model = self
+                .dir
+                .trim_start_matches("models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-");
+            let provider = self.provider.split(':').next().unwrap_or_default();
+            format!("{model}/{provider}/threads={}", self.threads)
+        }
+    }
+
+    /// The measurements of one pass of the request audio in 20 ms chunks.
+    #[derive(Default)]
+    struct Pass {
+        /// The time of each `decode` call.
+        decodes: Vec<Duration>,
+        /// The time of the whole pass.
+        total: Duration,
+        /// The audio end in ms and the pass time of the first chunk whose partial is `REQUEST`.
+        complete: Option<(u64, Duration)>,
+        /// Each new partial text with the audio end in ms of its chunk.
+        changes: Vec<(u64, String)>,
+        /// The final tokens with their times in s.
+        tokens: String,
+    }
+
+    impl Pass {
+        /// Records the partial `text` after the chunk that ends at `end_ms`, `elapsed` into the
+        /// pass.
+        fn note(&mut self, end_ms: u64, text: String, elapsed: Duration) {
+            let last = self.changes.last().map_or("", |(_, last)| last.as_str());
+            if last == text {
+                return;
+            }
+            if self.complete.is_none() && intent::normalize(&text) == REQUEST {
+                self.complete = Some((end_ms, elapsed));
+            }
+            self.changes.push((end_ms, text));
+        }
+    }
+
+    /// The float samples of `samples`.
+    fn wave(samples: &[i16]) -> Vec<f32> {
+        samples
+            .iter()
+            .map(|&sample| f32::from(sample) / f32::from(i16::MAX))
+            .collect()
+    }
+
+    /// Feeds `samples` to `stream`, decodes each ready chunk and gives the time of each decode.
+    fn feed(
+        recognizer: &OnlineRecognizer,
+        stream: &OnlineStream,
+        samples: &[f32],
+    ) -> Vec<Duration> {
+        if !samples.is_empty() {
+            stream.accept_waveform(i32::from(RATE), samples);
+        }
+        let mut decodes = Vec::new();
+        while recognizer.is_ready(stream) {
+            let start = Instant::now();
+            recognizer.decode(stream);
+            decodes.push(start.elapsed());
+        }
+        decodes
+    }
+
+    /// The partial text of `stream`.
+    fn text_of(recognizer: &OnlineRecognizer, stream: &OnlineStream) -> String {
+        recognizer
+            .get_result(stream)
+            .map(|result| result.text)
+            .unwrap_or_default()
+    }
+
+    /// The tokens of `stream` with their times in s.
+    fn tokens_of(recognizer: &OnlineRecognizer, stream: &OnlineStream) -> String {
+        let Some(result) = recognizer.get_result(stream) else {
+            return String::new();
+        };
+        let times = result.timestamps.unwrap_or_default();
+        let pairs: Vec<String> = result
+            .tokens
+            .iter()
+            .zip(times)
+            .map(|(token, time)| format!("{token}@{time:.2}"))
+            .collect();
+        pairs.join(" ")
+    }
+
+    /// One pass of `audio` in 20 ms chunks: in real time when `paced`, else as fast as possible.
+    fn pass(recognizer: &OnlineRecognizer, audio: &Audio, paced: bool) -> anyhow::Result<Pass> {
+        let stream = recognizer.create_stream();
+        let mut pass = Pass::default();
+        let start = Instant::now();
+        let chunks = speech::chunks(audio, CHUNK);
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let end_ms = u64::try_from(index + 1)? * 20;
+            if paced {
+                let arrival = start + Duration::from_millis(end_ms);
+                thread::sleep(arrival.saturating_duration_since(Instant::now()));
+            }
+            pass.decodes.extend(feed(recognizer, &stream, &wave(chunk)));
+            pass.note(end_ms, text_of(recognizer, &stream), start.elapsed());
+        }
+        pass.total = start.elapsed();
+        pass.tokens = tokens_of(recognizer, &stream);
+        Ok(pass)
+    }
+
+    /// The milliseconds of `duration`.
+    fn ms(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+
+    /// The mean and the largest of `decodes` in ms.
+    fn stats(decodes: &[Duration]) -> (f64, f64) {
+        let total: Duration = decodes.iter().sum();
+        let count = u32::try_from(decodes.len()).unwrap_or(u32::MAX).max(1);
+        let max = decodes.iter().max().copied().unwrap_or_default();
+        (ms(total / count), ms(max))
+    }
+
+    /// Feeds `audio` up to `cut_ms` in 20 ms chunks, then `pad_ms` of zeros at once, then
+    /// `input_finished` when `finished`. Gives the time after the cut and the partial text.
+    fn flush(
+        recognizer: &OnlineRecognizer,
+        audio: &Audio,
+        cut_ms: u64,
+        pad_ms: u64,
+        finished: bool,
+    ) -> anyhow::Result<(Duration, String)> {
+        let stream = recognizer.create_stream();
+        let cut = usize::try_from(cut_ms * 16)?.min(audio.samples.len());
+        for chunk in audio.samples[..cut].chunks(CHUNK) {
+            feed(recognizer, &stream, &wave(chunk));
+        }
+        let start = Instant::now();
+        let zeros = vec![0.0; usize::try_from(pad_ms * 16)?];
+        if !zeros.is_empty() {
+            stream.accept_waveform(i32::from(RATE), &zeros);
+        }
+        if finished {
+            stream.input_finished();
+        }
+        feed(recognizer, &stream, &[]);
+        Ok((start.elapsed(), text_of(recognizer, &stream)))
+    }
+
+    /// Prints the flush time and text of `recognizer` for each cut after the last voiced
+    /// sample, each zero padding and each `input_finished` choice.
+    fn print_flushes(
+        name: &str,
+        recognizer: &OnlineRecognizer,
+        audio: &Audio,
+    ) -> anyhow::Result<()> {
+        let voiced = last_voiced_ms(audio);
+        for after in [0, 132] {
+            for pad_ms in [0, 160, 320, 480, 640] {
+                for finished in [false, true] {
+                    let (time, text) = flush(recognizer, audio, voiced + after, pad_ms, finished)?;
+                    let complete = intent::normalize(&text) == REQUEST;
+                    println!(
+                        "MEASURE flush {name} cut=voiced+{after}ms pad={pad_ms}ms finished={finished} complete={complete} flush_ms={:.1} text={text:?}",
+                        ms(time)
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Prints the real-time factor and the decode times of `fast`, after the warm-up `warm`.
+    fn print_speed(name: &str, warm: &Pass, fast: &Pass, audio: &Audio) {
+        let seconds = speech::duration(audio).as_secs_f64();
+        let factor = fast.total.as_secs_f64() / seconds;
+        let warm_factor = warm.total.as_secs_f64() / seconds;
+        let (mean, max) = stats(&fast.decodes);
+        let count = fast.decodes.len();
+        println!(
+            "MEASURE speed {name} rtf={factor:.3} warmup_rtf={warm_factor:.3} decodes={count} decode_mean_ms={mean:.1} decode_max_ms={max:.1}"
+        );
+    }
+
+    /// Prints when the full request is in the partial of the fast pass (audio time) and of the
+    /// real-time pass (wall time after the last voiced sample).
+    fn print_latency(name: &str, fast: &Pass, paced: &Pass, audio: &Audio) {
+        let voiced = last_voiced_ms(audio);
+        let audio_ms = speech::duration(audio).as_millis();
+        let complete = fast.complete.map(|(end_ms, _)| end_ms);
+        let paced_audio = paced.complete.map(|(end_ms, _)| end_ms);
+        let voiced_time = Duration::from_millis(voiced);
+        let wall = paced
+            .complete
+            .map(|(_, elapsed)| ms(elapsed) - ms(voiced_time));
+        println!(
+            "MEASURE latency {name} last_voiced_ms={voiced} audio_ms={audio_ms} complete_audio_ms={complete:?} paced_complete_audio_ms={paced_audio:?} paced_latency_ms={wall:?}"
+        );
+        println!("MEASURE partials {name} {:?}", fast.changes);
+        println!("MEASURE tokens {name} {}", fast.tokens);
+    }
+
+    /// Prints the load time, the speed, the latency and the flush times of `setup`.
+    fn measure(setup: &Setup, audio: &Audio) -> anyhow::Result<()> {
+        let name = setup.name();
+        let start = Instant::now();
+        let recognizer = match setup.recognizer() {
+            Ok(recognizer) => recognizer,
+            Err(error) => {
+                println!("MEASURE skip {name}: {error:#}");
+                return Ok(());
+            }
+        };
+        println!("MEASURE load {name} load_ms={:.0}", ms(start.elapsed()));
+        let warm = pass(&recognizer, audio, false)?;
+        let fast = pass(&recognizer, audio, false)?;
+        let paced = pass(&recognizer, audio, true)?;
+        print_speed(&name, &warm, &fast, audio);
+        print_latency(&name, &fast, &paced, audio);
+        print_flushes(&name, &recognizer, audio)
+    }
+
+    /// The kernel time in µs of each execution provider and operator in the profiles in
+    /// `folder`.
+    fn kernel_times(folder: &Path) -> anyhow::Result<BTreeMap<(String, String), u64>> {
+        let mut times = BTreeMap::new();
+        for entry in fs::read_dir(folder)? {
+            let path = entry?.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            let text = fs::read_to_string(&path)?;
+            let Ok(events) = serde_json::from_str::<Vec<serde_json::Value>>(&text) else {
+                println!("MEASURE placement unparsable {}", path.display());
+                continue;
+            };
+            for event in &events {
+                add_kernel_time(&mut times, event);
+            }
+        }
+        Ok(times)
+    }
+
+    /// Adds the time of `event` to `times` when it is a kernel event.
+    fn add_kernel_time(times: &mut BTreeMap<(String, String), u64>, event: &serde_json::Value) {
+        let kernel = event["name"]
+            .as_str()
+            .is_some_and(|name| name.ends_with("_kernel_time"));
+        let args = &event["args"];
+        let (true, Some(provider), Some(op), Some(time)) = (
+            kernel,
+            args["provider"].as_str(),
+            args["op_name"].as_str(),
+            event["dur"].as_u64(),
+        ) else {
+            return;
+        };
+        *times
+            .entry((provider.to_owned(), op.to_owned()))
+            .or_default() += time;
+    }
+
+    /// Prints the kernel time of each execution provider in `times` and the slowest operators.
+    fn print_times(name: &str, times: &BTreeMap<(String, String), u64>) {
+        let mut providers: BTreeMap<&str, u64> = BTreeMap::new();
+        for ((provider, _), time) in times {
+            *providers.entry(provider.as_str()).or_default() += time;
+        }
+        let mut slowest: Vec<(&(String, String), &u64)> = times.iter().collect();
+        slowest.sort_by_key(|(_, time)| std::cmp::Reverse(**time));
+        slowest.truncate(15);
+        println!("MEASURE placement {name} kernel_us={providers:?}");
+        println!("MEASURE placement {name} slowest_us={slowest:?}");
+    }
+
+    /// Prints the kernel time of each execution provider and the slowest operators of `setup`
+    /// on CUDA, from the ONNX Runtime profile of one pass.
+    fn print_placement(setup: &Setup, audio: &Audio) -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let config = folder.path().join("ort.config");
+        let prefix = folder.path().join("profile");
+        fs::write(
+            &config,
+            format!("ProfilingFilePrefix={}\n", prefix.display()),
+        )?;
+        let profiled = Setup {
+            provider: format!("cuda:{}", config.display()),
+            ..setup.clone()
+        };
+        let recognizer = profiled.recognizer()?;
+        pass(&recognizer, audio, false)?;
+        drop(recognizer);
+        let name = setup.name();
+        print_times(&name, &kernel_times(folder.path())?);
+        Ok(())
+    }
+
+    /// The real-time factor of the Silero VAD of `jarvis.toml` alone on `device`, in 20 ms
+    /// chunks, after a warm-up.
+    fn vad_factor(device: Device, audio: &Audio) -> anyhow::Result<f64> {
+        let detector = VoiceActivityDetector::create(&vad(&config()?.asr, device), 30.0)
+            .context("cannot load the VAD")?;
+        let samples = wave(&audio.samples);
+        let mut time = Duration::ZERO;
+        for _ in 0..2 {
+            detector.reset();
+            let start = Instant::now();
+            for chunk in samples.chunks(CHUNK) {
+                detector.accept_waveform(chunk);
+                while detector.front().is_some() {
+                    detector.pop();
+                }
+            }
+            time = start.elapsed();
+        }
+        Ok(time.as_secs_f64() / speech::duration(audio).as_secs_f64())
+    }
+
+    /// Prints the real-time factor of the `SherpaStt` of `jarvis.toml` with its VAD, and of the
+    /// VAD alone, on `device`.
+    fn print_production(device: Device, audio: &Audio) -> anyhow::Result<()> {
+        let stt = SherpaStt::try_new(&config()?.asr, device)?;
+        let seconds = speech::duration(audio).as_secs_f64();
+        let mut factors = Vec::new();
+        for _ in 0..2 {
+            let mut stream = stt.stream()?;
+            let start = Instant::now();
+            let mut texts = Vec::new();
+            for chunk in speech::chunks(audio, CHUNK) {
+                stream.accept(chunk);
+                texts.push(stream.partial().text);
+            }
+            factors.push(start.elapsed().as_secs_f64() / seconds);
+        }
+        let vad = vad_factor(device, audio)?;
+        println!("MEASURE production {device:?} rtf={factors:?} vad_rtf={vad:.3}");
+        Ok(())
+    }
+
+    /// Measures the `SherpaStt` of `jarvis.toml` and its VAD on the GPU host.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn measure_a_production() -> anyhow::Result<()> {
+        let audio = fakes::speech(REQUEST).await?;
+        print_production(Device::Cpu, &audio)?;
+        print_production(Device::Cuda, &audio)
+    }
+
+    /// The folder, file infix, provider and thread count of each measured setup.
+    const SETUPS: [(&str, &str, &str, i32); 13] = [
+        (INT8_160, ".int8", "cpu", 4),
+        (INT8_160, ".int8", "cpu", 6),
+        (INT8_160, ".int8", "cpu", 8),
+        (INT8_80, ".int8", "cpu", 4),
+        (INT8_80, ".int8", "cpu", 8),
+        (INT8_160, ".int8", "cuda", 4),
+        (INT8_160, ".int8", "cuda", 8),
+        (INT8_80, ".int8", "cuda", 4),
+        (FP32_160, "", "cuda", 4),
+        (FP32_80, "", "cuda", 4),
+        (FP32_160, "", "cpu", 4),
+        (FP32_160, "", "cpu", 8),
+        (FP32_80, "", "cpu", 8),
+    ];
+
+    /// Measures each Nemotron export, provider and thread count on the GPU host.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn measure_b_exports() -> anyhow::Result<()> {
+        let audio = fakes::speech(REQUEST).await?;
+        let setups =
+            SETUPS.map(|(dir, infix, provider, threads)| Setup::new(dir, infix, provider, threads));
+        for setup in &setups {
+            measure(setup, &audio)?;
+        }
+        Ok(())
+    }
+
+    /// Prints where the CUDA kernels of each Nemotron export run on the GPU host.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn measure_c_placement() -> anyhow::Result<()> {
+        let audio = fakes::speech(REQUEST).await?;
+        for setup in [
+            Setup::new(INT8_160, ".int8", "cuda", 4),
+            Setup::new(FP32_160, "", "cuda", 4),
+        ] {
+            print_placement(&setup, &audio)?;
+        }
         Ok(())
     }
 }

@@ -193,6 +193,39 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: "false"
+      - name: Host and measured models
+        run: |
+          lscpu
+          nproc
+          free -h
+          df -h .
+          nvidia-smi
+          just models
+          hf=https://huggingface.co/csukuangfj2
+          prefix=sherpa-onnx-nemotron-speech-streaming-en-0.6b
+          int8_160=models/$prefix-160ms-int8-2026-04-25
+          fetch() {
+            mkdir -p "models/$1"
+            if ! echo "$3  models/$1/$2" | sha256sum --check --status; then
+              curl -sSfL -o "models/$1/$2" "$hf/$1/resolve/main/$2"
+              echo "$3  models/$1/$2" | sha256sum --check
+            fi
+          }
+          fetch "$prefix-80ms-int8-2026-04-25" encoder.int8.onnx 29a6aaf9155f25562a08a1aeea1f1a1a5d24b2f44a1d68211faf8a92073d1df6
+          for file in decoder.int8.onnx joiner.int8.onnx tokens.txt; do
+            ln -f "$int8_160/$file" "models/$prefix-80ms-int8-2026-04-25/$file"
+          done
+          fetch "$prefix-160ms-2026-04-25" encoder.onnx b46566b6deb00ad97da0c12bd119ee86e2bc89055c60bf8eba1f2dba205a50ef
+          fetch "$prefix-160ms-2026-04-25" encoder.data 44f65771e1570546f61106b3d0c604a60b398d061476fda8042bb05432601bd4
+          fetch "$prefix-160ms-2026-04-25" decoder.onnx 17614cc0415d49daefd63cd91cb3415af046fa5a487c2049def68f51a667d6fe
+          fetch "$prefix-160ms-2026-04-25" joiner.onnx d4ef2398e4b19cb166c0c12f03cb20333e4d359d63c5fd8cf965c0649c1d0d03
+          ln -f "$int8_160/tokens.txt" "models/$prefix-160ms-2026-04-25/tokens.txt"
+          fetch "$prefix-80ms-2026-04-25" encoder.onnx bc97f0671b127b56878ab9fd1b617734912fe51663e3c70c8a9923e3d3cb9136
+          for file in encoder.data decoder.onnx joiner.onnx tokens.txt; do
+            ln -f "models/$prefix-160ms-2026-04-25/$file" "models/$prefix-80ms-2026-04-25/$file"
+          done
+          du -sh models/*
+          df -h .
       - run: just gpu-models
       - run: echo "SHERPA_ONNX_LIB_DIR=$(just --evaluate cuda_libraries)" >> "$GITHUB_ENV"
       - run: mkdir -p target/fixture && cargo run --release -- dataset jarvis.toml target/fixture/train.json --house src/testing/house.json
@@ -202,7 +235,15 @@ jobs:
           key: fixture-model-${{ hashFiles('target/fixture/train.json', 'train/**') }}
           fail-on-cache-miss: true
       - run: sudo systemctl stop jarvis
+      - name: Start the GPU memory log
+        run: |
+          nvidia-smi --query-gpu=timestamp,memory.used,memory.total,utilization.gpu --format=csv -l 1 > gpu-memory.csv &
       - run: just gpu-test
+      - name: Print the GPU memory log
+        if: always()
+        run: |
+          pkill -f "nvidia-smi --query-gpu" || true
+          cat gpu-memory.csv
       - if: always()
         run: sudo systemctl start jarvis
 
