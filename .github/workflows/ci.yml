@@ -24,6 +24,14 @@ jobs:
         with:
           just-version: "1.59.0"
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v6
+        with:
+          path: |
+            models
+            !models/system-one
+          key: models-${{ runner.os }}-${{ hashFiles('justfile') }}
+          restore-keys: models-${{ runner.os }}-
+      - run: just models
       - run: just lint
 
   complexity:
@@ -76,12 +84,6 @@ jobs:
         with:
           python-version: "3.12"
       - run: just install-python
-      - run: mkdir -p target/fixture && cargo run --release -- dataset jarvis.toml target/fixture/train.json --house src/testing/house.json
-      - uses: actions/cache@v6
-        with:
-          path: models/system-one/fixture
-          key: fixture-model-${{ hashFiles('target/fixture/train.json', 'train/**') }}
-      - run: just fixture-model
       # The fixture model has its own cache.
       - uses: actions/cache@v6
         with:
@@ -91,6 +93,13 @@ jobs:
           key: models-${{ runner.os }}-${{ hashFiles('justfile') }}
           restore-keys: models-${{ runner.os }}-
       - run: just models
+      - run: echo "SHERPA_ONNX_LIB_DIR=$(just --evaluate cpu_libraries)" >> "$GITHUB_ENV"
+      - run: mkdir -p target/fixture && cargo run --release -- dataset jarvis.toml target/fixture/train.json --house src/testing/house.json
+      - uses: actions/cache@v6
+        with:
+          path: models/system-one/fixture
+          key: fixture-model-${{ hashFiles('target/fixture/train.json', 'train/**') }}
+      - run: just fixture-model
       - run: just cov
 
   bench:
@@ -103,6 +112,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: just install-valgrind
       - run: just install-gungraun-runner
+      - uses: actions/cache@v6
+        with:
+          path: |
+            models
+            !models/system-one
+          key: models-${{ runner.os }}-${{ hashFiles('justfile') }}
+          restore-keys: models-${{ runner.os }}-
+      - run: just models
       - run: just bench
 
   quint:
@@ -139,6 +156,14 @@ jobs:
           just-version: "1.59.0"
       - uses: Swatinem/rust-cache@v2
       - run: just install-verus
+      - uses: actions/cache@v6
+        with:
+          path: |
+            models
+            !models/system-one
+          key: models-${{ runner.os }}-${{ hashFiles('justfile') }}
+          restore-keys: models-${{ runner.os }}-
+      - run: just models
       - run: just verus
 
   workflow-lint:
@@ -168,6 +193,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: "false"
+      - run: just gpu-models
+      - run: echo "SHERPA_ONNX_LIB_DIR=$(just --evaluate cuda_libraries)" >> "$GITHUB_ENV"
       - run: mkdir -p target/fixture && cargo run --release -- dataset jarvis.toml target/fixture/train.json --house src/testing/house.json
       - uses: actions/cache/restore@v6
         with:

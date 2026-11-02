@@ -15,6 +15,11 @@ ping_interval_s = 30
 dir = "models/system-one"
 threshold = 0.6
 
+[tts]
+model_dir = "models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
+voice = 6     # speaker ID of the Supertonic voice style
+num_steps = 4 # denoising steps
+
 [announce]
 margin_ms = 300
 idle_wait_s = 30

@@ -31,6 +31,7 @@ jobs:
           just-version: "1.59.0"
       # The Linux archive has the CUDA libraries, the macOS archive the CPU libraries.
       - run: just ${{ runner.os == 'Linux' && 'gpu-models' || 'models' }}
+      - run: echo "SHERPA_ONNX_LIB_DIR=$(just --evaluate ${{ runner.os == 'Linux' && 'cuda_libraries' || 'cpu_libraries' }})" >> "$GITHUB_ENV"
       - run: cargo build --release --target ${{ matrix.target }}
       - run: tar -czhf "$ARCHIVE" -C "target/${{ matrix.target }}/release" jarvis -C "$GITHUB_WORKSPACE"/models/sherpa-onnx-v2.0.1-*/lib .
       - run: |
