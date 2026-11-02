@@ -1,60 +1,69 @@
 # Phase 6: Speech
 
-This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy with its Quint model, two-pass STT and the Wyoming speech events. Jarvis then serves all three Wyoming services.
+This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy with its Quint model, two-pass STT and the Wyoming speech events. Jarvis then serves all three Wyoming services.
 
 ---
 
-### 6.1 TTS Adapter
+### 6.1 Shared ONNX Runtime and GPU Recipes
 
-**Goal:** Add the `TextToSpeech` port and `SherpaTts` with the Piper voice, and the `models` recipe. Jarvis can now turn text into audio.
+**Goal:** Load the ONNX Runtime 1.28.2 shared library of sherpa-onnx 2.0.1 in `ort`, and add the library, GPU model and GPU test recipes. The classifier now uses the runtime that sherpa-onnx uses, and the GPU host runs it on CUDA.
 
-- **Implements:** G1. **Depends on:** 5.4c.
-- **Files:** create `src/adapters/sherpa.rs`, `src/domain/speech.rs`. Modify `src/ports.rs`, `src/lib.rs`, `justfile`, `.github/workflows/ci.yml`, `jarvis.toml`, `Cargo.toml`.
-
-**Model.** `TextToSpeech::synth(text) -> Result<Audio>`. `Audio { samples: Vec<i16>, rate }` is in `src/domain/speech.rs`. `SherpaTts` wraps `OfflineTts` with `[tts].model_dir`. `just models` downloads the 20M zipformer and the Piper voice into `models/`. It checks the SHA-256 of each file and downloads only a missing or wrong file. `models` is a setup recipe: `check` and the `rust-test` job run it before the tests, and tests do not download. CI caches `models/`.
-
-**Acceptance criteria.**
-
-- AC-6.1-1: When `just models` has run, the STT and TTS model folders exist in `models/`, and each file has the SHA-256 that the recipe lists. When `ci.yml` is parsed, `rust-test` runs `just models` before `just cov`.
-- AC-6.1-2: When `SherpaTts::synth("Hello")` runs, it returns 16-bit mono audio with more than 0 samples at the model rate.
-- AC-6.1-3: When `synth("")` runs, it returns zero samples and no error.
-
-**Proofs.**
-
-- P-6.1-1, P-6.1-2. Evidence: test.
-- P-6.1-3. Argument: `synth` returns empty audio for empty text before it calls the engine.
-
----
-
-### 6.2 Shared ONNX Runtime and GPU Recipes
-
-**Goal:** Load one shared ONNX Runtime library for `sherpa-onnx` and `ort`, and add the GPU model and GPU test recipes. Both crates now work in one process, and the GPU host runs every model on CUDA.
-
-- **Implements:** G18. **Depends on:** 6.1.
-- **Files:** modify `Cargo.toml`, `src/adapters/onnx.rs`, `src/adapters/sherpa.rs`, `justfile`, `.github/workflows/release.yml`, `xtask/src/gates.rs`.
+- **Implements:** G18. **Depends on:** 5.4c.
+- **Files:** modify `Cargo.toml`, `src/adapters/onnx.rs`, `justfile`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `xtask/src/gates.rs`.
 
 **Model.**
 
-- `sherpa-onnx` uses feature `shared`. `ort` uses feature `load-dynamic`. `SHERPA_ONNX_LIB_DIR` and `ORT_DYLIB_PATH` point to one folder with `libonnxruntime` (decision 27).
-- `gpu-models` downloads the Nemotron 160 ms model, the Parakeet Unified offline model and the sherpa-onnx `cuda-12.x-cudnn-9.x` `linux-x64-gpu` libraries.
-- `gpu-test` (sub-phase 0.13) now runs `gpu-models` first and sets `SHERPA_ONNX_LIB_DIR` and `ORT_DYLIB_PATH` to the CUDA libraries.
-- `models` also downloads the sherpa-onnx CPU shared libraries for the host system. `test` and `cov` set `SHERPA_ONNX_LIB_DIR` and `ORT_DYLIB_PATH` to them.
-- `device` selects the provider for `SherpaTts` and `OnnxClassifier`.
-- sherpa-onnx falls back to the CPU with only a log line when the CUDA provider does not load. Thus a test checks the CUDA provider of a sherpa-onnx model by the GPU memory of the test process (`nvidia-smi`): the memory grows when the model loads.
-- The Linux release job builds against the CUDA libraries and puts them in the archive. The macOS archive has the CPU libraries. Both release builds set the run path to the folder of the binary (`$ORIGIN` on Linux, `@executable_path` on macOS) through `RUSTFLAGS`, so the binary finds the shared libraries in its archive. The `jarvis` unit sets `ORT_DYLIB_PATH` (`01-architecture.md` section 10).
+- `ort` uses the features `load-dynamic` and `cuda`. It loads the `libonnxruntime` that `ORT_DYLIB_PATH` names (decision 27).
+- `just models` downloads the sherpa-onnx 2.0.1 CPU shared libraries for the host system into one library folder in `models/`. The recipe lists one SHA-256 for each archive that it downloads, and one for each `.onnx` file and each `tokens.txt` file in it. It checks each listed file and downloads only a missing or wrong file. `models` is a setup recipe: `check` and the `rust-test` job run it before the tests, and tests do not download. CI caches `models/`.
+- `gpu-models` downloads the Nemotron 160 ms model, the Parakeet Unified offline model and the sherpa-onnx 2.0.1 `cuda-12.x-cudnn-9.x-onnxruntime1.28.2` `linux-x64-gpu` libraries.
+- `test` and `cov` set `ORT_DYLIB_PATH` to the `libonnxruntime` in the CPU library folder, and `LD_LIBRARY_PATH` (`DYLD_LIBRARY_PATH` on macOS) to the folder. CI sets them in the same way.
+- `gpu-test` (sub-phase 0.13) now runs `gpu-models` first and sets `ORT_DYLIB_PATH` and `LD_LIBRARY_PATH` to the CUDA library folder.
+- The Linux release archive has the CUDA libraries. The macOS archive has the CPU libraries. The verification step sets `ORT_DYLIB_PATH` and `LD_LIBRARY_PATH` (`DYLD_LIBRARY_PATH` on macOS) to the extracted folder. The `jarvis` unit sets them in its environment file (`01-architecture.md` section 10).
 
 **Acceptance criteria.**
 
-- AC-6.2-1: When one test process loads the fixture classifier and `SherpaTts`, both predict or synthesize without error.
-- AC-6.2-2 [GPU host]: With `device = cuda`, `SherpaTts` and `OnnxClassifier` run in one process on the CUDA execution provider.
-- AC-6.2-3: When `release.yml` is parsed, the Linux build job has a verification step that fails unless the archive contains `libonnxruntime` and the CUDA provider library, and `ldd jarvis` in the extracted archive reports no missing library.
+- AC-6.1-1: When `just models` has run, the library folder exists in `models/`, and each file that the recipe lists has its SHA-256. When `ci.yml` is parsed, `rust-test` runs `just models` before `just cov`.
+- AC-6.1-2: When the tests run, `ORT_DYLIB_PATH` names the `libonnxruntime` in the library folder, and the fixture classifier predicts without error.
+- AC-6.1-3 [GPU host]: With `device = cuda`, `OnnxClassifier` runs on the CUDA execution provider of the shared library.
+- AC-6.1-4: When `release.yml` is parsed, the Linux build job has a verification step that fails unless the archive contains `libonnxruntime` and the CUDA provider library, and `ldd jarvis` in the extracted archive, with `LD_LIBRARY_PATH` set to the extracted folder, reports no missing library.
 
 **Proofs.**
 
-- P-6.2-1, P-6.2-2. Evidence: test.
-- P-6.2-3. Evidence: test (a structure test of `release.yml`).
+- P-6.1-1, P-6.1-2, P-6.1-3. Evidence: test.
+- P-6.1-4. Evidence: test (a structure test of `release.yml`).
 
-**Field log.** Push a tag. Record that the Linux archive passes its verification step. On the Intel MacBook, run `just models` and `just test`. Record that the sherpa-onnx macOS x86_64 libraries load ONNX Runtime 1.28.
+**Field log.** Push a tag. Record that the Linux archive passes its verification step. On the Intel MacBook, run `just models` and `just test`. Record that the sherpa-onnx macOS x86_64 libraries load ONNX Runtime 1.28.2.
+
+---
+
+### 6.2 TTS Adapter
+
+**Goal:** Add the `TextToSpeech` port and `SherpaTts` with the Supertonic-3 voice, and the STT and TTS models in the `models` recipe. Jarvis can now turn text into audio, and `sherpa-onnx` and `ort` work in one process.
+
+- **Implements:** G1, G18. **Depends on:** 6.1.
+- **Files:** create `src/adapters/sherpa.rs`, `src/domain/speech.rs`. Modify `src/ports.rs`, `src/lib.rs`, `justfile`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `xtask/src/gates.rs`, `jarvis.toml`, `Cargo.toml`.
+
+**Model.**
+
+- `TextToSpeech::synth(text) -> Result<Audio>`. `Audio { samples: Vec<i16>, rate }` is in `src/domain/speech.rs`.
+- `SherpaTts` wraps `OfflineTts` with the Supertonic-3 model in `[tts].model_dir`, the speaker ID `[tts].voice` and `[tts].num_steps`. The adapter fixes `lang = "en"` and `seed = 1`. Thus the same text gives bit-identical samples on every run. The model rate is 44.1 kHz.
+- `sherpa-onnx` is `=2.0.1` with feature `shared`. Each recipe and CI job that builds `jarvis` sets `SHERPA_ONNX_LIB_DIR` to the library folder of sub-phase 6.1, so no build downloads. `gpu-test` and the Linux release job set it to the CUDA library folder.
+- `just models` also downloads the 20M zipformer and the Supertonic-3 model `sherpa-onnx-supertonic-3-tts-int8-2026-05-11` into `models/`.
+- `device` selects the provider for `SherpaTts`.
+- sherpa-onnx falls back to the CPU with only a log line when the CUDA provider does not load. Thus a test checks the CUDA provider of a sherpa-onnx model by the GPU memory of the test process (`nvidia-smi`): the memory grows when the model loads.
+
+**Acceptance criteria.**
+
+- AC-6.2-1: When `just models` has run, the STT and TTS model folders exist in `models/`, and each file that the recipe lists has its SHA-256.
+- AC-6.2-2: When `SherpaTts::synth("Hello")` runs, it returns 16-bit mono audio with more than 0 samples at the model rate.
+- AC-6.2-3: When `synth("")` runs, it returns zero samples and no error.
+- AC-6.2-4: When one test process loads the fixture classifier and `SherpaTts`, both predict or synthesize without error.
+- AC-6.2-5 [GPU host]: With `device = cuda`, `SherpaTts` and `OnnxClassifier` run in one process on the CUDA execution provider.
+
+**Proofs.**
+
+- P-6.2-1, P-6.2-2, P-6.2-4, P-6.2-5. Evidence: test.
+- P-6.2-3. Argument: `synth` returns empty audio for empty text before it calls the engine.
 
 ---
 
@@ -162,7 +171,7 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 - **Implements:** G2. **Depends on:** 6.5.
 - **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `justfile`, `jarvis.toml`, `Cargo.toml`.
 
-**Model.** `SpeechToText::stream() -> Box<dyn SttStream>`. `SttStream`: `accept(samples)`, `partial() -> Partial { text, voice_end_ms: Option, vad_ms }`, `reset()`. `SherpaStt` wraps `OnlineRecognizer` with `[asr].model_dir`, and the sherpa-onnx Silero VAD with `[asr].vad_model`, `vad_threshold` and `vad_min_silence_ms` on the same samples. `vad_ms` is the end of the audio that the VAD has decided: audio that the VAD still holds to decide the start or the end of a segment is not decided. `voice_end_ms` is the audio position of the end of the last voiced frame, and `None` before any speech. While the VAD is in a speech segment, `voice_end_ms = vad_ms`. This sub-phase adds `asr.model_dir`, `asr.vad_model`, `asr.vad_threshold` and `asr.vad_min_silence_ms`. `just models` also downloads the Silero VAD model. `FakeStt` returns scripted partials with voice end times. `speech(text)` in `fakes.rs` synthesizes text with `SherpaTts`, resamples it to 16 kHz with `rubato`, and adds 500 ms of silence. `FakeStt` returns scripted partial texts.
+**Model.** `SpeechToText::stream() -> Box<dyn SttStream>`. `SttStream`: `accept(samples)`, `partial() -> Partial { text, voice_end_ms: Option, vad_ms }`, `reset()`. `SherpaStt` wraps `OnlineRecognizer` with `[asr].model_dir`, and the sherpa-onnx Silero VAD with `[asr].vad_model`, `vad_threshold` and `vad_min_silence_ms` on the same samples. `vad_ms` is the end of the audio that the VAD has decided: audio that the VAD still holds to decide the start or the end of a segment is not decided. `voice_end_ms` is the audio position of the end of the last voiced frame, and `None` before any speech. While the VAD is in a speech segment, `voice_end_ms = vad_ms`. This sub-phase adds `asr.model_dir`, `asr.vad_model`, `asr.vad_threshold` and `asr.vad_min_silence_ms`. `just models` also downloads the Silero VAD model. `FakeStt` returns scripted partials with voice end times. `speech(text)` in `fakes.rs` synthesizes text with `SherpaTts`, resamples it from 44.1 kHz to 16 kHz with `rubato`, and adds 500 ms of silence. The fixed TTS seed makes `speech(text)` bit-identical on every run. `FakeStt` returns scripted partial texts.
 
 **Acceptance criteria.**
 

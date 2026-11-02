@@ -485,7 +485,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 - `Classifier::predict(context, text) -> Result<Prediction>`. `ModelLoader::load(dir, device) -> Result<Arc<dyn Classifier>>`.
 - `OnnxClassifier` tokenizes `(context, text)` as a pair, runs the session, then calls `softmax`, `ranked` and `decode_bio` (sub-phases 3.11 to 3.11c). `predict` returns the `decode_bio` error.
-- `load` reads `labels.json`, `tokenizer.json` and `model.onnx`. Until sub-phase 6.2, `ort` uses the ONNX Runtime binaries that its build downloads.
+- `load` reads `labels.json`, `tokenizer.json` and `model.onnx`. Until sub-phase 6.1, `ort` uses the ONNX Runtime binaries that its build downloads.
 - `FakeClassifier` returns scripted predictions and records each `(context, text)`. `FakeModelLoader` returns scripted classifiers.
 
 **Acceptance criteria.**
@@ -513,7 +513,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 - `device = cuda` registers the CUDA execution provider. `device = cpu` registers only the CPU provider.
 - `predict` checks the session output before it calls `softmax`.
-- This sub-phase turns on the `cuda` feature of `ort`. On Linux, the binary then loads `libonnxruntime.so` at run time. Until sub-phase 6.2, the release job copies the ONNX Runtime libraries next to `jarvis` in the Linux archive, and the binary finds them in its own folder.
+- This sub-phase turns on the `cuda` feature of `ort`. On Linux, the binary then loads `libonnxruntime.so` at run time. Until sub-phase 6.1, the release job copies the ONNX Runtime libraries next to `jarvis` in the Linux archive, and the binary finds them in its own folder.
 - The `gpu-test` job needs the fixture model, and its checkout removes the ignored `models/` folder. Thus `gpu-test` runs after `rust-test` and restores `models/system-one/fixture/` from the `rust-test` cache.
 
 **Acceptance criteria.**

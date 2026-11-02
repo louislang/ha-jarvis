@@ -456,7 +456,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 | `x86_64-unknown-linux-gnu` | `ubuntu-latest` |
 | `x86_64-apple-darwin` | `macos-15-intel` |
 
-Each build makes `jarvis-<tag>-<target>.tar.gz` with the binary and its shared libraries. A verification step fails the job unless `file jarvis` reports an x86-64 ELF executable (Linux) or an x86_64 Mach-O executable (macOS), and `./jarvis` exits with code 0. A last job runs `gh release create` with both archives. The GPU host runs the Linux binary in a checkout of the repository at the same tag. The checkout has `train/`, `intents.toml`, `responses.toml`, `jarvis.toml` and the `.venv` of `just setup`. Sub-phase 3.10 adds the training image. Sub-phase 6.2 adds the CUDA libraries to the Linux archive. When GitHub stops the x86-64 macOS runners (fall 2027), the macOS job builds on arm64 with `--target x86_64-apple-darwin`.
+Each build makes `jarvis-<tag>-<target>.tar.gz` with the binary and its shared libraries. A verification step fails the job unless `file jarvis` reports an x86-64 ELF executable (Linux) or an x86_64 Mach-O executable (macOS), and `./jarvis` exits with code 0. A last job runs `gh release create` with both archives. The GPU host runs the Linux binary in a checkout of the repository at the same tag. The checkout has `train/`, `intents.toml`, `responses.toml`, `jarvis.toml` and the `.venv` of `just setup`. Sub-phase 3.10 adds the training image. Sub-phase 6.1 adds the CUDA libraries to the Linux archive. When GitHub stops the x86-64 macOS runners (fall 2027), the macOS job builds on arm64 with `--target x86_64-apple-darwin`.
 
 **Acceptance criteria.**
 
