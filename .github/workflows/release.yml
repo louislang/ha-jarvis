@@ -26,23 +26,26 @@ jobs:
       ARCHIVE: jarvis-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
     steps:
       - uses: actions/checkout@v7
-      # Until 6.2, the Linux archive holds the ONNX Runtime libraries, which `jarvis` loads from its own folder.
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: "1.59.0"
+      # The Linux archive has the CUDA libraries, the macOS archive the CPU libraries.
+      - run: just ${{ runner.os == 'Linux' && 'gpu-models' || 'models' }}
       - run: cargo build --release --target ${{ matrix.target }}
-        env:
-          RUSTFLAGS: ${{ runner.os == 'Linux' && '-C link-arg=-Wl,-rpath,$ORIGIN' || '' }}
-      - run: |
-          shopt -s nullglob
-          cd target/${{ matrix.target }}/release
-          tar -czhf "$GITHUB_WORKSPACE/$ARCHIVE" jarvis libonnxruntime*.so*
+      - run: tar -czhf "$ARCHIVE" -C "target/${{ matrix.target }}/release" jarvis -C "$GITHUB_WORKSPACE"/models/sherpa-onnx-v2.0.1-*/lib .
       - run: |
           mkdir verify
           tar -xzf "$ARCHIVE" -C verify
           cd verify
           file jarvis | grep -E 'ELF 64-bit LSB .*executable, x86-64|Mach-O 64-bit executable x86_64'
           if [ "$RUNNER_OS" = Linux ]; then
+            export ORT_DYLIB_PATH="$PWD/libonnxruntime.so" LD_LIBRARY_PATH="$PWD"
+            test -f libonnxruntime.so
             test -f libonnxruntime_providers_cuda.so
             libraries=$(ldd ./jarvis)
             if grep 'not found' <<< "$libraries"; then exit 1; fi
+          else
+            export ORT_DYLIB_PATH="$PWD/libonnxruntime.dylib" DYLD_LIBRARY_PATH="$PWD"
           fi
           ./jarvis
       - uses: actions/upload-artifact@v7
