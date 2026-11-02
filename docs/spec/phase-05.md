@@ -14,7 +14,7 @@ This phase adds the driving port and the Wyoming adapter. HA can use Jarvis as i
 **Model.**
 
 - `Assistant`: `info() -> Info`. `Info` has `name` and `version`. The adapter sets the other fields of the `handle` program: the attribution, `installed = true`, a description and the language `en`. Sub-phase 5.2 adds `handle`. Later sub-phases add `listen` and `speak`.
-- A Wyoming event is one JSON header line (`type`, `data_length`, `payload_length`), then `data_length` bytes of JSON data, then `payload_length` bytes of payload. Event types come from the `wyoming` crate.
+- A Wyoming event is one JSON header line (`type`, `data_length`, `payload_length`), then `data_length` bytes of JSON data, then `payload_length` bytes of payload. The adapter reads `type` as a string and matches the event types that it uses.
 - Each connection runs in its own task. An unknown event type is ignored. A header that is not valid JSON closes that connection only.
 - `FakeWyomingClient` and `FakeAssistant` are in `fakes.rs`.
 

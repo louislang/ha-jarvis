@@ -193,7 +193,6 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `tracing`, `tracing-subscriber` | Application, adapters, root | Logs and latency spans. |
 | `futures` | Ports, application, adapters | `Stream` for events, partial transcripts and sentences. |
 | `async-trait` | Ports, application, adapters, root | Async methods on port traits behind `Arc<dyn Port>`. |
-| `wyoming` | Adapter | Wyoming event types (sans-IO). |
 | `tokio-tungstenite`, `futures-util` | Adapter | HA WebSocket API. |
 | `sherpa-onnx` (feature `shared`) | Adapter | Streaming STT (`OnlineRecognizer`), TTS (`OfflineTts`, Piper VITS models), voice identification (`SpeakerEmbeddingExtractor`, `SpeakerEmbeddingManager`). CUDA or CPU provider. |
 | `ort` (feature `load-dynamic`), `tokenizers` | Adapter | System One model prediction with ONNX Runtime (CUDA or CPU execution provider). Tokenizer from `tokenizer.json`. |
@@ -228,7 +227,7 @@ Python packages for `train/` (pinned in `train/pyproject.toml`):
 - Runtime: `torch`, `transformers`, `onnx`, `onnxruntime`, `runpod`.
 - Development (`dev` extra): `pytest`, `pytest-cov`, `ruff`, `mypy`, `vulture`, `interrogate`.
 
-If the `wyoming` crate does not have an event type that Jarvis needs, add only that type in `adapters/wyoming.rs` with `serde`.
+Jarvis does not use the `wyoming` crate. Version 0.2.1 turns on the `serde_json` feature `arbitrary_precision` for the whole build, and then a template no longer reads an HA number as a number (AC-4.5d-1). `adapters/wyoming.rs` reads the event type as a string and defines the data of each event that Jarvis uses with `serde`.
 
 `ort` and `sherpa-onnx` load one shared ONNX Runtime library (decision 27). `SHERPA_ONNX_LIB_DIR` points to the sherpa-onnx CUDA build on the GPU host and in the Linux release job. `ORT_DYLIB_PATH` points to the `libonnxruntime` in the same folder. Sub-phase 6.1 proves that both work in one process.
 
