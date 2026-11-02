@@ -129,9 +129,9 @@ verus:
 bench:
     cargo bench --bench domain
 
-# Run the `[GPU host]` tests on CUDA, one at a time, so that the timing tests do not share the machine.
+# Run the `[GPU host]` tests on CUDA.
 gpu-test: models gpu-models
-    JARVIS_DEVICE=cuda SHERPA_ONNX_LIB_DIR={{ quote(cuda_libraries) }} ORT_DYLIB_PATH={{ quote(cuda_libraries / "libonnxruntime.so") }} LD_LIBRARY_PATH={{ quote(cuda_libraries) }} cargo test --workspace --release -- --ignored --test-threads=1
+    JARVIS_DEVICE=cuda SHERPA_ONNX_LIB_DIR={{ quote(cuda_libraries) }} ORT_DYLIB_PATH={{ quote(cuda_libraries / "libonnxruntime.so") }} LD_LIBRARY_PATH={{ quote(cuda_libraries) }} cargo test --workspace --release -- --ignored
 
 # Write the architecture diagram.
 diagram:

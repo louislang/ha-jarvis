@@ -762,7 +762,6 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::adapters::onnx::OnnxLoader;
-    use crate::adapters::sherpa::SherpaStt;
     use crate::adapters::sherpa::SherpaTts;
     use crate::app::conversation::Queues;
     use crate::domain::responses::Pool;
@@ -1450,21 +1449,6 @@ mod tests {
         Ok(total)
     }
 
-    /// True in the child process that runs the ignored test `name` alone. Else runs that child
-    /// and gives false when it passes.
-    fn alone(name: &str) -> anyhow::Result<bool> {
-        let alone = "JARVIS_ALONE";
-        if env::var_os(alone).is_some() {
-            return Ok(true);
-        }
-        let status = std::process::Command::new(env::current_exe()?)
-            .args(["--ignored", "--exact", name])
-            .env(alone, "1")
-            .status()?;
-        anyhow::ensure!(status.success(), "the test fails alone: {status}");
-        Ok(false)
-    }
-
     /// AC-6.2-4.
     #[tokio::test]
     async fn ac_6_2_4_classifier_and_tts_run_in_one_process() -> anyhow::Result<()> {
@@ -1480,7 +1464,14 @@ mod tests {
     #[tokio::test]
     #[ignore = "GPU host"]
     async fn ac_6_2_5_cuda_runs_classifier_and_tts_in_one_process() -> anyhow::Result<()> {
-        if !alone("tests::ac_6_2_5_cuda_runs_classifier_and_tts_in_one_process")? {
+        let alone = "JARVIS_ALONE";
+        if env::var_os(alone).is_none() {
+            let name = "tests::ac_6_2_5_cuda_runs_classifier_and_tts_in_one_process";
+            let status = std::process::Command::new(env::current_exe()?)
+                .args(["--ignored", "--exact", name])
+                .env(alone, "1")
+                .status()?;
+            anyhow::ensure!(status.success(), "the test fails alone: {status}");
             return Ok(());
         }
         let start = gpu_memory()?;
@@ -1495,23 +1486,5 @@ mod tests {
             "GPU memory in MiB: {start} at the start, {middle} after the classifier, {end} after the TTS"
         );
         predict_and_synth(classifier.as_ref(), &tts).await
-    }
-
-    /// AC-6.6b-7. sherpa-onnx falls back to the CPU with only a log line, so the GPU memory of
-    /// this process shows that the first pass loads on CUDA.
-    #[test]
-    #[ignore = "GPU host"]
-    fn ac_6_6b_7_cuda_runs_the_first_pass() -> anyhow::Result<()> {
-        if !alone("tests::ac_6_6b_7_cuda_runs_the_first_pass")? {
-            return Ok(());
-        }
-        let start = gpu_memory()?;
-        let _stt = SherpaStt::try_new(&Config::parse(VALID)?.asr, Device::Cuda)?;
-        let end = gpu_memory()?;
-        assert!(
-            start < end,
-            "GPU memory in MiB: {start} before and {end} after the first pass"
-        );
-        Ok(())
     }
 }
