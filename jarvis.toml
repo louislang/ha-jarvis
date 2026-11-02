@@ -12,6 +12,7 @@ announce_timeout_s = 60     # announce and ask: HA answers after the audio plays
 ping_interval_s = 30
 
 [model]
+dir = "models/system-one"
 threshold = 0.6
 
 [announce]

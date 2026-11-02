@@ -36,9 +36,15 @@ flowchart LR
         crate_testing_fakes[fakes]
     end
     crate --> crate
+    crate --> crate_adapters_files
+    crate --> crate_adapters_ha
+    crate --> crate_adapters_onnx
     crate --> crate_app_conversation
     crate --> crate_domain_catalog
+    crate --> crate_domain_model
+    crate --> crate_domain_responses
     crate --> crate_domain_state
+    crate --> crate_domain_state_cache
     crate --> crate_domain_training
     crate --> crate_ports
     crate_adapters_files --> crate_adapters_files
@@ -46,6 +52,7 @@ flowchart LR
     crate_adapters_ha --> crate
     crate_adapters_ha --> crate_adapters_ha
     crate_adapters_ha --> crate_domain_state
+    crate_adapters_ha --> crate_ports
     crate_adapters_onnx --> crate
     crate_adapters_onnx --> crate_adapters_onnx
     crate_adapters_onnx --> crate_domain_model
@@ -68,6 +75,7 @@ flowchart LR
     crate_domain_catalog --> crate_domain_intent
     crate_domain_contracts --> crate_domain_catalog
     crate_domain_contracts --> crate_domain_intent
+    crate_domain_contracts --> crate_domain_responses
     crate_domain_contracts --> crate_domain_state
     crate_domain_contracts --> crate_domain_state_cache
     crate_domain_contracts --> crate_domain_training

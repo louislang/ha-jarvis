@@ -28,6 +28,8 @@ use crate::domain::catalog::Intent;
 use crate::domain::catalog::Kind;
 use crate::domain::catalog::Target;
 use crate::domain::intent::Span;
+use crate::domain::responses::Pool;
+use crate::domain::responses::Response;
 use crate::domain::state::Area;
 use crate::domain::state::AreaId;
 use crate::domain::state::Context;
@@ -123,6 +125,14 @@ pub struct ExCatalog(Catalog);
 /// One action that Jarvis can take.
 #[verifier::external_type_specification]
 pub struct ExIntent(Intent);
+
+/// The responses of one intent or one filler type.
+#[verifier::external_type_specification]
+pub struct ExPool(Pool);
+
+/// One response template and its use count.
+#[verifier::external_type_specification]
+pub struct ExResponse(Response);
 
 /// How Jarvis replies to an intent and acts on it.
 #[verifier::external_type_specification]
