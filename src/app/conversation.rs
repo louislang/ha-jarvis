@@ -12,11 +12,14 @@ use arc_swap::ArcSwap;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use rand::rngs::StdRng;
+use serde_json::Map;
+use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::domain::decide::Chosen;
 use crate::domain::decide::Decision;
+use crate::domain::decide::Job;
 use crate::domain::responses;
 use crate::domain::responses::Pools;
 use crate::domain::state::ServiceCall;
@@ -40,6 +43,7 @@ pub struct Handled {
 }
 
 /// Dispatches decisions to the home, the announce queues and the pools task.
+#[derive(Clone)]
 pub struct Conversation {
     /// The current pools.
     pools: Arc<ArcSwap<Pools>>,
@@ -47,13 +51,13 @@ pub struct Conversation {
     changes: mpsc::Sender<Change>,
     /// The announce queues and their house.
     queues: Arc<Queues>,
-    /// The random source of the `failure` answers.
+    /// The random source of the answers that background work selects.
     rng: Arc<Mutex<StdRng>>,
 }
 
 impl Conversation {
     /// Dispatches to `queues`, their house and the pools task of `pools` and `changes`. Selects
-    /// the `failure` answers with `rng`.
+    /// the answers of background work with `rng`.
     #[must_use]
     pub fn new(
         pools: Arc<ArcSwap<Pools>>,
@@ -69,46 +73,97 @@ impl Conversation {
         }
     }
 
-    /// The reply of `decision` and its service call as background work. Records the use of the
-    /// reply. Increases the generation of `satellite`, the satellite entity of the request.
+    /// The reply or filler of `decision` and its service call or fetch as background work.
+    /// Records the use of the reply. Increases the generation of `satellite`, the satellite
+    /// entity of the request.
     pub fn dispatch(&self, decision: Decision, satellite: Option<&str>) -> Handled {
-        let (chosen, call) = match decision {
-            Decision::Reply { reply, call } => (reply, call),
-            Decision::Defer { filler, .. } => (filler, None),
+        let request = satellite
+            .map(|satellite| (satellite.to_owned(), self.queues.next_generation(satellite)));
+        let (chosen, after) = match decision {
+            Decision::Reply { reply, call } => (reply, call.map(|call| self.after(call, request))),
+            Decision::Defer {
+                filler,
+                job: Job::Fetch { call, pool },
+            } => (filler, Some(self.fetch(call, pool, request))),
+            Decision::Defer {
+                filler,
+                job: Job::Llm(_),
+            } => (filler, None),
             Decision::Fallback { reply } => (reply, None),
         };
         let Chosen { text, pool, index } = chosen;
         record_use(&self.changes, pool, index);
-        let request = satellite
-            .map(|satellite| (satellite.to_owned(), self.queues.next_generation(satellite)));
-        let after = call.map(|call| self.after(call, request));
         Handled { text, after }
     }
 
     /// Makes `call`. When it fails, logs the error, queues a `failure` answer on the satellite
     /// of `request` with the generation of `request`, and records its use.
     fn after(&self, call: ServiceCall, request: Option<(String, u64)>) -> Work {
-        let (pools, queues) = (Arc::clone(&self.pools), Arc::clone(&self.queues));
-        let (changes, rng) = (self.changes.clone(), Arc::clone(&self.rng));
+        let conversation = self.clone();
         async move {
-            let Err(error) = queues.home.call(call).await else {
+            let Err(error) = conversation.queues.home.call(call).await else {
                 return Ok(());
             };
             tracing::warn!("the call failed: {error:#}");
             let Some((satellite, generation)) = request else {
                 return Ok(());
             };
-            let (text, index) = {
-                let pools = pools.load();
-                let pool = pools.get("failure").expect("valid pools have failure");
-                let index =
-                    responses::select(pool, &mut rng.lock().expect("no lock holder panics"));
-                (pool.responses[index].text.clone(), index)
-            };
-            record_use(&changes, "failure".to_owned(), index);
+            let text = conversation.pick("failure");
+            let queues = &conversation.queues;
             queues.announce(&satellite, generation, &text).await
         }
         .boxed()
+    }
+
+    /// Makes `call` while `request` is the newest of its satellite. Renders an answer of `pool`
+    /// with the response data as `response`, or selects a `failure` answer when the call or the
+    /// render fails. Queues the answer with the generation of `request`, or logs it without a
+    /// satellite.
+    fn fetch(&self, call: ServiceCall, pool: String, request: Option<(String, u64)>) -> Work {
+        let conversation = self.clone();
+        async move {
+            if let Some((satellite, generation)) = &request
+                && !conversation.queues.is_current(satellite, *generation)
+            {
+                return Ok(());
+            }
+            let answer = match conversation.queues.home.call(call).await {
+                Ok(response) => conversation.render(&pool, response),
+                Err(error) => Err(error),
+            };
+            let text = answer.unwrap_or_else(|error| {
+                tracing::warn!("the fetch failed: {error:#}");
+                conversation.pick("failure")
+            });
+            let Some((satellite, generation)) = request else {
+                tracing::info!("the fetch answer is {text:?}");
+                return Ok(());
+            };
+            let queues = &conversation.queues;
+            queues.announce(&satellite, generation, &text).await
+        }
+        .boxed()
+    }
+
+    /// An answer of the pool `pool` rendered with `response` as `response`.
+    fn render(&self, pool: &str, response: Option<Value>) -> anyhow::Result<String> {
+        let template = self.pick(pool);
+        let context = Map::from_iter([("response".to_owned(), response.unwrap_or_default())]);
+        Ok(responses::render(&template, &context)?)
+    }
+
+    /// The text of an answer that `responses::select` picks from the current pool `pool`.
+    /// Records its use.
+    fn pick(&self, pool: &str) -> String {
+        let (text, index) = {
+            let pools = self.pools.load();
+            let found = pools.get(pool).expect("valid pools have each answer pool");
+            let index =
+                responses::select(found, &mut self.rng.lock().expect("no lock holder panics"));
+            (found.responses[index].text.clone(), index)
+        };
+        record_use(&self.changes, pool.to_owned(), index);
+        text
     }
 }
 
@@ -168,6 +223,11 @@ impl Queues {
         Arc::clone(satellites.entry(satellite.to_owned()).or_default())
     }
 
+    /// True when the generation of `satellite` is `generation`.
+    fn is_current(&self, satellite: &str, generation: u64) -> bool {
+        self.queue(satellite).generation.load(Ordering::SeqCst) == generation
+    }
+
     /// Increases the generation of `satellite` and returns it.
     pub fn next_generation(&self, satellite: &str) -> u64 {
         self.queue(satellite)
@@ -209,7 +269,7 @@ impl Queues {
                 break;
             }
         }
-        if queue.generation.load(Ordering::SeqCst) != generation {
+        if !self.is_current(satellite, generation) {
             return Ok(());
         }
         self.home.announce(satellite, text).await
@@ -324,6 +384,11 @@ mod tests {
             ("lights_on".to_owned(), lights),
             ("fallback".to_owned(), fallback),
             ("failure".to_owned(), pool(&[("Failed.", 0)])),
+            ("filler".to_owned(), pool(&[("One moment.", 0)])),
+            (
+                "weather".to_owned(),
+                pool(&[("It is {{ response.sky }}.", 0)]),
+            ),
         ])
     }
 
@@ -552,11 +617,20 @@ mod tests {
         (cache, receiver, conversation)
     }
 
+    /// The work of a dispatch of `decision` on `satellite`.
+    fn work(
+        conversation: &Conversation,
+        decision: Decision,
+        satellite: Option<&str>,
+    ) -> anyhow::Result<Work> {
+        let handled = conversation.dispatch(decision, satellite);
+        handled.after.ok_or_else(|| anyhow::anyhow!("no after"))
+    }
+
     /// The work of a dispatch on the satellite of a reply with `call()`, whose call fails.
     fn failed(home: &FakeHome, conversation: &Conversation) -> anyhow::Result<Work> {
         drop(home.delay());
-        let handled = conversation.dispatch(reply(Some(call())), Some(SATELLITE));
-        handled.after.ok_or_else(|| anyhow::anyhow!("no after"))
+        work(conversation, reply(Some(call())), Some(SATELLITE))
     }
 
     /// AC-4.9c-1.
@@ -612,6 +686,76 @@ mod tests {
             .fold(unused(), |pools, change| change(pools));
         let reply = responses::record_use(unused(), "lights_on", 1);
         assert_eq!(applied, responses::record_use(reply, "failure", 0));
+        Ok(())
+    }
+
+    /// The `weather` call with `return_response`.
+    fn weather() -> ServiceCall {
+        let target = vec!["weather.home".to_owned()];
+        let (domain, service) = ("weather".to_owned(), "get_forecasts".to_owned());
+        let (data, return_response) = (serde_json::Map::new(), true);
+        ServiceCall {
+            domain,
+            service,
+            target,
+            data,
+            return_response,
+        }
+    }
+
+    /// The work of a dispatch on `satellite` of a `weather` fetch.
+    fn fetch(conversation: &Conversation, satellite: Option<&str>) -> anyhow::Result<Work> {
+        let job = Job::Fetch {
+            call: weather(),
+            pool: "weather".to_owned(),
+        };
+        let filler = chosen("filler", 0);
+        work(conversation, Decision::Defer { filler, job }, satellite)
+    }
+
+    /// AC-4.9d-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_4_9d_1_fetch_calls_with_return_response() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (_cache, _changes, conversation) = still(&home, "idle");
+        fetch(&conversation, None)?.await?;
+        assert_eq!(home.calls(), [weather()]);
+        Ok(())
+    }
+
+    /// AC-4.9d-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_4_9d_2_fetch_announces_rendered_answer_when_idle() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        home.respond(serde_json::json!({ "sky": "sunny" }));
+        let (cache, _changes, conversation) = still(&home, "responding");
+        let idle = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(
+                announces(&home),
+                [] as [&str; 0],
+                "an announce came while busy"
+            );
+            set(&cache, "idle");
+        };
+        tokio::join!(fetch(&conversation, Some(SATELLITE))?, idle).0?;
+        assert_eq!(announces(&home), ["It is sunny."]);
+        let preannounce = home
+            .calls()
+            .pop()
+            .map(|call| call.data["preannounce"].clone());
+        assert_eq!(preannounce, Some(serde_json::json!(false)));
+        Ok(())
+    }
+
+    /// AC-4.9d-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_4_9d_3_failed_fetch_announces_failure() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (_cache, _changes, conversation) = still(&home, "idle");
+        drop(home.delay());
+        fetch(&conversation, Some(SATELLITE))?.await?;
+        assert_eq!(announces(&home), ["Failed."]);
         Ok(())
     }
 

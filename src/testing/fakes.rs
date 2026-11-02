@@ -40,7 +40,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// A `Home` with a settable snapshot, scripted events, a count of snapshot calls, recorded calls
-/// and announces, and delayed calls.
+/// and announces, delayed calls and response data.
 pub(crate) struct FakeHome {
     /// The snapshot that `snapshot` returns.
     snapshot: Mutex<Snapshot>,
@@ -54,6 +54,8 @@ pub(crate) struct FakeHome {
     gates: Mutex<VecDeque<oneshot::Receiver<()>>>,
     /// The service calls, in order. An announce is its `assist_satellite.announce` call.
     calls: Mutex<Vec<ServiceCall>>,
+    /// The response data that `call` gives.
+    response: Mutex<Option<Value>>,
 }
 
 impl FakeHome {
@@ -68,6 +70,7 @@ impl FakeHome {
             receiver: Mutex::new(Some(receiver)),
             gates: Mutex::default(),
             calls: Mutex::default(),
+            response: Mutex::default(),
         }
     }
 
@@ -88,6 +91,11 @@ impl FakeHome {
         let (sender, receiver) = oneshot::channel();
         lock(&self.gates).push_back(receiver);
         sender
+    }
+
+    /// Makes the later calls give `response` as their response data.
+    pub(crate) fn respond(&self, response: Value) {
+        *lock(&self.response) = Some(response);
     }
 
     /// The number of `snapshot` calls.
@@ -136,7 +144,7 @@ impl Home for FakeHome {
     async fn call(&self, call: ServiceCall) -> anyhow::Result<Option<Value>> {
         lock(&self.calls).push(call);
         self.wait().await?;
-        Ok(None)
+        Ok(lock(&self.response).clone())
     }
 
     async fn announce(&self, satellite: &str, text: &str) -> anyhow::Result<()> {
