@@ -208,6 +208,10 @@ impl Config {
         }
         let (threshold, commit_threshold) = (self.model.threshold, self.model.commit_threshold);
         anyhow::ensure!(
+            threshold > 0.5,
+            "model.threshold = {threshold} must be more than 0.5"
+        );
+        anyhow::ensure!(
             commit_threshold >= threshold,
             "model.commit_threshold = {commit_threshold} must be at least model.threshold = {threshold}"
         );
@@ -904,6 +908,19 @@ mod tests {
             assert!(
                 names.iter().all(|name| error.contains(name)),
                 "error for {broken} does not name {names:?}: {error}"
+            );
+        }
+    }
+
+    /// `model.threshold` must be more than 0.5 (sub-phase 2.2).
+    #[test]
+    fn fix_threshold_of_half_or_less_is_an_error() {
+        for threshold in ["0.5", "0.3"] {
+            let text = VALID.replace("threshold = 0.6", &format!("threshold = {threshold}"));
+            let error = parse_error(&text);
+            assert!(
+                error.contains("model.threshold") && error.contains("0.5"),
+                "error for {threshold} has no field or bound: {error}"
             );
         }
     }
