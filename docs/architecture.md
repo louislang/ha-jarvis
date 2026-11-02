@@ -8,6 +8,7 @@ flowchart LR
         crate_adapters_files[files]
         crate_adapters_ha[ha]
         crate_adapters_onnx[onnx]
+        crate_adapters_wyoming[wyoming]
     end
     subgraph app
         crate_app_background[background]
@@ -48,6 +49,7 @@ flowchart LR
     crate_adapters_onnx --> crate_adapters_onnx
     crate_adapters_onnx --> crate_domain_model
     crate_adapters_onnx --> crate_ports
+    crate_adapters_wyoming --> crate_ports
     crate_app_background --> crate_domain_state
     crate_app_background --> crate_domain_state_cache
     crate_app_background --> crate_ports

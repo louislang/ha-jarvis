@@ -1,6 +1,7 @@
 //! A fake for each port.
 
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -16,15 +17,22 @@ use futures::stream::BoxStream;
 use jiff::Timestamp;
 use serde_json::Value;
 use serde_json::json;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
+use tokio::net::TcpStream;
 
 use crate::Device;
 use crate::domain::model::Prediction;
 use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
+use crate::ports::Assistant;
 use crate::ports::Classifier;
 use crate::ports::Clock;
 use crate::ports::Home;
+use crate::ports::Info;
 use crate::ports::ModelLoader;
 use crate::ports::Store;
 
@@ -259,5 +267,58 @@ pub struct FakeClock(pub Timestamp);
 impl Clock for FakeClock {
     fn now(&self) -> Timestamp {
         self.0
+    }
+}
+
+/// An `Assistant` with a fixed name and version.
+pub(crate) struct FakeAssistant;
+
+impl Assistant for FakeAssistant {
+    fn info(&self) -> Info {
+        Info {
+            name: "jarvis-test".to_owned(),
+            version: "1.2.3".to_owned(),
+        }
+    }
+}
+
+/// A Wyoming client over TCP.
+pub(crate) struct FakeWyomingClient {
+    /// The connection to the server.
+    stream: BufReader<TcpStream>,
+}
+
+impl FakeWyomingClient {
+    /// Connects to the server at `address`.
+    pub(crate) async fn connect(address: SocketAddr) -> anyhow::Result<Self> {
+        Ok(Self {
+            stream: BufReader::new(TcpStream::connect(address).await?),
+        })
+    }
+
+    /// Writes `bytes` with no framing.
+    pub(crate) async fn send_raw(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        Ok(self.stream.write_all(bytes).await?)
+    }
+
+    /// Sends the event `event_type` with `data`.
+    pub(crate) async fn send(&mut self, event_type: &str, data: &Value) -> anyhow::Result<()> {
+        let data = data.to_string();
+        let header = json!({ "type": event_type, "data_length": data.len() });
+        self.send_raw(format!("{header}\n{data}").as_bytes()).await
+    }
+
+    /// The type and the data of the next event, or `None` when the server closes the connection.
+    pub(crate) async fn receive(&mut self) -> anyhow::Result<Option<(String, Value)>> {
+        let mut line = String::new();
+        if self.stream.read_line(&mut line).await? == 0 {
+            return Ok(None);
+        }
+        let header: Value = serde_json::from_str(&line)?;
+        let length = header["data_length"].as_u64().unwrap_or(0);
+        let mut data = vec![0; usize::try_from(length)?];
+        self.stream.read_exact(&mut data).await?;
+        let event_type = header["type"].as_str().unwrap_or_default().to_owned();
+        Ok(Some((event_type, serde_json::from_slice(&data)?)))
     }
 }
