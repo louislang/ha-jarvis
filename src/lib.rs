@@ -51,6 +51,7 @@ pub mod adapters {
     pub mod files;
     pub mod ha;
     pub mod onnx;
+    pub mod wyoming;
 }
 
 /// Shared test code.

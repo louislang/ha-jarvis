@@ -14,6 +14,21 @@ use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
 
+/// The name and the version that Jarvis gives to HA.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Info {
+    /// The program name.
+    pub name: String,
+    /// The program version.
+    pub version: String,
+}
+
+/// The driving port that the Wyoming server calls.
+pub trait Assistant: Send + Sync {
+    /// The name and the version of the conversation agent.
+    fn info(&self) -> Info;
+}
+
 /// The house: HA states, registries, events and service calls.
 #[async_trait]
 pub trait Home: Send + Sync {
