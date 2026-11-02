@@ -309,7 +309,6 @@ fn pcm(value: f32) -> i16 {
 /// with the Supertonic-3 model.
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
     use std::thread;
     use std::time::Instant;
 
@@ -339,9 +338,6 @@ mod tests {
 
     /// The 20 ms chunks of 16 kHz audio.
     const CHUNK: usize = 320;
-
-    /// Serializes the timing tests, so that they do not share the CPU.
-    static TIMING: Mutex<()> = Mutex::new(());
 
     /// The partial after each 20 ms chunk of `audio` in a new first pass of `stt`.
     fn partials(stt: &SherpaStt, audio: &Audio) -> anyhow::Result<Vec<Partial>> {
@@ -388,7 +384,6 @@ mod tests {
     /// the audio time.
     async fn real_time_factor(device: Device) -> anyhow::Result<f64> {
         let (stt, audio) = (stt(device)?, fakes::speech(REQUEST).await?);
-        let _only = TIMING.lock().expect("no timing test panicked");
         partials(&stt, &audio)?;
         let start = Instant::now();
         partials(&stt, &audio)?;
@@ -399,7 +394,6 @@ mod tests {
     /// CUDA, with the chunks in real time after a warm-up.
     fn last_word_latency(audio: &Audio) -> anyhow::Result<Duration> {
         let stt = stt(Device::Cuda)?;
-        let _only = TIMING.lock().expect("no timing test panicked");
         partials(&stt, audio)?;
         let mut stream = stt.stream()?;
         let start = Instant::now();
