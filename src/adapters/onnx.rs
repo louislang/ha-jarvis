@@ -185,12 +185,14 @@ impl Model {
 ///
 /// # Errors
 ///
-/// ONNX Runtime cannot register the provider.
+/// ONNX Runtime cannot create its environment or register the provider.
 fn builder(device: Device) -> ort::Result<SessionBuilder> {
     let provider = match device {
         Device::Cuda => CUDAExecutionProvider::default().build(),
         Device::Cpu => CPUExecutionProvider::default().build(),
     };
+    // The CUDA provider of ort 2.0.0-rc.10 needs the environment but does not create it.
+    ort::environment::get_environment()?;
     Session::builder()?.with_execution_providers([provider.error_on_failure()])
 }
 
