@@ -80,6 +80,7 @@ pub mod ports;
 pub mod app {
     pub mod background;
     pub mod conversation;
+    pub mod speech;
 }
 
 /// Port implementations, one technology each.

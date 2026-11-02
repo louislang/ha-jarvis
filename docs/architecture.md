@@ -14,6 +14,7 @@ flowchart LR
     subgraph app
         crate_app_background[background]
         crate_app_conversation[conversation]
+        crate_app_speech[speech]
     end
     subgraph domain
         crate_domain_catalog[catalog]
@@ -77,6 +78,11 @@ flowchart LR
     crate_app_conversation --> crate_domain_state_cache
     crate_app_conversation --> crate_domain_training
     crate_app_conversation --> crate_ports
+    crate_app_speech --> crate_app_speech
+    crate_app_speech --> crate_domain_catalog
+    crate_app_speech --> crate_domain_responses
+    crate_app_speech --> crate_domain_speech
+    crate_app_speech --> crate_ports
     crate_domain_catalog --> crate_domain_contracts
     crate_domain_catalog --> crate_domain_intent
     crate_domain_contracts --> crate_domain_catalog

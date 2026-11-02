@@ -7,6 +7,10 @@
 )]
 
 use std::hint;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use futures::executor;
 
 use gungraun::Callgrind;
 use gungraun::EventKind;
@@ -14,6 +18,11 @@ use gungraun::LibraryBenchmarkConfig;
 use gungraun::library_benchmark;
 use gungraun::library_benchmark_group;
 use gungraun::main;
+use jarvis::app::speech::Speech;
+use jarvis::domain::responses::Pool;
+use jarvis::domain::responses::Pools;
+use jarvis::domain::responses::Response;
+use jarvis::domain::speech::Audio;
 use jarvis::domain::state::Area;
 use jarvis::domain::state::AreaId;
 use jarvis::domain::state::Context;
@@ -25,6 +34,7 @@ use jarvis::domain::state::HomeConfig;
 use jarvis::domain::state::Snapshot;
 use jarvis::domain::state::State;
 use jarvis::domain::state_cache::StateCache;
+use jarvis::ports::TextToSpeech;
 use jiff::Timestamp;
 
 /// Entities in the benchmark cache.
@@ -123,6 +133,36 @@ fn cache_and_event() -> (StateCache, Event) {
     (cache(), event)
 }
 
+/// A `TextToSpeech` that gives 2 s of silence at 44.1 kHz.
+struct Silence;
+
+#[async_trait]
+impl TextToSpeech for Silence {
+    async fn synth(&self, _text: &str) -> anyhow::Result<Audio> {
+        Ok(Audio {
+            samples: vec![0; 88_200],
+            rate: 44_100,
+        })
+    }
+}
+
+/// A speech use case that has the 2 s audio of "One moment." in its cache and is never dropped.
+fn cached_speech() -> &'static Speech {
+    let speech = Speech::new(Arc::new(Silence));
+    let response = Response {
+        text: "One moment.".to_owned(),
+        uses: 0,
+    };
+    let pool = Pool {
+        responses: vec![response],
+        last: None,
+    };
+    let pools = Pools::from([("filler".to_owned(), pool)]);
+    executor::block_on(speech.prerender(&pools, &["Office".to_owned()]))
+        .expect("the silence has no error");
+    Box::leak(Box::new(speech))
+}
+
 /// A Callgrind configuration that fails above `instructions`.
 fn budget(instructions: u64) -> LibraryBenchmarkConfig {
     let mut callgrind = Callgrind::default();
@@ -160,4 +200,16 @@ library_benchmark_group!(
     benchmarks = [state_lookup, entities, apply]
 );
 
-main!(library_benchmark_groups = ac_2_8c_1_cache_budgets);
+// `speak` of a cached response of 2 s.
+#[library_benchmark(config = budget(100_000))]
+#[bench::seconds_2(cached_speech())]
+fn cache_hit(speech: &'static Speech) -> anyhow::Result<Arc<Audio>> {
+    executor::block_on(speech.speak(hint::black_box("One moment.")))
+}
+
+library_benchmark_group!(name = ac_6_3b_4_cache_hit_budget, benchmarks = [cache_hit]);
+
+main!(
+    library_benchmark_groups = ac_2_8c_1_cache_budgets,
+    ac_6_3b_4_cache_hit_budget
+);
