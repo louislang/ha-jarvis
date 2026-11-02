@@ -95,11 +95,11 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 **Goal:** Add the speech use case with `speak`, the audio cache and `prerender`. A TTS request for a known response is now a memory read.
 
 - **Implements:** G1, G4. **Depends on:** 6.3.
-- **Files:** create `src/app/speech.rs`. Modify `src/testing/fakes.rs`, `benches/domain.rs`, `Cargo.toml`.
+- **Files:** create `src/app/speech.rs`. Modify `src/lib.rs` (the module declaration only), `src/testing/fakes.rs`, `benches/domain.rs`, `Cargo.toml`.
 
 **Model.**
 
-- `AudioCache: DashMap<text, Audio>`. `speak(text)`: a hit returns the cached audio. A miss calls `synth` and returns the result without a store. Only `prerender` (and the prefetch of sub-phase 14.10, which replaces the old answer) adds audio, so the cache does not grow with dynamic texts.
+- `AudioCache: DashMap<text, Arc<Audio>>`. `speak(text)`: a hit returns the cached audio without a copy of the samples. A miss calls `synth` and returns the result without a store. Only `prerender` (and the prefetch of sub-phase 14.10, which replaces the old answer) adds audio, so the cache does not grow with dynamic texts.
 - `prerender(pools, areas)`: for each template whose only variable is `area` (or no variable), render it for each area and synthesize it. The `area` variable is the area name in lowercase, as in the replies of `decide`, so the cache keys match the reply texts.
 - This sub-phase adds the use case and its tests only. Sub-phase 6.10 connects it to `run`.
 - This sub-phase adds the crate `dashmap` to `Cargo.toml`.
