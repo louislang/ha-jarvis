@@ -116,6 +116,8 @@ pub struct Config {
     pub ha: HaConfig,
     /// System One model.
     pub model: ModelConfig,
+    /// Speech to text.
+    pub asr: AsrConfig,
     /// Text to speech.
     pub tts: TtsConfig,
     /// Announces.
@@ -137,16 +139,21 @@ impl Config {
         Ok(config)
     }
 
-    /// Checks the range of each field.
+    /// Checks the range of each field, then [`Config::validate_relations`].
     ///
     /// # Errors
     ///
-    /// A field is out of its range. The error names the field and the range.
+    /// A field is out of its range, or a pair of fields breaks its relation. The error names the
+    /// field and the range, or both fields.
     fn validate(&self) -> anyhow::Result<()> {
+        let asr = &self.asr;
         let positive = [
             ("ha.request_timeout_ms", self.ha.request_timeout_ms),
             ("ha.announce_timeout_s", self.ha.announce_timeout_s),
             ("ha.ping_interval_s", self.ha.ping_interval_s),
+            ("asr.early_commit_ms", asr.early_commit_ms),
+            ("asr.endpoint_ms", asr.endpoint_ms),
+            ("asr.max_utterance_ms", asr.max_utterance_ms),
         ];
         for (name, value) in positive {
             anyhow::ensure!(
@@ -154,15 +161,55 @@ impl Config {
                 "{name} = {value} is out of range: it must be more than 0"
             );
         }
-        let threshold = self.model.threshold;
-        anyhow::ensure!(
-            (0.0..=1.0).contains(&threshold),
-            "model.threshold = {threshold} is out of range: it must be in [0, 1]"
-        );
+        let probabilities = [
+            ("model.threshold", self.model.threshold),
+            ("model.commit_threshold", self.model.commit_threshold),
+        ];
+        for (name, value) in probabilities {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&value),
+                "{name} = {value} is out of range: it must be in [0, 1]"
+            );
+        }
         let holdout = self.train.holdout;
         anyhow::ensure!(
             (0.0..=1.0).contains(&holdout),
             "train.holdout = {holdout} is out of range: it must be in [0, 1]"
+        );
+        self.validate_relations()
+    }
+
+    /// Checks the relation of each pair of fields.
+    ///
+    /// # Errors
+    ///
+    /// A pair of fields breaks its relation. The error names both fields.
+    fn validate_relations(&self) -> anyhow::Result<()> {
+        let asr = &self.asr;
+        let ordered = [
+            (
+                "asr.early_commit_ms",
+                asr.early_commit_ms,
+                "asr.endpoint_ms",
+                asr.endpoint_ms,
+            ),
+            (
+                "asr.endpoint_ms",
+                asr.endpoint_ms,
+                "asr.max_utterance_ms",
+                asr.max_utterance_ms,
+            ),
+        ];
+        for (lower, low, upper, high) in ordered {
+            anyhow::ensure!(
+                high > low,
+                "{upper} = {high} must be more than {lower} = {low}"
+            );
+        }
+        let (threshold, commit_threshold) = (self.model.threshold, self.model.commit_threshold);
+        anyhow::ensure!(
+            commit_threshold >= threshold,
+            "model.commit_threshold = {commit_threshold} must be at least model.threshold = {threshold}"
         );
         Ok(())
     }
@@ -211,6 +258,20 @@ pub struct ModelConfig {
     pub dir: PathBuf,
     /// The least top probability that System One acts on.
     pub threshold: f32,
+    /// The least top probability of a confident partial, which commits after `early_commit_ms`.
+    pub commit_threshold: f32,
+}
+
+/// The `[asr]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AsrConfig {
+    /// The silence after a confident partial that commits.
+    pub early_commit_ms: u64,
+    /// The silence after any partial that commits.
+    pub endpoint_ms: u64,
+    /// The utterance length that always commits.
+    pub max_utterance_ms: u64,
 }
 
 /// The `[tts]` section.
@@ -727,6 +788,12 @@ mod tests {
             model: ModelConfig {
                 dir: PathBuf::from("models/system-one"),
                 threshold: 0.6,
+                commit_threshold: 0.9,
+            },
+            asr: AsrConfig {
+                early_commit_ms: 200,
+                endpoint_ms: 600,
+                max_utterance_ms: 8000,
             },
             tts: TtsConfig {
                 model_dir: PathBuf::from("models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11"),
@@ -808,6 +875,35 @@ mod tests {
             assert!(
                 error.contains("model.threshold") && error.contains("[0, 1]"),
                 "error for {threshold} has no field or range: {error}"
+            );
+        }
+    }
+
+    /// AC-6.5-6.
+    #[test]
+    fn ac_6_5_6_broken_relation_names_both_fields() {
+        let cases = [
+            (
+                "endpoint_ms = 600",
+                "endpoint_ms = 200",
+                ["asr.endpoint_ms", "asr.early_commit_ms"],
+            ),
+            (
+                "commit_threshold = 0.9",
+                "commit_threshold = 0.5",
+                ["model.commit_threshold", "model.threshold"],
+            ),
+            (
+                "max_utterance_ms = 8000",
+                "max_utterance_ms = 600",
+                ["asr.max_utterance_ms", "asr.endpoint_ms"],
+            ),
+        ];
+        for (field, broken, names) in cases {
+            let error = parse_error(&VALID.replace(field, broken));
+            assert!(
+                names.iter().all(|name| error.contains(name)),
+                "error for {broken} does not name {names:?}: {error}"
             );
         }
     }
