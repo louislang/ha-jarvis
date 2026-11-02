@@ -301,7 +301,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/domain/speaker.rs` | Domain | Discovery, presence, proximity and identification. | 15.1 |
 | `src/app/background.rs` | Application | Hot cache sync, habit learning, backfill, learned intents, prefetch. | 2.9 |
 | `src/app/conversation.rs` | Application | `handle` use case, dispatch, deferred jobs, dialog map. | 4.8 |
-| `src/app/speech.rs` | Application | `listen` and `speak` use cases, audio cache, pre-render. | 6.3 |
+| `src/app/speech.rs` | Application | `listen` and `speak` use cases, audio cache, pre-render. | 6.3b |
 | `src/app/review.rs` | Application | `Review` use case. | 12.7 |
 | `src/app/training.rs` | Application | Generated examples, training trigger, training run, accept and swap. | 13.6 |
 | `src/adapters/ha.rs` | Adapter | `Home` over the HA WebSocket API. | 2.2 |

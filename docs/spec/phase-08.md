@@ -13,7 +13,7 @@ This phase adds new responses to a pool when the pool has too few unused respons
 
 **Model.**
 
-- `needs_backfill(pool, min_fresh, max_pool) -> bool`: fewer than `min_fresh` responses have `uses = 0`, and the pool has fewer than `max_pool` responses. A full pool rotates by `uses` and does not grow. Only a pool whose templates use no variable, or only `area`, gets a backfill. Thus every new response can be pre-rendered (sub-phase 6.3).
+- `needs_backfill(pool, min_fresh, max_pool) -> bool`: fewer than `min_fresh` responses have `uses = 0`, and the pool has fewer than `max_pool` responses. A full pool rotates by `uses` and does not grow. Only a pool whose templates use no variable, or only `area`, gets a backfill. Thus every new response can be pre-rendered (sub-phase 6.3b).
 - `validate(candidate, pool, variables, max_chars) -> Result<()>`: not empty, at most `max_chars`, not equal to an existing response after `normalize`, uses only allowed variables, renders without error with `area = "kitchen"`.
 - `merge(pool, candidates, max_pool) -> Pool`: appends the valid candidates with `uses = 0`, up to `max_pool` responses.
 - This sub-phase adds `[backfill]` (`min_fresh`, `batch`, `max_chars`, `max_pool`).
