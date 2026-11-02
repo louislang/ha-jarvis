@@ -298,15 +298,16 @@ fn resample(audio: &Audio, rate: usize) -> anyhow::Result<Vec<i16>> {
     Ok(samples.collect())
 }
 
-/// A `SpeechToText` whose streams give the scripted partials in order, one after each `accept`.
+/// A `SpeechToText` whose streams give the scripted partials, with their voice ends, in order,
+/// one after each `accept`.
 pub struct FakeStt(pub Vec<Partial>);
 
 impl SpeechToText for FakeStt {
-    fn stream(&self) -> Box<dyn SttStream> {
-        Box::new(FakeSttStream {
+    fn stream(&self) -> anyhow::Result<Box<dyn SttStream>> {
+        Ok(Box::new(FakeSttStream {
             partials: self.0.clone().into(),
             current: Partial::default(),
-        })
+        }))
     }
 }
 
