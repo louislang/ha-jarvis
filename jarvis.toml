@@ -17,6 +17,7 @@ threshold = 0.6
 commit_threshold = 0.9
 
 [asr]
+model_dir = "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25"
 early_commit_ms = 200
 endpoint_ms = 600
 max_utterance_ms = 8000

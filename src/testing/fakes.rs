@@ -17,6 +17,10 @@ use futures::channel::mpsc;
 use futures::channel::oneshot;
 use futures::stream::BoxStream;
 use jiff::Timestamp;
+use rubato::Fft;
+use rubato::FixedSync;
+use rubato::Resampler;
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use serde_json::Value;
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
@@ -27,7 +31,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
 
+use crate::Config;
 use crate::Device;
+use crate::adapters::sherpa::SherpaTts;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
@@ -41,7 +47,10 @@ use crate::ports::Handled;
 use crate::ports::Home;
 use crate::ports::Info;
 use crate::ports::ModelLoader;
+use crate::ports::Partial;
+use crate::ports::SpeechToText;
 use crate::ports::Store;
+use crate::ports::SttStream;
 use crate::ports::TextToSpeech;
 
 /// The reference house snapshot.
@@ -255,6 +264,73 @@ impl TextToSpeech for FakeTts {
             samples: Vec::new(),
             rate: 16_000,
         })
+    }
+}
+
+/// The 16 kHz audio of `text` from the `SherpaTts` of `jarvis.toml` on the CPU, with 500 ms of
+/// silence after it.
+pub(crate) async fn speech(text: &str) -> anyhow::Result<Audio> {
+    let config = Config::parse(include_str!("../../jarvis.toml"))?;
+    let audio = SherpaTts::try_new(&config.tts, Device::Cpu)?
+        .synth(text)
+        .await?;
+    let rate = 16_000;
+    let mut samples = resample(&audio, rate)?;
+    samples.resize(samples.len() + rate / 2, 0);
+    Ok(Audio {
+        samples,
+        rate: u32::try_from(rate)?,
+    })
+}
+
+/// The samples of `audio` at `rate` Hz.
+fn resample(audio: &Audio, rate: usize) -> anyhow::Result<Vec<i16>> {
+    let input: Vec<f32> = audio.samples.iter().copied().map(f32::from).collect();
+    let from = usize::try_from(audio.rate)?;
+    let mut resampler = Fft::<f32>::new(from, rate, 1024, 1, FixedSync::Input)?;
+    let buffer = InterleavedSlice::new(&input, 1, input.len())?;
+    let output = resampler.process_all(&buffer, input.len(), None)?;
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a float cast saturates at the `i16` range"
+    )]
+    let samples = output.take_data().into_iter().map(|value| value as i16);
+    Ok(samples.collect())
+}
+
+/// A `SpeechToText` whose streams give the scripted partials in order, one after each `accept`.
+pub struct FakeStt(pub Vec<Partial>);
+
+impl SpeechToText for FakeStt {
+    fn stream(&self) -> Box<dyn SttStream> {
+        Box::new(FakeSttStream {
+            partials: self.0.clone().into(),
+            current: Partial::default(),
+        })
+    }
+}
+
+/// A stream of `FakeStt`.
+struct FakeSttStream {
+    /// The partials of the next `accept` calls, in order.
+    partials: VecDeque<Partial>,
+    /// The partial of the last `accept`, or the empty partial after `reset`.
+    current: Partial,
+}
+
+impl SttStream for FakeSttStream {
+    fn accept(&mut self, _samples: &[i16]) {
+        if let Some(next) = self.partials.pop_front() {
+            self.current = next;
+        }
+    }
+
+    fn partial(&self) -> Partial {
+        self.current.clone()
+    }
+
+    fn reset(&mut self) {
+        self.current = Partial::default();
     }
 }
 

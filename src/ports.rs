@@ -90,6 +90,31 @@ pub trait ModelLoader: Send + Sync {
     async fn load(&self, dir: &Path, device: Device) -> anyhow::Result<Arc<dyn Classifier>>;
 }
 
+/// The first-pass result of the audio so far.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Partial {
+    /// The decoded text.
+    pub text: String,
+}
+
+/// Speech to text.
+pub trait SpeechToText: Send + Sync {
+    /// A new first pass of 16 kHz audio.
+    fn stream(&self) -> Box<dyn SttStream>;
+}
+
+/// The first pass of one utterance. `accept` blocks while it decodes.
+pub trait SttStream: Send {
+    /// Decodes the next `samples`.
+    fn accept(&mut self, samples: &[i16]);
+
+    /// The result of the audio so far.
+    fn partial(&self) -> Partial;
+
+    /// Drops the audio so far.
+    fn reset(&mut self);
+}
+
 /// Text to speech.
 #[async_trait]
 pub trait TextToSpeech: Send + Sync {

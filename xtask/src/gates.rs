@@ -2009,6 +2009,6 @@ fn ac_6_1_4_linux_archive_has_cuda_libraries() {
 /// After `just models`, the STT and TTS model folders exist and each file of their sums has its SHA-256.
 #[test]
 fn ac_6_2_1_models_writes_stt_and_tts_folders() {
-    assert_fetched("zipformer_sums");
+    assert_fetched("nemotron_sums");
     assert_fetched("supertonic_sums");
 }
