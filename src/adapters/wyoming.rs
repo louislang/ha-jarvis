@@ -1,8 +1,10 @@
 //! The Wyoming TCP server. It calls `Assistant`.
 
+use std::mem;
 use std::sync::Arc;
 
 use serde::Deserialize;
+use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
@@ -30,6 +32,9 @@ struct Header {
     /// The number of payload bytes after the data.
     #[serde(default)]
     payload_length: u64,
+    /// The data in the header line. The data after the header adds to it.
+    #[serde(default)]
+    data: Map<String, Value>,
 }
 
 /// The data of a `transcript` event.
@@ -71,12 +76,12 @@ async fn connection(
     let mut stream = BufReader::new(stream);
     let mut line = String::new();
     while stream.read_line(&mut line).await? > 0 {
-        let header: Header = serde_json::from_str(&line)?;
+        let mut header: Header = serde_json::from_str(&line)?;
         line.clear();
-        let data = data(&mut stream, &header).await?;
+        let data = data(&mut stream, &mut header).await?;
         match header.event_type.as_str() {
             "describe" => write(&mut stream, "info", &info_data(&assistant.info())).await?,
-            "transcript" => transcript(&mut stream, assistant, &data).await?,
+            "transcript" => transcript(&mut stream, assistant, data).await?,
             _ => {}
         }
     }
@@ -92,9 +97,9 @@ async fn connection(
 async fn transcript(
     stream: &mut (impl AsyncWrite + Unpin),
     assistant: &dyn Assistant,
-    data: &[u8],
+    data: Map<String, Value>,
 ) -> anyhow::Result<()> {
-    let Transcript { text, context } = serde_json::from_slice(data)?;
+    let Transcript { text, context } = serde_json::from_value(Value::Object(data))?;
     match assistant.handle(&text, context).await {
         Ok(Handled { text, after }) => {
             write(stream, "handled", &json!({ "text": text })).await?;
@@ -112,19 +117,28 @@ async fn transcript(
     Ok(())
 }
 
-/// Reads the data of the event of `header` from `stream`, and drops its payload.
+/// The data of the event of `header`: the header data merged with the data that follows it on
+/// `stream`. Drops the payload.
 ///
 /// # Errors
 ///
-/// The read fails.
-async fn data(stream: &mut (impl AsyncRead + Unpin), header: &Header) -> anyhow::Result<Vec<u8>> {
-    let mut data = Vec::new();
+/// The read fails, or the data is not a JSON object.
+async fn data(
+    stream: &mut (impl AsyncRead + Unpin),
+    header: &mut Header,
+) -> anyhow::Result<Map<String, Value>> {
+    let mut bytes = Vec::new();
     (&mut *stream)
         .take(header.data_length)
-        .read_to_end(&mut data)
+        .read_to_end(&mut bytes)
         .await?;
     let payload = &mut stream.take(header.payload_length);
     tokio::io::copy(payload, &mut tokio::io::sink()).await?;
+    let mut data = mem::take(&mut header.data);
+    if !bytes.is_empty() {
+        let more: Map<String, Value> = serde_json::from_slice(&bytes)?;
+        data.extend(more);
+    }
     Ok(data)
 }
 
@@ -320,6 +334,26 @@ mod tests {
             assistant.started(),
             "the work did not start after the write"
         );
+        Ok(())
+    }
+
+    /// A transcript with its text in the header line and its context in the data block.
+    #[tokio::test]
+    async fn header_data_merges_with_the_data_block() -> anyhow::Result<()> {
+        let assistant = Arc::new(FakeAssistant::default());
+        let mut client = open(&assistant);
+        let data = json!({ "context": { "device_id": "device-1" } }).to_string();
+        let header =
+            json!({ "type": "transcript", "data": { "text": "hi" }, "data_length": data.len() });
+        client
+            .send_raw(format!("{header}\n{data}").as_bytes())
+            .await?;
+        client.receive().await?;
+        let context = Context {
+            device_id: Some("device-1".to_owned()),
+            ..Context::default()
+        };
+        assert_eq!(assistant.requests(), vec![("hi".to_owned(), context)]);
         Ok(())
     }
 }
