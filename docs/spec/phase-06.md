@@ -85,8 +85,8 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 **Proofs.**
 
-- P-6.3-4 (AC-6.3-4). Ensures: the concatenation of the chunks is the audio, and each chunk except the last has `size` samples. Argument: `chunks` is `samples.chunks(size)`, which partitions the slice in order into pieces of `size` with a shorter last piece. Concatenation of a partition gives the slice.
-- P-6.3-5. Ensures: `duration(audio) = len(samples) / rate`. Argument: the function is this division. 22050 samples at 22050 Hz give 1 s.
+- P-6.3-4 (AC-6.3-4). Requires: `size > 0`, because `slice::chunks` panics at 0. Ensures: the concatenation of the chunks is the audio, and each chunk except the last has `size` samples. Argument: `chunks` is `samples.chunks(size)`, which partitions the slice in order into pieces of `size` with a shorter last piece. Concatenation of a partition gives the slice.
+- P-6.3-5. Requires: `rate > 0`. Ensures: `duration(audio) = len(samples) / rate`. Argument: the function is this division. 22050 samples at 22050 Hz give 1 s.
 
 ---
 
