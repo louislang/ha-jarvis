@@ -1,18 +1,23 @@
 //! The Wyoming TCP server. It calls `Assistant`.
 
+use std::mem;
 use std::sync::Arc;
 
 use serde::Deserialize;
+use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::net::TcpListener;
-use tokio::net::TcpStream;
 
 use crate::ports::Assistant;
+use crate::ports::Context;
+use crate::ports::Handled;
 use crate::ports::Info;
 
 /// The header line of a Wyoming event.
@@ -27,6 +32,19 @@ struct Header {
     /// The number of payload bytes after the data.
     #[serde(default)]
     payload_length: u64,
+    /// The data in the header line. The data after the header adds to it.
+    #[serde(default)]
+    data: Map<String, Value>,
+}
+
+/// The data of a `transcript` event.
+#[derive(Deserialize)]
+struct Transcript {
+    /// The text of the request.
+    text: String,
+    /// The IDs of the request.
+    #[serde(default)]
+    context: Context,
 }
 
 /// Accepts connections on `listener` and serves each one in its own task.
@@ -51,29 +69,77 @@ pub async fn serve(listener: TcpListener, assistant: Arc<dyn Assistant>) -> anyh
 /// # Errors
 ///
 /// The connection fails, or a header is not valid JSON.
-async fn connection(stream: TcpStream, assistant: &dyn Assistant) -> anyhow::Result<()> {
+async fn connection(
+    stream: impl AsyncRead + AsyncWrite + Unpin,
+    assistant: &dyn Assistant,
+) -> anyhow::Result<()> {
     let mut stream = BufReader::new(stream);
     let mut line = String::new();
     while stream.read_line(&mut line).await? > 0 {
-        let header: Header = serde_json::from_str(&line)?;
+        let mut header: Header = serde_json::from_str(&line)?;
         line.clear();
-        skip(&mut stream, header.data_length).await?;
-        skip(&mut stream, header.payload_length).await?;
-        if header.event_type == "describe" {
-            write(&mut stream, "info", &info_data(&assistant.info())).await?;
+        let data = data(&mut stream, &mut header).await?;
+        match header.event_type.as_str() {
+            "describe" => write(&mut stream, "info", &info_data(&assistant.info())).await?,
+            "transcript" => transcript(&mut stream, assistant, data).await?,
+            _ => {}
         }
     }
     Ok(())
 }
 
-/// Reads and drops the next `length` bytes of `stream`.
+/// Answers the `transcript` data `data` with `handled` or `not-handled`. Starts the work of a
+/// reply after the write and the flush.
 ///
 /// # Errors
 ///
-/// The read fails.
-async fn skip(stream: &mut BufReader<TcpStream>, length: u64) -> anyhow::Result<()> {
-    tokio::io::copy(&mut stream.take(length), &mut tokio::io::sink()).await?;
+/// The data is not a transcript, or the write fails.
+async fn transcript(
+    stream: &mut (impl AsyncWrite + Unpin),
+    assistant: &dyn Assistant,
+    data: Map<String, Value>,
+) -> anyhow::Result<()> {
+    let Transcript { text, context } = serde_json::from_value(Value::Object(data))?;
+    match assistant.handle(&text, context).await {
+        Ok(Handled { text, after }) => {
+            write(stream, "handled", &json!({ "text": text })).await?;
+            stream.flush().await?;
+            if let Some(after) = after {
+                tokio::spawn(async move {
+                    if let Err(error) = after.await {
+                        tracing::warn!("the work after the reply failed: {error:#}");
+                    }
+                });
+            }
+        }
+        Err(error) => write(stream, "not-handled", &json!({ "text": error.to_string() })).await?,
+    }
     Ok(())
+}
+
+/// The data of the event of `header`: the header data merged with the data that follows it on
+/// `stream`. Drops the payload.
+///
+/// # Errors
+///
+/// The read fails, or the data is not a JSON object.
+async fn data(
+    stream: &mut (impl AsyncRead + Unpin),
+    header: &mut Header,
+) -> anyhow::Result<Map<String, Value>> {
+    let mut bytes = Vec::new();
+    (&mut *stream)
+        .take(header.data_length)
+        .read_to_end(&mut bytes)
+        .await?;
+    let payload = &mut stream.take(header.payload_length);
+    tokio::io::copy(payload, &mut tokio::io::sink()).await?;
+    let mut data = mem::take(&mut header.data);
+    if !bytes.is_empty() {
+        let more: Map<String, Value> = serde_json::from_slice(&bytes)?;
+        data.extend(more);
+    }
+    Ok(data)
 }
 
 /// Writes the event `event_type` with `data` to `stream`.
@@ -82,7 +148,7 @@ async fn skip(stream: &mut BufReader<TcpStream>, length: u64) -> anyhow::Result<
 ///
 /// The write fails.
 async fn write(
-    stream: &mut BufReader<TcpStream>,
+    stream: &mut (impl AsyncWrite + Unpin),
     event_type: &str,
     data: &Value,
 ) -> anyhow::Result<()> {
@@ -116,8 +182,10 @@ mod tests {
     use super::*;
 
     use std::net::SocketAddr;
+    use std::time::Duration;
 
     use futures::future;
+    use tokio::io::DuplexStream;
 
     use crate::testing::fakes::FakeAssistant;
     use crate::testing::fakes::FakeWyomingClient;
@@ -126,8 +194,35 @@ mod tests {
     async fn start() -> anyhow::Result<SocketAddr> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
-        tokio::spawn(serve(listener, Arc::new(FakeAssistant)));
+        tokio::spawn(serve(listener, Arc::new(FakeAssistant::default())));
         Ok(address)
+    }
+
+    /// A client on a connection to `assistant` through an in-memory stream with a 16-byte buffer
+    /// in each direction.
+    fn open(assistant: &Arc<FakeAssistant>) -> FakeWyomingClient<DuplexStream> {
+        let (client, server) = tokio::io::duplex(16);
+        let assistant = Arc::clone(assistant);
+        tokio::spawn(async move { connection(server, assistant.as_ref()).await });
+        FakeWyomingClient::new(client)
+    }
+
+    /// Sends `transcript` with a text and a full context on `client`.
+    async fn transcript(client: &mut FakeWyomingClient<DuplexStream>) -> anyhow::Result<()> {
+        let context = json!({
+            "conversation_id": "conversation-1",
+            "device_id": "device-1",
+            "satellite_id": "assist_satellite.kitchen",
+        });
+        let data = json!({ "text": "turn on the lights", "context": context });
+        client.send("transcript", &data).await
+    }
+
+    /// Sends `transcript` to `assistant` and returns the answer.
+    async fn answer(assistant: &Arc<FakeAssistant>) -> anyhow::Result<(String, Value)> {
+        let mut client = open(assistant);
+        transcript(&mut client).await?;
+        Ok(client.receive().await?.expect("the server answers"))
     }
 
     /// Sends `describe` on `client` and returns the `handle` programs of the `info` answer.
@@ -143,7 +238,7 @@ mod tests {
     async fn ac_5_1_1_describe_gives_info_with_one_handle_program() -> anyhow::Result<()> {
         let mut client = FakeWyomingClient::connect(start().await?).await?;
         let programs = describe(&mut client).await?;
-        let info = FakeAssistant.info();
+        let info = FakeAssistant::default().info();
         assert_eq!(programs.len(), 1, "programs: {programs:?}");
         assert_eq!(programs[0]["name"], info.name.as_str());
         assert_eq!(programs[0]["version"], info.version.as_str());
@@ -186,6 +281,79 @@ mod tests {
             answers.iter().all(|programs| programs.len() == 1),
             "answers: {answers:?}"
         );
+        Ok(())
+    }
+
+    /// AC-5.2-1.
+    #[tokio::test]
+    async fn ac_5_2_1_transcript_gives_the_text_and_the_context() -> anyhow::Result<()> {
+        let assistant = Arc::new(FakeAssistant::default());
+        answer(&assistant).await?;
+        let context = Context {
+            conversation_id: Some("conversation-1".to_owned()),
+            device_id: Some("device-1".to_owned()),
+            satellite_id: Some("assist_satellite.kitchen".to_owned()),
+        };
+        let expected = vec![("turn on the lights".to_owned(), context)];
+        assert_eq!(assistant.requests(), expected);
+        Ok(())
+    }
+
+    /// AC-5.2-2.
+    #[tokio::test]
+    async fn ac_5_2_2_ok_gives_handled_with_the_text() -> anyhow::Result<()> {
+        let answer = answer(&Arc::new(FakeAssistant::default())).await?;
+        let expected = json!({ "text": "reply to turn on the lights" });
+        assert_eq!(answer, ("handled".to_owned(), expected));
+        Ok(())
+    }
+
+    /// AC-5.2-3.
+    #[tokio::test]
+    async fn ac_5_2_3_err_gives_not_handled_with_the_error_text() -> anyhow::Result<()> {
+        let assistant = Arc::new(FakeAssistant::default());
+        assistant.fail("no model");
+        let answer = answer(&assistant).await?;
+        let expected = json!({ "text": "no model" });
+        assert_eq!(answer, ("not-handled".to_owned(), expected));
+        Ok(())
+    }
+
+    /// AC-5.2-4. A virtual sleep returns only when every task waits.
+    #[tokio::test(start_paused = true)]
+    async fn ac_5_2_4_after_starts_only_when_handled_is_written() -> anyhow::Result<()> {
+        let assistant = Arc::new(FakeAssistant::default());
+        let mut client = open(&assistant);
+        transcript(&mut client).await?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!assistant.started(), "the work started before the write");
+        let (event_type, _) = client.receive().await?.expect("the server answers");
+        assert_eq!(event_type, "handled");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            assistant.started(),
+            "the work did not start after the write"
+        );
+        Ok(())
+    }
+
+    /// A transcript with its text in the header line and its context in the data block.
+    #[tokio::test]
+    async fn header_data_merges_with_the_data_block() -> anyhow::Result<()> {
+        let assistant = Arc::new(FakeAssistant::default());
+        let mut client = open(&assistant);
+        let data = json!({ "context": { "device_id": "device-1" } }).to_string();
+        let header =
+            json!({ "type": "transcript", "data": { "text": "hi" }, "data_length": data.len() });
+        client
+            .send_raw(format!("{header}\n{data}").as_bytes())
+            .await?;
+        client.receive().await?;
+        let context = Context {
+            device_id: Some("device-1".to_owned()),
+            ..Context::default()
+        };
+        assert_eq!(assistant.requests(), vec![("hi".to_owned(), context)]);
         Ok(())
     }
 }

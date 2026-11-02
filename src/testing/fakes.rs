@@ -6,10 +6,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::channel::oneshot;
@@ -18,7 +20,9 @@ use jiff::Timestamp;
 use serde_json::Value;
 use serde_json::json;
 use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
@@ -31,6 +35,8 @@ use crate::domain::state::Snapshot;
 use crate::ports::Assistant;
 use crate::ports::Classifier;
 use crate::ports::Clock;
+use crate::ports::Context;
+use crate::ports::Handled;
 use crate::ports::Home;
 use crate::ports::Info;
 use crate::ports::ModelLoader;
@@ -270,9 +276,38 @@ impl Clock for FakeClock {
     }
 }
 
-/// An `Assistant` with a fixed name and version.
-pub(crate) struct FakeAssistant;
+/// An `Assistant` with a fixed name and version that records each request. `handle` replies
+/// with work that marks its start, or fails after `fail`.
+#[derive(Default)]
+pub(crate) struct FakeAssistant {
+    /// The text and the context of each request, in order.
+    requests: Mutex<Vec<(String, Context)>>,
+    /// The error text of the later requests, if any.
+    error: Mutex<Option<String>>,
+    /// True when the work of a reply has started.
+    started: Arc<AtomicBool>,
+}
 
+impl FakeAssistant {
+    /// Makes the later requests fail with `error`.
+    pub(crate) fn fail(&self, error: &str) {
+        *lock(&self.error) = Some(error.to_owned());
+    }
+
+    /// The text and the context of each request, in order.
+    #[must_use]
+    pub(crate) fn requests(&self) -> Vec<(String, Context)> {
+        lock(&self.requests).clone()
+    }
+
+    /// True when the work of a reply has started.
+    #[must_use]
+    pub(crate) fn started(&self) -> bool {
+        self.started.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
 impl Assistant for FakeAssistant {
     fn info(&self) -> Info {
         Info {
@@ -280,20 +315,45 @@ impl Assistant for FakeAssistant {
             version: "1.2.3".to_owned(),
         }
     }
+
+    async fn handle(&self, text: &str, context: Context) -> anyhow::Result<Handled> {
+        lock(&self.requests).push((text.to_owned(), context));
+        if let Some(error) = lock(&self.error).clone() {
+            anyhow::bail!(error);
+        }
+        let started = Arc::clone(&self.started);
+        Ok(Handled {
+            text: format!("reply to {text}"),
+            after: Some(
+                async move {
+                    started.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+                .boxed(),
+            ),
+        })
+    }
 }
 
-/// A Wyoming client over TCP.
-pub(crate) struct FakeWyomingClient {
+/// A Wyoming client over TCP or an in-memory stream.
+pub(crate) struct FakeWyomingClient<S = TcpStream> {
     /// The connection to the server.
-    stream: BufReader<TcpStream>,
+    stream: BufReader<S>,
 }
 
 impl FakeWyomingClient {
     /// Connects to the server at `address`.
     pub(crate) async fn connect(address: SocketAddr) -> anyhow::Result<Self> {
-        Ok(Self {
-            stream: BufReader::new(TcpStream::connect(address).await?),
-        })
+        Ok(Self::new(TcpStream::connect(address).await?))
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> FakeWyomingClient<S> {
+    /// A client on the open connection `stream`.
+    pub(crate) fn new(stream: S) -> Self {
+        Self {
+            stream: BufReader::new(stream),
+        }
     }
 
     /// Writes `bytes` with no framing.
