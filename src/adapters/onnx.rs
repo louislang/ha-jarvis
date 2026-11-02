@@ -491,6 +491,25 @@ mod tests {
         Ok(())
     }
 
+    /// The first session of a process opens the fixture model on CUDA.
+    ///
+    /// The test runs itself again in a child process, so that no earlier session exists.
+    #[test]
+    #[ignore = "GPU host"]
+    fn fix_first_cuda_session_creates_the_environment() -> anyhow::Result<()> {
+        if std::env::var_os("JARVIS_FRESH_PROCESS").is_some() {
+            fixture(Device::Cuda)?;
+            return Ok(());
+        }
+        let name = "adapters::onnx::tests::fix_first_cuda_session_creates_the_environment";
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args([name, "--exact", "--ignored"])
+            .env("JARVIS_FRESH_PROCESS", "1")
+            .status()?;
+        assert!(status.success(), "the child process exits with {status}");
+        Ok(())
+    }
+
     /// The `load` error for a folder with links to the fixture model and tokenizer and `labels`.
     ///
     /// The folder has no `labels.json` when `labels` is `None`.
