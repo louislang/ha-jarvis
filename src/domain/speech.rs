@@ -1,4 +1,4 @@
-//! Audio type, audio chunks and audio duration.
+//! Audio type, audio chunks, audio duration and commit policy.
 
 use std::time::Duration;
 
@@ -53,6 +53,45 @@ pub fn duration(audio: &Audio) -> Duration {
     seconds
         .checked_div(audio.rate)
         .expect("the rate is more than 0")
+}
+
+/// The silence and length limits that end an utterance, in milliseconds.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct CommitPolicy {
+    /// The silence after a confident partial that commits.
+    pub early_commit_ms: u64,
+    /// The silence after any partial that commits.
+    pub endpoint_ms: u64,
+    /// The utterance length that always commits.
+    pub max_utterance_ms: u64,
+}
+
+/// The utterance ends: after `silence_ms` of silence that follows text, or at `audio_ms` of audio.
+/// `silence_ms` is `None` before any speech.
+#[verus_spec(commit =>
+    ensures
+        commit == ((silence_ms matches Some(silence) && has_text
+            && ((confident && silence >= policy.early_commit_ms) || silence >= policy.endpoint_ms))
+            || audio_ms >= policy.max_utterance_ms),
+)]
+#[must_use]
+pub fn should_commit(
+    silence_ms: Option<u64>,
+    has_text: bool,
+    audio_ms: u64,
+    confident: bool,
+    policy: &CommitPolicy,
+) -> bool {
+    let spoken = match silence_ms {
+        Some(silence) => {
+            has_text
+                && ((confident && silence >= policy.early_commit_ms)
+                    || silence >= policy.endpoint_ms)
+        }
+        None => false,
+    };
+    spoken || audio_ms >= policy.max_utterance_ms
 }
 
 verus! {
@@ -131,6 +170,13 @@ proof fn lemma_joined_prefix(pieces: Seq<&[i16]>, samples: Seq<i16>, size: int, 
 
 #[cfg(test)]
 mod tests {
+    use quint_connect::Driver;
+    use quint_connect::State as ModelState;
+    use quint_connect::Step;
+    use quint_connect::quint_run;
+    use quint_connect::switch;
+    use serde::Deserialize;
+
     use super::*;
 
     #[test]
@@ -152,5 +198,171 @@ mod tests {
             rate: 22_050,
         };
         assert_eq!(duration(&audio), Duration::from_secs(1));
+    }
+
+    /// The commit policy of `jarvis.toml`.
+    const POLICY: CommitPolicy = CommitPolicy {
+        early_commit_ms: 200,
+        endpoint_ms: 600,
+        max_utterance_ms: 8000,
+    };
+
+    /// Each combination of silence, text and confidence.
+    fn inputs() -> Vec<(Option<u64>, bool, bool)> {
+        let silences = [None, Some(0), Some(200), Some(600), Some(u64::MAX)];
+        let flags = [(false, false), (false, true), (true, false), (true, true)];
+        let pairs = silences
+            .into_iter()
+            .flat_map(|silence| flags.map(|flag| (silence, flag)));
+        pairs
+            .map(|(silence, (text, confident))| (silence, text, confident))
+            .collect()
+    }
+
+    /// AC-6.5-1.
+    #[test]
+    fn ac_6_5_1_confident_partial_commits_at_early_commit_ms() {
+        assert!(should_commit(Some(200), true, 1000, true, &POLICY));
+    }
+
+    /// AC-6.5-2.
+    #[test]
+    fn ac_6_5_2_uncertain_partial_commits_at_endpoint_ms() {
+        assert!(
+            !should_commit(Some(599), true, 1000, false, &POLICY),
+            "commit at 599 ms"
+        );
+        assert!(
+            should_commit(Some(600), true, 1000, false, &POLICY),
+            "no commit at 600 ms"
+        );
+    }
+
+    /// AC-6.5-3.
+    #[test]
+    fn ac_6_5_3_max_utterance_ms_commits_for_any_input() {
+        for (silence, text, confident) in inputs() {
+            assert!(
+                should_commit(silence, text, 8000, confident, &POLICY),
+                "no commit for {silence:?}, text {text}, confident {confident}"
+            );
+        }
+    }
+
+    /// AC-6.5-5.
+    #[test]
+    fn ac_6_5_5_no_speech_or_no_text_does_not_commit() {
+        let quiet = inputs()
+            .into_iter()
+            .filter(|&(silence, text, _)| silence.is_none() || !text);
+        for (silence, text, confident) in quiet {
+            assert!(
+                !should_commit(silence, text, 7999, confident, &POLICY),
+                "commit for {silence:?}, text {text}, confident {confident}"
+            );
+        }
+    }
+
+    /// The commit model.
+    const MODEL: &str = include_str!("../../quint/commit.qnt");
+
+    /// The length of one model chunk.
+    const CHUNK_MS: u64 = 100;
+
+    /// The constant `name` of `commit.qnt`, in milliseconds.
+    fn model_ms(name: &str) -> u64 {
+        let prefix = format!("pure val {name} = ");
+        let value = MODEL
+            .lines()
+            .find_map(|line| line.trim().strip_prefix(prefix.as_str()));
+        let value: u64 = value
+            .expect("the model has the constant")
+            .parse()
+            .expect("a number");
+        value * CHUNK_MS
+    }
+
+    /// The model state that the conformance test compares.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Commit {
+        /// The utterance ended.
+        committed: bool,
+    }
+
+    impl ModelState<CommitDriver> for Commit {
+        /// `should_commit` of the inputs. `CommitOnlyWhenAllowed` and `NoLateCommit` make the
+        /// model `committed` equal to `allowed` after each step.
+        fn from_driver(driver: &CommitDriver) -> anyhow::Result<Self> {
+            let silence = driver
+                .voice_end
+                .map(|end| (driver.decided - end) * CHUNK_MS);
+            let audio = u64::try_from(driver.chunks.len())? * CHUNK_MS;
+            let (text, confident) = (driver.text, driver.confident);
+            Ok(Self {
+                committed: should_commit(silence, text, audio, confident, &driver.policy),
+            })
+        }
+    }
+
+    /// Replays `commit.qnt` against `should_commit`, with the model constants as the policy.
+    struct CommitDriver {
+        /// The policy from the model constants.
+        policy: CommitPolicy,
+        /// The chunks in arrival order. True is a voiced chunk.
+        chunks: Vec<bool>,
+        /// The number of chunks that the VAD decided.
+        decided: u64,
+        /// The number of decided chunks up to the last voiced chunk, or `None` before any.
+        voice_end: Option<u64>,
+        /// The partial is not empty.
+        text: bool,
+        /// The partial is confident.
+        confident: bool,
+    }
+
+    impl CommitDriver {
+        /// A driver with no audio and an empty partial.
+        fn new() -> Self {
+            Self {
+                policy: CommitPolicy {
+                    early_commit_ms: model_ms("EARLY"),
+                    endpoint_ms: model_ms("ENDPOINT"),
+                    max_utterance_ms: model_ms("MAX"),
+                },
+                chunks: Vec::new(),
+                decided: 0,
+                voice_end: None,
+                text: false,
+                confident: false,
+            }
+        }
+    }
+
+    impl Driver for CommitDriver {
+        type State = Commit;
+
+        #[expect(
+            non_snake_case,
+            reason = "`switch!` binds the model pick `nonEmpty` by its name"
+        )]
+        fn step(&mut self, step: &Step) -> anyhow::Result<()> {
+            switch!(step {
+                init => *self = Self::new(),
+                tick(voiced: bool) => self.chunks.push(voiced),
+                decide => {
+                    self.decided += 1;
+                    if self.chunks[usize::try_from(self.decided)? - 1] {
+                        self.voice_end = Some(self.decided);
+                    }
+                },
+                partial(nonEmpty: bool, conf: bool) => (self.text, self.confident) = (nonEmpty, conf),
+            })
+        }
+    }
+
+    /// AC-6.5-4. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/commit.qnt", max_steps = 30, seed = "1")]
+    fn ac_6_5_4_conformance() -> impl Driver {
+        CommitDriver::new()
     }
 }

@@ -14,6 +14,12 @@ ping_interval_s = 30
 [model]
 dir = "models/system-one"
 threshold = 0.6
+commit_threshold = 0.9
+
+[asr]
+early_commit_ms = 200
+endpoint_ms = 600
+max_utterance_ms = 8000
 
 [tts]
 model_dir = "models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
