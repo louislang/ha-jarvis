@@ -195,7 +195,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 - `SpeechToText::stream() -> Box<dyn SttStream>`. `SttStream`: `accept(samples)`, `partial() -> Partial { text }`, `reset()`.
 - `SherpaStt` wraps `OnlineRecognizer` with the streaming transducer in `[asr].model_dir`. This sub-phase adds `asr.model_dir`.
-- CPU machines and the GPU host use the same first-pass model: Nemotron 160 ms int8. The 20M zipformer does not recognize the first word of `speech(text)`. `just models` downloads the Nemotron model, and `gpu-models` does not. `just models` does not download the 20M zipformer. The structure test of AC-6.2-1 checks the Nemotron folder.
+- CPU machines and the GPU host use the same first-pass model: Nemotron 160 ms. CPU machines load its int8 files. The GPU host loads its fp32 files (sub-phase 6.6c). The 20M zipformer does not recognize the first word of `speech(text)`. `just models` downloads the int8 Nemotron model. `gpu-models` downloads the fp32 files of the same model. `just models` does not download the 20M zipformer. The structure test of AC-6.2-1 checks the Nemotron folder.
 - `FakeStt` returns scripted partials.
 - `speech(text)` in `fakes.rs` synthesizes text with `SherpaTts`, resamples it from 44.1 kHz to 16 kHz with `rubato`, and adds 500 ms of silence. The fixed TTS seed makes `speech(text)` bit-identical on every run.
 
@@ -244,24 +244,30 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 ### 6.6c First Pass on the GPU Host
 
-**Goal:** Check the text, the latency and the speed of the first pass on the GPU host, on CUDA and on the CPU. The first pass is now fast enough for the early commit.
+**Goal:** Load the fp32 first pass on the GPU host, flush the last word at the speech end, and check the text, the latency and the speed on CUDA and on the CPU. The first pass is now fast enough for the early commit.
 
 - **Implements:** G2, G18. **Depends on:** 6.6b.
-- **Files:** modify `src/adapters/sherpa.rs`, `justfile`.
+- **Files:** modify `src/adapters/sherpa.rs`, `src/lib.rs`, `justfile`, `jarvis.toml`.
 
 **Model.**
 
-- On the CPU, a real-time factor of less than 0.5 lets each 160 ms chunk decode in less than 80 ms, so the VAD, the speculative prediction and the early commit keep up.
+- Every device uses the same 160 ms Nemotron export and the same code. This sub-phase adds `asr.encoder`, `asr.decoder` and `asr.joiner`: the file names of the first-pass model in `model_dir`. `jarvis.toml` names the fp32 files (`encoder.onnx`, `decoder.onnx`, `joiner.onnx`). `jarvis.local.toml` and the tests on the CPU name the int8 files.
+- Measurements on the GPU host (4 threads, 20 ms chunks, `speech("turn on the kitchen lights")`) give the reasons. ONNX Runtime runs the int8 operators `MatMulInteger`, `ConvInteger` and `DynamicQuantizeLinear` on the CPU, also with the CUDA execution provider. Thus int8 on CUDA has a real-time factor of 0.622, and int8 on the CPU has 0.558. fp32 on CUDA has 0.130 and uses about 3.37 GB more GPU memory. No fp16 export exists. On the CPU, 6 and 8 threads are slower (0.716 and 0.800), so the first pass keeps 4 threads.
+- `gpu-models` downloads the fp32 files (about 2.5 GB) from the Hugging Face repository `csukuangfj2/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-2026-04-25`, with one SHA-256 for each file. The encoder keeps its weights in `encoder.data`. The fp32 export has the same `tokens.txt`, so its files go in the folder of the int8 files.
+- The model emits the last token about 410 ms of audio after the last voiced sample. Thus streaming alone gives the last word too late: 721 ms after the last voiced sample with fp32 on CUDA, 790 ms with int8 on the CPU. `input_finished()` does not flush the model.
+- Flush: when the VAD ends a speech segment, the stream feeds 640 ms of zeros to the recognizer and decodes them. 480 ms of zeros is not enough. The zeros go only to the recognizer, not to the VAD or the audio positions. sherpa-onnx 2.0.1 cannot clone a stream. Thus the zeros go into the live stream, and the flush runs only at the end of a VAD speech segment, where a commit and `reset` can follow.
+- The flush takes 88 ms with fp32 on CUDA and 376 ms with int8 on the CPU. Thus the last word comes about 220 ms after the last voiced sample on CUDA and about 510 ms on the CPU.
+- The Silero VAD runs on the CPU on every device. Its real-time factor is 0.004 on the CPU and 0.017 on CUDA.
+- On the CPU, a real-time factor of less than 0.6 lets each 160 ms chunk decode in less than 96 ms, so the decode keeps up with the audio.
 - `gpu-test` runs its tests one at a time (`--test-threads=1`), because timing tests that run in parallel slow each other down.
-- The first measurements on the GPU host failed AC-6.6c-2, AC-6.6c-3 and AC-6.6c-5: the last word came 792 ms after the last voiced sample, the CUDA real-time factor was 0.65, and the CPU real-time factor was 0.566 with 4 threads. This sub-phase starts with a measurement on the GPU host of other Nemotron exports and thread counts. The user then selects the model and the targets in a spec change before the code.
 
 **Acceptance criteria.**
 
 - AC-6.6c-1 [GPU host]: With `device = cuda`, the normalized final partial of `speech("turn on the kitchen lights")` is "turn on the kitchen lights".
-- AC-6.6c-2 [GPU host]: With `device = cuda`, the last word is in the partial less than 200 ms after the last voiced sample.
-- AC-6.6c-3 [GPU host]: With `device = cuda`, the real-time factor of the first pass is less than 0.1.
+- AC-6.6c-2 [GPU host]: With `device = cuda`, the last word is in the partial less than 250 ms after the last voiced sample.
+- AC-6.6c-3 [GPU host]: With `device = cuda`, the real-time factor of the first pass is less than 0.15.
 - AC-6.6c-4 [GPU host]: With `device = cuda`, the first pass runs on the CUDA execution provider.
-- AC-6.6c-5 [GPU host]: With `device = cpu`, the real-time factor of the first pass is less than 0.5.
+- AC-6.6c-5 [GPU host]: With `device = cpu` and 4 threads, the real-time factor of the first pass is less than 0.6.
 
 **Proofs.**
 

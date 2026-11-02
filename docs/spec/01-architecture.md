@@ -326,7 +326,7 @@ Unit tests are in a `#[cfg(test)] mod tests` block at the end of each source fil
 
 ## 9. Configuration Files
 
-`jarvis.toml` is the configuration of the GPU host. Another machine copies it to `jarvis.local.toml`, sets `device = "cpu"`, removes `second_pass_dir`, and runs `jarvis serve jarvis.local.toml`. Git ignores `jarvis.local.toml`.
+`jarvis.toml` is the configuration of the GPU host. Another machine copies it to `jarvis.local.toml`, sets `device = "cpu"`, names the int8 files of the first pass, removes `second_pass_dir`, and runs `jarvis serve jarvis.local.toml`. Git ignores `jarvis.local.toml`.
 
 `jarvis.toml`:
 
@@ -353,6 +353,10 @@ habits = 5
 
 [asr]
 model_dir = "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25"
+# The fp32 files of the same model. CPU machines name `encoder.int8.onnx`, `decoder.int8.onnx` and `joiner.int8.onnx`.
+encoder = "encoder.onnx"
+decoder = "decoder.onnx"
+joiner = "joiner.onnx"
 # Optional. Without it, the final transcript is the first-pass text (CPU machines).
 second_pass_dir = "models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"
 vad_model = "models/silero_vad.onnx"
@@ -679,7 +683,7 @@ Training set file (the contract between Jarvis and `train/train.py`):
 
 | Machine | OS | Device | STT model | Use |
 |---|---|---|---|---|
-| GPU host (self-hosted runner `gpu`) | Linux x86-64, RTX 2060 6 GB | `cuda` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, int8. Second pass: Parakeet Unified EN 0.6B offline, int8. | Runs Jarvis. Runs local training. |
+| GPU host (self-hosted runner `gpu`) | Linux x86-64, RTX 2060 6 GB | `cuda` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, fp32. Second pass: Parakeet Unified EN 0.6B offline, int8. | Runs Jarvis. Runs local training. |
 | Test machine | macOS x86-64 (Intel MacBook Pro) | `cpu` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, int8. No second pass. | Development. Runs the pre-commit hook (without `bench` and `gpu-test`). |
 | CI | `ubuntu-latest` | `cpu` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, int8. No second pass. | `just check`. |
 | RunPod | RunPod serverless | GPU | — | Training fallback. |
