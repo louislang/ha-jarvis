@@ -90,17 +90,25 @@ pub trait ModelLoader: Send + Sync {
     async fn load(&self, dir: &Path, device: Device) -> anyhow::Result<Arc<dyn Classifier>>;
 }
 
-/// The first-pass result of the audio so far.
+/// The first-pass result of the audio so far, with audio positions in milliseconds.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Partial {
     /// The decoded text.
     pub text: String,
+    /// The end of the last voiced frame, or `None` before any speech.
+    pub voice_end_ms: Option<u64>,
+    /// The end of the audio that the VAD has decided.
+    pub vad_ms: u64,
 }
 
 /// Speech to text.
 pub trait SpeechToText: Send + Sync {
     /// A new first pass of 16 kHz audio.
-    fn stream(&self) -> Box<dyn SttStream>;
+    ///
+    /// # Errors
+    ///
+    /// The VAD cannot load.
+    fn stream(&self) -> anyhow::Result<Box<dyn SttStream>>;
 }
 
 /// The first pass of one utterance. `accept` blocks while it decodes.

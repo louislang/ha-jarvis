@@ -35,6 +35,7 @@ nemotron_sums := """
     0be9702c2f427a2b6bb241d298e0d3836a558de1f5b9fd3018f1cce6e2b3fa98  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/decoder.int8.onnx
     a35eac38a22ebceb04d230ed7afe0d68f446ba6914a036b97f14fece95967e23  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/joiner.int8.onnx
     dc0b4584ab2e4ddbf888425c076c61b736e7356a015250db7d307e6f1a8188ff  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/tokens.txt"""
+silero_sums := "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6  silero_vad.onnx"
 # The SHA-256 of each file of `gpu-models`, one list for each archive.
 cuda_sums := "2aa541a65c1e7d921a053283419b70b30c1f6ae0a0f52f64b947ebe88c5f2a77  sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu.tar.bz2"
 parakeet_sums := """
@@ -57,12 +58,12 @@ cov:
     {{ cpu_runtime }} cargo llvm-cov --workspace --release --fail-under-lines 80.01
 
 # Download the CPU libraries and models.
-models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/tts-models" supertonic_sums)
+models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/tts-models" supertonic_sums) (fetch sherpa_onnx + "/asr-models" silero_sums)
 
 # Download the GPU models and the CUDA libraries.
 gpu-models: (fetch sherpa_onnx + "/v2.0.1" cuda_sums) (fetch sherpa_onnx + "/asr-models" parakeet_sums)
 
-# Download the archive of the first line of `sums` from `release` and extract it in `models/`, unless its folder exists and each file of `sums` has its SHA-256.
+# Download the file of the first line of `sums` from `release` to `models/` and extract it when it is an archive, unless its folder or file exists and each file of `sums` has its SHA-256.
 fetch release sums:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -70,12 +71,12 @@ fetch release sums:
     cd models
     line=$(head -n 1 <<< "{{ sums }}")
     archive=${line#*  }
-    if [ -d "${archive%.tar.bz2}" ] && shasum -a 256 --check --status <<< "{{ sums }}" 2> /dev/null; then exit 0; fi
+    if [ -e "${archive%.tar.bz2}" ] && shasum -a 256 --check --status <<< "{{ sums }}" 2> /dev/null; then exit 0; fi
     if ! shasum -a 256 --check --status <<< "$line" 2> /dev/null; then
         curl -sSfL -o "$archive" "{{ release }}/$archive"
         shasum -a 256 --check --quiet <<< "$line"
     fi
-    tar -xjf "$archive"
+    [[ "$archive" != *.tar.bz2 ]] || tar -xjf "$archive"
     shasum -a 256 --check --quiet <<< "{{ sums }}"
 
 # Check the format of the Rust code.
