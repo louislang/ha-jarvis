@@ -308,7 +308,7 @@ On a final error, the old model stays and the training state does not change. Th
 - P-13.9-5, P-13.9-6. Requires: `SwapNeverWorse`. Argument: step 6 swaps only when `accept(new, old)`, which is `new >= old`.
 - P-13.9-7, P-13.9-8. Requires: `CountResetsAfterRun`, `FailureKeepsModel`. Argument: step 7 runs after both branches of step 6. The error path returns before step 6.
 - P-13.9-1, P-13.9-2. Argument: the start condition is `should_train` (P-13.3-3).
-- P-13.9-10. Argument: `handle` reads the classifier with one `ArcSwap::load`, which never waits for a writer.
+- P-13.9-10. Argument: `handle` reads the classifier through the `Classifier` wrapper of sub-phase 5.4, which calls `ArcSwap::load` once. `load` never waits for a writer.
 - P-13.9-9, P-13.9-11 to P-13.9-14. Evidence: test.
 
 ---

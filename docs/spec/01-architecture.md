@@ -188,7 +188,8 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `vstd` | Domain | Verus: `#[verus_spec]`, `#[verus_verify]`, `verus!`, spec types and the `vstd` specifications of `std`. A normal build erases the proof code. |
 | `serde`, `serde_json` | All | Data types and messages. |
 | `tokio` | Application, adapters | Async runtime, TCP, timers, channels. |
-| `arc-swap` | Application | Atomic swap of the System One model. |
+| `arc-swap` | Application, root | Atomic swap of the System One model. |
+| `tokio-util` | Adapter, root | `TaskTracker`: the connection tasks and the `after` work that a shutdown waits for. |
 | `anyhow` | All except domain | Error propagation. Domain functions return typed errors. |
 | `tracing`, `tracing-subscriber` | Application, adapters, root | Logs and latency spans. |
 | `futures` | Ports, application, adapters | `Stream` for events, partial transcripts and sentences. |

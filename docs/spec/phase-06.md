@@ -8,7 +8,7 @@ This phase adds TTS, the shared ONNX Runtime, the audio cache, the commit policy
 
 **Goal:** Add the `TextToSpeech` port and `SherpaTts` with the Piper voice, and the `models` recipe. Jarvis can now turn text into audio.
 
-- **Implements:** G1. **Depends on:** 5.4.
+- **Implements:** G1. **Depends on:** 5.4c.
 - **Files:** create `src/adapters/sherpa.rs`, `src/domain/speech.rs`. Modify `src/ports.rs`, `src/lib.rs`, `justfile`, `.github/workflows/ci.yml`, `jarvis.toml`, `Cargo.toml`.
 
 **Model.** `TextToSpeech::synth(text) -> Result<Audio>`. `Audio { samples: Vec<i16>, rate }` is in `src/domain/speech.rs`. `SherpaTts` wraps `OfflineTts` with `[tts].model_dir`. `just models` downloads the 20M zipformer and the Piper voice into `models/`. It checks the SHA-256 of each file and downloads only a missing or wrong file. `models` is a setup recipe: `check` and the `rust-test` job run it before the tests, and tests do not download. CI caches `models/`.
