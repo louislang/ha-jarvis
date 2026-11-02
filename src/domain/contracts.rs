@@ -7,6 +7,7 @@ use std::hash::Hash;
 use std::slice::SliceIndex;
 use std::str::pattern::Pattern;
 use std::sync::Arc;
+use std::time::Duration;
 
 use jiff::Timestamp;
 use minijinja::Environment;
@@ -682,5 +683,29 @@ pub axiom fn axiom_total_order_is_total()
     ensures
         total(total_order()),
 ;
+
+/// The length of `duration` in nanoseconds.
+pub uninterp spec fn nanoseconds(duration: Duration) -> nat;
+
+/// Makes a duration of `secs` whole seconds. <https://doc.rust-lang.org/std/time/struct.Duration.html#method.from_secs>
+#[verifier::external_fn_specification]
+pub fn ex_duration_from_secs(secs: u64) -> (duration: Duration)
+    ensures
+        nanoseconds(duration) == secs * 1_000_000_000,
+{
+    Duration::from_secs(secs)
+}
+
+/// Divides `duration` by `rhs`, or gives `None` when `rhs` is 0. <https://doc.rust-lang.org/std/time/struct.Duration.html#method.checked_div>
+#[verifier::external_fn_specification]
+pub fn ex_duration_checked_div(duration: Duration, rhs: u32) -> (quotient: Option<Duration>)
+    ensures
+        match quotient {
+            Some(quotient) => rhs != 0 && nanoseconds(quotient) == nanoseconds(duration) / rhs as nat,
+            None => rhs == 0,
+        },
+{
+    duration.checked_div(rhs)
+}
 
 } // verus!
