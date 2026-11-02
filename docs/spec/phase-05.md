@@ -13,7 +13,7 @@ This phase adds the driving port and the Wyoming adapter. HA can use Jarvis as i
 
 **Model.**
 
-- `Assistant`: `info() -> Info`, `handle(text, context) -> Result<Handled>`. `Handled` has the text and the `after` work (sub-phase 4.8). Later sub-phases add `listen` and `speak`.
+- `Assistant`: `info() -> Info`. `Info` has `name` and `version`. The adapter sets the other fields of the `handle` program: the attribution, `installed = true`, a description and the language `en`. Sub-phase 5.2 adds `handle`. Later sub-phases add `listen` and `speak`.
 - A Wyoming event is one JSON header line (`type`, `data_length`, `payload_length`), then `data_length` bytes of JSON data, then `payload_length` bytes of payload. Event types come from the `wyoming` crate.
 - Each connection runs in its own task. An unknown event type is ignored. A header that is not valid JSON closes that connection only.
 - `FakeWyomingClient` and `FakeAssistant` are in `fakes.rs`.
@@ -38,9 +38,9 @@ This phase adds the driving port and the Wyoming adapter. HA can use Jarvis as i
 **Goal:** Connect the Wyoming `transcript` event to `Assistant::handle` and send the result as `handled` or `not-handled`. HA's conversation step now reaches Jarvis.
 
 - **Implements:** G10. **Depends on:** 5.1.
-- **Files:** modify `src/adapters/wyoming.rs`.
+- **Files:** modify `src/adapters/wyoming.rs`, `src/ports.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`.
 
-**Model.** `transcript` with `text` and `context` (`conversation_id`, `device_id`, `satellite_id`) calls `handle`. `Ok(h)` sends `handled { text: h.text }`, flushes the socket, and then starts `h.after`. `Err(e)` sends `not-handled { text: e.text }`.
+**Model.** This sub-phase adds `Assistant::handle(text, context) -> Result<Handled>`. `Handled` has the text and the `after` work (sub-phase 4.8). `Handled` and `Work` move from `src/app/conversation.rs` to `src/ports.rs`, because a port cannot use `crate::app`. `Context` in `src/ports.rs` has `conversation_id`, `device_id` and `satellite_id`, each an `Option<String>`. `transcript` with `text` and `context` (`conversation_id`, `device_id`, `satellite_id`) calls `handle`. `Ok(h)` sends `handled { text: h.text }`, flushes the socket, and then starts `h.after`. `Err(e)` sends `not-handled { text: e.text }`.
 
 **Acceptance criteria.**
 
