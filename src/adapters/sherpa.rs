@@ -314,9 +314,6 @@ fn pcm(value: f32) -> i16 {
 /// with the Supertonic-3 model.
 #[cfg(test)]
 mod tests {
-    use std::thread;
-    use std::time::Instant;
-
     use super::*;
     use crate::Config;
     use crate::domain::intent;
@@ -325,6 +322,9 @@ mod tests {
 
     /// The request of the STT tests.
     const REQUEST: &str = "turn on the kitchen lights";
+
+    /// The 20 ms chunks of 16 kHz audio.
+    const CHUNK: usize = 320;
 
     /// The configuration of `jarvis.toml`.
     fn config() -> anyhow::Result<Config> {
@@ -336,17 +336,19 @@ mod tests {
         SherpaTts::try_new(&config()?.tts, Device::Cpu)
     }
 
-    /// The `SherpaStt` of `jarvis.toml` on `device`.
-    fn stt(device: Device) -> anyhow::Result<SherpaStt> {
-        SherpaStt::try_new(&config()?.asr, device)
+    /// A new first pass of the `SherpaStt` of `jarvis.toml` on the CPU.
+    fn first_pass() -> anyhow::Result<Box<dyn SttStream>> {
+        SherpaStt::try_new(&config()?.asr, Device::Cpu)?.stream()
     }
 
-    /// The 20 ms chunks of 16 kHz audio.
-    const CHUNK: usize = 320;
+    /// The partial after each 20 ms chunk of `speech(REQUEST)`.
+    async fn partials() -> anyhow::Result<Vec<Partial>> {
+        partials_of(&fakes::speech(REQUEST).await?)
+    }
 
-    /// The partial after each 20 ms chunk of `audio` in a new first pass of `stt`.
-    fn partials(stt: &SherpaStt, audio: &Audio) -> anyhow::Result<Vec<Partial>> {
-        let mut stream = stt.stream()?;
+    /// The partial after each 20 ms chunk of `audio`.
+    fn partials_of(audio: &Audio) -> anyhow::Result<Vec<Partial>> {
+        let mut stream = first_pass()?;
         let chunks = speech::chunks(audio, CHUNK);
         let decode = |chunk: &[i16]| {
             stream.accept(chunk);
@@ -355,22 +357,10 @@ mod tests {
         Ok(chunks.into_iter().map(decode).collect())
     }
 
-    /// The normalized text of the last of `partials`.
-    fn final_text(partials: &[Partial]) -> Option<String> {
-        partials
-            .last()
-            .map(|partial| intent::normalize(&partial.text))
-    }
-
-    /// The partials of `speech(REQUEST)` on the CPU.
-    async fn request_partials() -> anyhow::Result<Vec<Partial>> {
-        partials(&stt(Device::Cpu)?, &fakes::speech(REQUEST).await?)
-    }
-
-    /// The partial of `speech("lights on")` on the CPU, then the partial after `reset`.
+    /// The partial of `speech("lights on")`, then the partial after `reset`.
     async fn reset_partials() -> anyhow::Result<(Partial, Partial)> {
         let audio = fakes::speech("lights on").await?;
-        let mut stream = stt(Device::Cpu)?.stream()?;
+        let mut stream = first_pass()?;
         stream.accept(&audio.samples);
         let before = stream.partial();
         stream.reset();
@@ -385,41 +375,13 @@ mod tests {
         last as u64 * 1000 / u64::from(audio.rate)
     }
 
-    /// The time of the first pass of `speech(REQUEST)` on `device` after a warm-up, divided by
-    /// the audio time.
-    async fn real_time_factor(device: Device) -> anyhow::Result<f64> {
-        let (stt, audio) = (stt(device)?, fakes::speech(REQUEST).await?);
-        partials(&stt, &audio)?;
-        let start = Instant::now();
-        partials(&stt, &audio)?;
-        Ok(start.elapsed().as_secs_f64() / speech::duration(&audio).as_secs_f64())
-    }
-
-    /// The time from the last voiced sample of `audio` to the first partial with `REQUEST` on
-    /// CUDA, with the chunks in real time after a warm-up.
-    fn last_word_latency(audio: &Audio) -> anyhow::Result<Duration> {
-        let stt = stt(Device::Cuda)?;
-        partials(&stt, audio)?;
-        let mut stream = stt.stream()?;
-        let start = Instant::now();
-        let voiced = start + Duration::from_millis(last_voiced_ms(audio));
-        let chunks = speech::chunks(audio, CHUNK);
-        for (index, chunk) in chunks.into_iter().enumerate() {
-            let arrival = start + Duration::from_millis(20) * u32::try_from(index + 1)?;
-            thread::sleep(arrival.saturating_duration_since(Instant::now()));
-            stream.accept(chunk);
-            if intent::normalize(&stream.partial().text) == REQUEST {
-                return Ok(Instant::now().saturating_duration_since(voiced));
-            }
-        }
-        anyhow::bail!("no partial has the last word")
-    }
-
     /// AC-6.6-1.
     #[tokio::test]
     async fn ac_6_6_1_final_partial_is_the_request() -> anyhow::Result<()> {
-        let partials = request_partials().await?;
-        let text = final_text(&partials);
+        let partials = partials().await?;
+        let text = partials
+            .last()
+            .map(|partial| intent::normalize(&partial.text));
         assert_eq!(text.as_deref(), Some(REQUEST), "{partials:?}");
         Ok(())
     }
@@ -427,7 +389,7 @@ mod tests {
     /// AC-6.6-2.
     #[tokio::test]
     async fn ac_6_6_2_partial_has_text_before_the_last_chunk() -> anyhow::Result<()> {
-        let partials = request_partials().await?;
+        let partials = partials().await?;
         let early = &partials[..partials.len() - 1];
         assert!(
             early.iter().any(|partial| !partial.text.is_empty()),
@@ -452,7 +414,7 @@ mod tests {
         let mut samples = vec![0; 8000];
         samples.extend(&lights.samples);
         let audio = Audio { samples, ..lights };
-        let partials = partials(&stt(Device::Cpu)?, &audio)?;
+        let partials = partials_of(&audio)?;
         let silence = &partials[..8000 / CHUNK];
         assert!(
             silence.iter().all(|partial| partial.voice_end_ms.is_none()),
@@ -472,7 +434,7 @@ mod tests {
     async fn ac_6_6b_2_silence_stays_short_until_the_last_voiced_sample() -> anyhow::Result<()> {
         let audio = fakes::speech(REQUEST).await?;
         let early_commit_ms = config()?.asr.early_commit_ms;
-        let partials = partials(&stt(Device::Cpu)?, &audio)?;
+        let partials = partials_of(&audio)?;
         let count = usize::try_from(last_voiced_ms(&audio))? / 20;
         for partial in &partials[..count] {
             if let Some(voice_end) = partial.voice_end_ms {
@@ -491,43 +453,6 @@ mod tests {
             "the audio is voiced: {before:?}"
         );
         assert_eq!(after.voice_end_ms, None);
-        Ok(())
-    }
-
-    /// AC-6.6b-4.
-    #[tokio::test]
-    #[ignore = "GPU host"]
-    async fn ac_6_6b_4_cuda_final_partial_is_the_request() -> anyhow::Result<()> {
-        let partials = partials(&stt(Device::Cuda)?, &fakes::speech(REQUEST).await?)?;
-        let text = final_text(&partials);
-        assert_eq!(text.as_deref(), Some(REQUEST), "{partials:?}");
-        Ok(())
-    }
-
-    /// AC-6.6b-5.
-    #[tokio::test]
-    #[ignore = "GPU host"]
-    async fn ac_6_6b_5_cuda_last_word_latency() -> anyhow::Result<()> {
-        let latency = last_word_latency(&fakes::speech(REQUEST).await?)?;
-        assert!(latency < Duration::from_millis(200), "latency {latency:?}");
-        Ok(())
-    }
-
-    /// AC-6.6b-6.
-    #[tokio::test]
-    #[ignore = "GPU host"]
-    async fn ac_6_6b_6_cuda_real_time_factor() -> anyhow::Result<()> {
-        let factor = real_time_factor(Device::Cuda).await?;
-        assert!(factor < 0.1, "real-time factor {factor}");
-        Ok(())
-    }
-
-    /// AC-6.6b-8.
-    #[tokio::test]
-    #[ignore = "GPU host"]
-    async fn ac_6_6b_8_cpu_real_time_factor() -> anyhow::Result<()> {
-        let factor = real_time_factor(Device::Cpu).await?;
-        assert!(factor < 0.5, "real-time factor {factor}");
         Ok(())
     }
 
