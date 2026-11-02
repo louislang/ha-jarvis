@@ -581,7 +581,8 @@ fn start_sync(home: Arc<dyn Home>, announce: &AnnounceConfig) -> Arc<Queues> {
 ///
 /// A signal handler cannot be registered, or `run` fails.
 fn serve(config: &Path) -> anyhow::Result<()> {
-    tokio::runtime::Runtime::new()?.block_on(async {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let result = runtime.block_on(async {
         let mut interrupt = unix::signal(SignalKind::interrupt())?;
         let mut terminate = unix::signal(SignalKind::terminate())?;
         let startup = Startup {
@@ -595,7 +596,11 @@ fn serve(config: &Path) -> anyhow::Result<()> {
             },
         };
         run(config, startup).await
-    })
+    });
+    // `run` waited up to 5 s. A drop of the runtime would wait for the blocking tasks with no
+    // limit, and the pools task blocks until its last sender drops.
+    runtime.shutdown_background();
+    result
 }
 
 /// Entry point of Jarvis: runs the command of the command line.
