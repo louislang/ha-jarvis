@@ -600,6 +600,7 @@ mod tests {
     use serde_json::json;
     use tokio::io::DuplexStream;
     use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
     use tokio::sync::watch;
 
     use crate::adapters::onnx::OnnxLoader;
@@ -942,16 +943,30 @@ mod tests {
         Ok(())
     }
 
+    /// A connector to no HA. It sends to `attempt` on each call.
+    fn no_ha(
+        attempt: mpsc::UnboundedSender<()>,
+    ) -> impl Fn(&str, u16) -> future::Ready<io::Result<DuplexStream>> + Send + 'static {
+        move |_: &str, _: u16| {
+            attempt.send(()).ok();
+            future::ready(Err(io::Error::other("HA is not available")))
+        }
+    }
+
+    /// Writes the configuration `text` to `jarvis.toml` in `folder` and returns its path.
+    fn config_in(folder: &Path, text: &str) -> anyhow::Result<PathBuf> {
+        let config = folder.join("jarvis.toml");
+        fs::write(&config, text)?;
+        Ok(config)
+    }
+
     /// The error of `run` for the configuration `text`, with no HA.
     async fn run_error(text: &str) -> anyhow::Result<String> {
         let folder = tempfile::tempdir()?;
-        let config = folder.path().join("jarvis.toml");
-        fs::write(&config, text)?;
+        let config = config_in(folder.path(), text)?;
         let startup = Startup {
             lookup: |_: &str| Some("token".to_owned()),
-            connector: |_: &str, _: u16| async {
-                Err::<DuplexStream, _>(io::Error::other("HA is not available"))
-            },
+            connector: no_ha(mpsc::unbounded_channel().0),
             shutdown: future::pending(),
         };
         let error = run(&config, startup).await.err().context("run succeeded")?;
@@ -1026,6 +1041,55 @@ mod tests {
         let error =
             run_error(&with_pools_in(folder.path()).replace("\"responses.toml\"", &path)).await?;
         assert!(error.contains("lights_on"), "no pool: {error}");
+        Ok(())
+    }
+
+    /// Connects to the Wyoming server at `address` once it listens, sends `describe` and gives
+    /// the type of the answer. Waits for an HA connection attempt on `attempts`, advances past
+    /// the backoff and waits for the next one.
+    async fn describe_without_ha(
+        address: SocketAddr,
+        attempts: &mut mpsc::UnboundedReceiver<()>,
+    ) -> anyhow::Result<Option<String>> {
+        let mut client = loop {
+            if let Ok(client) = FakeWyomingClient::connect(address).await {
+                break client;
+            }
+            tokio::task::yield_now().await;
+        };
+        client.send("describe", &json!({})).await?;
+        let event = client.receive().await?.map(|(event, _)| event);
+        attempts.recv().await;
+        // The longest backoff delay of `HaHome`.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        attempts.recv().await.context("no second attempt")?;
+        Ok(event)
+    }
+
+    /// AC-5.4b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_5_4b_1_without_ha_the_server_accepts_and_the_sync_tries_again() -> anyhow::Result<()>
+    {
+        let folder = tempfile::tempdir()?;
+        // A free port, because `run` binds the fixed address of `listen`.
+        let address = TcpListener::bind("127.0.0.1:0").await?.local_addr()?;
+        let text = with_pools_in(folder.path()).replace("\"cuda\"", "\"cpu\"");
+        let config = config_in(
+            folder.path(),
+            &text.replace("0.0.0.0:10700", &address.to_string()),
+        )?;
+        let (attempt, mut attempts) = mpsc::unbounded_channel();
+        let startup = Startup {
+            lookup: |_: &str| Some("token".to_owned()),
+            connector: no_ha(attempt),
+            shutdown: future::pending(),
+        };
+        tokio::select! {
+            result = run(&config, startup) => anyhow::bail!("run returned: {result:?}"),
+            event = describe_without_ha(address, &mut attempts) => {
+                assert_eq!(event?.as_deref(), Some("info"));
+            }
+        }
         Ok(())
     }
 }
