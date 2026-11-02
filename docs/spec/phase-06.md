@@ -132,7 +132,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 **Model.**
 
-- Constants (in 100 ms units): `EARLY = 2`, `ENDPOINT = 6`, `MAX = 20`, `LAG = 2` (the VAD decides a chunk at most `LAG` chunks late).
+- Constants (in 100 ms units): `EARLY = 2`, `ENDPOINT = 6`, `MAX = 8`, `LAG = 2` (the VAD decides a chunk at most `LAG` chunks late). `MAX` is small so that a simulation run of 30 steps reaches the `MAX` commit. The real limit is `max_utterance_ms` in the configuration (sub-phase 6.5).
 - State: `chunks: List[bool]` (true for a voiced chunk), `decided` (the number of chunks that the VAD decided), `voiceEnd` (the last decided voiced chunk, `-1` before any), `text: bool` (the partial is not empty), `confident: bool`, `committed: bool`, `reason`, `commitPos`.
 - Actions, each followed by "commit if allowed": `tick(voiced)` (enabled when `len(chunks) - decided < LAG`: append a chunk), `decide` (enabled when `decided < len(chunks)`: `decided += 1`, and `voiceEnd := decided` when that chunk is voiced), `partial(nonEmpty, conf)` (`text := nonEmpty`, `confident := conf`). A commit records `reason` and `commitPos := decided`.
 - `silence = decided - voiceEnd`. `allowed = (voiceEnd >= 0 and text and ((confident and silence >= EARLY) or silence >= ENDPOINT)) or len(chunks) >= MAX`. Silence counts from the last voiced chunk, not from the last partial change, so decoder delay does not add to the wait. Silence counts only decided chunks, so a late VAD decision cannot commit early. Before any speech, and with an empty partial, only `MAX` commits.
