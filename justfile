@@ -23,29 +23,20 @@ cpu_libraries := justfile_directory() / "models" / ("sherpa-onnx-v2.0.1-" + (if 
 cuda_libraries := justfile_directory() / "models/sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu/lib"
 # The SHA-256 of each file of `models`, one list for each archive.
 cpu_sums := if os() == "macos" { "be9042971c5d1b14da76a960534d2a8cdb6f0e5e02f5e1dc8bddff8576359bdd  sherpa-onnx-v2.0.1-osx-x64-shared-lib.tar.bz2" } else { "532c45bbd41036d83cd70606797529aa8086c2053395a58967736c727625b120  sherpa-onnx-v2.0.1-linux-x64-shared-lib.tar.bz2" }
-zipformer_sums := """
-    9c559283e8498d3fe95913c79ca1cb454bb26281ac2b102b41306c7d752765d9  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17.tar.bz2
-    21e2a2acd961b3ac72f55be2f10f1a285e1b0b0ba010d7c0b6eab141411b163c  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/decoder-epoch-99-avg-1.int8.onnx
-    45a7f940ecfb53d89fa270ad11b88b961e53a317203eb24b1c8e95ed208b0f30  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/decoder-epoch-99-avg-1.onnx
-    3810755ce7c3ab26b42a8bcf39d191308fa27fb0f53358823ba46141d03b7eb3  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/encoder-epoch-99-avg-1.int8.onnx
-    f77a22f4ff94604e1afb2aeb13504d7699363528c047c97d3436087c95c9b659  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/encoder-epoch-99-avg-1.onnx
-    e085d73b593cf9b0707f370dbd656d58327d3fe36d80d849202ef81df02cb01e  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/joiner-epoch-99-avg-1.int8.onnx
-    343e17dffa4f386ca206e00d3c406908f68f473c3d35968d6c3cddd5b8559a94  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/joiner-epoch-99-avg-1.onnx
-    49e3c2646595fd907228b3c6787069658f67b17377c60aeb8619c4551b2316fb  sherpa-onnx-streaming-zipformer-en-20M-2023-02-17/tokens.txt"""
 supertonic_sums := """
     82fa96f91c4ef8abaae3a14a3f4153facf88bed821d1f7331cec2700f432c427  sherpa-onnx-supertonic-3-tts-int8-2026-05-11.tar.bz2
     c3eb91414d5ff8a7a239b7fe9e34e7e2bf8a8140d8375ffb14718b1c639325db  sherpa-onnx-supertonic-3-tts-int8-2026-05-11/duration_predictor.int8.onnx
     c7befd5ea8c3119769e8a6c1486c4edc6a3bc8365c67621c881bbb774b9902ff  sherpa-onnx-supertonic-3-tts-int8-2026-05-11/text_encoder.int8.onnx
     20cd86fa5c6effedfda0e7cffe5b0569ca401c440a0c3a1d72bf39286c0db3fd  sherpa-onnx-supertonic-3-tts-int8-2026-05-11/vector_estimator.int8.onnx
     e923d60f53f95eb1ce235f1dc33ec56d9c057823c96fa6f8acf98f32b0da6152  sherpa-onnx-supertonic-3-tts-int8-2026-05-11/vocoder.int8.onnx"""
-# The SHA-256 of each file of `gpu-models`, one list for each archive.
-cuda_sums := "2aa541a65c1e7d921a053283419b70b30c1f6ae0a0f52f64b947ebe88c5f2a77  sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu.tar.bz2"
 nemotron_sums := """
     0ae73a41cd51599dc7cac9ac083d9d35de53d762ca45923505fde47a3751814b  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25.tar.bz2
     71111f61b18e1e65e01e369434a5c0434868d2f44892742ae54240600c681209  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/encoder.int8.onnx
     0be9702c2f427a2b6bb241d298e0d3836a558de1f5b9fd3018f1cce6e2b3fa98  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/decoder.int8.onnx
     a35eac38a22ebceb04d230ed7afe0d68f446ba6914a036b97f14fece95967e23  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/joiner.int8.onnx
     dc0b4584ab2e4ddbf888425c076c61b736e7356a015250db7d307e6f1a8188ff  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/tokens.txt"""
+# The SHA-256 of each file of `gpu-models`, one list for each archive.
+cuda_sums := "2aa541a65c1e7d921a053283419b70b30c1f6ae0a0f52f64b947ebe88c5f2a77  sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu.tar.bz2"
 parakeet_sums := """
     99f63605b3a85a54c250c0869670a687b7d6598a47bf2421515e1f839a76e150  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming.tar.bz2
     6716910b7a0833997fec7a410494c995d70124001a0e9b66d6370d6aced577e0  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming/encoder.int8.onnx
@@ -66,10 +57,10 @@ cov:
     {{ cpu_runtime }} cargo llvm-cov --workspace --release --fail-under-lines 80.01
 
 # Download the CPU libraries and models.
-models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums) (fetch sherpa_onnx + "/asr-models" zipformer_sums) (fetch sherpa_onnx + "/tts-models" supertonic_sums)
+models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/tts-models" supertonic_sums)
 
 # Download the GPU models and the CUDA libraries.
-gpu-models: (fetch sherpa_onnx + "/v2.0.1" cuda_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/asr-models" parakeet_sums)
+gpu-models: (fetch sherpa_onnx + "/v2.0.1" cuda_sums) (fetch sherpa_onnx + "/asr-models" parakeet_sums)
 
 # Download the archive of the first line of `sums` from `release` and extract it in `models/`, unless its folder exists and each file of `sums` has its SHA-256.
 fetch release sums:

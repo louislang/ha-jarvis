@@ -270,6 +270,8 @@ pub struct ModelConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AsrConfig {
+    /// The folder of the streaming transducer of the first pass.
+    pub model_dir: PathBuf,
     /// The silence after a confident partial that commits.
     pub early_commit_ms: u64,
     /// The silence after any partial that commits.
@@ -795,6 +797,9 @@ mod tests {
                 commit_threshold: 0.9,
             },
             asr: AsrConfig {
+                model_dir: PathBuf::from(
+                    "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25",
+                ),
                 early_commit_ms: 200,
                 endpoint_ms: 600,
                 max_utterance_ms: 8000,

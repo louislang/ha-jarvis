@@ -1,4 +1,4 @@
-//! `TextToSpeech` with sherpa-onnx.
+//! `SpeechToText` and `TextToSpeech` with sherpa-onnx.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -12,11 +12,100 @@ use sherpa_onnx::OfflineTts;
 use sherpa_onnx::OfflineTtsConfig;
 use sherpa_onnx::OfflineTtsModelConfig;
 use sherpa_onnx::OfflineTtsSupertonicModelConfig;
+use sherpa_onnx::OnlineModelConfig;
+use sherpa_onnx::OnlineRecognizer;
+use sherpa_onnx::OnlineRecognizerConfig;
+use sherpa_onnx::OnlineStream;
+use sherpa_onnx::OnlineTransducerModelConfig;
 
+use crate::AsrConfig;
 use crate::Device;
 use crate::TtsConfig;
 use crate::domain::speech::Audio;
+use crate::ports::Partial;
+use crate::ports::SpeechToText;
+use crate::ports::SttStream;
 use crate::ports::TextToSpeech;
+
+/// A `SpeechToText` with a streaming transducer.
+pub struct SherpaStt {
+    /// The streaming recognizer.
+    recognizer: Arc<OnlineRecognizer>,
+}
+
+impl SherpaStt {
+    /// Loads the first-pass model of `config` on `device`.
+    ///
+    /// # Errors
+    ///
+    /// The model cannot load.
+    pub fn try_new(config: &AsrConfig, device: Device) -> anyhow::Result<Self> {
+        let dir = &config.model_dir;
+        let file = |name: &str| Some(file(dir, name));
+        let transducer = OnlineTransducerModelConfig {
+            encoder: file("encoder.int8.onnx"),
+            decoder: file("decoder.int8.onnx"),
+            joiner: file("joiner.int8.onnx"),
+        };
+        let model_config = OnlineModelConfig {
+            transducer,
+            tokens: file("tokens.txt"),
+            provider: Some(provider(device)),
+            ..OnlineModelConfig::default()
+        };
+        let config = OnlineRecognizerConfig {
+            model_config,
+            ..OnlineRecognizerConfig::default()
+        };
+        let recognizer = OnlineRecognizer::create(&config)
+            .with_context(|| format!("cannot load the STT model in {}", dir.display()))?;
+        Ok(Self {
+            recognizer: Arc::new(recognizer),
+        })
+    }
+}
+
+impl SpeechToText for SherpaStt {
+    fn stream(&self) -> Box<dyn SttStream> {
+        Box::new(SherpaStream {
+            stream: self.recognizer.create_stream(),
+            recognizer: Arc::clone(&self.recognizer),
+        })
+    }
+}
+
+/// The recognizer stream of one utterance.
+struct SherpaStream {
+    /// The recognizer of `stream`.
+    recognizer: Arc<OnlineRecognizer>,
+    /// The decoded audio.
+    stream: OnlineStream,
+}
+
+impl SttStream for SherpaStream {
+    fn accept(&mut self, samples: &[i16]) {
+        let wave: Vec<f32> = samples
+            .iter()
+            .map(|&sample| f32::from(sample) / f32::from(i16::MAX))
+            .collect();
+        self.stream.accept_waveform(16_000, &wave);
+        while self.recognizer.is_ready(&self.stream) {
+            self.recognizer.decode(&self.stream);
+        }
+    }
+
+    fn partial(&self) -> Partial {
+        let result = self.recognizer.get_result(&self.stream);
+        Partial {
+            text: result.map(|result| result.text).unwrap_or_default(),
+        }
+    }
+
+    /// Makes a new recognizer stream, which has no decoded tokens.
+    fn reset(&mut self) {
+        self.stream = self.recognizer.create_stream();
+    }
+}
 
 /// A `TextToSpeech` with the Supertonic-3 model. It runs each synthesis on a blocking thread.
 pub struct SherpaTts {
@@ -60,7 +149,7 @@ impl SherpaTts {
 
 /// The engine configuration of the Supertonic-3 model in `dir` on `device`.
 fn engine(dir: &Path, device: Device) -> OfflineTtsConfig {
-    let file = |name: &str| Some(dir.join(name).to_string_lossy().into_owned());
+    let file = |name: &str| Some(file(dir, name));
     let supertonic = OfflineTtsSupertonicModelConfig {
         duration_predictor: file("duration_predictor.int8.onnx"),
         text_encoder: file("text_encoder.int8.onnx"),
@@ -70,19 +159,29 @@ fn engine(dir: &Path, device: Device) -> OfflineTtsConfig {
         unicode_indexer: file("unicode_indexer.bin"),
         voice_style: file("voice.bin"),
     };
-    let provider = match device {
-        Device::Cuda => "cuda",
-        Device::Cpu => "cpu",
-    };
     let model = OfflineTtsModelConfig {
         supertonic,
-        provider: Some(provider.to_owned()),
+        provider: Some(provider(device)),
         ..OfflineTtsModelConfig::default()
     };
     OfflineTtsConfig {
         model,
         ..OfflineTtsConfig::default()
     }
+}
+
+/// The path of the file `name` in `dir`.
+fn file(dir: &Path, name: &str) -> String {
+    dir.join(name).to_string_lossy().into_owned()
+}
+
+/// The sherpa-onnx execution provider of `device`.
+fn provider(device: Device) -> String {
+    match device {
+        Device::Cuda => "cuda",
+        Device::Cpu => "cpu",
+    }
+    .to_owned()
 }
 
 #[async_trait]
@@ -115,15 +214,80 @@ fn pcm(value: f32) -> i16 {
     (value * f32::from(i16::MAX)) as i16
 }
 
-/// Tests of the TTS adapter with the Supertonic-3 model.
+/// Tests of the STT adapter with the Nemotron model and of the TTS adapter with the Supertonic-3
+/// model.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Config;
+    use crate::domain::intent;
+    use crate::domain::speech;
+    use crate::testing::fakes;
+
+    /// The request of the STT tests.
+    const REQUEST: &str = "turn on the kitchen lights";
+
+    /// The configuration of `jarvis.toml`.
+    fn config() -> anyhow::Result<Config> {
+        Config::parse(include_str!("../../jarvis.toml"))
+    }
 
     /// The `SherpaTts` of `jarvis.toml` on the CPU.
     fn voice() -> anyhow::Result<SherpaTts> {
-        let config = crate::Config::parse(include_str!("../../jarvis.toml"))?;
-        SherpaTts::try_new(&config.tts, Device::Cpu)
+        SherpaTts::try_new(&config()?.tts, Device::Cpu)
+    }
+
+    /// A new first pass of the `SherpaStt` of `jarvis.toml` on the CPU.
+    fn first_pass() -> anyhow::Result<Box<dyn SttStream>> {
+        Ok(SherpaStt::try_new(&config()?.asr, Device::Cpu)?.stream())
+    }
+
+    /// The partial after each 20 ms chunk of `speech(REQUEST)`.
+    async fn partials() -> anyhow::Result<Vec<Partial>> {
+        let audio = fakes::speech(REQUEST).await?;
+        let mut stream = first_pass()?;
+        let chunks = speech::chunks(&audio, 320);
+        let decode = |chunk: &[i16]| {
+            stream.accept(chunk);
+            stream.partial()
+        };
+        Ok(chunks.into_iter().map(decode).collect())
+    }
+
+    /// AC-6.6-1.
+    #[tokio::test]
+    async fn ac_6_6_1_final_partial_is_the_request() -> anyhow::Result<()> {
+        let partials = partials().await?;
+        let text = partials
+            .last()
+            .map(|partial| intent::normalize(&partial.text));
+        assert_eq!(text.as_deref(), Some(REQUEST), "{partials:?}");
+        Ok(())
+    }
+
+    /// AC-6.6-2.
+    #[tokio::test]
+    async fn ac_6_6_2_partial_has_text_before_the_last_chunk() -> anyhow::Result<()> {
+        let partials = partials().await?;
+        let early = &partials[..partials.len() - 1];
+        assert!(
+            early.iter().any(|partial| !partial.text.is_empty()),
+            "no partial before the last chunk has text: {partials:?}"
+        );
+        Ok(())
+    }
+
+    /// AC-6.6-3.
+    #[tokio::test]
+    async fn ac_6_6_3_reset_drops_the_text() -> anyhow::Result<()> {
+        let audio = fakes::speech("lights on").await?;
+        let mut stream = first_pass()?;
+        stream.accept(&audio.samples);
+        let before = stream.partial();
+        assert!(!before.text.is_empty(), "the audio gives text: {before:?}");
+        stream.reset();
+        assert_eq!(stream.partial(), Partial::default());
+        Ok(())
     }
 
     /// AC-6.2-2.
