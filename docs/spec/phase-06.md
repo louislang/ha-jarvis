@@ -214,7 +214,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 ### 6.6b First-Pass Voice Activity
 
-**Goal:** Add the Silero VAD to the first pass, with the voice end and the decided audio in each partial, and check the first pass on the GPU host. The commit policy can now measure silence.
+**Goal:** Add the Silero VAD to the first pass, with the voice end and the decided audio in each partial. The commit policy can now measure silence.
 
 - **Implements:** G2, G18. **Depends on:** 6.6.
 - **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `justfile`, `jarvis.toml`.
@@ -226,23 +226,46 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - This sub-phase adds `asr.vad_model`, `asr.vad_threshold` and `asr.vad_min_silence_ms`.
 - `just models` also downloads the Silero VAD model `silero_vad.onnx`. It is one file, not an archive. Thus `fetch` extracts only `.tar.bz2` archives and checks a single file by its SHA-256.
 - `FakeStt` returns scripted partials with voice end times.
-- The first pass uses 4 threads. On the CPU, a real-time factor of less than 0.5 lets each 160 ms chunk decode in less than 80 ms, so the VAD, the speculative prediction and the early commit keep up.
+- The first pass uses 4 threads.
+- This sub-phase adds the `Config::validate` checks of sub-phase 2.2 for the new `asr` fields.
 
 **Acceptance criteria.**
 
 - AC-6.6b-1: When `SherpaStt` gets 500 ms of silence and then `speech("lights on")`, `voice_end_ms` is `None` during the silence and within 100 ms of the last voiced sample at the end.
 - AC-6.6b-2: When `SherpaStt` gets `speech("turn on the kitchen lights")`, `vad_ms - voice_end_ms` stays less than `early_commit_ms` until the last voiced sample.
 - AC-6.6b-3: When `reset` runs, `partial` returns no voice end.
-- AC-6.6b-4 [GPU host]: With `device = cuda`, the normalized final partial of `speech("turn on the kitchen lights")` is "turn on the kitchen lights".
-- AC-6.6b-5 [GPU host]: With `device = cuda`, the last word is in the partial less than 200 ms after the last voiced sample.
-- AC-6.6b-6 [GPU host]: With `device = cuda`, the real-time factor of the first pass is less than 0.1.
-- AC-6.6b-7 [GPU host]: With `device = cuda`, the first pass runs on the CUDA execution provider.
-- AC-6.6b-8 [GPU host]: With `device = cpu`, the real-time factor of the first pass is less than 0.5.
 
 **Proofs.**
 
 - P-6.6b-3. Argument: `reset` resets the VAD and sets the voice end to `None`.
-- P-6.6b-1, P-6.6b-2, P-6.6b-4 to P-6.6b-8. Evidence: test.
+- P-6.6b-1, P-6.6b-2. Evidence: test.
+
+---
+
+### 6.6c First Pass on the GPU Host
+
+**Goal:** Check the text, the latency and the speed of the first pass on the GPU host, on CUDA and on the CPU. The first pass is now fast enough for the early commit.
+
+- **Implements:** G2, G18. **Depends on:** 6.6b.
+- **Files:** modify `src/adapters/sherpa.rs`, `justfile`.
+
+**Model.**
+
+- On the CPU, a real-time factor of less than 0.5 lets each 160 ms chunk decode in less than 80 ms, so the VAD, the speculative prediction and the early commit keep up.
+- `gpu-test` runs its tests one at a time (`--test-threads=1`), because timing tests that run in parallel slow each other down.
+- The first measurements on the GPU host failed AC-6.6c-2, AC-6.6c-3 and AC-6.6c-5: the last word came 792 ms after the last voiced sample, the CUDA real-time factor was 0.65, and the CPU real-time factor was 0.566 with 4 threads. This sub-phase starts with a measurement on the GPU host of other Nemotron exports and thread counts. The user then selects the model and the targets in a spec change before the code.
+
+**Acceptance criteria.**
+
+- AC-6.6c-1 [GPU host]: With `device = cuda`, the normalized final partial of `speech("turn on the kitchen lights")` is "turn on the kitchen lights".
+- AC-6.6c-2 [GPU host]: With `device = cuda`, the last word is in the partial less than 200 ms after the last voiced sample.
+- AC-6.6c-3 [GPU host]: With `device = cuda`, the real-time factor of the first pass is less than 0.1.
+- AC-6.6c-4 [GPU host]: With `device = cuda`, the first pass runs on the CUDA execution provider.
+- AC-6.6c-5 [GPU host]: With `device = cpu`, the real-time factor of the first pass is less than 0.5.
+
+**Proofs.**
+
+- P-6.6c-1 to P-6.6c-5. Evidence: test.
 
 ---
 
