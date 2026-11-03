@@ -133,7 +133,7 @@ bench:
 
 # Run the `[GPU host]` tests on CUDA.
 gpu-test: models gpu-models
-    JARVIS_DEVICE=cuda SHERPA_ONNX_LIB_DIR={{ quote(cuda_libraries) }} ORT_DYLIB_PATH={{ quote(cuda_libraries / "libonnxruntime.so") }} LD_LIBRARY_PATH={{ quote(cuda_libraries) }} cargo test --workspace --release -- --ignored --test-threads=1 --nocapture diag_
+    JARVIS_DEVICE=cuda SHERPA_ONNX_LIB_DIR={{ quote(cuda_libraries) }} ORT_DYLIB_PATH={{ quote(cuda_libraries / "libonnxruntime.so") }} LD_LIBRARY_PATH={{ quote(cuda_libraries) }} cargo test --workspace --release -- --ignored --test-threads=1 --nocapture diag_g
 
 # Write the architecture diagram.
 diagram:

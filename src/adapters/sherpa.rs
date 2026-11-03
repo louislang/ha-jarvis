@@ -980,12 +980,13 @@ mod tests {
         tts: SherpaTts,
     }
 
-    /// Loads the models of the live process on CUDA and records the GPU memory after each.
-    async fn load_live(peak: &mut Vec<u64>) -> anyhow::Result<Live> {
+    /// Loads the models of the live process on CUDA, the passes with `provider`, and records
+    /// the GPU memory after each.
+    async fn load_live(provider: &str, peak: &mut Vec<u64>) -> anyhow::Result<Live> {
         use crate::ports::ModelLoader as _;
-        let first = online(NEMOTRON_FP16, "cuda")?;
+        let first = online(NEMOTRON_FP16, provider)?;
         print_memory("nemotron_fp16", peak)?;
-        let second = offline(PARAKEET_FP16, "cuda")?;
+        let second = offline(PARAKEET_FP16, provider)?;
         print_memory("parakeet_fp16", peak)?;
         let fixture = Path::new("models/system-one/fixture");
         let classifier = crate::adapters::onnx::OnnxLoader
@@ -1030,16 +1031,68 @@ mod tests {
             return Ok(());
         }
         let request = fakes::speech(REQUEST).await?;
-        let mut samples = fakes::speech(CALENDAR).await?.samples;
-        samples.resize(3 * usize::from(RATE), 0);
+        let samples = calendar_samples().await?;
         let mut peak = Vec::new();
         print_memory("start", &mut peak)?;
-        let live = load_live(&mut peak).await?;
+        let live = load_live("cuda", &mut peak).await?;
         for _ in 0..3 {
             run_live(&live, &request.samples, &samples, &mut peak).await?;
         }
         println!("DIAGNOSTIC peak max_process_mib={:?}", peak.iter().max());
         Ok(())
+    }
+
+    /// The speech of `CALENDAR` padded to 3 s.
+    async fn calendar_samples() -> anyhow::Result<Vec<i16>> {
+        let mut samples = fakes::speech(CALENDAR).await?.samples;
+        samples.resize(3 * usize::from(RATE), 0);
+        Ok(samples)
+    }
+
+    /// A CUDA provider whose ONNX Runtime arena grows by the requested size, with its folder.
+    fn arena_provider() -> anyhow::Result<(tempfile::TempDir, String)> {
+        let folder = tempfile::tempdir()?;
+        let config = folder.path().join("arena.config");
+        std::fs::write(&config, "arena_extend_strategy=kSameAsRequested\n")?;
+        let provider = format!("cuda:{}", config.display());
+        Ok((folder, provider))
+    }
+
+    /// Prints the first-pass speed and the second-pass p95 of `live`.
+    fn print_live_speed(live: &Live, request: &Audio, samples: &[i16]) -> anyhow::Result<()> {
+        let pass = run_first(&live.first, &request.samples);
+        print_first("arena-nemotron-fp16", &live.first, &pass, request)?;
+        let text = transcribe(&live.second, samples)?;
+        print_second(
+            "arena-parakeet-fp16",
+            &text,
+            &second_times(&live.second, samples)?,
+        );
+        Ok(())
+    }
+
+    /// Diagnostic: the GPU memory and speed of the live process with `kSameAsRequested` for the
+    /// fp16 passes.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn diag_g_arena() -> anyhow::Result<()> {
+        if !alone("diag_g_arena")? {
+            return Ok(());
+        }
+        let (_folder, provider) = arena_provider()?;
+        let request = fakes::speech(REQUEST).await?;
+        let samples = calendar_samples().await?;
+        let mut peak = Vec::new();
+        print_memory("arena_start", &mut peak)?;
+        let live = load_live(&provider, &mut peak).await?;
+        for _ in 0..3 {
+            run_live(&live, &request.samples, &samples, &mut peak).await?;
+        }
+        println!(
+            "DIAGNOSTIC peak arena max_process_mib={:?}",
+            peak.iter().max()
+        );
+        print_live_speed(&live, &request, &samples)
     }
 
     /// The 50 requests of the word error comparison of AC-6.7-3.
