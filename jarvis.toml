@@ -18,10 +18,12 @@ commit_threshold = 0.9
 
 [asr]
 model_dir = "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25"
-# The fp16 files. CPU machines name `encoder.int8.onnx`, `decoder.int8.onnx` and `joiner.int8.onnx`.
+# The fp16 files of both passes. CPU machines name `encoder.int8.onnx`, `decoder.int8.onnx` and `joiner.int8.onnx`.
 encoder = "encoder.fp16.onnx"
 decoder = "decoder.fp16.onnx"
 joiner = "joiner.fp16.onnx"
+# Optional. Without it, the final transcript is the first-pass text (CPU machines).
+second_pass_dir = "models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"
 vad_model = "models/silero_vad.onnx"
 vad_threshold = 0.5
 vad_min_silence_ms = 100

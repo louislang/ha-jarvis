@@ -1297,7 +1297,9 @@ dependencies = [
  "serde",
  "serde_json",
  "sherpa-onnx",
+ "strsim",
  "tempfile",
+ "text-processing-rs",
  "tokenizers",
  "tokio",
  "tokio-tungstenite",
@@ -1382,6 +1384,12 @@ dependencies = [
  "futures-util",
  "wasm-bindgen",
 ]
+
+[[package]]
+name = "lazy_static"
+version = "1.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
 name = "libbz2-rs-sys"
@@ -2475,6 +2483,15 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "text-processing-rs"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb19e0ed95cd1d683b8ff120634ae64b30d99fbc9ecec9441230181f25fe5256"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]

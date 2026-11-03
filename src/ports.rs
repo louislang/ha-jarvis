@@ -109,6 +109,14 @@ pub trait SpeechToText: Send + Sync {
     ///
     /// The VAD cannot load.
     fn stream(&self) -> anyhow::Result<Box<dyn SttStream>>;
+
+    /// The second-pass text of the 16 kHz `samples` of one utterance, or `None` without a second
+    /// pass. It blocks while it decodes.
+    ///
+    /// # Errors
+    ///
+    /// The second pass gives no result.
+    fn transcribe(&self, samples: &[i16]) -> anyhow::Result<Option<String>>;
 }
 
 /// The first pass of one utterance. `accept` blocks while it decodes.

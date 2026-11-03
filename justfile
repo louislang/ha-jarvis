@@ -46,12 +46,17 @@ parakeet_sums := """
     dc0b4584ab2e4ddbf888425c076c61b736e7356a015250db7d307e6f1a8188ff  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming/tokens.txt"""
 # The folder of the fp16 STT files, which are not in a download (`01-architecture.md` section 10).
 fp16_models := "/opt/jarvis-models/fp16"
-# The SHA-256 of each fp16 file of the first pass in `fp16_models`.
+# The SHA-256 of each fp16 file of each pass in `fp16_models`.
 nemotron_fp16_sums := """
     f2ff4ff73af5961cd9680e79868d4ed8f36544455d92115a71012f1a5bb0e55a  nemotron-160ms-encoder.fp16.onnx
     b4bc4b9579327604ea77d252a50c8bb99b4259324c26e64aa39b756011979f85  nemotron-160ms-encoder.fp16.weights
     0aad1db9eeaacf2c92ecf7e280281636b82d225c63834e51429cca4f3e7c5f48  nemotron-160ms-decoder.fp16.onnx
     fb270026bfcdd0fc9cb4c253b5180fd495fefbba8072e65cabe44b95e4e7e53e  nemotron-160ms-joiner.fp16.onnx"""
+parakeet_fp16_sums := """
+    cf899d8960088d0afe80f17713b35a185a85a3a6b24c31dacb40d8d934ec8957  parakeet-unified-encoder.fp16.onnx
+    0f13a87a83a3a77939f7a57aadea91e7fab963bda6f4ecdd0eb8d210cdb91bbc  parakeet-unified-encoder.fp16.weights
+    c31c063cffc978d19a0564eb31c63d131f1352ddedbd2b9c4559635b225cdcc1  parakeet-unified-decoder.fp16.onnx
+    1e09b15a71aeede79442ace27092d0690af323e50c210d609dc41bc11b60be97  parakeet-unified-joiner.fp16.onnx"""
 # Each build links the sherpa-onnx libraries of this folder, so no build downloads them.
 export SHERPA_ONNX_LIB_DIR := cpu_libraries
 # The environment that loads the ONNX Runtime of `cpu_libraries`.
@@ -69,7 +74,7 @@ cov:
 models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/tts-models" supertonic_sums) (fetch sherpa_onnx + "/asr-models" silero_sums)
 
 # Download the GPU models and the CUDA libraries, and copy the fp16 files next to the int8 files of the same model.
-gpu-models: cuda-libraries (fetch sherpa_onnx + "/asr-models" parakeet_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (copy-fp16 nemotron_fp16_sums "nemotron-160ms-" "sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25")
+gpu-models: cuda-libraries (fetch sherpa_onnx + "/asr-models" parakeet_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (copy-fp16 nemotron_fp16_sums "nemotron-160ms-" "sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25") (copy-fp16 parakeet_fp16_sums "parakeet-unified-" "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming")
 
 # Download the CUDA libraries.
 cuda-libraries: (fetch sherpa_onnx + "/v2.0.1" cuda_sums)
