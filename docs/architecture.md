@@ -80,8 +80,10 @@ flowchart LR
     crate_app_conversation --> crate_ports
     crate_app_speech --> crate_app_speech
     crate_app_speech --> crate_domain_catalog
+    crate_app_speech --> crate_domain_intent
     crate_app_speech --> crate_domain_responses
     crate_app_speech --> crate_domain_speech
+    crate_app_speech --> crate_domain_training
     crate_app_speech --> crate_ports
     crate_domain_catalog --> crate_domain_contracts
     crate_domain_catalog --> crate_domain_intent
