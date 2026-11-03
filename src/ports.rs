@@ -64,6 +64,9 @@ pub trait Assistant: Send + Sync {
 
     /// The reply to the transcript `text` in `context` and the work after it.
     async fn handle(&self, text: &str, context: Context) -> anyhow::Result<Handled>;
+
+    /// The audio of `text`.
+    async fn speak(&self, text: &str) -> anyhow::Result<Arc<Audio>>;
 }
 
 /// The house: HA states, registries, events and service calls.

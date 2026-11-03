@@ -67,6 +67,7 @@ flowchart LR
     crate_adapters_sherpa --> crate_adapters_sherpa
     crate_adapters_sherpa --> crate_domain_speech
     crate_adapters_sherpa --> crate_ports
+    crate_adapters_wyoming --> crate_domain_speech
     crate_adapters_wyoming --> crate_ports
     crate_app_background --> crate_domain_state
     crate_app_background --> crate_domain_state_cache

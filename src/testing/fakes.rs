@@ -409,8 +409,8 @@ impl Clock for FakeClock {
 }
 
 /// An `Assistant` with a fixed name and version that records each request. `handle` replies
-/// with work that marks its start, or fails after `fail`. `listen` gives the scripted sessions in
-/// order.
+/// with work that marks its start, and `speak` gives 1500 samples of silence, or both fail after
+/// `fail`. `listen` gives the scripted sessions in order.
 #[derive(Default)]
 pub(crate) struct FakeAssistant {
     /// The text and the context of each request, in order.
@@ -493,6 +493,16 @@ impl Assistant for FakeAssistant {
             ),
         })
     }
+
+    async fn speak(&self, _text: &str) -> anyhow::Result<Arc<Audio>> {
+        if let Some(error) = lock(&self.error).clone() {
+            anyhow::bail!(error);
+        }
+        Ok(Arc::new(Audio {
+            samples: vec![0; 1500],
+            rate: 16_000,
+        }))
+    }
 }
 
 /// A scripted listen session of `FakeAssistant`.
@@ -551,15 +561,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin> FakeWyomingClient<S> {
     }
 
     /// The type and the data of the next event, or `None` when the server closes the connection.
+    /// Drops the payload.
     pub(crate) async fn receive(&mut self) -> anyhow::Result<Option<(String, Value)>> {
         let mut line = String::new();
         if self.stream.read_line(&mut line).await? == 0 {
             return Ok(None);
         }
         let header: Value = serde_json::from_str(&line)?;
-        let length = header["data_length"].as_u64().unwrap_or(0);
-        let mut data = vec![0; usize::try_from(length)?];
+        let length = usize::try_from(header["data_length"].as_u64().unwrap_or(0))?;
+        let payload = usize::try_from(header["payload_length"].as_u64().unwrap_or(0))?;
+        let mut data = vec![0; length + payload];
         self.stream.read_exact(&mut data).await?;
+        data.truncate(length);
         let event_type = header["type"].as_str().unwrap_or_default().to_owned();
         Ok(Some((event_type, serde_json::from_slice(&data)?)))
     }
