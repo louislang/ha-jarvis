@@ -156,7 +156,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 25. **Logging is not on the critical path.** Jarvis writes the interaction after it returns `Handled`. Later announces and questions update the same record.
 26. **Feedback rules.** A bad action blocks that decision (intent and targets) for that normalized text at once. `decide` then uses the next entity candidate, then the next intent with enough probability. Else it sends the request to System Two with the bad action as a correction. A bad response leaves its pool. The next training run learns from all marks and corrections.
 27. **One ONNX Runtime, GPU or CPU.** `sherpa-onnx` (feature `shared`) and `ort` (feature `load-dynamic`) load the same ONNX Runtime 1.28.2 shared library from sherpa-onnx 2.0.1. On the GPU host, it is the CUDA 12 and cuDNN 9 build from the sherpa-onnx `linux-x64-gpu` release. On other machines, it is the CPU build. Thus the two crates cannot conflict, and `device` selects the CUDA or the CPU execution provider for all models.
-28. **Two-pass STT.** The first pass streams, so Jarvis knows the words while the user speaks. It uses NVIDIA Nemotron Speech Streaming EN 0.6B with 160 ms chunks on the GPU host. A 160 ms chunk is shorter than `early_commit_ms`, so the last words arrive inside the silence wait. At commit, the second pass decodes the whole utterance with NVIDIA Parakeet Unified EN 0.6B in offline mode. The second pass has full context, so it is more accurate. On the Open ASR Leaderboard sets, the average word error rate goes from 7.67% to 5.91%, and on LibriSpeech test-clean from 2.56% to 1.63%. HA receives the second-pass text. Both models are official sherpa-onnx exports. The GPU host runs fp16 conversions of them (sub-phase 6.6c). Cloud streaming APIs take about 250 ms to 300 ms to give the final text, so they cannot meet G1. CPU machines use the same first pass and have no second pass.
+28. **Two-pass STT.** The first pass streams, so Jarvis knows the words while the user speaks. It uses NVIDIA Nemotron Speech Streaming EN 0.6B with 160 ms chunks on the GPU host. The first pass gives the last word only after the VAD ends the segment and flushes the model, about 203 ms after the last voiced sample (sub-phase 6.6c). Thus at an early commit after 200 ms the first-pass text can lack the end of the last word. At commit, the second pass decodes the whole utterance with NVIDIA Parakeet Unified EN 0.6B in offline mode. The second pass has full context, so it is more accurate. On the Open ASR Leaderboard sets, the average word error rate goes from 7.67% to 5.91%, and on LibriSpeech test-clean from 2.56% to 1.63%. HA receives the second-pass text, so the cut first-pass text does not reach HA on the GPU host. Both models are official sherpa-onnx exports. The GPU host runs fp16 conversions of them (sub-phase 6.6c). Cloud streaming APIs take about 250 ms to 300 ms to give the final text, so they cannot meet G1. CPU machines use the same first pass and have no second pass.
 29. **Blocking work off the async workers.** STT decoding, the second pass, `predict`, TTS synthesis, voice embedding and SQLite calls run in `tokio::task::spawn_blocking`. The async workers only move bytes and wait. Thus a decode for one satellite does not delay `handle` for another.
 
 ## 6. Latency Budget (System One)
@@ -164,7 +164,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 | Step | Budget |
 |---|---|
 | Trailing silence before early commit (`early_commit_ms`), from the last voiced sample | 200 ms |
-| Second pass of a 3 s utterance (GPU host). The first pass finishes inside the silence wait. | 40 ms |
+| Second pass of a 3 s utterance (GPU host). | 40 ms |
 | Wyoming `Transcript` → `Handled` (model prediction 10 ms, decide, select) | 20 ms |
 | Wyoming `Synthesize` → first audio chunk (cache hit) | 10 ms |
 | Margin | 30 ms |
@@ -327,7 +327,7 @@ Unit tests are in a `#[cfg(test)] mod tests` block at the end of each source fil
 
 ## 9. Configuration Files
 
-`jarvis.toml` is the configuration of the GPU host. Another machine copies it to `jarvis.local.toml`, sets `device = "cpu"`, names the int8 files, removes `second_pass_dir`, and runs `jarvis serve jarvis.local.toml`. Git ignores `jarvis.local.toml`.
+`jarvis.toml` is the configuration of the GPU host. Another machine copies it to `jarvis.local.toml`, sets `device = "cpu"`, names the int8 files, removes `second_pass_dir`, sets `early_commit_ms = 250`, and runs `jarvis serve jarvis.local.toml`. Git ignores `jarvis.local.toml`. Without a second pass, the transcript is the first-pass text. The VAD ends the segment and flushes the last word about 203 ms after the last voiced sample (sub-phase 6.6c), so 250 ms lets the flush finish before an early commit.
 
 `jarvis.toml`:
 
