@@ -436,3 +436,29 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 - P-6.10-1. Argument: the handler writes `audio-start`, then iterates `chunks` (P-6.3-4), then writes `audio-stop`, in one sequential function.
 - P-6.10-2, P-6.10-3. Evidence: test.
+
+---
+
+### 6.11 Logs
+
+**Goal:** Write the `tracing` events to stderr, and log each request and each transcript. systemd puts stderr in the journal, so `journalctl -u jarvis` shows what Jarvis did.
+
+- **Implements:** G15. **Depends on:** 6.10.
+- **Files:** modify `Cargo.toml`, `src/lib.rs`, `src/app/conversation.rs`, `src/app/speech.rs`.
+
+**Model.**
+
+- `main` installs one `tracing_subscriber::fmt` subscriber that writes to stderr. An `EnvFilter` reads `RUST_LOG`. Without `RUST_LOG`, the level is `info`. The output has no ANSI colors and no time, because the journal adds the time. This sub-phase adds `tracing-subscriber` with the features `fmt` and `env-filter`.
+- `handle` logs one `info` event for each request: the transcript, the top label and its probability, the decision kind and the reply text.
+- A `Listening` session logs one `info` event when it gives a transcript, at a commit or at `finish`: the transcript, which pass gave it, and the audio length in ms.
+- The interaction log of phase 12 stores the same data. These events are only text in the journal.
+
+**Acceptance criteria.**
+
+- AC-6.11-1: When the subscriber writes to a buffer and `RUST_LOG` is not set, an `info` event is in the buffer and a `debug` event is not.
+- AC-6.11-2: When `handle` returns a reply, the log has one `info` event with the transcript, the top label and the reply text.
+- AC-6.11-3: When a session gives a transcript, the log has one `info` event with the transcript and the pass.
+
+**Proofs.**
+
+- P-6.11-1 to P-6.11-3. Evidence: test.
