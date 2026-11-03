@@ -40,14 +40,17 @@ use crate::adapters::files::FileStore;
 use crate::adapters::ha::HaHome;
 use crate::adapters::onnx::OnnxLoader;
 use crate::adapters::sherpa::SherpaStt;
+use crate::adapters::sherpa::SherpaTts;
 use crate::app::conversation::Conversation;
 use crate::app::conversation::Queues;
 use crate::app::speech::Listener;
+use crate::app::speech::Speech;
 use crate::domain::catalog::Catalog;
 use crate::domain::model::Prediction;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Pools;
 use crate::domain::responses::Response;
+use crate::domain::speech::Audio;
 use crate::domain::speech::CommitPolicy;
 use crate::domain::state::Snapshot;
 use crate::domain::state_cache::StateCache;
@@ -363,6 +366,8 @@ pub struct App {
     conversation: Conversation,
     /// The `listen` use case.
     listener: Listener,
+    /// The `speak` use case.
+    speech: Arc<Speech>,
 }
 
 #[async_trait]
@@ -380,6 +385,10 @@ impl Assistant for App {
 
     async fn handle(&self, text: &str, context: ports::Context) -> anyhow::Result<Handled> {
         self.conversation.handle(text, context).await
+    }
+
+    async fn speak(&self, text: &str) -> anyhow::Result<Arc<Audio>> {
+        self.speech.speak(text).await
     }
 }
 
@@ -588,10 +597,11 @@ pub struct Startup<Lookup, Connector, Shutdown> {
     pub shutdown: Shutdown,
 }
 
-/// Starts Jarvis with the configuration file `config` and the outside world `startup`: HA,
-/// the sync, the System One model, the STT models and the Wyoming server. When `startup.shutdown` completes,
-/// stops the start, or stops accepting connections and waits up to [`SHUTDOWN_WAIT`] for the
-/// running connections, the work after their replies and the saves of the stores.
+/// Starts Jarvis with the configuration file `config` and the outside world `startup`: HA, the
+/// sync, the System One model, the STT and TTS models, the pre-render and the Wyoming server.
+/// When `startup.shutdown` completes, stops the start, or stops accepting connections and waits
+/// up to [`SHUTDOWN_WAIT`] for the running connections, the work after their replies and the
+/// saves of the stores.
 ///
 /// # Errors
 ///
@@ -680,7 +690,8 @@ where
 }
 
 /// The app of `config`, `catalog` and the source pools `pools` on `home`, and its pools task.
-/// Starts the pools task and the sync, and loads the System One model, then the STT models.
+/// Starts the pools task and the sync, and loads the System One model, then the STT and TTS
+/// models. Then starts the pre-render.
 ///
 /// # Errors
 ///
@@ -693,8 +704,9 @@ async fn start_app(
 ) -> anyhow::Result<(App, JoinHandle<()>)> {
     let store = Arc::new(FileStore::try_new(config.pools.clone())?);
     let task = app::conversation::start_pools(pools, store)?;
-    let queues = start_sync(home, &config.announce);
-    let (classifier, listener) = load_models(config).await?;
+    let (cache, queues) = start_sync(home, &config.announce);
+    let (classifier, listener, speech) = load_models(config).await?;
+    start_prerender(&speech, &task.pools, cache);
     let rng = StdRng::seed_from_u64(SystemClock.now().as_millisecond().unsigned_abs());
     let (catalog, threshold) = (Arc::new(catalog), config.model.threshold);
     let (pools, changes) = (task.pools, task.changes);
@@ -703,34 +715,68 @@ async fn start_app(
     let app = App {
         conversation,
         listener,
+        speech,
     };
     Ok((app, task.task))
 }
 
 /// The System One model of `config`, then the listener on the STT models of `config`, which
-/// predicts with that model. The STT models load on a blocking thread.
+/// predicts with that model, and the speech use case on the TTS model of `config`. The STT and
+/// TTS models load on a blocking thread.
 ///
 /// # Errors
 ///
 /// A model cannot load.
-async fn load_models(config: &Config) -> anyhow::Result<(Arc<dyn Classifier>, Listener)> {
+async fn load_models(
+    config: &Config,
+) -> anyhow::Result<(Arc<dyn Classifier>, Listener, Arc<Speech>)> {
     let dir = config.model.dir.join("fixture");
     let model = OnnxLoader.load(&dir, config.device).await?;
     let classifier: Arc<dyn Classifier> = Arc::new(CurrentClassifier(ArcSwap::from_pointee(model)));
-    let (asr, device) = (config.asr.clone(), config.device);
+    let (asr, tts, device) = (config.asr.clone(), config.tts.clone(), config.device);
     let stt = tokio::task::spawn_blocking(move || SherpaStt::try_new(&asr, device)).await??;
+    let tts = tokio::task::spawn_blocking(move || SherpaTts::try_new(&tts, device)).await??;
     let listener = listener(config, Arc::new(stt), Arc::clone(&classifier));
-    Ok((classifier, listener))
+    Ok((classifier, listener, Arc::new(Speech::new(Arc::new(tts)))))
 }
 
-/// Starts the sync of a hot cache with `home`. Gives the announce queues of `announce` on it.
-fn start_sync(home: Arc<dyn Home>, announce: &AnnounceConfig) -> Arc<Queues> {
+/// Starts the sync of a hot cache with `home`. Gives the hot cache and the announce queues of
+/// `announce` on it.
+fn start_sync(
+    home: Arc<dyn Home>,
+    announce: &AnnounceConfig,
+) -> (watch::Receiver<StateCache>, Arc<Queues>) {
     let (cache, receiver) = watch::channel(StateCache::default());
     let sync = Arc::clone(&home);
     tokio::spawn(async move { app::background::sync(sync.as_ref(), &cache).await });
     let margin = Duration::from_millis(announce.margin_ms);
     let idle_wait = Duration::from_secs(announce.idle_wait_s);
-    Arc::new(Queues::new(home, receiver, margin, idle_wait))
+    let queues = Queues::new(home, receiver.clone(), margin, idle_wait);
+    (receiver, Arc::new(queues))
+}
+
+/// Starts a task that pre-renders `pools` with `speech` for the area names of the first snapshot
+/// in `cache`.
+fn start_prerender(
+    speech: &Arc<Speech>,
+    pools: &Arc<ArcSwap<Pools>>,
+    mut cache: watch::Receiver<StateCache>,
+) {
+    let (speech, pools) = (Arc::clone(speech), Arc::clone(pools));
+    tokio::spawn(async move {
+        if cache.changed().await.is_err() {
+            return;
+        }
+        let areas: Vec<String> = cache
+            .borrow()
+            .areas
+            .iter()
+            .map(|area| area.name.clone())
+            .collect();
+        if let Err(error) = speech.prerender(&pools.load_full(), &areas).await {
+            tracing::warn!("the pre-render failed: {error:#}");
+        }
+    });
 }
 
 /// Runs Jarvis with the configuration file `config`, the environment and TCP, until it fails
@@ -814,7 +860,6 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::adapters::onnx::OnnxLoader;
-    use crate::adapters::sherpa::SherpaTts;
     use crate::app::conversation::Queues;
     use crate::domain::responses::Pool;
     use crate::domain::responses::Pools;
@@ -828,6 +873,7 @@ mod tests {
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeStt;
+    use crate::testing::fakes::FakeTts;
     use crate::testing::fakes::FakeWyomingClient;
 
     /// A valid configuration with every field.
@@ -1202,9 +1248,11 @@ mod tests {
             catalog,
             threshold,
         );
+        let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
         Ok(App {
             conversation,
             listener,
+            speech,
         })
     }
 
@@ -1252,11 +1300,67 @@ mod tests {
     #[tokio::test]
     #[ignore = "GPU host"]
     async fn ac_5_3_6_transcript_to_handled_p95_is_less_than_20_ms() -> anyhow::Result<()> {
-        // The first 100 requests warm up the model.
-        let mut times = round_trips(1100).await?.split_off(100);
-        times.sort();
-        let p95 = times[times.len() * 95 / 100];
+        let p95 = p95(round_trips(1100).await?);
         assert!(p95 < Duration::from_millis(20), "p95 is {p95:?}");
+        Ok(())
+    }
+
+    /// The 95th percentile of `times` after the first 100, which warm up the models.
+    fn p95(mut times: Vec<Duration>) -> Duration {
+        let mut times = times.split_off(100);
+        times.sort();
+        times[times.len() * 95 / 100]
+    }
+
+    /// Serves an app with the TTS of `VALID` and the pre-rendered pools on a local port, and
+    /// gives its address.
+    async fn speech_server() -> anyhow::Result<SocketAddr> {
+        let config = Config::parse(VALID)?;
+        let speech = Speech::new(Arc::new(voice(config.device)?));
+        let catalog = load_catalog(&config.intents)?;
+        let areas = ["Kitchen".to_owned()];
+        speech.prerender(&pools(&catalog), &areas).await?;
+        let (classifier, stt) = (FakeClassifier::default(), FakeStt::default());
+        let app = App {
+            speech: Arc::new(speech),
+            ..app_with(Arc::new(classifier), Arc::new(stt))?
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        spawn_server(listener, Arc::new(app));
+        Ok(address)
+    }
+
+    /// The time from a `synthesize` event of a pre-rendered text on `client` to its first
+    /// `audio-chunk` event. Reads the rest of the audio.
+    async fn first_chunk(client: &mut FakeWyomingClient) -> anyhow::Result<Duration> {
+        let start = Instant::now();
+        client
+            .send("synthesize", &json!({ "text": "Done." }))
+            .await?;
+        client.receive().await?;
+        let first = client.receive().await?.map(|(event, _)| event);
+        let time = start.elapsed();
+        anyhow::ensure!(
+            first.as_deref() == Some("audio-chunk"),
+            "the second event is {first:?}"
+        );
+        while client.receive().await?.context("the server closed")?.0 != "audio-stop" {}
+        Ok(time)
+    }
+
+    /// AC-6.10-3.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn ac_6_10_3_cached_synthesize_to_first_chunk_p95_is_less_than_10_ms()
+    -> anyhow::Result<()> {
+        let mut client = FakeWyomingClient::connect(speech_server().await?).await?;
+        let mut times = Vec::new();
+        for _ in 0..1100 {
+            times.push(first_chunk(&mut client).await?);
+        }
+        let p95 = p95(times);
+        assert!(p95 < Duration::from_millis(10), "p95 is {p95:?}");
         Ok(())
     }
 
