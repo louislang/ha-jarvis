@@ -195,7 +195,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 - `SpeechToText::stream() -> Box<dyn SttStream>`. `SttStream`: `accept(samples)`, `partial() -> Partial { text }`, `reset()`.
 - `SherpaStt` wraps `OnlineRecognizer` with the streaming transducer in `[asr].model_dir`. This sub-phase adds `asr.model_dir`.
-- CPU machines and the GPU host use the same first-pass model: Nemotron 160 ms int8. The 20M zipformer does not recognize the first word of `speech(text)`. `just models` downloads the Nemotron model, and `gpu-models` does not. `just models` does not download the 20M zipformer. The structure test of AC-6.2-1 checks the Nemotron folder.
+- CPU machines and the GPU host use the same first-pass model: Nemotron 160 ms. CPU machines load its int8 files. The GPU host loads its fp16 files (sub-phase 6.6c). The 20M zipformer does not recognize the first word of `speech(text)`. `just models` downloads the int8 Nemotron model. `gpu-models` downloads the fp16 files of the same model. `just models` does not download the 20M zipformer. The structure test of AC-6.2-1 checks the Nemotron folder.
 - `FakeStt` returns scripted partials.
 - `speech(text)` in `fakes.rs` synthesizes text with `SherpaTts`, resamples it from 44.1 kHz to 16 kHz with `rubato`, and adds 500 ms of silence. The fixed TTS seed makes `speech(text)` bit-identical on every run.
 
@@ -244,24 +244,32 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 ### 6.6c First Pass on the GPU Host
 
-**Goal:** Check the text, the latency and the speed of the first pass on the GPU host, on CUDA and on the CPU. The first pass is now fast enough for the early commit.
+**Goal:** Load the fp16 first pass on the GPU host, flush the last word at the speech end, and check the text, the latency and the speed on CUDA and on the CPU. The first pass is now fast enough for the early commit.
 
 - **Implements:** G2, G18. **Depends on:** 6.6b.
-- **Files:** modify `src/adapters/sherpa.rs`, `justfile`.
+- **Files:** create `sherpa-cuda.config`. Modify `src/adapters/sherpa.rs`, `src/lib.rs`, `justfile`, `jarvis.toml`.
 
 **Model.**
 
-- On the CPU, a real-time factor of less than 0.5 lets each 160 ms chunk decode in less than 80 ms, so the VAD, the speculative prediction and the early commit keep up.
-- `gpu-test` runs its tests one at a time (`--test-threads=1`), because timing tests that run in parallel slow each other down.
-- The first measurements on the GPU host failed AC-6.6c-2, AC-6.6c-3 and AC-6.6c-5: the last word came 792 ms after the last voiced sample, the CUDA real-time factor was 0.65, and the CPU real-time factor was 0.566 with 4 threads. This sub-phase starts with a measurement on the GPU host of other Nemotron exports and thread counts. The user then selects the model and the targets in a spec change before the code.
+- Every device uses the same 160 ms Nemotron export and the same code. This sub-phase adds `asr.encoder`, `asr.decoder` and `asr.joiner`: the file names of the encoder, the decoder and the joiner in `model_dir`. Sub-phase 6.7 uses the same names in `second_pass_dir`, because both models have the same file names. `jarvis.toml` names the fp16 files (`encoder.fp16.onnx`, `decoder.fp16.onnx`, `joiner.fp16.onnx`). `jarvis.local.toml` and the tests on the CPU name the int8 files.
+- Measurements on the GPU host (4 threads, 20 ms chunks, `speech("turn on the kitchen lights")`) give the reasons. ONNX Runtime runs the int8 operators `MatMulInteger`, `ConvInteger` and `DynamicQuantizeLinear` on the CPU, also with the CUDA execution provider. Thus int8 on CUDA has a real-time factor of 0.622, and int8 on the CPU has 0.558. fp32 on CUDA has 0.130, but it takes about 3.4 GB of GPU memory. fp16 on CUDA has 0.085 (14.4 ms for each 160 ms chunk), runs all compute on CUDA, and gives the same text as fp32. On the CPU, 6 and 8 threads are slower (0.716 and 0.800), so the first pass keeps 4 threads.
+- No fp16 export exists. A one-time manual step converts the fp32 export (Hugging Face `csukuangfj2/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-2026-04-25`) with onnxconverter-common 1.16.0 `convert_float_to_float16(keep_io_types=True)`. In the encoder, the model inputs and outputs, `Range` and 8 `Cast(to=FLOAT)` nodes stay fp32. The repository has no conversion code.
+- The fp16 files are not in a download. They are copied by hand, once, to the folder `/opt/jarvis-models/fp16/` on the GPU host (`01-architecture.md` section 10), with `NOTICE.md`, the license notice of both models: "Licensed by NVIDIA Corporation under the NVIDIA Open Model License". Both models have `encoder.fp16.onnx`, so each file name starts with the model: `nemotron-160ms-` or `parakeet-unified-`. Each model has four files: `encoder.fp16.onnx`, `encoder.fp16.weights`, `decoder.fp16.onnx` and `joiner.fp16.onnx`.
+- `gpu-models` reads the folder from the `justfile` variable `fp16_models` (default `/opt/jarvis-models/fp16`). It checks the SHA-256 of each file and fails with a message that names the missing or wrong file. Then it copies each file without its prefix into the folder of the int8 files of the same model, next to their `tokens.txt`. A copy also works when the folder is on another file system. The encoder names its weights file (`encoder.fp16.weights`), so the copied names must not change. This sub-phase copies the `nemotron-160ms-` files, and sub-phase 6.7 copies the `parakeet-unified-` files.
+- `sherpa-cuda.config` holds the CUDA option `arena_extend_strategy=kSameAsRequested`. With `device = cuda`, each STT session gets the provider string `cuda:sherpa-cuda.config`: sherpa-onnx 2.0.1 reads the provider options from the file after the colon. Each STT session then takes about 1.2 GB of GPU memory instead of about 2.1 GB, at the same speed.
+- The model emits the last token about 410 ms of audio after the last voiced sample. Thus streaming alone gives the last word too late: 721 ms after the last voiced sample with fp32 on CUDA, 790 ms with int8 on the CPU. `input_finished()` does not flush the model.
+- Flush: when the VAD ends a speech segment, the stream feeds 640 ms of zeros to the recognizer and decodes them. 480 ms of zeros is not enough. The zeros go only to the recognizer, not to the VAD or the audio positions. sherpa-onnx 2.0.1 cannot clone a stream. Thus the zeros go into the live stream, and the flush runs only at the end of a VAD speech segment, where a commit and `reset` can follow.
+- The flush takes about 58 ms with fp16 on CUDA and 376 ms with int8 on the CPU. Thus the last word comes about 190 ms after the last voiced sample on CUDA (an estimate) and about 510 ms on the CPU.
+- The Silero VAD runs on the CPU on every device. Its real-time factor is 0.004 on the CPU and 0.017 on CUDA.
+- On the CPU, a real-time factor of less than 0.6 lets each 160 ms chunk decode in less than 96 ms, so the decode keeps up with the audio.
 
 **Acceptance criteria.**
 
 - AC-6.6c-1 [GPU host]: With `device = cuda`, the normalized final partial of `speech("turn on the kitchen lights")` is "turn on the kitchen lights".
-- AC-6.6c-2 [GPU host]: With `device = cuda`, the last word is in the partial less than 200 ms after the last voiced sample.
-- AC-6.6c-3 [GPU host]: With `device = cuda`, the real-time factor of the first pass is less than 0.1.
+- AC-6.6c-2 [GPU host]: With `device = cuda`, the last word is in the partial less than 250 ms after the last voiced sample.
+- AC-6.6c-3 [GPU host]: With `device = cuda`, the real-time factor of the first pass is less than 0.15.
 - AC-6.6c-4 [GPU host]: With `device = cuda`, the first pass runs on the CUDA execution provider.
-- AC-6.6c-5 [GPU host]: With `device = cpu`, the real-time factor of the first pass is less than 0.5.
+- AC-6.6c-5 [GPU host]: With `device = cpu` and 4 threads, the real-time factor of the first pass is less than 0.6.
 
 **Proofs.**
 
@@ -274,11 +282,13 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 **Goal:** Add `transcribe`, the offline second pass with Parakeet Unified. At commit, Jarvis can decode the whole utterance again for a more accurate transcript.
 
 - **Implements:** G2, G18. **Depends on:** 6.6b.
-- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
+- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`, `Cargo.toml`, `justfile`.
 
 **Model.**
 
 - `SpeechToText::transcribe(samples) -> Result<Option<String>>`. `SherpaStt` holds an optional `OfflineRecognizer` from `[asr].second_pass_dir`. Without it, `transcribe` returns `Ok(None)`. `FakeStt` returns a scripted second-pass text.
+- The second pass loads the files `asr.encoder`, `asr.decoder` and `asr.joiner` in `second_pass_dir`, with the provider string of the first pass (sub-phase 6.6c). Thus the GPU host loads the fp16 Parakeet files with `kSameAsRequested`. `gpu-models` copies the `parakeet-unified-` files of `fp16_models` into the folder of the int8 Parakeet files, as sub-phase 6.6c does for Nemotron.
+- Measurements on the GPU host: `transcribe` of 3 s has a p95 of 29.5 ms with fp16 and 44.2 ms with fp32. Over the 50 phrases of AC-6.7-3, fp16 gives the same text as fp32.
 - Parakeet writes numbers as digits and symbols ("10 minutes", "30%", "7.30", "3 p.m."). Nemotron writes the same speech as words ("ten minutes", "thirty percent", "seven thirty", "three pm"). `normalize` keeps digits. Thus the two passes give different text for the same speech, and digits would reach System One.
 - `transcribe` returns the second-pass text with its numbers as words, in three steps:
   1. A time with a dot becomes a time with a colon: "H.MM" becomes "H:MM", for an hour from 0 to 23 and two minute digits from 00 to 59.

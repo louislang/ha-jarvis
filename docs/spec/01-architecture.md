@@ -156,7 +156,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 25. **Logging is not on the critical path.** Jarvis writes the interaction after it returns `Handled`. Later announces and questions update the same record.
 26. **Feedback rules.** A bad action blocks that decision (intent and targets) for that normalized text at once. `decide` then uses the next entity candidate, then the next intent with enough probability. Else it sends the request to System Two with the bad action as a correction. A bad response leaves its pool. The next training run learns from all marks and corrections.
 27. **One ONNX Runtime, GPU or CPU.** `sherpa-onnx` (feature `shared`) and `ort` (feature `load-dynamic`) load the same ONNX Runtime 1.28.2 shared library from sherpa-onnx 2.0.1. On the GPU host, it is the CUDA 12 and cuDNN 9 build from the sherpa-onnx `linux-x64-gpu` release. On other machines, it is the CPU build. Thus the two crates cannot conflict, and `device` selects the CUDA or the CPU execution provider for all models.
-28. **Two-pass STT.** The first pass streams, so Jarvis knows the words while the user speaks. It uses NVIDIA Nemotron Speech Streaming EN 0.6B with 160 ms chunks on the GPU host. A 160 ms chunk is shorter than `early_commit_ms`, so the last words arrive inside the silence wait. At commit, the second pass decodes the whole utterance with NVIDIA Parakeet Unified EN 0.6B in offline mode. The second pass has full context, so it is more accurate. On the Open ASR Leaderboard sets, the average word error rate goes from 7.67% to 5.91%, and on LibriSpeech test-clean from 2.56% to 1.63%. HA receives the second-pass text. Both models are official sherpa-onnx exports. Cloud streaming APIs take about 250 ms to 300 ms to give the final text, so they cannot meet G1. CPU machines use the same first pass and have no second pass.
+28. **Two-pass STT.** The first pass streams, so Jarvis knows the words while the user speaks. It uses NVIDIA Nemotron Speech Streaming EN 0.6B with 160 ms chunks on the GPU host. A 160 ms chunk is shorter than `early_commit_ms`, so the last words arrive inside the silence wait. At commit, the second pass decodes the whole utterance with NVIDIA Parakeet Unified EN 0.6B in offline mode. The second pass has full context, so it is more accurate. On the Open ASR Leaderboard sets, the average word error rate goes from 7.67% to 5.91%, and on LibriSpeech test-clean from 2.56% to 1.63%. HA receives the second-pass text. Both models are official sherpa-onnx exports. The GPU host runs fp16 conversions of them (sub-phase 6.6c). Cloud streaming APIs take about 250 ms to 300 ms to give the final text, so they cannot meet G1. CPU machines use the same first pass and have no second pass.
 29. **Blocking work off the async workers.** STT decoding, the second pass, `predict`, TTS synthesis, voice embedding and SQLite calls run in `tokio::task::spawn_blocking`. The async workers only move bytes and wait. Thus a decode for one satellite does not delay `handle` for another.
 
 ## 6. Latency Budget (System One)
@@ -264,6 +264,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `xtask/src/merge.rs` | Tools | The merge rules, the merge command and the pre-push guard. | 0.15 |
 | `benches/domain.rs` | Test | Gungraun benchmarks with absolute instruction budgets. | 2.8c |
 | `jarvis.toml` | — | Runtime configuration. | 1.1 |
+| `sherpa-cuda.config` | — | The CUDA provider options of the STT sessions: `arena_extend_strategy=kSameAsRequested`. | 6.6c |
 | `intents.toml` | — | Intent catalog with seed examples. | 3.2 |
 | `responses.toml` | — | The source response pools. You edit it. Jarvis reads it and does not write it. | 4.1 |
 | `train/pyproject.toml` | Training | Pinned Python packages and the configuration of `ruff`, `mypy`, `pytest`, `coverage`, `vulture` and `interrogate`. | 3.5 |
@@ -326,7 +327,7 @@ Unit tests are in a `#[cfg(test)] mod tests` block at the end of each source fil
 
 ## 9. Configuration Files
 
-`jarvis.toml` is the configuration of the GPU host. Another machine copies it to `jarvis.local.toml`, sets `device = "cpu"`, removes `second_pass_dir`, and runs `jarvis serve jarvis.local.toml`. Git ignores `jarvis.local.toml`.
+`jarvis.toml` is the configuration of the GPU host. Another machine copies it to `jarvis.local.toml`, sets `device = "cpu"`, names the int8 files, removes `second_pass_dir`, and runs `jarvis serve jarvis.local.toml`. Git ignores `jarvis.local.toml`.
 
 `jarvis.toml`:
 
@@ -353,6 +354,10 @@ habits = 5
 
 [asr]
 model_dir = "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25"
+# The fp16 files of both passes. CPU machines name `encoder.int8.onnx`, `decoder.int8.onnx` and `joiner.int8.onnx`.
+encoder = "encoder.fp16.onnx"
+decoder = "decoder.fp16.onnx"
+joiner = "joiner.fp16.onnx"
 # Optional. Without it, the final transcript is the first-pass text (CPU machines).
 second_pass_dir = "models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"
 vad_model = "models/silero_vad.onnx"
@@ -679,7 +684,7 @@ Training set file (the contract between Jarvis and `train/train.py`):
 
 | Machine | OS | Device | STT model | Use |
 |---|---|---|---|---|
-| GPU host (self-hosted runner `gpu`) | Linux x86-64, RTX 2060 6 GB | `cuda` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, int8. Second pass: Parakeet Unified EN 0.6B offline, int8. | Runs Jarvis. Runs local training. |
+| GPU host (self-hosted runner `gpu`) | Linux x86-64, RTX 2060 6 GB | `cuda` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, fp16. Second pass: Parakeet Unified EN 0.6B offline, fp16. | Runs Jarvis. Runs local training. |
 | Test machine | macOS x86-64 (Intel MacBook Pro) | `cpu` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, int8. No second pass. | Development. Runs the pre-commit hook (without `bench` and `gpu-test`). |
 | CI | `ubuntu-latest` | `cpu` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, int8. No second pass. | `just check`. |
 | RunPod | RunPod serverless | GPU | — | Training fallback. |
@@ -690,18 +695,34 @@ VRAM budget on the GPU host (6 GB):
 
 | Use | Budget |
 |---|---|
-| STT first pass (Nemotron 0.6B) | 1.5 GB |
-| STT second pass (Parakeet Unified 0.6B) | 1.5 GB |
+| STT first pass (Nemotron 0.6B, fp16) | 1.25 GB |
+| STT second pass (Parakeet Unified 0.6B, fp16) | 1.25 GB |
 | System One model | 0.3 GB |
 | TTS (Supertonic-3) and voice identification (CAM++) | 0.4 GB |
 | ONNX Runtime arenas and CUDA context | 0.8 GB |
 | Local training run (MiniLM, fp16, `batch_size = 8`) | 1.0 GB |
+| Margin | 0.5 GB |
 | Reserve (not usable on a 6 GB card) | 0.5 GB |
 | **Total** | **6.0 GB** |
 
-The model budgets assume fp16 weights. The int8 models use less. The usable budget is 5.5 GB, below the 5.8 GB limit of AC-13.10-5. GPU host tests measure the real peak and check that each model runs on the CUDA execution provider (AC-3.12b-3, AC-6.1-3, AC-6.2-5, AC-6.6c-4, AC-6.7-5, AC-15.3-7). The process trainer limits the PyTorch memory of a local run to `train.max_vram_gb` (`torch.cuda.set_per_process_memory_fraction`), so a run cannot take the memory of the live models. If a local run fails with "CUDA out of memory", the run moves to RunPod (decision 12). Live STT never stops for training.
+The model budgets assume fp16 weights. The GPU host does not run the int8 STT models, because ONNX Runtime runs their int8 operators on the CPU (sub-phase 6.6c). Each fp16 STT session takes about 1.2 GB with the CUDA option `arena_extend_strategy=kSameAsRequested`, and about 2.1 GB with the default arena. With this option on both STT sessions, the measured peak of both STT passes, the System One model and TTS is 3.57 GB (5.23 GB with the default arena). The usable budget is 5.5 GB, below the 5.8 GB limit of AC-13.10-5. GPU host tests measure the real peak and check that each model runs on the CUDA execution provider (AC-3.12b-3, AC-6.1-3, AC-6.2-5, AC-6.6c-4, AC-6.7-5, AC-15.3-7). The process trainer limits the PyTorch memory of a local run to `train.max_vram_gb` (`torch.cuda.set_per_process_memory_fraction`), so a run cannot take the memory of the live models. If a local run fails with "CUDA out of memory", the run moves to RunPod (decision 12). Live STT never stops for training.
 
-The GPU host needs the NVIDIA driver, CUDA 12, cuDNN 9, and a Python 3.12 virtual environment in `.venv` with `pip install ./train`.
+The GPU host needs the NVIDIA driver, CUDA 12, cuDNN 9, and a Python 3.12 virtual environment in `.venv`. The host has only Python 3.14, so `uv` installs Python 3.12:
+
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv python install 3.12
+uv venv --python 3.12 .venv
+uv pip install ./train
+```
+
+The fp16 STT files (sub-phase 6.6c) are not in a download. Copy them by hand, once, from the MacBook to the GPU host, with their license notice `NOTICE.md`. The NVIDIA Open Model License requires the notice on redistribution. The folder is outside the runner checkout, so a clean checkout does not remove it. Make the folder first, readable by the runner user and the `jarvis` unit.
+
+```sh
+scp <folder>/*.fp16.* <folder>/NOTICE.md <GPU host>:/opt/jarvis-models/fp16/
+```
+
+The checkout of the `jarvis` unit runs `just models` and `just gpu-models` too. Thus its model folders in `models/` get the same files as the runner.
 
 ## 11. Reference House
 
