@@ -298,16 +298,24 @@ fn resample(audio: &Audio, rate: usize) -> anyhow::Result<Vec<i16>> {
     Ok(samples.collect())
 }
 
-/// A `SpeechToText` whose streams give the scripted partials, with their voice ends, in order,
-/// one after each `accept`.
-pub struct FakeStt(pub Vec<Partial>);
+/// A `SpeechToText` with scripted first-pass partials and a scripted second-pass text.
+pub struct FakeStt {
+    /// The partials of each stream, with their voice ends, in order, one after each `accept`.
+    pub partials: Vec<Partial>,
+    /// The text of each `transcribe`.
+    pub second_pass: Option<String>,
+}
 
 impl SpeechToText for FakeStt {
     fn stream(&self) -> anyhow::Result<Box<dyn SttStream>> {
         Ok(Box::new(FakeSttStream {
-            partials: self.0.clone().into(),
+            partials: self.partials.clone().into(),
             current: Partial::default(),
         }))
+    }
+
+    fn transcribe(&self, _samples: &[i16]) -> anyhow::Result<Option<String>> {
+        Ok(self.second_pass.clone())
     }
 }
 

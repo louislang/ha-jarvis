@@ -290,6 +290,8 @@ pub struct AsrConfig {
     pub decoder: String,
     /// The file name of the joiner in the model folder.
     pub joiner: String,
+    /// The folder of the offline transducer of the second pass, or `None` for no second pass.
+    pub second_pass_dir: Option<PathBuf>,
     /// The Silero VAD model file.
     pub vad_model: PathBuf,
     /// The least VAD speech probability of a voiced frame.
@@ -800,6 +802,27 @@ mod tests {
         let _ = super::main();
     }
 
+    /// The `[asr]` section of `jarvis.toml`.
+    fn expected_asr() -> AsrConfig {
+        AsrConfig {
+            model_dir: PathBuf::from(
+                "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25",
+            ),
+            encoder: "encoder.fp16.onnx".to_owned(),
+            decoder: "decoder.fp16.onnx".to_owned(),
+            joiner: "joiner.fp16.onnx".to_owned(),
+            second_pass_dir: Some(PathBuf::from(
+                "models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming",
+            )),
+            vad_model: PathBuf::from("models/silero_vad.onnx"),
+            vad_threshold: 0.5,
+            vad_min_silence_ms: 100,
+            early_commit_ms: 200,
+            endpoint_ms: 600,
+            max_utterance_ms: 8000,
+        }
+    }
+
     /// AC-1.1-1.
     #[test]
     fn ac_1_1_1_parse_returns_each_value() -> anyhow::Result<()> {
@@ -821,20 +844,7 @@ mod tests {
                 threshold: 0.6,
                 commit_threshold: 0.9,
             },
-            asr: AsrConfig {
-                model_dir: PathBuf::from(
-                    "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25",
-                ),
-                encoder: "encoder.fp16.onnx".to_owned(),
-                decoder: "decoder.fp16.onnx".to_owned(),
-                joiner: "joiner.fp16.onnx".to_owned(),
-                vad_model: PathBuf::from("models/silero_vad.onnx"),
-                vad_threshold: 0.5,
-                vad_min_silence_ms: 100,
-                early_commit_ms: 200,
-                endpoint_ms: 600,
-                max_utterance_ms: 8000,
-            },
+            asr: expected_asr(),
             tts: TtsConfig {
                 model_dir: PathBuf::from("models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11"),
                 voice: 6,
@@ -1520,6 +1530,33 @@ mod tests {
         assert!(
             start < end,
             "GPU memory in MiB: {start} before and {end} after the first pass"
+        );
+        Ok(())
+    }
+
+    /// AC-6.7-5. sherpa-onnx falls back to the CPU with only a log line, so the GPU memory of
+    /// this process shows that the second pass loads on CUDA. The first load also creates the
+    /// CUDA context, so the second load of the first pass alone is the reference.
+    #[test]
+    #[ignore = "GPU host"]
+    fn ac_6_7_5_cuda_runs_the_second_pass() -> anyhow::Result<()> {
+        if !alone("tests::ac_6_7_5_cuda_runs_the_second_pass")? {
+            return Ok(());
+        }
+        let both = Config::parse(VALID)?.asr;
+        let first = AsrConfig {
+            second_pass_dir: None,
+            ..both.clone()
+        };
+        let mut memory = vec![gpu_memory()?];
+        let mut loaded = Vec::new();
+        for asr in [&first, &first, &both] {
+            loaded.push(SherpaStt::try_new(asr, Device::Cuda)?);
+            memory.push(gpu_memory()?);
+        }
+        assert!(
+            memory[3] - memory[2] > memory[2] - memory[1],
+            "GPU memory in MiB at the start and after each load: {memory:?}"
         );
         Ok(())
     }

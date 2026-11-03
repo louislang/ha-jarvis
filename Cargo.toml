@@ -21,6 +21,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sherpa-onnx = { version = "=2.0.1", default-features = false, features = ["shared"] }
 tempfile = "3.27.0"
+text-processing-rs = "0.2.2"
 tokio = { version = "1.54.1", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
@@ -41,6 +42,7 @@ workspace = true
 gungraun = "=0.20.0"
 quint-connect = "0.1.2"
 rubato = "5.0.1"
+strsim = "0.11.1"
 tokio = { version = "1.54.1", features = ["macros", "rt", "test-util", "io-util"] }
 
 [[bench]]
