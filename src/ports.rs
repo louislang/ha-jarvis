@@ -93,6 +93,14 @@ pub trait Classifier: Send + Sync {
     async fn predict(&self, context: &str, text: &str) -> anyhow::Result<Prediction>;
 }
 
+/// System Two: the remote model for the requests that System One cannot classify.
+#[async_trait]
+pub trait Reasoner: Send + Sync {
+    /// Sends one small request when the last request is `openai.warm_idle_s` or more ago, so that
+    /// the next request does not open a new connection.
+    async fn warm(&self) -> anyhow::Result<()>;
+}
+
 /// Opens System One model folders.
 #[async_trait]
 pub trait ModelLoader: Send + Sync {
