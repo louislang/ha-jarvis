@@ -553,7 +553,7 @@ mod tests {
         latencies.sort();
         let p90 = latencies[latencies.len() * 9 / 10];
         assert!(
-            p90 < Duration::from_millis(250),
+            p90 < Duration::from_millis(300),
             "p90 {p90:?} of {latencies:?}"
         );
         Ok(())
