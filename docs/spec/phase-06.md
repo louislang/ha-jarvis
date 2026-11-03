@@ -274,22 +274,33 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 **Goal:** Add `transcribe`, the offline second pass with Parakeet Unified. At commit, Jarvis can decode the whole utterance again for a more accurate transcript.
 
 - **Implements:** G2, G18. **Depends on:** 6.6b.
-- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
+- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
 
-**Model.** `SpeechToText::transcribe(samples) -> Result<Option<String>>`. `SherpaStt` holds an optional `OfflineRecognizer` from `[asr].second_pass_dir`. Without it, `transcribe` returns `Ok(None)`. `FakeStt` returns a scripted second-pass text.
+**Model.**
+
+- `SpeechToText::transcribe(samples) -> Result<Option<String>>`. `SherpaStt` holds an optional `OfflineRecognizer` from `[asr].second_pass_dir`. Without it, `transcribe` returns `Ok(None)`. `FakeStt` returns a scripted second-pass text.
+- Parakeet writes numbers as digits and symbols ("10 minutes", "30%", "7.30", "3 p.m."). Nemotron writes the same speech as words ("ten minutes", "thirty percent", "seven thirty", "three pm"). `normalize` keeps digits. Thus the two passes give different text for the same speech, and digits would reach System One.
+- `transcribe` returns the second-pass text with its numbers as words, in three steps:
+  1. A time with a dot becomes a time with a colon: "H.MM" becomes "H:MM", for an hour from 0 to 23 and two minute digits from 00 to 59.
+  2. `text_processing_rs::tn_normalize_sentence` writes the numbers as words. It is the Rust port of the NVIDIA NeMo text normalization. Examples: "10" becomes "ten", "30%" becomes "thirty percent", "7:30" becomes "seven thirty", "7:05" becomes "seven oh five", "72.5" becomes "seventy two point five", "1st" becomes "first".
+  3. "a.m." and "p.m." become "am" and "pm". The crate writes the period of a colon time as "a m" or "p m", so these become "am" and "pm" too.
+- A time without a separator ("645") and a year ("2026" becomes "two thousand twenty six") stay different from the Nemotron text. A decimal with two digits after the dot ("2.50") reads as a time.
+- `normalize` and its Verus clauses do not change.
+- The word error rate is the word edit distance (`strsim::generic_levenshtein` on the words) between the normalized text and the normalized phrase, divided by the number of words in the phrase.
 
 **Acceptance criteria.**
 
 - AC-6.7-1: When no second pass is configured, `transcribe` returns `None`.
 - AC-6.7-2 [GPU host]: `transcribe` of `speech("add dentist to my calendar for monday")` gives the normalized text "add dentist to my calendar for monday".
-- AC-6.7-3 [GPU host]: Over 50 different `speech` phrases, the second-pass word error rate is equal to or less than the first-pass word error rate.
+- AC-6.7-3 [GPU host]: Over 50 different `speech` phrases, 10 of them with numbers, percents or times, the word error rate of the `transcribe` text is equal to or less than the word error rate of the first-pass text.
 - AC-6.7-4 [GPU host]: `transcribe` of a 3 s utterance has a p95 of less than 40 ms.
 - AC-6.7-5 [GPU host]: With `device = cuda`, the second pass runs on the CUDA execution provider.
+- AC-6.7-6: When the second-pass text is "Set the lights to 30% at 7.30 p.m. and the heat to 72.5 at 3 p.m.", the normalized converted text is "set the lights to thirty percent at seven thirty pm and the heat to seventy two point five at three pm".
 
 **Proofs.**
 
 - P-6.7-1. Argument: `transcribe` matches on the optional recognizer and returns `None` for `None`.
-- P-6.7-2 to P-6.7-5. Evidence: test.
+- P-6.7-2 to P-6.7-6. Evidence: test.
 
 ---
 

@@ -181,7 +181,7 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `minijinja` | Domain | Response and service data templates. |
 | `rand` | Domain | Response selection and context samples. |
 | `jiff` | Domain | Time zones, buckets and calendar dates. |
-| `strsim` | Domain | Fuzzy match of a spoken answer to a list of choices. |
+| `strsim` | Domain, adapter tests | Fuzzy match of a spoken answer to a list of choices. Word edit distance for the second-pass word error rate (AC-6.7-3). |
 | `dashmap` | Application | Concurrent audio cache. |
 | `ndarray`, `linfa`, `linfa-clustering` | Domain | DBSCAN clusters of `unknown` embeddings. |
 | `xxhash-rust` | Domain | Stable hash for the held-out split. |
@@ -196,6 +196,7 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `async-trait` | Ports, application, adapters, root | Async methods on port traits behind `Arc<dyn Port>`. |
 | `tokio-tungstenite`, `futures-util` | Adapter | HA WebSocket API. |
 | `sherpa-onnx` (`=2.0.1`, feature `shared`) | Adapter | Streaming STT (`OnlineRecognizer`), TTS (`OfflineTts`, Supertonic-3 model), voice identification (`SpeakerEmbeddingExtractor`, `SpeakerEmbeddingManager`). CUDA or CPU provider. |
+| `text-processing-rs` | Adapter | Numbers as words in the second-pass text (`tn_normalize_sentence`). |
 | `ort` (features `load-dynamic`, `cuda`), `tokenizers` | Adapter | System One model prediction with ONNX Runtime (CUDA or CPU execution provider). Tokenizer from `tokenizer.json`. |
 | `reqwest` | Adapter | RunPod serverless REST API. |
 | `object_store` (feature `aws`) | Adapter | RunPod network volume through its S3-compatible API. |
