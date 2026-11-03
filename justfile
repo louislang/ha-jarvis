@@ -241,9 +241,15 @@ install-python:
     python{{ python_version }} -m venv .venv
     {{ venv }}/pip install './train[dev]'
 
-# Diagnostic: install the fp16 converter and its pinned dependencies in a virtual environment in the job's temporary folder.
+# Diagnostic: install the fp16 converter and its pinned dependencies in a virtual environment in the job's temporary folder. The host Python has no `ensurepip`, so the pinned pip wheel runs the install.
 install-onnxconverter-common:
+    #!/usr/bin/env bash
+    set -euo pipefail
     python3 --version
-    python3 -m venv "${RUNNER_TEMP:-target}/fp16-venv"
-    "${RUNNER_TEMP:-target}/fp16-venv/bin/pip" install --no-deps onnxconverter-common=={{ onnxconverter_common_version }} onnx==1.23.2 numpy==2.2.6 protobuf==7.36.2 ml_dtypes==0.5.4 packaging==26.3 typing_extensions==4.16.0
-    "${RUNNER_TEMP:-target}/fp16-venv/bin/pip" check
+    folder="${RUNNER_TEMP:-target}"
+    python3 -m venv --without-pip "$folder/fp16-venv"
+    wheel="$folder/pip-26.3-py3-none-any.whl"
+    curl -sSfL -o "$wheel" https://files.pythonhosted.org/packages/07/25/ee8c38ae72d66b844ce8eb9711ba905dba21ca1a8a0c960057c41cd23337/pip-26.3-py3-none-any.whl
+    echo "f3b60b20ffaadd4415ed7957212a38ac63fa4c5fa375bd0f4a797777940fad13  $wheel" | shasum -a 256 --check
+    "$folder/fp16-venv/bin/python" "$wheel/pip" install --no-deps onnxconverter-common=={{ onnxconverter_common_version }} onnx==1.23.2 numpy==2.5.4 protobuf==7.36.2 ml_dtypes==0.6.0 packaging==26.3 typing_extensions==4.16.0
+    "$folder/fp16-venv/bin/python" "$wheel/pip" check
