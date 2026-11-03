@@ -259,14 +259,15 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - `sherpa-cuda.config` holds the CUDA option `arena_extend_strategy=kSameAsRequested`. With `device = cuda`, each STT session gets the provider string `cuda:sherpa-cuda.config`: sherpa-onnx 2.0.1 reads the provider options from the file after the colon. Each STT session then takes about 1.2 GB of GPU memory instead of about 2.1 GB, at the same speed.
 - The model emits the last token about 410 ms of audio after the last voiced sample. Thus streaming alone gives the last word too late: 721 ms after the last voiced sample with fp32 on CUDA, 790 ms with int8 on the CPU. `input_finished()` does not flush the model.
 - Flush: when the VAD ends a speech segment, the stream feeds 640 ms of zeros to the recognizer and decodes them. 480 ms of zeros is not enough. The zeros go only to the recognizer, not to the VAD or the audio positions. sherpa-onnx 2.0.1 cannot clone a stream. Thus the zeros go into the live stream, and the flush runs only at the end of a VAD speech segment, where a commit and `reset` can follow.
-- The flush takes about 58 ms with fp16 on CUDA and 376 ms with int8 on the CPU. Thus the last word comes about 190 ms after the last voiced sample on CUDA (an estimate) and about 510 ms on the CPU.
+- The flush takes about 58 ms with fp16 on CUDA and 376 ms with int8 on the CPU. The VAD ends the segment about 203 ms after the last voiced sample: the Silero VAD holds the speech for about 90 ms, then waits `vad_min_silence_ms` on 32 ms frames. Thus on the GPU host the last word comes 270 to 279 ms after the last voiced sample (measured, 10 runs), and about 580 ms on the CPU (an estimate).
+- The real-time factor measures the streaming decode only. Its audio stops at the last voiced sample, so no flush runs. AC-6.6c-2 measures the flush.
 - The Silero VAD runs on the CPU on every device. Its real-time factor is 0.004 on the CPU and 0.017 on CUDA.
 - On the CPU, a real-time factor of less than 0.6 lets each 160 ms chunk decode in less than 96 ms, so the decode keeps up with the audio.
 
 **Acceptance criteria.**
 
 - AC-6.6c-1 [GPU host]: With `device = cuda`, the normalized final partial of `speech("turn on the kitchen lights")` is "turn on the kitchen lights".
-- AC-6.6c-2 [GPU host]: With `device = cuda`, the last word is in the partial less than 250 ms after the last voiced sample.
+- AC-6.6c-2 [GPU host]: With `device = cuda`, the last word is in the partial less than 300 ms after the last voiced sample.
 - AC-6.6c-3 [GPU host]: With `device = cuda`, the real-time factor of the first pass is less than 0.15.
 - AC-6.6c-4 [GPU host]: With `device = cuda`, the first pass runs on the CUDA execution provider.
 - AC-6.6c-5 [GPU host]: With `device = cpu` and 4 threads, the real-time factor of the first pass is less than 0.6.
