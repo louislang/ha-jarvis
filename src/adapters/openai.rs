@@ -1,18 +1,31 @@
 //! `Reasoner` with the `OpenAI` Responses API.
 
+use std::mem;
 use std::sync::Mutex;
 use std::time::Duration;
 
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
 use async_openai::types::responses::CreateResponseArgs;
+use async_openai::types::responses::ResponseFailedEvent;
+use async_openai::types::responses::ResponseIncompleteEvent;
+use async_openai::types::responses::ResponseRefusalDeltaEvent;
+use async_openai::types::responses::ResponseStreamEvent;
+use async_openai::types::responses::ResponseTextDeltaEvent;
 use async_openai::types::responses::Status;
 use async_trait::async_trait;
+use futures::StreamExt;
+use futures::TryStreamExt;
+use futures::future;
+use futures::stream;
+use futures::stream::BoxStream;
 use tokio::time::Instant;
 
 use crate::OpenAiConfig;
 use crate::domain::decide::Question;
+use crate::domain::speech;
 use crate::ports::Reasoner;
+use crate::ports::Step;
 
 /// The TCP keepalive interval of the pooled connections.
 const KEEPALIVE: Duration = Duration::from_secs(30);
@@ -48,6 +61,36 @@ pub fn user_message(question: &Question) -> String {
         entities.concat(),
         question.text
     )
+}
+
+/// The steps of the answer stream `event`. A refusal is spoken as the answer. `buffer` keeps the
+/// text after the last complete sentence.
+///
+/// # Errors
+///
+/// The response failed or is incomplete, or the stream gives an error.
+fn steps(buffer: &mut String, event: ResponseStreamEvent) -> anyhow::Result<Vec<Step>> {
+    match event {
+        ResponseStreamEvent::ResponseOutputTextDelta(ResponseTextDeltaEvent { delta, .. })
+        | ResponseStreamEvent::ResponseRefusalDelta(ResponseRefusalDeltaEvent { delta, .. }) => {
+            let (complete, rest) = speech::sentences(buffer, &delta);
+            *buffer = rest;
+            Ok(complete.into_iter().map(Step::Sentence).collect())
+        }
+        ResponseStreamEvent::ResponseCompleted(_) => {
+            let rest = mem::take(buffer);
+            let last = (!rest.is_empty()).then_some(Step::Sentence(rest));
+            Ok(last.into_iter().chain([Step::Done]).collect())
+        }
+        ResponseStreamEvent::ResponseFailed(ResponseFailedEvent { response, .. })
+        | ResponseStreamEvent::ResponseIncomplete(ResponseIncompleteEvent { response, .. }) => {
+            anyhow::bail!("the response is {:?}", response.status)
+        }
+        ResponseStreamEvent::ResponseError(error) => {
+            anyhow::bail!("the response stream failed: {}", error.message)
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// A `Reasoner` on one HTTP client for the process life. Its pooled connections have no idle
@@ -94,19 +137,19 @@ impl OpenAiReasoner {
         })
     }
 
-    /// Records a request now when the last request is `warm_idle` or more ago, or when there is
-    /// no last request. True when it records.
+    /// Records a request now when the last request is `idle` or more ago, or when there is no
+    /// last request. True when it records.
     ///
     /// # Errors
     ///
     /// An earlier record panicked.
-    fn record_when_idle(&self) -> anyhow::Result<bool> {
+    fn record_when_idle(&self, idle: Duration) -> anyhow::Result<bool> {
         let mut last_request = self
             .last_request
             .lock()
             .map_err(|_poisoned| anyhow::anyhow!("an earlier record panicked"))?;
         let now = Instant::now();
-        if last_request.is_some_and(|last| now.duration_since(last) < self.warm_idle) {
+        if last_request.is_some_and(|last| now.duration_since(last) < idle) {
             return Ok(false);
         }
         *last_request = Some(now);
@@ -117,7 +160,7 @@ impl OpenAiReasoner {
 #[async_trait]
 impl Reasoner for OpenAiReasoner {
     async fn warm(&self) -> anyhow::Result<()> {
-        if !self.record_when_idle()? {
+        if !self.record_when_idle(self.warm_idle)? {
             return Ok(());
         }
         let request = CreateResponseArgs::default()
@@ -134,6 +177,32 @@ impl Reasoner for OpenAiReasoner {
         );
         Ok(())
     }
+
+    fn answer(&self, question: &Question) -> BoxStream<'static, anyhow::Result<Step>> {
+        let request = CreateResponseArgs::default()
+            .model(&self.model)
+            .instructions(system_prompt())
+            .input(user_message(question))
+            .max_output_tokens(self.max_output_tokens)
+            .store(false)
+            .build();
+        let recorded = self.record_when_idle(Duration::ZERO);
+        let client = self.client.clone();
+        let events = async move {
+            recorded?;
+            anyhow::Ok(client.responses().create_stream(request?).await?)
+        };
+        let events = stream::once(events)
+            .map_ok(|events| events.map_err(anyhow::Error::from))
+            .try_flatten();
+        let steps = events.scan(String::new(), |buffer, event| {
+            future::ready(Some(event.and_then(|event| steps(buffer, event))))
+        });
+        steps
+            .map_ok(|steps| stream::iter(steps.into_iter().map(Ok)))
+            .try_flatten()
+            .boxed()
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +210,7 @@ mod tests {
     use super::*;
 
     use anyhow::Context as _;
+    use serde_json::Value;
     use serde_json::json;
     use wiremock::Mock;
     use wiremock::MockServer;
@@ -153,21 +223,31 @@ mod tests {
     use crate::domain::state_cache::StateCache;
     use crate::testing::fakes::house;
 
-    /// A mock `OpenAI` server that answers each response request with `status`, and a reasoner of
-    /// `jarvis.toml` on it.
-    async fn mock(status: &str) -> anyhow::Result<(MockServer, OpenAiReasoner)> {
-        let server = MockServer::start().await;
-        let body = json!({
+    /// A response object with `status`.
+    fn response(status: &str) -> Value {
+        json!({
             "id": "resp_1",
             "object": "response",
             "created_at": 0,
             "model": "gpt-4.1-nano",
             "output": [],
             "status": status,
-        });
+        })
+    }
+
+    /// A mock `OpenAI` server that answers each response request with `status`, and a reasoner of
+    /// `jarvis.toml` on it.
+    async fn mock(status: &str) -> anyhow::Result<(MockServer, OpenAiReasoner)> {
+        serve(ResponseTemplate::new(200).set_body_json(response(status))).await
+    }
+
+    /// A mock `OpenAI` server that answers each response request with `template`, and a reasoner
+    /// of `jarvis.toml` on it.
+    async fn serve(template: ResponseTemplate) -> anyhow::Result<(MockServer, OpenAiReasoner)> {
+        let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/responses"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .respond_with(template)
             .mount(&server)
             .await;
         let config = Config::parse(include_str!("../../jarvis.toml"))?.openai;
@@ -226,16 +306,100 @@ mod tests {
         Ok(())
     }
 
-    /// The user message of the question "what is on" from `area` of the reference house on
-    /// Monday 2026-10-26 08:00, the local time in `America/Chicago`.
-    fn asked(area: Option<&str>) -> String {
+    /// The question "what is on" from `area` of the reference house on Monday 2026-10-26 08:00,
+    /// the local time in `America/Chicago`.
+    fn question(area: Option<&str>) -> Question {
         let house = house();
         let location = house.config.location_name.clone();
         let cache = StateCache::load(house);
         let area = area.map(|area| AreaId(area.to_owned()));
         let now = jiff::civil::date(2026, 10, 26).at(8, 0, 0, 0);
-        let question = decide::question("what is on", area.as_ref(), &location, now, &cache);
-        user_message(&question)
+        decide::question("what is on", area.as_ref(), &location, now, &cache)
+    }
+
+    /// The user message of `question(area)`.
+    fn asked(area: Option<&str>) -> String {
+        user_message(&question(area))
+    }
+
+    /// The steps of an answer that a mock `OpenAI` server streams as `deltas` of the event `kind`.
+    async fn answered(kind: &str, deltas: &[&str]) -> anyhow::Result<Vec<Step>> {
+        let texts = deltas.iter().map(|delta| {
+            json!({
+                "type": kind,
+                "sequence_number": 0,
+                "item_id": "msg_1",
+                "output_index": 0,
+                "content_index": 0,
+                "delta": delta,
+            })
+        });
+        let completed = json!({
+            "type": "response.completed",
+            "sequence_number": 0,
+            "response": response("completed"),
+        });
+        let events: Vec<String> = texts
+            .chain([completed])
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        let template =
+            ResponseTemplate::new(200).set_body_raw(events.concat(), "text/event-stream");
+        let (_server, reasoner) = serve(template).await?;
+        reasoner
+            .answer(&question(Some("kitchen")))
+            .try_collect()
+            .await
+    }
+
+    /// An answer within `warm_idle_s` of the next `warm` counts as the last request.
+    #[tokio::test(start_paused = true)]
+    async fn answer_records_the_last_request() -> anyhow::Result<()> {
+        let (server, reasoner) = mock("completed").await?;
+        reasoner.warm().await?;
+        tokio::time::advance(Duration::from_secs(59)).await;
+        let _steps: Vec<anyhow::Result<Step>> = reasoner.answer(&question(None)).collect().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        reasoner.warm().await?;
+        assert_eq!(requests(&server).await?, 2);
+        Ok(())
+    }
+
+    /// The event type of a text delta.
+    const TEXT: &str = "response.output_text.delta";
+
+    /// A refusal is the answer text.
+    #[tokio::test(start_paused = true)]
+    async fn refusal_is_spoken() -> anyhow::Result<()> {
+        let steps = answered("response.refusal.delta", &["I can't help."]).await?;
+        assert_eq!(
+            steps,
+            [Step::Sentence("I can't help.".to_owned()), Step::Done]
+        );
+        Ok(())
+    }
+
+    /// AC-7.3-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_3_2_rest_is_the_last_sentence_at_the_end() -> anyhow::Result<()> {
+        let steps = answered(TEXT, &["Hello there. It", " is"]).await?;
+        assert_eq!(steps[1..], [Step::Sentence("It is".to_owned()), Step::Done]);
+        Ok(())
+    }
+
+    /// AC-7.3-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_3_4_two_sentences_give_sentence_sentence_done() -> anyhow::Result<()> {
+        let steps = answered(TEXT, &["Hello there.", " How are", " you?"]).await?;
+        assert_eq!(
+            steps,
+            [
+                Step::Sentence("Hello there.".to_owned()),
+                Step::Sentence("How are you?".to_owned()),
+                Step::Done,
+            ]
+        );
+        Ok(())
     }
 
     /// The entity lines of `message`.

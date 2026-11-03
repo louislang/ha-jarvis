@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::Device;
+use crate::domain::decide::Question;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
@@ -99,6 +100,18 @@ pub trait Reasoner: Send + Sync {
     /// Sends one small request when the last request is `openai.warm_idle_s` or more ago, so that
     /// the next request does not open a new connection.
     async fn warm(&self) -> anyhow::Result<()>;
+
+    /// The steps of the answer to `question`, each step as soon as it is complete.
+    fn answer(&self, question: &Question) -> BoxStream<'static, anyhow::Result<Step>>;
+}
+
+/// One step of a System Two answer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Step {
+    /// A complete sentence to speak.
+    Sentence(String),
+    /// The answer is complete.
+    Done,
 }
 
 /// Opens System One model folders.

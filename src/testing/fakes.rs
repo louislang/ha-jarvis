@@ -34,6 +34,7 @@ use tokio::net::TcpStream;
 use crate::Config;
 use crate::Device;
 use crate::adapters::sherpa::SherpaTts;
+use crate::domain::decide::Question;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
@@ -51,6 +52,7 @@ use crate::ports::ModelLoader;
 use crate::ports::Partial;
 use crate::ports::Reasoner;
 use crate::ports::SpeechToText;
+use crate::ports::Step;
 use crate::ports::Store;
 use crate::ports::SttStream;
 use crate::ports::TextToSpeech;
@@ -243,7 +245,7 @@ impl ModelLoader for FakeModelLoader {
     }
 }
 
-/// A `Reasoner` that counts the `warm` calls.
+/// A `Reasoner` that counts the `warm` calls and answers with `Done`.
 #[derive(Default)]
 pub(crate) struct FakeReasoner {
     /// The number of `warm` calls.
@@ -263,6 +265,10 @@ impl Reasoner for FakeReasoner {
     async fn warm(&self) -> anyhow::Result<()> {
         self.warms.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    fn answer(&self, _question: &Question) -> BoxStream<'static, anyhow::Result<Step>> {
+        futures::stream::iter([Ok(Step::Done)]).boxed()
     }
 }
 
