@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -26,10 +27,10 @@ use crate::ports::TextToSpeech;
 /// The number of samples in one millisecond of 16 kHz audio.
 const SAMPLES_PER_MS: u64 = 16;
 
-/// Starts listen sessions that predict on each changed first-pass partial and commit by the
-/// policy.
+/// Starts listen sessions that predict on each changed first-pass partial, commit by the policy
+/// and give the second-pass transcript.
 pub struct Listener {
-    /// The first pass of each session.
+    /// The two passes of each session.
     stt: Arc<dyn SpeechToText>,
     /// The speculative prediction of each changed partial.
     classifier: Arc<dyn Classifier>,
@@ -63,21 +64,24 @@ impl Listener {
     /// The first pass cannot start.
     pub fn listen(&self) -> anyhow::Result<Box<dyn Listening>> {
         Ok(Box::new(Session {
-            stream: self.stt.stream()?,
+            stream: Arc::new(Mutex::new(self.stt.stream()?)),
+            stt: Arc::clone(&self.stt),
             classifier: Arc::clone(&self.classifier),
             policy: self.policy.clone(),
             threshold: self.threshold,
             text: String::new(),
             confident: false,
-            samples: 0,
+            samples: Vec::new(),
         }))
     }
 }
 
 /// The state of one listen session.
 struct Session {
-    /// The first pass of the utterance.
-    stream: Box<dyn SttStream>,
+    /// The first pass of the utterance. A blocking thread decodes with it.
+    stream: Arc<Mutex<Box<dyn SttStream>>>,
+    /// The second pass of the utterance.
+    stt: Arc<dyn SpeechToText>,
     /// The speculative prediction of each changed partial.
     classifier: Arc<dyn Classifier>,
     /// The silence and length limits of the utterance.
@@ -88,8 +92,8 @@ struct Session {
     text: String,
     /// True when the prediction of `text` is a confident command.
     confident: bool,
-    /// The number of pushed samples.
-    samples: u64,
+    /// The pushed samples.
+    samples: Vec<i16>,
 }
 
 impl Session {
@@ -101,16 +105,46 @@ impl Session {
         }
     }
 
-    /// The transcript when `partial` ends the utterance by the policy, else `None`.
-    fn commit(&self, partial: &Partial) -> Option<String> {
+    /// True when `partial` ends the utterance by the policy.
+    fn commits(&self, partial: &Partial) -> bool {
         let silence_ms = partial
             .voice_end_ms
             .map(|voice_end_ms| partial.vad_ms.saturating_sub(voice_end_ms));
-        let audio_ms = self.samples / SAMPLES_PER_MS;
+        let audio_ms = self.samples.len() as u64 / SAMPLES_PER_MS;
         let has_text = !self.text.is_empty();
         speech::should_commit(silence_ms, has_text, audio_ms, self.confident, &self.policy)
-            .then(|| self.text.clone())
     }
+
+    /// The second-pass text of the pushed samples, else the first-pass text. A second-pass error
+    /// gives the first-pass text.
+    ///
+    /// # Errors
+    ///
+    /// The second pass panicked.
+    async fn transcript(&self) -> anyhow::Result<String> {
+        let (stt, samples) = (Arc::clone(&self.stt), self.samples.clone());
+        match tokio::task::spawn_blocking(move || stt.transcribe(&samples)).await? {
+            Ok(Some(text)) => Ok(text),
+            Ok(None) => Ok(self.text.clone()),
+            Err(error) => {
+                tracing::warn!("the second pass failed: {error:#}");
+                Ok(self.text.clone())
+            }
+        }
+    }
+}
+
+/// Decodes `samples` with `stream` and gives its partial.
+///
+/// # Errors
+///
+/// An earlier decode panicked.
+fn accept(stream: &Mutex<Box<dyn SttStream>>, samples: &[i16]) -> anyhow::Result<Partial> {
+    let mut stream = stream
+        .lock()
+        .map_err(|_poisoned| anyhow::anyhow!("an earlier decode panicked"))?;
+    stream.accept(samples);
+    Ok(stream.partial())
 }
 
 /// True when the top label of the `classifier` prediction of `text` in no context is not
@@ -132,15 +166,18 @@ async fn confident(classifier: &dyn Classifier, threshold: f32, text: &str) -> b
 #[async_trait]
 impl Listening for Session {
     async fn push(&mut self, samples: Vec<i16>) -> anyhow::Result<Option<String>> {
-        self.stream.accept(&samples);
-        self.samples += samples.len() as u64;
-        let partial = self.stream.partial();
+        self.samples.extend_from_slice(&samples);
+        let stream = Arc::clone(&self.stream);
+        let partial = tokio::task::spawn_blocking(move || accept(&stream, &samples)).await??;
         self.update(&partial.text).await;
-        Ok(self.commit(&partial))
+        if !self.commits(&partial) {
+            return Ok(None);
+        }
+        Ok(Some(self.transcript().await?))
     }
 
     async fn finish(self: Box<Self>) -> anyhow::Result<String> {
-        Ok(self.text)
+        self.transcript().await
     }
 }
 
@@ -244,20 +281,15 @@ mod tests {
         }
     }
 
-    /// A session over `partials`, with a classifier that gives `predictions`, and that
-    /// classifier.
+    /// A session on `stt`, with a classifier that gives `predictions`, and that classifier.
     fn session(
-        partials: Vec<Partial>,
+        stt: FakeStt,
         predictions: Vec<Prediction>,
     ) -> anyhow::Result<(Box<dyn Listening>, Arc<FakeClassifier>)> {
         let classifier = Arc::new(FakeClassifier::default());
         for prediction in predictions {
             classifier.script(prediction);
         }
-        let stt = FakeStt {
-            partials,
-            second_pass: None,
-        };
         let listener = Listener::new(
             Arc::new(stt),
             Arc::clone(&classifier) as Arc<dyn Classifier>,
@@ -274,7 +306,11 @@ mod tests {
         predictions: Vec<Prediction>,
     ) -> anyhow::Result<(Vec<Option<String>>, Arc<FakeClassifier>)> {
         let count = partials.len();
-        let (mut session, classifier) = session(partials, predictions)?;
+        let stt = FakeStt {
+            partials,
+            ..FakeStt::default()
+        };
+        let (mut session, classifier) = session(stt, predictions)?;
         let mut results = Vec::new();
         for _ in 0..count {
             results.push(session.push(vec![0; 320]).await?);
@@ -322,11 +358,46 @@ mod tests {
         Ok(())
     }
 
+    /// The commit of a confident `TEXT` after 200 ms of silence, with the second pass
+    /// `second_pass`.
+    async fn commit_with(
+        second_pass: Result<Option<String>, String>,
+    ) -> anyhow::Result<Option<String>> {
+        let stt = FakeStt {
+            partials: vec![partial(TEXT, Some(500), 500), partial(TEXT, Some(500), 700)],
+            second_pass,
+            ..FakeStt::default()
+        };
+        let (mut session, _) = session(stt, vec![prediction("lights_on", 0.95)])?;
+        session.push(vec![0; 320]).await?;
+        session.push(vec![0; 320]).await
+    }
+
+    /// AC-6.8b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_6_8b_1_commit_gives_the_second_pass_text() -> anyhow::Result<()> {
+        let second_pass = "turn on the kitchen lights".to_owned();
+        let transcript = commit_with(Ok(Some(second_pass.clone()))).await?;
+        assert_eq!(transcript, Some(second_pass));
+        Ok(())
+    }
+
+    /// AC-6.8b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_6_8b_2_second_pass_error_gives_the_first_pass_text() -> anyhow::Result<()> {
+        let transcript = commit_with(Err("no result".to_owned())).await?;
+        assert_eq!(transcript, Some(TEXT.to_owned()));
+        Ok(())
+    }
+
     /// AC-6.8-6.
     #[tokio::test(start_paused = true)]
     async fn ac_6_8_6_finish_before_commit_returns_transcript_at_once() -> anyhow::Result<()> {
-        let partials = vec![partial(TEXT, Some(500), 500)];
-        let (mut session, _) = session(partials, vec![prediction("lights_on", 0.95)])?;
+        let stt = FakeStt {
+            partials: vec![partial(TEXT, Some(500), 500)],
+            ..FakeStt::default()
+        };
+        let (mut session, _) = session(stt, vec![prediction("lights_on", 0.95)])?;
         assert_eq!(session.push(vec![0; 320]).await?, None);
         let start = tokio::time::Instant::now();
         assert_eq!(session.finish().await?, TEXT);

@@ -46,6 +46,7 @@ use crate::ports::Context;
 use crate::ports::Handled;
 use crate::ports::Home;
 use crate::ports::Info;
+use crate::ports::Listening;
 use crate::ports::ModelLoader;
 use crate::ports::Partial;
 use crate::ports::SpeechToText;
@@ -298,12 +299,26 @@ fn resample(audio: &Audio, rate: usize) -> anyhow::Result<Vec<i16>> {
     Ok(samples.collect())
 }
 
-/// A `SpeechToText` with scripted first-pass partials and a scripted second-pass text.
+/// A `SpeechToText` with scripted first-pass partials, a scripted second-pass result and a gate
+/// on `accept`.
 pub struct FakeStt {
     /// The partials of each stream, with their voice ends, in order, one after each `accept`.
     pub partials: Vec<Partial>,
-    /// The text of each `transcribe`.
-    pub second_pass: Option<String>,
+    /// The result of each `transcribe`: the text, or the error message.
+    pub second_pass: Result<Option<String>, String>,
+    /// The lock that each `accept` takes first. A test holds it to block `accept`.
+    pub gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Default for FakeStt {
+    /// No partials, no second pass and an open gate.
+    fn default() -> Self {
+        Self {
+            partials: Vec::new(),
+            second_pass: Ok(None),
+            gate: Arc::default(),
+        }
+    }
 }
 
 impl SpeechToText for FakeStt {
@@ -311,11 +326,12 @@ impl SpeechToText for FakeStt {
         Ok(Box::new(FakeSttStream {
             partials: self.partials.clone().into(),
             current: Partial::default(),
+            gate: Arc::clone(&self.gate),
         }))
     }
 
     fn transcribe(&self, _samples: &[i16]) -> anyhow::Result<Option<String>> {
-        Ok(self.second_pass.clone())
+        self.second_pass.clone().map_err(anyhow::Error::msg)
     }
 }
 
@@ -325,10 +341,13 @@ struct FakeSttStream {
     partials: VecDeque<Partial>,
     /// The partial of the last `accept`, or the empty partial after `reset`.
     current: Partial,
+    /// The lock that each `accept` takes first.
+    gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SttStream for FakeSttStream {
     fn accept(&mut self, _samples: &[i16]) {
+        drop(self.gate.blocking_lock());
         if let Some(next) = self.partials.pop_front() {
             self.current = next;
         }
@@ -427,6 +446,10 @@ impl Assistant for FakeAssistant {
             name: "jarvis-test".to_owned(),
             version: "1.2.3".to_owned(),
         }
+    }
+
+    fn listen(&self) -> anyhow::Result<Box<dyn Listening>> {
+        anyhow::bail!("FakeAssistant does not listen")
     }
 
     async fn handle(&self, text: &str, context: Context) -> anyhow::Result<Handled> {
