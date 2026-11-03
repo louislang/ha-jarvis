@@ -9,6 +9,8 @@ quint_version := "0.33.0"
 quint_evaluator_version := "v0.7.0"
 verus_version := "0.2026.10.26.d17fbd0"
 python_version := "3.12"
+# Diagnostic: the fp16 converter of the GPU host measurement.
+onnxconverter_common_version := "1.16.0"
 # The apt package of `ubuntu-latest`.
 valgrind_version := "1:3.26.0-0ubuntu1"
 # The version of the `gungraun` library.
@@ -131,7 +133,7 @@ bench:
 
 # Run the `[GPU host]` tests on CUDA.
 gpu-test: models gpu-models
-    JARVIS_DEVICE=cuda SHERPA_ONNX_LIB_DIR={{ quote(cuda_libraries) }} ORT_DYLIB_PATH={{ quote(cuda_libraries / "libonnxruntime.so") }} LD_LIBRARY_PATH={{ quote(cuda_libraries) }} cargo test --workspace --release -- --ignored --test-threads=1
+    JARVIS_DEVICE=cuda SHERPA_ONNX_LIB_DIR={{ quote(cuda_libraries) }} ORT_DYLIB_PATH={{ quote(cuda_libraries / "libonnxruntime.so") }} LD_LIBRARY_PATH={{ quote(cuda_libraries) }} cargo test --workspace --release -- --ignored --test-threads=1 --nocapture diag_
 
 # Write the architecture diagram.
 diagram:
@@ -175,7 +177,7 @@ check: models workflow-lint format lint complexity duplication architecture diag
     {{ if env("JARVIS_DEVICE", "") == "cuda" { "just gpu-test" } else { "" } }}
 
 # Install the tools and the pre-commit hook.
-setup: pre-push-hook install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint install-quint-evaluator install-verus install-valgrind install-gungraun-runner install-python
+setup: pre-push-hook install-just install-cargo-llvm-cov install-actionlint install-pre-commit install-rust-code-analysis-cli install-jscpd install-quint install-quint-evaluator install-verus install-valgrind install-gungraun-runner install-python install-onnxconverter-common
     pre-commit install --hook-type pre-commit
     gh extension install github/gh-stack
 
@@ -238,3 +240,9 @@ install-gungraun-runner:
 install-python:
     python{{ python_version }} -m venv .venv
     {{ venv }}/pip install './train[dev]'
+
+# Diagnostic: install the fp16 converter and its pinned dependencies in a virtual environment in the job's temporary folder.
+install-onnxconverter-common:
+    python{{ python_version }} -m venv "${RUNNER_TEMP:-target}/fp16-venv"
+    "${RUNNER_TEMP:-target}/fp16-venv/bin/pip" install --no-deps onnxconverter-common=={{ onnxconverter_common_version }} onnx==1.23.2 numpy==2.5.4 protobuf==7.36.2 ml_dtypes==0.6.0 packaging==26.3 typing_extensions==4.16.0
+    "${RUNNER_TEMP:-target}/fp16-venv/bin/pip" check

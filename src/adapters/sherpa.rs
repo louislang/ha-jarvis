@@ -314,6 +314,14 @@ fn pcm(value: f32) -> i16 {
 /// with the Supertonic-3 model.
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::time::Instant;
+
+    use sherpa_onnx::OfflineModelConfig;
+    use sherpa_onnx::OfflineRecognizer;
+    use sherpa_onnx::OfflineRecognizerConfig;
+    use sherpa_onnx::OfflineTransducerModelConfig;
+
     use super::*;
     use crate::Config;
     use crate::domain::intent;
@@ -470,6 +478,690 @@ mod tests {
     async fn ac_6_2_3_empty_text_gives_no_samples() -> anyhow::Result<()> {
         let audio = voice()?.synth("").await?;
         assert_eq!(audio.samples, Vec::<i16>::new());
+        Ok(())
+    }
+
+    /// The fp32 Nemotron 160 ms export and its fp16 conversion.
+    const NEMOTRON: &str = "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-2026-04-25";
+
+    /// The int8 Nemotron 160 ms export.
+    const NEMOTRON_INT8: &str =
+        "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25";
+
+    /// The fp32 Parakeet Unified export and its fp16 conversion.
+    const PARAKEET: &str = "models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-non-streaming";
+
+    /// The int8 Parakeet Unified export.
+    const PARAKEET_INT8: &str =
+        "models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming";
+
+    /// The second-pass request.
+    const CALENDAR: &str = "add dentist to my calendar for monday";
+
+    /// One model folder, the infix of its file names and its execution provider.
+    #[derive(Clone, Copy)]
+    struct Export {
+        /// The model folder.
+        dir: &'static str,
+        /// `.fp16`, `.int8` or empty.
+        infix: &'static str,
+        /// `cuda` or `cpu`.
+        provider: &'static str,
+    }
+
+    /// Builds an `Export`.
+    const fn export(dir: &'static str, infix: &'static str, provider: &'static str) -> Export {
+        Export {
+            dir,
+            infix,
+            provider,
+        }
+    }
+
+    /// The int8 Nemotron on the CPU.
+    const NEMOTRON_INT8_CPU: Export = export(NEMOTRON_INT8, ".int8", "cpu");
+
+    /// The fp16 Nemotron on CUDA.
+    const NEMOTRON_FP16: Export = export(NEMOTRON, ".fp16", "cuda");
+
+    /// The fp32 Nemotron on CUDA.
+    const NEMOTRON_FP32: Export = export(NEMOTRON, "", "cuda");
+
+    /// The int8 Parakeet on the CPU.
+    const PARAKEET_INT8_CPU: Export = export(PARAKEET_INT8, ".int8", "cpu");
+
+    /// The fp16 Parakeet on CUDA.
+    const PARAKEET_FP16: Export = export(PARAKEET, ".fp16", "cuda");
+
+    /// The fp32 Parakeet on CUDA.
+    const PARAKEET_FP32: Export = export(PARAKEET, "", "cuda");
+
+    impl Export {
+        /// The path of the model file `name` of the export.
+        fn file(self, name: &str) -> String {
+            format!("{}/{name}{}.onnx", self.dir, self.infix)
+        }
+
+        /// The path of `tokens.txt`.
+        fn tokens(self) -> String {
+            format!("{}/tokens.txt", self.dir)
+        }
+
+        /// The name of the export in the printed lines.
+        fn name(self) -> String {
+            let dir = self.dir.trim_start_matches("models/sherpa-onnx-");
+            format!("{dir}{}/{}", self.infix, self.provider)
+        }
+    }
+
+    /// The streaming recognizer of `export` with 4 threads on `provider`.
+    fn online(export: Export, provider: &str) -> anyhow::Result<OnlineRecognizer> {
+        let transducer = OnlineTransducerModelConfig {
+            encoder: Some(export.file("encoder")),
+            decoder: Some(export.file("decoder")),
+            joiner: Some(export.file("joiner")),
+        };
+        let model_config = OnlineModelConfig {
+            transducer,
+            tokens: Some(export.tokens()),
+            provider: Some(provider.to_owned()),
+            num_threads: 4,
+            ..OnlineModelConfig::default()
+        };
+        let config = OnlineRecognizerConfig {
+            model_config,
+            ..OnlineRecognizerConfig::default()
+        };
+        OnlineRecognizer::create(&config).with_context(|| format!("cannot load {}", export.name()))
+    }
+
+    /// The offline recognizer of `export` with 4 threads on `provider`.
+    fn offline(export: Export, provider: &str) -> anyhow::Result<OfflineRecognizer> {
+        let transducer = OfflineTransducerModelConfig {
+            encoder: Some(export.file("encoder")),
+            decoder: Some(export.file("decoder")),
+            joiner: Some(export.file("joiner")),
+        };
+        let model_config = OfflineModelConfig {
+            transducer,
+            tokens: Some(export.tokens()),
+            provider: Some(provider.to_owned()),
+            num_threads: 4,
+            model_type: Some("nemo_transducer".to_owned()),
+            ..OfflineModelConfig::default()
+        };
+        let config = OfflineRecognizerConfig {
+            model_config,
+            ..OfflineRecognizerConfig::default()
+        };
+        OfflineRecognizer::create(&config).with_context(|| format!("cannot load {}", export.name()))
+    }
+
+    /// The samples in [-1, 1] of the 16-bit `samples`.
+    fn wave(samples: &[i16]) -> Vec<f32> {
+        samples
+            .iter()
+            .map(|&sample| f32::from(sample) / f32::from(i16::MAX))
+            .collect()
+    }
+
+    /// Decodes each ready chunk of `stream` and gives the time of each decode.
+    fn decode_ready(recognizer: &OnlineRecognizer, stream: &OnlineStream) -> Vec<Duration> {
+        let mut decodes = Vec::new();
+        while recognizer.is_ready(stream) {
+            let start = Instant::now();
+            recognizer.decode(stream);
+            decodes.push(start.elapsed());
+        }
+        decodes
+    }
+
+    /// The partial text of `stream`.
+    fn text_of(recognizer: &OnlineRecognizer, stream: &OnlineStream) -> String {
+        recognizer
+            .get_result(stream)
+            .map(|result| result.text)
+            .unwrap_or_default()
+    }
+
+    /// One first pass of `samples` in 20 ms chunks, then 640 ms of zeros.
+    struct Pass {
+        /// The time of each decode of the chunks.
+        decodes: Vec<Duration>,
+        /// The time of all chunks.
+        total: Duration,
+        /// The time to decode the zeros.
+        flush: Duration,
+        /// The text before the zeros.
+        text: String,
+        /// The text after the zeros.
+        flushed: String,
+    }
+
+    /// The first pass of `samples` with `recognizer`.
+    fn run_first(recognizer: &OnlineRecognizer, samples: &[i16]) -> Pass {
+        let stream = recognizer.create_stream();
+        let mut decodes = Vec::new();
+        let start = Instant::now();
+        for chunk in samples.chunks(CHUNK) {
+            stream.accept_waveform(i32::from(RATE), &wave(chunk));
+            decodes.extend(decode_ready(recognizer, &stream));
+        }
+        let total = start.elapsed();
+        let text = text_of(recognizer, &stream);
+        let start = Instant::now();
+        stream.accept_waveform(i32::from(RATE), &vec![0.0; 640 * 16]);
+        decode_ready(recognizer, &stream);
+        let flush = start.elapsed();
+        let flushed = text_of(recognizer, &stream);
+        Pass {
+            decodes,
+            total,
+            flush,
+            text,
+            flushed,
+        }
+    }
+
+    /// The text of `samples` with `recognizer`.
+    fn transcribe(recognizer: &OfflineRecognizer, samples: &[i16]) -> anyhow::Result<String> {
+        let stream = recognizer.create_stream();
+        stream.accept_waveform(i32::from(RATE), &wave(samples));
+        recognizer.decode(&stream);
+        Ok(stream.get_result().context("no result")?.text)
+    }
+
+    /// The milliseconds of `duration`.
+    fn ms(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+
+    /// The GPU memory in MiB that `nvidia-smi` reports for this process.
+    fn gpu_memory() -> anyhow::Result<u64> {
+        let output = std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-compute-apps=pid,used_memory",
+                "--format=csv,noheader,nounits",
+            ])
+            .output()?;
+        let pid = std::process::id().to_string();
+        let mut total = 0;
+        for line in String::from_utf8(output.stdout)?.lines() {
+            if let Some((process, memory)) = line.split_once(',')
+                && process.trim() == pid
+            {
+                total += memory.trim().parse::<u64>()?;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Creates the CUDA context with the Silero VAD and gives it with the GPU memory before and
+    /// after.
+    fn cuda_context() -> anyhow::Result<(VoiceActivityDetector, u64, u64)> {
+        let before = gpu_memory()?;
+        let detector = VoiceActivityDetector::create(&vad(&config()?.asr, Device::Cuda), 30.0)
+            .context("cannot load the VAD")?;
+        detector.accept_waveform(&[0.0; 512]);
+        Ok((detector, before, gpu_memory()?))
+    }
+
+    /// True in the child process that runs the ignored test `name` alone. Else runs that child.
+    fn alone(name: &str) -> anyhow::Result<bool> {
+        let alone = "JARVIS_ALONE";
+        if std::env::var_os(alone).is_some() {
+            return Ok(true);
+        }
+        let name = format!("adapters::sherpa::tests::{name}");
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--ignored", "--exact", &name, "--nocapture"])
+            .env(alone, "1")
+            .status()?;
+        anyhow::ensure!(status.success(), "{name} fails alone: {status}");
+        Ok(false)
+    }
+
+    /// Adds the time of `event` to `times` when it is a kernel event.
+    fn add_kernel_time(times: &mut BTreeMap<(String, String), u64>, event: &serde_json::Value) {
+        let args = &event["args"];
+        let kernel = event["name"]
+            .as_str()
+            .is_some_and(|name| name.ends_with("_kernel_time"));
+        if let (true, Some(provider), Some(op), Some(time)) = (
+            kernel,
+            args["provider"].as_str(),
+            args["op_name"].as_str(),
+            event["dur"].as_u64(),
+        ) {
+            *times
+                .entry((provider.to_owned(), op.to_owned()))
+                .or_default() += time;
+        }
+    }
+
+    /// The kernel time in µs of each execution provider and operator in the profiles in
+    /// `folder`.
+    fn kernel_times(folder: &Path) -> anyhow::Result<BTreeMap<(String, String), u64>> {
+        let mut times = BTreeMap::new();
+        for entry in std::fs::read_dir(folder)? {
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                let events: Vec<serde_json::Value> =
+                    serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+                for event in &events {
+                    add_kernel_time(&mut times, event);
+                }
+            }
+        }
+        Ok(times)
+    }
+
+    /// Prints the kernel time of each provider, the slowest operators and the slowest CPU
+    /// operators of `times`.
+    fn print_times(name: &str, times: &BTreeMap<(String, String), u64>) {
+        let mut providers: BTreeMap<&str, u64> = BTreeMap::new();
+        for ((provider, _), time) in times {
+            *providers.entry(provider.as_str()).or_default() += time;
+        }
+        let mut slowest: Vec<(&(String, String), &u64)> = times.iter().collect();
+        slowest.sort_by_key(|(_, time)| std::cmp::Reverse(**time));
+        let cpu: Vec<&(&(String, String), &u64)> = slowest
+            .iter()
+            .filter(|((provider, _), _)| provider.starts_with("CPU"))
+            .take(10)
+            .collect();
+        println!("DIAGNOSTIC placement {name} kernel_us={providers:?}");
+        println!("DIAGNOSTIC placement {name} cpu_us={cpu:?}");
+        println!(
+            "DIAGNOSTIC placement {name} slowest_us={:?}",
+            &slowest[..slowest.len().min(12)]
+        );
+    }
+
+    /// Runs `run` with a profiling CUDA provider and prints where the kernels run.
+    fn print_placement(
+        name: &str,
+        run: impl FnOnce(&str) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let config = folder.path().join("ort.config");
+        let prefix = folder.path().join("profile");
+        std::fs::write(
+            &config,
+            format!("ProfilingFilePrefix={}\n", prefix.display()),
+        )?;
+        run(&format!("cuda:{}", config.display()))?;
+        print_times(name, &kernel_times(folder.path())?);
+        Ok(())
+    }
+
+    /// Prints the GPU memory in MiB at the start, after the CUDA context, after the load and
+    /// after the runs.
+    fn print_model_memory(name: &str, [start, context, loaded, used]: [u64; 4]) {
+        println!(
+            "DIAGNOSTIC memory {name} start={start} context={context} loaded={loaded} used={used} model_mib={} run_mib={}",
+            loaded.saturating_sub(context),
+            used.saturating_sub(context)
+        );
+    }
+
+    /// Prints the texts, the speed and the flush times of `pass` over `audio`, and of a pass of
+    /// `audio` cut 132 ms after the last voiced sample, as at the VAD end.
+    fn print_first(
+        name: &str,
+        recognizer: &OnlineRecognizer,
+        pass: &Pass,
+        audio: &Audio,
+    ) -> anyhow::Result<()> {
+        let voiced = usize::try_from(last_voiced_ms(audio) + 132)? * 16;
+        let cut = run_first(recognizer, &audio.samples[..voiced]);
+        let rtf = pass.total.as_secs_f64() / speech::duration(audio).as_secs_f64();
+        let total: Duration = pass.decodes.iter().sum();
+        let count = u32::try_from(pass.decodes.len()).unwrap_or(u32::MAX).max(1);
+        let max = pass.decodes.iter().max().copied().unwrap_or_default();
+        println!(
+            "DIAGNOSTIC first {name} text={:?} flushed={:?} rtf={rtf:.3} decodes={count} decode_mean_ms={:.1} decode_max_ms={:.1} flush_640_ms={:.1} cut_flush_ms={:.1} cut_flushed={:?}",
+            pass.text,
+            pass.flushed,
+            ms(total / count),
+            ms(max),
+            ms(pass.flush),
+            ms(cut.flush),
+            cut.flushed
+        );
+        Ok(())
+    }
+
+    /// Prints the text, the speed, the flush time, the GPU memory and the placement of the
+    /// first pass `export`.
+    async fn measure_first(export: Export) -> anyhow::Result<()> {
+        let audio = fakes::speech(REQUEST).await?;
+        let (_context, start, context) = cuda_context()?;
+        let recognizer = online(export, export.provider)?;
+        let loaded = gpu_memory()?;
+        run_first(&recognizer, &audio.samples);
+        let pass = run_first(&recognizer, &audio.samples);
+        let used = gpu_memory()?;
+        let name = export.name();
+        print_first(&name, &recognizer, &pass, &audio)?;
+        print_model_memory(&name, [start, context, loaded, used]);
+        drop(recognizer);
+        print_placement(&name, |provider| {
+            run_first(&online(export, provider)?, &audio.samples);
+            Ok(())
+        })
+    }
+
+    /// The sorted times in ms of 20 second passes of `samples` after a warm-up.
+    fn second_times(recognizer: &OfflineRecognizer, samples: &[i16]) -> anyhow::Result<Vec<f64>> {
+        transcribe(recognizer, samples)?;
+        let mut times = Vec::new();
+        for _ in 0..20 {
+            let start = Instant::now();
+            transcribe(recognizer, samples)?;
+            times.push(ms(start.elapsed()));
+        }
+        times.sort_by(f64::total_cmp);
+        Ok(times)
+    }
+
+    /// Loads the second pass `export` after the CUDA context, and gives the context, the
+    /// recognizer and the GPU memory at the start, after the context and after the load.
+    fn load_second(
+        export: Export,
+    ) -> anyhow::Result<(VoiceActivityDetector, OfflineRecognizer, [u64; 3])> {
+        let (detector, start, context) = cuda_context()?;
+        let recognizer = offline(export, export.provider)?;
+        Ok((detector, recognizer, [start, context, gpu_memory()?]))
+    }
+
+    /// Prints the second-pass `text` and the sorted `times` of 20 runs.
+    fn print_second(name: &str, text: &str, times: &[f64]) {
+        println!(
+            "DIAGNOSTIC second {name} text={text:?} normalized_ok={} p95_ms={:.1} median_ms={:.1} min_ms={:.1} times={times:.0?}",
+            intent::normalize(text) == CALENDAR,
+            times[18],
+            times[10],
+            times[0]
+        );
+    }
+
+    /// Prints the text, the p95 of a 3 s utterance, the GPU memory and the placement of the
+    /// second pass `export`.
+    async fn measure_second(export: Export) -> anyhow::Result<()> {
+        let audio = fakes::speech(CALENDAR).await?;
+        let (_context, recognizer, [start, context, loaded]) = load_second(export)?;
+        let text = transcribe(&recognizer, &audio.samples)?;
+        let mut samples = audio.samples.clone();
+        samples.resize(3 * usize::from(RATE), 0);
+        let times = second_times(&recognizer, &samples)?;
+        let used = gpu_memory()?;
+        let name = export.name();
+        print_second(&name, &text, &times);
+        print_model_memory(&name, [start, context, loaded, used]);
+        drop(recognizer);
+        let second = |provider: &str| offline(export, provider);
+        print_placement(&name, |provider| {
+            transcribe(&second(provider)?, &samples).map(drop)
+        })
+    }
+
+    /// Diagnostic: the fp16 Nemotron first pass on CUDA.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn diag_a_nemotron_fp16() -> anyhow::Result<()> {
+        if alone("diag_a_nemotron_fp16")? {
+            measure_first(NEMOTRON_FP16).await?;
+        }
+        Ok(())
+    }
+
+    /// Diagnostic: the fp32 Nemotron first pass on CUDA.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn diag_b_nemotron_fp32() -> anyhow::Result<()> {
+        if alone("diag_b_nemotron_fp32")? {
+            measure_first(NEMOTRON_FP32).await?;
+        }
+        Ok(())
+    }
+
+    /// Diagnostic: the fp16 Parakeet second pass on CUDA.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn diag_c_parakeet_fp16() -> anyhow::Result<()> {
+        if alone("diag_c_parakeet_fp16")? {
+            measure_second(PARAKEET_FP16).await?;
+        }
+        Ok(())
+    }
+
+    /// Diagnostic: the fp32 Parakeet second pass on CUDA.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn diag_d_parakeet_fp32() -> anyhow::Result<()> {
+        if alone("diag_d_parakeet_fp32")? {
+            measure_second(PARAKEET_FP32).await?;
+        }
+        Ok(())
+    }
+
+    /// Prints the GPU memory of this process and of the whole GPU after `step`, and adds the
+    /// process memory to `peak`.
+    fn print_memory(step: &str, peak: &mut Vec<u64>) -> anyhow::Result<()> {
+        let output = std::process::Command::new("nvidia-smi")
+            .args([
+                "--query-gpu=memory.used,memory.total",
+                "--format=csv,noheader",
+            ])
+            .output()?;
+        let process = gpu_memory()?;
+        let gpu = String::from_utf8(output.stdout)?;
+        println!(
+            "DIAGNOSTIC peak {step} process_mib={process} gpu={}",
+            gpu.trim()
+        );
+        peak.push(process);
+        Ok(())
+    }
+
+    /// The models of the live process on CUDA.
+    struct Live {
+        /// The fp16 first pass.
+        first: OnlineRecognizer,
+        /// The fp16 second pass.
+        second: OfflineRecognizer,
+        /// The System One classifier.
+        classifier: Arc<dyn crate::ports::Classifier>,
+        /// The TTS.
+        tts: SherpaTts,
+    }
+
+    /// Loads the models of the live process on CUDA and records the GPU memory after each.
+    async fn load_live(peak: &mut Vec<u64>) -> anyhow::Result<Live> {
+        use crate::ports::ModelLoader as _;
+        let first = online(NEMOTRON_FP16, "cuda")?;
+        print_memory("nemotron_fp16", peak)?;
+        let second = offline(PARAKEET_FP16, "cuda")?;
+        print_memory("parakeet_fp16", peak)?;
+        let fixture = Path::new("models/system-one/fixture");
+        let classifier = crate::adapters::onnx::OnnxLoader
+            .load(fixture, Device::Cuda)
+            .await?;
+        print_memory("classifier", peak)?;
+        let tts = SherpaTts::try_new(&config()?.tts, Device::Cuda)?;
+        print_memory("tts", peak)?;
+        Ok(Live {
+            first,
+            second,
+            classifier,
+            tts,
+        })
+    }
+
+    /// Runs each model of `live` once and records the GPU memory after each.
+    async fn run_live(
+        live: &Live,
+        request: &[i16],
+        samples: &[i16],
+        peak: &mut Vec<u64>,
+    ) -> anyhow::Result<()> {
+        run_first(&live.first, request);
+        print_memory("first_pass_run", peak)?;
+        transcribe(&live.second, samples)?;
+        print_memory("second_pass_run", peak)?;
+        live.classifier
+            .predict("area: kitchen | habits: none", REQUEST)
+            .await?;
+        print_memory("classifier_run", peak)?;
+        let reply = "The kitchen lights are on, and the calendar has a dentist visit on Monday.";
+        live.tts.synth(reply).await?;
+        print_memory("tts_run", peak)
+    }
+
+    /// Diagnostic: the GPU memory with the fp16 passes, the classifier and the TTS on CUDA.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn diag_e_peak() -> anyhow::Result<()> {
+        if !alone("diag_e_peak")? {
+            return Ok(());
+        }
+        let request = fakes::speech(REQUEST).await?;
+        let mut samples = fakes::speech(CALENDAR).await?.samples;
+        samples.resize(3 * usize::from(RATE), 0);
+        let mut peak = Vec::new();
+        print_memory("start", &mut peak)?;
+        let live = load_live(&mut peak).await?;
+        for _ in 0..3 {
+            run_live(&live, &request.samples, &samples, &mut peak).await?;
+        }
+        println!("DIAGNOSTIC peak max_process_mib={:?}", peak.iter().max());
+        Ok(())
+    }
+
+    /// The 50 requests of the word error comparison of AC-6.7-3.
+    fn requests() -> Vec<String> {
+        let actions = [
+            ("turn on", "lights"),
+            ("turn off", "fan"),
+            ("open", "blinds"),
+            ("close", "door"),
+            ("pause", "speaker"),
+        ];
+        let areas = [
+            "kitchen",
+            "office",
+            "bedroom",
+            "garage",
+            "hallway",
+            "basement",
+            "bathroom",
+            "porch",
+            "living room",
+            "dining room",
+        ];
+        let mut requests = Vec::new();
+        for (action, device) in actions {
+            for area in areas {
+                requests.push(format!("{action} the {area} {device}"));
+            }
+        }
+        requests
+    }
+
+    /// The word-level edit distance from `reference` to `hypothesis`.
+    fn word_errors(reference: &str, hypothesis: &str) -> usize {
+        let hypothesis: Vec<&str> = hypothesis.split_whitespace().collect();
+        let mut row: Vec<usize> = (0..=hypothesis.len()).collect();
+        for (index, word) in reference.split_whitespace().enumerate() {
+            let mut diagonal = row[0];
+            row[0] = index + 1;
+            for (column, other) in hypothesis.iter().enumerate() {
+                let substitution = diagonal + usize::from(word != *other);
+                diagonal = row[column + 1];
+                row[column + 1] = substitution.min(row[column] + 1).min(diagonal + 1);
+            }
+        }
+        row[hypothesis.len()]
+    }
+
+    /// Prints the word errors of `export` as the first pass over `audios` of `requests`, without
+    /// and with the zeros.
+    fn first_errors(export: Export, requests: &[String], audios: &[Audio]) -> anyhow::Result<()> {
+        let recognizer = online(export, export.provider)?;
+        let (mut plain, mut flushed) = (0, 0);
+        for (request, audio) in requests.iter().zip(audios) {
+            let pass = run_first(&recognizer, &audio.samples);
+            let (text, after) = (
+                intent::normalize(&pass.text),
+                intent::normalize(&pass.flushed),
+            );
+            plain += word_errors(request, &text);
+            flushed += word_errors(request, &after);
+            if &after != request || &text != request {
+                println!(
+                    "DIAGNOSTIC miss {} {request:?} text={text:?} flushed={after:?}",
+                    export.name()
+                );
+            }
+        }
+        println!(
+            "DIAGNOSTIC errors first {} plain={plain} flushed={flushed}",
+            export.name()
+        );
+        Ok(())
+    }
+
+    /// Prints the word errors of `export` as the second pass over `audios` of `requests`.
+    fn second_errors(export: Export, requests: &[String], audios: &[Audio]) -> anyhow::Result<()> {
+        let recognizer = offline(export, export.provider)?;
+        let mut errors = 0;
+        for (request, audio) in requests.iter().zip(audios) {
+            let text = intent::normalize(&transcribe(&recognizer, &audio.samples)?);
+            errors += word_errors(request, &text);
+            if &text != request {
+                println!(
+                    "DIAGNOSTIC miss {} {request:?} text={text:?}",
+                    export.name()
+                );
+            }
+        }
+        println!("DIAGNOSTIC errors second {} errors={errors}", export.name());
+        Ok(())
+    }
+
+    /// The speech of each of `requests`.
+    async fn speeches(requests: &[String]) -> anyhow::Result<Vec<Audio>> {
+        let mut audios = Vec::new();
+        for request in requests {
+            audios.push(fakes::speech(request).await?);
+        }
+        Ok(audios)
+    }
+
+    /// Diagnostic: the word errors of each export over the 50 requests of AC-6.7-3.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn diag_f_word_errors() -> anyhow::Result<()> {
+        if !alone("diag_f_word_errors")? {
+            return Ok(());
+        }
+        let requests = requests();
+        let audios = speeches(&requests).await?;
+        let words: usize = requests
+            .iter()
+            .map(|request| request.split_whitespace().count())
+            .sum();
+        println!("DIAGNOSTIC errors words={words}");
+        for export in [NEMOTRON_INT8_CPU, NEMOTRON_FP16, NEMOTRON_FP32] {
+            first_errors(export, &requests, &audios)?;
+        }
+        for export in [PARAKEET_INT8_CPU, PARAKEET_FP16, PARAKEET_FP32] {
+            second_errors(export, &requests, &audios)?;
+        }
         Ok(())
     }
 }

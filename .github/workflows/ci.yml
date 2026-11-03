@@ -194,6 +194,113 @@ jobs:
         with:
           cache-bin: "false"
       - run: just gpu-models
+      - run: just install-onnxconverter-common
+      - name: Fetch the fp32 models and convert them to fp16
+        run: |
+          free -h
+          df -h .
+          nvidia-smi
+          hf=https://huggingface.co/csukuangfj2
+          nemotron=sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-2026-04-25
+          parakeet=sherpa-onnx-nemo-parakeet-unified-en-0.6b-non-streaming
+          fetch() {
+            mkdir -p "models/$1"
+            if ! echo "$3  models/$1/$2" | sha256sum --check --status; then
+              curl -sSfL -o "models/$1/$2" "$hf/$1/resolve/main/$2"
+              echo "$3  models/$1/$2" | sha256sum --check
+            fi
+          }
+          fetch "$nemotron" encoder.onnx b46566b6deb00ad97da0c12bd119ee86e2bc89055c60bf8eba1f2dba205a50ef
+          fetch "$nemotron" encoder.data 44f65771e1570546f61106b3d0c604a60b398d061476fda8042bb05432601bd4
+          fetch "$nemotron" decoder.onnx 17614cc0415d49daefd63cd91cb3415af046fa5a487c2049def68f51a667d6fe
+          fetch "$nemotron" joiner.onnx d4ef2398e4b19cb166c0c12f03cb20333e4d359d63c5fd8cf965c0649c1d0d03
+          fetch "$parakeet" encoder.onnx b96ad329f7190b672655c7c5020e191098705d4a736508012b89ad8ef820315a
+          fetch "$parakeet" encoder.weights c054b2932ee13aa39ed84982a399822f3193311fb6fd8e1e204566722614bd87
+          fetch "$parakeet" decoder.onnx 41136a36f1673de81e1b5182f2aad09791815ec6cc9861ebaf2c56b1a374474f
+          fetch "$parakeet" joiner.onnx 680ddf13ab1f8a75b8d9f831980124b826dbbf4640f92cdfd30b72d4d2e811a4
+          ln -f models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/tokens.txt "models/$nemotron/tokens.txt"
+          ln -f models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming/tokens.txt "models/$parakeet/tokens.txt"
+          for model in "$nemotron" "$parakeet"; do
+            folder="models/$model"
+            if [ ! -s "$folder/joiner.fp16.onnx" ]; then
+              "$RUNNER_TEMP/fp16-venv/bin/python" -I - \
+                "$folder/encoder.onnx" "$folder/encoder.fp16.onnx" encoder.fp16.weights \
+                "$folder/decoder.onnx" "$folder/decoder.fp16.onnx" decoder.fp16.weights \
+                "$folder/joiner.onnx" "$folder/joiner.fp16.onnx" joiner.fp16.weights <<'EOF'
+          import collections
+          import os
+          import resource
+          import sys
+          import tempfile
+          import warnings
+
+          import numpy
+          import onnx
+          from onnxconverter_common import float16
+
+
+          def convert(source, target, weights):
+              folder = os.path.dirname(source)
+              with tempfile.NamedTemporaryFile(dir=folder, suffix=".onnx") as inferred:
+                  onnx.shape_inference.infer_shapes_path(source, inferred.name)
+                  model = onnx.load(inferred.name, load_external_data=False)
+              with warnings.catch_warnings(record=True) as clamped:
+                  warnings.simplefilter("always")
+                  # onnxconverter-common 1.16 keeps `to=FLOAT` of a Cast but makes its output fp16.
+                  # Blocked, such a Cast stays fp32 between two inserted casts.
+                  to_float = [
+                      node.name
+                      for node in model.graph.node
+                      if node.op_type == "Cast"
+                      and any(a.name == "to" and a.i == onnx.TensorProto.FLOAT for a in node.attribute)
+                  ]
+                  model = float16.convert_float_to_float16(
+                      model, keep_io_types=True, disable_shape_infer=True, node_block_list=to_float
+                  )
+                  external = 0
+                  with open(os.path.join(folder, weights), "wb") as out:
+                      for tensor in model.graph.initializer:
+                          if tensor.data_location != onnx.TensorProto.EXTERNAL:
+                              continue
+                          info = {entry.key: entry.value for entry in tensor.external_data}
+                          data = numpy.fromfile(
+                              os.path.join(folder, info["location"]),
+                              dtype=numpy.uint8,
+                              count=int(info["length"]),
+                              offset=int(info.get("offset", "0")),
+                          )
+                          if tensor.data_type == onnx.TensorProto.FLOAT16:
+                              data = float16.convert_np_to_float16(data.view(numpy.float32))
+                          payload = data.tobytes()
+                          offset = out.tell()
+                          out.write(payload)
+                          del tensor.external_data[:]
+                          for key, value in (("location", weights), ("offset", offset), ("length", len(payload))):
+                              entry = tensor.external_data.add()
+                              entry.key, entry.value = key, str(value)
+                          external += 1
+              onnx.save(model, target)
+              types = collections.Counter(tensor.data_type for tensor in model.graph.initializer)
+              kept = sorted({node.op_type for node in model.graph.node if node.op_type in float16.DEFAULT_OP_BLOCK_LIST})
+              casts = sum(1 for node in model.graph.node if node.op_type == "Cast")
+              rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+              print(
+                  f"DIAGNOSTIC convert {target} external={external} initializer_types={dict(types)}"
+                  f" casts={casts} fp32_ops={kept} fp32_casts={len(to_float)} clamp_warnings={len(clamped)} max_rss_kib={rss}",
+                  flush=True,
+              )
+
+
+          arguments = sys.argv[1:]
+          for index in range(0, len(arguments), 3):
+              convert(*arguments[index : index + 3])
+          EOF
+            fi
+            ls -la "$folder"
+            sha256sum "$folder"/*.fp16.*
+          done
+          du -sh models/*
+          df -h .
       - run: echo "SHERPA_ONNX_LIB_DIR=$(just --evaluate cuda_libraries)" >> "$GITHUB_ENV"
       - run: mkdir -p target/fixture && cargo run --release -- dataset jarvis.toml target/fixture/train.json --house src/testing/house.json
       - uses: actions/cache/restore@v6
@@ -202,7 +309,14 @@ jobs:
           key: fixture-model-${{ hashFiles('target/fixture/train.json', 'train/**') }}
           fail-on-cache-miss: true
       - run: sudo systemctl stop jarvis
+      - name: Start the GPU memory log
+        run: nohup nvidia-smi --query-gpu=timestamp,memory.used,memory.total --format=csv,noheader,nounits -lms 200 > "$RUNNER_TEMP/gpu-memory.csv" 2>&1 &
       - run: just gpu-test
+      - name: Print the GPU memory log
+        if: always()
+        run: |
+          pkill -f "nvidia-smi --query-gpu" || true
+          awk -F', ' 'NR % 10 == 1 { print } $2 > peak { peak = $2; line = $0 } END { print "DIAGNOSTIC gpu peak", line }' "$RUNNER_TEMP/gpu-memory.csv"
       - if: always()
         run: sudo systemctl start jarvis
 
