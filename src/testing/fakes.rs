@@ -409,11 +409,16 @@ impl Clock for FakeClock {
 }
 
 /// An `Assistant` with a fixed name and version that records each request. `handle` replies
-/// with work that marks its start, or fails after `fail`.
+/// with work that marks its start, or fails after `fail`. `listen` gives the scripted sessions in
+/// order.
 #[derive(Default)]
 pub(crate) struct FakeAssistant {
     /// The text and the context of each request, in order.
     requests: Mutex<Vec<(String, Context)>>,
+    /// The listen sessions of the next `listen` calls, in order.
+    sessions: Mutex<VecDeque<FakeListening>>,
+    /// The samples of each `push` of all sessions, in order.
+    pushes: Arc<Mutex<Vec<Vec<i16>>>>,
     /// The error text of the later requests, if any.
     error: Mutex<Option<String>>,
     /// True when the work of a reply has started.
@@ -437,6 +442,22 @@ impl FakeAssistant {
     pub(crate) fn started(&self) -> bool {
         self.started.load(Ordering::SeqCst)
     }
+
+    /// Makes the next `listen` give a session whose `push` gives `push` and whose `finish` gives
+    /// `finish`.
+    pub(crate) fn script(&self, push: Option<&str>, finish: &str) {
+        lock(&self.sessions).push_back(FakeListening {
+            push: push.map(str::to_owned),
+            finish: finish.to_owned(),
+            pushes: Arc::clone(&self.pushes),
+        });
+    }
+
+    /// The samples of each `push` of all sessions, in order.
+    #[must_use]
+    pub(crate) fn pushes(&self) -> Vec<Vec<i16>> {
+        lock(&self.pushes).clone()
+    }
 }
 
 #[async_trait]
@@ -449,7 +470,10 @@ impl Assistant for FakeAssistant {
     }
 
     fn listen(&self) -> anyhow::Result<Box<dyn Listening>> {
-        anyhow::bail!("FakeAssistant does not listen")
+        let session = lock(&self.sessions).pop_front();
+        Ok(Box::new(
+            session.ok_or_else(|| anyhow::anyhow!("no scripted session"))?,
+        ))
     }
 
     async fn handle(&self, text: &str, context: Context) -> anyhow::Result<Handled> {
@@ -468,6 +492,28 @@ impl Assistant for FakeAssistant {
                 .boxed(),
             ),
         })
+    }
+}
+
+/// A scripted listen session of `FakeAssistant`.
+struct FakeListening {
+    /// The result of each `push`.
+    push: Option<String>,
+    /// The result of `finish`.
+    finish: String,
+    /// The samples of each `push`, in order.
+    pushes: Arc<Mutex<Vec<Vec<i16>>>>,
+}
+
+#[async_trait]
+impl Listening for FakeListening {
+    async fn push(&mut self, samples: Vec<i16>) -> anyhow::Result<Option<String>> {
+        lock(&self.pushes).push(samples);
+        Ok(self.push.clone())
+    }
+
+    async fn finish(self: Box<Self>) -> anyhow::Result<String> {
+        Ok(self.finish)
     }
 }
 

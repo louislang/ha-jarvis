@@ -1,6 +1,5 @@
 //! The Wyoming TCP server. It calls `Assistant`.
 
-use std::mem;
 use std::pin;
 use std::sync::Arc;
 
@@ -21,6 +20,7 @@ use crate::ports::Assistant;
 use crate::ports::Context;
 use crate::ports::Handled;
 use crate::ports::Info;
+use crate::ports::Listening;
 
 /// The header line of a Wyoming event.
 #[derive(Deserialize)]
@@ -48,6 +48,24 @@ struct Transcript {
     #[serde(default)]
     context: Context,
 }
+
+/// The `audio-start` data: the format of the audio.
+#[derive(Deserialize, PartialEq)]
+struct Format {
+    /// The samples per second.
+    rate: u32,
+    /// The bytes of each sample.
+    width: u32,
+    /// The number of channels.
+    channels: u32,
+}
+
+/// The only audio format that the first pass accepts: 16 kHz, 16-bit, mono.
+const FORMAT: Format = Format {
+    rate: 16_000,
+    width: 2,
+    channels: 1,
+};
 
 /// Accepts connections on `listener` until `shutdown` completes. Serves each one in its own
 /// task on `tracker`.
@@ -89,17 +107,94 @@ async fn connection(
 ) -> anyhow::Result<()> {
     let mut stream = BufReader::new(stream);
     let mut line = String::new();
+    let mut session = None;
     while stream.read_line(&mut line).await? > 0 {
-        let mut header: Header = serde_json::from_str(&line)?;
+        let (
+            Header {
+                event_type, data, ..
+            },
+            payload,
+        ) = event(&mut stream, &line).await?;
         line.clear();
-        let data = data(&mut stream, &mut header).await?;
-        match header.event_type.as_str() {
+        match event_type.as_str() {
             "describe" => write(&mut stream, "info", &info_data(&assistant.info())).await?,
             "transcript" => transcript(&mut stream, assistant, data, tracker).await?,
-            _ => {}
+            other => stt(&mut stream, assistant, &mut session, other, data, &payload).await?,
         }
     }
     Ok(())
+}
+
+/// Feeds the event `event_type` with `data` and `payload` to `session`. Gives the transcript at
+/// a commit and at `audio-stop`. `transcribe` starts a new session. The other STT events act
+/// only in an open session, and other events do nothing.
+///
+/// # Errors
+///
+/// The session cannot start, the audio is not 16 kHz 16-bit mono, or the session fails.
+async fn listen(
+    assistant: &dyn Assistant,
+    session: &mut Option<Box<dyn Listening>>,
+    event_type: &str,
+    data: Map<String, Value>,
+    payload: &[u8],
+) -> anyhow::Result<Option<String>> {
+    if event_type == "transcribe" {
+        *session = Some(assistant.listen()?);
+        return Ok(None);
+    }
+    let Some(mut listening) = session.take() else {
+        return Ok(None);
+    };
+    let result = match event_type {
+        "audio-start" => check_format(data).map(|()| None),
+        "audio-chunk" => listening.push(samples(payload)).await,
+        "audio-stop" => return listening.finish().await.map(Some),
+        _ => Ok(None),
+    };
+    *session = Some(listening);
+    result
+}
+
+/// Checks that the `audio-start` data `data` gives 16 kHz 16-bit mono audio.
+///
+/// # Errors
+///
+/// The data has no format, or another format.
+fn check_format(data: Map<String, Value>) -> anyhow::Result<()> {
+    let format: Format = serde_json::from_value(Value::Object(data))?;
+    anyhow::ensure!(format == FORMAT, "the audio is not 16 kHz 16-bit mono");
+    Ok(())
+}
+
+/// Feeds the event `event_type` with `data` and `payload` to `session` with `listen`. Writes
+/// `transcript` for a transcript, or `error` for a failure, and then ends `session`. Thus the
+/// ended session ignores the rest of its audio.
+///
+/// # Errors
+///
+/// The write fails.
+async fn stt(
+    stream: &mut (impl AsyncWrite + Unpin),
+    assistant: &dyn Assistant,
+    session: &mut Option<Box<dyn Listening>>,
+    event_type: &str,
+    data: Map<String, Value>,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    let (event_type, text) = match listen(assistant, session, event_type, data, payload).await {
+        Ok(None) => return Ok(()),
+        Ok(Some(text)) => ("transcript", text),
+        Err(error) => ("error", format!("{error:#}")),
+    };
+    *session = None;
+    write(stream, event_type, &json!({ "text": text })).await
+}
+
+/// The 16-bit little-endian samples of `payload`.
+fn samples(payload: &[u8]) -> Vec<i16> {
+    let (pairs, _): (&[[u8; 2]], &[u8]) = payload.as_chunks();
+    pairs.iter().copied().map(i16::from_le_bytes).collect()
 }
 
 /// Answers the `transcript` data `data` with `handled` or `not-handled`. Starts the work of a
@@ -132,29 +227,35 @@ async fn transcript(
     Ok(())
 }
 
-/// The data of the event of `header`: the header data merged with the data that follows it on
-/// `stream`. Drops the payload.
+/// The event of the header line `line` and its payload. The header data is merged with the
+/// data that follows the line on `stream`.
 ///
 /// # Errors
 ///
-/// The read fails, or the data is not a JSON object.
-async fn data(
+/// The header is not valid JSON, the read fails, or the data is not a JSON object.
+async fn event(
     stream: &mut (impl AsyncRead + Unpin),
-    header: &mut Header,
-) -> anyhow::Result<Map<String, Value>> {
-    let mut bytes = Vec::new();
-    (&mut *stream)
-        .take(header.data_length)
-        .read_to_end(&mut bytes)
-        .await?;
-    let payload = &mut stream.take(header.payload_length);
-    tokio::io::copy(payload, &mut tokio::io::sink()).await?;
-    let mut data = mem::take(&mut header.data);
+    line: &str,
+) -> anyhow::Result<(Header, Vec<u8>)> {
+    let mut header: Header = serde_json::from_str(line)?;
+    let bytes = read(stream, header.data_length).await?;
+    let payload = read(stream, header.payload_length).await?;
     if !bytes.is_empty() {
         let more: Map<String, Value> = serde_json::from_slice(&bytes)?;
-        data.extend(more);
+        header.data.extend(more);
     }
-    Ok(data)
+    Ok((header, payload))
+}
+
+/// The next `length` bytes of `stream`, or fewer at the end of the stream.
+///
+/// # Errors
+///
+/// The read fails.
+async fn read(stream: &mut (impl AsyncRead + Unpin), length: u64) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    stream.take(length).read_to_end(&mut bytes).await?;
+    Ok(bytes)
 }
 
 /// Writes the event `event_type` with `data` to `stream`.
@@ -175,7 +276,7 @@ async fn write(
     Ok(stream.write_all(&bytes).await?)
 }
 
-/// The `info` data: one `handle` program with one English model.
+/// The `info` data: one `asr` and one `handle` program, each with one English model.
 fn info_data(info: &Info) -> Value {
     let artifact = json!({
         "name": info.name,
@@ -188,7 +289,7 @@ fn info_data(info: &Info) -> Value {
     model["languages"] = json!(["en"]);
     let mut program = artifact;
     program["models"] = json!([model]);
-    json!({ "handle": [program] })
+    json!({ "asr": [program.clone()], "handle": [program] })
 }
 
 /// Tests of the Wyoming server.
@@ -354,6 +455,149 @@ mod tests {
             assistant.started(),
             "the work did not start after the write"
         );
+        Ok(())
+    }
+
+    /// Sends `transcribe` and `audio-start` at `rate` Hz on `client`.
+    async fn start_audio(
+        client: &mut FakeWyomingClient<DuplexStream>,
+        rate: u32,
+    ) -> anyhow::Result<()> {
+        client
+            .send("transcribe", &json!({ "language": "en" }))
+            .await?;
+        let format = json!({ "rate": rate, "width": 2, "channels": 1 });
+        client.send("audio-start", &format).await
+    }
+
+    /// Sends `audio-chunk` with the 16-bit little-endian `samples` as its payload on `client`.
+    async fn chunk(
+        client: &mut FakeWyomingClient<DuplexStream>,
+        samples: &[i16],
+    ) -> anyhow::Result<()> {
+        let payload: Vec<u8> = samples
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect();
+        let data = json!({ "rate": 16_000, "width": 2, "channels": 1 });
+        let header =
+            json!({ "type": "audio-chunk", "data": data, "payload_length": payload.len() });
+        let mut bytes = format!("{header}\n").into_bytes();
+        bytes.extend(payload);
+        client.send_raw(&bytes).await
+    }
+
+    /// The next event on `client`.
+    async fn next(client: &mut FakeWyomingClient<DuplexStream>) -> anyhow::Result<(String, Value)> {
+        Ok(client.receive().await?.expect("the server answers"))
+    }
+
+    /// The `transcript` event with `text`.
+    fn transcript_event(text: &str) -> (String, Value) {
+        ("transcript".to_owned(), json!({ "text": text }))
+    }
+
+    /// AC-6.9-1.
+    #[tokio::test]
+    async fn ac_6_9_1_commit_sends_transcript_before_audio_stop() -> anyhow::Result<()> {
+        let assistant = Arc::new(FakeAssistant::default());
+        assistant.script(Some("turn on the lights"), "finished");
+        let mut client = open(&assistant);
+        start_audio(&mut client, 16_000).await?;
+        chunk(&mut client, &[1, -2, 300]).await?;
+        assert_eq!(
+            next(&mut client).await?,
+            transcript_event("turn on the lights")
+        );
+        assert_eq!(assistant.pushes(), vec![vec![1, -2, 300]]);
+        Ok(())
+    }
+
+    /// AC-6.9-2.
+    #[tokio::test]
+    async fn ac_6_9_2_audio_stop_first_sends_the_finish_transcript() -> anyhow::Result<()> {
+        let assistant = Arc::new(FakeAssistant::default());
+        assistant.script(None, "finished");
+        let mut client = open(&assistant);
+        start_audio(&mut client, 16_000).await?;
+        chunk(&mut client, &[1, 2]).await?;
+        client.send("audio-stop", &json!({})).await?;
+        assert_eq!(next(&mut client).await?, transcript_event("finished"));
+        Ok(())
+    }
+
+    /// AC-6.9-3.
+    #[tokio::test]
+    async fn ac_6_9_3_audio_after_the_transcript_sends_no_second_transcript() -> anyhow::Result<()>
+    {
+        let assistant = Arc::new(FakeAssistant::default());
+        assistant.script(Some("turn on the lights"), "finished");
+        let mut client = open(&assistant);
+        start_audio(&mut client, 16_000).await?;
+        chunk(&mut client, &[1]).await?;
+        next(&mut client).await?;
+        chunk(&mut client, &[2]).await?;
+        chunk(&mut client, &[3]).await?;
+        client.send("audio-stop", &json!({})).await?;
+        client.send("describe", &json!({})).await?;
+        assert_eq!(next(&mut client).await?.0, "info");
+        assert_eq!(assistant.pushes(), vec![vec![1]]);
+        Ok(())
+    }
+
+    /// AC-6.9-4.
+    #[tokio::test]
+    async fn ac_6_9_4_describe_lists_the_asr_and_handle_programs() -> anyhow::Result<()> {
+        let mut client = open(&Arc::new(FakeAssistant::default()));
+        client.send("describe", &json!({})).await?;
+        let (_, data) = next(&mut client).await?;
+        for service in ["asr", "handle"] {
+            let programs = data[service].as_array().cloned().unwrap_or_default();
+            assert_eq!(programs.len(), 1, "{service} programs: {data}");
+            assert_eq!(programs[0]["models"][0]["languages"], json!(["en"]));
+        }
+        Ok(())
+    }
+
+    /// AC-6.9-5.
+    #[tokio::test]
+    async fn ac_6_9_5_rate_44100_sends_error_and_no_push() -> anyhow::Result<()> {
+        let assistant = Arc::new(FakeAssistant::default());
+        assistant.script(None, "finished");
+        let mut client = open(&assistant);
+        start_audio(&mut client, 44_100).await?;
+        assert_eq!(next(&mut client).await?.0, "error");
+        chunk(&mut client, &[1]).await?;
+        client.send("describe", &json!({})).await?;
+        assert_eq!(next(&mut client).await?.0, "info");
+        assert_eq!(assistant.pushes(), Vec::<Vec<i16>>::new());
+        Ok(())
+    }
+
+    /// AC-6.9-6.
+    #[tokio::test]
+    async fn ac_6_9_6_two_sessions_send_one_transcript_each() -> anyhow::Result<()> {
+        let assistant = Arc::new(FakeAssistant::default());
+        assistant.script(Some("first"), "unused");
+        assistant.script(None, "second");
+        let mut client = open(&assistant);
+        start_audio(&mut client, 16_000).await?;
+        chunk(&mut client, &[1]).await?;
+        assert_eq!(next(&mut client).await?, transcript_event("first"));
+        start_audio(&mut client, 16_000).await?;
+        chunk(&mut client, &[2]).await?;
+        client.send("audio-stop", &json!({})).await?;
+        assert_eq!(next(&mut client).await?, transcript_event("second"));
+        Ok(())
+    }
+
+    /// A `transcribe` without a session sends `error`.
+    #[tokio::test]
+    async fn failed_listen_sends_error() -> anyhow::Result<()> {
+        let mut client = open(&Arc::new(FakeAssistant::default()));
+        client.send("transcribe", &json!({})).await?;
+        let expected = ("error".to_owned(), json!({ "text": "no scripted session" }));
+        assert_eq!(next(&mut client).await?, expected);
         Ok(())
     }
 
