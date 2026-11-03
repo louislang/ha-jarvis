@@ -39,13 +39,16 @@ use tokio_util::task::TaskTracker;
 use crate::adapters::files::FileStore;
 use crate::adapters::ha::HaHome;
 use crate::adapters::onnx::OnnxLoader;
+use crate::adapters::sherpa::SherpaStt;
 use crate::app::conversation::Conversation;
 use crate::app::conversation::Queues;
+use crate::app::speech::Listener;
 use crate::domain::catalog::Catalog;
 use crate::domain::model::Prediction;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Pools;
 use crate::domain::responses::Response;
+use crate::domain::speech::CommitPolicy;
 use crate::domain::state::Snapshot;
 use crate::domain::state_cache::StateCache;
 use crate::domain::training::Settings;
@@ -56,7 +59,9 @@ use crate::ports::Clock;
 use crate::ports::Handled;
 use crate::ports::Home;
 use crate::ports::Info;
+use crate::ports::Listening;
 use crate::ports::ModelLoader;
+use crate::ports::SpeechToText;
 
 /// Pure rules.
 pub mod domain {
@@ -356,6 +361,8 @@ impl Clock for SystemClock {
 pub struct App {
     /// The `handle` use case.
     conversation: Conversation,
+    /// The `listen` use case.
+    listener: Listener,
 }
 
 #[async_trait]
@@ -367,9 +374,28 @@ impl Assistant for App {
         }
     }
 
+    fn listen(&self) -> anyhow::Result<Box<dyn Listening>> {
+        self.listener.listen()
+    }
+
     async fn handle(&self, text: &str, context: ports::Context) -> anyhow::Result<Handled> {
         self.conversation.handle(text, context).await
     }
+}
+
+/// The listener of `config` on `stt`, which predicts each partial with `classifier`.
+fn listener(
+    config: &Config,
+    stt: Arc<dyn SpeechToText>,
+    classifier: Arc<dyn Classifier>,
+) -> Listener {
+    let asr = &config.asr;
+    let policy = CommitPolicy {
+        early_commit_ms: asr.early_commit_ms,
+        endpoint_ms: asr.endpoint_ms,
+        max_utterance_ms: asr.max_utterance_ms,
+    };
+    Listener::new(stt, classifier, policy, config.model.commit_threshold)
 }
 
 /// The System One model of the conversation. A swap affects the next `predict`.
@@ -563,13 +589,13 @@ pub struct Startup<Lookup, Connector, Shutdown> {
 }
 
 /// Starts Jarvis with the configuration file `config` and the outside world `startup`: HA,
-/// the sync, the System One model and the Wyoming server. When `startup.shutdown` completes,
+/// the sync, the System One model, the STT models and the Wyoming server. When `startup.shutdown` completes,
 /// stops the start, or stops accepting connections and waits up to [`SHUTDOWN_WAIT`] for the
 /// running connections, the work after their replies and the saves of the stores.
 ///
 /// # Errors
 ///
-/// A file cannot be read or is not valid, a secret is not set, the model cannot load, or the
+/// A file cannot be read or is not valid, a secret is not set, a model cannot load, or the
 /// server cannot bind or accept.
 pub async fn run<Lookup, Connector, Transport, Stream>(
     config: &Path,
@@ -587,12 +613,12 @@ where
     let pools = load_pools(&config.responses, &catalog)?;
     let home = start_home(&config.ha, &secrets.ha_token, startup.connector)?;
     let mut shutdown = pin::pin!(startup.shutdown);
-    // The model can load for a long time, so a shutdown stops the start too.
-    let (conversation, pools_task) = tokio::select! {
-        started = conversation(&config, catalog, pools, home) => started?,
+    // The models can load for a long time, so a shutdown stops the start too.
+    let (app, pools_task) = tokio::select! {
+        started = start_app(&config, catalog, pools, home) => started?,
         () = &mut shutdown => return Ok(()),
     };
-    serve_until(config.listen, App { conversation }, pools_task, shutdown).await
+    serve_until(config.listen, app, pools_task, shutdown).await
 }
 
 /// Serves `app` on `listen` until `shutdown` completes. Then waits up to [`SHUTDOWN_WAIT`] for
@@ -653,30 +679,48 @@ where
     Ok(HaHome::start(move || connector(&host, port), token, ha))
 }
 
-/// The conversation of `config`, `catalog` and the source pools `pools` on `home`, and its pools
-/// task. Starts the pools task and the sync, and loads the System One model.
+/// The app of `config`, `catalog` and the source pools `pools` on `home`, and its pools task.
+/// Starts the pools task and the sync, and loads the System One model, then the STT models.
 ///
 /// # Errors
 ///
-/// The saved pools or the model cannot load.
-async fn conversation(
+/// The saved pools or a model cannot load.
+async fn start_app(
     config: &Config,
     catalog: Catalog,
     pools: Pools,
     home: Arc<dyn Home>,
-) -> anyhow::Result<(Conversation, JoinHandle<()>)> {
+) -> anyhow::Result<(App, JoinHandle<()>)> {
     let store = Arc::new(FileStore::try_new(config.pools.clone())?);
     let task = app::conversation::start_pools(pools, store)?;
     let queues = start_sync(home, &config.announce);
-    let dir = config.model.dir.join("fixture");
-    let model = OnnxLoader.load(&dir, config.device).await?;
-    let classifier = Arc::new(CurrentClassifier(ArcSwap::from_pointee(model)));
+    let (classifier, listener) = load_models(config).await?;
     let rng = StdRng::seed_from_u64(SystemClock.now().as_millisecond().unsigned_abs());
     let (catalog, threshold) = (Arc::new(catalog), config.model.threshold);
     let (pools, changes) = (task.pools, task.changes);
     let conversation =
         Conversation::new(pools, changes, queues, rng, classifier, catalog, threshold);
-    Ok((conversation, task.task))
+    let app = App {
+        conversation,
+        listener,
+    };
+    Ok((app, task.task))
+}
+
+/// The System One model of `config`, then the listener on the STT models of `config`, which
+/// predicts with that model. The STT models load on a blocking thread.
+///
+/// # Errors
+///
+/// A model cannot load.
+async fn load_models(config: &Config) -> anyhow::Result<(Arc<dyn Classifier>, Listener)> {
+    let dir = config.model.dir.join("fixture");
+    let model = OnnxLoader.load(&dir, config.device).await?;
+    let classifier: Arc<dyn Classifier> = Arc::new(CurrentClassifier(ArcSwap::from_pointee(model)));
+    let (asr, device) = (config.asr.clone(), config.device);
+    let stt = tokio::task::spawn_blocking(move || SherpaStt::try_new(&asr, device)).await??;
+    let listener = listener(config, Arc::new(stt), Arc::clone(&classifier));
+    Ok((classifier, listener))
 }
 
 /// Starts the sync of a hot cache with `home`. Gives the announce queues of `announce` on it.
@@ -770,7 +814,6 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::adapters::onnx::OnnxLoader;
-    use crate::adapters::sherpa::SherpaStt;
     use crate::adapters::sherpa::SherpaTts;
     use crate::app::conversation::Queues;
     use crate::domain::responses::Pool;
@@ -784,6 +827,7 @@ mod tests {
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeStore;
+    use crate::testing::fakes::FakeStt;
     use crate::testing::fakes::FakeWyomingClient;
 
     /// A valid configuration with every field.
@@ -1138,13 +1182,17 @@ mod tests {
         Arc::new(Queues::new(home, receiver, wait, wait))
     }
 
-    /// The app of `VALID` with `classifier`, the reference house and `pools`.
-    fn app_with(classifier: Arc<dyn Classifier>) -> anyhow::Result<App> {
+    /// The app of `VALID` with `classifier`, `stt`, the reference house and `pools`.
+    fn app_with(
+        classifier: Arc<dyn Classifier>,
+        stt: Arc<dyn SpeechToText>,
+    ) -> anyhow::Result<App> {
         let config = Config::parse(VALID)?;
         let catalog = load_catalog(&config.intents)?;
         let task = app::conversation::start_pools(pools(&catalog), Arc::new(FakeStore::new(None)))?;
         let (rng, threshold) = (StdRng::seed_from_u64(1), config.model.threshold);
         let (pools, changes, catalog) = (task.pools, task.changes, Arc::new(catalog));
+        let listener = listener(&config, stt, Arc::clone(&classifier));
         let conversation = Conversation::new(
             pools,
             changes,
@@ -1154,14 +1202,18 @@ mod tests {
             catalog,
             threshold,
         );
-        Ok(App { conversation })
+        Ok(App {
+            conversation,
+            listener,
+        })
     }
 
     /// The app of `VALID` with the fixture model, the reference house and `pools`.
     async fn fixture_app() -> anyhow::Result<App> {
         let fixture = Path::new("models/system-one/fixture");
         let device = Config::parse(VALID)?.device;
-        app_with(OnnxLoader.load(fixture, device).await?)
+        let classifier = OnnxLoader.load(fixture, device).await?;
+        app_with(classifier, Arc::new(FakeStt::default()))
     }
 
     /// Serves `app` on `listener` in its own task, with no shutdown.
@@ -1276,12 +1328,30 @@ mod tests {
     async fn ac_5_4_4_swap_gives_the_next_handle_the_new_classifier() -> anyhow::Result<()> {
         let (old, new): (Arc<FakeClassifier>, Arc<FakeClassifier>) = Default::default();
         let current = Arc::new(CurrentClassifier(ArcSwap::from_pointee(old.clone() as _)));
-        let app = app_with(Arc::clone(&current) as _)?;
+        let app = app_with(Arc::clone(&current) as _, Arc::new(FakeStt::default()))?;
         let handle = || app.handle("turn on the lights", ports::Context::default());
         let _ = handle().await;
         current.0.store(Arc::new(new.clone() as _));
         let _ = handle().await;
         assert_eq!((old.calls().len(), new.calls().len()), (1, 1));
+        Ok(())
+    }
+
+    /// AC-6.8b-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_6_8b_3_blocked_accept_does_not_delay_handle() -> anyhow::Result<()> {
+        let stt = Arc::new(FakeStt::default());
+        let closed = stt.gate.lock().await;
+        let app = app_with(Arc::new(FakeClassifier::default()), Arc::clone(&stt) as _)?;
+        let mut session = app.listen()?;
+        let push = tokio::spawn(async move { session.push(vec![0; 320]).await });
+        tokio::task::yield_now().await;
+        let _ = app
+            .handle("turn on the lights", ports::Context::default())
+            .await;
+        assert!(!push.is_finished(), "accept ended before handle returned");
+        drop(closed);
+        push.await??;
         Ok(())
     }
 
@@ -1325,10 +1395,13 @@ mod tests {
         }
     }
 
-    /// A configuration in `folder` with a server address on a free local port, and the address.
+    /// A CPU configuration in `folder` with a server address on a free local port, and the
+    /// address. It names the int8 files and no second pass, as on a CPU machine.
     fn listening_config(folder: &Path) -> anyhow::Result<(PathBuf, SocketAddr)> {
         let address = free_address();
         let text = with_pools_in(folder).replace("\"cuda\"", "\"cpu\"");
+        let text = text.replace(".fp16.", ".int8.");
+        let text = text.replace("second_pass_dir =", "# second_pass_dir =");
         let text = text.replace("0.0.0.0:10700", &address.to_string());
         Ok((config_in(folder, &text)?, address))
     }

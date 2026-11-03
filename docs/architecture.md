@@ -42,10 +42,13 @@ flowchart LR
     crate --> crate_adapters_files
     crate --> crate_adapters_ha
     crate --> crate_adapters_onnx
+    crate --> crate_adapters_sherpa
     crate --> crate_app_conversation
+    crate --> crate_app_speech
     crate --> crate_domain_catalog
     crate --> crate_domain_model
     crate --> crate_domain_responses
+    crate --> crate_domain_speech
     crate --> crate_domain_state
     crate --> crate_domain_state_cache
     crate --> crate_domain_training

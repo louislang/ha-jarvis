@@ -55,6 +55,13 @@ pub trait Assistant: Send + Sync {
     /// The name and the version of the conversation agent.
     fn info(&self) -> Info;
 
+    /// A listen session for the audio of one utterance.
+    ///
+    /// # Errors
+    ///
+    /// The session cannot start.
+    fn listen(&self) -> anyhow::Result<Box<dyn Listening>>;
+
     /// The reply to the transcript `text` in `context` and the work after it.
     async fn handle(&self, text: &str, context: Context) -> anyhow::Result<Handled>;
 }
