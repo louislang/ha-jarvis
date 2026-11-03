@@ -131,6 +131,16 @@ pub trait SttStream: Send {
     fn reset(&mut self);
 }
 
+/// One listen session: the audio of one utterance, chunk by chunk.
+#[async_trait]
+pub trait Listening: Send {
+    /// Accepts the 16 kHz mono `samples` of one audio chunk. Gives the transcript at a commit.
+    async fn push(&mut self, samples: Vec<i16>) -> anyhow::Result<Option<String>>;
+
+    /// The transcript of the audio so far.
+    async fn finish(self: Box<Self>) -> anyhow::Result<String>;
+}
+
 /// Text to speech.
 #[async_trait]
 pub trait TextToSpeech: Send + Sync {
