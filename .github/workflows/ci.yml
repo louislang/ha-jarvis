@@ -93,7 +93,10 @@ jobs:
           key: models-${{ runner.os }}-${{ hashFiles('justfile') }}
           restore-keys: models-${{ runner.os }}-
       - run: just models
-      - run: echo "SHERPA_ONNX_LIB_DIR=$(just --evaluate cpu_libraries)" >> "$GITHUB_ENV"
+      # `jarvis` links the sherpa-onnx libraries, so `jarvis dataset` needs them at run time.
+      - run: |
+          echo "SHERPA_ONNX_LIB_DIR=$(just --evaluate cpu_libraries)" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$(just --evaluate cpu_libraries)" >> "$GITHUB_ENV"
       - run: mkdir -p target/fixture && cargo run --release -- dataset jarvis.toml target/fixture/train.json --house src/testing/house.json
       - uses: actions/cache@v6
         with:
@@ -194,7 +197,10 @@ jobs:
         with:
           cache-bin: "false"
       - run: just gpu-models
-      - run: echo "SHERPA_ONNX_LIB_DIR=$(just --evaluate cuda_libraries)" >> "$GITHUB_ENV"
+      # `jarvis` links the sherpa-onnx libraries, so `jarvis dataset` needs them at run time.
+      - run: |
+          echo "SHERPA_ONNX_LIB_DIR=$(just --evaluate cuda_libraries)" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$(just --evaluate cuda_libraries)" >> "$GITHUB_ENV"
       - run: mkdir -p target/fixture && cargo run --release -- dataset jarvis.toml target/fixture/train.json --house src/testing/house.json
       - uses: actions/cache/restore@v6
         with:
