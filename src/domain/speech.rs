@@ -1,4 +1,4 @@
-//! Audio type, audio chunks, audio duration and commit policy.
+//! Audio type, audio chunks, audio duration, commit policy and sentence split.
 
 use std::time::Duration;
 
@@ -94,7 +94,141 @@ pub fn should_commit(
     spoken || audio_ms >= policy.max_utterance_ms
 }
 
+/// The complete sentences of `buffer` followed by `chunk`, and the rest. A sentence is the text up
+/// to and including a `.`, `?` or `!` that a space follows. The space is in no sentence.
+#[verus_spec(split =>
+    ensures
+        spaced(split.0@) + split.1@ == buffer@ + chunk@,
+        forall|index: int| 0 <= index < split.0@.len() ==> #[trigger] complete(split.0@[index]@),
+        unbroken(split.1@),
+)]
+#[must_use]
+pub fn sentences(buffer: &str, chunk: &str) -> (Vec<String>, String) {
+    let mut text = buffer.to_owned();
+    text.push_str(chunk);
+    let chars: Vec<char> = text.chars().collect();
+    let mut complete: Vec<String> = Vec::new();
+    let mut rest = String::new();
+    let mut index = 0;
+    proof! {
+        assert(spaced(complete@) + rest@ =~= chars@.take(0));
+    }
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            chars@ == buffer@ + chunk@,
+            splitting(chars@, complete@, rest@, index as int),
+        decreases chars@.len() - index,
+    ))]
+    while index < chars.len() {
+        proof! {
+            lemma_split(chars@, complete@, rest@, index as int);
+        }
+        if is_boundary(&chars, index) {
+            complete.push(rest);
+            rest = String::new();
+        } else {
+            rest.push(chars[index]);
+        }
+        index += 1;
+    }
+    proof! {
+        assert(chars@.take(chars@.len() as int) =~= chars@);
+    }
+    (complete, rest)
+}
+
+/// True when the character at `index` of `chars` is a space after `.`, `?` or `!`.
+#[verus_spec(result =>
+    requires
+        index < chars@.len(),
+    ensures
+        result == boundary(chars@, index as int),
+)]
+fn is_boundary(chars: &[char], index: usize) -> bool {
+    if index == 0 || chars[index] != ' ' {
+        return false;
+    }
+    let before = chars[index - 1];
+    before == '.' || before == '?' || before == '!'
+}
+
 verus! {
+
+/// True when `c` ends a sentence before a space.
+pub open spec fn mark(c: char) -> bool {
+    c == '.' || c == '?' || c == '!'
+}
+
+/// True when the character at `index` of `text` is a space after a mark.
+pub open spec fn boundary(text: Seq<char>, index: int) -> bool {
+    0 < index < text.len() && text[index] == ' ' && mark(text[index - 1])
+}
+
+/// True when `text` has no space after a mark.
+pub open spec fn unbroken(text: Seq<char>) -> bool {
+    forall|index: int| !#[trigger] boundary(text, index)
+}
+
+/// True when `text` is one complete sentence: it ends with a mark and has no space after a mark.
+pub open spec fn complete(text: Seq<char>) -> bool {
+    text.len() > 0 && mark(text.last()) && unbroken(text)
+}
+
+/// The text of `sentences` in order, each with the space after it.
+pub open spec fn spaced(sentences: Seq<String>) -> Seq<char> {
+    sentences.map_values(|sentence: String| sentence@.push(' ')).flatten()
+}
+
+/// The loop invariant of `sentences`: `done` and `rest` split the first `index` characters
+/// of `chars`, and `rest` ends with the character before `index` when it is not empty.
+spec fn splitting(chars: Seq<char>, done: Seq<String>, rest: Seq<char>, index: int) -> bool {
+    &&& 0 <= index <= chars.len()
+    &&& spaced(done) + rest == chars.take(index)
+    &&& forall|position: int| 0 <= position < done.len() ==> #[trigger] complete(done[position]@)
+    &&& unbroken(rest)
+    &&& rest.len() > 0 ==> index > 0 && rest.last() == chars[index - 1]
+    &&& index > 0 && chars[index - 1] != ' ' ==> rest.len() > 0
+}
+
+/// The loop invariant of `sentences` holds after the character at `index` ends a sentence or
+/// joins `rest`.
+proof fn lemma_split(chars: Seq<char>, done: Seq<String>, rest: Seq<char>, index: int)
+    requires
+        index < chars.len(),
+        splitting(chars, done, rest, index),
+    ensures
+        boundary(chars, index) ==> forall|ended: String| #[trigger] ended@ == rest
+            ==> splitting(chars, done.push(ended), Seq::empty(), index + 1),
+        !boundary(chars, index) ==> splitting(chars, done, rest.push(chars[index]), index + 1),
+{
+    assert(chars.take(index).push(chars[index]) =~= chars.take(index + 1));
+    if boundary(chars, index) {
+        assert forall|ended: String| #[trigger] ended@ == rest
+            implies splitting(chars, done.push(ended), Seq::empty(), index + 1) by {
+            let mapped = done.map_values(|sentence: String| sentence@.push(' '));
+            assert(done.push(ended).map_values(|sentence: String| sentence@.push(' '))
+                =~= mapped.push(rest.push(' ')));
+            mapped.lemma_flatten_push(rest.push(' '));
+            assert(spaced(done.push(ended)) + Seq::empty() =~= spaced(done) + rest + seq![' ']);
+            assert(complete(ended@));
+            assert forall|position: int| 0 <= position < done.len() + 1
+                implies #[trigger] complete(done.push(ended)[position]@) by {
+                if position < done.len() {
+                    assert(complete(done[position]@));
+                }
+            }
+            assert(unbroken(Seq::<char>::empty()));
+        }
+    } else {
+        let pushed = rest.push(chars[index]);
+        assert(spaced(done) + pushed =~= (spaced(done) + rest).push(chars[index]));
+        assert forall|position: int| !#[trigger] boundary(pushed, position) by {
+            if position < rest.len() {
+                assert(!boundary(rest, position));
+            }
+        }
+    }
+}
 
 /// The samples of `pieces` in order.
 pub open spec fn joined(pieces: Seq<&[i16]>) -> Seq<i16> {
@@ -261,6 +395,41 @@ mod tests {
                 "commit for {silence:?}, text {text}, confident {confident}"
             );
         }
+    }
+
+    /// AC-7.3-1.
+    #[test]
+    fn ac_7_3_1_complete_sentence_is_split_from_the_rest() {
+        let (complete, rest) = sentences("", "Hello there. It is");
+        assert_eq!(
+            (complete, rest.as_str()),
+            (vec!["Hello there.".to_owned()], "It is")
+        );
+    }
+
+    /// AC-7.3-3.
+    #[test]
+    fn ac_7_3_3_sentences_and_rest_join_to_the_chunks() {
+        let chunks = [
+            "Hel",
+            "lo there.",
+            " It is",
+            " sunny! Is it",
+            "?  Yes.\tNo. ",
+            "Maybe",
+        ];
+        let mut buffer = String::new();
+        let mut joined = String::new();
+        for chunk in chunks {
+            let (complete, rest) = sentences(&buffer, chunk);
+            joined = format!("{joined} {}", complete.join(" "));
+            buffer = rest;
+        }
+        let normal = |text: &str| text.split_whitespace().collect::<Vec<&str>>().join(" ");
+        assert_eq!(
+            normal(&format!("{joined} {buffer}")),
+            normal(&chunks.concat())
+        );
     }
 
     /// The commit model.
