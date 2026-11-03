@@ -394,7 +394,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - **Implements:** G1, G2. **Depends on:** 6.8b.
 - **Files:** modify `src/adapters/wyoming.rs`, `src/ports.rs`, `src/testing/fakes.rs`.
 
-**Model.** `transcribe` starts a `Listening`. Each `transcribe` event on the same connection starts a new `Listening`. `audio-start` with a rate other than 16000 Hz, a width other than 2 bytes or more than one channel gives an `error` event and ends that session. Each `audio-chunk` goes to `push`. When `push` returns a transcript, the adapter sends `transcript` at once and ignores the rest of the audio. `audio-stop` before a commit calls `finish` and sends `transcript`. `info` lists the `asr` program. `FakeAssistant::listen` gives sessions with scripted transcripts, and they record each `push`.
+**Model.** `transcribe` starts a `Listening`. Each `transcribe` event on the same connection starts a new `Listening`. `audio-start` with a rate other than 16000 Hz, a width other than 2 bytes or more than one channel gives an `error` event and ends that session. Each `audio-chunk` goes to `push`. When `push` returns a transcript, the adapter sends `transcript` at once and ignores the rest of the audio. `audio-stop` before a commit calls `finish` and sends `transcript`. When `listen`, `push` or `finish` fails, the adapter sends `error` and ends that session. The connection stays open. `info` lists the `asr` program. `FakeAssistant::listen` gives sessions with scripted transcripts, and they record each `push`.
 
 **Acceptance criteria.**
 
@@ -407,7 +407,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 **Proofs.**
 
-- P-6.9-3 (AC-6.9-3). Argument: the connection keeps `sent: bool`. Sending sets it, and both send paths check it first.
+- P-6.9-3 (AC-6.9-3). Argument: the connection keeps the open session as an `Option`. Sending `transcript` or `error` sets it to `None`, and `audio-chunk` and `audio-stop` act only on an open session.
 - P-6.9-1, P-6.9-2, P-6.9-4 to P-6.9-6. Evidence: test.
 
 ---
@@ -417,12 +417,13 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 **Goal:** Add `speak` to the `Assistant` port and connect the Wyoming `synthesize` event to it. Jarvis now serves all three Wyoming services with cached audio.
 
 - **Implements:** G1. **Depends on:** 6.9.
-- **Files:** modify `src/adapters/wyoming.rs`, `src/ports.rs`, `src/app/speech.rs`, `src/lib.rs`.
+- **Files:** modify `src/adapters/wyoming.rs`, `src/ports.rs`, `src/app/speech.rs`, `src/lib.rs`, `src/testing/fakes.rs`.
 
 **Model.**
 
 - `run` builds `SherpaTts` and the speech use case of sub-phase 6.3b. After the first snapshot, a background task runs `prerender` with the area names of the hot cache. `serve` does not wait for it.
-- `synthesize` calls `speak(text)`. The adapter sends `audio-start`, one `audio-chunk` for each chunk of 1024 samples, and `audio-stop`. `info` lists `asr`, `handle` and `tts`.
+- `synthesize` calls `speak(text)`. The adapter sends `audio-start`, one `audio-chunk` for each chunk of 1024 samples, and `audio-stop`. When `speak` fails, the adapter sends `error`, as in sub-phase 6.9. `info` lists `asr`, `handle` and `tts`.
+- `serve` sets `TCP_NODELAY` on each connection. Without it, Nagle's algorithm holds the first `audio-chunk` until the client acknowledges `audio-start`, and AC-6.10-3 fails.
 - HA caches TTS audio by text, so HA does not send `synthesize` for each filler. Thus the announce queue waits for the satellite state, not for `synthesize` (sub-phase 4.9b).
 
 **Acceptance criteria.**
