@@ -362,7 +362,7 @@ On a final error, the old model stays and the training state does not change. Th
 
 These steps are not tests and gate nothing.
 
-1. On the GPU host, make `.venv` with Python 3.12 and install `./train`.
+1. On the GPU host, make `.venv` with Python 3.12 and install `./train` with `uv` (`01-architecture.md` section 10).
 2. Say "Start training". Record that the run uses the GPU and that the log shows both accuracies and the decision.
 3. In RunPod, make a network volume, an S3 API key and a serverless endpoint with `ghcr.io/<owner>/jarvis-train:<tag>`. Allow only GPU types with compute capability 9.0 or lower, because torch 2.2.2 has no kernels for newer GPUs (sub-phase 3.5). Set `[train.runpod]`.
 4. Set a base model that is too large for 6 GB. Say "Start training". Record that the run moves to RunPod. Set `train.base_model` back.
