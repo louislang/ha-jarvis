@@ -210,14 +210,12 @@ proof fn lemma_split(chars: Seq<char>, done: Seq<String>, rest: Seq<char>, index
                 =~= mapped.push(rest.push(' ')));
             mapped.lemma_flatten_push(rest.push(' '));
             assert(spaced(done.push(ended)) + Seq::empty() =~= spaced(done) + rest + seq![' ']);
-            assert(complete(ended@));
             assert forall|position: int| 0 <= position < done.len() + 1
                 implies #[trigger] complete(done.push(ended)[position]@) by {
                 if position < done.len() {
                     assert(complete(done[position]@));
                 }
             }
-            assert(unbroken(Seq::<char>::empty()));
         }
     } else {
         let pushed = rest.push(chars[index]);

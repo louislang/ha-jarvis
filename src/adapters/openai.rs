@@ -1,7 +1,6 @@
 //! `Reasoner` with the `OpenAI` Responses API.
 
 use std::mem;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -10,7 +9,9 @@ use async_openai::config::OpenAIConfig;
 use async_openai::types::responses::CreateResponseArgs;
 use async_openai::types::responses::ResponseFailedEvent;
 use async_openai::types::responses::ResponseIncompleteEvent;
+use async_openai::types::responses::ResponseRefusalDeltaEvent;
 use async_openai::types::responses::ResponseStreamEvent;
+use async_openai::types::responses::ResponseTextDeltaEvent;
 use async_openai::types::responses::Status;
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -62,16 +63,17 @@ pub fn user_message(question: &Question) -> String {
     )
 }
 
-/// The steps of the answer stream `event`. `buffer` keeps the text after the last complete
-/// sentence.
+/// The steps of the answer stream `event`. A refusal is spoken as the answer. `buffer` keeps the
+/// text after the last complete sentence.
 ///
 /// # Errors
 ///
 /// The response failed or is incomplete, or the stream gives an error.
 fn steps(buffer: &mut String, event: ResponseStreamEvent) -> anyhow::Result<Vec<Step>> {
     match event {
-        ResponseStreamEvent::ResponseOutputTextDelta(text) => {
-            let (complete, rest) = speech::sentences(buffer, &text.delta);
+        ResponseStreamEvent::ResponseOutputTextDelta(ResponseTextDeltaEvent { delta, .. })
+        | ResponseStreamEvent::ResponseRefusalDelta(ResponseRefusalDeltaEvent { delta, .. }) => {
+            let (complete, rest) = speech::sentences(buffer, &delta);
             *buffer = rest;
             Ok(complete.into_iter().map(Step::Sentence).collect())
         }
@@ -103,7 +105,7 @@ pub struct OpenAiReasoner {
     /// The time since the last request after which `warm` sends a request.
     warm_idle: Duration,
     /// The time of the last request, or `None` before the first request.
-    last_request: Arc<Mutex<Option<Instant>>>,
+    last_request: Mutex<Option<Instant>>,
 }
 
 impl OpenAiReasoner {
@@ -131,33 +133,34 @@ impl OpenAiReasoner {
             model: config.model.clone(),
             max_output_tokens: config.max_output_tokens,
             warm_idle: Duration::from_secs(config.warm_idle_s),
-            last_request: Arc::default(),
+            last_request: Mutex::new(None),
         })
     }
-}
 
-/// Records a request now in `last_request` when the last request is `idle` or more ago, or when
-/// there is no last request. True when it records.
-///
-/// # Errors
-///
-/// An earlier record panicked.
-fn record_when_idle(last_request: &Mutex<Option<Instant>>, idle: Duration) -> anyhow::Result<bool> {
-    let mut last_request = last_request
-        .lock()
-        .map_err(|_poisoned| anyhow::anyhow!("an earlier record panicked"))?;
-    let now = Instant::now();
-    if last_request.is_some_and(|last| now.duration_since(last) < idle) {
-        return Ok(false);
+    /// Records a request now when the last request is `idle` or more ago, or when there is no
+    /// last request. True when it records.
+    ///
+    /// # Errors
+    ///
+    /// An earlier record panicked.
+    fn record_when_idle(&self, idle: Duration) -> anyhow::Result<bool> {
+        let mut last_request = self
+            .last_request
+            .lock()
+            .map_err(|_poisoned| anyhow::anyhow!("an earlier record panicked"))?;
+        let now = Instant::now();
+        if last_request.is_some_and(|last| now.duration_since(last) < idle) {
+            return Ok(false);
+        }
+        *last_request = Some(now);
+        Ok(true)
     }
-    *last_request = Some(now);
-    Ok(true)
 }
 
 #[async_trait]
 impl Reasoner for OpenAiReasoner {
     async fn warm(&self) -> anyhow::Result<()> {
-        if !record_when_idle(&self.last_request, self.warm_idle)? {
+        if !self.record_when_idle(self.warm_idle)? {
             return Ok(());
         }
         let request = CreateResponseArgs::default()
@@ -183,12 +186,11 @@ impl Reasoner for OpenAiReasoner {
             .max_output_tokens(self.max_output_tokens)
             .store(false)
             .build();
+        let recorded = self.record_when_idle(Duration::ZERO);
         let client = self.client.clone();
-        let last_request = Arc::clone(&self.last_request);
         let events = async move {
-            let request = request?;
-            record_when_idle(&last_request, Duration::ZERO)?;
-            anyhow::Ok(client.responses().create_stream(request).await?)
+            recorded?;
+            anyhow::Ok(client.responses().create_stream(request?).await?)
         };
         let events = stream::once(events)
             .map_ok(|events| events.map_err(anyhow::Error::from))
@@ -320,11 +322,11 @@ mod tests {
         user_message(&question(area))
     }
 
-    /// The steps of an answer that a mock `OpenAI` server streams as the text `deltas`.
-    async fn answered(deltas: &[&str]) -> anyhow::Result<Vec<Step>> {
+    /// The steps of an answer that a mock `OpenAI` server streams as `deltas` of the event `kind`.
+    async fn answered(kind: &str, deltas: &[&str]) -> anyhow::Result<Vec<Step>> {
         let texts = deltas.iter().map(|delta| {
             json!({
-                "type": "response.output_text.delta",
+                "type": kind,
                 "sequence_number": 0,
                 "item_id": "msg_1",
                 "output_index": 0,
@@ -363,21 +365,32 @@ mod tests {
         Ok(())
     }
 
+    /// The event type of a text delta.
+    const TEXT: &str = "response.output_text.delta";
+
+    /// A refusal is the answer text.
+    #[tokio::test(start_paused = true)]
+    async fn refusal_is_spoken() -> anyhow::Result<()> {
+        let steps = answered("response.refusal.delta", &["I can't help."]).await?;
+        assert_eq!(
+            steps,
+            [Step::Sentence("I can't help.".to_owned()), Step::Done]
+        );
+        Ok(())
+    }
+
     /// AC-7.3-2.
     #[tokio::test(start_paused = true)]
     async fn ac_7_3_2_rest_is_the_last_sentence_at_the_end() -> anyhow::Result<()> {
-        let steps = answered(&["Hello there. It", " is"]).await?;
-        assert_eq!(
-            steps.get(1..),
-            Some([Step::Sentence("It is".to_owned()), Step::Done].as_slice())
-        );
+        let steps = answered(TEXT, &["Hello there. It", " is"]).await?;
+        assert_eq!(steps[1..], [Step::Sentence("It is".to_owned()), Step::Done]);
         Ok(())
     }
 
     /// AC-7.3-4.
     #[tokio::test(start_paused = true)]
     async fn ac_7_3_4_two_sentences_give_sentence_sentence_done() -> anyhow::Result<()> {
-        let steps = answered(&["Hello there.", " How are", " you?"]).await?;
+        let steps = answered(TEXT, &["Hello there.", " How are", " you?"]).await?;
         assert_eq!(
             steps,
             [
