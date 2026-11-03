@@ -107,7 +107,12 @@ impl Conversation {
             area,
         };
         let decision = self.decide(&prediction, &request);
-        Ok(self.dispatch(decision, context.satellite_id.as_deref()))
+        let kind = kind(&decision);
+        let handled = self.dispatch(decision, context.satellite_id.as_deref());
+        let top = prediction.ranked.first();
+        let reply = handled.text.as_str();
+        tracing::info!(transcript = text, ?top, kind, reply, "handled");
+        Ok(handled)
     }
 
     /// The ID and the name of the area of the device `device` in the hot cache.
@@ -227,6 +232,15 @@ impl Conversation {
         };
         record_use(&self.changes, pool.to_owned(), index);
         text
+    }
+}
+
+/// The name of the kind of `decision`.
+fn kind(decision: &Decision) -> &'static str {
+    match decision {
+        Decision::Reply { .. } => "reply",
+        Decision::Defer { .. } => "defer",
+        Decision::Fallback { .. } => "fallback",
     }
 }
 
@@ -393,6 +407,7 @@ fn merge(mut source: Pools, saved: &Pools) -> Pools {
 /// Tests of dispatch and the pools task.
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::thread;
     use std::time::Duration;
 
@@ -405,6 +420,7 @@ mod tests {
     use serde::Deserialize;
     use tokio::runtime::Runtime;
     use tokio::time::Instant;
+    use tracing::instrument::WithSubscriber;
 
     use super::*;
     use crate::domain::responses::Pool;
@@ -927,6 +943,31 @@ mod tests {
     async fn ac_5_3_7_prediction_gets_the_normalized_text() {
         let (_, calls) = handled(Some("lights_on"), "Turn on the Lights.", Some(KITCHEN)).await;
         assert_eq!(calls[0].1, "turn on the lights");
+    }
+
+    /// AC-6.11-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_6_11_2_handle_logs_one_info_event() -> anyhow::Result<()> {
+        let log = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt().with_writer(Arc::new(log.reopen()?));
+        let (handled, _) = handled(Some("lights_on"), "turn on the lights", Some(KITCHEN))
+            .with_subscriber(subscriber.finish())
+            .await;
+        let reply = handled?.text;
+        let text = fs::read_to_string(log.path())?;
+        let events: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains(" INFO "))
+            .collect();
+        assert_eq!(events.len(), 1, "the log is {text:?}");
+        for part in ["turn on the lights", "lights_on", &reply] {
+            assert!(
+                events[0].contains(part),
+                "{part:?} is not in {:?}",
+                events[0]
+            );
+        }
+        Ok(())
     }
 
     /// The model state that the conformance test compares.

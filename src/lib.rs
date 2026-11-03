@@ -35,6 +35,9 @@ use tokio::signal::unix::SignalKind;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::task::TaskTracker;
+use tracing::Subscriber;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::MakeWriter;
 
 use crate::adapters::files::FileStore;
 use crate::adapters::ha::HaHome;
@@ -855,10 +858,28 @@ fn serve(config: &Path) -> anyhow::Result<()> {
     result
 }
 
-/// Entry point of Jarvis: runs the command of the command line.
+/// Entry point of Jarvis: installs the stderr log subscriber of `RUST_LOG` and runs the command
+/// of the command line.
 #[must_use]
 pub fn main() -> ExitCode {
+    let filter = env::var(EnvFilter::DEFAULT_ENV).ok();
+    // Only the tests call `main` a second time in one process.
+    let _ = tracing::subscriber::set_global_default(subscriber(filter.as_deref(), io::stderr));
     start(env::args_os())
+}
+
+/// The log subscriber that writes to `writer` the events that `filter` enables, else the `info`
+/// events, with no ANSI colors and no time, because the journal adds the time.
+fn subscriber<Writer>(filter: Option<&str>, writer: Writer) -> impl Subscriber + Send + Sync
+where
+    Writer: for<'writer> MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(filter.unwrap_or("info")))
+        .with_ansi(false)
+        .without_time()
+        .with_writer(writer)
+        .finish()
 }
 
 /// Runs the command of the command line `args`. Without a command, prints the usage.
@@ -938,6 +959,22 @@ mod tests {
     #[test]
     fn ac_0_1_2_main_returns() {
         let _ = super::main();
+    }
+
+    /// AC-6.11-1.
+    #[test]
+    fn ac_6_11_1_without_rust_log_info_is_logged_and_debug_is_not() -> anyhow::Result<()> {
+        let log = tempfile::NamedTempFile::new()?;
+        tracing::subscriber::with_default(subscriber(None, Arc::new(log.reopen()?)), || {
+            tracing::info!("shown");
+            tracing::debug!("hidden");
+        });
+        let text = fs::read_to_string(log.path())?;
+        assert!(
+            text.contains("shown") && !text.contains("hidden"),
+            "the log is {text:?}"
+        );
+        Ok(())
     }
 
     /// The `[asr]` section of `jarvis.toml`.
