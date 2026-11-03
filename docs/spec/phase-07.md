@@ -39,9 +39,9 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 **Goal:** Add the prompt builder with a static system prompt and a user message with only the area entities. OpenAI prompt caching can reuse the system prompt, and the request stays small.
 
 - **Implements:** G7. **Depends on:** 7.1.
-- **Files:** modify `src/adapters/openai.rs`, `src/ports.rs`, `src/domain/decide.rs`.
+- **Files:** modify `src/adapters/openai.rs`, `src/domain/decide.rs`, `src/domain/select.rs`.
 
-**Model.** `Question { text, area, entities, now }` is in `src/domain/decide.rs`, because `decide` builds it. `entities` are the entities in the area with name and state. `now` is the local time in the HA time zone (`Snapshot.config`). `system_prompt()` is a constant. It asks for plain text to speak: short sentences, with no Markdown, lists or emoji. `user_message(question)` has the date, the time, the HA location name, the area, the entities and the text. The system prompt has no date, so prompt caching still works.
+**Model.** `Question { text, area, location, entities, now }` is in `src/domain/decide.rs`. The pure function `question(text, area, location, now, cache)` builds it. Sub-phase 7.5 calls it; this sub-phase does not wire it in. `entities` are the entities of every domain whose area (`entity_area`) is `area`, with name and state, and without the entities that `select` skips (`is_skipped`: an entity category, hidden, disabled, or on a satellite device). `location` is the HA location name (`Snapshot.config.location_name`). `now` is the local time in the HA time zone (`Snapshot.config.time_zone`). The caller converts the time, so the domain needs no time zone database. `system_prompt()` is a constant. It asks for plain text to speak: short sentences, with no Markdown, lists or emoji. `user_message(question)` has the date, the time, the HA location name, the area, the entities and the text. The system prompt has no date, so prompt caching still works.
 
 **Acceptance criteria.**
 
@@ -55,7 +55,7 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 
 - P-7.2-1. Ensures: `system_prompt()` gives the same string on every call. Argument: `system_prompt` is a constant and takes no input.
 - P-7.2-4, P-7.2-5. Evidence: test.
-- P-7.2-2, P-7.2-3. Ensures: the user message lists only the entities of the area, and none without an area. Argument: the entities come from `entities(area, ...)`, which returns only entities in the area (P-2.8-3), and `None` gives an empty list.
+- P-7.2-2, P-7.2-3. Ensures: the user message lists only the entities of the area, and none without an area. Argument: `question` keeps an entity only when `entity_area` gives `area` (P-2.8-3), and `None` gives an empty list.
 
 ---
 
@@ -116,11 +116,12 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 **Goal:** Connect `Job::Llm` to `answer` and the announce queue. An unknown request now gets a filler at once, then each answer sentence is announced on the same satellite.
 
 - **Implements:** G6, G7. **Depends on:** 7.4.
-- **Files:** modify `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`.
+- **Files:** modify `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`, `src/domain/state_cache.rs`.
 - **Quint:** `announce.qnt` (the same queue as sub-phase 4.9b).
 
 **Model.**
 
+- `StateCache::load` keeps `location_name` and `time_zone` of `Snapshot.config`. The `after` work builds the question with `question` (sub-phase 7.2): the area of the request, the location name, and the current time in the HA time zone.
 - `Defer(Llm)`: return the filler. The `after` work consumes `answer`: each `Sentence` goes to the announce queue of sub-phase 4.9b. Each `Call` runs through `Home` before the next step. An error announces from `failure`.
 - The use case waits at most `openai.timeout_ms` for each step of `answer`. A longer wait is a timeout error.
 - A `Call` runs only when its service domain and the domain of each target entity are in `openai.allowed_domains`, and each target entity is in the hot cache. Else the consumer sends the tool error "not permitted" and makes no call. A misheard request thus cannot unlock a door. Leave `switch` out of the list when a switch drives a door, a gate or a lock. This sub-phase adds `openai.allowed_domains`.
