@@ -177,7 +177,8 @@ fn lowest(ids: &[EntityId]) -> EntityId {
     ensures
         found == skipped(*cache, *entity),
 )]
-fn is_skipped(cache: &StateCache, entity: &Entity) -> bool {
+#[must_use]
+pub fn is_skipped(cache: &StateCache, entity: &Entity) -> bool {
     entity.entity_category.is_some()
         || entity.hidden_by.is_some()
         || entity.disabled_by.is_some()

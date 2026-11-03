@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use jiff::Timestamp;
+use jiff::civil::DateTime;
 use minijinja::Environment;
 use minijinja::Error;
 use minijinja::Expression;
@@ -56,6 +57,11 @@ verus! {
 #[verifier::external_type_specification]
 #[verifier::external_body]
 pub struct ExTimestamp(Timestamp);
+
+/// A date and a time of day, without a time zone. <https://docs.rs/jiff/0.2/jiff/civil/struct.DateTime.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExDateTime(DateTime);
 
 /// A JSON object. <https://docs.rs/serde_json/1/serde_json/struct.Map.html>
 #[verifier::external_type_specification]

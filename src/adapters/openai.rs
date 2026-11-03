@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use tokio::time::Instant;
 
 use crate::OpenAiConfig;
+use crate::domain::decide::Question;
 use crate::ports::Reasoner;
 
 /// The TCP keepalive interval of the pooled connections.
@@ -18,6 +19,36 @@ const KEEPALIVE: Duration = Duration::from_secs(30);
 
 /// The input of the warm request.
 const WARM_INPUT: &str = "Reply with OK.";
+
+/// The system message of each answer. It has no date or other changing text, so `OpenAI` prompt
+/// caching can reuse it.
+#[must_use]
+pub fn system_prompt() -> &'static str {
+    "You are Jarvis, the voice assistant of a house. Answer the request with plain text to speak \
+     aloud: short sentences, with no Markdown, lists or emoji."
+}
+
+/// The user message of `question`: the local time, the HA location name, the area, the entities
+/// of the area and the text.
+#[must_use]
+pub fn user_message(question: &Question) -> String {
+    let area = question
+        .area
+        .as_ref()
+        .map_or("none", |area| area.0.as_str());
+    let entities: Vec<String> = question
+        .entities
+        .iter()
+        .map(|entity| format!("- {}: {}\n", entity.name, entity.state))
+        .collect();
+    format!(
+        "Time: {}\nLocation: {}\nArea: {area}\nEntities:\n{}Request: {}",
+        question.now.strftime("%A %Y-%m-%d %H:%M"),
+        question.location,
+        entities.concat(),
+        question.text
+    )
+}
 
 /// A `Reasoner` on one HTTP client for the process life. Its pooled connections have no idle
 /// timeout and TCP keepalive.
@@ -117,6 +148,10 @@ mod tests {
     use wiremock::matchers;
 
     use crate::Config;
+    use crate::domain::decide;
+    use crate::domain::state::AreaId;
+    use crate::domain::state_cache::StateCache;
+    use crate::testing::fakes::house;
 
     /// A mock `OpenAI` server that answers each response request with `status`, and a reasoner of
     /// `jarvis.toml` on it.
@@ -189,5 +224,74 @@ mod tests {
             "the error is {error:#}"
         );
         Ok(())
+    }
+
+    /// The user message of the question "what is on" from `area` of the reference house on
+    /// Monday 2026-10-26 08:00, the local time in `America/Chicago`.
+    fn asked(area: Option<&str>) -> String {
+        let house = house();
+        let location = house.config.location_name.clone();
+        let cache = StateCache::load(house);
+        let area = area.map(|area| AreaId(area.to_owned()));
+        let now = jiff::civil::date(2026, 10, 26).at(8, 0, 0, 0);
+        let question = decide::question("what is on", area.as_ref(), &location, now, &cache);
+        user_message(&question)
+    }
+
+    /// The entity lines of `message`.
+    fn entity_lines(message: &str) -> Vec<&str> {
+        message
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .collect()
+    }
+
+    /// AC-7.2-1.
+    #[test]
+    fn ac_7_2_1_system_message_is_equal_for_two_areas() {
+        let kitchen = (system_prompt(), asked(Some("kitchen")));
+        let office = (system_prompt(), asked(Some("office")));
+        assert_ne!(kitchen.1, office.1, "the user messages are equal");
+        assert_eq!(kitchen.0.as_bytes(), office.0.as_bytes());
+    }
+
+    /// AC-7.2-2.
+    #[test]
+    fn ac_7_2_2_kitchen_user_message_has_only_kitchen_entities() {
+        assert_eq!(
+            entity_lines(&asked(Some("kitchen"))),
+            [
+                "- Carson Kitchen Media Player: idle",
+                "- Thermostat: heat",
+                "- Thermostat Current Temperature: 63.5",
+                "- Thermostat Motion: on",
+                "- Overhead Light: off",
+                "- Strawberry Lamp: on",
+            ]
+        );
+    }
+
+    /// AC-7.2-3.
+    #[test]
+    fn ac_7_2_3_no_area_has_no_entities() {
+        let message = asked(None);
+        assert!(entity_lines(&message).is_empty(), "{message}");
+    }
+
+    /// AC-7.2-4.
+    #[test]
+    fn ac_7_2_4_user_message_has_local_time_and_location() {
+        let message = asked(Some("kitchen"));
+        assert!(message.contains("Monday 2026-10-26 08:00"), "{message}");
+        assert!(message.contains(&house().config.location_name), "{message}");
+    }
+
+    /// AC-7.2-5.
+    #[test]
+    fn ac_7_2_5_system_prompt_asks_for_plain_spoken_text() {
+        let prompt = system_prompt().to_lowercase();
+        for wanted in ["plain text", "speak", "markdown", "lists", "emoji"] {
+            assert!(prompt.contains(wanted), "{wanted:?} is not in {prompt:?}");
+        }
     }
 }

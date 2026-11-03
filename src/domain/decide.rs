@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use jiff::civil::DateTime;
 use minijinja::Environment;
 use minijinja::UndefinedBehavior;
 use minijinja::value::Serde;
@@ -85,6 +86,93 @@ pub struct Request {
     pub transcript: String,
     /// The area of the satellite.
     pub area: Option<AreaId>,
+}
+
+/// A System Two question with the context of its area.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Question {
+    /// The request text.
+    pub text: String,
+    /// The area of the satellite.
+    pub area: Option<AreaId>,
+    /// The HA location name.
+    pub location: String,
+    /// The entities of `area` that `select` does not skip and that have a state.
+    pub entities: Vec<EntityState>,
+    /// The local time in the HA time zone.
+    pub now: DateTime,
+}
+
+/// The name and the state of one entity.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntityState {
+    /// The name that HA shows.
+    pub name: String,
+    /// For example `on` or `64.0`.
+    pub state: String,
+}
+
+/// The question `text` from `area` at `location` at the local time `now`, with the entities of
+/// `area` in `cache`.
+#[verus_spec(asked =>
+    ensures
+        area is None ==> asked.entities@.len() == 0,
+        area matches Some(found) ==> forall|position: int| 0 <= position < asked.entities@.len()
+            ==> #[trigger] described(*cache, *found, asked.entities@[position]),
+)]
+#[must_use]
+pub fn question(
+    text: &str,
+    area: Option<&AreaId>,
+    location: &str,
+    now: DateTime,
+    cache: &StateCache,
+) -> Question {
+    let (area, entities) = match area {
+        Some(area) => (Some(area.clone()), area_entities(area, cache)),
+        None => (None, Vec::new()),
+    };
+    Question {
+        text: text.to_owned(),
+        area,
+        location: location.to_owned(),
+        entities,
+        now,
+    }
+}
+
+/// The name and the state of each entity of `area` that `select` does not skip and that has a
+/// state.
+#[verus_spec(found =>
+    ensures
+        forall|position: int| 0 <= position < found@.len()
+            ==> #[trigger] described(*cache, *area, found@[position]),
+)]
+fn area_entities(area: &AreaId, cache: &StateCache) -> Vec<EntityState> {
+    let mut found = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= cache.entities@.len(),
+            forall|position: int| 0 <= position < found@.len()
+                ==> #[trigger] described(*cache, *area, found@[position]),
+        decreases cache.entities@.len() - index,
+    ))]
+    while index < cache.entities.len() {
+        let entity = &cache.entities[index];
+        let present = !select::is_skipped(cache, entity)
+            && matches!(cache.entity_area(entity), Some(found) if found.0.as_str() == area.0.as_str());
+        if let (true, Some(state)) = (present, cache.state(entity.entity_id.0.as_str())) {
+            found.push(EntityState {
+                name: entity.name.clone(),
+                state: state.state.clone(),
+            });
+        }
+        index += 1;
+    }
+    found
 }
 
 /// The decision for `prediction` of `request`: a System Two job for an `unknown`, uncertain or
@@ -612,6 +700,19 @@ broadcast use {
 /// True when `catalog` has an intent with the name `name`.
 pub open spec fn cataloged(catalog: Catalog, name: Seq<char>) -> bool {
     exists|index: int| 0 <= index < catalog.intents@.len() && #[trigger] catalog.intents@[index].name@ == name
+}
+
+/// True when `entity` is in `area` and `select` does not skip it.
+pub open spec fn present(cache: StateCache, area: AreaId, entity: crate::domain::state::Entity) -> bool {
+    &&& !select::skipped(cache, entity)
+    &&& crate::domain::state_cache::entity_area(cache, entity) matches Some(found) && found.0@ == area.0@
+}
+
+/// True when `item` has the name of an entity of `cache` that is present in `area`.
+pub open spec fn described(cache: StateCache, area: AreaId, item: EntityState) -> bool {
+    exists|index: int| 0 <= index < cache.entities@.len()
+        && #[trigger] cache.entities@[index].name == item.name
+        && present(cache, area, cache.entities@[index])
 }
 
 /// True when `decision` asks System Two `question`.
