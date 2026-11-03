@@ -154,7 +154,7 @@ Every test gives the same result on every run with the same code.
 ### 6.3 Test Structure
 
 1. Domain tests use no fakes. Application tests use port fakes, with no network and no models. Adapter tests use local servers, in-memory object stores or the models in `models/`.
-2. `just models` downloads the CPU models and libraries. `just gpu-models` downloads the GPU models and libraries. `just fixture-model` trains the fixture model.
+2. `just models` downloads the CPU models and libraries. `just gpu-models` downloads the GPU models and libraries and copies the fp16 files. `just cuda-libraries` downloads only the CUDA libraries. `just fixture-model` trains the fixture model.
 3. Coverage is more than 80% for all code written, from the first commit. Sub-phase 0.1 puts the coverage gate in the pre-commit hook and in CI before any other code.
 
 ## 7. PR, Commit and Required Check Rules
