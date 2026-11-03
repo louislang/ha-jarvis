@@ -243,6 +243,7 @@ install-python:
 
 # Diagnostic: install the fp16 converter and its pinned dependencies in a virtual environment in the job's temporary folder.
 install-onnxconverter-common:
-    python{{ python_version }} -m venv "${RUNNER_TEMP:-target}/fp16-venv"
-    "${RUNNER_TEMP:-target}/fp16-venv/bin/pip" install --no-deps onnxconverter-common=={{ onnxconverter_common_version }} onnx==1.23.2 numpy==2.5.4 protobuf==7.36.2 ml_dtypes==0.6.0 packaging==26.3 typing_extensions==4.16.0
+    python3 --version
+    python3 -m venv "${RUNNER_TEMP:-target}/fp16-venv"
+    "${RUNNER_TEMP:-target}/fp16-venv/bin/pip" install --no-deps onnxconverter-common=={{ onnxconverter_common_version }} onnx==1.23.2 numpy==2.2.6 protobuf==7.36.2 ml_dtypes==0.5.4 packaging==26.3 typing_extensions==4.16.0
     "${RUNNER_TEMP:-target}/fp16-venv/bin/pip" check
