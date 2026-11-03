@@ -318,40 +318,72 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 ### 6.8 Listen Use Case
 
-**Goal:** Add `listen`, which feeds audio to the first pass, predicts on each changed partial, commits by the policy and runs the second pass. Jarvis now produces a final transcript before the user's audio stream ends.
+**Goal:** Add the `Listening` port and the listen use case, which feeds audio to the first pass, predicts on each changed partial and commits by the policy. The use case can now give the first-pass transcript before the user's audio stream ends.
 
 - **Implements:** G1, G2. **Depends on:** 6.7.
-- **Files:** modify `src/app/speech.rs`, `src/ports.rs`, `src/lib.rs`.
+- **Files:** modify `src/app/speech.rs`, `src/ports.rs`.
 
 **Model.**
 
-- `Assistant::listen() -> Listening`. `Listening::push(chunk) -> Option<Transcript>` and `finish() -> Transcript`.
-- `push`: accept the chunk in `spawn_blocking` (decision 29). If the partial text changed and is not empty, predict `normalize(partial)` with `context_text(None, [])` and keep `confident`. `silence_ms = vad_ms - voice_end_ms`. If `should_commit`, return the transcript.
-- The transcript is `transcribe(utterance audio)` when it returns `Some(text)`, else the first-pass partial. A `transcribe` error is logged, and the first-pass text is used.
+- `Listening` is a port trait in `src/ports.rs`, because `adapters/wyoming.rs` cannot name an application type. It is `Send` and has two async methods: `push(samples: Vec<i16>) -> Result<Option<String>>` and `finish(self: Box<Self>) -> Result<String>`. The transcript is a `String`. `samples` are the 16 kHz mono samples of one audio chunk. `push` takes them by value, so sub-phase 6.8b can move them to a blocking thread. `finish` consumes the session. In this sub-phase, `push` and `finish` always return `Ok`.
+- `Listener` in `src/app/speech.rs` holds the `SpeechToText`, the `Classifier`, the `CommitPolicy` and `model.commit_threshold`. `Listener::listen() -> Result<Box<dyn Listening>>` starts a session on a new first-pass stream. It returns `Result`, because `stream()` can fail (sub-phase 6.6b). A session starts with no last text and `confident` false.
+- `push`: accept the samples. If the partial text changed and is not empty, predict `normalize(text)` with `context_text(None, [])`, keep `confident`, and keep the text as the last text. `silence_ms` is `vad_ms - voice_end_ms`, and `None` when `voice_end_ms` is `None`. `audio_ms` is the duration of the pushed samples at 16 kHz. If `should_commit`, return the transcript, else `None`.
+- `confident` is true when the top label is not `unknown` and `p(top) >= model.commit_threshold` (decision 2). `push` calculates it from the ranked labels of the prediction. No domain function is necessary.
+- A `predict` error is logged, and the partial is not confident. Thus the commit still occurs at `endpoint_ms`.
+- The transcript is the text of the last partial. `finish` returns it at once.
+- The session keeps no commit state. After `push` returns a transcript, the caller drops the session. Sub-phase 6.9 sends one `transcript` for each session (P-6.9-3).
+- In this sub-phase, `accept` runs on the async worker. Sub-phase 6.8b moves it to `spawn_blocking`, adds the second pass and connects the use case to `run`.
 
 **Acceptance criteria.**
 
 - AC-6.8-1: When `FakeStt` gives the same partial two times, `FakeClassifier` records one `predict` call.
 - AC-6.8-2: When `FakeClassifier` gives `lights_on` 0.95, `push` returns the transcript `early_commit_ms` after the last voiced sample.
-- AC-6.8-3: When a second pass is configured and `FakeStt` gives different first-pass and second-pass texts, `push` returns the second-pass text.
 - AC-6.8-4: When no second pass is configured, `push` returns the first-pass text.
-- AC-6.8-5: When `transcribe` returns an error, `push` returns the first-pass text.
 - AC-6.8-6: When `finish` runs before a commit, it returns the transcript at once.
 - AC-6.8-7: When `FakeStt` reports no voice for 1 s of audio, `push` returns none.
 - AC-6.8-8: When a confident partial has 150 ms of silence and then voice again, `push` does not commit. It commits `early_commit_ms` after the new last voiced sample.
 - AC-6.8-9: When the partial changes during the silence to a text that is not confident, `push` commits only at `endpoint_ms` of silence.
-- AC-6.8-10: When `FakeStt` blocks inside `accept` on one session, `handle` on another connection returns before the block ends.
 - AC-6.8-11: When the partial is "Turn on the", `FakeClassifier` records the text "turn on the".
+- AC-6.8-12: When `predict` returns an error, `push` commits only at `endpoint_ms` of silence.
 
 **Proofs.**
 
 - P-6.8-1 (AC-6.8-1). Argument: `predict` is called only inside `if partial != last_partial`, and `last_partial` is updated after the call.
-- P-6.8-10. Argument: `accept` runs in `spawn_blocking`, so it does not hold the async worker that runs `handle`.
 - P-6.8-11. Argument: `push` passes `normalize(partial)` to `predict` (P-3.1-1).
-- P-6.8-3 to P-6.8-5. Argument: the final text is `match transcribe(audio) { Ok(Some(t)) => t, _ => first_pass }`.
+- P-6.8-4. Argument: the transcript is the text of the last partial, and this sub-phase calls no `transcribe`.
 - P-6.8-2. Requires: `should_commit` (P-6.5-1). Evidence: test for the timing.
 - P-6.8-6. Argument: `finish` builds the transcript without checking `should_commit`.
 - P-6.8-7 to P-6.8-9. Requires: P-6.5-1, P-6.5-2, P-6.5-5. Evidence: test.
+- P-6.8-12. Argument: a `predict` error sets `confident` to false, and with `confident` false, `should_commit` is true for silence only at `endpoint_ms` (P-6.5-2).
+
+---
+
+### 6.8b Second Pass and Wiring
+
+**Goal:** Add the second pass to the listen use case, run the STT work on blocking threads, and connect `listen` to `App` and `run`. `App` now gives the second-pass transcript at commit, and a decode in one session does not delay `handle`.
+
+- **Implements:** G1, G2. **Depends on:** 6.8.
+- **Files:** modify `src/app/speech.rs`, `src/ports.rs`, `src/lib.rs`, `src/testing/fakes.rs`.
+
+**Model.**
+
+- `Assistant::listen() -> Result<Box<dyn Listening>>`. `App` delegates it to `Listener`. `FakeAssistant::listen` returns an error. Sub-phase 6.9 scripts it.
+- The session also keeps the pushed samples. The transcript is `transcribe(samples)` when it returns `Some(text)`, else the first-pass text. A `transcribe` error is logged, and the first-pass text is used. `push` at a commit and `finish` both build the transcript in this way.
+- `accept` and `transcribe` run in `spawn_blocking` (decision 29). A panic on the blocking thread gives an error from `push` or `finish`.
+- `run` loads `SherpaStt` with `[asr]` and `device` in `spawn_blocking`, after the System One model and in the same `select!`. Thus a shutdown during the STT load stops the start, as for the System One model. `Listener` uses the classifier of the conversation, so a model swap affects both. The `CommitPolicy` comes from `[asr]`.
+- `jarvis.toml` names the fp16 files and `second_pass_dir`. CI and the test machine do not have these files. Thus AC-5.4b-1 and AC-5.4c-1 use a CPU configuration: `device = "cpu"`, the int8 file names and no `second_pass_dir`, as on a CPU machine (`01-architecture.md` section 9). AC-5.4-3 fails at the System One model before the STT load, so its test does not change.
+- `FakeStt`: `transcribe` can return an error, and `accept` can block until the test releases it.
+
+**Acceptance criteria.**
+
+- AC-6.8b-1: When a second pass is configured and `FakeStt` gives different first-pass and second-pass texts, `push` returns the second-pass text.
+- AC-6.8b-2: When `transcribe` returns an error, `push` returns the first-pass text.
+- AC-6.8b-3: When `FakeStt` blocks inside `accept` in a session of `App::listen`, `App::handle` returns before the block ends.
+
+**Proofs.**
+
+- P-6.8b-1, P-6.8b-2. Argument: the transcript is `match transcribe(samples) { Ok(Some(t)) => t, _ => first_pass }`. The `Ok(None)` arm keeps AC-6.8-4 true.
+- P-6.8b-3. Argument: `accept` runs in `spawn_blocking`, so it does not hold the async worker that runs `handle`.
 
 ---
 
@@ -359,10 +391,10 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 **Goal:** Connect the Wyoming `transcribe` and audio events to `listen`. Jarvis now serves HA's STT step and sends the transcript before HA stops the audio.
 
-- **Implements:** G1, G2. **Depends on:** 6.8.
-- **Files:** modify `src/adapters/wyoming.rs`, `src/ports.rs`.
+- **Implements:** G1, G2. **Depends on:** 6.8b.
+- **Files:** modify `src/adapters/wyoming.rs`, `src/ports.rs`, `src/testing/fakes.rs`.
 
-**Model.** `transcribe` starts a `Listening`. Each `transcribe` event on the same connection starts a new `Listening`. `audio-start` with a rate other than 16000 Hz, a width other than 2 bytes or more than one channel gives an `error` event and ends that session. Each `audio-chunk` goes to `push`. When `push` returns a transcript, the adapter sends `transcript` at once and ignores the rest of the audio. `audio-stop` before a commit calls `finish` and sends `transcript`. `info` lists the `asr` program.
+**Model.** `transcribe` starts a `Listening`. Each `transcribe` event on the same connection starts a new `Listening`. `audio-start` with a rate other than 16000 Hz, a width other than 2 bytes or more than one channel gives an `error` event and ends that session. Each `audio-chunk` goes to `push`. When `push` returns a transcript, the adapter sends `transcript` at once and ignores the rest of the audio. `audio-stop` before a commit calls `finish` and sends `transcript`. `info` lists the `asr` program. `FakeAssistant::listen` gives sessions with scripted transcripts, and they record each `push`.
 
 **Acceptance criteria.**
 
