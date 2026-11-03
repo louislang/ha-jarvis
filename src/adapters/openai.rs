@@ -1,6 +1,7 @@
 //! `Reasoner` with the `OpenAI` Responses API.
 
 use std::mem;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -102,7 +103,7 @@ pub struct OpenAiReasoner {
     /// The time since the last request after which `warm` sends a request.
     warm_idle: Duration,
     /// The time of the last request, or `None` before the first request.
-    last_request: Mutex<Option<Instant>>,
+    last_request: Arc<Mutex<Option<Instant>>>,
 }
 
 impl OpenAiReasoner {
@@ -130,34 +131,33 @@ impl OpenAiReasoner {
             model: config.model.clone(),
             max_output_tokens: config.max_output_tokens,
             warm_idle: Duration::from_secs(config.warm_idle_s),
-            last_request: Mutex::new(None),
+            last_request: Arc::default(),
         })
     }
+}
 
-    /// Records a request now when the last request is `warm_idle` or more ago, or when there is
-    /// no last request. True when it records.
-    ///
-    /// # Errors
-    ///
-    /// An earlier record panicked.
-    fn record_when_idle(&self) -> anyhow::Result<bool> {
-        let mut last_request = self
-            .last_request
-            .lock()
-            .map_err(|_poisoned| anyhow::anyhow!("an earlier record panicked"))?;
-        let now = Instant::now();
-        if last_request.is_some_and(|last| now.duration_since(last) < self.warm_idle) {
-            return Ok(false);
-        }
-        *last_request = Some(now);
-        Ok(true)
+/// Records a request now in `last_request` when the last request is `idle` or more ago, or when
+/// there is no last request. True when it records.
+///
+/// # Errors
+///
+/// An earlier record panicked.
+fn record_when_idle(last_request: &Mutex<Option<Instant>>, idle: Duration) -> anyhow::Result<bool> {
+    let mut last_request = last_request
+        .lock()
+        .map_err(|_poisoned| anyhow::anyhow!("an earlier record panicked"))?;
+    let now = Instant::now();
+    if last_request.is_some_and(|last| now.duration_since(last) < idle) {
+        return Ok(false);
     }
+    *last_request = Some(now);
+    Ok(true)
 }
 
 #[async_trait]
 impl Reasoner for OpenAiReasoner {
     async fn warm(&self) -> anyhow::Result<()> {
-        if !self.record_when_idle()? {
+        if !record_when_idle(&self.last_request, self.warm_idle)? {
             return Ok(());
         }
         let request = CreateResponseArgs::default()
@@ -184,7 +184,12 @@ impl Reasoner for OpenAiReasoner {
             .store(false)
             .build();
         let client = self.client.clone();
-        let events = async move { anyhow::Ok(client.responses().create_stream(request?).await?) };
+        let last_request = Arc::clone(&self.last_request);
+        let events = async move {
+            let request = request?;
+            record_when_idle(&last_request, Duration::ZERO)?;
+            anyhow::Ok(client.responses().create_stream(request).await?)
+        };
         let events = stream::once(events)
             .map_ok(|events| events.map_err(anyhow::Error::from))
             .try_flatten();
@@ -343,6 +348,19 @@ mod tests {
             .answer(&question(Some("kitchen")))
             .try_collect()
             .await
+    }
+
+    /// An answer within `warm_idle_s` of the next `warm` counts as the last request.
+    #[tokio::test(start_paused = true)]
+    async fn answer_records_the_last_request() -> anyhow::Result<()> {
+        let (server, reasoner) = mock("completed").await?;
+        reasoner.warm().await?;
+        tokio::time::advance(Duration::from_secs(59)).await;
+        let _steps: Vec<anyhow::Result<Step>> = reasoner.answer(&question(None)).collect().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        reasoner.warm().await?;
+        assert_eq!(requests(&server).await?, 2);
+        Ok(())
     }
 
     /// AC-7.3-2.
