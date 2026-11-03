@@ -716,6 +716,14 @@ uv venv --python 3.12 .venv
 uv pip install ./train
 ```
 
+The fp16 STT files (sub-phase 6.6c) are not in a download. Copy them by hand, once, from the MacBook to the GPU host, with their license notice `NOTICE.md`. The NVIDIA Open Model License requires the notice on redistribution. The folder is outside the runner checkout, so a clean checkout does not remove it. Make the folder first, readable by the runner user and the `jarvis` unit.
+
+```sh
+scp <folder>/*.fp16.* <folder>/NOTICE.md <GPU host>:/opt/jarvis-models/fp16/
+```
+
+The checkout of the `jarvis` unit runs `just models` and `just gpu-models` too. Thus its model folders in `models/` get the same files as the runner.
+
 ## 11. Reference House
 
 The test fixtures (`FakeHome`, `FakeHaServer`) model this house. The data comes from the HA instance on 2026-10-25. `src/testing/house.json` holds it as a `Home` snapshot.
