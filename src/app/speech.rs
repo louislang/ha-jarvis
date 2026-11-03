@@ -20,6 +20,7 @@ use crate::domain::training;
 use crate::ports::Classifier;
 use crate::ports::Listening;
 use crate::ports::Partial;
+use crate::ports::Reasoner;
 use crate::ports::SpeechToText;
 use crate::ports::SttStream;
 use crate::ports::TextToSpeech;
@@ -27,13 +28,15 @@ use crate::ports::TextToSpeech;
 /// The number of samples in one millisecond of 16 kHz audio.
 const SAMPLES_PER_MS: u64 = 16;
 
-/// Starts listen sessions that predict on each changed first-pass partial, commit by the policy
-/// and give the second-pass transcript.
+/// Starts listen sessions that warm System Two, predict on each changed first-pass partial,
+/// commit by the policy and give the second-pass transcript.
 pub struct Listener {
     /// The two passes of each session.
     stt: Arc<dyn SpeechToText>,
     /// The speculative prediction of each changed partial.
     classifier: Arc<dyn Classifier>,
+    /// System Two, warmed at the start of each session.
+    reasoner: Arc<dyn Reasoner>,
     /// The silence and length limits of an utterance.
     policy: CommitPolicy,
     /// The lowest top probability of a confident partial: `model.commit_threshold`.
@@ -41,30 +44,41 @@ pub struct Listener {
 }
 
 impl Listener {
-    /// Listens with `stt` and `classifier`, and commits by `policy` and `threshold`.
+    /// Listens with `stt` and `classifier`, warms `reasoner`, and commits by `policy` and
+    /// `threshold`.
     #[must_use]
     pub fn new(
         stt: Arc<dyn SpeechToText>,
         classifier: Arc<dyn Classifier>,
+        reasoner: Arc<dyn Reasoner>,
         policy: CommitPolicy,
         threshold: f32,
     ) -> Self {
         Self {
             stt,
             classifier,
+            reasoner,
             policy,
             threshold,
         }
     }
 
-    /// A session on a new first-pass stream, with no text.
+    /// A session on a new first-pass stream, with no text. Starts a warm of System Two in the
+    /// background.
     ///
     /// # Errors
     ///
     /// The first pass cannot start.
     pub fn listen(&self) -> anyhow::Result<Box<dyn Listening>> {
+        let stream = self.stt.stream()?;
+        let reasoner = Arc::clone(&self.reasoner);
+        tokio::spawn(async move {
+            if let Err(error) = reasoner.warm().await {
+                tracing::warn!("the warm of System Two failed: {error:#}");
+            }
+        });
         Ok(Box::new(Session {
-            stream: Arc::new(Mutex::new(self.stt.stream()?)),
+            stream: Arc::new(Mutex::new(stream)),
             stt: Arc::clone(&self.stt),
             classifier: Arc::clone(&self.classifier),
             policy: self.policy.clone(),
@@ -251,6 +265,7 @@ mod tests {
     use crate::domain::responses::Pool;
     use crate::domain::responses::Response;
     use crate::testing::fakes::FakeClassifier;
+    use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStt;
     use crate::testing::fakes::FakeTts;
 
@@ -281,6 +296,17 @@ mod tests {
         }
     }
 
+    /// A listener on `stt` and `classifier` that warms `reasoner`.
+    fn listener(
+        stt: FakeStt,
+        classifier: &Arc<FakeClassifier>,
+        reasoner: &Arc<FakeReasoner>,
+    ) -> Listener {
+        let classifier = Arc::clone(classifier) as Arc<dyn Classifier>;
+        let reasoner = Arc::clone(reasoner) as Arc<dyn Reasoner>;
+        Listener::new(Arc::new(stt), classifier, reasoner, POLICY, 0.9)
+    }
+
     /// A session on `stt`, with a classifier that gives `predictions`, and that classifier.
     fn session(
         stt: FakeStt,
@@ -290,13 +316,19 @@ mod tests {
         for prediction in predictions {
             classifier.script(prediction);
         }
-        let listener = Listener::new(
-            Arc::new(stt),
-            Arc::clone(&classifier) as Arc<dyn Classifier>,
-            POLICY,
-            0.9,
-        );
+        let listener = listener(stt, &classifier, &Arc::default());
         Ok((listener.listen()?, classifier))
+    }
+
+    /// AC-7.1-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_1_4_listen_warms_the_reasoner_once() -> anyhow::Result<()> {
+        let reasoner = Arc::new(FakeReasoner::default());
+        let listener = listener(FakeStt::default(), &Arc::default(), &reasoner);
+        let _session = listener.listen()?;
+        tokio::task::yield_now().await;
+        assert_eq!(reasoner.warms(), 1);
+        Ok(())
     }
 
     /// The result of each push of a 20 ms chunk, one push for each of `partials`, and the

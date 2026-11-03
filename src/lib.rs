@@ -39,6 +39,7 @@ use tokio_util::task::TaskTracker;
 use crate::adapters::files::FileStore;
 use crate::adapters::ha::HaHome;
 use crate::adapters::onnx::OnnxLoader;
+use crate::adapters::openai::OpenAiReasoner;
 use crate::adapters::sherpa::SherpaStt;
 use crate::adapters::sherpa::SherpaTts;
 use crate::app::conversation::Conversation;
@@ -64,6 +65,7 @@ use crate::ports::Home;
 use crate::ports::Info;
 use crate::ports::Listening;
 use crate::ports::ModelLoader;
+use crate::ports::Reasoner;
 use crate::ports::SpeechToText;
 
 /// Pure rules.
@@ -96,6 +98,7 @@ pub mod adapters {
     pub mod files;
     pub mod ha;
     pub mod onnx;
+    pub mod openai;
     pub mod sherpa;
     pub mod wyoming;
 }
@@ -128,6 +131,8 @@ pub struct Config {
     pub asr: AsrConfig,
     /// Text to speech.
     pub tts: TtsConfig,
+    /// System Two.
+    pub openai: OpenAiConfig,
     /// Announces.
     pub announce: AnnounceConfig,
     /// Training.
@@ -326,6 +331,24 @@ pub struct TtsConfig {
     pub num_steps: i32,
 }
 
+/// The `[openai]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct OpenAiConfig {
+    /// Environment variable that holds the `OpenAI` API key.
+    pub api_key_env: String,
+    /// The model of each request.
+    pub model: String,
+    /// The longest wait for each step of an answer.
+    pub timeout_ms: u64,
+    /// The time since the last request after which `warm` sends a request.
+    pub warm_idle_s: u64,
+    /// The output token limit of an answer.
+    pub max_output_tokens: u32,
+    /// The output token limit of a structured output: `generate`, `paraphrase` and `propose`.
+    pub bulk_max_output_tokens: u32,
+}
+
 /// The `[announce]` section.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -392,11 +415,13 @@ impl Assistant for App {
     }
 }
 
-/// The listener of `config` on `stt`, which predicts each partial with `classifier`.
+/// The listener of `config` on `stt`, which predicts each partial with `classifier` and warms
+/// `reasoner`.
 fn listener(
     config: &Config,
     stt: Arc<dyn SpeechToText>,
     classifier: Arc<dyn Classifier>,
+    reasoner: Arc<dyn Reasoner>,
 ) -> Listener {
     let asr = &config.asr;
     let policy = CommitPolicy {
@@ -404,7 +429,8 @@ fn listener(
         endpoint_ms: asr.endpoint_ms,
         max_utterance_ms: asr.max_utterance_ms,
     };
-    Listener::new(stt, classifier, policy, config.model.commit_threshold)
+    let threshold = config.model.commit_threshold;
+    Listener::new(stt, classifier, reasoner, policy, threshold)
 }
 
 /// The System One model of the conversation. A swap affects the next `predict`.
@@ -424,6 +450,8 @@ impl Classifier for CurrentClassifier {
 pub struct Secrets {
     /// HA long-lived access token.
     pub ha_token: String,
+    /// `OpenAI` API key.
+    pub openai_key: String,
 }
 
 impl Secrets {
@@ -436,11 +464,16 @@ impl Secrets {
         config: &Config,
         lookup: impl Fn(&str) -> Option<String>,
     ) -> anyhow::Result<Self> {
-        let name = &config.ha.token_env;
-        match lookup(name) {
-            Some(ha_token) if !ha_token.is_empty() => Ok(Self { ha_token }),
-            _ => anyhow::bail!("environment variable {name} is not set or is empty"),
-        }
+        let secret = |name: &str| match lookup(name) {
+            Some(value) if !value.is_empty() => Ok(value),
+            _ => Err(anyhow::anyhow!(
+                "environment variable {name} is not set or is empty"
+            )),
+        };
+        Ok(Self {
+            ha_token: secret(&config.ha.token_env)?,
+            openai_key: secret(&config.openai.api_key_env)?,
+        })
     }
 }
 
@@ -625,7 +658,7 @@ where
     let mut shutdown = pin::pin!(startup.shutdown);
     // The models can load for a long time, so a shutdown stops the start too.
     let (app, pools_task) = tokio::select! {
-        started = start_app(&config, catalog, pools, home) => started?,
+        started = start_app(&config, catalog, pools, home, reasoner(&config, &secrets)?) => started?,
         () = &mut shutdown => return Ok(()),
     };
     serve_until(config.listen, app, pools_task, shutdown).await
@@ -689,9 +722,21 @@ where
     Ok(HaHome::start(move || connector(&host, port), token, ha))
 }
 
-/// The app of `config`, `catalog` and the source pools `pools` on `home`, and its pools task.
-/// Starts the pools task and the sync, and loads the System One model, then the STT and TTS
-/// models. Then starts the pre-render.
+/// The reasoner of `config` with the `OpenAI` API key of `secrets`.
+///
+/// # Errors
+///
+/// The HTTP client cannot be built.
+fn reasoner(config: &Config, secrets: &Secrets) -> anyhow::Result<Arc<dyn Reasoner>> {
+    Ok(Arc::new(OpenAiReasoner::try_new(
+        &config.openai,
+        &secrets.openai_key,
+    )?))
+}
+
+/// The app of `config`, `catalog` and the source pools `pools` on `home` and `reasoner`, and its
+/// pools task. Starts the pools task and the sync, and loads the System One model, then the STT
+/// and TTS models. Then starts the pre-render.
 ///
 /// # Errors
 ///
@@ -701,11 +746,12 @@ async fn start_app(
     catalog: Catalog,
     pools: Pools,
     home: Arc<dyn Home>,
+    reasoner: Arc<dyn Reasoner>,
 ) -> anyhow::Result<(App, JoinHandle<()>)> {
     let store = Arc::new(FileStore::try_new(config.pools.clone())?);
     let task = app::conversation::start_pools(pools, store)?;
     let (cache, queues) = start_sync(home, &config.announce);
-    let (classifier, listener, speech) = load_models(config).await?;
+    let (classifier, listener, speech) = load_models(config, reasoner).await?;
     start_prerender(&speech, &task.pools, cache);
     let rng = StdRng::seed_from_u64(SystemClock.now().as_millisecond().unsigned_abs());
     let (catalog, threshold) = (Arc::new(catalog), config.model.threshold);
@@ -721,14 +767,15 @@ async fn start_app(
 }
 
 /// The System One model of `config`, then the listener on the STT models of `config`, which
-/// predicts with that model, and the speech use case on the TTS model of `config`. The STT and
-/// TTS models load on a blocking thread.
+/// predicts with that model and warms `reasoner`, and the speech use case on the TTS model of
+/// `config`. The STT and TTS models load on a blocking thread.
 ///
 /// # Errors
 ///
 /// A model cannot load.
 async fn load_models(
     config: &Config,
+    reasoner: Arc<dyn Reasoner>,
 ) -> anyhow::Result<(Arc<dyn Classifier>, Listener, Arc<Speech>)> {
     let dir = config.model.dir.join("fixture");
     let model = OnnxLoader.load(&dir, config.device).await?;
@@ -736,7 +783,7 @@ async fn load_models(
     let (asr, tts, device) = (config.asr.clone(), config.tts.clone(), config.device);
     let stt = tokio::task::spawn_blocking(move || SherpaStt::try_new(&asr, device)).await??;
     let tts = tokio::task::spawn_blocking(move || SherpaTts::try_new(&tts, device)).await??;
-    let listener = listener(config, Arc::new(stt), Arc::clone(&classifier));
+    let listener = listener(config, Arc::new(stt), Arc::clone(&classifier), reasoner);
     Ok((classifier, listener, Arc::new(Speech::new(Arc::new(tts)))))
 }
 
@@ -871,6 +918,7 @@ mod tests {
     use crate::testing::fakes;
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeHome;
+    use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeStt;
     use crate::testing::fakes::FakeTts;
@@ -939,6 +987,14 @@ mod tests {
                 model_dir: PathBuf::from("models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11"),
                 voice: 6,
                 num_steps: 4,
+            },
+            openai: OpenAiConfig {
+                api_key_env: "OPENAI_API_KEY".to_owned(),
+                model: "gpt-4.1-nano".to_owned(),
+                timeout_ms: 8000,
+                warm_idle_s: 60,
+                max_output_tokens: 150,
+                bulk_max_output_tokens: 8000,
             },
             announce: AnnounceConfig {
                 margin_ms: 300,
@@ -1098,7 +1154,8 @@ mod tests {
     /// AC-1.2-1.
     #[test]
     fn ac_1_2_1_resolve_returns_ha_token() -> anyhow::Result<()> {
-        assert_eq!(resolve(&[("HA_TOKEN", "abc")])?.ha_token, "abc");
+        let secrets = resolve(&[("HA_TOKEN", "abc"), ("OPENAI_API_KEY", "key")])?;
+        assert_eq!(secrets.ha_token, "abc");
         Ok(())
     }
 
@@ -1238,7 +1295,8 @@ mod tests {
         let task = app::conversation::start_pools(pools(&catalog), Arc::new(FakeStore::new(None)))?;
         let (rng, threshold) = (StdRng::seed_from_u64(1), config.model.threshold);
         let (pools, changes, catalog) = (task.pools, task.changes, Arc::new(catalog));
-        let listener = listener(&config, stt, Arc::clone(&classifier));
+        let reasoner = Arc::new(FakeReasoner::default());
+        let listener = listener(&config, stt, Arc::clone(&classifier), reasoner);
         let conversation = Conversation::new(
             pools,
             changes,

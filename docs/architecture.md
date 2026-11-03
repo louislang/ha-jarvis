@@ -8,6 +8,7 @@ flowchart LR
         crate_adapters_files[files]
         crate_adapters_ha[ha]
         crate_adapters_onnx[onnx]
+        crate_adapters_openai[openai]
         crate_adapters_sherpa[sherpa]
         crate_adapters_wyoming[wyoming]
     end
@@ -42,6 +43,7 @@ flowchart LR
     crate --> crate_adapters_files
     crate --> crate_adapters_ha
     crate --> crate_adapters_onnx
+    crate --> crate_adapters_openai
     crate --> crate_adapters_sherpa
     crate --> crate_app_conversation
     crate --> crate_app_speech
@@ -63,6 +65,9 @@ flowchart LR
     crate_adapters_onnx --> crate_adapters_onnx
     crate_adapters_onnx --> crate_domain_model
     crate_adapters_onnx --> crate_ports
+    crate_adapters_openai --> crate
+    crate_adapters_openai --> crate_adapters_openai
+    crate_adapters_openai --> crate_ports
     crate_adapters_sherpa --> crate
     crate_adapters_sherpa --> crate_adapters_sherpa
     crate_adapters_sherpa --> crate_domain_speech

@@ -49,6 +49,7 @@ use crate::ports::Info;
 use crate::ports::Listening;
 use crate::ports::ModelLoader;
 use crate::ports::Partial;
+use crate::ports::Reasoner;
 use crate::ports::SpeechToText;
 use crate::ports::Store;
 use crate::ports::SttStream;
@@ -239,6 +240,29 @@ impl ModelLoader for FakeModelLoader {
     async fn load(&self, dir: &Path, _device: Device) -> anyhow::Result<Arc<dyn Classifier>> {
         let classifier = lock(&self.classifiers).pop_front();
         classifier.ok_or_else(|| anyhow::anyhow!("no scripted classifier for {}", dir.display()))
+    }
+}
+
+/// A `Reasoner` that counts the `warm` calls.
+#[derive(Default)]
+pub(crate) struct FakeReasoner {
+    /// The number of `warm` calls.
+    warms: AtomicUsize,
+}
+
+impl FakeReasoner {
+    /// The number of `warm` calls.
+    #[must_use]
+    pub(crate) fn warms(&self) -> usize {
+        self.warms.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl Reasoner for FakeReasoner {
+    async fn warm(&self) -> anyhow::Result<()> {
+        self.warms.fetch_add(1, Ordering::SeqCst);
+        Ok(())
     }
 }
 

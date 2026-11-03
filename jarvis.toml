@@ -36,6 +36,14 @@ model_dir = "models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
 voice = 6     # speaker ID of the Supertonic voice style
 num_steps = 4 # denoising steps
 
+[openai]
+api_key_env = "OPENAI_API_KEY"
+model = "gpt-4.1-nano"
+timeout_ms = 8000
+warm_idle_s = 60
+max_output_tokens = 150      # answers
+bulk_max_output_tokens = 8000 # structured output: generate, paraphrase, propose
+
 [announce]
 margin_ms = 300
 idle_wait_s = 30
