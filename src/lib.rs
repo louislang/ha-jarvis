@@ -284,6 +284,12 @@ pub struct ModelConfig {
 pub struct AsrConfig {
     /// The folder of the streaming transducer of the first pass.
     pub model_dir: PathBuf,
+    /// The file name of the encoder in the model folder.
+    pub encoder: String,
+    /// The file name of the decoder in the model folder.
+    pub decoder: String,
+    /// The file name of the joiner in the model folder.
+    pub joiner: String,
     /// The Silero VAD model file.
     pub vad_model: PathBuf,
     /// The least VAD speech probability of a voiced frame.
@@ -762,6 +768,7 @@ mod tests {
     use tokio::sync::watch;
 
     use crate::adapters::onnx::OnnxLoader;
+    use crate::adapters::sherpa::SherpaStt;
     use crate::adapters::sherpa::SherpaTts;
     use crate::app::conversation::Queues;
     use crate::domain::responses::Pool;
@@ -818,6 +825,9 @@ mod tests {
                 model_dir: PathBuf::from(
                     "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25",
                 ),
+                encoder: "encoder.fp16.onnx".to_owned(),
+                decoder: "decoder.fp16.onnx".to_owned(),
+                joiner: "joiner.fp16.onnx".to_owned(),
                 vad_model: PathBuf::from("models/silero_vad.onnx"),
                 vad_threshold: 0.5,
                 vad_min_silence_ms: 100,
@@ -1449,6 +1459,21 @@ mod tests {
         Ok(total)
     }
 
+    /// True in the child process that runs the ignored test `name` alone. Else runs that child
+    /// and gives false when it passes.
+    fn alone(name: &str) -> anyhow::Result<bool> {
+        let alone = "JARVIS_ALONE";
+        if env::var_os(alone).is_some() {
+            return Ok(true);
+        }
+        let status = std::process::Command::new(env::current_exe()?)
+            .args(["--ignored", "--exact", name])
+            .env(alone, "1")
+            .status()?;
+        anyhow::ensure!(status.success(), "the test fails alone: {status}");
+        Ok(false)
+    }
+
     /// AC-6.2-4.
     #[tokio::test]
     async fn ac_6_2_4_classifier_and_tts_run_in_one_process() -> anyhow::Result<()> {
@@ -1464,14 +1489,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "GPU host"]
     async fn ac_6_2_5_cuda_runs_classifier_and_tts_in_one_process() -> anyhow::Result<()> {
-        let alone = "JARVIS_ALONE";
-        if env::var_os(alone).is_none() {
-            let name = "tests::ac_6_2_5_cuda_runs_classifier_and_tts_in_one_process";
-            let status = std::process::Command::new(env::current_exe()?)
-                .args(["--ignored", "--exact", name])
-                .env(alone, "1")
-                .status()?;
-            anyhow::ensure!(status.success(), "the test fails alone: {status}");
+        if !alone("tests::ac_6_2_5_cuda_runs_classifier_and_tts_in_one_process")? {
             return Ok(());
         }
         let start = gpu_memory()?;
@@ -1486,5 +1504,23 @@ mod tests {
             "GPU memory in MiB: {start} at the start, {middle} after the classifier, {end} after the TTS"
         );
         predict_and_synth(classifier.as_ref(), &tts).await
+    }
+
+    /// AC-6.6c-4. sherpa-onnx falls back to the CPU with only a log line, so the GPU memory of
+    /// this process shows that the first pass loads on CUDA.
+    #[test]
+    #[ignore = "GPU host"]
+    fn ac_6_6c_4_cuda_runs_the_first_pass() -> anyhow::Result<()> {
+        if !alone("tests::ac_6_6c_4_cuda_runs_the_first_pass")? {
+            return Ok(());
+        }
+        let start = gpu_memory()?;
+        let _stt = SherpaStt::try_new(&Config::parse(VALID)?.asr, Device::Cuda)?;
+        let end = gpu_memory()?;
+        assert!(
+            start < end,
+            "GPU memory in MiB: {start} before and {end} after the first pass"
+        );
+        Ok(())
     }
 }

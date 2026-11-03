@@ -37,6 +37,10 @@ const RATE: u16 = 16_000;
 /// The samples of one Silero VAD frame.
 const WINDOW: u16 = 512;
 
+/// The zeros that flush the last word at the end of a VAD speech segment: 640 ms. The model emits
+/// the last token about 410 ms of audio after the last voiced sample, and 480 ms is not enough.
+const FLUSH: usize = 10_240;
+
 /// A `SpeechToText` with a streaming transducer and the Silero VAD.
 pub struct SherpaStt {
     /// The streaming recognizer.
@@ -54,19 +58,19 @@ impl SherpaStt {
     ///
     /// The model cannot load.
     pub fn try_new(config: &AsrConfig, device: Device) -> anyhow::Result<Self> {
-        let vad = vad(config, device);
+        let vad = vad(config);
         let min_silence = config.vad_min_silence_ms * u64::from(RATE) / 1000;
         let dir = &config.model_dir;
         let file = |name: &str| Some(file(dir, name));
         let transducer = OnlineTransducerModelConfig {
-            encoder: file("encoder.int8.onnx"),
-            decoder: file("decoder.int8.onnx"),
-            joiner: file("joiner.int8.onnx"),
+            encoder: file(&config.encoder),
+            decoder: file(&config.decoder),
+            joiner: file(&config.joiner),
         };
         let model_config = OnlineModelConfig {
             transducer,
             tokens: file("tokens.txt"),
-            provider: Some(provider(device)),
+            provider: Some(stt_provider(device)),
             num_threads: 4,
             ..OnlineModelConfig::default()
         };
@@ -84,8 +88,9 @@ impl SherpaStt {
     }
 }
 
-/// The Silero VAD configuration of `config` on `device`.
-fn vad(config: &AsrConfig, device: Device) -> VadModelConfig {
+/// The Silero VAD configuration of `config`. The VAD runs on the CPU, where it is faster than on
+/// CUDA.
+fn vad(config: &AsrConfig) -> VadModelConfig {
     let seconds = |ms: u64| Duration::from_millis(ms).as_secs_f32();
     let silero_vad = SileroVadModelConfig {
         model: Some(config.vad_model.to_string_lossy().into_owned()),
@@ -102,7 +107,7 @@ fn vad(config: &AsrConfig, device: Device) -> VadModelConfig {
         silero_vad,
         sample_rate: i32::from(RATE),
         num_threads: 1,
-        provider: Some(provider(device)),
+        provider: Some(provider(Device::Cpu)),
         ..VadModelConfig::default()
     }
 }
@@ -141,13 +146,24 @@ struct SherpaStream {
 }
 
 impl SherpaStream {
-    /// Updates the VAD positions after `count` more samples of at most one frame.
-    fn track(&mut self, count: usize) {
+    /// Feeds `wave` to the recognizer and decodes it.
+    fn decode(&self, wave: &[f32]) {
+        self.stream.accept_waveform(i32::from(RATE), wave);
+        while self.recognizer.is_ready(&self.stream) {
+            self.recognizer.decode(&self.stream);
+        }
+    }
+
+    /// Updates the VAD positions after `count` more samples of at most one frame. Gives true when
+    /// the VAD ends a speech segment.
+    fn track(&mut self, count: usize) -> bool {
         self.fed += count as u64;
+        let mut ended = false;
         while let Some(segment) = self.vad.front() {
             let end = segment.start().unsigned_abs() + u64::from(segment.n().unsigned_abs());
             self.voice_end = Some(end);
             self.vad.pop();
+            ended = true;
         }
         let detected = self.vad.detected();
         // In a segment, the VAD holds the frames that can end it. Out of one, it holds the frame
@@ -165,6 +181,7 @@ impl SherpaStream {
         if detected {
             self.voice_end = Some(self.decided);
         }
+        ended
     }
 }
 
@@ -174,14 +191,17 @@ impl SttStream for SherpaStream {
             .iter()
             .map(|&sample| f32::from(sample) / f32::from(i16::MAX))
             .collect();
-        self.stream.accept_waveform(i32::from(RATE), &wave);
-        while self.recognizer.is_ready(&self.stream) {
-            self.recognizer.decode(&self.stream);
-        }
+        self.decode(&wave);
         // The VAD gives one decision for all frames of one call.
+        let mut ended = false;
         for window in wave.chunks(usize::from(WINDOW)) {
             self.vad.accept_waveform(window);
-            self.track(window.len());
+            ended |= self.track(window.len());
+        }
+        // sherpa-onnx cannot clone a stream, so the zeros go into the live stream, where a commit
+        // and `reset` can follow. They do not move the audio positions.
+        if ended {
+            self.decode(&vec![0.0; FLUSH]);
         }
     }
 
@@ -271,6 +291,15 @@ fn file(dir: &Path, name: &str) -> String {
     dir.join(name).to_string_lossy().into_owned()
 }
 
+/// The execution provider of an STT session on `device`. sherpa-onnx reads the CUDA options from
+/// the file after the colon.
+fn stt_provider(device: Device) -> String {
+    match device {
+        Device::Cuda => "cuda:sherpa-cuda.config".to_owned(),
+        Device::Cpu => provider(device),
+    }
+}
+
 /// The sherpa-onnx execution provider of `device`.
 fn provider(device: Device) -> String {
     match device {
@@ -314,6 +343,9 @@ fn pcm(value: f32) -> i16 {
 /// with the Supertonic-3 model.
 #[cfg(test)]
 mod tests {
+    use std::thread;
+    use std::time::Instant;
+
     use super::*;
     use crate::Config;
     use crate::domain::intent;
@@ -336,19 +368,25 @@ mod tests {
         SherpaTts::try_new(&config()?.tts, Device::Cpu)
     }
 
-    /// A new first pass of the `SherpaStt` of `jarvis.toml` on the CPU.
-    fn first_pass() -> anyhow::Result<Box<dyn SttStream>> {
-        SherpaStt::try_new(&config()?.asr, Device::Cpu)?.stream()
+    /// The `SherpaStt` of `jarvis.toml` on `device`. The CPU loads the int8 files.
+    fn stt(device: Device) -> anyhow::Result<SherpaStt> {
+        let mut asr = config()?.asr;
+        if device == Device::Cpu {
+            let int8 = |part: &str| format!("{part}.int8.onnx");
+            (asr.encoder, asr.decoder, asr.joiner) =
+                (int8("encoder"), int8("decoder"), int8("joiner"));
+        }
+        SherpaStt::try_new(&asr, device)
     }
 
-    /// The partial after each 20 ms chunk of `speech(REQUEST)`.
+    /// The partials of `speech(REQUEST)` on the CPU.
     async fn partials() -> anyhow::Result<Vec<Partial>> {
-        partials_of(&fakes::speech(REQUEST).await?)
+        partials_of(&stt(Device::Cpu)?, &fakes::speech(REQUEST).await?)
     }
 
-    /// The partial after each 20 ms chunk of `audio`.
-    fn partials_of(audio: &Audio) -> anyhow::Result<Vec<Partial>> {
-        let mut stream = first_pass()?;
+    /// The partial after each 20 ms chunk of `audio` in a new first pass of `stt`.
+    fn partials_of(stt: &SherpaStt, audio: &Audio) -> anyhow::Result<Vec<Partial>> {
+        let mut stream = stt.stream()?;
         let chunks = speech::chunks(audio, CHUNK);
         let decode = |chunk: &[i16]| {
             stream.accept(chunk);
@@ -360,7 +398,7 @@ mod tests {
     /// The partial of `speech("lights on")`, then the partial after `reset`.
     async fn reset_partials() -> anyhow::Result<(Partial, Partial)> {
         let audio = fakes::speech("lights on").await?;
-        let mut stream = first_pass()?;
+        let mut stream = stt(Device::Cpu)?.stream()?;
         stream.accept(&audio.samples);
         let before = stream.partial();
         stream.reset();
@@ -375,13 +413,49 @@ mod tests {
         last as u64 * 1000 / u64::from(audio.rate)
     }
 
+    /// The normalized text of the last of `partials`.
+    fn final_text(partials: &[Partial]) -> Option<String> {
+        partials
+            .last()
+            .map(|partial| intent::normalize(&partial.text))
+    }
+
+    /// The time of the first pass on `device` of `speech(REQUEST)` up to its last voiced sample,
+    /// after a warm-up, divided by the audio time. The VAD does not end the speech segment, so
+    /// no flush runs.
+    async fn real_time_factor(device: Device) -> anyhow::Result<f64> {
+        let (stt, mut audio) = (stt(device)?, fakes::speech(REQUEST).await?);
+        let end = usize::try_from(last_voiced_ms(&audio))? * usize::from(RATE) / 1000;
+        audio.samples.truncate(end);
+        partials_of(&stt, &audio)?;
+        let start = Instant::now();
+        partials_of(&stt, &audio)?;
+        Ok(start.elapsed().as_secs_f64() / speech::duration(&audio).as_secs_f64())
+    }
+
+    /// The time from the last voiced sample of `audio` to the first partial with `REQUEST` in a
+    /// new first pass of `stt`, with each chunk at its real time.
+    fn last_word_latency(stt: &SherpaStt, audio: &Audio) -> anyhow::Result<Duration> {
+        let mut stream = stt.stream()?;
+        let start = Instant::now();
+        let voiced = start + Duration::from_millis(last_voiced_ms(audio));
+        let chunks = speech::chunks(audio, CHUNK);
+        for (index, chunk) in chunks.into_iter().enumerate() {
+            let arrival = start + Duration::from_millis(20) * u32::try_from(index + 1)?;
+            thread::sleep(arrival.saturating_duration_since(Instant::now()));
+            stream.accept(chunk);
+            if intent::normalize(&stream.partial().text) == REQUEST {
+                return Ok(Instant::now().saturating_duration_since(voiced));
+            }
+        }
+        anyhow::bail!("no partial has the last word")
+    }
+
     /// AC-6.6-1.
     #[tokio::test]
     async fn ac_6_6_1_final_partial_is_the_request() -> anyhow::Result<()> {
         let partials = partials().await?;
-        let text = partials
-            .last()
-            .map(|partial| intent::normalize(&partial.text));
+        let text = final_text(&partials);
         assert_eq!(text.as_deref(), Some(REQUEST), "{partials:?}");
         Ok(())
     }
@@ -414,7 +488,7 @@ mod tests {
         let mut samples = vec![0; 8000];
         samples.extend(&lights.samples);
         let audio = Audio { samples, ..lights };
-        let partials = partials_of(&audio)?;
+        let partials = partials_of(&stt(Device::Cpu)?, &audio)?;
         let silence = &partials[..8000 / CHUNK];
         assert!(
             silence.iter().all(|partial| partial.voice_end_ms.is_none()),
@@ -434,7 +508,7 @@ mod tests {
     async fn ac_6_6b_2_silence_stays_short_until_the_last_voiced_sample() -> anyhow::Result<()> {
         let audio = fakes::speech(REQUEST).await?;
         let early_commit_ms = config()?.asr.early_commit_ms;
-        let partials = partials_of(&audio)?;
+        let partials = partials_of(&stt(Device::Cpu)?, &audio)?;
         let count = usize::try_from(last_voiced_ms(&audio))? / 20;
         for partial in &partials[..count] {
             if let Some(voice_end) = partial.voice_end_ms {
@@ -453,6 +527,53 @@ mod tests {
             "the audio is voiced: {before:?}"
         );
         assert_eq!(after.voice_end_ms, None);
+        Ok(())
+    }
+
+    /// AC-6.6c-1.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn ac_6_6c_1_cuda_final_partial_is_the_request() -> anyhow::Result<()> {
+        let partials = partials_of(&stt(Device::Cuda)?, &fakes::speech(REQUEST).await?)?;
+        let text = final_text(&partials);
+        assert_eq!(text.as_deref(), Some(REQUEST), "{partials:?}");
+        Ok(())
+    }
+
+    /// AC-6.6c-2.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn ac_6_6c_2_cuda_last_word_latency() -> anyhow::Result<()> {
+        let (stt, audio) = (stt(Device::Cuda)?, fakes::speech(REQUEST).await?);
+        // The first run warms up the model.
+        last_word_latency(&stt, &audio)?;
+        let latencies: anyhow::Result<Vec<Duration>> =
+            (0..10).map(|_| last_word_latency(&stt, &audio)).collect();
+        let mut latencies = latencies?;
+        latencies.sort();
+        let p90 = latencies[latencies.len() * 9 / 10];
+        assert!(
+            p90 < Duration::from_millis(300),
+            "p90 {p90:?} of {latencies:?}"
+        );
+        Ok(())
+    }
+
+    /// AC-6.6c-3.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn ac_6_6c_3_cuda_real_time_factor() -> anyhow::Result<()> {
+        let factor = real_time_factor(Device::Cuda).await?;
+        assert!(factor < 0.15, "real-time factor {factor}");
+        Ok(())
+    }
+
+    /// AC-6.6c-5.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn ac_6_6c_5_cpu_real_time_factor() -> anyhow::Result<()> {
+        let factor = real_time_factor(Device::Cpu).await?;
+        assert!(factor < 0.6, "real-time factor {factor}");
         Ok(())
     }
 

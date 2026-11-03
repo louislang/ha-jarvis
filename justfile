@@ -44,6 +44,14 @@ parakeet_sums := """
     a5e223392c90e75f8144cdb5eb95af7625db389e39edef2bd1a9c872b3298fe6  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming/decoder.int8.onnx
     869f43f7d24595c55581ad3bf249a935fb8a71389fbdaa7504b9f46f93140f8a  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming/joiner.int8.onnx
     dc0b4584ab2e4ddbf888425c076c61b736e7356a015250db7d307e6f1a8188ff  sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming/tokens.txt"""
+# The folder of the fp16 STT files, which are not in a download (`01-architecture.md` section 10).
+fp16_models := "/opt/jarvis-models/fp16"
+# The SHA-256 of each fp16 file of the first pass in `fp16_models`.
+nemotron_fp16_sums := """
+    f2ff4ff73af5961cd9680e79868d4ed8f36544455d92115a71012f1a5bb0e55a  nemotron-160ms-encoder.fp16.onnx
+    b4bc4b9579327604ea77d252a50c8bb99b4259324c26e64aa39b756011979f85  nemotron-160ms-encoder.fp16.weights
+    0aad1db9eeaacf2c92ecf7e280281636b82d225c63834e51429cca4f3e7c5f48  nemotron-160ms-decoder.fp16.onnx
+    fb270026bfcdd0fc9cb4c253b5180fd495fefbba8072e65cabe44b95e4e7e53e  nemotron-160ms-joiner.fp16.onnx"""
 # Each build links the sherpa-onnx libraries of this folder, so no build downloads them.
 export SHERPA_ONNX_LIB_DIR := cpu_libraries
 # The environment that loads the ONNX Runtime of `cpu_libraries`.
@@ -60,8 +68,21 @@ cov:
 # Download the CPU libraries and models.
 models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/tts-models" supertonic_sums) (fetch sherpa_onnx + "/asr-models" silero_sums)
 
-# Download the GPU models and the CUDA libraries.
-gpu-models: (fetch sherpa_onnx + "/v2.0.1" cuda_sums) (fetch sherpa_onnx + "/asr-models" parakeet_sums)
+# Download the GPU models and the CUDA libraries, and copy the fp16 files next to the int8 files of the same model.
+gpu-models: cuda-libraries (fetch sherpa_onnx + "/asr-models" parakeet_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (copy-fp16 nemotron_fp16_sums "nemotron-160ms-" "sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25")
+
+# Download the CUDA libraries.
+cuda-libraries: (fetch sherpa_onnx + "/v2.0.1" cuda_sums)
+
+# Check the SHA-256 of each file of `sums` in `fp16_models`, then copy each file without `prefix` to the folder `folder` of `models/`. The encoder names its weights file, so the copied names must not change.
+copy-fp16 sums prefix folder:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ quote(fp16_models) }}
+    shasum -a 256 --check --quiet <<< "{{ sums }}"
+    while read -r _ file; do
+        cp "$file" {{ quote(justfile_directory() / "models" / folder) }}/"${file#{{ prefix }}}"
+    done <<< "{{ sums }}"
 
 # Download the file of the first line of `sums` from `release` to `models/` and extract it when it is an archive, unless its folder or file exists and each file of `sums` has its SHA-256.
 fetch release sums:
