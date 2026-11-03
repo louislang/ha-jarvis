@@ -124,27 +124,40 @@ impl Session {
         let silence_ms = partial
             .voice_end_ms
             .map(|voice_end_ms| partial.vad_ms.saturating_sub(voice_end_ms));
-        let audio_ms = self.samples.len() as u64 / SAMPLES_PER_MS;
         let has_text = !self.text.is_empty();
+        let audio_ms = self.audio_ms();
         speech::should_commit(silence_ms, has_text, audio_ms, self.confident, &self.policy)
     }
 
+    /// The length of the pushed samples in ms.
+    fn audio_ms(&self) -> u64 {
+        self.samples.len() as u64 / SAMPLES_PER_MS
+    }
+
     /// The second-pass text of the pushed samples, else the first-pass text. A second-pass error
-    /// gives the first-pass text.
+    /// gives the first-pass text. Logs the text, its pass and the audio length.
     ///
     /// # Errors
     ///
     /// The second pass panicked.
     async fn transcript(&self) -> anyhow::Result<String> {
         let (stt, samples) = (Arc::clone(&self.stt), self.samples.clone());
-        match tokio::task::spawn_blocking(move || stt.transcribe(&samples)).await? {
-            Ok(Some(text)) => Ok(text),
-            Ok(None) => Ok(self.text.clone()),
-            Err(error) => {
-                tracing::warn!("the second pass failed: {error:#}");
-                Ok(self.text.clone())
-            }
-        }
+        let (text, pass) =
+            match tokio::task::spawn_blocking(move || stt.transcribe(&samples)).await? {
+                Ok(Some(text)) => (text, "second"),
+                Ok(None) => (self.text.clone(), "first"),
+                Err(error) => {
+                    tracing::warn!("the second pass failed: {error:#}");
+                    (self.text.clone(), "first")
+                }
+            };
+        tracing::info!(
+            transcript = text,
+            pass,
+            audio_ms = self.audio_ms(),
+            "transcript"
+        );
+        Ok(text)
     }
 }
 
@@ -260,6 +273,10 @@ fn texts(pools: &Pools, areas: &[String]) -> anyhow::Result<BTreeSet<String>> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use tracing::instrument::WithSubscriber;
+
     use super::*;
     use crate::domain::model::Prediction;
     use crate::domain::responses::Pool;
@@ -419,6 +436,31 @@ mod tests {
     async fn ac_6_8b_2_second_pass_error_gives_the_first_pass_text() -> anyhow::Result<()> {
         let transcript = commit_with(Err("no result".to_owned())).await?;
         assert_eq!(transcript, Some(TEXT.to_owned()));
+        Ok(())
+    }
+
+    /// AC-6.11-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_6_11_3_transcript_logs_one_info_event() -> anyhow::Result<()> {
+        let log = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt().with_writer(Arc::new(log.reopen()?));
+        let second_pass = "turn on the kitchen lights".to_owned();
+        commit_with(Ok(Some(second_pass.clone())))
+            .with_subscriber(subscriber.finish())
+            .await?;
+        let text = fs::read_to_string(log.path())?;
+        let events: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains(" INFO "))
+            .collect();
+        assert_eq!(events.len(), 1, "the log is {text:?}");
+        for part in [second_pass.as_str(), "second"] {
+            assert!(
+                events[0].contains(part),
+                "{part:?} is not in {:?}",
+                events[0]
+            );
+        }
         Ok(())
     }
 

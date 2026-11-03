@@ -33,6 +33,7 @@ tracing = "0.1.44"
 vstd = "=0.0.0-2026-10-25-0158"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 dashmap = "6.2.1"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "env-filter"] }
 
 [package.metadata.verus]
 verify = true
