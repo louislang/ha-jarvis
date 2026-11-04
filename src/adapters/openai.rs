@@ -4,26 +4,42 @@ use std::mem;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
+use async_openai::types::responses::CreateResponse;
 use async_openai::types::responses::CreateResponseArgs;
+use async_openai::types::responses::FunctionTool;
+use async_openai::types::responses::FunctionToolCall;
+use async_openai::types::responses::InputItem;
+use async_openai::types::responses::InputParam;
+use async_openai::types::responses::OutputItem;
+use async_openai::types::responses::ResponseCompletedEvent;
 use async_openai::types::responses::ResponseFailedEvent;
 use async_openai::types::responses::ResponseIncompleteEvent;
+use async_openai::types::responses::ResponseOutputItemDoneEvent;
 use async_openai::types::responses::ResponseRefusalDeltaEvent;
 use async_openai::types::responses::ResponseStreamEvent;
 use async_openai::types::responses::ResponseTextDeltaEvent;
 use async_openai::types::responses::Status;
+use async_openai::types::responses::Tool;
 use async_trait::async_trait;
 use futures::StreamExt;
-use futures::TryStreamExt;
+use futures::channel::mpsc;
+use futures::channel::oneshot;
 use futures::future;
 use futures::stream;
 use futures::stream::BoxStream;
+use serde::Deserialize;
+use serde_json::Map;
+use serde_json::Value;
+use serde_json::json;
 use tokio::time::Instant;
 
 use crate::OpenAiConfig;
 use crate::domain::decide::Question;
 use crate::domain::speech;
+use crate::domain::state::ServiceCall;
 use crate::ports::Reasoner;
 use crate::ports::Step;
 
@@ -52,7 +68,7 @@ pub fn user_message(question: &Question) -> String {
     let entities: Vec<String> = question
         .entities
         .iter()
-        .map(|entity| format!("- {}: {}\n", entity.name, entity.state))
+        .map(|item| format!("- {} ({}): {}\n", item.name, item.entity_id, item.state))
         .collect();
     format!(
         "Time: {}\nLocation: {}\nArea: {area}\nEntities:\n{}Request: {}",
@@ -61,6 +77,46 @@ pub fn user_message(question: &Question) -> String {
         entities.concat(),
         question.text
     )
+}
+
+/// The `call_service` tool: one HA service call.
+fn call_service() -> Tool {
+    Tool::Function(FunctionTool {
+        name: "call_service".to_owned(),
+        description: Some("Calls a Home Assistant service on entities of the house.".to_owned()),
+        parameters: Some(json!({
+            "type": "object",
+            "properties": {
+                "domain": {"type": "string", "description": "For example light."},
+                "service": {"type": "string", "description": "For example turn_on."},
+                "target": {"type": "array", "items": {"type": "string"}, "description": "Entity IDs."},
+                "data": {"type": "object", "description": "The service data."},
+            },
+            "required": ["domain", "service", "target", "data"],
+        })),
+        // Strict mode does not permit the free-form `data` object.
+        strict: Some(false),
+        ..FunctionTool::default()
+    })
+}
+
+/// The arguments of a `call_service` tool call.
+#[derive(Deserialize)]
+struct Arguments {
+    /// For example `light`.
+    domain: String,
+    /// For example `turn_on`.
+    service: String,
+    /// The target entity IDs.
+    target: Vec<String>,
+    /// The service data.
+    data: Map<String, Value>,
+}
+
+/// The text in `buffer` as the last sentence, or `None` when it is empty.
+fn rest(buffer: &mut String) -> Option<Step> {
+    let rest = mem::take(buffer);
+    (!rest.is_empty()).then_some(Step::Sentence(rest))
 }
 
 /// The steps of the answer stream `event`. A refusal is spoken as the answer. `buffer` keeps the
@@ -78,9 +134,7 @@ fn steps(buffer: &mut String, event: ResponseStreamEvent) -> anyhow::Result<Vec<
             Ok(complete.into_iter().map(Step::Sentence).collect())
         }
         ResponseStreamEvent::ResponseCompleted(_) => {
-            let rest = mem::take(buffer);
-            let last = (!rest.is_empty()).then_some(Step::Sentence(rest));
-            Ok(last.into_iter().chain([Step::Done]).collect())
+            Ok(rest(buffer).into_iter().chain([Step::Done]).collect())
         }
         ResponseStreamEvent::ResponseFailed(ResponseFailedEvent { response, .. })
         | ResponseStreamEvent::ResponseIncomplete(ResponseIncompleteEvent { response, .. }) => {
@@ -93,6 +147,103 @@ fn steps(buffer: &mut String, event: ResponseStreamEvent) -> anyhow::Result<Vec<
     }
 }
 
+/// One answer in progress: one response request for each round of tool calls.
+struct Answer {
+    /// The API client.
+    client: Client<OpenAIConfig>,
+    /// The request of the next response.
+    request: CreateResponse,
+    /// The tool outputs of the current response.
+    outputs: Vec<InputItem>,
+    /// The number of tool calls that the answer can still make.
+    calls_left: u32,
+    /// The channel of the steps to the consumer.
+    steps: mpsc::UnboundedSender<anyhow::Result<Step>>,
+}
+
+impl Answer {
+    /// Sends the steps of one response and runs its tool calls. True when the response
+    /// completes with a tool call, so the answer continues.
+    async fn round(&mut self) -> anyhow::Result<bool> {
+        let request = self.request.clone();
+        let mut events = self.client.responses().create_stream(request).await?;
+        let mut buffer = String::new();
+        let mut next = false;
+        while let Some(event) = events.next().await {
+            next |= self.event(&mut buffer, event?).await?;
+        }
+        Ok(next)
+    }
+
+    /// Sends the steps of `event` or runs its tool call. `buffer` keeps the text after the last
+    /// complete sentence. True when the response completes with a tool call.
+    async fn event(
+        &mut self,
+        buffer: &mut String,
+        event: ResponseStreamEvent,
+    ) -> anyhow::Result<bool> {
+        match event {
+            ResponseStreamEvent::ResponseOutputItemDone(ResponseOutputItemDoneEvent {
+                item: OutputItem::FunctionCall(call),
+                ..
+            }) => self.call(call).await?,
+            ResponseStreamEvent::ResponseCompleted(ResponseCompletedEvent { response, .. })
+                if !self.outputs.is_empty() =>
+            {
+                self.request.previous_response_id = Some(response.id);
+                self.request.input = InputParam::Items(mem::take(&mut self.outputs));
+                self.send(rest(buffer))?;
+                return Ok(true);
+            }
+            event => self.send(steps(buffer, event)?)?,
+        }
+        Ok(false)
+    }
+
+    /// Runs the tool call `call` through the consumer and keeps its output.
+    async fn call(&mut self, call: FunctionToolCall) -> anyhow::Result<()> {
+        let result = match self.service_call(&call.arguments) {
+            Ok(service_call) => {
+                let (reply, result) = oneshot::channel();
+                self.send([Step::Call(service_call, reply)])?;
+                result.await?
+            }
+            Err(error) => Err(error),
+        };
+        let output = match result {
+            Ok(Some(response)) => response.to_string(),
+            Ok(None) => "done".to_owned(),
+            Err(error) => format!("error: {error:#}"),
+        };
+        let output =
+            json!({"type": "function_call_output", "call_id": call.call_id, "output": output});
+        self.outputs.push(serde_json::from_value(output)?);
+        Ok(())
+    }
+
+    /// The service call of the tool call `arguments`. An error when the answer has
+    /// `max_tool_calls` calls or the arguments are not valid.
+    fn service_call(&mut self, arguments: &str) -> anyhow::Result<ServiceCall> {
+        self.calls_left = self.calls_left.checked_sub(1).context("limit reached")?;
+        let arguments: Arguments = serde_json::from_str(arguments)?;
+        Ok(ServiceCall {
+            domain: arguments.domain,
+            service: arguments.service,
+            target: arguments.target,
+            data: arguments.data,
+            return_response: false,
+        })
+    }
+
+    /// Sends `steps` to the consumer.
+    fn send(&self, steps: impl IntoIterator<Item = Step>) -> anyhow::Result<()> {
+        for step in steps {
+            self.steps.unbounded_send(Ok(step))?;
+        }
+        Ok(())
+    }
+}
+
 /// A `Reasoner` on one HTTP client for the process life. Its pooled connections have no idle
 /// timeout and TCP keepalive.
 pub struct OpenAiReasoner {
@@ -102,6 +253,8 @@ pub struct OpenAiReasoner {
     model: String,
     /// The output token limit of an answer.
     max_output_tokens: u32,
+    /// The most tool calls of one answer.
+    max_tool_calls: u32,
     /// The time since the last request after which `warm` sends a request.
     warm_idle: Duration,
     /// The time of the last request, or `None` before the first request.
@@ -132,6 +285,7 @@ impl OpenAiReasoner {
             client: Client::build(http, api),
             model: config.model.clone(),
             max_output_tokens: config.max_output_tokens,
+            max_tool_calls: config.max_tool_calls,
             warm_idle: Duration::from_secs(config.warm_idle_s),
             last_request: Mutex::new(None),
         })
@@ -183,25 +337,32 @@ impl Reasoner for OpenAiReasoner {
             .model(&self.model)
             .instructions(system_prompt())
             .input(user_message(question))
+            .tools([call_service()])
             .max_output_tokens(self.max_output_tokens)
-            .store(false)
             .build();
         let recorded = self.record_when_idle(Duration::ZERO);
         let client = self.client.clone();
-        let events = async move {
+        let calls_left = self.max_tool_calls;
+        let (steps, receiver) = mpsc::unbounded();
+        let errors = steps.clone();
+        let run = async move {
             recorded?;
-            anyhow::Ok(client.responses().create_stream(request?).await?)
+            let mut answer = Answer {
+                client,
+                request: request?,
+                outputs: Vec::new(),
+                calls_left,
+                steps,
+            };
+            while answer.round().await? {}
+            Ok(())
         };
-        let events = stream::once(events)
-            .map_ok(|events| events.map_err(anyhow::Error::from))
-            .try_flatten();
-        let steps = events.scan(String::new(), |buffer, event| {
-            future::ready(Some(event.and_then(|event| steps(buffer, event))))
-        });
-        steps
-            .map_ok(|steps| stream::iter(steps.into_iter().map(Ok)))
-            .try_flatten()
-            .boxed()
+        let run =
+            stream::once(
+                async move { run.await.or_else(|error| errors.unbounded_send(Err(error))) },
+            );
+        // The steps and the error go through one channel, so the error comes after the steps.
+        stream::select(receiver, run.filter_map(|_sent| future::ready(None))).boxed()
     }
 }
 
@@ -209,7 +370,7 @@ impl Reasoner for OpenAiReasoner {
 mod tests {
     use super::*;
 
-    use anyhow::Context as _;
+    use futures::TryStreamExt;
     use serde_json::Value;
     use serde_json::json;
     use wiremock::Mock;
@@ -322,9 +483,24 @@ mod tests {
         user_message(&question(area))
     }
 
-    /// The steps of an answer that a mock `OpenAI` server streams as `deltas` of the event `kind`.
-    async fn answered(kind: &str, deltas: &[&str]) -> anyhow::Result<Vec<Step>> {
-        let texts = deltas.iter().map(|delta| {
+    /// A response stream of `events` and a completed event.
+    fn stream(events: impl IntoIterator<Item = Value>) -> ResponseTemplate {
+        let completed = json!({
+            "type": "response.completed",
+            "sequence_number": 0,
+            "response": response("completed"),
+        });
+        let events: Vec<String> = events
+            .into_iter()
+            .chain([completed])
+            .map(|event| format!("data: {event}\n\n"))
+            .collect();
+        ResponseTemplate::new(200).set_body_raw(events.concat(), "text/event-stream")
+    }
+
+    /// A response stream of `deltas` of the event `kind`.
+    fn spoken(kind: &str, deltas: &[&str]) -> ResponseTemplate {
+        stream(deltas.iter().map(|delta| {
             json!({
                 "type": kind,
                 "sequence_number": 0,
@@ -333,23 +509,133 @@ mod tests {
                 "content_index": 0,
                 "delta": delta,
             })
+        }))
+    }
+
+    /// A step with the reply of a call left out.
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        /// A sentence.
+        Sentence(String),
+        /// A service call.
+        Call(ServiceCall),
+        /// The end of the answer.
+        Done,
+    }
+
+    /// The steps of an answer that a mock `OpenAI` server streams as `template`, then "It is on."
+    /// after a tool output, and the server. Each call gives `{"state": "on"}`.
+    async fn served(template: ResponseTemplate) -> anyhow::Result<(MockServer, Vec<Seen>)> {
+        let (server, reasoner) = serve(template).await?;
+        Mock::given(matchers::body_string_contains("function_call_output"))
+            .respond_with(spoken(TEXT, &["It is on."]))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let mut steps = reasoner.answer(&question(Some("kitchen")));
+        let mut seen = Vec::new();
+        while let Some(step) = steps.try_next().await? {
+            seen.push(match step {
+                Step::Sentence(text) => Seen::Sentence(text),
+                Step::Call(call, reply) => {
+                    let sent = reply.send(Ok(Some(json!({"state": "on"}))));
+                    anyhow::ensure!(sent.is_ok(), "the answer dropped the reply");
+                    Seen::Call(call)
+                }
+                Step::Done => Seen::Done,
+            });
+        }
+        Ok((server, seen))
+    }
+
+    /// The steps of an answer that a mock `OpenAI` server streams as `deltas` of the event `kind`.
+    async fn answered(kind: &str, deltas: &[&str]) -> anyhow::Result<Vec<Seen>> {
+        Ok(served(spoken(kind, deltas)).await?.1)
+    }
+
+    /// The steps of an answer whose first response has a tool call `call_<n>` for each of
+    /// `arguments`, and the tool outputs of the last request.
+    async fn called(arguments: &[&str]) -> anyhow::Result<(Vec<Seen>, Vec<Value>)> {
+        let calls = arguments.iter().zip(1..).map(|(arguments, number)| {
+            json!({
+                "type": "response.output_item.done",
+                "sequence_number": 0,
+                "output_index": 0,
+                "item": {
+                    "type": "function_call",
+                    "call_id": format!("call_{number}"),
+                    "name": "call_service",
+                    "arguments": arguments,
+                },
+            })
         });
-        let completed = json!({
-            "type": "response.completed",
-            "sequence_number": 0,
-            "response": response("completed"),
+        let (server, seen) = served(stream(calls)).await?;
+        let requests = server.received_requests().await.context("no requests")?;
+        let body: Value = requests.last().context("no request")?.body_json()?;
+        let input = body["input"]
+            .as_array()
+            .context("the input is not a list")?;
+        let outputs = input
+            .iter()
+            .filter(|item| item["type"] == "function_call_output");
+        Ok((seen, outputs.cloned().collect()))
+    }
+
+    /// Valid `call_service` arguments.
+    const LIGHT_ON: &str = r#"{"domain": "light", "service": "turn_on",
+        "target": ["light.overhead"], "data": {"brightness_pct": 50}}"#;
+
+    /// AC-7.4-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_4_1_tool_call_gives_call_step() -> anyhow::Result<()> {
+        let (seen, _outputs) = called(&[LIGHT_ON]).await?;
+        let call = ServiceCall {
+            domain: "light".to_owned(),
+            service: "turn_on".to_owned(),
+            target: vec!["light.overhead".to_owned()],
+            data: serde_json::from_value(json!({"brightness_pct": 50}))?,
+            return_response: false,
+        };
+        assert_eq!(seen[0], Seen::Call(call));
+        Ok(())
+    }
+
+    /// AC-7.4-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_4_2_result_goes_to_the_model_then_final_text() -> anyhow::Result<()> {
+        let (seen, outputs) = called(&[LIGHT_ON]).await?;
+        let output = json!({
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": r#"{"state":"on"}"#,
         });
-        let events: Vec<String> = texts
-            .chain([completed])
-            .map(|event| format!("data: {event}\n\n"))
-            .collect();
-        let template =
-            ResponseTemplate::new(200).set_body_raw(events.concat(), "text/event-stream");
-        let (_server, reasoner) = serve(template).await?;
-        reasoner
-            .answer(&question(Some("kitchen")))
-            .try_collect()
-            .await
+        assert_eq!(outputs, [output]);
+        assert_eq!(
+            seen[1..],
+            [Seen::Sentence("It is on.".to_owned()), Seen::Done]
+        );
+        Ok(())
+    }
+
+    /// AC-7.4-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_4_3_invalid_arguments_give_a_tool_error() -> anyhow::Result<()> {
+        let (seen, outputs) = called(&[r#"{"domain": "light"}"#]).await?;
+        assert_eq!(seen, [Seen::Sentence("It is on.".to_owned()), Seen::Done]);
+        let output = outputs[0]["output"].as_str().context("no output")?;
+        assert!(output.starts_with("error: "), "the output is {output:?}");
+        Ok(())
+    }
+
+    /// AC-7.4-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_4_4_call_after_the_limit_gives_limit_reached() -> anyhow::Result<()> {
+        let (seen, outputs) = called(&[LIGHT_ON; 6]).await?;
+        let calls = seen.iter().filter(|step| matches!(step, Seen::Call(_)));
+        assert_eq!(calls.count(), 5);
+        assert_eq!(outputs[5]["call_id"], "call_6");
+        assert_eq!(outputs[5]["output"], "error: limit reached");
+        Ok(())
     }
 
     /// An answer within `warm_idle_s` of the next `warm` counts as the last request.
@@ -374,7 +660,7 @@ mod tests {
         let steps = answered("response.refusal.delta", &["I can't help."]).await?;
         assert_eq!(
             steps,
-            [Step::Sentence("I can't help.".to_owned()), Step::Done]
+            [Seen::Sentence("I can't help.".to_owned()), Seen::Done]
         );
         Ok(())
     }
@@ -383,7 +669,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_7_3_2_rest_is_the_last_sentence_at_the_end() -> anyhow::Result<()> {
         let steps = answered(TEXT, &["Hello there. It", " is"]).await?;
-        assert_eq!(steps[1..], [Step::Sentence("It is".to_owned()), Step::Done]);
+        assert_eq!(steps[1..], [Seen::Sentence("It is".to_owned()), Seen::Done]);
         Ok(())
     }
 
@@ -394,9 +680,9 @@ mod tests {
         assert_eq!(
             steps,
             [
-                Step::Sentence("Hello there.".to_owned()),
-                Step::Sentence("How are you?".to_owned()),
-                Step::Done,
+                Seen::Sentence("Hello there.".to_owned()),
+                Seen::Sentence("How are you?".to_owned()),
+                Seen::Done,
             ]
         );
         Ok(())
@@ -425,12 +711,12 @@ mod tests {
         assert_eq!(
             entity_lines(&asked(Some("kitchen"))),
             [
-                "- Carson Kitchen Media Player: idle",
-                "- Thermostat: heat",
-                "- Thermostat Current Temperature: 63.5",
-                "- Thermostat Motion: on",
-                "- Overhead Light: off",
-                "- Strawberry Lamp: on",
+                "- Carson Kitchen Media Player (media_player.carson_kitchen_media_player): idle",
+                "- Thermostat (climate.thermostat): heat",
+                "- Thermostat Current Temperature (sensor.thermostat_current_temperature): 63.5",
+                "- Thermostat Motion (binary_sensor.thermostat_motion): on",
+                "- Overhead Light (light.kitchen): off",
+                "- Strawberry Lamp (light.strawberry_lamp): on",
             ]
         );
     }

@@ -104,12 +104,14 @@ pub struct Question {
     pub now: DateTime,
 }
 
-/// The name and the state of one entity.
+/// The name, the entity ID and the state of one entity.
 #[verus_verify]
 #[derive(Clone, Debug, PartialEq)]
 pub struct EntityState {
     /// The name that HA shows.
     pub name: String,
+    /// For example `light.overhead`.
+    pub entity_id: String,
     /// For example `on` or `64.0`.
     pub state: String,
 }
@@ -167,6 +169,7 @@ fn area_entities(area: &AreaId, cache: &StateCache) -> Vec<EntityState> {
         if let (true, Some(state)) = (present, cache.state(entity.entity_id.0.as_str())) {
             found.push(EntityState {
                 name: entity.name.clone(),
+                entity_id: entity.entity_id.0.clone(),
                 state: state.state.clone(),
             });
         }

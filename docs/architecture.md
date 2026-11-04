@@ -69,6 +69,7 @@ flowchart LR
     crate_adapters_openai --> crate_adapters_openai
     crate_adapters_openai --> crate_domain_decide
     crate_adapters_openai --> crate_domain_speech
+    crate_adapters_openai --> crate_domain_state
     crate_adapters_openai --> crate_ports
     crate_adapters_sherpa --> crate
     crate_adapters_sherpa --> crate_adapters_sherpa
