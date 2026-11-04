@@ -45,6 +45,7 @@ flowchart LR
     crate --> crate_adapters_onnx
     crate --> crate_adapters_openai
     crate --> crate_adapters_sherpa
+    crate --> crate_app_background
     crate --> crate_app_conversation
     crate --> crate_app_speech
     crate --> crate_domain_catalog
@@ -80,11 +81,13 @@ flowchart LR
     crate_app_background --> crate
     crate_app_background --> crate_app_background
     crate_app_background --> crate_app_conversation
+    crate_app_background --> crate_app_speech
     crate_app_background --> crate_domain_catalog
     crate_app_background --> crate_domain_responses
     crate_app_background --> crate_domain_state
     crate_app_background --> crate_domain_state_cache
     crate_app_background --> crate_ports
+    crate_app_conversation --> crate_app_background
     crate_app_conversation --> crate_app_conversation
     crate_app_conversation --> crate_domain_catalog
     crate_app_conversation --> crate_domain_decide

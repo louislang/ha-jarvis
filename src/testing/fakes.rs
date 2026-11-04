@@ -389,6 +389,8 @@ impl FakeTts {
 impl TextToSpeech for FakeTts {
     async fn synth(&self, text: &str) -> anyhow::Result<Audio> {
         lock(&self.texts).push(text.to_owned());
+        // Other tasks run during a synthesis, as with a real TTS.
+        tokio::task::yield_now().await;
         Ok(Audio {
             samples: Vec::new(),
             rate: 16_000,

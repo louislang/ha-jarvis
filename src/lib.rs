@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::pin;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -45,7 +46,10 @@ use crate::adapters::onnx::OnnxLoader;
 use crate::adapters::openai::OpenAiReasoner;
 use crate::adapters::sherpa::SherpaStt;
 use crate::adapters::sherpa::SherpaTts;
+use crate::app::background::Backfill;
+use crate::app::conversation::Change;
 use crate::app::conversation::Conversation;
+use crate::app::conversation::PoolsTask;
 use crate::app::conversation::Queues;
 use crate::app::conversation::SystemTwo;
 use crate::app::speech::Listener;
@@ -779,27 +783,49 @@ async fn start_app(
     home: Arc<dyn Home>,
     reasoner: Arc<dyn Reasoner>,
 ) -> anyhow::Result<(App, JoinHandle<()>)> {
-    let store = Arc::new(FileStore::try_new(config.pools.clone())?);
-    let task = app::conversation::start_pools(pools, store)?;
+    let task = start_pools(config, pools)?;
     let (cache, queues) = start_sync(home, &config.announce);
     let (classifier, listener, speech) = load_models(config, Arc::clone(&reasoner)).await?;
-    start_prerender(&speech, &task.pools, cache);
-    let (catalog, threshold) = (Arc::new(catalog), config.model.threshold);
+    start_prerender(&speech, &task.pools, cache.clone());
+    let catalog = Arc::new(catalog);
+    let backfill = backfill(config, &reasoner, task.changes, &speech, &catalog, cache);
     let two = system_two(&config.openai, reasoner, Arc::new(SystemClock));
+    let threshold = config.model.threshold;
     let app = App {
         conversation: Conversation::new(
-            task.pools,
-            task.changes,
-            queues,
-            classifier,
-            catalog,
-            threshold,
-            two,
+            task.pools, backfill, queues, classifier, catalog, threshold, two,
         ),
         listener,
         speech,
     };
     Ok((app, task.task))
+}
+
+/// Starts the pools task of the source pools `pools` and the saved pools of `config`.
+///
+/// # Errors
+///
+/// The saved pools cannot load.
+fn start_pools(config: &Config, pools: Pools) -> anyhow::Result<PoolsTask> {
+    let store = Arc::new(FileStore::try_new(config.pools.clone())?);
+    app::conversation::start_pools(pools, store)
+}
+
+/// The backfill of `config` with `reasoner`, the pools task of `changes`, the pre-render of
+/// `speech`, `catalog` and the hot cache `cache`.
+fn backfill(
+    config: &Config,
+    reasoner: &Arc<dyn Reasoner>,
+    changes: mpsc::Sender<Change>,
+    speech: &Arc<Speech>,
+    catalog: &Arc<Catalog>,
+    cache: watch::Receiver<StateCache>,
+) -> Arc<Backfill> {
+    let (reasoner, speech) = (Arc::clone(reasoner), Arc::clone(speech));
+    let (backfill, catalog) = (config.backfill.clone(), Arc::clone(catalog));
+    Arc::new(Backfill::new(
+        backfill, reasoner, changes, speech, catalog, cache,
+    ))
 }
 
 /// System Two on `reasoner` and `clock` with the timeout and the call rules of `openai`.
@@ -865,12 +891,7 @@ fn start_prerender(
         if cache.changed().await.is_err() {
             return;
         }
-        let areas: Vec<String> = cache
-            .borrow()
-            .areas
-            .iter()
-            .map(|area| area.name.clone())
-            .collect();
+        let areas = app::background::area_names(&cache.borrow());
         if let Err(error) = speech.prerender(&pools.load_full(), &areas).await {
             tracing::warn!("the pre-render failed: {error:#}");
         }
@@ -1405,6 +1426,30 @@ mod tests {
         system_two(&config.openai, Arc::new(FakeReasoner::default()), clock)
     }
 
+    /// The conversation of `config` with `classifier`, `queues()`, `two(config)`, the pools of
+    /// `catalog` and a backfill on `FakeReasoner` and `speech`.
+    fn conversation(
+        config: &Config,
+        catalog: Catalog,
+        classifier: Arc<dyn Classifier>,
+        speech: &Arc<Speech>,
+    ) -> anyhow::Result<Conversation> {
+        let task = app::conversation::start_pools(pools(&catalog), Arc::new(FakeStore::new(None)))?;
+        let (catalog, cache) = (Arc::new(catalog), watch::channel(StateCache::default()).1);
+        let reasoner: Arc<dyn Reasoner> = Arc::new(FakeReasoner::default());
+        let backfill = backfill(config, &reasoner, task.changes, speech, &catalog, cache);
+        let (queues, threshold) = (queues(), config.model.threshold);
+        Ok(Conversation::new(
+            task.pools,
+            backfill,
+            queues,
+            classifier,
+            catalog,
+            threshold,
+            two(config),
+        ))
+    }
+
     /// The app of `VALID` with `classifier`, `stt`, the reference house and `pools`.
     fn app_with(
         classifier: Arc<dyn Classifier>,
@@ -1412,22 +1457,11 @@ mod tests {
     ) -> anyhow::Result<App> {
         let config = Config::parse(VALID)?;
         let catalog = load_catalog(&config.intents)?;
-        let task = app::conversation::start_pools(pools(&catalog), Arc::new(FakeStore::new(None)))?;
-        let (pools, changes, catalog) = (task.pools, task.changes, Arc::new(catalog));
+        let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
         let reasoner = Arc::new(FakeReasoner::default());
         let listener = listener(&config, stt, Arc::clone(&classifier), reasoner);
-        let conversation = Conversation::new(
-            pools,
-            changes,
-            queues(),
-            classifier,
-            catalog,
-            config.model.threshold,
-            two(&config),
-        );
-        let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
         Ok(App {
-            conversation,
+            conversation: conversation(&config, catalog, classifier, &speech)?,
             listener,
             speech,
         })
