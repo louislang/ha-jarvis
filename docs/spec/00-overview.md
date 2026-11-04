@@ -16,7 +16,7 @@ This specification uses ASD-STE100 Simplified Technical English (STE).
 | `00-overview.md` | This file: the specification format, technical names, goals, examples and the phase index. |
 | `01-architecture.md` | Layers, ports, the System One model, decisions, latency budget, crates, files, configuration, machines, the reference house and the change map. |
 | `02-rules.md` | Code rules, Python rules, test rules, Quint rules, proof rules, PR rules and the required checks. |
-| `phase-00.md` to `phase-16.md` | One file for each phase. |
+| `phase-00.md` to `phase-17.md` | One file for each phase. |
 
 `CLAUDE.md` at the repository root holds the working rules for code changes. It must agree with `02-rules.md`.
 
@@ -71,6 +71,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | Pool | A list of response templates for one intent or one filler type. |
 | Filler | A response that Jarvis speaks immediately when the real answer needs more time. |
 | Hot cache | The in-memory copy of HA entity states and registries. |
+| Plugin | A Jarvis data source for one remote API, for example the weather forecast. System Two gets it as a tool, and a fetch intent names it. |
 | Announce | The HA service `assist_satellite.announce`. It speaks text on one satellite. |
 | Ask | The HA service `assist_satellite.start_conversation`. It speaks a question on one satellite, then listens without the wake word. |
 | Dialog | The state of one open conversation on one satellite. |
@@ -167,7 +168,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 ### 1.5 Example Learned Intents
 
 - Users often say "Tell me a joke". The model gives `unknown`, so System Two answers. Jarvis clusters these requests. System Two proposes `tell_joke`, a static intent with 10 jokes. It has no service, so Jarvis adds it automatically. After the next training run, "Tell me a joke" gets System One speed.
-- Users often ask "What is the weather like?". System Two proposes `what_is_weather` with the service `weather.get_forecasts`. It calls an HA service, so it waits for your approval on the review page.
+- Users often say "Good night". System Two proposes `good_night` with the service `scene.turn_on`. It calls an HA service, so it waits for your approval on the review page.
 - A user says "How is traffic to work?" at about 08:00 on weekdays. System Two proposes a prefetch intent. At 07:55 Jarvis gets the answer. At 08:00 the answer is ready.
 
 ### 1.6 Example Training Triggers
@@ -185,7 +186,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 
 ## 2. Phase Index
 
-Each line is one PR.
+Each line is one PR. The work order follows the rows of this table, not the phase numbers. Thus phase 17 comes after phase 9 and before phase 10.
 
 | Phase | Sub-phases |
 |---|---|
@@ -199,6 +200,7 @@ Each line is one PR.
 | [7 System Two](phase-07.md) | 7.1 Reasoner port and warm connection · 7.2 Prompt builder · 7.3 Sentence streaming · 7.4 Tool calls · 7.5 Deferred answers |
 | [8 Response Backfill](phase-08.md) | 8.1 Backfill policy · 8.2 Response generation · 8.3 Backfill Quint model · 8.4 Backfill use case |
 | [9 End-to-End Verification](phase-09.md) | 9.1 Pipeline harness · 9.2 Latency tests |
+| [17 Plugins](phase-17.md) | 17.1 Plugin port and cache · 17.2 Plugin tools in System Two · 17.3 Open-Meteo weather plugin · 17.4 Weather intent through the plugin |
 | [10 Multi-Turn Dialogs](phase-10.md) | 10.1 Dialog Quint model · 10.2 Dialog state · 10.3 Answer fill and cancel · 10.4 Ask decision and HA ask · 10.5 Dialog routing · 10.6 System Two questions · 10.7 Early commit for answers |
 | [11 Habit Learning](phase-11.md) | 11.1 Source, action and bucket · 11.2 Scores and summary · 11.3 Habit learning and store · 11.4 History bootstrap · 11.5 Habits in the model context · 11.6 Habits in entity and slot selection · 11.7 Habits in the System Two prompt |
 | [12 Interaction Log and Feedback](phase-12.md) | 12.1 Audio correlation · 12.2 Feedback Quint model · 12.3 Feedback rules · 12.4 Interaction log port and SQLite storage · 12.5 Marks, unknowns and pruning · 12.6 Record interactions · 12.7 Review port and use case · 12.8 Review web API · 12.9 Review page · 12.10 Feedback in decide · 12.11 Feedback in responses and System Two |

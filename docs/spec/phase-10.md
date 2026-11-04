@@ -8,7 +8,7 @@ This phase lets Jarvis ask questions. Jarvis asks when it does not understand, w
 
 **Goal:** Add `quint/dialog.qnt`, the model of open dialogs on several satellites with turns, cancel, timeout and deferred jobs in flight. Prove the turn limit and that a cancelled or replaced request never acts, before the Rust code exists.
 
-- **Implements:** G13, G19. **Depends on:** 9.2.
+- **Implements:** G13, G19. **Depends on:** 17.4.
 - **Files:** create `quint/dialog.qnt`.
 - **Quint:** `dialog.qnt`.
 

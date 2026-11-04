@@ -34,11 +34,11 @@ This phase makes System Two teach System One. Jarvis clusters frequent `unknown`
 - **Implements:** G14. **Depends on:** 14.1.
 - **Files:** modify `src/domain/learn.rs`.
 
-**Model.** `validate_proposal(proposal, catalog, learned) -> Result<LearnedIntent>`: the name is snake case, is new, and is not `unknown`. There are `min_examples` examples or more, and each passes `validate_example`. The responses render with the slots of the examples. The kind decides the other fields:
+**Model.** `validate_proposal(proposal, catalog, learned, plugins) -> Result<LearnedIntent>`. `plugins` are the tool names of the plugin registry (sub-phase 17.1). The name is snake case, is new, and is not `unknown`. There are `min_examples` examples or more, and each passes `validate_example`. The responses render with the slots of the examples. The kind decides the other fields:
 
 - `command`: `target` and `select` (or `entity`) are present. `service` is optional. The data templates use only the slots and the built-ins.
 - `query`: `select` is present, and `service` is absent.
-- `fetch`: `service` is present, and each response uses `response`.
+- `fetch`: `plugin` is one of `plugins`, `service` is absent, and each response uses `response` (decision 30).
 - `prefetch`: `question` is present, `service` is absent, and the examples have no slots.
 - `none`: no other check. The entry only marks the cluster as not suitable.
 
@@ -50,7 +50,7 @@ This phase makes System Two teach System One. Jarvis clusters frequent `unknown`
 - AC-14.2-2: When a proposal example has a markup error, `validate_proposal` returns an error.
 - AC-14.2-3: When a proposal name equals an existing intent name or `unknown`, `validate_proposal` returns an error.
 - AC-14.2-4: When an intent has a `service`, `needs_approval` returns true. Without a `service`, it returns false.
-- AC-14.2-5: When a `fetch` proposal has no `service`, or a `prefetch` proposal has a `service`, no `question` or a slot, `validate_proposal` returns an error that names the field.
+- AC-14.2-5: When a `fetch` proposal has no `plugin`, a `plugin` that is not in `plugins` or a `service`, or a `prefetch` proposal has a `service`, no `question` or a slot, `validate_proposal` returns an error that names the field.
 - AC-14.2-6: When a `command` proposal has no `target`, `validate_proposal` returns an error.
 
 **Proofs.**
@@ -100,18 +100,18 @@ This phase makes System Two teach System One. Jarvis clusters frequent `unknown`
 - **Implements:** G14. **Depends on:** 14.3.
 - **Files:** modify `src/ports.rs`, `src/adapters/openai.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `embed(texts) -> Result<Vec<Vec<f32>>>` calls the OpenAI embeddings API with `openai.embedding_model`. `propose(texts, intent names) -> Result<Proposal>` with structured output `{ name, kind, examples, responses, service, target, select, data, question }` and `bulk_max_output_tokens`. The prompt asks for `learn.responses` responses. This sub-phase adds `learn.responses`. `question` is the question that a `prefetch` intent asks System Two. `kind` is `command`, `query`, `fetch`, `prefetch` or `none`. `none` means the requests are not suitable for an intent.
+**Model.** `embed(texts) -> Result<Vec<Vec<f32>>>` calls the OpenAI embeddings API with `openai.embedding_model`. `propose(texts, intent names, tools) -> Result<Proposal>` with structured output `{ name, kind, examples, responses, service, plugin, target, select, data, question }` and `bulk_max_output_tokens`. The prompt asks for `learn.responses` responses. This sub-phase adds `learn.responses`. `question` is the question that a `prefetch` intent asks System Two. `kind` is `command`, `query`, `fetch`, `prefetch` or `none`. `none` means the requests are not suitable for an intent. `tools` are the plugin tools, so a `fetch` proposal can name one in `plugin`.
 
 **Acceptance criteria.**
 
 - AC-14.4-1: When the mock returns a valid proposal, `propose` returns it.
-- AC-14.4-2: When the prompt builder runs, the prompt contains the cluster texts and the existing intent names.
+- AC-14.4-2: When the prompt builder runs, the prompt contains the cluster texts, the existing intent names and the names and descriptions of the plugin tools.
 - AC-14.4-3: When the mock returns JSON that does not match the schema, `propose` returns an error.
 - AC-14.4-4: When `embed` gets two texts, the mock receives one embeddings request with `embedding_model`, and `embed` returns two vectors.
 
 **Proofs.**
 
-- P-14.4-2. Argument: the prompt builder iterates both lists.
+- P-14.4-2. Argument: the prompt builder iterates the three lists.
 - P-14.4-1, P-14.4-3, P-14.4-4. Evidence: test.
 
 ---
@@ -256,7 +256,7 @@ This phase makes System Two teach System One. Jarvis clusters frequent `unknown`
 - **Files:** modify `src/app/background.rs`, `src/app/conversation.rs`, `src/app/speech.rs`, `src/lib.rs`, `jarvis.toml`.
 - **Quint:** `prefetch.qnt` (conformance).
 
-**Model.** Each minute, for each active prefetch intent with `prefetch_due`, call `answer` with the intent `question`. The question has the area of the most recent interaction of the intent, so System Two gets its entities. A `Call` step with a service in `learn.prefetch_services` runs, and its result goes back to System Two. Any other `Call` step discards the prefetch and makes no call. Only a stream that ends with `Done` and no error forms the answer, which is pre-rendered, stored with its time, and replaces the old answer. Prefetch intents have no slots (sub-phase 14.2), so the intent is the full cache key. When the intent is predicted, a fresh answer is the reply. Else the request goes to System Two. This sub-phase adds `learn.prefetch_services`.
+**Model.** Each minute, for each active prefetch intent with `prefetch_due`, call `answer` with the intent `question`. The question has the area of the most recent interaction of the intent, so System Two gets its entities. A `Call` step with a service in `learn.prefetch_services` runs, and its result goes back to System Two. Any other `Call` step discards the prefetch and makes no call. A `Plugin` step runs through the plugin registry, because a plugin only reads data (decision 30). Only a stream that ends with `Done` and no error forms the answer, which is pre-rendered, stored with its time, and replaces the old answer. Prefetch intents have no slots (sub-phase 14.2), so the intent is the full cache key. When the intent is predicted, a fresh answer is the reply. Else the request goes to System Two. This sub-phase adds `learn.prefetch_services`.
 
 **Acceptance criteria.**
 
@@ -267,14 +267,16 @@ This phase makes System Two teach System One. Jarvis clusters frequent `unknown`
 - AC-14.10-5: When `FakeReasoner` gives a `Call` step for a service that is not in `prefetch_services` during a prefetch, Jarvis discards the answer and `FakeHome` records no call.
 - AC-14.10-6: When `quint-connect` replays 100 traces of `prefetch.qnt`, the stored answer and the `FakeHome` calls match the model after each step.
 - AC-14.10-7 [GPU host]: A fresh prefetch answer has a response latency p95 of 300 ms or less in the Phase 9 harness.
-- AC-14.10-8: When `FakeReasoner` gives a `Call` step for `weather.get_forecasts`, which is in `prefetch_services`, `FakeHome` records the call and the prefetch continues.
+- AC-14.10-8: When `FakeReasoner` gives a `Call` step for `calendar.get_events`, which is in `prefetch_services`, `FakeHome` records the call and the prefetch continues.
 - AC-14.10-9: When the prefetch stream ends with an error after one sentence, Jarvis stores no answer.
+- AC-14.10-10: When `FakeReasoner` gives a `Plugin` step during a prefetch, `FakePlugin` records the fetch, `FakeHome` records no call, and the prefetch continues.
 
 **Proofs.**
 
 - P-14.10-3, P-14.10-4. Requires: `ServedAnswerIsFresh`. Argument: the reply branch is guarded by `fresh` (P-14.9-2).
 - P-14.10-5. Requires: `NoCallFromPrefetch`. Argument: the `Call` arm of the prefetch consumer checks the service against `prefetch_services` before it calls `Home`. Any other service returns a discard.
 - P-14.10-8, P-14.10-9. Evidence: test.
+- P-14.10-10. Argument: the `Plugin` arm of the prefetch consumer calls only `Plugins::fetch` and has no discard.
 - P-14.10-1, P-14.10-2, P-14.10-6, P-14.10-7. Evidence: test.
 
 ---
