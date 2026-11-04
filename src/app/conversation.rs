@@ -53,6 +53,10 @@ pub struct SystemTwo {
     pub clock: Arc<dyn Clock>,
     /// The longest wait for each step of an answer.
     pub timeout: Duration,
+    /// The domains of the services and the targets that a call can have.
+    pub allowed_domains: Vec<String>,
+    /// The services that a call runs with `return_response`.
+    pub read_services: Vec<String>,
 }
 
 /// Decides requests with System One and dispatches the decisions to the home, System Two, the
@@ -273,7 +277,7 @@ impl Conversation {
     }
 
     /// Announces each sentence of the System Two answer to `text` from `area` on the satellite
-    /// of `request` as it arrives. Each call gets the tool error "not permitted".
+    /// of `request` as it arrives. Makes each call before the next step and sends back its result.
     ///
     /// # Errors
     ///
@@ -296,13 +300,36 @@ impl Conversation {
                     queues.announce(satellite, *generation, &sentence).await?;
                 }
                 // The send fails only when the answer has ended, so the result is not needed.
-                Some(Ok(Step::Call(_, reply))) => {
-                    let _ = reply.send(Err(anyhow::anyhow!("not permitted")));
+                Some(Ok(Step::Call(call, reply))) => {
+                    let _ = reply.send(self.tool(call).await);
                 }
                 Some(Ok(Step::Done)) | None => return Ok(()),
                 Some(Err(error)) => return Err(error),
             }
         }
+    }
+
+    /// The response data of the System Two `call`, with `return_response` when `read_services`
+    /// has its service.
+    ///
+    /// # Errors
+    ///
+    /// "not permitted" when `allowed_domains` lacks the domain of the service or of a target, or
+    /// the hot cache lacks a target. Else the call fails.
+    async fn tool(&self, mut call: ServiceCall) -> anyhow::Result<Option<Value>> {
+        let allowed = |domain: &str| self.two.allowed_domains.iter().any(|name| name == domain);
+        let permitted = allowed(&call.domain) && {
+            let cache = self.queues.cache.borrow();
+            let known = |entity: &String| {
+                let domain = entity.split('.').next().unwrap_or_default();
+                allowed(domain) && cache.state(entity).is_some()
+            };
+            call.target.iter().all(known)
+        };
+        anyhow::ensure!(permitted, "not permitted");
+        let service = format!("{}.{}", call.domain, call.service);
+        call.return_response = self.two.read_services.contains(&service);
+        self.queues.home.call(call).await
     }
 
     /// An answer of the pool `pool` rendered with `response` as `response`.
@@ -518,6 +545,7 @@ mod tests {
     use crate::domain::responses::Pool;
     use crate::domain::responses::Response;
     use crate::domain::state::ServiceCall;
+    use crate::domain::state::State;
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
@@ -572,6 +600,8 @@ mod tests {
                 reasoner,
                 clock,
                 timeout,
+                allowed_domains: ALLOWED.map(str::to_owned).to_vec(),
+                read_services: vec!["calendar.get_events".to_owned()],
             },
         )
     }
@@ -614,15 +644,20 @@ mod tests {
         Chosen { text, pool, index }
     }
 
-    /// A call that turns on the kitchen light.
-    fn call() -> ServiceCall {
+    /// A call of `domain.service` on `target`.
+    fn service(domain: &str, service: &str, target: &str) -> ServiceCall {
         ServiceCall {
-            domain: "light".to_owned(),
-            service: "turn_on".to_owned(),
-            target: vec!["light.kitchen".to_owned()],
+            domain: domain.to_owned(),
+            service: service.to_owned(),
+            target: vec![target.to_owned()],
             data: serde_json::Map::new(),
             return_response: false,
         }
+    }
+
+    /// A call that turns on the kitchen light.
+    fn call() -> ServiceCall {
+        service("light", "turn_on", "light.kitchen")
     }
 
     /// A `lights_on` reply with `call`.
@@ -919,15 +954,9 @@ mod tests {
 
     /// The `weather` call with `return_response`.
     fn weather() -> ServiceCall {
-        let target = vec!["weather.home".to_owned()];
-        let (domain, service) = ("weather".to_owned(), "get_forecasts".to_owned());
-        let (data, return_response) = (serde_json::Map::new(), true);
         ServiceCall {
-            domain,
-            service,
-            target,
-            data,
-            return_response,
+            return_response: true,
+            ..service("weather", "get_forecasts", "weather.home")
         }
     }
 
@@ -1178,13 +1207,86 @@ mod tests {
         Ok(())
     }
 
-    /// AC-7.5-12.
+    /// AC-7.5b-1.
     #[tokio::test(start_paused = true)]
-    async fn ac_7_5_12_call_gets_not_permitted_and_makes_no_call() -> anyhow::Result<()> {
-        let (home, _cache, reasoner, work) = reasoning("idle", vec![Scripted::Call(call())])?;
+    async fn ac_7_5b_1_call_reaches_home_before_the_next_step() -> anyhow::Result<()> {
+        let steps = vec![Scripted::Call(call()), Scripted::Sentence("One.")];
+        let (home, _cache, _, work) = reasoning("idle", steps)?;
+        let gate = home.delay();
+        let waiting = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(home.calls(), [call()], "a step came before the call ended");
+            gate.send(())
+        };
+        let (done, sent) = tokio::join!(work, waiting);
+        done?;
+        sent.map_err(|()| anyhow::anyhow!("the call ended early"))?;
+        assert_eq!(home.calls()[0], call());
+        assert_eq!(announces(&home), ["One."]);
+        Ok(())
+    }
+
+    /// The `openai.allowed_domains` of the tests.
+    const ALLOWED: [&str; 6] = [
+        "light",
+        "switch",
+        "fan",
+        "media_player",
+        "climate",
+        "calendar",
+    ];
+
+    /// Makes sure that the System Two `call` makes no call and gets "not permitted".
+    async fn not_permitted(call: ServiceCall) -> anyhow::Result<()> {
+        let (home, _cache, reasoner, work) = reasoning("idle", vec![Scripted::Call(call)])?;
         work.await?;
         assert_eq!(home.calls(), []);
         assert_eq!(reasoner.results(), ["not permitted"]);
+        Ok(())
+    }
+
+    /// AC-7.5b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_5b_2_lock_domain_is_not_permitted() -> anyhow::Result<()> {
+        not_permitted(service("lock", "unlock", "lock.front_door")).await
+    }
+
+    /// AC-7.5b-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_5b_3_lock_target_is_not_permitted() -> anyhow::Result<()> {
+        not_permitted(service("light", "turn_on", "lock.front_door")).await
+    }
+
+    /// Adds `entity` to `cache` with the state of the satellite.
+    fn add(cache: &watch::Sender<StateCache>, entity: &str) {
+        cache.send_modify(|cache| {
+            let mut state = State::clone(&cache.states[SATELLITE]);
+            state.entity_id = entity.to_owned();
+            cache.states.insert(Arc::from(entity), Arc::new(state));
+        });
+    }
+
+    /// AC-7.5b-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_5b_4_read_service_returns_response_data() -> anyhow::Result<()> {
+        let events = service("calendar", "get_events", "calendar.alex");
+        let light = ServiceCall {
+            return_response: true,
+            ..call()
+        };
+        let steps = vec![Scripted::Call(events.clone()), Scripted::Call(light)];
+        let (home, cache, reasoner, work) = reasoning("idle", steps)?;
+        add(&cache, "calendar.alex");
+        let data = serde_json::json!({ "calendar.alex": { "events": [] } });
+        home.respond(data.clone());
+        work.await?;
+        let read = ServiceCall {
+            return_response: true,
+            ..events
+        };
+        assert_eq!(home.calls(), [read, call()]);
+        let result = format!("{:?}", Ok::<_, ()>(Some(Ok::<_, ()>(Some(data)))));
+        assert_eq!(reasoner.results()[0], result);
         Ok(())
     }
 
