@@ -137,6 +137,8 @@ pub struct Config {
     pub tts: TtsConfig,
     /// System Two.
     pub openai: OpenAiConfig,
+    /// Response backfill.
+    pub backfill: BackfillConfig,
     /// Announces.
     pub announce: AnnounceConfig,
     /// Training.
@@ -357,6 +359,20 @@ pub struct OpenAiConfig {
     pub allowed_domains: Vec<String>,
     /// The services that a System Two call runs with `return_response`.
     pub read_services: Vec<String>,
+}
+
+/// The `[backfill]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct BackfillConfig {
+    /// A pool with fewer unused responses than this gets a backfill.
+    pub min_fresh: usize,
+    /// The number of candidates that one backfill asks for.
+    pub batch: usize,
+    /// The most characters of a new response.
+    pub max_chars: usize,
+    /// The most responses of a pool.
+    pub max_pool: usize,
 }
 
 /// The `[announce]` section.
@@ -1081,6 +1097,12 @@ mod tests {
                 num_steps: 4,
             },
             openai: expected_openai(),
+            backfill: BackfillConfig {
+                min_fresh: 3,
+                batch: 5,
+                max_chars: 80,
+                max_pool: 30,
+            },
             announce: AnnounceConfig {
                 margin_ms: 300,
                 idle_wait_s: 30,

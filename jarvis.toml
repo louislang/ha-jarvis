@@ -47,6 +47,12 @@ max_tool_calls = 5
 allowed_domains = ["light", "switch", "fan", "media_player", "climate", "calendar"]
 read_services = ["calendar.get_events", "todo.get_items"] # called with return_response = true
 
+[backfill]
+min_fresh = 3
+batch = 5
+max_chars = 80
+max_pool = 30
+
 [announce]
 margin_ms = 300
 idle_wait_s = 30
