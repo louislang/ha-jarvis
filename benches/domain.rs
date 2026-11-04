@@ -152,6 +152,7 @@ fn cached_speech() -> &'static Speech {
     let response = Response {
         text: "One moment.".to_owned(),
         uses: 0,
+        generated: false,
     };
     let pool = Pool {
         responses: vec![response],

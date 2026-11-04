@@ -28,6 +28,7 @@ use crate::domain::intent;
 use crate::domain::model::Prediction;
 use crate::domain::responses;
 use crate::domain::responses::Pools;
+use crate::domain::responses::Response;
 use crate::domain::state::AreaId;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
@@ -616,7 +617,8 @@ pub fn start_pools(source: Pools, store: Arc<dyn Store<Pools>>) -> anyhow::Resul
     })
 }
 
-/// The pools of `source` with the use count of each response that `saved` has too.
+/// The pools of `source` with the use count of each response that `saved` has too, then the
+/// generated responses of `saved` that `source` does not have.
 fn merge(mut source: Pools, saved: &Pools) -> Pools {
     for (name, pool) in &mut source {
         let old = saved
@@ -626,8 +628,19 @@ fn merge(mut source: Pools, saved: &Pools) -> Pools {
             let same = old.iter().find(|other| other.text == response.text);
             response.uses = same.map_or(0, |other| other.uses);
         }
+        let kept = generated(old, &pool.responses);
+        pool.responses.extend(kept);
     }
     source
+}
+
+/// The generated responses of `saved` whose text no response of `source` has.
+fn generated(saved: &[Response], source: &[Response]) -> Vec<Response> {
+    let new = |other: &&Response| {
+        let same = |response: &Response| response.text == other.text;
+        other.generated && !source.iter().any(same)
+    };
+    saved.iter().filter(new).cloned().collect()
 }
 
 /// Tests of dispatch and the pools task.
@@ -650,7 +663,6 @@ mod tests {
 
     use super::*;
     use crate::domain::responses::Pool;
-    use crate::domain::responses::Response;
     use crate::domain::state::ServiceCall;
     use crate::domain::state::State;
     use crate::testing::fakes::FakeClassifier;
@@ -720,6 +732,7 @@ mod tests {
             let responses = texts.iter().map(|&(text, uses)| Response {
                 text: text.to_owned(),
                 uses,
+                generated: false,
             });
             Pool {
                 responses: responses.collect(),
@@ -878,6 +891,43 @@ mod tests {
         let task = start_pools(source, Arc::new(FakeStore::new(Some(saved))))?;
         let expected = pools(&[("Lights on.", 3), ("New.", 0)], 5);
         assert_eq!(**task.pools.load(), expected);
+        Ok(())
+    }
+
+    /// The pools that the startup merge gives for the source response `Lights on.` and the saved
+    /// responses `lights`.
+    fn merged(lights: Vec<Response>) -> anyhow::Result<Pools> {
+        let mut saved = pools(&[], 0);
+        saved
+            .get_mut("lights_on")
+            .expect("the pool exists")
+            .responses = lights;
+        let store = Arc::new(FakeStore::new(Some(saved)));
+        let task = start_pools(pools(&[("Lights on.", 0)], 0), store)?;
+        Ok(Pools::clone(&task.pools.load()))
+    }
+
+    /// A saved generated response stays after the startup merge, with its use count.
+    #[tokio::test(start_paused = true)]
+    async fn startup_merge_keeps_generated_response() -> anyhow::Result<()> {
+        let text = "Done.".to_owned();
+        let generated = Response {
+            text,
+            uses: 2,
+            generated: true,
+        };
+        let mut expected = pools(&[("Lights on.", 0)], 0);
+        let pool = expected.get_mut("lights_on").expect("the pool exists");
+        pool.responses.push(generated.clone());
+        assert_eq!(merged(vec![generated])?, expected);
+        Ok(())
+    }
+
+    /// A saved source response that is no longer in the source leaves after the startup merge.
+    #[tokio::test(start_paused = true)]
+    async fn startup_merge_drops_removed_source_response() -> anyhow::Result<()> {
+        let removed = pools(&[("Done.", 2)], 0)["lights_on"].responses.clone();
+        assert_eq!(merged(removed)?, pools(&[("Lights on.", 0)], 0));
         Ok(())
     }
 

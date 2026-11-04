@@ -956,7 +956,11 @@ mod tests {
                     _ => format!("The {name} response."),
                 };
                 let pool = Pool {
-                    responses: vec![Response { text, uses: 0 }],
+                    responses: vec![Response {
+                        text,
+                        uses: 0,
+                        generated: false,
+                    }],
                     last: None,
                 };
                 (name.to_owned(), pool)

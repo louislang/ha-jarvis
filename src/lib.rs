@@ -623,7 +623,12 @@ fn load_pools(path: &Path, catalog: &Catalog) -> anyhow::Result<Pools> {
     let mut pools = Pools::new();
     for (name, file) in file.pools {
         let texts = file.responses.into_iter();
-        let responses = texts.map(|text| Response { text, uses: 0 }).collect();
+        let source = |text| Response {
+            text,
+            uses: 0,
+            generated: false,
+        };
+        let responses = texts.map(source).collect();
         let last = None;
         pools.insert(name, Pool { responses, last });
     }
@@ -1371,6 +1376,7 @@ mod tests {
             let response = Response {
                 text: "Done.".to_owned(),
                 uses: 0,
+                generated: false,
             };
             let responses = vec![response];
             (

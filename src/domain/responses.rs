@@ -38,6 +38,9 @@ pub struct Response {
     pub text: String,
     /// The number of times that Jarvis used the response.
     pub uses: u64,
+    /// True when a backfill generated the response, so it is not in `responses.toml`.
+    #[serde(default)]
+    pub generated: bool,
 }
 
 /// A failed pool check.
@@ -463,6 +466,7 @@ pub fn merge(mut pool: Pool, candidates: &[String], max_pool: usize) -> Pool {
         pool.responses.push(Response {
             text: candidates[index].clone(),
             uses: 0,
+            generated: true,
         });
         proof! {
             assert(unused(candidates@.take(index + 1)) =~= unused(candidates@.take(index as int)).push(pool.responses@.last()));
@@ -549,7 +553,7 @@ pub open spec fn used(old: Pool, new: Pool, index: int) -> bool {
     let response = old.responses[index];
     let uses = if response.uses < u64::MAX { (response.uses + 1) as u64 } else { response.uses };
     &&& new.last == Some(index as usize)
-    &&& new.responses@ == old.responses@.update(index, Response { text: response.text, uses })
+    &&& new.responses@ == old.responses@.update(index, Response { text: response.text, uses, generated: response.generated })
 }
 
 /// True when `new` is `old` with one more use of the response at `index` of the pool `key`, or
@@ -590,9 +594,9 @@ pub open spec fn fits(pool: Pool, candidate: Seq<char>, max_chars: int) -> bool 
     &&& distinct(pool, normal)
 }
 
-/// Unused responses with the texts `texts`.
+/// Unused generated responses with the texts `texts`.
 pub open spec fn unused(texts: Seq<String>) -> Seq<Response> {
-    texts.map_values(|text: String| Response { text, uses: 0 })
+    texts.map_values(|text: String| Response { text, uses: 0, generated: true })
 }
 
 /// `responses`, then unused responses with the first `candidates`, up to `max_pool` responses.
@@ -685,6 +689,7 @@ mod tests {
             let responses = texts.iter().map(|text| Response {
                 text: text.as_str().expect("a response is a string").to_owned(),
                 uses: 0,
+                generated: false,
             });
             let pool = Pool {
                 responses: responses.collect(),
@@ -718,6 +723,7 @@ mod tests {
             .map(|&uses| Response {
                 text: String::new(),
                 uses,
+                generated: false,
             })
             .collect();
         Pool { responses, last }
@@ -868,6 +874,7 @@ mod tests {
         let responses = texts.iter().map(|text| Response {
             text: (*text).to_owned(),
             uses: 0,
+            generated: false,
         });
         Pool {
             responses: responses.collect(),
@@ -923,9 +930,11 @@ mod tests {
         old.responses[0].uses = 3;
         old.last = Some(0);
         let mut expected = old.clone();
-        expected
-            .responses
-            .extend(texts(&["Three.", "Four."]).responses);
+        let mut added = texts(&["Three.", "Four."]).responses;
+        for response in &mut added {
+            response.generated = true;
+        }
+        expected.responses.extend(added);
         let candidates = ["Three.".to_owned(), "Four.".to_owned()];
         assert_eq!(merge(old, &candidates, 30), expected);
     }
