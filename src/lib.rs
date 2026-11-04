@@ -353,6 +353,10 @@ pub struct OpenAiConfig {
     pub bulk_max_output_tokens: u32,
     /// The most tool calls of one answer.
     pub max_tool_calls: u32,
+    /// The domains of the services and the targets that a System Two call can have.
+    pub allowed_domains: Vec<String>,
+    /// The services that a System Two call runs with `return_response`.
+    pub read_services: Vec<String>,
 }
 
 /// The `[announce]` section.
@@ -760,11 +764,7 @@ async fn start_app(
     let (classifier, listener, speech) = load_models(config, Arc::clone(&reasoner)).await?;
     start_prerender(&speech, &task.pools, cache);
     let (catalog, threshold) = (Arc::new(catalog), config.model.threshold);
-    let two = SystemTwo {
-        reasoner,
-        clock: Arc::new(SystemClock),
-        timeout: Duration::from_millis(config.openai.timeout_ms),
-    };
+    let two = system_two(&config.openai, reasoner, Arc::new(SystemClock));
     let app = App {
         conversation: Conversation::new(
             task.pools,
@@ -779,6 +779,21 @@ async fn start_app(
         speech,
     };
     Ok((app, task.task))
+}
+
+/// System Two on `reasoner` and `clock` with the timeout and the call rules of `openai`.
+fn system_two(
+    openai: &OpenAiConfig,
+    reasoner: Arc<dyn Reasoner>,
+    clock: Arc<dyn Clock>,
+) -> SystemTwo {
+    SystemTwo {
+        reasoner,
+        clock,
+        timeout: Duration::from_millis(openai.timeout_ms),
+        allowed_domains: openai.allowed_domains.clone(),
+        read_services: openai.read_services.clone(),
+    }
 }
 
 /// The System One model of `config`, then the listener on the STT models of `config`, which
@@ -1011,6 +1026,33 @@ mod tests {
         }
     }
 
+    /// The `[openai]` section of `jarvis.toml`.
+    fn expected_openai() -> OpenAiConfig {
+        OpenAiConfig {
+            api_key_env: "OPENAI_API_KEY".to_owned(),
+            model: "gpt-4.1-nano".to_owned(),
+            timeout_ms: 8000,
+            warm_idle_s: 60,
+            max_output_tokens: 150,
+            bulk_max_output_tokens: 8000,
+            max_tool_calls: 5,
+            allowed_domains: [
+                "light",
+                "switch",
+                "fan",
+                "media_player",
+                "climate",
+                "calendar",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            read_services: vec![
+                "calendar.get_events".to_owned(),
+                "todo.get_items".to_owned(),
+            ],
+        }
+    }
+
     /// AC-1.1-1.
     #[test]
     fn ac_1_1_1_parse_returns_each_value() -> anyhow::Result<()> {
@@ -1038,15 +1080,7 @@ mod tests {
                 voice: 6,
                 num_steps: 4,
             },
-            openai: OpenAiConfig {
-                api_key_env: "OPENAI_API_KEY".to_owned(),
-                model: "gpt-4.1-nano".to_owned(),
-                timeout_ms: 8000,
-                warm_idle_s: 60,
-                max_output_tokens: 150,
-                bulk_max_output_tokens: 8000,
-                max_tool_calls: 5,
-            },
+            openai: expected_openai(),
             announce: AnnounceConfig {
                 margin_ms: 300,
                 idle_wait_s: 30,
@@ -1336,6 +1370,12 @@ mod tests {
         Arc::new(Queues::new(home, receiver, wait, wait))
     }
 
+    /// System Two of `config` on `FakeReasoner` at the Unix epoch.
+    fn two(config: &Config) -> SystemTwo {
+        let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
+        system_two(&config.openai, Arc::new(FakeReasoner::default()), clock)
+    }
+
     /// The app of `VALID` with `classifier`, `stt`, the reference house and `pools`.
     fn app_with(
         classifier: Arc<dyn Classifier>,
@@ -1347,11 +1387,6 @@ mod tests {
         let (pools, changes, catalog) = (task.pools, task.changes, Arc::new(catalog));
         let reasoner = Arc::new(FakeReasoner::default());
         let listener = listener(&config, stt, Arc::clone(&classifier), reasoner);
-        let two = SystemTwo {
-            reasoner: Arc::new(FakeReasoner::default()),
-            clock: Arc::new(FakeClock(Timestamp::UNIX_EPOCH)),
-            timeout: Duration::ZERO,
-        };
         let conversation = Conversation::new(
             pools,
             changes,
@@ -1359,7 +1394,7 @@ mod tests {
             classifier,
             catalog,
             config.model.threshold,
-            two,
+            two(&config),
         );
         let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
         Ok(App {
