@@ -74,7 +74,7 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 - **Implements:** G8. **Depends on:** 2.2.
 - **Files:** modify `src/adapters/ha.rs`, `src/ports.rs`.
 
-**Model.** `HaHome` keeps `next_id: u64` and `pending: Map<u64, reply sender>`. A request takes `next_id`, then `next_id` increases by 1. A `result` message with ID `n` goes to `pending[n]`, and `n` is removed. Each request has the deadline `ha.request_timeout_ms`. A timeout removes `n` from `pending` and returns a timeout error. `snapshot` sends `get_states`, `config/area_registry/list`, `config/device_registry/list`, `config/entity_registry/list`, `get_config` and `auth/current_user`. The list of the entity registry has no aliases, so `snapshot` also sends `config/entity_registry/get_entries` with all entity IDs and takes the aliases from it.
+**Model.** `HaHome` keeps `next_id: u64` and `pending: Map<u64, reply sender>`. A request takes `next_id`, then `next_id` increases by 1. A `result` message with ID `n` goes to `pending[n]`, and `n` is removed. Each request has the deadline `ha.request_timeout_ms`. A timeout removes `n` from `pending` and returns a timeout error. `snapshot` sends `get_states`, `config/area_registry/list`, `config/device_registry/list`, `config/entity_registry/list`, `get_config` and `auth/current_user`. The list of the entity registry has no aliases, so `snapshot` also sends `config/entity_registry/get_entries` with all entity IDs and takes the aliases from it. HA lists `null` among the aliases for the name of the entity, so `snapshot` keeps only the aliases that are strings: the `name` already gives the name.
 
 **Acceptance criteria.**
 
@@ -84,6 +84,7 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 - AC-2.3-4: When HA returns `success = false`, the caller receives an error with the HA error message.
 - AC-2.3-5: When no result arrives within `request_timeout_ms`, the caller receives a timeout error and the ID is no longer pending.
 - AC-2.3-6: When `snapshot` runs, each entity has the aliases of its entry in `config/entity_registry/get_entries`.
+- AC-2.3-7: When an entry of `config/entity_registry/get_entries` has a `null` alias, `snapshot` succeeds, and the entity has only the string aliases of the entry.
 
 **Proofs.**
 
@@ -213,6 +214,7 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
   - `reconnect` (when `not connected`): `epoch := epoch + 1`, `connected := true`, `loading := true`. The subscription starts here, so later changes enter the queue.
   - `takeSnapshot` (when `loading` and `snap = None`): `snap := Some(home)`. Changes can still arrive before the result.
   - `applySnapshot` (when `snap = Some(s)`): `cache := s`, `snap := None`, `loading := false`.
+  - `failSnapshot` (when `snap = Some(s)`): `snap := None`. `loading` stays true, so `takeSnapshot` runs again. This is the retry of sub-phase 2.9.
 - Invariants:
   - `CacheEqualsHomeWhenIdle`: `connected and not loading and queue == [] implies cache == home`.
   - `NoEventAfterDisconnect`: every queued event has the current epoch.
@@ -224,12 +226,13 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 - AC-2.6-3 [Quint]: `NoEventAfterDisconnect` holds in simulation and in `quint verify` to 10 steps.
 - AC-2.6-4 [Quint]: The test `ac_2_6_4_change_while_disconnected` passes: a change while disconnected is in the cache after `reconnect` and the snapshot.
 - AC-2.6-5 [Quint]: The test `ac_2_6_5_change_during_load` passes: a change between `takeSnapshot` and `applySnapshot` is in the cache after the queue is delivered.
+- AC-2.6-6 [Quint]: The test `ac_2_6_6_failed_snapshot_retries` passes: after `failSnapshot`, a new `takeSnapshot` and `applySnapshot` give `cache == home` when the queue is delivered.
 
 **Proofs.**
 
-- P-2.6-2 (AC-2.6-2). Claim: `CacheEqualsHomeWhenIdle` is an inductive invariant together with `QueueReplaysToHome`: when connected and not loading, applying `queue` in order to `cache` gives `home`; after `takeSnapshot`, applying `queue` in order to `snap` gives `home`. Argument by induction on steps. Initially `connected`, `cache = home` and `queue = []`. `change` keeps the claim, because the new entry is the last write to `e`. `deliver` moves the head from the queue into the cache, so the replay result is the same. `disconnect` makes the claim vacuous. `reconnect` starts with an empty queue. `takeSnapshot` sets `snap = home`, and every later change enters the queue. A queued change from before `takeSnapshot` is already in `snap`, and replay in order ends with the last write of each entity, so the result is `home`. `applySnapshot` copies `snap` into `cache` with the same queue. When the queue is empty and loading is false, the claim gives `cache = home`.
+- P-2.6-2 (AC-2.6-2). Claim: `CacheEqualsHomeWhenIdle` is an inductive invariant together with `QueueReplaysToHome`: when connected and not loading, applying `queue` in order to `cache` gives `home`; after `takeSnapshot`, applying `queue` in order to `snap` gives `home`. Argument by induction on steps. Initially `connected`, `cache = home` and `queue = []`. `change` keeps the claim, because the new entry is the last write to `e`. `deliver` moves the head from the queue into the cache, so the replay result is the same. `disconnect` makes the claim vacuous. `reconnect` starts with an empty queue. `takeSnapshot` sets `snap = home`, and every later change enters the queue. A queued change from before `takeSnapshot` is already in `snap`, and replay in order ends with the last write of each entity, so the result is `home`. `applySnapshot` copies `snap` into `cache` with the same queue. `failSnapshot` keeps `loading` true, so the claim is vacuous until the next `takeSnapshot`. When the queue is empty and loading is false, the claim gives `cache = home`.
 - P-2.6-3 (AC-2.6-3). Argument by induction: `change` appends with the current epoch. `disconnect` empties the queue. `reconnect` requires `not connected`, so a disconnect came first and the queue is empty when the epoch increases. No action adds an old epoch.
-- P-2.6-1, P-2.6-4, P-2.6-5. Evidence: model check.
+- P-2.6-1, P-2.6-4, P-2.6-5, P-2.6-6. Evidence: model check.
 
 ---
 
@@ -338,7 +341,7 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 - **Files:** create `src/app/background.rs`, `src/testing/fakes.rs`. Modify `src/lib.rs`, `Cargo.toml`.
 - **Quint:** `cache_sync.qnt` (conformance).
 
-**Model.** `sync(home, cache: ArcSwap<StateCache>)`: take the `events` stream first, then load the snapshot. When the first `snapshot` fails, sync waits for `Reconnected`. Events that arrive during a load wait in the stream and apply after it. For each event: `StateChanged` applies it, `RegistryUpdated` and `Reconnected` load a new snapshot. `FakeHome` returns `house.json`, sends scripted events, records calls and can delay calls.
+**Model.** `sync(home, cache: ArcSwap<StateCache>)`: take the `events` stream first, then load the snapshot. A failed `snapshot` keeps the old cache, logs one `warn` event with the error, and runs again after a delay: 1 s, doubled after each failure, at most 30 s. The delay starts at 1 s again after a successful load. Events wait in the stream during the retries, as during a load. Events that arrive during a load wait in the stream and apply after it. For each event: `StateChanged` applies it, `RegistryUpdated` and `Reconnected` load a new snapshot. `FakeHome` returns `house.json`, sends scripted events, records calls, can delay calls and can fail the next `snapshot` calls.
 
 **Acceptance criteria.**
 
@@ -346,14 +349,17 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 - AC-2.9-2: When `FakeHome` sends a state change, the cache shows the new state before virtual time advances.
 - AC-2.9-3: When `FakeHome` sends `RegistryUpdated`, `FakeHome` records a second `snapshot` call.
 - AC-2.9-4: When `FakeHome` sends `Reconnected`, the cache replaces all old data with the new snapshot.
-- AC-2.9-5: When `quint-connect` replays 100 traces of `cache_sync.qnt`, the cache equals the model `cache` after each step. `FakeHome` maps `takeSnapshot` to the start of a delayed `snapshot` call and `applySnapshot` to its result.
+- AC-2.9-5: When `quint-connect` replays 100 traces of `cache_sync.qnt`, the cache equals the model `cache` after each step. `FakeHome` maps `takeSnapshot` to the start of a delayed `snapshot` call, `applySnapshot` to its result and `failSnapshot` to a failed result.
 - AC-2.9-6: When `FakeHome` sends a state change while the `snapshot` call is delayed, the cache has the change after the load.
-- AC-2.9-7: When the first `snapshot` fails, the cache loads the snapshot after `FakeHome` sends `Reconnected`.
+- AC-2.9-7: When the first `snapshot` fails, `FakeHome` records a second `snapshot` call after 1 s of virtual time, and the cache has that snapshot.
+- AC-2.9-8: When a `snapshot` fails, the log has one `warn` event with the error.
+- AC-2.9-9: When `snapshot` fails three times, the retries start after 1 s, 2 s and 4 s of virtual time.
 
 **Proofs.**
 
 - P-2.9-1, P-2.9-3, P-2.9-4. Argument: the event loop is a match on the event type. `RegistryUpdated` and `Reconnected` both call `load(snapshot())`, and `load` replaces all data (P-2.7-1).
 - P-2.9-2. Argument: the event loop applies each event when it is received, with no timer between receive and apply.
 - P-2.9-6. Argument: the stream exists before the load, so the event waits in it and applies after the load (P-2.6-2).
-- P-2.9-7. Argument: the `Err` arm of the first load reads the stream until `Reconnected`, which takes the reload arm of the event loop.
+- P-2.9-7, P-2.9-9. Argument: the `Err` arm of the load sleeps for the delay, doubles it up to 30 s and calls `snapshot` again. The event loop reads no event during the load.
+- P-2.9-8. Evidence: test.
 - P-2.9-5. Evidence: test. With P-2.6-2, it gives `CacheEqualsHomeWhenIdle` for the Rust code on the replayed traces.
