@@ -209,7 +209,7 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 **Goal:** Add the `get_states` tool, so System Two can read the states of any area of the house. A question about the garage from a living room satellite now gets a correct answer.
 
 - **Implements:** G7. **Depends on:** 7.5c.
-- **Files:** modify `src/ports.rs`, `src/adapters/openai.rs`, `src/domain/decide.rs`, `src/app/conversation.rs`, `src/lib.rs`.
+- **Files:** modify `src/ports.rs`, `src/adapters/openai.rs`, `src/domain/decide.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`.
 
 **Model.**
 
