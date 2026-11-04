@@ -314,11 +314,14 @@ impl Conversation {
     ///
     /// # Errors
     ///
-    /// "not permitted" when `allowed_domains` lacks the domain of the service or of a target, or
-    /// the hot cache lacks a target. Else the call fails.
+    /// "not permitted" when `allowed_domains` lacks the domain of the service or of a target, the
+    /// hot cache lacks a target, or the data has a target key. Else the call fails.
     async fn tool(&self, mut call: ServiceCall) -> anyhow::Result<Option<Value>> {
         let allowed = |domain: &str| self.two.allowed_domains.iter().any(|name| name == domain);
-        let permitted = allowed(&call.domain) && {
+        // HA adds the targets of these data keys to the call, so they would skip the checks.
+        let keys = ["entity_id", "device_id", "area_id", "floor_id", "label_id"];
+        let untargeted = !keys.iter().any(|&key| call.data.contains_key(key));
+        let permitted = untargeted && allowed(&call.domain) && {
             let cache = self.queues.cache.borrow();
             let known = |entity: &String| {
                 let domain = entity.split('.').next().unwrap_or_default();
@@ -1255,6 +1258,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_7_5b_3_lock_target_is_not_permitted() -> anyhow::Result<()> {
         not_permitted(service("light", "turn_on", "lock.front_door")).await
+    }
+
+    /// A target key in the data would add targets that the checks do not see.
+    #[tokio::test(start_paused = true)]
+    async fn target_key_in_data_is_not_permitted() -> anyhow::Result<()> {
+        let mut call = call();
+        call.data.insert("area_id".to_owned(), "kitchen".into());
+        not_permitted(call).await
     }
 
     /// Adds `entity` to `cache` with the state of the satellite.
