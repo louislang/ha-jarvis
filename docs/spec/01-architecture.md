@@ -386,6 +386,7 @@ bulk_max_output_tokens = 8000 # structured output: generate, paraphrase, propose
 max_tool_calls = 5
 embedding_model = "text-embedding-3-small"
 allowed_domains = ["light", "switch", "fan", "media_player", "climate", "calendar"]
+read_services = ["calendar.get_events", "todo.get_items"] # called with return_response = true
 
 [plugins]
 cache_s = 300      # a forecast changes slowly
