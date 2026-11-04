@@ -1,6 +1,7 @@
 //! A fake for each port.
 
 use std::collections::VecDeque;
+use std::mem;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use std::sync::MutexGuard;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -245,11 +247,31 @@ impl ModelLoader for FakeModelLoader {
     }
 }
 
-/// A `Reasoner` that counts the `warm` calls and answers with `Done`.
+/// One scripted step of a `FakeReasoner` answer.
+pub(crate) enum Scripted {
+    /// A sentence.
+    Sentence(&'static str),
+    /// A service call.
+    Call(ServiceCall),
+    /// An error with this text.
+    Error(&'static str),
+    /// A wait of this time before the next step.
+    Wait(Duration),
+}
+
+/// The receiver of the tool result of one call.
+type Reply = oneshot::Receiver<anyhow::Result<Option<Value>>>;
+
+/// A `Reasoner` that counts the `warm` calls, answers with the scripted steps and keeps the
+/// reply of each call.
 #[derive(Default)]
 pub(crate) struct FakeReasoner {
     /// The number of `warm` calls.
     warms: AtomicUsize,
+    /// The steps of the next answer, in order.
+    script: Mutex<Vec<Scripted>>,
+    /// The reply of each call, in order.
+    replies: Arc<Mutex<Vec<Reply>>>,
 }
 
 impl FakeReasoner {
@@ -257,6 +279,22 @@ impl FakeReasoner {
     #[must_use]
     pub(crate) fn warms(&self) -> usize {
         self.warms.load(Ordering::SeqCst)
+    }
+
+    /// Makes the next answer give `steps`.
+    pub(crate) fn script(&self, steps: Vec<Scripted>) {
+        *lock(&self.script) = steps;
+    }
+
+    /// The tool result of each call that came back: the error text, else the result.
+    #[must_use]
+    pub(crate) fn results(&self) -> Vec<String> {
+        let mut replies = lock(&self.replies);
+        let results = replies.iter_mut().map(|reply| match reply.try_recv() {
+            Ok(Some(Err(error))) => error.to_string(),
+            other => format!("{other:?}"),
+        });
+        results.collect()
     }
 }
 
@@ -268,7 +306,27 @@ impl Reasoner for FakeReasoner {
     }
 
     fn answer(&self, _question: &Question) -> BoxStream<'static, anyhow::Result<Step>> {
-        futures::stream::iter([Ok(Step::Done)]).boxed()
+        let steps = mem::take(&mut *lock(&self.script));
+        let replies = Arc::clone(&self.replies);
+        let step = move |step| {
+            let replies = Arc::clone(&replies);
+            async move {
+                match step {
+                    Scripted::Sentence(text) => Some(Ok(Step::Sentence(text.to_owned()))),
+                    Scripted::Call(call) => {
+                        let (sender, receiver) = oneshot::channel();
+                        lock(&replies).push(receiver);
+                        Some(Ok(Step::Call(call, sender)))
+                    }
+                    Scripted::Error(text) => Some(Err(anyhow::anyhow!(text))),
+                    Scripted::Wait(time) => {
+                        tokio::time::sleep(time).await;
+                        None
+                    }
+                }
+            }
+        };
+        futures::stream::iter(steps).filter_map(step).boxed()
     }
 }
 

@@ -122,7 +122,6 @@ pub struct ExServiceCall(ServiceCall);
 
 /// The HA configuration that Jarvis uses.
 #[verifier::external_type_specification]
-#[verifier::external_body]
 pub struct ExHomeConfig(HomeConfig);
 
 /// The intent catalog of `intents.toml`.
