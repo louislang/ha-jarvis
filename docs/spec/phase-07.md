@@ -92,9 +92,13 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 **Goal:** Add the `call_service` tool, so System Two can act on HA. The application runs each call through `Home`, returns the result to the model, and continues the answer.
 
 - **Implements:** G7. **Depends on:** 7.3.
-- **Files:** modify `src/adapters/openai.rs`, `src/ports.rs`, `src/testing/fakes.rs`, `jarvis.toml`.
+- **Files:** modify `src/adapters/openai.rs`, `src/ports.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `Step::Call(ServiceCall, reply)`: the consumer runs the call and sends the result back on `reply`. The adapter sends the tool result to OpenAI and continues the stream. One answer makes at most `openai.max_tool_calls` tool calls. A later tool call gets the tool error "limit reached" and no `Step::Call`. This sub-phase adds `openai.max_tool_calls`.
+**Model.** `Step::Call(ServiceCall, reply)`: the consumer runs the call and sends the result back on `reply`. The adapter sends the tool result to OpenAI and continues the stream. One answer makes at most `openai.max_tool_calls` tool calls. A later tool call gets the tool error "limit reached" and no `Step::Call`. This sub-phase adds `openai.max_tool_calls` (`OpenAiConfig` in `src/lib.rs`).
+
+- After a response with tool calls, the adapter sends the tool results with `previous_response_id`. Thus `answer` requests keep the OpenAI default `store` (true). `warm` keeps `store: false`.
+- A successful call without response data gives the tool result "done". A call with response data gives its JSON. A failed call gives "error: " and the error text.
+- Each tool call has `return_response: false`. Thus System Two cannot call a service that only gives response data, for example `weather.get_forecasts`: HA returns an error, and the model gets it as the tool result.
 
 **Acceptance criteria.**
 
