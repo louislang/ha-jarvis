@@ -114,10 +114,13 @@ impl Backfill {
         }
         let pool = pool.clone();
         tokio::spawn(async move {
-            if let Err(error) = self.fill(&name, &pool).await {
-                tracing::warn!("the backfill of {name} failed: {error:#}");
+            match self.candidates(&name, &pool).await {
+                Ok(new) => self.send_merge(name, new),
+                Err(error) => {
+                    tracing::warn!("the backfill of {name} failed: {error:#}");
+                    self.running().remove(&name);
+                }
             }
-            self.running().remove(&name);
         });
     }
 
@@ -126,21 +129,19 @@ impl Backfill {
         self.running.lock().expect("no lock holder panics")
     }
 
-    /// Asks for new responses of the pool `name`, which is `pool`, and sends the merge of the
-    /// valid ones.
+    /// The new responses of the pool `name`, which is `pool`, that System Two writes and that are
+    /// valid.
     ///
     /// # Errors
     ///
     /// `generate` fails.
-    async fn fill(&self, name: &str, pool: &Pool) -> anyhow::Result<()> {
+    async fn candidates(&self, name: &str, pool: &Pool) -> anyhow::Result<Vec<String>> {
         let variables = self.variables(name);
         let existing = texts(pool);
         let generated = self
             .reasoner
             .generate(name, &existing, &variables, self.config.batch);
-        let new = self.valid(pool, generated.await?, &variables);
-        self.send_merge(name.to_owned(), new);
-        Ok(())
+        Ok(self.valid(pool, generated.await?, &variables))
     }
 
     /// The variables that the responses of the pool `name` can use: `area` for an intent pool.
@@ -170,13 +171,16 @@ impl Backfill {
         texts(&checked).split_off(pool.responses.len())
     }
 
-    /// Sends the merge of `new` into the pool `name` to the pools task.
-    fn send_merge(&self, name: String, new: Vec<String>) {
-        let max_pool = self.config.max_pool;
+    /// Sends the merge of `new` into the pool `name` to the pools task, which then ends the
+    /// backfill of the pool.
+    fn send_merge(self: &Arc<Self>, name: String, new: Vec<String>) {
+        let (backfill, max_pool) = (Arc::clone(self), self.config.max_pool);
         self.send(Box::new(move |mut pools| {
             if let Some(pool) = pools.remove(&name) {
-                pools.insert(name, responses::merge(pool, &new, max_pool));
+                pools.insert(name.clone(), responses::merge(pool, &new, max_pool));
             }
+            // A use that the task applies after this change sees the new responses.
+            backfill.running().remove(&name);
             pools
         }));
     }
