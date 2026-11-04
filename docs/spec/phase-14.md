@@ -267,7 +267,7 @@ This phase makes System Two teach System One. Jarvis clusters frequent `unknown`
 - AC-14.10-5: When `FakeReasoner` gives a `Call` step for a service that is not in `prefetch_services` during a prefetch, Jarvis discards the answer and `FakeHome` records no call.
 - AC-14.10-6: When `quint-connect` replays 100 traces of `prefetch.qnt`, the stored answer and the `FakeHome` calls match the model after each step.
 - AC-14.10-7 [GPU host]: A fresh prefetch answer has a response latency p95 of 300 ms or less in the Phase 9 harness.
-- AC-14.10-8: When `FakeReasoner` gives a `Call` step for `calendar.get_events`, which is in `prefetch_services`, `FakeHome` records the call and the prefetch continues.
+- AC-14.10-8: When `FakeReasoner` gives a `Call` step for `calendar.get_events`, which is in `prefetch_services`, `FakeHome` records the call with `return_response: true` (`openai.read_services`, sub-phase 7.5) and the prefetch continues.
 - AC-14.10-9: When the prefetch stream ends with an error after one sentence, Jarvis stores no answer.
 - AC-14.10-10: When `FakeReasoner` gives a `Plugin` step during a prefetch, `FakePlugin` records the fetch, `FakeHome` records no call, and the prefetch continues.
 
