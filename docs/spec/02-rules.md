@@ -29,7 +29,7 @@ This file uses the technical names in `00-overview.md` section 0.3. All sub-phas
 | R13 | Only the files in `01-architecture.md` section 8. | Structure test in `xtask/src/gates.rs` |
 | R14 | A file has a maximum of 500 lines where possible. | Review |
 | R15 | All domain functions are pure. Other code uses pure functions where possible. | Review, `architecture` |
-| R16 | Each port has exactly one production adapter. The only exception is `Trainer` (process and RunPod). Port fakes are in `src/testing/fakes.rs`. A fake server that only one adapter's tests use (for example `FakeHaServer`) is in the test block of that adapter. | Review |
+| R16 | Each port has exactly one production adapter. The only exceptions are `Trainer` (process and RunPod) and `Plugin` (one adapter for each remote API). Port fakes are in `src/testing/fakes.rs`. A fake server that only one adapter's tests use (for example `FakeHaServer`) is in the test block of that adapter. | Review |
 | R17 | The same code runs on the GPU and the CPU. `device` selects it. No separate GPU and CPU code paths. | Review |
 | R18 | Obey the application-code rules of the Google Rust Style Guide. `CLAUDE.md` lists them. Clippy enforces the rules that have a lint (`wildcard_imports`, `enum_glob_use`, `string_add`, `fn_params_excessive_bools`, `needless_for_each`, `must_use_candidate`). | `rust-lint`, review |
 | R19 | Do not skip the pre-commit hook (`git commit --no-verify`). | Review |

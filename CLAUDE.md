@@ -55,7 +55,7 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 - As few files as possible. A file has 500 lines or fewer where possible.
 - Each struct and each function has one responsibility.
 - Use pure functions where possible. All domain functions are pure.
-- Each port has exactly one production adapter. The only exception is `Trainer` (local process and RunPod fallback). Port fakes are in `src/testing/fakes.rs` only. A fake server that only one adapter's tests use (for example `FakeHaServer`) is in the test block of that adapter.
+- Each port has exactly one production adapter. The only exceptions are `Trainer` (local process and RunPod fallback) and `Plugin` (one adapter for each remote API). Port fakes are in `src/testing/fakes.rs` only. A fake server that only one adapter's tests use (for example `FakeHaServer`) is in the test block of that adapter.
 - The same code runs on the GPU and the CPU. `device` in `jarvis.toml` selects it. No separate GPU and CPU code paths.
 
 ## Comments and Text
