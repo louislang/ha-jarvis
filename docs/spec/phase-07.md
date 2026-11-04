@@ -201,3 +201,35 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 **Proofs.**
 
 - P-7.5c-1, P-7.5c-2. Argument: `handle` matches on `ctx.satellite_id`. The `None` arm awaits the job instead of returning the filler.
+
+---
+
+### 7.6 Area States Tool
+
+**Goal:** Add the `get_states` tool, so System Two can read the states of any area of the house. A question about the garage from a living room satellite now gets a correct answer.
+
+- **Implements:** G7. **Depends on:** 7.5c.
+- **Files:** modify `src/ports.rs`, `src/adapters/openai.rs`, `src/domain/decide.rs`, `src/app/conversation.rs`, `src/lib.rs`.
+
+**Model.**
+
+- Each `answer` request has the function tool `get_states(area)` with `strict: true`, next to `call_service`. `area` is an area name or alias.
+- A `get_states` tool call gives `Step::States(area, reply)`, with the same `reply` as `Step::Call` (sub-phase 7.4). It counts toward `openai.max_tool_calls`.
+- The pure function `area_states(name, cache)` in `src/domain/decide.rs` finds the area with `area_by_name` (sub-phase 2.8b). It gives the entities of that area with the rule of `question` (sub-phase 7.2). An unknown name gives `None`.
+- The consumer sends the JSON list of the name, entity ID and state of each entity as the tool result. An unknown name gives the tool error "error: unknown area". The states come from the hot cache, so the step makes no `Home` call. The step only reads, so it has no `allowed_domains` check.
+- `Question` gets `areas`: the names of all areas of the hot cache. `user_message` lists them, so the model can name an area. The entities of the satellite area stay in the user message.
+
+**Acceptance criteria.**
+
+- AC-7.6-1: When the reasoner answers, each `answer` request to the mock has the function tool `get_states` with `strict: true`.
+- AC-7.6-2: When the mock returns a `get_states` call for "Garage", `answer` gives `Step::States` with "Garage". When the consumer sends the result, the adapter sends it to the mock and then gives the final text.
+- AC-7.6-3: When `area_states` runs for "garage" on the reference house, it gives only the Garage entities that `select` does not skip, each with its state. For "attic" it gives `None`.
+- AC-7.6-4: When `FakeReasoner` gives `Step::States` for "Garage" from a Kitchen satellite, the tool result is the JSON list of the Garage entities and `FakeHome` records no call. For "attic", the tool result is "error: unknown area".
+- AC-7.6-5: When the prompt builder runs, the user message lists the name of each area of the hot cache.
+
+**Proofs.**
+
+- P-7.6-1, P-7.6-2. Evidence: test.
+- P-7.6-3. Ensures: each entity of `area_states` is in the area of the name and is not skipped. Argument: `area_states` uses the entity rule of `question` (P-7.2-2).
+- P-7.6-4. Argument: the `States` arm reads only the hot cache and sends the result on `reply`.
+- P-7.6-5. Evidence: test.
