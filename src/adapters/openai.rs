@@ -437,6 +437,7 @@ impl Reasoner for OpenAiReasoner {
             .text(responses_format())
             .max_output_tokens(self.bulk_max_output_tokens)
             .build()?;
+        self.record_when_idle(Duration::ZERO)?;
         let response = self.create(request).await?;
         let text = response.output_text().context("the response has no text")?;
         // Serde also reads a struct from a JSON array, which the schema does not permit.
@@ -728,6 +729,16 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         reasoner.warm().await?;
         assert_eq!(requests(&server).await?, 2);
+        Ok(())
+    }
+
+    /// A `generate` within `warm_idle_s` of the next `warm` counts as the last request.
+    #[tokio::test(start_paused = true)]
+    async fn generate_records_the_last_request() -> anyhow::Result<()> {
+        let (server, reasoner) = mock("completed").await?;
+        let _generated = reasoner.generate("lights_on", &[], &variables(), 2).await;
+        reasoner.warm().await?;
+        assert_eq!(requests(&server).await?, 1);
         Ok(())
     }
 
