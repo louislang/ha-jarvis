@@ -1,4 +1,4 @@
-//! Response pools: select, render, record use and validation.
+//! Response pools: select, render, record use, backfill policy and validation.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -17,6 +17,7 @@ use crate::domain::catalog;
 use crate::domain::catalog::Catalog;
 use crate::domain::catalog::Kind;
 use crate::domain::catalog::Target;
+use crate::domain::intent;
 
 /// The response pools by pool name.
 pub type Pools = BTreeMap<String, Pool>;
@@ -57,6 +58,23 @@ pub enum PoolError {
         /// The variable name.
         variable: String,
     },
+}
+
+/// A rejected backfill candidate.
+#[verus_verify]
+#[must_use]
+#[derive(Clone, Debug, PartialEq)]
+pub enum CandidateError {
+    /// The candidate has no words.
+    Empty,
+    /// The candidate has more characters than the limit.
+    Long,
+    /// The candidate equals a response of the pool after `normalize`.
+    Duplicate,
+    /// The candidate does not parse, or does not render with `area = "kitchen"`.
+    Template,
+    /// The candidate uses this variable, which the intent does not have.
+    Variable(String),
 }
 
 /// The index of a random response of `pool` with the lowest use count, other than the last
@@ -299,6 +317,161 @@ fn check_template(pool: &str, template: &str, allowed: &BTreeSet<String>) -> Res
     }
 }
 
+/// True when `pool` gets new responses: fewer than `min_fresh` are unused, it has fewer than
+/// `max_pool`, and its templates use no variable but `area`, so each one can be pre-rendered.
+#[verus_spec(result =>
+    ensures
+        result ==> fresh(pool.responses@) < min_fresh && pool.responses.len() < max_pool,
+)]
+#[must_use]
+pub fn needs_backfill(pool: &Pool, min_fresh: usize, max_pool: usize) -> bool {
+    pool.responses.len() < max_pool && count_fresh(pool) < min_fresh && only_area(pool)
+}
+
+/// The number of responses of `pool` with no use.
+#[verus_spec(count =>
+    ensures
+        count == fresh(pool.responses@),
+)]
+fn count_fresh(pool: &Pool) -> usize {
+    let mut count = 0;
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= pool.responses.len(),
+            count <= index,
+            count == fresh(pool.responses@.take(index as int)),
+        decreases pool.responses.len() - index,
+    ))]
+    while index < pool.responses.len() {
+        proof! {
+            assert(pool.responses@.take(index + 1).drop_last() =~= pool.responses@.take(index as int));
+        }
+        if pool.responses[index].uses == 0 {
+            count += 1;
+        }
+        index += 1;
+    }
+    proof! {
+        assert(pool.responses@.take(index as int) =~= pool.responses@);
+    }
+    count
+}
+
+/// True when each template of `pool` parses and uses no variable but `area`.
+#[verus_verify]
+fn only_area(pool: &Pool) -> bool {
+    let mut area = BTreeSet::new();
+    area.insert("area".to_owned());
+    for response in &pool.responses {
+        if !matches!(
+            catalog::unknown_variable(response.text.as_str(), &area),
+            Ok(None)
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Checks that the backfill `candidate` for `pool` has words, has at most `max_chars`
+/// characters, differs from each response after `normalize`, uses only `variables` and renders
+/// with `area = "kitchen"`.
+///
+/// # Errors
+///
+/// The first check that fails.
+#[verus_spec(result =>
+    ensures
+        result is Ok ==> fits(*pool, candidate@, max_chars as int),
+)]
+pub fn validate(
+    candidate: &str,
+    pool: &Pool,
+    variables: &BTreeSet<String>,
+    max_chars: usize,
+) -> Result<(), CandidateError> {
+    let normal = intent::normalize(candidate);
+    if normal.is_empty() {
+        return Err(CandidateError::Empty);
+    }
+    let chars: Vec<char> = candidate.chars().collect();
+    if chars.len() > max_chars {
+        return Err(CandidateError::Long);
+    }
+    if repeats(pool, normal.as_str()) {
+        return Err(CandidateError::Duplicate);
+    }
+    match catalog::unknown_variable(candidate, variables) {
+        Err(_) => return Err(CandidateError::Template),
+        Ok(Some(variable)) => return Err(CandidateError::Variable(variable)),
+        Ok(None) => {}
+    }
+    let mut context = serde_json::Map::new();
+    context.insert("area".to_owned(), Value::from("kitchen".to_owned()));
+    match render(candidate, &context) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(CandidateError::Template),
+    }
+}
+
+/// True when a response of `pool` equals `normal` after `normalize`.
+#[verus_spec(result =>
+    ensures
+        result == !distinct(*pool, normal@),
+)]
+fn repeats(pool: &Pool, normal: &str) -> bool {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= pool.responses.len(),
+            forall|seen: int| 0 <= seen < index
+                ==> intent::normalized(#[trigger] pool.responses[seen].text@) != normal@,
+        decreases pool.responses.len() - index,
+    ))]
+    while index < pool.responses.len() {
+        if intent::normalize(pool.responses[index].text.as_str()).as_str() == normal {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// `pool` with `candidates` appended as unused responses, up to `max_pool` responses.
+#[verus_spec(merged =>
+    ensures
+        merged.last == pool.last,
+        merged.responses@ == appended(pool.responses@, candidates@, max_pool as int),
+        pool.responses.len() <= max_pool ==> merged.responses.len() <= max_pool,
+)]
+#[must_use]
+pub fn merge(mut pool: Pool, candidates: &[String], max_pool: usize) -> Pool {
+    proof_decl! {
+        let ghost before = pool;
+    }
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= candidates.len(),
+            index == 0 || before.responses.len() + index <= max_pool,
+            pool.last == before.last,
+            pool.responses@ == before.responses@ + unused(candidates@.take(index as int)),
+        decreases candidates.len() - index,
+    ))]
+    while index < candidates.len() && pool.responses.len() < max_pool {
+        pool.responses.push(Response {
+            text: candidates[index].clone(),
+            uses: 0,
+        });
+        proof! {
+            assert(unused(candidates@.take(index + 1)) =~= unused(candidates@.take(index as int)).push(pool.responses@.last()));
+        }
+        index += 1;
+    }
+    pool
+}
+
 verus! {
 
 broadcast use {
@@ -389,6 +562,44 @@ pub open spec fn recorded(old: Map<String, Pool>, new: Map<String, Pool>, key: S
     } else {
         new == old
     }
+}
+
+/// The number of `responses` with no use.
+pub open spec fn fresh(responses: Seq<Response>) -> int
+    decreases responses.len(),
+{
+    if responses.len() == 0 {
+        0
+    } else {
+        fresh(responses.drop_last()) + if responses.last().uses == 0 { 1int } else { 0int }
+    }
+}
+
+/// True when no response of `pool` equals `normal` after `normalize`.
+pub open spec fn distinct(pool: Pool, normal: Seq<char>) -> bool {
+    forall|index: int| 0 <= index < pool.responses.len()
+        ==> crate::domain::intent::normalized(#[trigger] pool.responses[index].text@) != normal
+}
+
+/// True when `candidate` has words, has at most `max_chars` characters and differs from each
+/// response of `pool` after `normalize`.
+pub open spec fn fits(pool: Pool, candidate: Seq<char>, max_chars: int) -> bool {
+    let normal = crate::domain::intent::normalized(candidate);
+    &&& normal.len() > 0
+    &&& candidate.len() <= max_chars
+    &&& distinct(pool, normal)
+}
+
+/// Unused responses with the texts `texts`.
+pub open spec fn unused(texts: Seq<String>) -> Seq<Response> {
+    texts.map_values(|text: String| Response { text, uses: 0 })
+}
+
+/// `responses`, then unused responses with the first `candidates`, up to `max_pool` responses.
+pub open spec fn appended(responses: Seq<Response>, candidates: Seq<String>, max_pool: int) -> Seq<Response> {
+    let room = if max_pool > responses.len() { max_pool - responses.len() } else { 0 };
+    let count = if candidates.len() < room { candidates.len() as int } else { room };
+    responses + unused(candidates.take(count))
 }
 
 /// Every allowed response before `count` has `minimum(pool, count)` uses or more.
@@ -489,13 +700,7 @@ mod tests {
     /// Sets the responses of the pool `name` of `pools` to `texts`.
     fn set(pools: &mut Pools, name: &str, texts: &[&str]) {
         let pool = pools.get_mut(name).expect("the pool exists");
-        pool.responses = texts
-            .iter()
-            .map(|text| Response {
-                text: (*text).to_owned(),
-                uses: 0,
-            })
-            .collect();
+        pool.responses = self::texts(texts).responses;
     }
 
     /// The error of a template of the pool `pool` that uses `variable`.
@@ -656,5 +861,90 @@ mod tests {
         assert_eq!(result, unknown("fan_on", "response"));
         let result = validate(|pools, _| set(pools, "filler", &["One moment, {{ area }}."]));
         assert_eq!(result, unknown("filler", "area"));
+    }
+
+    /// A pool with one unused response for each of `texts`.
+    fn texts(texts: &[&str]) -> Pool {
+        let responses = texts.iter().map(|text| Response {
+            text: (*text).to_owned(),
+            uses: 0,
+        });
+        Pool {
+            responses: responses.collect(),
+            last: None,
+        }
+    }
+
+    /// The result of `validate` for `candidate` against the pool "Turning on the lights." with
+    /// the variable `area` and at most 30 characters.
+    fn check(candidate: &str) -> Result<(), CandidateError> {
+        let area = BTreeSet::from(["area".to_owned()]);
+        super::validate(candidate, &texts(&["Turning on the lights."]), &area, 30)
+    }
+
+    /// AC-8.1-1.
+    #[test]
+    fn ac_8_1_1_fewer_than_min_fresh_unused_needs_backfill() {
+        assert!(needs_backfill(&pool(&[0, 0, 1], None), 3, 30));
+        assert!(!needs_backfill(&pool(&[0, 0, 0, 1], None), 3, 30));
+    }
+
+    /// AC-8.1-2.
+    #[test]
+    fn ac_8_1_2_normalized_duplicate_is_rejected() {
+        assert_eq!(
+            check("turning on the  LIGHTS!"),
+            Err(CandidateError::Duplicate)
+        );
+        assert_eq!(check("The {{ area }} lights are on."), Ok(()));
+    }
+
+    /// AC-8.1-3.
+    #[test]
+    fn ac_8_1_3_unknown_variable_is_rejected() {
+        assert_eq!(
+            check("Playing {{ show }}."),
+            Err(CandidateError::Variable("show".to_owned()))
+        );
+    }
+
+    /// AC-8.1-4.
+    #[test]
+    fn ac_8_1_4_empty_or_long_candidate_is_rejected() {
+        assert_eq!(check(""), Err(CandidateError::Empty));
+        assert_eq!(check(&"a".repeat(31)), Err(CandidateError::Long));
+        assert_eq!(check(&"a".repeat(30)), Ok(()));
+    }
+
+    /// AC-8.1-5.
+    #[test]
+    fn ac_8_1_5_merge_appends_unused_candidates() {
+        let mut old = texts(&["One.", "Two."]);
+        old.responses[0].uses = 3;
+        old.last = Some(0);
+        let mut expected = old.clone();
+        expected
+            .responses
+            .extend(texts(&["Three.", "Four."]).responses);
+        let candidates = ["Three.".to_owned(), "Four.".to_owned()];
+        assert_eq!(merge(old, &candidates, 30), expected);
+    }
+
+    /// AC-8.1-6.
+    #[test]
+    fn ac_8_1_6_full_pool_gets_no_backfill() {
+        let full = pool(&[0, 0, 0], None);
+        assert!(!needs_backfill(&full, 5, 3));
+        let candidates = ["New.".to_owned()];
+        assert_eq!(merge(full.clone(), &candidates, 3), full);
+        let merged = merge(pool(&[1, 1], None), &["A.".to_owned(), "B.".to_owned()], 3);
+        assert_eq!(merged.responses.len(), 3);
+    }
+
+    /// AC-8.1-7.
+    #[test]
+    fn ac_8_1_7_variable_other_than_area_gets_no_backfill() {
+        assert!(!needs_backfill(&texts(&["{{ entity }} is on."]), 3, 30));
+        assert!(needs_backfill(&texts(&["In the {{ area }}."]), 3, 30));
     }
 }
