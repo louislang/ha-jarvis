@@ -41,7 +41,7 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 - **Implements:** G7. **Depends on:** 7.1.
 - **Files:** modify `src/adapters/openai.rs`, `src/domain/decide.rs`, `src/domain/select.rs`.
 
-**Model.** `Question { text, area, location, entities, now }` is in `src/domain/decide.rs`. The pure function `question(text, area, location, now, cache)` builds it. Sub-phase 7.5 calls it; this sub-phase does not wire it in. `entities` are the entities of every domain whose area (`entity_area`) is `area`, with name and state, and without the entities that `select` skips (`is_skipped`: an entity category, hidden, disabled, or on a satellite device). `location` is the HA location name (`Snapshot.config.location_name`). `now` is the local time in the HA time zone (`Snapshot.config.time_zone`). The caller converts the time, so the domain needs no time zone database. `system_prompt()` is a constant. It asks for plain text to speak: short sentences, with no Markdown, lists or emoji. `user_message(question)` has the date, the time, the HA location name, the area, the entities and the text. The system prompt has no date, so prompt caching still works.
+**Model.** `Question { text, area, location, entities, now }` is in `src/domain/decide.rs`. The pure function `question(text, area, location, now, cache)` builds it. Sub-phase 7.5 calls it; this sub-phase does not wire it in. `entities` are the entities of every domain whose area (`entity_area`) is `area`, with name, entity ID and state, and without the entities that `select` skips (`is_skipped`: an entity category, hidden, disabled, or on a satellite device). `location` is the HA location name (`Snapshot.config.location_name`). `now` is the local time in the HA time zone (`Snapshot.config.time_zone`). The caller converts the time, so the domain needs no time zone database. `system_prompt()` is a constant. It asks for plain text to speak: short sentences, with no Markdown, lists or emoji. `user_message(question)` has the date, the time, the HA location name, the area, the entities and the text. The system prompt has no date, so prompt caching still works.
 
 **Acceptance criteria.**
 
@@ -92,9 +92,9 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 **Goal:** Add the `call_service` tool, so System Two can act on HA. The application runs each call through `Home`, returns the result to the model, and continues the answer.
 
 - **Implements:** G7. **Depends on:** 7.3.
-- **Files:** modify `src/adapters/openai.rs`, `src/ports.rs`, `src/lib.rs`, `jarvis.toml`.
+- **Files:** modify `src/adapters/openai.rs`, `src/ports.rs`, `src/lib.rs`, `src/domain/decide.rs`, `jarvis.toml`.
 
-**Model.** `Step::Call(ServiceCall, reply)`: the consumer runs the call and sends the result back on `reply`. The adapter sends the tool result to OpenAI and continues the stream. One answer makes at most `openai.max_tool_calls` tool calls. A later tool call gets the tool error "limit reached" and no `Step::Call`. This sub-phase adds `openai.max_tool_calls` (`OpenAiConfig` in `src/lib.rs`).
+**Model.** `Step::Call(ServiceCall, reply)`: the consumer runs the call and sends the result back on `reply`. The adapter sends the tool result to OpenAI and continues the stream. One answer makes at most `openai.max_tool_calls` tool calls. A later tool call gets the tool error "limit reached" and no `Step::Call`. This sub-phase adds `openai.max_tool_calls` (`OpenAiConfig` in `src/lib.rs`). The `target` of `call_service` names entity IDs, so `EntityState` gets `entity_id`, and each entity line of `user_message` shows it, for example "- Overhead Light (light.overhead): off".
 
 - After a response with tool calls, the adapter sends the tool results with `previous_response_id`. Thus `answer` requests keep the OpenAI default `store` (true). `warm` keeps `store: false`.
 - A successful call without response data gives the tool result "done". A call with response data gives its JSON. A failed call gives "error: " and the error text.
