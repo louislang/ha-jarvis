@@ -8,7 +8,7 @@ This phase adds new responses to a pool when the pool has too few unused respons
 
 **Goal:** Add the pure backfill rules: when a pool needs new responses, which candidates are valid, and how they merge. Pools can now grow without duplicates or broken templates.
 
-- **Implements:** G5. **Depends on:** 7.5.
+- **Implements:** G5. **Depends on:** 7.5b.
 - **Files:** modify `src/domain/responses.rs`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.**
