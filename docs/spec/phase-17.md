@@ -57,7 +57,7 @@ This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a
 **Model.**
 
 - `Step::Plugin(PluginCall, reply)` has the same `reply` as `Step::Call` (sub-phase 7.4).
-- `OpenAiReasoner` gets the tools of the registry from `src/lib.rs`. Each `answer` request has a function tool with `strict: true` for each of them, next to `call_service`.
+- `OpenAiReasoner` gets the tools of the registry from `src/lib.rs`. Each `answer` request has a function tool with `strict: true` for each of them, next to `call_service` and `get_states`.
 - A tool call with the name of a plugin tool gives `Step::Plugin` with that name and the arguments. Arguments that are not a JSON object give a tool error, as in AC-7.4-3. A plugin call counts toward `openai.max_tool_calls`.
 - The `after` work of `Defer(Llm)` (sub-phase 7.5) runs each `Step::Plugin` with `Plugins::fetch` and the `HomeConfig` of the hot cache. It sends the JSON text of the result, or "error: " and the error text, back on `reply`. A plugin only reads data, so the step has no `allowed_domains` check and no `Home` call.
 - `StateCache` keeps the whole `HomeConfig` of the snapshot, and `config()` gives it.
