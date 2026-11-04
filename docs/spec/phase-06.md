@@ -451,6 +451,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - `main` installs one `tracing_subscriber::fmt` subscriber that writes to stderr. An `EnvFilter` reads `RUST_LOG`. Without `RUST_LOG`, the level is `info`. The output has no ANSI colors and no time, because the journal adds the time. This sub-phase adds `tracing-subscriber` with the features `fmt` and `env-filter`.
 - `handle` logs one `info` event for each request: the transcript, the top label and its probability, the decision kind and the reply text.
 - A `Listening` session logs one `info` event when it gives a transcript, at a commit or at `finish`: the transcript, which pass gave it, and the audio length in ms.
+- Sync logs one `warn` event for each failed `snapshot`, with the error (sub-phase 2.9).
 - The interaction log of phase 12 stores the same data. These events are only text in the journal.
 
 **Acceptance criteria.**
