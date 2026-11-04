@@ -21,6 +21,7 @@ use crate::domain::decide;
 use crate::domain::decide::Chosen;
 use crate::domain::decide::Decision;
 use crate::domain::decide::Job;
+use crate::domain::decide::Question;
 use crate::domain::decide::Request;
 use crate::domain::intent;
 use crate::domain::model::Prediction;
@@ -31,17 +32,31 @@ use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
 use crate::domain::training;
 use crate::ports::Classifier;
+use crate::ports::Clock;
 use crate::ports::Context;
 use crate::ports::Handled;
 use crate::ports::Home;
+use crate::ports::Reasoner;
+use crate::ports::Step;
 use crate::ports::Store;
 use crate::ports::Work;
 
 /// One change to the pools, applied by the pools task.
 pub type Change = Box<dyn FnOnce(Pools) -> Pools + Send>;
 
-/// Decides requests with System One and dispatches the decisions to the home, the announce
-/// queues and the pools task.
+/// System Two, the time of its questions and the longest wait for each step of an answer.
+#[derive(Clone)]
+pub struct SystemTwo {
+    /// The remote model.
+    pub reasoner: Arc<dyn Reasoner>,
+    /// The current time.
+    pub clock: Arc<dyn Clock>,
+    /// The longest wait for each step of an answer.
+    pub timeout: Duration,
+}
+
+/// Decides requests with System One and dispatches the decisions to the home, System Two, the
+/// announce queues and the pools task.
 #[derive(Clone)]
 pub struct Conversation {
     /// The current pools.
@@ -58,29 +73,35 @@ pub struct Conversation {
     catalog: Arc<Catalog>,
     /// The least top probability that System One acts on.
     threshold: f32,
+    /// System Two.
+    two: SystemTwo,
 }
 
 impl Conversation {
-    /// Decides with `classifier`, `catalog` and `threshold`. Dispatches to `queues`, their house
-    /// and the pools task of `pools` and `changes`. Selects the responses with `rng`.
+    /// Decides with `classifier`, `catalog` and `threshold`, and asks `two`. Dispatches to
+    /// `queues`, their house and the pools task of `pools` and `changes`. Selects the responses
+    /// with a random source seeded from the time of `two`.
     #[must_use]
     pub fn new(
         pools: Arc<ArcSwap<Pools>>,
         changes: mpsc::Sender<Change>,
         queues: Arc<Queues>,
-        rng: StdRng,
         classifier: Arc<dyn Classifier>,
         catalog: Arc<Catalog>,
         threshold: f32,
+        two: SystemTwo,
     ) -> Self {
+        use rand::SeedableRng;
+        let seed = two.clock.now().as_millisecond().unsigned_abs();
         Self {
             pools,
             changes,
             queues,
-            rng: Arc::new(Mutex::new(rng)),
+            rng: Arc::new(Mutex::new(StdRng::seed_from_u64(seed))),
             classifier,
             catalog,
             threshold,
+            two,
         }
     }
 
@@ -107,8 +128,8 @@ impl Conversation {
             area,
         };
         let decision = self.decide(&prediction, &request);
-        let kind = kind(&decision);
-        let handled = self.dispatch(decision, context.satellite_id.as_deref());
+        let (kind, area) = (kind(&decision), request.area.as_ref());
+        let handled = self.dispatch(decision, area, context.satellite_id.as_deref());
         let top = prediction.ranked.first();
         let reply = handled.text.as_str();
         tracing::info!(transcript = text, ?top, kind, reply, "handled");
@@ -141,10 +162,15 @@ impl Conversation {
         )
     }
 
-    /// The reply or filler of `decision` and its service call or fetch as background work.
-    /// Records the use of the reply. Increases the generation of `satellite`, the satellite
-    /// entity of the request.
-    pub fn dispatch(&self, decision: Decision, satellite: Option<&str>) -> Handled {
+    /// The reply or filler of `decision` and its service call, fetch or System Two answer from
+    /// `area` as background work, the answer only with `satellite`. Records the use of the reply.
+    /// Increases the generation of `satellite`, the satellite entity of the request.
+    pub fn dispatch(
+        &self,
+        decision: Decision,
+        area: Option<&AreaId>,
+        satellite: Option<&str>,
+    ) -> Handled {
         let request = satellite
             .map(|satellite| (satellite.to_owned(), self.queues.next_generation(satellite)));
         let (chosen, after) = match decision {
@@ -155,8 +181,11 @@ impl Conversation {
             } => (filler, Some(self.fetch(call, pool, request))),
             Decision::Defer {
                 filler,
-                job: Job::Llm(_),
-            } => (filler, None),
+                job: Job::Llm(text),
+            } => {
+                let llm = request.map(|request| self.llm(text, area.cloned(), request));
+                (filler, llm)
+            }
             Decision::Fallback { reply } => (reply, None),
         };
         let Chosen { text, pool, index } = chosen;
@@ -211,6 +240,69 @@ impl Conversation {
             queues.announce(&satellite, generation, &text).await
         }
         .boxed()
+    }
+
+    /// Announces each sentence of the System Two answer to `text` from `area` on the satellite
+    /// of `request` as it arrives, or a `failure` answer when the answer fails.
+    fn llm(&self, text: String, area: Option<AreaId>, request: (String, u64)) -> Work {
+        let conversation = self.clone();
+        async move {
+            let Err(error) = conversation.answer(&text, area.as_ref(), &request).await else {
+                return Ok(());
+            };
+            tracing::warn!("the answer failed: {error:#}");
+            let (text, (satellite, generation)) = (conversation.pick("failure"), request);
+            let queues = &conversation.queues;
+            queues.announce(&satellite, generation, &text).await
+        }
+        .boxed()
+    }
+
+    /// The System Two question for `text` from `area` with the local time of the house.
+    ///
+    /// # Errors
+    ///
+    /// The HA configuration or its time zone is not known.
+    fn question(&self, text: &str, area: Option<&AreaId>) -> anyhow::Result<Question> {
+        use anyhow::Context as _;
+        let cache = self.queues.cache.borrow();
+        let config = cache.config.as_ref().context("no HA configuration")?;
+        let now = self.two.clock.now().in_tz(&config.time_zone)?.datetime();
+        let location = &config.location_name;
+        Ok(decide::question(text, area, location, now, &cache))
+    }
+
+    /// Announces each sentence of the System Two answer to `text` from `area` on the satellite
+    /// of `request` as it arrives. Each call gets the tool error "not permitted".
+    ///
+    /// # Errors
+    ///
+    /// The HA configuration or its time zone is not known, the answer fails, no step comes
+    /// within the timeout, or an announce fails.
+    async fn answer(
+        &self,
+        text: &str,
+        area: Option<&AreaId>,
+        (satellite, generation): &(String, u64),
+    ) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use futures::StreamExt;
+        let mut steps = self.two.reasoner.answer(&self.question(text, area)?);
+        let queues = &self.queues;
+        loop {
+            let next = tokio::time::timeout(self.two.timeout, steps.next()).await;
+            match next.context("no step of the answer within the timeout")? {
+                Some(Ok(Step::Sentence(sentence))) => {
+                    queues.announce(satellite, *generation, &sentence).await?;
+                }
+                // The send fails only when the answer has ended, so the result is not needed.
+                Some(Ok(Step::Call(_, reply))) => {
+                    let _ = reply.send(Err(anyhow::anyhow!("not permitted")));
+                }
+                Some(Ok(Step::Done)) | None => return Ok(()),
+                Some(Err(error)) => return Err(error),
+            }
+        }
     }
 
     /// An answer of the pool `pool` rendered with `response` as `response`.
@@ -411,12 +503,12 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use jiff::Timestamp;
     use quint_connect::Driver;
     use quint_connect::State as ModelState;
     use quint_connect::Step;
     use quint_connect::quint_run;
     use quint_connect::switch;
-    use rand::SeedableRng;
     use serde::Deserialize;
     use tokio::runtime::Runtime;
     use tokio::time::Instant;
@@ -427,8 +519,11 @@ mod tests {
     use crate::domain::responses::Response;
     use crate::domain::state::ServiceCall;
     use crate::testing::fakes::FakeClassifier;
+    use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
+    use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
+    use crate::testing::fakes::Scripted;
     use crate::testing::fakes::house;
 
     /// The satellite entity of the tests.
@@ -443,24 +538,41 @@ mod tests {
     /// The device of the kitchen satellite.
     const KITCHEN: &str = "98f4aacf9c4152ffe32dff212df91521";
 
-    /// A conversation with `pools`, `changes`, `queues` and `classifier`, the catalog of
-    /// `intents.toml` and the `model.threshold` of `jarvis.toml`.
+    /// The house, the hot cache, the reasoner and the work of a System Two job.
+    type Reasoning = (
+        Arc<FakeHome>,
+        watch::Sender<StateCache>,
+        Arc<FakeReasoner>,
+        Work,
+    );
+
+    /// The `openai.timeout_ms` of the tests.
+    const TIMEOUT: Duration = Duration::from_millis(8000);
+
+    /// A conversation with `pools`, `changes`, `queues`, `classifier` and `reasoner`, the catalog
+    /// of `intents.toml` and the `model.threshold` of `jarvis.toml`.
     fn conversation(
         pools: Arc<ArcSwap<Pools>>,
         changes: mpsc::Sender<Change>,
         queues: Queues,
         classifier: Arc<dyn Classifier>,
+        reasoner: Arc<FakeReasoner>,
     ) -> Conversation {
         let catalog = toml::from_str(include_str!("../../intents.toml")).expect("it is a catalog");
-        let (rng, queues) = (StdRng::seed_from_u64(1), Arc::new(queues));
+        let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
+        let (queues, timeout) = (Arc::new(queues), TIMEOUT);
         Conversation::new(
             pools,
             changes,
             queues,
-            rng,
             classifier,
             Arc::new(catalog),
             0.6,
+            SystemTwo {
+                reasoner,
+                clock,
+                timeout,
+            },
         )
     }
 
@@ -528,7 +640,8 @@ mod tests {
         let task = start_pools(unused(), Arc::clone(&store) as _)?;
         let (pools, changes) = (Arc::clone(&task.pools), task.changes.clone());
         let classifier = Arc::new(FakeClassifier::default());
-        let conversation = conversation(pools, changes, queues(home, "idle").1, classifier);
+        let queues = queues(home, "idle").1;
+        let conversation = conversation(pools, changes, queues, classifier, Arc::default());
         Ok((task, store, conversation))
     }
 
@@ -551,7 +664,7 @@ mod tests {
         });
         let (_task, _store, conversation) = start(&home)?;
         let start = Instant::now();
-        let handled = conversation.dispatch(reply(Some(call())), None);
+        let handled = conversation.dispatch(reply(Some(call())), None, None);
         assert_eq!(Instant::now(), start, "dispatch waited for the call");
         assert!(handled.after.is_some(), "the call is not in after");
         Ok(())
@@ -562,7 +675,7 @@ mod tests {
     async fn ac_4_8_2_call_only_after_start() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
         let (_task, _store, conversation) = start(&home)?;
-        let after = conversation.dispatch(reply(Some(call())), None).after;
+        let after = conversation.dispatch(reply(Some(call())), None, None).after;
         assert_eq!(home.calls(), [], "a call came before the start");
         after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
         assert_eq!(home.calls(), [call()]);
@@ -573,7 +686,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_4_8_3_store_receives_new_use_count() -> anyhow::Result<()> {
         let started = start(&Arc::new(FakeHome::default()))?;
-        let _ = started.2.dispatch(reply(Some(call())), None);
+        let _ = started.2.dispatch(reply(Some(call())), None, None);
         let expected = responses::record_use(unused(), "lights_on", 1);
         assert_eq!(last_save(started).await?, expected);
         Ok(())
@@ -584,7 +697,7 @@ mod tests {
     async fn ac_4_8_4_reply_without_call_makes_no_call() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
         let (_task, _store, conversation) = start(&home)?;
-        let handled = conversation.dispatch(reply(None), None);
+        let handled = conversation.dispatch(reply(None), None, None);
         assert!(handled.after.is_none(), "a reply with no call has work");
         assert_eq!(home.calls(), []);
         Ok(())
@@ -595,7 +708,7 @@ mod tests {
     async fn ac_4_8_5_fallback_has_text_and_no_after() -> anyhow::Result<()> {
         let (_task, _store, conversation) = start(&Arc::new(FakeHome::default()))?;
         let reply = chosen("fallback", 0);
-        let handled = conversation.dispatch(Decision::Fallback { reply }, None);
+        let handled = conversation.dispatch(Decision::Fallback { reply }, None, None);
         assert_eq!(handled.text, "Sorry.");
         assert!(handled.after.is_none(), "a fallback has work");
         Ok(())
@@ -607,7 +720,7 @@ mod tests {
         let started = start(&Arc::new(FakeHome::default()))?;
         thread::scope(|scope| {
             for _ in 0..100 {
-                scope.spawn(|| started.2.dispatch(reply(None), None));
+                scope.spawn(|| started.2.dispatch(reply(None), None, None));
             }
         });
         let saved = last_save(started).await?;
@@ -695,13 +808,14 @@ mod tests {
         Ok(())
     }
 
-    /// A conversation on `home` and `classifier` with the queues of `queues(home, value)`, the
-    /// pools `unused()` and the receiver of its changes. It has no pools task, because a running
-    /// blocking task stops the paused clock.
+    /// A conversation on `home`, `classifier` and `reasoner` with the queues of
+    /// `queues(home, value)`, the pools `unused()` and the receiver of its changes. It has no
+    /// pools task, because a running blocking task stops the paused clock.
     fn still_with(
         home: &Arc<FakeHome>,
         value: &str,
         classifier: Arc<dyn Classifier>,
+        reasoner: Arc<FakeReasoner>,
     ) -> (
         watch::Sender<StateCache>,
         mpsc::Receiver<Change>,
@@ -710,7 +824,7 @@ mod tests {
         let (cache, queues) = queues(home, value);
         let pools = Arc::new(ArcSwap::from_pointee(unused()));
         let (changes, receiver) = mpsc::channel();
-        let conversation = conversation(pools, changes, queues, classifier);
+        let conversation = conversation(pools, changes, queues, classifier, reasoner);
         (cache, receiver, conversation)
     }
 
@@ -723,7 +837,12 @@ mod tests {
         mpsc::Receiver<Change>,
         Conversation,
     ) {
-        still_with(home, value, Arc::new(FakeClassifier::default()))
+        still_with(
+            home,
+            value,
+            Arc::<FakeClassifier>::default(),
+            Arc::default(),
+        )
     }
 
     /// The work of a dispatch of `decision` on `satellite`.
@@ -732,7 +851,7 @@ mod tests {
         decision: Decision,
         satellite: Option<&str>,
     ) -> anyhow::Result<Work> {
-        let handled = conversation.dispatch(decision, satellite);
+        let handled = conversation.dispatch(decision, None, satellite);
         handled.after.ok_or_else(|| anyhow::anyhow!("no after"))
     }
 
@@ -778,7 +897,7 @@ mod tests {
         let home = Arc::new(FakeHome::default());
         let (_cache, _changes, conversation) = still(&home, "idle");
         let first = failed(&home, &conversation)?;
-        let _ = conversation.dispatch(reply(None), Some(SATELLITE));
+        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE));
         first.await?;
         assert_eq!(announces(&home), [] as [&str; 0]);
         Ok(())
@@ -886,9 +1005,10 @@ mod tests {
         }
         let home = Arc::new(FakeHome::default());
         let (_cache, _changes, conversation) =
-            still_with(&home, "idle", Arc::clone(&classifier) as _);
+            still_with(&home, "idle", Arc::clone(&classifier) as _, Arc::default());
         let context = Context {
             device_id: device.map(str::to_owned),
+            satellite_id: device.map(|_| SATELLITE.to_owned()),
             ..Context::default()
         };
         let result = conversation.handle(text, context).await;
@@ -967,6 +1087,104 @@ mod tests {
                 events[0]
             );
         }
+        Ok(())
+    }
+
+    /// AC-7.5-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_5_1_unknown_gives_a_filler_before_time_advances() -> anyhow::Result<()> {
+        let start = Instant::now();
+        let (handled, _) = handled(Some("unknown"), "tell me a joke", Some(KITCHEN)).await;
+        assert_eq!(Instant::now(), start, "handle waited");
+        assert_eq!(handled?.text, "One moment.");
+        Ok(())
+    }
+
+    /// A System Two job on the satellite in the state `value` whose reasoner gives `steps`: its
+    /// house, hot cache, reasoner and work.
+    fn reasoning(value: &str, steps: Vec<Scripted>) -> anyhow::Result<Reasoning> {
+        let (home, reasoner) = (Arc::default(), Arc::new(FakeReasoner::default()));
+        reasoner.script(steps);
+        let classifier = Arc::new(FakeClassifier::default());
+        let (cache, _, conversation) = still_with(&home, value, classifier, Arc::clone(&reasoner));
+        let (filler, job) = (chosen("filler", 0), Job::Llm("tell me".to_owned()));
+        let defer = Decision::Defer { filler, job };
+        Ok((
+            home,
+            cache,
+            reasoner,
+            work(&conversation, defer, Some(SATELLITE))?,
+        ))
+    }
+
+    /// AC-7.5-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_5_2_two_sentences_give_two_announces_in_order() -> anyhow::Result<()> {
+        let steps = vec![Scripted::Sentence("One."), Scripted::Sentence("Two.")];
+        let (home, _cache, _, work) = reasoning("idle", steps)?;
+        work.await?;
+        assert_eq!(announces(&home), ["One.", "Two."]);
+        Ok(())
+    }
+
+    /// AC-7.5-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_5_3_first_announce_starts_margin_after_idle() -> anyhow::Result<()> {
+        let (home, cache, _, work) = reasoning("responding", vec![Scripted::Sentence("One.")])?;
+        let (start, busy_for) = (Instant::now(), Duration::from_millis(1500));
+        let idle = async {
+            tokio::time::sleep(busy_for).await;
+            set(&cache, "idle");
+        };
+        tokio::join!(work, idle).0?;
+        assert!(
+            Instant::now() - start >= busy_for + MARGIN,
+            "it started early"
+        );
+        assert_eq!(announces(&home), ["One."]);
+        Ok(())
+    }
+
+    /// AC-7.5-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_5_5_answer_error_announces_failure() -> anyhow::Result<()> {
+        let (home, _cache, _, work) = reasoning("idle", vec![Scripted::Error("broken")])?;
+        work.await?;
+        assert_eq!(announces(&home), ["Failed."]);
+        Ok(())
+    }
+
+    /// AC-7.5-9.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_5_9_sentence_is_announced_while_the_reasoner_waits() -> anyhow::Result<()> {
+        let wait = Duration::from_secs(1);
+        let steps = vec![Scripted::Sentence("One."), Scripted::Wait(wait)];
+        let (home, _cache, _, work) = reasoning("idle", steps)?;
+        let waiting = async {
+            tokio::time::sleep(wait / 2).await;
+            assert_eq!(announces(&home), ["One."], "no announce during the wait");
+        };
+        tokio::join!(work, waiting).0
+    }
+
+    /// AC-7.5-10.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_5_10_no_step_within_timeout_announces_failure() -> anyhow::Result<()> {
+        let start = Instant::now();
+        let (home, _cache, _, work) = reasoning("idle", vec![Scripted::Wait(TIMEOUT * 2)])?;
+        work.await?;
+        assert_eq!(Instant::now() - start, TIMEOUT + MARGIN, "no timeout");
+        assert_eq!(announces(&home), ["Failed."]);
+        Ok(())
+    }
+
+    /// AC-7.5-12.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_5_12_call_gets_not_permitted_and_makes_no_call() -> anyhow::Result<()> {
+        let (home, _cache, reasoner, work) = reasoning("idle", vec![Scripted::Call(call())])?;
+        work.await?;
+        assert_eq!(home.calls(), []);
+        assert_eq!(reasoner.results(), ["not permitted"]);
         Ok(())
     }
 

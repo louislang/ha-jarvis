@@ -47,6 +47,7 @@ use crate::adapters::sherpa::SherpaStt;
 use crate::adapters::sherpa::SherpaTts;
 use crate::app::conversation::Conversation;
 use crate::app::conversation::Queues;
+use crate::app::conversation::SystemTwo;
 use crate::app::speech::Listener;
 use crate::app::speech::Speech;
 use crate::domain::catalog::Catalog;
@@ -756,15 +757,24 @@ async fn start_app(
     let store = Arc::new(FileStore::try_new(config.pools.clone())?);
     let task = app::conversation::start_pools(pools, store)?;
     let (cache, queues) = start_sync(home, &config.announce);
-    let (classifier, listener, speech) = load_models(config, reasoner).await?;
+    let (classifier, listener, speech) = load_models(config, Arc::clone(&reasoner)).await?;
     start_prerender(&speech, &task.pools, cache);
-    let rng = StdRng::seed_from_u64(SystemClock.now().as_millisecond().unsigned_abs());
     let (catalog, threshold) = (Arc::new(catalog), config.model.threshold);
-    let (pools, changes) = (task.pools, task.changes);
-    let conversation =
-        Conversation::new(pools, changes, queues, rng, classifier, catalog, threshold);
+    let two = SystemTwo {
+        reasoner,
+        clock: Arc::new(SystemClock),
+        timeout: Duration::from_millis(config.openai.timeout_ms),
+    };
     let app = App {
-        conversation,
+        conversation: Conversation::new(
+            task.pools,
+            task.changes,
+            queues,
+            classifier,
+            catalog,
+            threshold,
+            two,
+        ),
         listener,
         speech,
     };
@@ -940,6 +950,7 @@ mod tests {
     use crate::ports::TextToSpeech;
     use crate::testing::fakes;
     use crate::testing::fakes::FakeClassifier;
+    use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
@@ -1333,18 +1344,22 @@ mod tests {
         let config = Config::parse(VALID)?;
         let catalog = load_catalog(&config.intents)?;
         let task = app::conversation::start_pools(pools(&catalog), Arc::new(FakeStore::new(None)))?;
-        let (rng, threshold) = (StdRng::seed_from_u64(1), config.model.threshold);
         let (pools, changes, catalog) = (task.pools, task.changes, Arc::new(catalog));
         let reasoner = Arc::new(FakeReasoner::default());
         let listener = listener(&config, stt, Arc::clone(&classifier), reasoner);
+        let two = SystemTwo {
+            reasoner: Arc::new(FakeReasoner::default()),
+            clock: Arc::new(FakeClock(Timestamp::UNIX_EPOCH)),
+            timeout: Duration::ZERO,
+        };
         let conversation = Conversation::new(
             pools,
             changes,
             queues(),
-            rng,
             classifier,
             catalog,
-            threshold,
+            config.model.threshold,
+            two,
         );
         let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
         Ok(App {

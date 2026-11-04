@@ -11,6 +11,7 @@ use crate::domain::state::Device;
 use crate::domain::state::Entity;
 use crate::domain::state::EntityId;
 use crate::domain::state::Event;
+use crate::domain::state::HomeConfig;
 use crate::domain::state::Snapshot;
 use crate::domain::state::State;
 
@@ -25,6 +26,8 @@ pub struct StateCache {
     pub devices: Arc<BTreeMap<Arc<str>, Device>>,
     /// The entity registry.
     pub entities: Arc<Vec<Entity>>,
+    /// The HA configuration, after the first load.
+    pub config: Option<HomeConfig>,
 }
 
 #[verus_verify]
@@ -68,6 +71,7 @@ impl StateCache {
             areas: Arc::new(snapshot.areas),
             devices: Arc::new(by_id(snapshot.devices)),
             entities: Arc::new(snapshot.entities),
+            config: Some(snapshot.config),
         }
     }
 
