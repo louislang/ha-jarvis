@@ -14,6 +14,7 @@ use tokio::sync::watch;
 
 use crate::BackfillConfig;
 use crate::app::conversation::Change;
+use crate::app::speech::Speech;
 use crate::domain::catalog::Catalog;
 use crate::domain::responses;
 use crate::domain::responses::Pool;
@@ -70,27 +71,35 @@ pub struct Backfill {
     reasoner: Arc<dyn Reasoner>,
     /// The sender of the changes to the pools task.
     changes: mpsc::Sender<Change>,
+    /// The pre-render of the new responses.
+    speech: Arc<Speech>,
     /// The intent catalog. Only an intent pool can use `area`.
     catalog: Arc<Catalog>,
+    /// The hot cache, which has the area names of the pre-render.
+    cache: watch::Receiver<StateCache>,
     /// The pools with a backfill in progress.
     running: Mutex<HashSet<String>>,
 }
 
 impl Backfill {
-    /// Backfills with the limits of `config` and the candidates of `reasoner`, and sends the uses
-    /// and the merges on `changes`.
+    /// Backfills with the limits of `config` and the candidates of `reasoner`, pre-renders with
+    /// `speech` for the areas of `cache`, and sends the uses and the merges on `changes`.
     #[must_use]
     pub fn new(
         config: BackfillConfig,
         reasoner: Arc<dyn Reasoner>,
         changes: mpsc::Sender<Change>,
+        speech: Arc<Speech>,
         catalog: Arc<Catalog>,
+        cache: watch::Receiver<StateCache>,
     ) -> Self {
         Self {
             config,
             reasoner,
             changes,
+            speech,
             catalog,
+            cache,
             running: Mutex::default(),
         }
     }
@@ -141,18 +150,35 @@ impl Backfill {
     }
 
     /// The new responses of the pool `name`, which is `pool`, that System Two writes and that are
-    /// valid.
+    /// valid, after their pre-render.
     ///
     /// # Errors
     ///
-    /// `generate` fails.
+    /// `generate` or the pre-render fails.
     async fn candidates(&self, name: &str, pool: &Pool) -> anyhow::Result<Vec<String>> {
         let variables = self.variables(name);
         let existing = texts(pool);
         let generated = self
             .reasoner
             .generate(name, &existing, &variables, self.config.batch);
-        Ok(self.valid(pool, generated.await?, &variables))
+        let new = self.valid(pool, generated.await?, &variables);
+        self.prerender(name, &new).await?;
+        Ok(new)
+    }
+
+    /// Synthesizes the responses `new` of the pool `name` for the area names of the hot cache.
+    ///
+    /// # Errors
+    ///
+    /// A synthesis fails.
+    async fn prerender(&self, name: &str, new: &[String]) -> anyhow::Result<()> {
+        let empty = Pool {
+            responses: Vec::new(),
+            last: None,
+        };
+        let added = Pools::from([(name.to_owned(), responses::merge(empty, new, usize::MAX))]);
+        let areas = area_names(&self.cache.borrow());
+        self.speech.prerender(&added, &areas).await
     }
 
     /// The variables that the responses of the pool `name` can use: `area` for an intent pool.
@@ -197,6 +223,13 @@ impl Backfill {
     }
 }
 
+/// The name of each area of `cache`.
+#[must_use]
+pub fn area_names(cache: &StateCache) -> Vec<String> {
+    let names = cache.areas.iter().map(|area| area.name.clone());
+    names.collect()
+}
+
 /// The text of each response of `pool`.
 fn texts(pool: &Pool) -> Vec<String> {
     let texts = pool.responses.iter().map(|response| response.text.clone());
@@ -226,10 +259,13 @@ mod tests {
 
     use super::*;
     use crate::Config;
+    use crate::app::conversation;
     use crate::domain::state::Snapshot;
     use crate::domain::state::State;
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeReasoner;
+    use crate::testing::fakes::FakeStore;
+    use crate::testing::fakes::FakeTts;
     use crate::testing::fakes::house;
 
     /// The entity that the tests change.
@@ -418,6 +454,63 @@ mod tests {
         assert_retries(3, &[1, 3, 7]).await;
     }
 
+    /// The candidates of the pre-render tests.
+    const NEW: [&str; 2] = ["All set.", "There you go."];
+
+    /// True when `speech` speaks each of `NEW` without a new synthesis of `tts`.
+    async fn cached(speech: &Speech, tts: &FakeTts) -> anyhow::Result<bool> {
+        let synths = tts.texts().len();
+        for text in NEW {
+            speech.speak(text).await?;
+        }
+        Ok(tts.texts().len() == synths)
+    }
+
+    /// AC-8.4b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_8_4b_1_generate_saves_and_caches_new_responses() -> anyhow::Result<()> {
+        let (reasoner, tts) = (
+            Arc::new(FakeReasoner::default()),
+            Arc::new(FakeTts::default()),
+        );
+        let store = Arc::new(FakeStore::new(None));
+        let task = conversation::start_pools(pools(), Arc::clone(&store) as _)?;
+        let backfill = backfill(Arc::clone(&reasoner), task.changes, &tts);
+        backfill.record_use("a".to_owned(), 0);
+        // The pools task runs on a blocking thread, which stops the paused clock.
+        while reasoner.generated().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        reasoner.release("a", Ok(NEW.map(str::to_owned).to_vec()));
+        let speech = Arc::clone(&backfill.speech);
+        drop(backfill);
+        task.task.await?;
+        let saved: Pools = store.saves().pop().expect("the task saves each change");
+        assert_eq!(texts(&saved["a"])[START..], NEW);
+        assert!(cached(&speech, &tts).await?, "a new response has no audio");
+        Ok(())
+    }
+
+    /// AC-8.4b-3.
+    #[test]
+    fn ac_8_4b_3_audio_before_merge() -> anyhow::Result<()> {
+        let mut driver = BackfillDriver::new();
+        driver.record_use("a");
+        let new = NEW.map(str::to_owned).to_vec();
+        driver.reasoner.release("a", Ok(new));
+        driver.runtime.block_on(async {
+            // Each synthesis lets this task run, so the loop sees the merge when it arrives.
+            let mut tries = 0..100;
+            while driver.changes.try_recv().is_err() && tries.next().is_some() {
+                tokio::task::yield_now().await;
+            }
+            assert!(!tries.is_empty(), "no merge arrived");
+            let cached = cached(&driver.backfill.speech, &driver.tts).await?;
+            assert!(cached, "the merge came before the audio");
+            Ok(())
+        })
+    }
+
     /// The model state that the conformance test compares.
     #[derive(Debug, Deserialize, PartialEq)]
     struct CacheSync {
@@ -554,18 +647,32 @@ mod tests {
         }
     }
 
-    /// A backfill with `reasoner` and `changes`, the `[backfill]` of `jarvis.toml` with no pool
-    /// limit and the catalog of `intents.toml`.
-    fn backfill(reasoner: Arc<FakeReasoner>, changes: mpsc::Sender<Change>) -> Arc<Backfill> {
+    /// A backfill with `reasoner`, `changes` and `tts`, the `[backfill]` of `jarvis.toml` with no
+    /// pool limit, the catalog of `intents.toml` and the hot cache of the reference house.
+    fn backfill(
+        reasoner: Arc<FakeReasoner>,
+        changes: mpsc::Sender<Change>,
+        tts: &Arc<FakeTts>,
+    ) -> Arc<Backfill> {
         let mut config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
         config.backfill.max_pool = usize::MAX;
         let catalog = toml::from_str(include_str!("../../intents.toml")).expect("it is a catalog");
-        Arc::new(Backfill::new(
-            config.backfill,
-            reasoner,
-            changes,
-            Arc::new(catalog),
-        ))
+        let speech = Arc::new(Speech::new(Arc::clone(tts) as _));
+        let cache = watch::channel(StateCache::load(house())).1;
+        let catalog = Arc::new(catalog);
+        let backfill = Backfill::new(config.backfill, reasoner, changes, speech, catalog, cache);
+        Arc::new(backfill)
+    }
+
+    /// The pools `a` and `b`, each with `START` unused responses.
+    fn pools() -> Pools {
+        let texts: Vec<String> = (1..=START).map(|n| format!("Response {n}.")).collect();
+        let empty = Pool {
+            responses: Vec::new(),
+            last: None,
+        };
+        let pool = responses::merge(empty, &texts, START);
+        Pools::from([("a".to_owned(), pool.clone()), ("b".to_owned(), pool)])
     }
 
     /// Replays `backfill.qnt` against the backfill, with `FakeReasoner` as System Two and the
@@ -577,6 +684,8 @@ mod tests {
         reasoner: Arc<FakeReasoner>,
         /// The use case.
         backfill: Arc<Backfill>,
+        /// The TTS of its pre-render.
+        tts: Arc<FakeTts>,
         /// The receiver of its changes.
         changes: mpsc::Receiver<Change>,
         /// The pools after each change.
@@ -588,20 +697,15 @@ mod tests {
         fn new() -> Self {
             let mut runtime = tokio::runtime::Builder::new_current_thread();
             let runtime = runtime.enable_time().start_paused(true).build();
-            let reasoner = Arc::new(FakeReasoner::default());
+            let (reasoner, tts) = (Arc::new(FakeReasoner::default()), Arc::default());
             let (changes, receiver) = mpsc::channel();
-            let texts: Vec<String> = (1..=START).map(|n| format!("Response {n}.")).collect();
-            let empty = Pool {
-                responses: Vec::new(),
-                last: None,
-            };
-            let pool = responses::merge(empty, &texts, START);
             Self {
                 runtime: runtime.expect("the runtime builds"),
-                backfill: backfill(Arc::clone(&reasoner), changes),
+                backfill: backfill(Arc::clone(&reasoner), changes, &tts),
                 reasoner,
+                tts,
                 changes: receiver,
-                pools: Pools::from([("a".to_owned(), pool.clone()), ("b".to_owned(), pool)]),
+                pools: pools(),
             }
         }
 

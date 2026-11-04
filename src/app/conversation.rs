@@ -17,6 +17,7 @@ use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::app::background::Backfill;
 use crate::domain::catalog::Catalog;
 use crate::domain::decide;
 use crate::domain::decide::Chosen;
@@ -67,8 +68,8 @@ pub struct SystemTwo {
 pub struct Conversation {
     /// The current pools.
     pools: Arc<ArcSwap<Pools>>,
-    /// The sender of the changes to the pools task.
-    changes: mpsc::Sender<Change>,
+    /// The use records and the backfills of the pools.
+    backfill: Arc<Backfill>,
     /// The announce queues, their house and the hot cache.
     queues: Arc<Queues>,
     /// The random source of the response selection.
@@ -85,12 +86,12 @@ pub struct Conversation {
 
 impl Conversation {
     /// Decides with `classifier`, `catalog` and `threshold`, and asks `two`. Dispatches to
-    /// `queues`, their house and the pools task of `pools` and `changes`. Selects the responses
-    /// with a random source seeded from the time of `two`.
+    /// `queues`, their house and `backfill`, which records the uses of `pools`. Selects the
+    /// responses with a random source seeded from the time of `two`.
     #[must_use]
     pub fn new(
         pools: Arc<ArcSwap<Pools>>,
-        changes: mpsc::Sender<Change>,
+        backfill: Arc<Backfill>,
         queues: Arc<Queues>,
         classifier: Arc<dyn Classifier>,
         catalog: Arc<Catalog>,
@@ -101,7 +102,7 @@ impl Conversation {
         let seed = two.clock.now().as_millisecond().unsigned_abs();
         Self {
             pools,
-            changes,
+            backfill,
             queues,
             rng: Arc::new(Mutex::new(StdRng::seed_from_u64(seed))),
             classifier,
@@ -222,7 +223,7 @@ impl Conversation {
             Decision::Fallback { reply } => (reply, None),
         };
         let Chosen { text, pool, index } = chosen;
-        record_use(&self.changes, pool, index);
+        self.backfill.record_use(pool, index);
         Handled { text, after }
     }
 
@@ -457,7 +458,7 @@ impl Conversation {
                 responses::select(found, &mut self.rng.lock().expect("no lock holder panics"));
             (found.responses[index].text.clone(), index)
         };
-        record_use(&self.changes, pool.to_owned(), index);
+        self.backfill.record_use(pool.to_owned(), index);
         text
     }
 }
@@ -469,14 +470,6 @@ fn kind(decision: &Decision) -> &'static str {
         Decision::Defer { .. } => "defer",
         Decision::Fallback { .. } => "fallback",
     }
-}
-
-/// Sends the use of the response at `index` of the pool `pool` to the pools task of `changes`.
-fn record_use(changes: &mpsc::Sender<Change>, pool: String, index: usize) {
-    // The task holds the receiver until every sender drops, so the send fails only after a panic.
-    let _ = changes.send(Box::new(move |pools| {
-        responses::record_use(pools, &pool, index)
-    }));
 }
 
 /// The announce queue and the generation of one satellite.
@@ -662,6 +655,7 @@ mod tests {
     use tracing::instrument::WithSubscriber;
 
     use super::*;
+    use crate::app::speech::Speech;
     use crate::domain::responses::Pool;
     use crate::domain::state::ServiceCall;
     use crate::domain::state::State;
@@ -670,6 +664,7 @@ mod tests {
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
+    use crate::testing::fakes::FakeTts;
     use crate::testing::fakes::Scripted;
     use crate::testing::fakes::house;
 
@@ -696,21 +691,41 @@ mod tests {
     /// The `openai.timeout_ms` of the tests.
     const TIMEOUT: Duration = Duration::from_millis(8000);
 
-    /// A conversation with `pools`, `changes`, `queues`, `classifier` and `reasoner`, the catalog
-    /// of `intents.toml` and the `model.threshold` of `jarvis.toml`.
+    /// A backfill on `changes`, `reasoner`, the hot cache of `queues` and `FakeTts`, with the
+    /// catalog of `intents.toml` and the `[backfill]` of `jarvis.toml` up to `max_pool` responses.
+    fn backfill(
+        changes: mpsc::Sender<Change>,
+        reasoner: Arc<FakeReasoner>,
+        queues: &Queues,
+        max_pool: usize,
+    ) -> Arc<Backfill> {
+        let mut config = crate::Config::parse(include_str!("../../jarvis.toml")).expect("valid");
+        config.backfill.max_pool = max_pool;
+        let catalog = toml::from_str(include_str!("../../intents.toml")).expect("it is a catalog");
+        let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
+        let (catalog, cache) = (Arc::new(catalog), queues.cache.clone());
+        let backfill = Backfill::new(config.backfill, reasoner, changes, speech, catalog, cache);
+        Arc::new(backfill)
+    }
+
+    /// A conversation with `pools`, `queues`, `classifier` and `reasoner`, the backfill of
+    /// `changes` up to `max_pool` responses, the catalog of `intents.toml` and the
+    /// `model.threshold` of `jarvis.toml`.
     fn conversation(
         pools: Arc<ArcSwap<Pools>>,
         changes: mpsc::Sender<Change>,
+        max_pool: usize,
         queues: Queues,
         classifier: Arc<dyn Classifier>,
         reasoner: Arc<FakeReasoner>,
     ) -> Conversation {
         let catalog = toml::from_str(include_str!("../../intents.toml")).expect("it is a catalog");
         let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
+        let backfill = backfill(changes, Arc::clone(&reasoner), &queues, max_pool);
         let (queues, timeout) = (Arc::new(queues), TIMEOUT);
         Conversation::new(
             pools,
-            changes,
+            backfill,
             queues,
             classifier,
             Arc::new(catalog),
@@ -796,7 +811,8 @@ mod tests {
         let (pools, changes) = (Arc::clone(&task.pools), task.changes.clone());
         let classifier = Arc::new(FakeClassifier::default());
         let queues = queues(home, "idle").1;
-        let conversation = conversation(pools, changes, queues, classifier, Arc::default());
+        // No backfill starts: a held `generate` would keep the pools task running.
+        let conversation = conversation(pools, changes, 0, queues, classifier, Arc::default());
         Ok((task, store, conversation))
     }
 
@@ -1016,7 +1032,7 @@ mod tests {
         let (cache, queues) = queues(home, value);
         let pools = Arc::new(ArcSwap::from_pointee(unused()));
         let (changes, receiver) = mpsc::channel();
-        let conversation = conversation(pools, changes, queues, classifier, reasoner);
+        let conversation = conversation(pools, changes, usize::MAX, queues, classifier, reasoner);
         (cache, receiver, conversation)
     }
 
@@ -1107,6 +1123,28 @@ mod tests {
         let reply = responses::record_use(unused(), "lights_on", 1);
         assert_eq!(applied, responses::record_use(reply, "failure", 0));
         Ok(())
+    }
+
+    /// AC-8.4b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_8_4b_2_select_does_not_wait_for_generate() {
+        let (home, reasoner) = (
+            Arc::new(FakeHome::default()),
+            Arc::new(FakeReasoner::default()),
+        );
+        let classifier = Arc::<FakeClassifier>::default();
+        let (_cache, changes, conversation) =
+            still_with(&home, "idle", classifier, Arc::clone(&reasoner));
+        let _ = conversation.dispatch(reply(None), None, None);
+        let _ = changes
+            .try_iter()
+            .fold(unused(), |pools, change| change(pools));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let waiting = reasoner.generated();
+        assert_eq!(waiting, ["lights_on"], "no generate call waits");
+        let start = Instant::now();
+        let _ = conversation.pick("lights_on");
+        assert_eq!(Instant::now(), start, "select waited for the backfill");
     }
 
     /// The `weather` call with `return_response`.
