@@ -48,7 +48,7 @@ Dependency rules:
                                    │   ┌────▼──── domain/ ──────┐ │   Store<T> ───────▶ adapters/files.rs
                                    │   │ intent model training  │ │   Clock ──────────▶ SystemClock (lib.rs)
                                    │   │ decide responses state │ │   Plugin ─────────▶ adapters/open_meteo.rs ─▶ Open-Meteo
-                                   │   │ dialog habits feedback │ │
+                                   │   │ dialog habits feedback │ │                     adapters/plex.rs ─▶ Plex
                                    │   │ learn speaker speech   │ │
                                    │   └────────────────────────┘ │
                                    └──────────────────────────────┘
@@ -71,7 +71,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | `ModelLoader` | Driven | `load` (gives a `Classifier` for a model folder) | `adapters/onnx.rs` |
 | `Trainer` | Driven | `train` (gives a model folder for a training set) | `adapters/process.rs` (local GPU) and `adapters/runpod.rs` (fallback) |
 | `Reasoner` | Driven | `warm`, `answer` (gives steps: sentence, call, plugin, ask, done), `generate`, `paraphrase`, `embed`, `propose` | `adapters/openai.rs` |
-| `Plugin` | Driven | `tool`, `fetch` | One adapter for each remote API: `adapters/open_meteo.rs` (weather) |
+| `Plugin` | Driven | `tool`, `fetch` | One adapter for each remote API: `adapters/open_meteo.rs` (weather), `adapters/plex.rs` (new shows) |
 | `InteractionLog` | Driven | `append`, `update`, `list`, `audio`, `mark`, `marked`, `unknowns`, `prune` | `adapters/sqlite.rs` |
 | `Store<T>` | Driven | `load`, `save` | `adapters/files.rs` (TOML or JSON from the file extension) |
 | `Clock` | Driven | `now` | `SystemClock` in `src/lib.rs` |
@@ -159,7 +159,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 27. **One ONNX Runtime, GPU or CPU.** `sherpa-onnx` (feature `shared`) and `ort` (feature `load-dynamic`) load the same ONNX Runtime 1.28.2 shared library from sherpa-onnx 2.0.1. On the GPU host, it is the CUDA 12 and cuDNN 9 build from the sherpa-onnx `linux-x64-gpu` release. On other machines, it is the CPU build. Thus the two crates cannot conflict, and `device` selects the CUDA or the CPU execution provider for all models.
 28. **Two-pass STT.** The first pass streams, so Jarvis knows the words while the user speaks. It uses NVIDIA Nemotron Speech Streaming EN 0.6B with 160 ms chunks on the GPU host. The first pass gives the last word only after the VAD ends the segment and flushes the model, about 203 ms after the last voiced sample (sub-phase 6.6c). Thus at an early commit after 200 ms the first-pass text can lack the end of the last word. At commit, the second pass decodes the whole utterance with NVIDIA Parakeet Unified EN 0.6B in offline mode. The second pass has full context, so it is more accurate. On the Open ASR Leaderboard sets, the average word error rate goes from 7.67% to 5.91%, and on LibriSpeech test-clean from 2.56% to 1.63%. HA receives the second-pass text, so the cut first-pass text does not reach HA on the GPU host. Both models are official sherpa-onnx exports. The GPU host runs fp16 conversions of them (sub-phase 6.6c). Cloud streaming APIs take about 250 ms to 300 ms to give the final text, so they cannot meet G1. CPU machines use the same first pass and have no second pass.
 29. **Blocking work off the async workers.** STT decoding, the second pass, `predict`, TTS synthesis, voice embedding and SQLite calls run in `tokio::task::spawn_blocking`. The async workers only move bytes and wait. Thus a decode for one satellite does not delay `handle` for another.
-30. **Remote data through plugins.** Data from a remote server, for example a weather forecast, reaches Jarvis only through a `Plugin` adapter. Jarvis code builds the request and parses the reply into a typed result. Thus the result is the same for the same reply, and no model sees a raw API call. System Two gets each plugin as its own tool, for example `get_weather(when)`. A System One fetch intent names a plugin. The plugin registry keeps each result for `plugins.cache_s`. A plugin only reads data, so it has no `allowed_domains` check. System Two still calls HA services directly, within `openai.allowed_domains` (sub-phase 7.5). The weather plugin uses Open-Meteo, which needs no API key, with the location of the HA configuration.
+30. **Remote data through plugins.** Data from a remote server, for example a weather forecast, reaches Jarvis only through a `Plugin` adapter. Jarvis code builds the request and parses the reply into a typed result. Thus the result is the same for the same reply, and no model sees a raw API call. System Two gets each plugin as its own tool, for example `get_weather(when)`. A System One fetch intent names a plugin. The plugin registry keeps each result for `plugins.cache_s`. A plugin only reads data, so it has no `allowed_domains` check. System Two still calls HA services directly, within `openai.allowed_domains` (sub-phase 7.5). The weather plugin uses Open-Meteo, which needs no API key, with the location of the HA configuration. The Plex plugin reads the recently added items and the On Deck list of the Plex server with a token (phase 18).
 
 ## 6. Latency Budget (System One)
 
@@ -200,14 +200,14 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `sherpa-onnx` (`=2.0.1`, feature `shared`) | Adapter | Streaming STT (`OnlineRecognizer`), TTS (`OfflineTts`, Supertonic-3 model), voice identification (`SpeakerEmbeddingExtractor`, `SpeakerEmbeddingManager`). CUDA or CPU provider. |
 | `text-processing-rs` | Adapter | Numbers as words in the second-pass text (`tn_normalize_sentence`). |
 | `ort` (features `load-dynamic`, `cuda`), `tokenizers` | Adapter | System One model prediction with ONNX Runtime (CUDA or CPU execution provider). Tokenizer from `tokenizer.json`. |
-| `reqwest` | Adapter | RunPod serverless REST API. Open-Meteo forecast API (features `json`, `query`). |
+| `reqwest` | Adapter | RunPod serverless REST API. Open-Meteo forecast API (features `json`, `query`). Plex server API. |
 | `object_store` (feature `aws`) | Adapter | RunPod network volume through its S3-compatible API. |
 | `async-openai` | Adapter | OpenAI Responses API: streaming, tools, structured output, `previous_response_id`. |
 | `rusqlite` (feature `bundled`) | Adapter | Interaction log database. |
 | `axum` | Adapter | Review web page and API. |
 | `hound` | Adapter | WAV encode for audio playback. |
 | `toml`, `tempfile` | Adapter, root | File stores with atomic write. Configuration. |
-| `wiremock` (dev) | Adapter tests | Mock OpenAI, RunPod and Open-Meteo servers. |
+| `wiremock` (dev) | Adapter tests | Mock OpenAI, RunPod, Open-Meteo and Plex servers. |
 | `rubato` (dev) | Test | Resample TTS audio from 44.1 kHz to 16 kHz in `speech(text)`. |
 | `cargo-llvm-cov` (tool) | — | Coverage gate. |
 | `rust-code-analysis-cli` (tool) | — | Cyclomatic complexity, Halstead and Python function length metrics. `xtask complexity` reads its JSON output. |
@@ -321,6 +321,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/adapters/process.rs` | Adapter | `Trainer` that runs `train/train.py` as a local process. | 13.7 |
 | `src/adapters/runpod.rs` | Adapter | `Trainer` with the RunPod REST API and network volume (fallback). | 13.8b |
 | `src/adapters/open_meteo.rs` | Adapter | `Plugin` `get_weather` with the Open-Meteo forecast API. | 17.3 |
+| `src/adapters/plex.rs` | Adapter | `Plugin` `get_new_shows` with the Plex server API. | 18.11 |
 | `src/testing/house.json` | Test | The reference house snapshot (section 11). | 2.1 |
 | `src/testing/fakes.rs` | Test | `#[cfg(test)]` only. A fake for each port, `FakeWyomingClient`, `speech(text)`. | 2.9 |
 | `src/testing/e2e.rs` | Test | `#[cfg(test)]` only. Pipeline harness and end-to-end latency tests. | 9.1 |
@@ -394,6 +395,11 @@ timeout_ms = 5000
 
 [plugins.weather]
 url = "https://api.open-meteo.com/v1/forecast"
+
+# Optional. Without this section, Jarvis has no Plex plugin.
+[plugins.plex]
+url = "http://plex.local:32400"
+token_env = "PLEX_TOKEN"
 
 [backfill]
 min_fresh = 3
@@ -604,6 +610,8 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 - The area is the area slot. If no slot, it is the satellite area. The area slot matches an area name or alias without case sensitivity.
 - `target = "entities"` uses all matching entities in the area.
 - `target = "entity"` uses `entity`, or the matching entity in the area with the lowest entity ID. Sub-phase 11.6 replaces "lowest entity ID" with "highest habit score". `target` is `entity` when it is absent.
+- `target = "house"` uses all matching entities of the house, in any area. A query with it needs no area.
+- A list query is a query with `target = "entities"` or `target = "house"`. `state` is the state that it keeps, for example `on`. Its pool gets `entities`: the state, the attributes and the name of each selected entity with that state. An empty selection gives `Fallback`. An empty `entities` list does not (sub-phase 18.1).
 - A command or query whose selection is empty gives `Fallback`: Jarvis replies from the pool `fallback` and makes no call.
 - When the area has no matching entity and the house has exactly one, Jarvis uses that entity. Example: one thermostat for the house.
 - `habit_defaults` maps a slot to a habit action. When the slot is empty, Jarvis uses the most frequent value of that action now.
@@ -669,7 +677,7 @@ responses = ["Okay, never mind."]
 
 A pool named `ask_<slot>` holds the questions for one missing slot. A pool that is not an intent pool uses no template variable.
 
-Template variables of an intent pool: `area` (area name), slot names, `entity` (state, attributes, name), `response` (the plugin result of a fetch), `person` (name and the fields of its `[[people]]` entry). `entity` exists only for `target = "entity"`, `response` only for `kind = "fetch"`, and `person` only for `needs_speaker = true`.
+Template variables of an intent pool: `area` (area name), slot names, `entity` (state, attributes, name), `entities` (a list of `entity` objects), `response` (the plugin result of a fetch), `person` (name and the fields of its `[[people]]` entry). `entity` exists only for `target = "entity"`, `entities` only for a list query, `response` only for `kind = "fetch"`, and `person` only for `needs_speaker = true`.
 
 Training set file (the contract between Jarvis and `train/train.py`):
 
@@ -748,6 +756,7 @@ The test fixtures (`FakeHome`, `FakeHaServer`) model this house. The data comes 
 - Climate: one thermostat, in the Kitchen.
 - TV: one media player in the Living Room with the aliases "the TV" and "plex".
 - Speakers: each satellite area has speaker media players.
+- Locks, garage doors and windows: none. The tests of sub-phase 18.3 add them to the hot cache.
 - Office: two temperature sensors with different values (64.0 °F and 76.6 °F). The higher value is probably the satellite sensor, which the device makes warm. Entity selection skips the entities of a satellite device (section 9).
 
 ---

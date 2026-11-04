@@ -16,7 +16,7 @@ This specification uses ASD-STE100 Simplified Technical English (STE).
 | `00-overview.md` | This file: the specification format, technical names, goals, examples and the phase index. |
 | `01-architecture.md` | Layers, ports, the System One model, decisions, latency budget, crates, files, configuration, machines, the reference house and the change map. |
 | `02-rules.md` | Code rules, Python rules, test rules, Quint rules, proof rules, PR rules and the required checks. |
-| `phase-00.md` to `phase-17.md` | One file for each phase. |
+| `phase-00.md` to `phase-18.md` | One file for each phase. |
 
 `CLAUDE.md` at the repository root holds the working rules for code changes. It must agree with `02-rules.md`.
 
@@ -186,7 +186,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 
 ## 2. Phase Index
 
-Each line is one PR. The work order follows the rows of this table, not the phase numbers. Thus phase 17 comes after phase 9 and before phase 10.
+Each line is one PR. The work order follows the rows of this table, not the phase numbers. Thus phases 17 and 18 come after phase 9 and before phase 10.
 
 | Phase | Sub-phases |
 |---|---|
@@ -201,6 +201,7 @@ Each line is one PR. The work order follows the rows of this table, not the phas
 | [8 Response Backfill](phase-08.md) | 8.1 Backfill policy · 8.2 Response generation · 8.3 Backfill Quint model · 8.4 Backfill use case · 8.4b Backfill pre-render and wiring |
 | [9 End-to-End Verification](phase-09.md) | 9.1 Pipeline harness · 9.2 Latency tests |
 | [17 Plugins](phase-17.md) | 17.1 Plugin port and cache · 17.2 Plugin tools in System Two · 17.3 Open-Meteo weather plugin · 17.4 Weather intent through the plugin |
+| [18 Queries and Media](phase-18.md) | 18.1 List queries · 18.2 Light queries · 18.3 Door, window and lock queries · 18.4 Climate and fan queries · 18.5 Presence and alarm queries · 18.6 Now playing query · 18.7 Music playback · 18.8 Music controls · 18.9 Plex playback · 18.10 TV controls · 18.11 Plex plugin · 18.12 New shows intent |
 | [10 Multi-Turn Dialogs](phase-10.md) | 10.1 Dialog Quint model · 10.2 Dialog state · 10.3 Answer fill and cancel · 10.4 Ask decision and HA ask · 10.5 Dialog routing · 10.6 System Two questions · 10.7 Early commit for answers |
 | [11 Habit Learning](phase-11.md) | 11.1 Source, action and bucket · 11.2 Scores and summary · 11.3 Habit learning and store · 11.4 History bootstrap · 11.5 Habits in the model context · 11.6 Habits in entity and slot selection · 11.7 Habits in the System Two prompt |
 | [12 Interaction Log and Feedback](phase-12.md) | 12.1 Audio correlation · 12.2 Feedback Quint model · 12.3 Feedback rules · 12.4 Interaction log port and SQLite storage · 12.5 Marks, unknowns and pruning · 12.6 Record interactions · 12.7 Review port and use case · 12.8 Review web API · 12.9 Review page · 12.10 Feedback in decide · 12.11 Feedback in responses and System Two |
