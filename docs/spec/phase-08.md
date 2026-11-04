@@ -94,7 +94,7 @@ This phase adds new responses to a pool when the pool has too few unused respons
 **Goal:** Start a backfill in the background after a response use, save the merged pool and synthesize the new responses. Pools grow without delaying any reply.
 
 - **Implements:** G4, G5, G19. **Depends on:** 8.3.
-- **Files:** modify `src/app/background.rs`, `src/app/conversation.rs`, `src/app/speech.rs`.
+- **Files:** modify `src/app/background.rs`, `src/app/conversation.rs`, `src/app/speech.rs`, `src/testing/fakes.rs`, `src/lib.rs`.
 - **Quint:** `backfill.qnt` (conformance).
 
 **Model.** After `record_use`, if `needs_backfill`, the use case inserts the pool name into an in-flight set. If the insert succeeds, it spawns `generate`, validates each candidate against the pool and the candidates before it, so two equal candidates of one batch add one response, pre-renders the new responses, sends the merge to the pools task (sub-phase 4.8, which saves it) and removes the name. New responses have `uses = 0`, so `select` prefers them, and the pre-render comes first. On error, it removes the name and changes nothing.
