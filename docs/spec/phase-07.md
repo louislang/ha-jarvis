@@ -117,43 +117,67 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 
 ### 7.5 Deferred Answers
 
-**Goal:** Connect `Job::Llm` to `answer` and the announce queue. An unknown request now gets a filler at once, then each answer sentence is announced on the same satellite.
+**Goal:** Connect `Job::Llm` to `answer` and the announce queue. An unknown request now gets a filler at once, then each answer sentence is announced on the same satellite. Without a satellite, `handle` returns the answer as text.
 
 - **Implements:** G6, G7. **Depends on:** 7.4.
-- **Files:** modify `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`, `src/domain/state_cache.rs`.
+- **Files:** modify `src/app/conversation.rs`, `src/lib.rs`, `src/domain/state_cache.rs`, `src/testing/fakes.rs`.
 - **Quint:** `announce.qnt` (the same queue as sub-phase 4.9b).
 
 **Model.**
 
 - `StateCache::load` keeps `location_name` and `time_zone` of `Snapshot.config`. The `after` work builds the question with `question` (sub-phase 7.2): the area of the request, the location name, and the current time in the HA time zone.
-- `Defer(Llm)`: return the filler. The `after` work consumes `answer`: each `Sentence` goes to the announce queue of sub-phase 4.9b. Each `Call` runs through `Home` before the next step. An error announces from `failure`.
+- `Defer(Llm)`: return the filler. The `after` work consumes `answer`: each `Sentence` goes to the announce queue of sub-phase 4.9b. An error announces from `failure`.
+- Each `Call` gets the tool error "not permitted" and makes no call. Sub-phase 7.5b runs the calls.
 - The use case waits at most `openai.timeout_ms` for each step of `answer`. A longer wait is a timeout error.
-- A `Call` runs only when its service domain and the domain of each target entity are in `openai.allowed_domains`, and each target entity is in the hot cache. Else the consumer sends the tool error "not permitted" and makes no call. A misheard request thus cannot unlock a door. Leave `switch` out of the list when a switch drives a door, a gate or a lock. This sub-phase adds `openai.allowed_domains`.
-- A `Call` whose service is in `openai.read_services` runs with `return_response: true`, and its response data is the tool result. Every other `Call` runs with `return_response: false`. Jarvis sets the flag from the list, not the model. A read service passes the same domain and hot-cache checks. HA has this data already, so it needs no plugin (phase 17). This sub-phase adds `openai.read_services`.
-- Without a `satellite_id`, there is no satellite for an announce. `handle` then waits for the job and returns the joined sentences as the text, with no filler. A fetch job (sub-phase 4.9d) works the same way. The wait ends with the `timeout_ms` error.
+- Without a `satellite_id`, there is no satellite for an announce. `handle` then waits for the job and returns the joined sentences as the text, with no filler. A fetch job (sub-phase 4.9d) works the same way: `handle` returns the fetch answer as the text. This replaces the 4.9d rule that a fetch without a satellite only logs its answer. The wait ends with the `timeout_ms` error.
+- `FakeReasoner` gives scripted steps: sentences, a `Call` (it records the tool result that comes back on the reply), an error, or a wait.
 
 **Acceptance criteria.**
 
 - AC-7.5-1: When `FakeClassifier` gives `unknown`, `handle` returns a filler before virtual time advances.
 - AC-7.5-2: When `FakeReasoner` gives two sentences, `FakeHome` records two announces in the same order.
 - AC-7.5-3: When the satellite becomes idle 1.5 s after the reply, the first announce starts at 1.5 s plus `margin_ms` or later.
-- AC-7.5-4: When `FakeReasoner` gives `Call`, `FakeHome` records the call before the next step.
 - AC-7.5-5: When `answer` returns an error, `FakeHome` records an announce from `failure`.
-- AC-7.5-6: When `FakeReasoner` gives a `Call` for the domain `lock`, which is not in `allowed_domains`, `FakeHome` records no call and the tool result is "not permitted".
 - AC-7.5-7: When the context has no `satellite_id` and `FakeReasoner` gives two sentences, `handle` returns both sentences as the text and `FakeHome` records no announce.
-- AC-7.5-8: When `FakeReasoner` gives `light.turn_on` with the target `lock.front_door`, `FakeHome` records no call and the tool result is "not permitted".
-- AC-7.5-11: When `FakeReasoner` gives `calendar.get_events`, which is in `read_services`, `FakeHome` records the call with `return_response: true`, and the tool result is its response data. When it gives `light.turn_on`, `FakeHome` records `return_response: false`.
 - AC-7.5-9: When `FakeReasoner` gives one sentence and then waits, `FakeHome` records the announce of that sentence before the reasoner continues.
 - AC-7.5-10: When `FakeReasoner` gives no step within `timeout_ms`, the job ends with a timeout error, and `FakeHome` records an announce from `failure`.
+- AC-7.5-12: When `FakeReasoner` gives a `Call`, `FakeHome` records no call and the tool result is "not permitted".
+- AC-7.5-13: When the context has no `satellite_id` and the job is a fetch, `handle` returns the fetch answer as the text.
 
 **Proofs.**
 
 - P-7.5-2, P-7.5-3. Requires: `SentencesInOrder` and `AnnounceWhenIdle` (P-4.7-2, P-4.7-3) and the conformance of sub-phase 4.9b. Argument: sentences enter the same queue that the model describes, in stream order.
-- P-7.5-4. Argument: the consumer awaits the call result before it reads the next step.
 - P-7.5-5. Argument: the error arm of the consumer selects from `failure`.
-- P-7.5-6, P-7.5-8. Argument: the `Call` arm checks the service domain, the domain of each target entity and the hot cache before it calls `Home`.
-- P-7.5-11. Argument: the `Call` arm sets `return_response` to whether `read_services` has the service.
 - P-7.5-9. Argument: the consumer puts each sentence in the queue when it arrives, with no wait for the next step.
 - P-7.5-10. Argument: the wait for each step has the deadline `timeout_ms`, and the timeout arm takes the error arm (P-7.5-5).
-- P-7.5-7. Argument: `handle` matches on `ctx.satellite_id`. The `None` arm awaits the job instead of returning the filler.
+- P-7.5-7, P-7.5-13. Argument: `handle` matches on `ctx.satellite_id`. The `None` arm awaits the job instead of returning the filler.
 - P-7.5-1. Argument: `Defer` returns the filler with the job as `after`, with no await on the reasoner.
+- P-7.5-12. Argument: the `Call` arm sends "not permitted" and does not call `Home`.
+
+---
+
+### 7.5b Tool Calls Through HA
+
+**Goal:** Run the `Call` steps of System Two through `Home`, after the domain and hot-cache checks. System Two can now act on HA and read HA data services.
+
+- **Implements:** G7. **Depends on:** 7.5.
+- **Files:** modify `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`.
+
+**Model.**
+
+- Each `Call` runs through `Home` before the next step. This replaces the "not permitted" rule of sub-phase 7.5 and AC-7.5-12.
+- A `Call` runs only when its service domain and the domain of each target entity are in `openai.allowed_domains`, and each target entity is in the hot cache. Else the consumer sends the tool error "not permitted" and makes no call. A misheard request thus cannot unlock a door. Leave `switch` out of the list when a switch drives a door, a gate or a lock. This sub-phase adds `openai.allowed_domains`.
+- A `Call` whose service is in `openai.read_services` runs with `return_response: true`, and its response data is the tool result. Every other `Call` runs with `return_response: false`. Jarvis sets the flag from the list, not the model. A read service passes the same domain and hot-cache checks. HA has this data already, so it needs no plugin (phase 17). This sub-phase adds `openai.read_services`.
+
+**Acceptance criteria.**
+
+- AC-7.5b-1: When `FakeReasoner` gives `Call`, `FakeHome` records the call before the next step.
+- AC-7.5b-2: When `FakeReasoner` gives a `Call` for the domain `lock`, which is not in `allowed_domains`, `FakeHome` records no call and the tool result is "not permitted".
+- AC-7.5b-3: When `FakeReasoner` gives `light.turn_on` with the target `lock.front_door`, `FakeHome` records no call and the tool result is "not permitted".
+- AC-7.5b-4: When `FakeReasoner` gives `calendar.get_events`, which is in `read_services`, `FakeHome` records the call with `return_response: true`, and the tool result is its response data. When it gives `light.turn_on`, `FakeHome` records `return_response: false`.
+
+**Proofs.**
+
+- P-7.5b-1. Argument: the consumer awaits the call result before it reads the next step.
+- P-7.5b-2, P-7.5b-3. Argument: the `Call` arm checks the service domain, the domain of each target entity and the hot cache before it calls `Home`.
+- P-7.5b-4. Argument: the `Call` arm sets `return_response` to whether `read_services` has the service.
