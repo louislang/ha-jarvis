@@ -238,8 +238,8 @@ impl Speech {
         Ok(Arc::new(self.tts.synth(text).await?))
     }
 
-    /// Synthesizes and caches each pool response whose only variable is `area`, once for each
-    /// area name in `areas`.
+    /// Synthesizes and caches each pool response with no variable, and each pool response whose
+    /// only variable is `area` once for each area name in `areas`.
     ///
     /// # Errors
     ///
@@ -253,14 +253,19 @@ impl Speech {
     }
 }
 
-/// The text of each pool response whose only variable is `area`, rendered with each area name in
-/// `areas` in lowercase, as `decide` renders it.
+/// The text of each pool response with no variable, and of each pool response whose only
+/// variable is `area` rendered with each area name in `areas` in lowercase, as `decide` renders it.
 fn texts(pools: &Pools, areas: &[String]) -> anyhow::Result<BTreeSet<String>> {
-    let allowed = BTreeSet::from(["area".to_owned()]);
+    let (allowed, none) = (BTreeSet::from(["area".to_owned()]), BTreeSet::new());
     let mut texts = BTreeSet::new();
     let templates = pools.values().flat_map(|pool| &pool.responses);
     for template in templates {
         if catalog::unknown_variable(&template.text, &allowed)?.is_some() {
+            continue;
+        }
+        // A house with no areas still gets the audio of a response with no variable.
+        if catalog::unknown_variable(&template.text, &none)?.is_none() {
+            texts.insert(responses::render(&template.text, &Map::new())?);
             continue;
         }
         for area in areas {
@@ -625,6 +630,15 @@ mod tests {
             !texts.iter().any(|text| text.contains("degrees")),
             "an entity template was synthesized: {texts:?}"
         );
+        Ok(())
+    }
+
+    /// A house with no areas gets the audio of each response with no variable.
+    #[tokio::test(start_paused = true)]
+    async fn prerender_without_areas_caches_text_without_variables() -> anyhow::Result<()> {
+        let (speech, tts) = speech();
+        speech.prerender(&pools(), &[]).await?;
+        assert_eq!(tts.texts(), ["One moment."]);
         Ok(())
     }
 
