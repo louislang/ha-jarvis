@@ -57,14 +57,14 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Model.**
 
 - `lights_query`: `target = "entities"` with the filters of `lights_on`, `state = "on"`. It answers "is the garage light on" and "which lights are on". Examples: "is the [garage](area) light on", "which lights are on", "are the lights on in the [kitchen](area)", "are any lights on". Pool: `{% if entities %}{{ entities | map(attribute="name") | join(", ") }} {{ "is" if entities | length == 1 else "are" }} on.{% else %}No lights are on in the {{ area }}.{% endif %}`
-- `brightness_query`: `target = "entities"`, `select = [{ domain = "light" }]`, `state = "on"`. Examples: "how bright is the [office](area) light", "how bright are the lights", "what is the brightness of the [bedroom](area) lights". HA gives `brightness` from 0 to 255. Pool: `{% for light in entities %}{{ light.name }} is at {{ (light.attributes.brightness / 2.55) | round | int }} percent.{{ " " if not loop.last else "" }}{% else %}No lights are on in the {{ area }}.{% endfor %}`
+- `brightness_query`: `target = "entities"`, `select = [{ domain = "light" }]`, `state = "on"`. Examples: "how bright is the [office](area) light", "how bright are the lights", "what is the brightness of the [bedroom](area) lights". HA gives `brightness` from 0 to 255. An on/off light has no `brightness`, and the pool names it without a value, so one such light does not make the whole reply `Fallback`. Pool: `{% for light in entities %}{{ light.name }} {% if light.attributes.brightness is defined and light.attributes.brightness is number %}is at {{ (light.attributes.brightness / 2.55) | round | int }} percent{% else %}has no brightness value{% endif %}.{{ " " if not loop.last else "" }}{% else %}No lights are on in the {{ area }}.{% endfor %}`
 - The area of both intents is the area slot, else the satellite area (sub-phase 4.5b).
 
 **Acceptance criteria.**
 
 - AC-18.2-1: When the intent is `lights_query` with the area slot "garage", the reply is "No lights are on in the garage." and there is no call.
 - AC-18.2-2: When the intent is `lights_query` and the satellite is in the Kitchen, the reply is "Strawberry Lamp is on."
-- AC-18.2-3: When the intent is `brightness_query`, the satellite is in the Office, and only Desk LED (brightness 255) and Office Lamp (brightness 128) are on there, the reply is "Desk LED is at 100 percent. Office Lamp is at 50 percent."
+- AC-18.2-3: When the intent is `brightness_query`, the satellite is in the Office, and only Desk LED (brightness 255) and Office Lamp (brightness 128) are on there, the reply is "Desk LED is at 100 percent. Office Lamp is at 50 percent." When the satellite is in the Bedroom, the reply is "Bedroom Fan Light is at 100 percent. Bedroom Lamp Left has no brightness value. Bedroom Lamp Right has no brightness value. Bedroom Corner Lamp has no brightness value."
 - AC-18.2-4: When `intents.toml` and `responses.toml` are read, `validate_catalog` and `validate_pools` return `Ok`.
 
 **Proofs.**
