@@ -1059,6 +1059,7 @@ mod tests {
                 "media_player",
                 "climate",
                 "calendar",
+                "todo",
             ]
             .map(str::to_owned)
             .to_vec(),
