@@ -2,12 +2,12 @@
 
 use std::collections::BTreeSet;
 use std::collections::HashSet;
-use std::future;
 use std::mem;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::mpsc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use tokio::sync::watch;
@@ -23,34 +23,42 @@ use crate::domain::state_cache::StateCache;
 use crate::ports::Home;
 use crate::ports::Reasoner;
 
+/// The wait before the first retry of a failed snapshot.
+const FIRST_RETRY: Duration = Duration::from_secs(1);
+
+/// The longest wait between two snapshot retries.
+const MAX_RETRY: Duration = Duration::from_secs(30);
+
 /// Keeps `cache` equal to the states and the registries of `home` until the event stream ends.
 /// Publishes each new cache to the receivers of `cache`.
 pub async fn sync(home: &dyn Home, cache: &watch::Sender<StateCache>) {
     let mut events = home.events();
-    if load(home, cache).await.is_err() {
-        events = events
-            .skip_while(|event| future::ready(!matches!(event, Event::Reconnected)))
-            .boxed();
-    }
+    load(home, cache).await;
     while let Some(event) = events.next().await {
         match event {
             Event::StateChanged { .. } => {
                 cache.send_modify(|cache| *cache = mem::take(cache).apply(event));
             }
-            // A failed load keeps the old cache: the adapter sends `Reconnected` after it connects again.
-            Event::RegistryUpdated | Event::Reconnected => load(home, cache).await.unwrap_or(()),
+            Event::RegistryUpdated | Event::Reconnected => load(home, cache).await,
         }
     }
 }
 
-/// Replaces `cache` with a new snapshot of `home`. Logs a failed snapshot.
-async fn load(home: &dyn Home, cache: &watch::Sender<StateCache>) -> anyhow::Result<()> {
-    let snapshot = home
-        .snapshot()
-        .await
-        .inspect_err(|error| tracing::warn!("the snapshot failed: {error:#}"))?;
-    cache.send_replace(StateCache::load(snapshot));
-    Ok(())
+/// Replaces `cache` with a new snapshot of `home`. After each failed snapshot, logs the error,
+/// keeps the old cache and tries again after a wait of 1 s, doubled each time, at most 30 s.
+async fn load(home: &dyn Home, cache: &watch::Sender<StateCache>) {
+    let mut wait = FIRST_RETRY;
+    loop {
+        match home.snapshot().await {
+            Ok(snapshot) => {
+                cache.send_replace(StateCache::load(snapshot));
+                return;
+            }
+            Err(error) => tracing::warn!("the snapshot failed: {error:#}"),
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(MAX_RETRY);
+    }
 }
 
 /// Records response uses, and adds new responses to a pool that a use leaves with too few unused
@@ -314,14 +322,33 @@ mod tests {
         assert_eq!(cache.borrow().state(KITCHEN), Some(&state(KITCHEN, "off")));
     }
 
+    /// Starts sync with `failures` failed `snapshot` calls. Checks that `snapshot` call `k + 2`
+    /// starts `retries[k]` seconds after the start, and not before.
+    async fn assert_retries(failures: usize, retries: &[u64]) -> watch::Receiver<StateCache> {
+        let home = FakeHome::default();
+        for _ in 0..failures {
+            drop(home.delay());
+        }
+        let begin = Instant::now();
+        let (home, cache) = start(home).await;
+        for (calls, &retry) in (1..).zip(retries) {
+            let at = begin + Duration::from_secs(retry);
+            tokio::time::sleep_until(at - Duration::from_millis(1)).await;
+            assert_eq!(
+                home.snapshots(),
+                calls,
+                "the retry started before {retry} s"
+            );
+            tokio::time::sleep_until(at + Duration::from_millis(1)).await;
+            assert_eq!(home.snapshots(), calls + 1, "no retry at {retry} s");
+        }
+        cache
+    }
+
     /// AC-2.9-7.
     #[tokio::test(start_paused = true)]
-    async fn ac_2_9_7_failed_start_loads_after_reconnect() {
-        let home = FakeHome::default();
-        drop(home.delay());
-        let (home, cache) = start(home).await;
-        home.send(Event::Reconnected);
-        settle().await;
+    async fn ac_2_9_7_failed_start_loads_after_one_second() {
+        let cache = assert_retries(1, &[1]).await;
         assert_eq!(*cache.borrow(), StateCache::load(house()));
     }
 
@@ -385,6 +412,12 @@ mod tests {
         Ok(())
     }
 
+    /// AC-2.9-9.
+    #[tokio::test(start_paused = true)]
+    async fn ac_2_9_9_retries_wait_one_two_and_four_seconds() {
+        assert_retries(3, &[1, 3, 7]).await;
+    }
+
     /// The model state that the conformance test compares.
     #[derive(Debug, Deserialize, PartialEq)]
     struct CacheSync {
@@ -420,6 +453,8 @@ mod tests {
         queue: Option<VecDeque<Event>>,
         /// The gate of the delayed snapshot call.
         gate: Option<oneshot::Sender<()>>,
+        /// A snapshot call failed and sync waits to retry it.
+        retry: bool,
     }
 
     impl CacheSyncDriver {
@@ -436,6 +471,7 @@ mod tests {
                 states,
                 queue: Some(VecDeque::new()),
                 gate: None,
+                retry: false,
             }
         }
 
@@ -445,6 +481,17 @@ mod tests {
             let states = states.iter().map(|(id, v)| state(id, &v.to_string()));
             snapshot.states = states.collect();
             snapshot
+        }
+
+        /// Starts a delayed snapshot call: the pending retry, else the load after `Reconnected`.
+        fn take_snapshot(&mut self) {
+            self.gate = Some(self.home.delay());
+            if mem::take(&mut self.retry) {
+                self.runtime
+                    .block_on(async { tokio::time::sleep(MAX_RETRY).await });
+            } else {
+                self.home.send(Event::Reconnected);
+            }
         }
     }
 
@@ -462,13 +509,14 @@ mod tests {
                 deliver => if let Some(event) = self.queue.as_mut().and_then(VecDeque::pop_front) {
                     self.home.send(event);
                 },
-                disconnect => (self.queue, self.gate) = (None, None),
-                reconnect => self.queue = Some(VecDeque::new()),
-                takeSnapshot => {
-                    self.gate = Some(self.home.delay());
-                    self.home.send(Event::Reconnected);
+                disconnect => {
+                    self.queue = None;
+                    self.retry |= self.gate.take().is_some();
                 },
+                reconnect => self.queue = Some(VecDeque::new()),
+                takeSnapshot => self.take_snapshot(),
                 applySnapshot => self.gate.take().map(|gate| gate.send(())),
+                failSnapshot => (self.gate, self.retry) = (None, true),
             })
         }
     }
