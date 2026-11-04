@@ -30,8 +30,8 @@ This phase adds new responses to a pool when the pool has too few unused respons
 
 **Proofs.**
 
-- P-8.1-1, P-8.1-6, P-8.1-7. Ensures: `needs_backfill = only_area(pool) and count(uses == 0) < min_fresh and len < max_pool`, and `merge` gives at most `max_pool` responses. Argument: `needs_backfill` is this conjunction. `merge` takes at most `max_pool - len` candidates.
-- P-8.1-2 to P-8.1-4. Ensures: `validate` returns `Ok` if and only if every listed check passes. Argument: `validate` is the conjunction of the listed checks and returns the first failure.
+- P-8.1-1, P-8.1-6, P-8.1-7. Ensures: when `needs_backfill` is true, `count(uses == 0) < min_fresh` and `len < max_pool`, and `merge` gives at most `max_pool` responses. Argument: `needs_backfill` is the conjunction of these checks and `only_area(pool)`. `merge` takes at most `max_pool - len` candidates. The `only_area` part is evidence: test (AC-8.1-7), because `only_area` reads the variables of a template through `minijinja`, which Verus cannot see (P-4.2-2).
+- P-8.1-2 to P-8.1-4. Ensures: when `validate` returns `Ok`, the candidate has words after `normalize`, has at most `max_chars` characters, and differs from each response after `normalize`. Argument: `validate` is the conjunction of the listed checks and returns the first failure. The variable and render checks are evidence: test (AC-8.1-3), because they go through `minijinja` (P-4.2-2). Verus keeps only this direction, as in P-3.2b.
 - P-8.1-5. Ensures: the result is the old responses unchanged, then the candidates with `uses = 0`. Argument: `merge` is `pool ++ map(candidates, uses = 0)`. Concatenation keeps the prefix.
 
 ---
@@ -97,7 +97,7 @@ This phase adds new responses to a pool when the pool has too few unused respons
 - **Files:** modify `src/app/background.rs`, `src/app/conversation.rs`, `src/app/speech.rs`.
 - **Quint:** `backfill.qnt` (conformance).
 
-**Model.** After `record_use`, if `needs_backfill`, the use case inserts the pool name into an in-flight set. If the insert succeeds, it spawns `generate`, validates, pre-renders the new responses, sends the merge to the pools task (sub-phase 4.8, which saves it) and removes the name. New responses have `uses = 0`, so `select` prefers them, and the pre-render comes first. On error, it removes the name and changes nothing.
+**Model.** After `record_use`, if `needs_backfill`, the use case inserts the pool name into an in-flight set. If the insert succeeds, it spawns `generate`, validates each candidate against the pool and the candidates before it, so two equal candidates of one batch add one response, pre-renders the new responses, sends the merge to the pools task (sub-phase 4.8, which saves it) and removes the name. New responses have `uses = 0`, so `select` prefers them, and the pre-render comes first. On error, it removes the name and changes nothing.
 
 **Acceptance criteria.**
 
