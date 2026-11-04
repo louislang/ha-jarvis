@@ -1,5 +1,6 @@
 //! A fake for each port.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::mem;
@@ -265,8 +266,8 @@ pub(crate) enum Scripted {
 /// The receiver of the tool result of one call.
 type Reply = oneshot::Receiver<anyhow::Result<Option<Value>>>;
 
-/// A `Reasoner` that counts the `warm` calls, answers with the scripted steps and keeps the
-/// reply of each call.
+/// A `Reasoner` that counts the `warm` calls, answers with the scripted steps, keeps the reply of
+/// each call, records the pool of each `generate` call and holds it until `release`.
 #[derive(Default)]
 pub(crate) struct FakeReasoner {
     /// The number of `warm` calls.
@@ -275,6 +276,10 @@ pub(crate) struct FakeReasoner {
     script: Mutex<Vec<Scripted>>,
     /// The reply of each call, in order.
     replies: Arc<Mutex<Vec<Reply>>>,
+    /// The pool of each `generate` call, in order.
+    generated: Mutex<Vec<String>>,
+    /// The result sender of each held `generate` call, by pool.
+    held: Mutex<BTreeMap<String, oneshot::Sender<anyhow::Result<Vec<String>>>>>,
 }
 
 impl FakeReasoner {
@@ -298,6 +303,19 @@ impl FakeReasoner {
             other => format!("{other:?}"),
         });
         results.collect()
+    }
+
+    /// The pool of each `generate` call, in order.
+    #[must_use]
+    pub(crate) fn generated(&self) -> Vec<String> {
+        lock(&self.generated).clone()
+    }
+
+    /// Ends the held `generate` call of `pool` with `result`.
+    pub(crate) fn release(&self, pool: &str, result: anyhow::Result<Vec<String>>) {
+        let sender = lock(&self.held).remove(pool);
+        let sender = sender.expect("a generate call of the pool waits");
+        sender.send(result).expect("the generate call waits");
     }
 }
 
@@ -340,12 +358,15 @@ impl Reasoner for FakeReasoner {
 
     async fn generate(
         &self,
-        _pool: &str,
+        pool: &str,
         _existing: &[String],
         _variables: &BTreeSet<String>,
         _n: usize,
     ) -> anyhow::Result<Vec<String>> {
-        Ok(Vec::new())
+        lock(&self.generated).push(pool.to_owned());
+        let (sender, receiver) = oneshot::channel();
+        lock(&self.held).insert(pool.to_owned(), sender);
+        receiver.await?
     }
 }
 
