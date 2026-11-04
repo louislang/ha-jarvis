@@ -43,9 +43,12 @@ pub async fn sync(home: &dyn Home, cache: &watch::Sender<StateCache>) {
     }
 }
 
-/// Replaces `cache` with a new snapshot of `home`.
+/// Replaces `cache` with a new snapshot of `home`. Logs a failed snapshot.
 async fn load(home: &dyn Home, cache: &watch::Sender<StateCache>) -> anyhow::Result<()> {
-    let snapshot = home.snapshot().await?;
+    let snapshot = home
+        .snapshot()
+        .await
+        .inspect_err(|error| tracing::warn!("the snapshot failed: {error:#}"))?;
     cache.send_replace(StateCache::load(snapshot));
     Ok(())
 }
@@ -198,6 +201,7 @@ fn texts(pool: &Pool) -> Vec<String> {
 mod tests {
     use std::collections::BTreeMap;
     use std::collections::VecDeque;
+    use std::fs;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -350,6 +354,35 @@ mod tests {
             driver.backfill.running().is_empty(),
             "the pool stays in flight"
         );
+    }
+
+    /// AC-2.9-8.
+    #[tokio::test(start_paused = true)]
+    async fn ac_2_9_8_failed_snapshot_logs_one_warn_event() -> anyhow::Result<()> {
+        let log = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt().with_writer(Arc::new(log.reopen()?));
+        // The current-thread runtime polls the sync task on this thread, so it logs here too.
+        let _default = tracing::subscriber::set_default(subscriber.finish());
+        let home = FakeHome::default();
+        let gate = home.delay();
+        start(home).await;
+        // A parallel test can register the callsite while it has no subscriber.
+        tracing::callsite::rebuild_interest_cache();
+        drop(gate);
+        settle().await;
+        let text = fs::read_to_string(log.path())?;
+        let events: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains(" WARN "))
+            .collect();
+        assert_eq!(events.len(), 1, "the log is {text:?}");
+        let error = oneshot::Canceled.to_string();
+        assert!(
+            events[0].contains(&error),
+            "{error:?} is not in {:?}",
+            events[0]
+        );
+        Ok(())
     }
 
     /// The model state that the conformance test compares.
