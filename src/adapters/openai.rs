@@ -68,7 +68,7 @@ pub fn user_message(question: &Question) -> String {
     let entities: Vec<String> = question
         .entities
         .iter()
-        .map(|entity| format!("- {}: {}\n", entity.name, entity.state))
+        .map(|item| format!("- {} ({}): {}\n", item.name, item.entity_id, item.state))
         .collect();
     format!(
         "Time: {}\nLocation: {}\nArea: {area}\nEntities:\n{}Request: {}",
@@ -523,9 +523,8 @@ mod tests {
         Done,
     }
 
-    /// The steps of an answer that a mock `OpenAI` server streams as `template` and then, after
-    /// a tool output, as "It is on.", and the server. The result of each call is
-    /// `{"state": "on"}`.
+    /// The steps of an answer that a mock `OpenAI` server streams as `template`, then "It is on."
+    /// after a tool output, and the server. Each call gives `{"state": "on"}`.
     async fn served(template: ResponseTemplate) -> anyhow::Result<(MockServer, Vec<Seen>)> {
         let (server, reasoner) = serve(template).await?;
         Mock::given(matchers::body_string_contains("function_call_output"))
@@ -571,8 +570,7 @@ mod tests {
             })
         });
         let (server, seen) = served(stream(calls)).await?;
-        let requests = server.received_requests().await;
-        let requests = requests.context("the server records no requests")?;
+        let requests = server.received_requests().await.context("no requests")?;
         let body: Value = requests.last().context("no request")?.body_json()?;
         let input = body["input"]
             .as_array()
@@ -713,12 +711,12 @@ mod tests {
         assert_eq!(
             entity_lines(&asked(Some("kitchen"))),
             [
-                "- Carson Kitchen Media Player: idle",
-                "- Thermostat: heat",
-                "- Thermostat Current Temperature: 63.5",
-                "- Thermostat Motion: on",
-                "- Overhead Light: off",
-                "- Strawberry Lamp: on",
+                "- Carson Kitchen Media Player (media_player.carson_kitchen_media_player): idle",
+                "- Thermostat (climate.thermostat): heat",
+                "- Thermostat Current Temperature (sensor.thermostat_current_temperature): 63.5",
+                "- Thermostat Motion (binary_sensor.thermostat_motion): on",
+                "- Overhead Light (light.kitchen): off",
+                "- Strawberry Lamp (light.strawberry_lamp): on",
             ]
         );
     }
