@@ -1,5 +1,6 @@
 //! `Reasoner` with the `OpenAI` Responses API.
 
+use std::collections::BTreeSet;
 use std::mem;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -16,6 +17,7 @@ use async_openai::types::responses::InputParam;
 use async_openai::types::responses::OutputItem;
 use async_openai::types::responses::ResponseCompletedEvent;
 use async_openai::types::responses::ResponseFailedEvent;
+use async_openai::types::responses::ResponseFormatJsonSchema;
 use async_openai::types::responses::ResponseIncompleteEvent;
 use async_openai::types::responses::ResponseOutputItemDoneEvent;
 use async_openai::types::responses::ResponseRefusalDeltaEvent;
@@ -77,6 +79,49 @@ pub fn user_message(question: &Question) -> String {
         entities.concat(),
         question.text
     )
+}
+
+/// The `generate` input: `n` new responses for the pool `pool`, unlike each of `existing`, with
+/// only the template variables `variables`.
+fn generate_prompt(
+    pool: &str,
+    existing: &[String],
+    variables: &BTreeSet<String>,
+    n: usize,
+) -> String {
+    let existing: Vec<String> = existing.iter().map(|text| format!("- {text}\n")).collect();
+    let variables: Vec<&str> = variables.iter().map(String::as_str).collect();
+    format!(
+        "Write {n} new responses of the voice assistant Jarvis for the response pool {pool}. Each \
+         response is plain text to speak aloud and differs from each existing response. A \
+         response can use only these template variables, as {{{{ name }}}}: {}.\nExisting \
+         responses:\n{}",
+        variables.join(", "),
+        existing.concat()
+    )
+}
+
+/// The structured output format of `generate`: `{ "responses": [string] }`.
+fn responses_format() -> ResponseFormatJsonSchema {
+    ResponseFormatJsonSchema {
+        description: None,
+        name: "responses".to_owned(),
+        schema: json!({
+            "type": "object",
+            "properties": {"responses": {"type": "array", "items": {"type": "string"}}},
+            "required": ["responses"],
+            "additionalProperties": false,
+        }),
+        strict: Some(true),
+    }
+}
+
+/// The output of `generate`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Generated {
+    /// The new responses.
+    responses: Vec<String>,
 }
 
 /// The `call_service` tool: one HA service call.
@@ -253,6 +298,8 @@ pub struct OpenAiReasoner {
     model: String,
     /// The output token limit of an answer.
     max_output_tokens: u32,
+    /// The output token limit of a structured output.
+    bulk_max_output_tokens: u32,
     /// The most tool calls of one answer.
     max_tool_calls: u32,
     /// The time since the last request after which `warm` sends a request.
@@ -285,6 +332,7 @@ impl OpenAiReasoner {
             client: Client::build(http, api),
             model: config.model.clone(),
             max_output_tokens: config.max_output_tokens,
+            bulk_max_output_tokens: config.bulk_max_output_tokens,
             max_tool_calls: config.max_tool_calls,
             warm_idle: Duration::from_secs(config.warm_idle_s),
             last_request: Mutex::new(None),
@@ -363,6 +411,25 @@ impl Reasoner for OpenAiReasoner {
             );
         // The steps and the error go through one channel, so the error comes after the steps.
         stream::select(receiver, run.filter_map(|_sent| future::ready(None))).boxed()
+    }
+
+    async fn generate(
+        &self,
+        pool: &str,
+        existing: &[String],
+        variables: &BTreeSet<String>,
+        n: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        let request = CreateResponseArgs::default()
+            .model(&self.model)
+            .input(generate_prompt(pool, existing, variables, n))
+            .text(responses_format())
+            .max_output_tokens(self.bulk_max_output_tokens)
+            .build()?;
+        let response = self.client.responses().create(request).await?;
+        let text = response.output_text().context("the response has no text")?;
+        let generated: Generated = serde_json::from_str(&text)?;
+        Ok(generated.responses)
     }
 }
 
@@ -743,5 +810,55 @@ mod tests {
         for wanted in ["plain text", "speak", "markdown", "lists", "emoji"] {
             assert!(prompt.contains(wanted), "{wanted:?} is not in {prompt:?}");
         }
+    }
+
+    /// The variables `area` and `person`.
+    fn variables() -> BTreeSet<String> {
+        BTreeSet::from(["area".to_owned(), "person".to_owned()])
+    }
+
+    /// AC-8.2-1.
+    #[test]
+    fn ac_8_2_1_prompt_has_existing_responses_and_variables() {
+        let existing = ["Done.".to_owned(), "The {{ area }} is ready.".to_owned()];
+        let prompt = generate_prompt("lights_on", &existing, &variables(), 5);
+        for wanted in ["Done.", "The {{ area }} is ready.", "area", "person"] {
+            assert!(prompt.contains(wanted), "{wanted:?} is not in {prompt:?}");
+        }
+    }
+
+    /// The result of `generate` when a mock `OpenAI` server replies with the output text `text`,
+    /// and the body of the request.
+    async fn generated(text: &str) -> anyhow::Result<(anyhow::Result<Vec<String>>, Value)> {
+        let mut body = response("completed");
+        body["output"] = json!([{
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "annotations": [], "text": text}],
+        }]);
+        let (server, reasoner) = serve(ResponseTemplate::new(200).set_body_json(body)).await?;
+        let result = reasoner.generate("lights_on", &[], &variables(), 2).await;
+        let requests = server.received_requests().await.context("no requests")?;
+        Ok((result, requests[0].body_json()?))
+    }
+
+    /// AC-8.2-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_8_2_2_schema_reply_gives_its_responses() -> anyhow::Result<()> {
+        let (result, request) = generated(r#"{"responses": ["A", "B"]}"#).await?;
+        assert_eq!(result?, ["A", "B"]);
+        assert_eq!(request["max_output_tokens"], 8000);
+        assert_eq!(request["text"]["format"]["type"], "json_schema");
+        Ok(())
+    }
+
+    /// AC-8.2-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_8_2_3_reply_off_the_schema_is_an_error() -> anyhow::Result<()> {
+        let (result, _request) = generated(r#"{"responses": "A"}"#).await?;
+        assert!(result.is_err(), "the result is {result:?}");
+        Ok(())
     }
 }

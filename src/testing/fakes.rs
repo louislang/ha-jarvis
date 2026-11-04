@@ -1,5 +1,6 @@
 //! A fake for each port.
 
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::mem;
 use std::net::SocketAddr;
@@ -327,6 +328,16 @@ impl Reasoner for FakeReasoner {
             }
         };
         futures::stream::iter(steps).filter_map(step).boxed()
+    }
+
+    async fn generate(
+        &self,
+        _pool: &str,
+        _existing: &[String],
+        _variables: &BTreeSet<String>,
+        _n: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 
