@@ -231,6 +231,7 @@ mod tests {
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::house;
+    use crate::testing::fakes::log_dispatch;
 
     /// The entity that the tests change.
     const KITCHEN: &str = "light.kitchen";
@@ -387,14 +388,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_2_9_8_failed_snapshot_logs_one_warn_event() -> anyhow::Result<()> {
         let log = tempfile::NamedTempFile::new()?;
-        let subscriber = tracing_subscriber::fmt().with_writer(Arc::new(log.reopen()?));
         // The current-thread runtime polls the sync task on this thread, so it logs here too.
-        let _default = tracing::subscriber::set_default(subscriber.finish());
+        let _default = tracing::dispatcher::set_default(&log_dispatch(&log)?);
         let home = FakeHome::default();
         let gate = home.delay();
         start(home).await;
-        // A parallel test can register the callsite while it has no subscriber.
-        tracing::callsite::rebuild_interest_cache();
         drop(gate);
         settle().await;
         let text = fs::read_to_string(log.path())?;

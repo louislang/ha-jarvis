@@ -3,10 +3,12 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
+use std::io;
 use std::mem;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::atomic::AtomicBool;
@@ -27,6 +29,7 @@ use rubato::Resampler;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
 use serde_json::Value;
 use serde_json::json;
+use tempfile::NamedTempFile;
 use tokio::io::AsyncBufReadExt;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
@@ -34,6 +37,8 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
+use tracing::Dispatch;
+use tracing::subscriber::NoSubscriber;
 
 use crate::Config;
 use crate::Device;
@@ -65,6 +70,22 @@ use crate::ports::TextToSpeech;
 #[must_use]
 pub(crate) fn house() -> Snapshot {
     serde_json::from_str(include_str!("house.json")).expect("house.json is a snapshot")
+}
+
+/// A dispatcher that writes the `info` events to `log`.
+///
+/// # Errors
+///
+/// `log` does not open again.
+pub fn log_dispatch(log: &NamedTempFile) -> io::Result<Dispatch> {
+    // While only one dispatcher is alive, `tracing-core` takes the interest of a callsite from
+    // the default dispatcher of the thread that registers it. Thus a parallel test without a
+    // dispatcher turns the callsite off. With this second dispatcher alive for the whole run,
+    // `tracing-core` asks every live dispatcher.
+    static SILENT: LazyLock<Dispatch> = LazyLock::new(|| Dispatch::new(NoSubscriber::default()));
+    LazyLock::force(&SILENT);
+    let subscriber = tracing_subscriber::fmt().with_writer(Arc::new(log.reopen()?));
+    Ok(Dispatch::new(subscriber.finish()))
 }
 
 /// The contents of `mutex`.
