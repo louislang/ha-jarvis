@@ -1,5 +1,6 @@
 //! Port traits and their data types.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -104,6 +105,16 @@ pub trait Reasoner: Send + Sync {
 
     /// The steps of the answer to `question`, each step as soon as it is complete.
     fn answer(&self, question: &Question) -> BoxStream<'static, anyhow::Result<Step>>;
+
+    /// `n` new responses for the pool `pool`, which has the responses `existing` and can use the
+    /// template variables `variables`.
+    async fn generate(
+        &self,
+        pool: &str,
+        existing: &[String],
+        variables: &BTreeSet<String>,
+        n: usize,
+    ) -> anyhow::Result<Vec<String>>;
 }
 
 /// One step of a System Two answer.
