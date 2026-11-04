@@ -290,6 +290,7 @@ mod tests {
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStt;
     use crate::testing::fakes::FakeTts;
+    use crate::testing::fakes::log_dispatch;
 
     /// Commits 200 ms after confident text, 600 ms after other text and at 10 s of audio.
     const POLICY: CommitPolicy = CommitPolicy {
@@ -448,10 +449,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_6_11_3_transcript_logs_one_info_event() -> anyhow::Result<()> {
         let log = tempfile::NamedTempFile::new()?;
-        let subscriber = tracing_subscriber::fmt().with_writer(Arc::new(log.reopen()?));
         let second_pass = "turn on the kitchen lights".to_owned();
         commit_with(Ok(Some(second_pass.clone())))
-            .with_subscriber(subscriber.finish())
+            .with_subscriber(log_dispatch(&log)?)
             .await?;
         let text = fs::read_to_string(log.path())?;
         let events: Vec<&str> = text

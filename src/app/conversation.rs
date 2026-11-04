@@ -667,6 +667,7 @@ mod tests {
     use crate::testing::fakes::FakeTts;
     use crate::testing::fakes::Scripted;
     use crate::testing::fakes::house;
+    use crate::testing::fakes::log_dispatch;
 
     /// The satellite entity of the tests.
     const SATELLITE: &str = "assist_satellite.carson_kitchen";
@@ -1299,9 +1300,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_6_11_2_handle_logs_one_info_event() -> anyhow::Result<()> {
         let log = tempfile::NamedTempFile::new()?;
-        let subscriber = tracing_subscriber::fmt().with_writer(Arc::new(log.reopen()?));
         let (handled, _) = handled(Some("lights_on"), "turn on the lights", Some(KITCHEN))
-            .with_subscriber(subscriber.finish())
+            .with_subscriber(log_dispatch(&log)?)
             .await;
         let reply = handled?.text;
         let text = fs::read_to_string(log.path())?;
