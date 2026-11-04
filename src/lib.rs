@@ -1051,7 +1051,7 @@ mod tests {
     fn expected_openai() -> OpenAiConfig {
         OpenAiConfig {
             api_key_env: "OPENAI_API_KEY".to_owned(),
-            model: "gpt-4.1-nano".to_owned(),
+            model: "gpt-5.4-mini".to_owned(),
             timeout_ms: 8000,
             warm_idle_s: 60,
             max_output_tokens: 150,
