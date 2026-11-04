@@ -91,28 +91,52 @@ This phase adds new responses to a pool when the pool has too few unused respons
 
 ### 8.4 Backfill Use Case
 
-**Goal:** Start a backfill in the background after a response use, save the merged pool and synthesize the new responses. Pools grow without delaying any reply.
+**Goal:** Start a backfill in the background after a response use, and save the merged pool. Pools grow without delaying any reply.
 
 - **Implements:** G4, G5, G19. **Depends on:** 8.3.
-- **Files:** modify `src/app/background.rs`, `src/app/conversation.rs`, `src/app/speech.rs`, `src/testing/fakes.rs`, `src/lib.rs`.
+- **Files:** modify `src/app/background.rs`, `src/testing/fakes.rs`.
 - **Quint:** `backfill.qnt` (conformance).
 
-**Model.** After `record_use`, if `needs_backfill`, the use case inserts the pool name into an in-flight set. If the insert succeeds, it spawns `generate`, validates each candidate against the pool and the candidates before it, so two equal candidates of one batch add one response, pre-renders the new responses, sends the merge to the pools task (sub-phase 4.8, which saves it) and removes the name. New responses have `uses = 0`, so `select` prefers them, and the pre-render comes first. On error, it removes the name and changes nothing.
+**Model.** After `record_use`, if `needs_backfill`, the use case inserts the pool name into an in-flight set. If the insert succeeds, it spawns `generate`, validates each candidate against the pool and the candidates before it, so two equal candidates of one batch add one response, sends the merge to the pools task (sub-phase 4.8, which saves it) and removes the name. New responses have `uses = 0`, so `select` prefers them. On error, it removes the name and changes nothing.
+
+- The allowed variables of `generate` and `validate` are `area` for the pool of an intent, and none for any other pool, because Jarvis speaks the text of the other pools without a render. Thus the use case gets the intent catalog.
+- `Backfill` owns the `changes` sender of the pools task and records each use, so a use and its backfill check are one change.
 
 **Acceptance criteria.**
 
 - AC-8.4-1: When a use makes `needs_backfill` true, `FakeReasoner` records one `generate` call.
 - AC-8.4-2: When a backfill for a pool is in progress, a second use of that pool starts no second backfill.
-- AC-8.4-3: When `generate` completes, the response store has the new responses and the audio cache has their audio.
 - AC-8.4-4: When `generate` returns an error, the pools do not change.
 - AC-8.4-5: When `quint-connect` replays 100 traces of `backfill.qnt`, the in-flight set and the pool versions match the model after each step.
-- AC-8.4-6: When the backfill task is blocked inside `generate`, `select` on the same pool returns before virtual time advances.
-- AC-8.4-7: When the merge reaches the pools task, the audio cache already has the audio of each new response.
 
 **Proofs.**
 
 - P-8.4-2. Requires: `OneBackfillPerPool` (P-8.3-2). Argument: `HashSet::insert` returns false when the name is present, and the spawn runs only when it returns true. This is the `start` guard of the model.
 - P-8.4-4. Requires: `PoolsChangeOnlyOnSuccess` (P-8.3-3). Argument: the save runs only in the `Ok` branch.
-- P-8.4-6. Argument: `select` reads the pools from an `ArcSwap` and holds no lock that the backfill task holds.
-- P-8.4-7. Argument: the task awaits the pre-render before it sends the merge.
-- P-8.4-1, P-8.4-3, P-8.4-5. Evidence: test.
+- P-8.4-1, P-8.4-5. Evidence: test.
+
+---
+
+### 8.4b Backfill Pre-render and Wiring
+
+**Goal:** Synthesize the new responses before the merge, and start the backfill in the running Jarvis. Pools now grow in production, and a new response is ready to speak when `select` first picks it.
+
+- **Implements:** G4, G5, G19. **Depends on:** 8.4.
+- **Files:** modify `src/app/background.rs`, `src/app/speech.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`, `src/lib.rs`.
+
+**Model.**
+
+- After the validation, the backfill pre-renders the new responses with `Speech`, then sends the merge. The pre-render needs the area names, so `Backfill` also gets the hot cache.
+- `Conversation` gets an `Arc<Backfill>` in place of the `changes` sender. `start_app` creates `Backfill` with `BackfillConfig`, the reasoner, the pools task, `Speech`, the intent catalog and the hot cache.
+
+**Acceptance criteria.**
+
+- AC-8.4b-1: When `generate` completes, the response store has the new responses and the audio cache has their audio.
+- AC-8.4b-2: When the backfill task is blocked inside `generate`, `select` on the same pool returns before virtual time advances.
+- AC-8.4b-3: When the merge reaches the pools task, the audio cache already has the audio of each new response.
+
+**Proofs.**
+
+- P-8.4b-2. Argument: `select` reads the pools from an `ArcSwap` and holds no lock that the backfill task holds.
+- P-8.4b-3. Argument: the task awaits the pre-render before it sends the merge.
+- P-8.4b-1. Evidence: test.
