@@ -15,6 +15,7 @@ use async_openai::types::responses::FunctionToolCall;
 use async_openai::types::responses::InputItem;
 use async_openai::types::responses::InputParam;
 use async_openai::types::responses::OutputItem;
+use async_openai::types::responses::Response;
 use async_openai::types::responses::ResponseCompletedEvent;
 use async_openai::types::responses::ResponseFailedEvent;
 use async_openai::types::responses::ResponseFormatJsonSchema;
@@ -339,6 +340,21 @@ impl OpenAiReasoner {
         })
     }
 
+    /// The response to `request`.
+    ///
+    /// # Errors
+    ///
+    /// The request fails, or the response is incomplete.
+    async fn create(&self, request: CreateResponse) -> anyhow::Result<Response> {
+        let response = self.client.responses().create(request).await?;
+        anyhow::ensure!(
+            response.status != Status::Incomplete,
+            "the response is incomplete: {:?}",
+            response.incomplete_details
+        );
+        Ok(response)
+    }
+
     /// Records a request now when the last request is `idle` or more ago, or when there is no
     /// last request. True when it records.
     ///
@@ -371,12 +387,7 @@ impl Reasoner for OpenAiReasoner {
             .max_output_tokens(self.max_output_tokens)
             .store(false)
             .build()?;
-        let response = self.client.responses().create(request).await?;
-        anyhow::ensure!(
-            response.status != Status::Incomplete,
-            "the response is incomplete: {:?}",
-            response.incomplete_details
-        );
+        self.create(request).await?;
         Ok(())
     }
 
@@ -426,7 +437,7 @@ impl Reasoner for OpenAiReasoner {
             .text(responses_format())
             .max_output_tokens(self.bulk_max_output_tokens)
             .build()?;
-        let response = self.client.responses().create(request).await?;
+        let response = self.create(request).await?;
         let text = response.output_text().context("the response has no text")?;
         // Serde also reads a struct from a JSON array, which the schema does not permit.
         let object: Map<String, Value> = serde_json::from_str(&text)?;
@@ -829,10 +840,13 @@ mod tests {
         }
     }
 
-    /// The result of `generate` when a mock `OpenAI` server replies with the output text `text`,
-    /// and the body of the request.
-    async fn generated(text: &str) -> anyhow::Result<(anyhow::Result<Vec<String>>, Value)> {
-        let mut body = response("completed");
+    /// The result of `generate` when a mock `OpenAI` server replies with `status` and the output
+    /// text `text`, and the body of the request.
+    async fn generated(
+        status: &str,
+        text: &str,
+    ) -> anyhow::Result<(anyhow::Result<Vec<String>>, Value)> {
+        let mut body = response(status);
         body["output"] = json!([{
             "type": "message",
             "id": "msg_1",
@@ -849,7 +863,7 @@ mod tests {
     /// AC-8.2-2.
     #[tokio::test(start_paused = true)]
     async fn ac_8_2_2_schema_reply_gives_its_responses() -> anyhow::Result<()> {
-        let (result, request) = generated(r#"{"responses": ["A", "B"]}"#).await?;
+        let (result, request) = generated("completed", r#"{"responses": ["A", "B"]}"#).await?;
         assert_eq!(result?, ["A", "B"]);
         assert_eq!(request["max_output_tokens"], 8000);
         assert_eq!(request["text"]["format"]["type"], "json_schema");
@@ -859,9 +873,17 @@ mod tests {
     /// AC-8.2-3.
     #[tokio::test(start_paused = true)]
     async fn ac_8_2_3_reply_off_the_schema_is_an_error() -> anyhow::Result<()> {
-        for reply in [r#"{"responses": "A"}"#, r#"[["A", "B"]]"#] {
-            let (result, _request) = generated(reply).await?;
-            assert!(result.is_err(), "the result of {reply} is {result:?}");
+        let replies = [
+            ("completed", r#"{"responses": "A"}"#),
+            ("completed", r#"[["A", "B"]]"#),
+            ("incomplete", r#"{"responses": ["A", "B"]}"#),
+        ];
+        for (status, text) in replies {
+            let (result, _request) = generated(status, text).await?;
+            assert!(
+                result.is_err(),
+                "the result of {status} {text} is {result:?}"
+            );
         }
         Ok(())
     }
