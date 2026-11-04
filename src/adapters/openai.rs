@@ -428,7 +428,9 @@ impl Reasoner for OpenAiReasoner {
             .build()?;
         let response = self.client.responses().create(request).await?;
         let text = response.output_text().context("the response has no text")?;
-        let generated: Generated = serde_json::from_str(&text)?;
+        // Serde also reads a struct from a JSON array, which the schema does not permit.
+        let object: Map<String, Value> = serde_json::from_str(&text)?;
+        let generated: Generated = serde_json::from_value(Value::Object(object))?;
         Ok(generated.responses)
     }
 }
@@ -857,8 +859,10 @@ mod tests {
     /// AC-8.2-3.
     #[tokio::test(start_paused = true)]
     async fn ac_8_2_3_reply_off_the_schema_is_an_error() -> anyhow::Result<()> {
-        let (result, _request) = generated(r#"{"responses": "A"}"#).await?;
-        assert!(result.is_err(), "the result is {result:?}");
+        for reply in [r#"{"responses": "A"}"#, r#"[["A", "B"]]"#] {
+            let (result, _request) = generated(reply).await?;
+            assert!(result.is_err(), "the result of {reply} is {result:?}");
+        }
         Ok(())
     }
 }
