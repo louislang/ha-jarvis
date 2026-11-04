@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::channel::oneshot;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use jiff::Timestamp;
@@ -106,10 +107,13 @@ pub trait Reasoner: Send + Sync {
 }
 
 /// One step of a System Two answer.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub enum Step {
     /// A complete sentence to speak.
     Sentence(String),
+    /// A service call to run. The answer continues after the consumer sends the result of the
+    /// call on the sender.
+    Call(ServiceCall, oneshot::Sender<anyhow::Result<Option<Value>>>),
     /// The answer is complete.
     Done,
 }

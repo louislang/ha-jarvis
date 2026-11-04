@@ -43,6 +43,7 @@ timeout_ms = 8000
 warm_idle_s = 60
 max_output_tokens = 150      # answers
 bulk_max_output_tokens = 8000 # structured output: generate, paraphrase, propose
+max_tool_calls = 5
 
 [announce]
 margin_ms = 300

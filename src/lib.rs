@@ -350,6 +350,8 @@ pub struct OpenAiConfig {
     pub max_output_tokens: u32,
     /// The output token limit of a structured output: `generate`, `paraphrase` and `propose`.
     pub bulk_max_output_tokens: u32,
+    /// The most tool calls of one answer.
+    pub max_tool_calls: u32,
 }
 
 /// The `[announce]` section.
@@ -1032,6 +1034,7 @@ mod tests {
                 warm_idle_s: 60,
                 max_output_tokens: 150,
                 bulk_max_output_tokens: 8000,
+                max_tool_calls: 5,
             },
             announce: AnnounceConfig {
                 margin_ms: 300,
