@@ -70,7 +70,7 @@ This phase adds new responses to a pool when the pool has too few unused respons
 
 - Constants: `POOLS = Set("a", "b")`.
 - State: `fresh: POOL -> int`, `running: POOL -> int` (backfill jobs of the pool), `version: POOL -> int`, `prevVersion: POOL -> int` and `lastAction` (history of the last step).
-- Actions: `use(p)` (`fresh[p] -= 1` if positive, then `start(p)` if `fresh[p] < MIN` and `running[p] = 0`: `running[p] += 1`), `succeed(p)` (when `running[p] > 0`: `fresh[p] += BATCH`, `version[p] += 1`, `running[p] -= 1`), `fail(p)` (when `running[p] > 0`: `running[p] -= 1`). Each action first sets `prevVersion := version` and `lastAction`.
+- Actions: `use(p)` (`fresh[p] -= 1` if positive, then `start(p)` if `fresh[p] < MIN` and `running[p] = 0`: `running[p] += 1`), `succeed(p)` (when `running[p] > 0`: `fresh[p] += BATCH`, `version[p] += 1`, `running[p] -= 1`), `failBackfill(p)` (when `running[p] > 0`: `running[p] -= 1`). Each action first sets `prevVersion := version` and `lastAction`. Quint reserves `fail`, so the fail action is `failBackfill`.
 - Invariants:
   - `OneBackfillPerPool`: `running[p] <= 1` for each pool.
   - `PoolsChangeOnlyOnSuccess`: `version[p] != prevVersion[p]` implies `lastAction = succeed(p)`.
