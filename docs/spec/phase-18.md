@@ -2,9 +2,7 @@
 
 This phase adds System One query intents about the house, Music Assistant playback and Plex playback. The queries read only the hot cache and make no service call. The music intents call `music_assistant.play_media` and the `media_player` services on the speaker of the area. The Plex intents call `media_player.play_media` with a `plex://` content ID on the TV. The list of new Plex shows comes from the Plex server, so it is a plugin (`01-architecture.md` decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 17 and before phase 10.
 
-Each sub-phase that adds an intent adds its seed examples to `intents.toml` and its pool to `responses.toml` (`01-architecture.md` section 12). The training set then changes, so `just fixture-model` trains the fixture model again (sub-phase 3.9), and CI trains it again because the cache key is the hash of the training set. AC-3.12-1 to AC-3.12-4 then check the new seed examples. When the fixture model does not learn a new example, the PR changes the examples, not the tests. Jarvis serves the fixture model until sub-phase 13.9, and the training runs of phase 13 use the same seed examples. Sub-phase 10.4 adds the `ask_<slot>` pools for the new slots (`media`, `movie`, `season`, `episode`, `volume`).
-
-The tests of the intent sub-phases decide with the catalog of `intents.toml`, the pools of `responses.toml` and the reference house. A test that needs an entity that the reference house does not have adds it to the snapshot before it loads the cache.
+Each sub-phase that adds an intent adds its seed examples to `intents.toml` and its pool to `responses.toml` (`01-architecture.md` section 12). The training set then changes, so `just fixture-model` trains the fixture model again (sub-phase 3.9), and CI trains it again because the cache key is the hash of the training set. AC-3.12-1 to AC-3.12-4 then check the new seed examples. When the fixture model does not learn a new example, the PR changes the examples, not the tests. Jarvis serves the fixture model until sub-phase 13.9, and the training runs of phase 13 use the same seed examples. Sub-phase 10.4 adds the `ask_<slot>` pools for the new slots (`media`, `movie`, `season`, `episode`, `volume`). The tests of the intent sub-phases decide with the catalog of `intents.toml`, the pools of `responses.toml` and the reference house. A test that needs an entity that the reference house does not have adds it to the snapshot before it loads the cache.
 
 ---
 
@@ -87,14 +85,14 @@ The tests of the intent sub-phases decide with the catalog of `intents.toml`, th
 - The reference house has no lock, no garage door and no window sensor (`01-architecture.md` section 11). The tests add `lock.front_door` "Front Door" (Outside, `locked`), `cover.garage_door` "Garage Door" (Garage, device class `garage`, `open`), `binary_sensor.kitchen_window` "Kitchen Window" (Kitchen, device class `window`, `on`) and `binary_sensor.bedroom_window` "Bedroom Window" (Bedroom, device class `window`, `off`).
 - `lock_query`: `target = "house"`, `select = [{ domain = "lock" }]`. Examples: "is the front door locked", "are the doors locked", "is the door locked", "did i lock the door". The model has no entity name slot, so the answer names each lock with its state. Pool: `{% for lock in entities %}The {{ lock.name }} is {{ lock.state }}.{{ " " if not loop.last else "" }}{% endfor %}`
 - `garage_door_query`: `target = "house"`, `select = [{ domain = "cover", device_class = "garage" }]`. Examples: "is the garage door open", "is the garage door closed", "did i close the garage door". Pool: `{% for door in entities %}The {{ door.name }} is {{ door.state }}.{{ " " if not loop.last else "" }}{% endfor %}`
-- `windows_query`: `target = "house"`, `select = [{ domain = "binary_sensor", device_class = "window" }]`, `state = "on"`. HA gives `on` for an open window. Examples: "are any windows open", "is a window open", "are the windows closed". Pool: `{% if entities %}{{ entities | map(attribute="name") | join(", ") }} {{ "is" if entities | length == 1 else "are" }} open.{% else %}All windows are closed.{% endif %}`
+- `windows_query`: `target = "house"`, `select = [{ domain = "binary_sensor", device_class = "window" }]`, no `state`. HA gives `on` for an open window and `off` for a closed window. The pool says "All windows are closed." only when each window is `off`. It names each other window with its state, so an `unavailable` sensor is not a closed window. Examples: "are any windows open", "is a window open", "are the windows closed". Pool: `{% set others = entities | rejectattr("state", "eq", "off") | list %}{% for window in others %}{{ window.name }} is {{ "open" if window.state == "on" else window.state }}.{{ " " if not loop.last else "" }}{% else %}All windows are closed.{% endfor %}`
 - The three intents have no `service`. `openai.allowed_domains` stays without `lock` and `cover` (sub-phase 7.5b).
 
 **Acceptance criteria.**
 
 - AC-18.3-1: When the intent is `lock_query` from the Kitchen satellite, the reply is "The Front Door is locked." and there is no call.
 - AC-18.3-2: When the intent is `garage_door_query`, the reply is "The Garage Door is open."
-- AC-18.3-3: When the intent is `windows_query`, the reply is "Kitchen Window is open." When both windows are `off`, the reply is "All windows are closed."
+- AC-18.3-3: When the intent is `windows_query`, the reply is "Kitchen Window is open." When both windows are `off`, the reply is "All windows are closed." When the Kitchen Window is `unavailable` and the Bedroom Window is `off`, the reply is "Kitchen Window is unavailable."
 - AC-18.3-4: When `intents.toml` is read, `lock_query`, `garage_door_query` and `windows_query` have no `service`, and no intent has a `service` in the `lock` domain.
 
 **Proofs.**
@@ -265,26 +263,30 @@ The tests of the intent sub-phases decide with the catalog of `intents.toml`, th
 **Goal:** Add pause, skip ahead and stop for the TV. "Pause the TV" then acts on the TV of the house.
 
 - **Implements:** G3. **Depends on:** 18.9.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/app/conversation.rs`.
 
 **Model.**
 
 - Each intent has `target = "entity"` and the TV filter of sub-phase 18.9.
 - `tv_pause`: `media_player.media_pause`. Examples: "pause the tv", "pause the show", "pause the movie". Pool: `Pausing the TV.`
-- `tv_skip`: `media_player.media_seek` with `data = { seek_position = "{{ entity.attributes.media_position + 30 }}" }`. HA has no relative seek, so Jarvis seeks to 30 s after the last reported position. Examples: "skip ahead", "skip ahead on the tv", "fast forward the movie". Pool: `Skipping ahead.`
+- HA has no relative seek, and a player does not update `media_position` while it plays. The position is valid at `media_position_updated_at` (HA media player documentation). Thus `Request` gets `now`, the time of the request, which `handle` takes from `Clock`.
+- `position(state, attributes, now)` is a pure function. It gives `media_position` plus the seconds from `media_position_updated_at` to `now` when `state` is `playing`, else `media_position`. A missing value, or a time that does not parse as a `jiff` `Timestamp`, gives `None`. The `entity` object gets `position` when the result is `Some`.
+- `tv_skip`: `media_player.media_seek` with `data = { seek_position = "{{ entity.position + 30 }}" }`. Examples: "skip ahead", "skip ahead on the tv", "fast forward the movie". Pool: `Skipping ahead.`
 - `tv_stop`: `media_player.media_stop`. Examples: "stop the tv", "stop the movie", "stop the show". Pool: `Stopping the TV.`
 
 **Acceptance criteria.**
 
 - AC-18.10-1: When the intent is `tv_pause`, the call is `media_player.media_pause` with the target `media_player.apple_tv`.
-- AC-18.10-2: When the intent is `tv_skip` and the TV has `media_position = 600`, the call is `media_player.media_seek` with `seek_position = 630` as a number.
-- AC-18.10-3: When the intent is `tv_skip` and the TV has no `media_position`, the result is `Fallback`.
+- AC-18.10-2: When the TV is `paused` with `media_position = 600`, the `tv_skip` call is `media_player.media_seek` with `seek_position = 630` as a number.
+- AC-18.10-3: When the TV is `playing` with `media_position = 600` and `media_position_updated_at` 60 s before `now`, the `tv_skip` call has `seek_position = 690`.
 - AC-18.10-4: When the intent is `tv_stop`, the call is `media_player.media_stop` with the target `media_player.apple_tv`.
+- AC-18.10-5: When the TV has no `media_position`, the result of `tv_skip` is `Fallback`.
 
 **Proofs.**
 
-- P-18.10-1, P-18.10-2, P-18.10-4. Evidence: test. The rules are P-4.5c-1 and P-4.5d-1.
-- P-18.10-3. Evidence: test. An expression with an undefined result gives `Fallback` (sub-phase 4.5d).
+- P-18.10-2, P-18.10-3 (AC-18.10-2, AC-18.10-3). Ensures: `position` is `media_position + (now - updated)` in seconds when `state` is `playing`, else `media_position`, and `None` when a value is missing or does not parse (rule 5.1.9). Argument: `position` matches on the state, the two attributes and the parse result. The tests check the values 630 and 690.
+- P-18.10-1, P-18.10-4. Evidence: test. The rules are P-4.5c-1 and P-4.5d-1.
+- P-18.10-5. Evidence: test. Without `position`, the expression is undefined, which gives `Fallback` (sub-phase 4.5d).
 
 ---
 
