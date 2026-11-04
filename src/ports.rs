@@ -125,6 +125,9 @@ pub enum Step {
     /// A service call to run. The answer continues after the consumer sends the result of the
     /// call on the sender.
     Call(ServiceCall, oneshot::Sender<anyhow::Result<Option<Value>>>),
+    /// A read of the entity states of the area with this name or alias. The answer continues
+    /// after the consumer sends the states on the sender.
+    States(String, oneshot::Sender<anyhow::Result<Option<Value>>>),
     /// The answer is complete.
     Done,
 }

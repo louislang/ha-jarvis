@@ -254,6 +254,8 @@ pub(crate) enum Scripted {
     Sentence(&'static str),
     /// A service call.
     Call(ServiceCall),
+    /// A read of the states of the area with this name.
+    States(&'static str),
     /// An error with this text.
     Error(&'static str),
     /// A wait of this time before the next step.
@@ -299,6 +301,13 @@ impl FakeReasoner {
     }
 }
 
+/// A sender of a tool result whose receiver is kept in `replies`.
+fn reply(replies: &Mutex<Vec<Reply>>) -> oneshot::Sender<anyhow::Result<Option<Value>>> {
+    let (sender, receiver) = oneshot::channel();
+    lock(replies).push(receiver);
+    sender
+}
+
 #[async_trait]
 impl Reasoner for FakeReasoner {
     async fn warm(&self) -> anyhow::Result<()> {
@@ -314,10 +323,9 @@ impl Reasoner for FakeReasoner {
             async move {
                 match step {
                     Scripted::Sentence(text) => Some(Ok(Step::Sentence(text.to_owned()))),
-                    Scripted::Call(call) => {
-                        let (sender, receiver) = oneshot::channel();
-                        lock(&replies).push(receiver);
-                        Some(Ok(Step::Call(call, sender)))
+                    Scripted::Call(call) => Some(Ok(Step::Call(call, reply(&replies)))),
+                    Scripted::States(area) => {
+                        Some(Ok(Step::States(area.to_owned(), reply(&replies))))
                     }
                     Scripted::Error(text) => Some(Err(anyhow::anyhow!(text))),
                     Scripted::Wait(time) => {
