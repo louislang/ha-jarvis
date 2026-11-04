@@ -988,9 +988,9 @@ mod tests {
         Ok(())
     }
 
-    /// A `null` alias of `get_entries` is left out.
+    /// AC-2.3-7.
     #[test]
-    fn null_alias_is_left_out() {
+    fn ac_2_3_7_null_alias_is_left_out() {
         let mut fields = Map::new();
         fields.insert("entity_id".to_owned(), json!("light.lamp"));
         fields.insert("name".to_owned(), json!("Lamp"));
