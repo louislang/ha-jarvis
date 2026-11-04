@@ -8,6 +8,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
+use async_openai::error::OpenAIError;
 use async_openai::types::responses::CreateResponse;
 use async_openai::types::responses::CreateResponseArgs;
 use async_openai::types::responses::FunctionTool;
@@ -60,8 +61,8 @@ pub fn system_prompt() -> &'static str {
      aloud: short sentences, with no Markdown, lists or emoji."
 }
 
-/// The user message of `question`: the local time, the HA location name, the area, the entities
-/// of the area and the text.
+/// The user message of `question`: the local time, the HA location name, the area names, the
+/// area, the entities of the area and the text.
 #[must_use]
 pub fn user_message(question: &Question) -> String {
     let area = question
@@ -74,9 +75,10 @@ pub fn user_message(question: &Question) -> String {
         .map(|item| format!("- {} ({}): {}\n", item.name, item.entity_id, item.state))
         .collect();
     format!(
-        "Time: {}\nLocation: {}\nArea: {area}\nEntities:\n{}Request: {}",
+        "Time: {}\nLocation: {}\nAreas: {}\nArea: {area}\nEntities:\n{}Request: {}",
         question.now.strftime("%A %Y-%m-%d %H:%M"),
         question.location,
+        question.areas.join(", "),
         entities.concat(),
         question.text
     )
@@ -144,6 +146,31 @@ fn call_service() -> Tool {
         strict: Some(false),
         ..FunctionTool::default()
     })
+}
+
+/// The `get_states` tool: the entity states of one area.
+fn get_states() -> Tool {
+    Tool::Function(FunctionTool {
+        name: "get_states".to_owned(),
+        description: Some("Gives the entity states of one area of the house.".to_owned()),
+        parameters: Some(json!({
+            "type": "object",
+            "properties": {
+                "area": {"type": "string", "description": "An area name or alias."},
+            },
+            "required": ["area"],
+            "additionalProperties": false,
+        })),
+        strict: Some(true),
+        ..FunctionTool::default()
+    })
+}
+
+/// The arguments of a `get_states` tool call.
+#[derive(Deserialize)]
+struct StatesArguments {
+    /// An area name or alias.
+    area: String,
 }
 
 /// The arguments of a `call_service` tool call.
@@ -248,10 +275,10 @@ impl Answer {
 
     /// Runs the tool call `call` through the consumer and keeps its output.
     async fn call(&mut self, call: FunctionToolCall) -> anyhow::Result<()> {
-        let result = match self.service_call(&call.arguments) {
-            Ok(service_call) => {
-                let (reply, result) = oneshot::channel();
-                self.send([Step::Call(service_call, reply)])?;
+        let (reply, result) = oneshot::channel();
+        let result = match self.step(&call, reply) {
+            Ok(step) => {
+                self.send([step])?;
                 result.await?
             }
             Err(error) => Err(error),
@@ -267,18 +294,27 @@ impl Answer {
         Ok(())
     }
 
-    /// The service call of the tool call `arguments`. An error when the answer has
-    /// `max_tool_calls` calls or the arguments are not valid.
-    fn service_call(&mut self, arguments: &str) -> anyhow::Result<ServiceCall> {
+    /// The step of the tool call `call` with its result sender `reply`. An error when the
+    /// answer has `max_tool_calls` calls or the arguments are not valid.
+    fn step(
+        &mut self,
+        call: &FunctionToolCall,
+        reply: oneshot::Sender<anyhow::Result<Option<Value>>>,
+    ) -> anyhow::Result<Step> {
         self.calls_left = self.calls_left.checked_sub(1).context("limit reached")?;
-        let arguments: Arguments = serde_json::from_str(arguments)?;
-        Ok(ServiceCall {
+        if call.name == "get_states" {
+            let arguments: StatesArguments = serde_json::from_str(&call.arguments)?;
+            return Ok(Step::States(arguments.area, reply));
+        }
+        let arguments: Arguments = serde_json::from_str(&call.arguments)?;
+        let service_call = ServiceCall {
             domain: arguments.domain,
             service: arguments.service,
             target: arguments.target,
             data: arguments.data,
             return_response: false,
-        })
+        };
+        Ok(Step::Call(service_call, reply))
     }
 
     /// Sends `steps` to the consumer.
@@ -373,6 +409,21 @@ impl OpenAiReasoner {
         *last_request = Some(now);
         Ok(true)
     }
+
+    /// The first response request of the answer to `question`, with both tools.
+    ///
+    /// # Errors
+    ///
+    /// The request cannot be built.
+    fn request(&self, question: &Question) -> Result<CreateResponse, OpenAIError> {
+        CreateResponseArgs::default()
+            .model(&self.model)
+            .instructions(system_prompt())
+            .input(user_message(question))
+            .tools([call_service(), get_states()])
+            .max_output_tokens(self.max_output_tokens)
+            .build()
+    }
 }
 
 #[async_trait]
@@ -392,13 +443,7 @@ impl Reasoner for OpenAiReasoner {
     }
 
     fn answer(&self, question: &Question) -> BoxStream<'static, anyhow::Result<Step>> {
-        let request = CreateResponseArgs::default()
-            .model(&self.model)
-            .instructions(system_prompt())
-            .input(user_message(question))
-            .tools([call_service()])
-            .max_output_tokens(self.max_output_tokens)
-            .build();
+        let request = self.request(question);
         let recorded = self.record_when_idle(Duration::ZERO);
         let client = self.client.clone();
         let calls_left = self.max_tool_calls;
@@ -600,12 +645,21 @@ mod tests {
         Sentence(String),
         /// A service call.
         Call(ServiceCall),
+        /// A read of the states of an area.
+        States(String),
         /// The end of the answer.
         Done,
     }
 
+    /// Sends `{"state": "on"}` on `reply`.
+    fn on(reply: oneshot::Sender<anyhow::Result<Option<Value>>>) -> anyhow::Result<()> {
+        let sent = reply.send(Ok(Some(json!({"state": "on"}))));
+        anyhow::ensure!(sent.is_ok(), "the answer dropped the reply");
+        Ok(())
+    }
+
     /// The steps of an answer that a mock `OpenAI` server streams as `template`, then "It is on."
-    /// after a tool output, and the server. Each call gives `{"state": "on"}`.
+    /// after a tool output, and the server. Each tool call gives `{"state": "on"}`.
     async fn served(template: ResponseTemplate) -> anyhow::Result<(MockServer, Vec<Seen>)> {
         let (server, reasoner) = serve(template).await?;
         Mock::given(matchers::body_string_contains("function_call_output"))
@@ -619,9 +673,12 @@ mod tests {
             seen.push(match step {
                 Step::Sentence(text) => Seen::Sentence(text),
                 Step::Call(call, reply) => {
-                    let sent = reply.send(Ok(Some(json!({"state": "on"}))));
-                    anyhow::ensure!(sent.is_ok(), "the answer dropped the reply");
+                    on(reply)?;
                     Seen::Call(call)
+                }
+                Step::States(area, reply) => {
+                    on(reply)?;
+                    Seen::States(area)
                 }
                 Step::Done => Seen::Done,
             });
@@ -634,9 +691,9 @@ mod tests {
         Ok(served(spoken(kind, deltas)).await?.1)
     }
 
-    /// The steps of an answer whose first response has a tool call `call_<n>` for each of
-    /// `arguments`, and the tool outputs of the last request.
-    async fn called(arguments: &[&str]) -> anyhow::Result<(Vec<Seen>, Vec<Value>)> {
+    /// The steps of an answer whose first response has a call `call_<n>` of the tool `tool` for
+    /// each of `arguments`, and the body of each request.
+    async fn requested(tool: &str, arguments: &[&str]) -> anyhow::Result<(Vec<Seen>, Vec<Value>)> {
         let calls = arguments.iter().zip(1..).map(|(arguments, number)| {
             json!({
                 "type": "response.output_item.done",
@@ -645,21 +702,37 @@ mod tests {
                 "item": {
                     "type": "function_call",
                     "call_id": format!("call_{number}"),
-                    "name": "call_service",
+                    "name": tool,
                     "arguments": arguments,
                 },
             })
         });
         let (server, seen) = served(stream(calls)).await?;
         let requests = server.received_requests().await.context("no requests")?;
-        let body: Value = requests.last().context("no request")?.body_json()?;
-        let input = body["input"]
+        let bodies: serde_json::Result<Vec<Value>> =
+            requests.iter().map(wiremock::Request::body_json).collect();
+        Ok((seen, bodies?))
+    }
+
+    /// The steps of an answer whose first response has a call `call_<n>` of the tool `tool` for
+    /// each of `arguments`, and the tool outputs of the last request.
+    async fn tool_called(
+        tool: &str,
+        arguments: &[&str],
+    ) -> anyhow::Result<(Vec<Seen>, Vec<Value>)> {
+        let (seen, bodies) = requested(tool, arguments).await?;
+        let input = bodies.last().context("no request")?["input"]
             .as_array()
             .context("the input is not a list")?;
         let outputs = input
             .iter()
             .filter(|item| item["type"] == "function_call_output");
         Ok((seen, outputs.cloned().collect()))
+    }
+
+    /// `tool_called` for `call_service`.
+    async fn called(arguments: &[&str]) -> anyhow::Result<(Vec<Seen>, Vec<Value>)> {
+        tool_called("call_service", arguments).await
     }
 
     /// Valid `call_service` arguments.
@@ -716,6 +789,35 @@ mod tests {
         assert_eq!(calls.count(), 5);
         assert_eq!(outputs[5]["call_id"], "call_6");
         assert_eq!(outputs[5]["output"], "error: limit reached");
+        Ok(())
+    }
+
+    /// Valid `get_states` arguments.
+    const GARAGE: &str = r#"{"area": "Garage"}"#;
+
+    /// AC-7.6-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_6_1_each_answer_request_has_strict_get_states() -> anyhow::Result<()> {
+        let (_seen, bodies) = requested("get_states", &[GARAGE]).await?;
+        assert_eq!(bodies.len(), 2);
+        for body in bodies {
+            let tools = body["tools"].as_array().context("no tools")?;
+            let found = tools.iter().find(|tool| tool["name"] == "get_states");
+            assert_eq!(found.context("no get_states")?["strict"], true, "{body}");
+        }
+        Ok(())
+    }
+
+    /// AC-7.6-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_6_2_get_states_gives_states_step_then_final_text() -> anyhow::Result<()> {
+        let (seen, outputs) = tool_called("get_states", &[GARAGE]).await?;
+        let sentence = Seen::Sentence("It is on.".to_owned());
+        assert_eq!(
+            seen,
+            [Seen::States("Garage".to_owned()), sentence, Seen::Done]
+        );
+        assert_eq!(outputs[0]["output"], r#"{"state":"on"}"#);
         Ok(())
     }
 
@@ -825,6 +927,20 @@ mod tests {
         let message = asked(Some("kitchen"));
         assert!(message.contains("Monday 2026-10-26 08:00"), "{message}");
         assert!(message.contains(&house().config.location_name), "{message}");
+    }
+
+    /// AC-7.6-5.
+    #[test]
+    fn ac_7_6_5_user_message_lists_each_area() {
+        let message = asked(Some("kitchen"));
+        let listed = message.lines().find(|line| line.starts_with("Areas: "));
+        for area in house().areas {
+            let name = area.name;
+            assert!(
+                listed.unwrap_or_default().contains(&name),
+                "{name} is not in {message}"
+            );
+        }
     }
 
     /// AC-7.2-5.

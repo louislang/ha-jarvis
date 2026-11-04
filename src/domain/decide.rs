@@ -100,6 +100,8 @@ pub struct Question {
     pub location: String,
     /// The entities of `area` that `select` does not skip and that have a state.
     pub entities: Vec<EntityState>,
+    /// The names of all areas of the hot cache.
+    pub areas: Vec<String>,
     /// The local time in the HA time zone.
     pub now: DateTime,
 }
@@ -141,8 +143,39 @@ pub fn question(
         area,
         location: location.to_owned(),
         entities,
+        areas: area_names(cache),
         now,
     }
+}
+
+/// The name of each area of `cache`.
+#[verus_verify]
+fn area_names(cache: &StateCache) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= cache.areas@.len(),
+        decreases cache.areas@.len() - index,
+    ))]
+    while index < cache.areas.len() {
+        names.push(cache.areas[index].name.clone());
+        index += 1;
+    }
+    names
+}
+
+/// The entities of the area with the name or alias `name` in `cache`, as `question` gives them,
+/// or `None` when `cache` has no such area.
+#[verus_spec(found =>
+    ensures
+        found matches Some(entities) ==> forall|position: int| 0 <= position < entities@.len()
+            ==> #[trigger] in_named_area(*cache, name@, entities@[position]),
+)]
+#[must_use]
+pub fn area_states(name: &str, cache: &StateCache) -> Option<Vec<EntityState>> {
+    let area = cache.area_by_name(name)?;
+    Some(area_entities(area, cache))
 }
 
 /// The name and the state of each entity of `area` that `select` does not skip and that has a
@@ -718,6 +751,16 @@ pub open spec fn described(cache: StateCache, area: AreaId, item: EntityState) -
         && present(cache, area, cache.entities@[index])
 }
 
+/// True when `item` is described in an area of `cache` with the name or alias `name`.
+pub open spec fn in_named_area(cache: StateCache, name: Seq<char>, item: EntityState) -> bool {
+    exists|index: int| 0 <= index < cache.areas@.len()
+        && crate::domain::state_cache::named(
+            #[trigger] cache.areas@[index],
+            crate::domain::contracts::lowercase(name),
+        )
+        && described(cache, cache.areas@[index].area_id, item)
+}
+
 /// True when `decision` asks System Two `question`.
 pub open spec fn deferred(decision: Decision, question: String) -> bool {
     decision matches Decision::Defer { job: Job::Llm(asked), .. } && asked@ == question@
@@ -1289,6 +1332,19 @@ mod tests {
         let cache = kitchen_temperature("21");
         let decision = decided_at(&catalog, "temperature_query", "kitchen", &cache);
         assert_eq!(decision, queried("It is 21 degrees in the kitchen."));
+    }
+
+    /// AC-7.6-3.
+    #[test]
+    fn ac_7_6_3_area_states_give_the_unskipped_entities_of_the_area() {
+        let cache = StateCache::load(house());
+        let light = EntityState {
+            name: "Garage Light".to_owned(),
+            entity_id: "switch.garage_light".to_owned(),
+            state: "off".to_owned(),
+        };
+        assert_eq!(area_states("garage", &cache), Some(vec![light]));
+        assert_eq!(area_states("attic", &cache), None);
     }
 
     /// AC-4.6-5.

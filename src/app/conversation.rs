@@ -311,22 +311,39 @@ impl Conversation {
         use anyhow::Context as _;
         use futures::StreamExt;
         let mut steps = self.two.reasoner.answer(&self.question(text, area)?);
-        let mut sentences = Vec::new();
-        loop {
+        let (mut sentences, mut more) = (Vec::new(), true);
+        while more {
             let next = tokio::time::timeout(self.two.timeout, steps.next()).await;
-            match next.context("no step of the answer within the timeout")? {
-                Some(Ok(Step::Sentence(sentence))) => {
-                    self.say(sentence, request, &mut sentences).await?;
-                }
-                Some(Ok(Step::Call(call, reply))) => {
-                    if !self.step_call(call, reply, request).await {
-                        return Ok(sentences);
-                    }
-                }
-                Some(Ok(Step::Done)) | None => return Ok(sentences),
-                Some(Err(error)) => return Err(error),
-            }
+            more = match next.context("no step of the answer within the timeout")? {
+                Some(step) => self.step(step?, request, &mut sentences).await?,
+                None => false,
+            };
         }
+        Ok(sentences)
+    }
+
+    /// Runs `step` of the System Two answer for `request`, as `answer` describes. False when the
+    /// answer ends.
+    ///
+    /// # Errors
+    ///
+    /// An announce fails.
+    async fn step(
+        &self,
+        step: Step,
+        request: Option<&(String, u64)>,
+        sentences: &mut Vec<String>,
+    ) -> anyhow::Result<bool> {
+        match step {
+            Step::Sentence(sentence) => self.say(sentence, request, sentences).await?,
+            Step::Call(call, reply) => return Ok(self.step_call(call, reply, request).await),
+            Step::States(area, reply) => {
+                // The send fails only when the answer has ended, so the result is not needed.
+                let _ = reply.send(self.states(&area));
+            }
+            Step::Done => return Ok(false),
+        }
+        Ok(true)
     }
 
     /// Announces `sentence` on the satellite of `request`, or adds it to `sentences` with no
@@ -391,6 +408,22 @@ impl Conversation {
         let service = format!("{}.{}", call.domain, call.service);
         call.return_response = self.two.read_services.contains(&service);
         self.queues.home.call(call).await
+    }
+
+    /// The JSON list of the name, the entity ID and the state of each entity of the area `name`
+    /// in the hot cache.
+    ///
+    /// # Errors
+    ///
+    /// "unknown area" when the hot cache has no area with the name or alias `name`.
+    fn states(&self, name: &str) -> anyhow::Result<Option<Value>> {
+        use anyhow::Context as _;
+        let cache = self.queues.cache.borrow();
+        let found = decide::area_states(name, &cache).context("unknown area")?;
+        let states = found.into_iter().map(|item| {
+            serde_json::json!({"name": item.name, "entity_id": item.entity_id, "state": item.state})
+        });
+        Ok(Some(Value::Array(states.collect())))
     }
 
     /// An answer of the pool `pool` rendered with the response data of `call` as `response`.
@@ -1397,6 +1430,21 @@ mod tests {
         assert_eq!(home.calls(), [read, call()]);
         let result = format!("{:?}", Ok::<_, ()>(Some(Ok::<_, ()>(Some(data)))));
         assert_eq!(reasoner.results()[0], result);
+        Ok(())
+    }
+
+    /// AC-7.6-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_6_4_states_come_from_the_hot_cache() -> anyhow::Result<()> {
+        let steps = vec![Scripted::States("Garage"), Scripted::States("attic")];
+        let (home, _cache, reasoner, work) = reasoning("idle", steps)?;
+        work.await?;
+        assert_eq!(home.calls(), []);
+        let light = serde_json::json!([
+            { "name": "Garage Light", "entity_id": "switch.garage_light", "state": "off" },
+        ]);
+        let states = format!("{:?}", Ok::<_, ()>(Some(Ok::<_, ()>(Some(light)))));
+        assert_eq!(reasoner.results(), [states, "unknown area".to_owned()]);
         Ok(())
     }
 
