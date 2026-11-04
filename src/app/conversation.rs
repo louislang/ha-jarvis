@@ -112,7 +112,7 @@ impl Conversation {
 
     /// The reply to the transcript `text` in `context` and its work: the System One prediction
     /// of the normalized text in the area name of the satellite device, its decision and its
-    /// dispatch.
+    /// dispatch, or the answer of a deferred job when `context` has no satellite.
     ///
     /// # Errors
     ///
@@ -134,7 +134,9 @@ impl Conversation {
         };
         let decision = self.decide(&prediction, &request);
         let (kind, area) = (kind(&decision), request.area.as_ref());
-        let handled = self.dispatch(decision, area, context.satellite_id.as_deref());
+        let handled = self
+            .reply(decision, area, context.satellite_id.as_deref())
+            .await;
         let top = prediction.ranked.first();
         let reply = handled.text.as_str();
         tracing::info!(transcript = text, ?top, kind, reply, "handled");
@@ -167,8 +169,30 @@ impl Conversation {
         )
     }
 
-    /// The reply or filler of `decision` and its service call, fetch or System Two answer from
-    /// `area` as background work, the answer only with `satellite`. Records the use of the reply.
+    /// The dispatch of `decision` from `area` on `satellite`. Without `satellite`, the answer of a
+    /// deferred job, or a `failure` answer when the job fails.
+    async fn reply(
+        &self,
+        decision: Decision,
+        area: Option<&AreaId>,
+        satellite: Option<&str>,
+    ) -> Handled {
+        let answer = match (decision, satellite) {
+            (Decision::Defer { job, .. }, None) => match job {
+                Job::Fetch { call, pool } => self.fetched(call, &pool).await,
+                Job::Llm(text) => self
+                    .answer(&text, area, None)
+                    .await
+                    .map(|all| all.join(" ")),
+            },
+            (decision, satellite) => return self.dispatch(decision, area, satellite),
+        };
+        let text = self.or_failure(answer);
+        Handled { text, after: None }
+    }
+
+    /// The reply or filler of `decision` and its service call from `area` as background work,
+    /// and its fetch or System Two answer only with `satellite`. Records the use of the reply.
     /// Increases the generation of `satellite`, the satellite entity of the request.
     pub fn dispatch(
         &self,
@@ -183,7 +207,10 @@ impl Conversation {
             Decision::Defer {
                 filler,
                 job: Job::Fetch { call, pool },
-            } => (filler, Some(self.fetch(call, pool, request))),
+            } => (
+                filler,
+                request.map(|request| self.fetch(call, pool, request)),
+            ),
             Decision::Defer {
                 filler,
                 job: Job::Llm(text),
@@ -217,30 +244,17 @@ impl Conversation {
         .boxed()
     }
 
-    /// Makes `call` while `request` is the newest of its satellite. Renders an answer of `pool`
-    /// with the response data as `response`, or selects a `failure` answer when the call or the
-    /// render fails. Queues the answer with the generation of `request`, or logs it without a
-    /// satellite.
-    fn fetch(&self, call: ServiceCall, pool: String, request: Option<(String, u64)>) -> Work {
+    /// Makes `call` while `request` is the newest of its satellite. Queues its answer of `pool`,
+    /// or a `failure` answer when it fails, with the generation of `request`.
+    fn fetch(&self, call: ServiceCall, pool: String, request: (String, u64)) -> Work {
         let conversation = self.clone();
         async move {
-            if let Some((satellite, generation)) = &request
-                && !conversation.queues.is_current(satellite, *generation)
-            {
+            let (satellite, generation) = request;
+            if !conversation.queues.is_current(&satellite, generation) {
                 return Ok(());
             }
-            let answer = match conversation.queues.home.call(call).await {
-                Ok(response) => conversation.render(&pool, response),
-                Err(error) => Err(error),
-            };
-            let text = answer.unwrap_or_else(|error| {
-                tracing::warn!("the fetch failed: {error:#}");
-                conversation.pick("failure")
-            });
-            let Some((satellite, generation)) = request else {
-                tracing::info!("the fetch answer is {text:?}");
-                return Ok(());
-            };
+            let answer = conversation.fetched(call, &pool).await;
+            let text = conversation.or_failure(answer);
             let queues = &conversation.queues;
             queues.announce(&satellite, generation, &text).await
         }
@@ -252,11 +266,13 @@ impl Conversation {
     fn llm(&self, text: String, area: Option<AreaId>, request: (String, u64)) -> Work {
         let conversation = self.clone();
         async move {
-            let Err(error) = conversation.answer(&text, area.as_ref(), &request).await else {
+            let Err(error) = conversation
+                .answer(&text, area.as_ref(), Some(&request))
+                .await
+            else {
                 return Ok(());
             };
-            tracing::warn!("the answer failed: {error:#}");
-            let (text, (satellite, generation)) = (conversation.pick("failure"), request);
+            let (text, (satellite, generation)) = (conversation.or_failure(Err(error)), request);
             let queues = &conversation.queues;
             queues.announce(&satellite, generation, &text).await
         }
@@ -277,9 +293,10 @@ impl Conversation {
         Ok(decide::question(text, area, location, now, &cache))
     }
 
-    /// Announces each sentence of the System Two answer to `text` from `area` on the satellite
-    /// of `request` as it arrives. Makes each call before the next step and sends back its result.
-    /// Ends before a call when `request` is no longer the newest of its satellite.
+    /// The sentences of the System Two answer to `text` from `area`. With `request`, announces
+    /// each sentence on its satellite as it arrives instead. Makes each call before the next step
+    /// and sends back its result. Ends before a call when `request` is no longer the newest of
+    /// its satellite.
     ///
     /// # Errors
     ///
@@ -289,40 +306,60 @@ impl Conversation {
         &self,
         text: &str,
         area: Option<&AreaId>,
-        request: &(String, u64),
-    ) -> anyhow::Result<()> {
+        request: Option<&(String, u64)>,
+    ) -> anyhow::Result<Vec<String>> {
         use anyhow::Context as _;
         use futures::StreamExt;
         let mut steps = self.two.reasoner.answer(&self.question(text, area)?);
-        let (satellite, generation) = request;
+        let mut sentences = Vec::new();
         loop {
             let next = tokio::time::timeout(self.two.timeout, steps.next()).await;
             match next.context("no step of the answer within the timeout")? {
                 Some(Ok(Step::Sentence(sentence))) => {
-                    self.queues
-                        .announce(satellite, *generation, &sentence)
-                        .await?;
+                    self.say(sentence, request, &mut sentences).await?;
                 }
                 Some(Ok(Step::Call(call, reply))) => {
                     if !self.step_call(call, reply, request).await {
-                        return Ok(());
+                        return Ok(sentences);
                     }
                 }
-                Some(Ok(Step::Done)) | None => return Ok(()),
+                Some(Ok(Step::Done)) | None => return Ok(sentences),
                 Some(Err(error)) => return Err(error),
             }
         }
     }
 
+    /// Announces `sentence` on the satellite of `request`, or adds it to `sentences` with no
+    /// `request`.
+    ///
+    /// # Errors
+    ///
+    /// The announce fails.
+    async fn say(
+        &self,
+        sentence: String,
+        request: Option<&(String, u64)>,
+        sentences: &mut Vec<String>,
+    ) -> anyhow::Result<()> {
+        let Some((satellite, generation)) = request else {
+            sentences.push(sentence);
+            return Ok(());
+        };
+        self.queues
+            .announce(satellite, *generation, &sentence)
+            .await
+    }
+
     /// Makes `call` and sends its result on `reply` while `request` is the newest of its
-    /// satellite. False when it is not.
+    /// satellite, or with no `request`. False when it is not.
     async fn step_call(
         &self,
         call: ServiceCall,
         reply: oneshot::Sender<anyhow::Result<Option<Value>>>,
-        (satellite, generation): &(String, u64),
+        request: Option<&(String, u64)>,
     ) -> bool {
-        let current = self.queues.is_current(satellite, *generation);
+        let current = request
+            .is_none_or(|(satellite, generation)| self.queues.is_current(satellite, *generation));
         if current {
             // The send fails only when the answer has ended, so the result is not needed.
             let _ = reply.send(self.tool(call).await);
@@ -356,11 +393,24 @@ impl Conversation {
         self.queues.home.call(call).await
     }
 
-    /// An answer of the pool `pool` rendered with `response` as `response`.
-    fn render(&self, pool: &str, response: Option<Value>) -> anyhow::Result<String> {
+    /// An answer of the pool `pool` rendered with the response data of `call` as `response`.
+    ///
+    /// # Errors
+    ///
+    /// The call or the render fails.
+    async fn fetched(&self, call: ServiceCall, pool: &str) -> anyhow::Result<String> {
+        let response = self.queues.home.call(call).await?;
         let template = self.pick(pool);
         let context = Map::from_iter([("response".to_owned(), response.unwrap_or_default())]);
         Ok(responses::render(&template, &context)?)
+    }
+
+    /// The text of `answer`, or a `failure` answer when it is an error. Logs the error.
+    fn or_failure(&self, answer: anyhow::Result<String>) -> String {
+        answer.unwrap_or_else(|error| {
+            tracing::warn!("the answer failed: {error:#}");
+            self.pick("failure")
+        })
     }
 
     /// The text of an answer that `responses::select` picks from the current pool `pool`.
@@ -999,8 +1049,8 @@ mod tests {
     async fn ac_4_9d_1_fetch_calls_with_return_response() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
         let (_cache, _changes, conversation) = still(&home, "idle");
-        fetch(&conversation, None)?.await?;
-        assert_eq!(home.calls(), [weather()]);
+        fetch(&conversation, Some(SATELLITE))?.await?;
+        assert_eq!(home.calls().first(), Some(&weather()));
         Ok(())
     }
 
@@ -1040,14 +1090,8 @@ mod tests {
         Ok(())
     }
 
-    /// The result of `handle` for `text` from the satellite device `device` when the classifier
-    /// gives `label` with 0.9, or fails without `label`. Also the `(context, text)` of each
-    /// prediction.
-    async fn handled(
-        label: Option<&str>,
-        text: &str,
-        device: Option<&str>,
-    ) -> (anyhow::Result<Handled>, Vec<(String, String)>) {
+    /// A classifier that gives `label` with 0.9, or fails without `label`.
+    fn classifier(label: Option<&str>) -> Arc<FakeClassifier> {
         let classifier = Arc::new(FakeClassifier::default());
         if let Some(label) = label {
             let ranked = vec![(label.to_owned(), 0.9)];
@@ -1056,6 +1100,18 @@ mod tests {
                 slots: Vec::new(),
             });
         }
+        classifier
+    }
+
+    /// The result of `handle` for `text` from the satellite device `device` when the classifier
+    /// gives `label` with 0.9, or fails without `label`. Also the `(context, text)` of each
+    /// prediction.
+    async fn handled(
+        label: Option<&str>,
+        text: &str,
+        device: Option<&str>,
+    ) -> (anyhow::Result<Handled>, Vec<(String, String)>) {
+        let classifier = classifier(label);
         let home = Arc::new(FakeHome::default());
         let (_cache, _changes, conversation) =
             still_with(&home, "idle", Arc::clone(&classifier) as _, Arc::default());
@@ -1097,7 +1153,7 @@ mod tests {
 
     /// AC-5.3-4.
     #[tokio::test(start_paused = true)]
-    async fn ac_5_3_4_defer_gives_a_filler() -> anyhow::Result<()> {
+    async fn ac_5_3_4_defer_on_a_satellite_gives_a_filler() -> anyhow::Result<()> {
         let (handled, _) = handled(Some("unknown"), "tell me a joke", Some(KITCHEN)).await;
         assert_eq!(handled?.text, "One moment.");
         Ok(())
@@ -1341,6 +1397,48 @@ mod tests {
         assert_eq!(home.calls(), [read, call()]);
         let result = format!("{:?}", Ok::<_, ()>(Some(Ok::<_, ()>(Some(data)))));
         assert_eq!(reasoner.results()[0], result);
+        Ok(())
+    }
+
+    /// The text of `handle` for `text` on `home` from the kitchen device with no satellite, when
+    /// the classifier gives `label` and the reasoner gives `steps`. The hot cache also has
+    /// `weather.home`.
+    async fn typed(
+        label: &str,
+        text: &str,
+        home: &Arc<FakeHome>,
+        steps: Vec<Scripted>,
+    ) -> anyhow::Result<String> {
+        let reasoner = Arc::new(FakeReasoner::default());
+        reasoner.script(steps);
+        let (cache, _changes, conversation) =
+            still_with(home, "idle", classifier(Some(label)), reasoner);
+        add(&cache, "weather.home");
+        let context = Context {
+            device_id: Some(KITCHEN.to_owned()),
+            ..Context::default()
+        };
+        Ok(conversation.handle(text, context).await?.text)
+    }
+
+    /// AC-7.5c-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_5c_1_no_satellite_returns_the_sentences() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let steps = vec![Scripted::Sentence("One."), Scripted::Sentence("Two.")];
+        let text = typed("unknown", "tell me a joke", &home, steps).await?;
+        assert_eq!(text, "One. Two.");
+        assert_eq!(announces(&home), [] as [&str; 0]);
+        Ok(())
+    }
+
+    /// AC-7.5c-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_7_5c_2_no_satellite_returns_the_fetch_answer() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        home.respond(serde_json::json!({ "sky": "sunny" }));
+        let text = typed("weather", "what is the weather like", &home, Vec::new()).await?;
+        assert_eq!(text, "It is sunny.");
         Ok(())
     }
 
