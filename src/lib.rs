@@ -114,6 +114,7 @@ pub mod adapters {
 /// Shared test code.
 #[cfg(test)]
 pub mod testing {
+    pub mod e2e;
     pub mod fakes;
 }
 

@@ -37,6 +37,7 @@ flowchart LR
         crate[crate]
     end
     subgraph testing
+        crate_testing_e2e[e2e]
         crate_testing_fakes[fakes]
     end
     crate --> crate
