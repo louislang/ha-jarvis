@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use futures::FutureExt;
+use futures::channel::oneshot;
 use rand::rngs::StdRng;
 use serde_json::Map;
 use serde_json::Value;
@@ -278,6 +279,7 @@ impl Conversation {
 
     /// Announces each sentence of the System Two answer to `text` from `area` on the satellite
     /// of `request` as it arrives. Makes each call before the next step and sends back its result.
+    /// Ends before a call when `request` is no longer the newest of its satellite.
     ///
     /// # Errors
     ///
@@ -287,26 +289,45 @@ impl Conversation {
         &self,
         text: &str,
         area: Option<&AreaId>,
-        (satellite, generation): &(String, u64),
+        request: &(String, u64),
     ) -> anyhow::Result<()> {
         use anyhow::Context as _;
         use futures::StreamExt;
         let mut steps = self.two.reasoner.answer(&self.question(text, area)?);
-        let queues = &self.queues;
+        let (satellite, generation) = request;
         loop {
             let next = tokio::time::timeout(self.two.timeout, steps.next()).await;
             match next.context("no step of the answer within the timeout")? {
                 Some(Ok(Step::Sentence(sentence))) => {
-                    queues.announce(satellite, *generation, &sentence).await?;
+                    self.queues
+                        .announce(satellite, *generation, &sentence)
+                        .await?;
                 }
-                // The send fails only when the answer has ended, so the result is not needed.
                 Some(Ok(Step::Call(call, reply))) => {
-                    let _ = reply.send(self.tool(call).await);
+                    if !self.step_call(call, reply, request).await {
+                        return Ok(());
+                    }
                 }
                 Some(Ok(Step::Done)) | None => return Ok(()),
                 Some(Err(error)) => return Err(error),
             }
         }
+    }
+
+    /// Makes `call` and sends its result on `reply` while `request` is the newest of its
+    /// satellite. False when it is not.
+    async fn step_call(
+        &self,
+        call: ServiceCall,
+        reply: oneshot::Sender<anyhow::Result<Option<Value>>>,
+        (satellite, generation): &(String, u64),
+    ) -> bool {
+        let current = self.queues.is_current(satellite, *generation);
+        if current {
+            // The send fails only when the answer has ended, so the result is not needed.
+            let _ = reply.send(self.tool(call).await);
+        }
+        current
     }
 
     /// The response data of the System Two `call`, with `return_response` when `read_services`
@@ -1258,6 +1279,28 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_7_5b_3_lock_target_is_not_permitted() -> anyhow::Result<()> {
         not_permitted(service("light", "turn_on", "lock.front_door")).await
+    }
+
+    /// A newer request on the satellite stops the calls of an older answer.
+    #[tokio::test(start_paused = true)]
+    async fn newer_request_stops_the_calls_of_an_older_answer() -> anyhow::Result<()> {
+        let (home, reasoner) = (
+            Arc::new(FakeHome::default()),
+            Arc::new(FakeReasoner::default()),
+        );
+        reasoner.script(vec![Scripted::Call(call())]);
+        let classifier = Arc::new(FakeClassifier::default());
+        let (_cache, _changes, conversation) = still_with(&home, "idle", classifier, reasoner);
+        let (filler, job) = (chosen("filler", 0), Job::Llm("tell me".to_owned()));
+        let old = work(
+            &conversation,
+            Decision::Defer { filler, job },
+            Some(SATELLITE),
+        )?;
+        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE));
+        old.await?;
+        assert_eq!(home.calls(), []);
+        Ok(())
     }
 
     /// A target key in the data would add targets that the checks do not see.
