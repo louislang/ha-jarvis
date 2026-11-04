@@ -385,7 +385,7 @@ max_output_tokens = 150      # answers
 bulk_max_output_tokens = 8000 # structured output: generate, paraphrase, propose
 max_tool_calls = 5
 embedding_model = "text-embedding-3-small"
-allowed_domains = ["light", "switch", "fan", "media_player", "climate", "calendar"]
+allowed_domains = ["light", "switch", "fan", "media_player", "climate", "calendar", "todo"]
 read_services = ["calendar.get_events", "todo.get_items"] # called with return_response = true
 
 [plugins]

@@ -162,7 +162,7 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 **Model.**
 
 - Each `Call` runs through `Home` before the next step. This replaces the "not permitted" rule of sub-phase 7.5 and AC-7.5-12.
-- A `Call` runs only when its service domain and the domain of each target entity are in `openai.allowed_domains`, and each target entity is in the hot cache. Else the consumer sends the tool error "not permitted" and makes no call. A misheard request thus cannot unlock a door. Leave `switch` out of the list when a switch drives a door, a gate or a lock. This sub-phase adds `openai.allowed_domains`.
+- A `Call` runs only when its service domain and the domain of each target entity are in `openai.allowed_domains`, and each target entity is in the hot cache. Else the consumer sends the tool error "not permitted" and makes no call. HA also takes targets from the keys `entity_id`, `device_id`, `area_id`, `floor_id` and `label_id` in the call data, so a `Call` whose data has one of these keys is also "not permitted". A misheard request thus cannot unlock a door. Leave `switch` out of the list when a switch drives a door, a gate or a lock. This sub-phase adds `openai.allowed_domains`.
 - A `Call` whose service is in `openai.read_services` runs with `return_response: true`, and its response data is the tool result. Every other `Call` runs with `return_response: false`. Jarvis sets the flag from the list, not the model. A read service passes the same domain and hot-cache checks. HA has this data already, so it needs no plugin (phase 17). This sub-phase adds `openai.read_services`.
 
 **Acceptance criteria.**
