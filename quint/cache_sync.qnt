@@ -129,6 +129,18 @@ module cache_sync {
     epoch' = epoch,
   }
 
+  /// The snapshot call fails. The cache stays and waits for a retry of the snapshot.
+  action failSnapshot = all {
+    snap != None,
+    snap' = None,
+    home' = home,
+    cache' = cache,
+    queue' = queue,
+    connected' = connected,
+    epoch' = epoch,
+    loading' = loading,
+  }
+
   /// Any enabled event.
   action step = any {
     nondet e = ENTITIES.oneOf()
@@ -139,6 +151,7 @@ module cache_sync {
     reconnect,
     takeSnapshot,
     applySnapshot,
+    failSnapshot,
   }
 
   /// The cache equals HA when the connection is open, loaded and has no pending event.
@@ -168,6 +181,19 @@ module cache_sync {
     .then(change("a", 1 - home.get("a")))
     .then(applySnapshot)
     .expect(cache != home)
+    .then(deliver)
+    .expect(cache == home and queue == List())
+
+  /// After a failed snapshot, the retry gives the cache the state of HA when the queue is delivered.
+  run ac_2_6_6_failed_snapshot_retries = init
+    .then(disconnect)
+    .then(reconnect)
+    .then(takeSnapshot)
+    .then(change("a", 1 - home.get("a")))
+    .then(failSnapshot)
+    .expect(loading and snap == None and cache != home)
+    .then(takeSnapshot)
+    .then(applySnapshot)
     .then(deliver)
     .expect(cache == home and queue == List())
 }
