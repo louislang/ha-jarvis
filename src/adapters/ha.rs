@@ -396,10 +396,15 @@ fn complete_entity(
     names: &HashMap<&Value, &Value>,
 ) {
     let id = fields.get("entity_id").cloned().unwrap_or_default();
-    let aliases = entries[id.as_str().unwrap_or_default()]
-        .get("aliases")
-        .cloned();
-    fields.insert("aliases".to_owned(), aliases.unwrap_or_else(|| json!([])));
+    let listed = entries[id.as_str().unwrap_or_default()]["aliases"].as_array();
+    // HA lists `null` for the name of the entity, which `name` already gives.
+    let aliases: Vec<Value> = listed
+        .into_iter()
+        .flatten()
+        .filter(|alias| alias.is_string())
+        .cloned()
+        .collect();
+    fields.insert("aliases".to_owned(), Value::Array(aliases));
     if fields.get("name").is_none_or(Value::is_null) {
         let name = names.get(&id).copied().unwrap_or(&id).clone();
         fields.insert("name".to_owned(), name);
@@ -981,6 +986,17 @@ mod tests {
         };
         assert_eq!(aliases(snapshot), aliases(expected));
         Ok(())
+    }
+
+    /// A `null` alias of `get_entries` is left out.
+    #[test]
+    fn null_alias_is_left_out() {
+        let mut fields = Map::new();
+        fields.insert("entity_id".to_owned(), json!("light.lamp"));
+        fields.insert("name".to_owned(), json!("Lamp"));
+        let entries = json!({ "light.lamp": { "aliases": [null, "Reading Light"] } });
+        complete_entity(&mut fields, &entries, &HashMap::new());
+        assert_eq!(fields["aliases"], json!(["Reading Light"]));
     }
 
     /// AC-2.4-1.
