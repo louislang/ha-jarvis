@@ -561,6 +561,7 @@ mod tests {
                 .map(|text| Response {
                     text: (*text).to_owned(),
                     uses: 0,
+                    generated: false,
                 })
                 .collect(),
             last: None,
