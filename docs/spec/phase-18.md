@@ -236,25 +236,26 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Add Plex movies, the next episode of a show and one episode by number on the TV. "Put on The Matrix" and "season 2 episode 5 of The Office" then play through Plex.
 
 - **Implements:** G3. **Depends on:** 18.8.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/responses.rs`, `Cargo.toml`.
 
 **Model.**
 
 - Each intent calls `media_player.play_media` on the TV: `target = "entity"` and `select = [{ domain = "media_player", name = "tv" }]`, as `tv_show`. HA resolves the `plex://` content ID through the Plex integration. The library names are `Movies` and `TV Shows`. Change them in `intents.toml` when the Plex server uses other names.
 - `play_movie`: examples "put on [the matrix](movie)", "play the movie [inception](movie)", "watch [toy story](movie)", "put on the movie [up](movie)". `data = { media_content_type = "movie", media_content_id = 'plex://{"library_name": "Movies", "title": "{{ movie }}"}' }`. Pool: `Putting on {{ movie }}.`
 - `continue_show`: examples "continue [the office](show)", "play the next episode of [bluey](show)", "keep watching [severance](show)", "next episode of [the office](show)". `data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "resume": 1}' }`. With `resume`, Plex starts the On Deck episode of the show, else the first episode. Pool: `Continuing {{ show }}.`
-- `play_episode`: examples "play season [2](season) episode [5](episode) of [the office](show)", "put on [bluey](show) season [1](season) episode [3](episode)", "watch [severance](show) season [1](season) episode [1](episode)". `data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "season_number": {{ season }}, "episode_number": {{ episode }}}' }`. Pool: `Playing {{ show }}, season {{ season }}, episode {{ episode }}.`
-- The second pass writes numbers as digits (`text-processing-rs`, sub-phase 6.7). A number in words makes the content ID invalid JSON. Then HA returns an error, and Jarvis announces a `failure` answer (sub-phase 4.9c).
+- `play_episode`: examples "play season [two](season) episode [five](episode) of [the office](show)", "put on [bluey](show) season [one](season) episode [three](episode)", "watch [severance](show) season [1](season) episode [1](episode)". `data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "season_number": {{ season | number }}, "episode_number": {{ episode | number }}}' }`. Pool: `Playing {{ show }}, season {{ season }}, episode {{ episode }}.`
+- The second pass writes numbers as words (`tn_normalize_sentence`, sub-phase 6.7), and HA refuses "two" as a number. Thus the render environments of `responses.rs` and `decide.rs` get the `minijinja` filter `number`: the `text2num` `text2digits` of the value with `Language::english()` ("two" gives "2"). Digits stay unchanged, and other text does not render, which gives `Fallback`. This sub-phase also changes the `volume_set` data to `{{ volume | number | int / 100 }}`.
 
 **Acceptance criteria.**
 
 - AC-18.9-1: When the intent is `play_movie` with the slot `movie = the matrix`, the call is `media_player.play_media` with the target `media_player.apple_tv`, `media_content_type = "movie"`, and the `media_content_id` `plex://{"library_name": "Movies", "title": "the matrix"}`.
 - AC-18.9-2: When the intent is `continue_show` with the slot `show = the office`, the `media_content_id` is `plex://{"library_name": "TV Shows", "show_name": "the office", "resume": 1}`.
 - AC-18.9-3: When the intent is `play_episode` with the slots `show = the office`, `season = 2` and `episode = 5`, the `media_content_id` is `plex://{"library_name": "TV Shows", "show_name": "the office", "season_number": 2, "episode_number": 5}`.
+- AC-18.9-4: When the slots are `season = two` and `episode = five`, the `media_content_id` is the one of AC-18.9-3. When `volume_set` has `volume = fifty`, `volume_level` is 0.5.
 
 **Proofs.**
 
-- P-18.9-1 to P-18.9-3. Evidence: test. The rules are P-4.5c-1 and P-4.5d-2.
+- P-18.9-1 to P-18.9-4. Evidence: test. The rules are P-4.5c-1 and P-4.5d-2. The words to digits come from `text2num` (`02-rules.md` section 5, rule 5).
 
 ---
 

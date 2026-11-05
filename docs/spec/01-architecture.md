@@ -183,6 +183,7 @@ The budget applies to the GPU host. The `gpu-test` job runs the latency tests th
 | `minijinja` | Domain | Response and service data templates. |
 | `rand` | Domain | Response selection and context samples. |
 | `jiff` | Domain | Time zones, buckets and calendar dates. |
+| `text2num` | Domain | Number words to digits in the template filter `number` (sub-phase 18.9). |
 | `strsim` | Domain, adapter tests | Fuzzy match of a spoken answer to a list of choices. Word edit distance for the second-pass word error rate (AC-6.7-3). |
 | `dashmap` | Application | Concurrent audio cache. |
 | `ndarray`, `linfa`, `linfa-clustering` | Domain | DBSCAN clusters of `unknown` embeddings. |
