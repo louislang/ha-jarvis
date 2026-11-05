@@ -204,8 +204,7 @@ impl Pipeline {
 }
 
 /// Starts the app of `config` on `home` and `reasoner`, waits for its pre-render and serves it on
-/// a local port. Gives the
-/// address and the tracker of the connection tasks.
+/// a local port. Gives the address and the tracker of the connection tasks.
 ///
 /// # Errors
 ///
@@ -276,11 +275,8 @@ async fn stream_audio(
 /// The house has no state.
 fn house() -> anyhow::Result<Snapshot> {
     let mut house = fakes::house();
-    let mut weather = house
-        .states
-        .first()
-        .context("the house has no state")?
-        .clone();
+    let first = house.states.first().context("the house has no state")?;
+    let mut weather = first.clone();
     "weather.home".clone_into(&mut weather.entity_id);
     house.states.push(weather);
     Ok(house)
@@ -295,15 +291,16 @@ fn house() -> anyhow::Result<Snapshot> {
 fn config(device: Device, folder: &Path) -> anyhow::Result<Config> {
     let mut config = Config::parse(include_str!("../../jarvis.toml"))?;
     config.pools = folder.join("pools.json");
-    config.device = device;
-    if device == Device::Cpu {
-        let asr = &mut config.asr;
-        asr.encoder = "encoder.int8.onnx".to_owned();
-        asr.decoder = "decoder.int8.onnx".to_owned();
-        asr.joiner = "joiner.int8.onnx".to_owned();
-        asr.second_pass_dir = None;
-        asr.early_commit_ms = 250;
+    if device == Device::Cuda {
+        return Ok(config);
     }
+    config.device = Device::Cpu;
+    let asr = &mut config.asr;
+    asr.encoder = "encoder.int8.onnx".to_owned();
+    asr.decoder = "decoder.int8.onnx".to_owned();
+    asr.joiner = "joiner.int8.onnx".to_owned();
+    asr.second_pass_dir = None;
+    asr.early_commit_ms = 250;
     Ok(config)
 }
 
@@ -532,46 +529,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "GPU host"]
     async fn ac_9_2_1_fan_command_response_latency_p95_is_300_ms_or_less() -> anyhow::Result<()> {
-        assert_commands_within(&FAN_COMMANDS, "fan_on", Duration::from_millis(300)).await
-    }
-
-    /// AC-9.2-5.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "GPU host"]
-    async fn ac_9_2_5_light_command_response_latency_p95_is_400_ms_or_less() -> anyhow::Result<()> {
-        assert_commands_within(&LIGHT_COMMANDS, "lights_on", Duration::from_millis(400)).await
-    }
-
-    /// Asserts that the response latency of each of `commands` in the office has a p95 of
-    /// `limit` or less. Each reply is a response of `pool`.
-    ///
-    /// # Errors
-    ///
-    /// The pipeline does not start, or a run fails.
-    async fn assert_commands_within(
-        commands: &[&str],
-        pool: &str,
-        limit: Duration,
-    ) -> anyhow::Result<()> {
-        let pipeline = Pipeline::start(Device::Cuda).await?;
-        let replies = responses(pool, "office")?;
-        let mut p95s = Vec::new();
-        for &text in commands {
-            p95s.push((text, p95(&pipeline, text, &replies).await?));
-        }
-        assert!(p95s.iter().all(|(_, p95)| *p95 <= limit), "p95s: {p95s:?}");
-        Ok(())
+        within(&FAN_COMMANDS, "fan_on", "office", 300).await
     }
 
     /// AC-9.2-2.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "GPU host"]
     async fn ac_9_2_2_weather_filler_latency_p95_is_300_ms_or_less() -> anyhow::Result<()> {
-        let pipeline = Pipeline::start(Device::Cuda).await?;
-        let fillers = responses("filler", "kitchen")?;
-        let p95 = p95(&pipeline, "what is the weather", &fillers).await?;
-        assert!(p95 <= Duration::from_millis(300), "p95 is {p95:?}");
-        Ok(())
+        within(&["what is the weather"], "filler", "kitchen", 300).await
     }
 
     /// AC-9.2-3.
@@ -579,15 +544,15 @@ mod tests {
     #[ignore = "GPU host"]
     async fn ac_9_2_3_unknown_filler_latency_p95_is_endpoint_ms_and_150_ms_or_less()
     -> anyhow::Result<()> {
-        let pipeline = Pipeline::start(Device::Cuda).await?;
-        let fillers = responses("filler", "kitchen")?;
-        let p95 = p95(&pipeline, "what is the meaning of life", &fillers).await?;
-        let endpoint_ms = Config::parse(include_str!("../../jarvis.toml"))?
-            .asr
-            .endpoint_ms;
-        let limit = Duration::from_millis(endpoint_ms + 150);
-        assert!(p95 <= limit, "p95 is {p95:?}, more than {limit:?}");
-        Ok(())
+        let config = Config::parse(include_str!("../../jarvis.toml"))?;
+        let limit_ms = config.asr.endpoint_ms + 150;
+        within(
+            &["what is the meaning of life"],
+            "filler",
+            "kitchen",
+            limit_ms,
+        )
+        .await
     }
 
     /// AC-9.2-4. Only `tv_show` responses have a variable other than `area`.
@@ -595,10 +560,30 @@ mod tests {
     #[ignore = "GPU host"]
     async fn ac_9_2_4_uncached_command_response_latency_p95_is_700_ms_or_less() -> anyhow::Result<()>
     {
+        within(&["turn the tv to jeopardy"], "tv_show", "kitchen", 700).await
+    }
+
+    /// AC-9.2-5.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "GPU host"]
+    async fn ac_9_2_5_light_command_response_latency_p95_is_400_ms_or_less() -> anyhow::Result<()> {
+        within(&LIGHT_COMMANDS, "lights_on", "office", 400).await
+    }
+
+    /// Asserts that each of `texts` in `area` on CUDA, with a reply of `pool`, has a p95 latency
+    /// of `limit_ms` or less.
+    async fn within(texts: &[&str], pool: &str, area: &str, limit_ms: u64) -> anyhow::Result<()> {
         let pipeline = Pipeline::start(Device::Cuda).await?;
-        let replies = responses("tv_show", "kitchen")?;
-        let p95 = p95(&pipeline, "turn the tv to jeopardy", &replies).await?;
-        assert!(p95 <= Duration::from_millis(700), "p95 is {p95:?}");
+        let replies = responses(pool, area)?;
+        let mut p95s = Vec::new();
+        for &text in texts {
+            p95s.push((text, p95(&pipeline, text, &replies).await?));
+        }
+        let limit = Duration::from_millis(limit_ms);
+        assert!(
+            p95s.iter().all(|(_, p95)| *p95 <= limit),
+            "p95s: {p95s:?}, limit {limit:?}"
+        );
         Ok(())
     }
 }
