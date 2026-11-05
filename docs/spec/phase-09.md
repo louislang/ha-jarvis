@@ -24,11 +24,38 @@ This phase proves the latency goal for the full pipeline.
 
 ---
 
+### 9.1b Exact Silence
+
+**Goal:** Count the silence after a VAD speech segment to the sample, and set `early_commit_ms = 100` and `vad_min_silence_ms = 60`. The early commit then comes about 32 ms to 56 ms sooner, so the latency tests of sub-phase 9.2 can meet G1.
+
+- **Implements:** G1, G2. **Depends on:** 9.1.
+- **Files:** modify `src/adapters/sherpa.rs`, `src/lib.rs`, `jarvis.toml`.
+
+**Model.**
+
+- In a VAD speech segment, `voice_end_ms = vad_ms`, so the silence is 0 (sub-phase 6.6b). Thus an early commit can occur only after the VAD ends the segment. This does not change.
+- Before this sub-phase, `vad_ms` counted only full 32 ms VAD frames. Out of a segment, it also held back the last full frame, which can start a new segment. Thus at the segment end the silence was `vad_min_silence_ms` - 32 ms, and it grew in 32 ms steps. The early commit came one held frame (32 ms) and up to one frame step late.
+- Out of a speech segment, `vad_ms` is now the end of all audio that the stream accepted, to the sample. The adapter holds no frame there. Thus at the segment end the silence is `vad_min_silence_ms` plus the samples that the VAD has not run yet (less than one frame), and it grows with each accepted sample. This replaces the `vad_ms` of sub-phase 6.6b out of a segment.
+- Speech that starts after a segment end counts as silence until the VAD detects it. `commit.qnt` does not change: its chunks are the decisions that the adapter reports in `vad_ms`.
+- `jarvis.toml` sets `early_commit_ms = 100` and `vad_min_silence_ms = 60`. `vad_threshold` stays 0.5. The test of AC-6.5-6 replaces the old values in `jarvis.toml`, so it changes with them.
+
+**Acceptance criteria.**
+
+- AC-9.1b-1: When `SherpaStt` gets `speech("turn on the kitchen lights")` in 20 ms chunks, each partial with `vad_ms > voice_end_ms` has `vad_ms` equal to the length of the accepted audio.
+- AC-9.1b-2: When `SherpaStt` gets `speech("turn on the kitchen lights")` in 20 ms chunks, the first partial with `vad_ms > voice_end_ms` has `vad_ms - voice_end_ms` of `vad_min_silence_ms` or more and less than `vad_min_silence_ms` + 32 ms.
+- AC-9.1b-3: `Config::parse` of `jarvis.toml` gives `asr.early_commit_ms = 100` and `asr.vad_min_silence_ms = 60`.
+
+**Proofs.**
+
+- P-9.1b-1 to P-9.1b-3. Evidence: test.
+
+---
+
 ### 9.2 Latency Tests
 
 **Goal:** Add the end-to-end latency tests for commands, fetches and System Two fillers. The `gpu-test` job runs them on the GPU host with `device = cuda`, the Nemotron first pass and the Parakeet second pass, against the 300 ms goal.
 
-- **Implements:** G1, G2, G6. **Depends on:** 9.1.
+- **Implements:** G1, G2, G6. **Depends on:** 9.1b.
 - **Files:** modify `src/testing/e2e.rs`, `src/lib.rs`.
 
 **Model.** The tests run the harness of sub-phase 9.1 on the GPU host with `device = cuda`, the Nemotron first pass and the Parakeet second pass, at real-time pace. Each phrase runs once as a warm-up, then 20 times. The response latency of a run is the sum of three segments: from the last voiced sample to `transcript`, from `transcript` to `handled`, and from `synthesize` to the first audio chunk. The harness sends each next event at once, so the sum equals the time from the last voiced sample to the first audio chunk. The p95 of 20 runs is the 19th smallest value. The latency to a filler uses the same segments with the filler text.
