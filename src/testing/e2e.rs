@@ -60,6 +60,8 @@ pub(crate) struct Times {
 
 /// The answers of one run.
 pub(crate) struct Run {
+    /// The text of `transcript`.
+    pub(crate) transcript: String,
     /// The text of `handled`.
     pub(crate) reply: String,
     /// The number of `audio-chunk` events for the reply.
@@ -126,6 +128,7 @@ impl Pipeline {
             first_chunk,
         };
         Ok(Run {
+            transcript,
             reply,
             chunks,
             times,
@@ -462,19 +465,24 @@ mod tests {
         Ok(())
     }
 
-    /// The response latency of a run with `times`: from the last voiced sample to `transcript`,
-    /// from `transcript` to `handled`, and from `synthesize` to the first audio chunk.
-    fn latency(times: &Times) -> Duration {
-        let segments = [
-            (times.last_voiced, times.transcript),
-            (times.handle, times.handled),
-            (times.synthesize, times.first_chunk),
-        ];
-        segments.iter().map(|(start, end)| *end - *start).sum()
+    /// The response latency segments of `times`: the last voiced sample to `transcript`,
+    /// `transcript` to `handled`, and `synthesize` to the first audio chunk.
+    fn segments(times: &Times) -> [Duration; 3] {
+        [
+            times.transcript - times.last_voiced,
+            times.handled - times.handle,
+            times.first_chunk - times.synthesize,
+        ]
+    }
+
+    /// The p95 (the 19th smallest of 20) and the median (the 10th smallest) of `values`.
+    fn percentiles(mut values: Vec<Duration>) -> (Duration, Duration) {
+        values.sort();
+        (values[RUNS - 2], values[RUNS / 2 - 1])
     }
 
     /// The p95 of the response latencies of `RUNS` runs of `text` on `pipeline` after one
-    /// warm-up run, also written to stderr. Each reply is in `replies`. System Two answers each run
+    /// warm-up run, with the [`report`]. Each reply is in `replies`. System Two answers each run
     /// after 2 s.
     ///
     /// # Errors
@@ -482,20 +490,39 @@ mod tests {
     /// A run fails, or its reply is not in `replies`.
     async fn p95(pipeline: &Pipeline, text: &str, replies: &[String]) -> anyhow::Result<Duration> {
         let speech = fakes::speech(text).await?.samples;
-        let mut latencies = Vec::new();
+        let mut runs = Vec::new();
         for _ in 0..=RUNS {
             let wait = Scripted::Wait(Duration::from_secs(2));
             pipeline.reasoner.script(vec![wait]);
             let run = pipeline.run(&speech).await?;
             let reply = &run.reply;
             anyhow::ensure!(replies.contains(reply), "{text:?} gives {reply:?}");
-            latencies.push(latency(&run.times));
+            runs.push(run);
         }
-        latencies.remove(0);
-        latencies.sort();
-        let p95 = latencies[RUNS - 2];
+        report(text, &runs[1..])
+    }
+
+    /// The p95 of the response latencies of `runs` of `text`. Writes it to stderr with the p95
+    /// and the median of each segment, and the texts of the last run.
+    ///
+    /// # Errors
+    ///
+    /// `runs` is empty, or the write fails.
+    fn report(text: &str, runs: &[Run]) -> anyhow::Result<Duration> {
+        let measured: Vec<[Duration; 3]> = runs.iter().map(|run| segments(&run.times)).collect();
+        let (p95, _) = percentiles(measured.iter().map(|three| three.iter().sum()).collect());
+        let [a, b, c] =
+            [0, 1, 2].map(|part| percentiles(measured.iter().map(|three| three[part]).collect()));
+        let Run {
+            transcript, reply, ..
+        } = runs.last().context("no run")?;
         // The test harness captures `eprintln!` of a test that passes, but not a direct write.
-        writeln!(std::io::stderr(), "{text:?}: p95 {p95:?}")?;
+        let segments = format!("(p95, median) of a {a:?} b {b:?} c {c:?}");
+        let texts = format!("transcript {transcript:?}; reply {reply:?}");
+        writeln!(
+            std::io::stderr(),
+            "{text:?}: p95 {p95:?}; {segments}; {texts}"
+        )?;
         Ok(p95)
     }
 
