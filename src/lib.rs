@@ -1061,7 +1061,7 @@ mod tests {
                 "models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming",
             )),
             vad_model: PathBuf::from("models/silero_vad.onnx"),
-            vad_threshold: 0.5,
+            vad_threshold: 0.65,
             vad_min_silence_ms: 60,
             early_commit_ms: 100,
             endpoint_ms: 600,
@@ -1196,7 +1196,7 @@ mod tests {
                 "ha.request_timeout_ms",
             ),
             (
-                "vad_threshold = 0.5",
+                "vad_threshold = 0.65",
                 "vad_threshold = 0.0",
                 "asr.vad_threshold",
             ),

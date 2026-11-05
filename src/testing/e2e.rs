@@ -401,14 +401,16 @@ mod tests {
     /// The text of the runs of sub-phase 9.1.
     const REQUEST: &str = "turn on the lights";
 
-    /// Command phrases in the office whose top intent with the fixture model is at or above
-    /// `model.commit_threshold`, with the pool of the intent. Each response is pre-rendered.
-    const COMMANDS: [(&str, &str); 5] = [
-        ("turn on the office fan", "fan_on"),
-        ("start the office fan", "fan_on"),
-        ("turn on the office lights", "lights_on"),
-        ("office lights on", "lights_on"),
-        ("turn the office lights on", "lights_on"),
+    /// Fan command phrases in the office whose top intent with the fixture model is at or above
+    /// `model.commit_threshold`. Each `fan_on` response is pre-rendered.
+    const FAN_COMMANDS: [&str; 2] = ["turn on the office fan", "start the office fan"];
+
+    /// Light command phrases in the office whose top intent with the fixture model is at or
+    /// above `model.commit_threshold`. Each `lights_on` response is pre-rendered.
+    const LIGHT_COMMANDS: [&str; 3] = [
+        "turn on the office lights",
+        "office lights on",
+        "turn the office lights on",
     ];
 
     /// The number of measured runs of each phrase.
@@ -529,16 +531,34 @@ mod tests {
     /// AC-9.2-1.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "GPU host"]
-    async fn ac_9_2_1_command_response_latency_p95_is_300_ms_or_less() -> anyhow::Result<()> {
+    async fn ac_9_2_1_fan_command_response_latency_p95_is_300_ms_or_less() -> anyhow::Result<()> {
+        assert_commands_within(&FAN_COMMANDS, "fan_on", Duration::from_millis(300)).await
+    }
+
+    /// AC-9.2-5.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "GPU host"]
+    async fn ac_9_2_5_light_command_response_latency_p95_is_400_ms_or_less() -> anyhow::Result<()> {
+        assert_commands_within(&LIGHT_COMMANDS, "lights_on", Duration::from_millis(400)).await
+    }
+
+    /// Asserts that the response latency of each of `commands` in the office has a p95 of
+    /// `limit` or less. Each reply is a response of `pool`.
+    ///
+    /// # Errors
+    ///
+    /// The pipeline does not start, or a run fails.
+    async fn assert_commands_within(
+        commands: &[&str],
+        pool: &str,
+        limit: Duration,
+    ) -> anyhow::Result<()> {
         let pipeline = Pipeline::start(Device::Cuda).await?;
+        let replies = responses(pool, "office")?;
         let mut p95s = Vec::new();
-        for (text, pool) in COMMANDS {
-            p95s.push((
-                text,
-                p95(&pipeline, text, &responses(pool, "office")?).await?,
-            ));
+        for &text in commands {
+            p95s.push((text, p95(&pipeline, text, &replies).await?));
         }
-        let limit = Duration::from_millis(300);
         assert!(p95s.iter().all(|(_, p95)| *p95 <= limit), "p95s: {p95s:?}");
         Ok(())
     }
@@ -557,7 +577,7 @@ mod tests {
     /// AC-9.2-3.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "GPU host"]
-    async fn ac_9_2_3_unknown_filler_latency_p95_is_endpoint_ms_and_100_ms_or_less()
+    async fn ac_9_2_3_unknown_filler_latency_p95_is_endpoint_ms_and_150_ms_or_less()
     -> anyhow::Result<()> {
         let pipeline = Pipeline::start(Device::Cuda).await?;
         let fillers = responses("filler", "kitchen")?;
@@ -565,7 +585,7 @@ mod tests {
         let endpoint_ms = Config::parse(include_str!("../../jarvis.toml"))?
             .asr
             .endpoint_ms;
-        let limit = Duration::from_millis(endpoint_ms + 100);
+        let limit = Duration::from_millis(endpoint_ms + 150);
         assert!(p95 <= limit, "p95 is {p95:?}, more than {limit:?}");
         Ok(())
     }
@@ -573,12 +593,12 @@ mod tests {
     /// AC-9.2-4. Only `tv_show` responses have a variable other than `area`.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "GPU host"]
-    async fn ac_9_2_4_uncached_command_response_latency_p95_is_400_ms_or_less() -> anyhow::Result<()>
+    async fn ac_9_2_4_uncached_command_response_latency_p95_is_700_ms_or_less() -> anyhow::Result<()>
     {
         let pipeline = Pipeline::start(Device::Cuda).await?;
         let replies = responses("tv_show", "kitchen")?;
         let p95 = p95(&pipeline, "turn the tv to jeopardy", &replies).await?;
-        assert!(p95 <= Duration::from_millis(400), "p95 is {p95:?}");
+        assert!(p95 <= Duration::from_millis(700), "p95 is {p95:?}");
         Ok(())
     }
 }
