@@ -41,6 +41,7 @@ use serde_json::json;
 use tokio::time::Instant;
 
 use crate::OpenAiConfig;
+use crate::domain::decide::EntityState;
 use crate::domain::decide::Question;
 use crate::domain::speech;
 use crate::domain::state::ServiceCall;
@@ -62,26 +63,31 @@ pub fn system_prompt() -> &'static str {
 }
 
 /// The user message of `question`: the local time, the HA location name, the area names, the
-/// area, the entities of the area and the text.
+/// area, the entities of the area, the entities with no area and the text.
 #[must_use]
 pub fn user_message(question: &Question) -> String {
     let area = question
         .area
         .as_ref()
         .map_or("none", |area| area.0.as_str());
-    let entities: Vec<String> = question
-        .entities
-        .iter()
-        .map(|item| format!("- {} ({}): {}\n", item.name, item.entity_id, item.state))
-        .collect();
     format!(
-        "Time: {}\nLocation: {}\nAreas: {}\nArea: {area}\nEntities:\n{}Request: {}",
+        "Time: {}\nLocation: {}\nAreas: {}\nArea: {area}\nEntities:\n{}Other entities:\n{}Request: {}",
         question.now.strftime("%A %Y-%m-%d %H:%M"),
         question.location,
         question.areas.join(", "),
-        entities.concat(),
+        entity_list(&question.entities),
+        entity_list(&question.unassigned),
         question.text
     )
+}
+
+/// One line "- name (entity ID): state" for each of `entities`.
+fn entity_list(entities: &[EntityState]) -> String {
+    let lines: Vec<String> = entities
+        .iter()
+        .map(|item| format!("- {} ({}): {}\n", item.name, item.entity_id, item.state))
+        .collect();
+    lines.concat()
 }
 
 /// The `generate` input: `n` new responses for the pool `pool`, unlike each of `existing`, with
@@ -601,7 +607,15 @@ mod tests {
         let cache = StateCache::load(house);
         let area = area.map(|area| AreaId(area.to_owned()));
         let now = jiff::civil::date(2026, 10, 26).at(8, 0, 0, 0);
-        decide::question("what is on", area.as_ref(), &location, now, &cache)
+        let domains = ["calendar", "todo"];
+        decide::question(
+            "what is on",
+            area.as_ref(),
+            &location,
+            now,
+            &cache,
+            &domains,
+        )
     }
 
     /// The user message of `question(area)`.
@@ -941,6 +955,38 @@ mod tests {
                 "{name} is not in {message}"
             );
         }
+    }
+
+    /// The entity lines under "Other entities:" of the user message of `question(area)` with the
+    /// unassigned entity `calendar.family`.
+    fn other_lines(area: Option<&str>) -> Vec<String> {
+        let mut asked = question(area);
+        asked.unassigned = vec![EntityState {
+            name: "Family".to_owned(),
+            entity_id: "calendar.family".to_owned(),
+            state: "off".to_owned(),
+        }];
+        let message = user_message(&asked);
+        let lines = message
+            .lines()
+            .skip_while(|&line| line != "Other entities:");
+        let entities = lines.filter(|line| line.starts_with("- "));
+        entities.map(str::to_owned).collect()
+    }
+
+    /// AC-7.7-1.
+    #[test]
+    fn ac_7_7_1_user_message_lists_the_calendar_under_other_entities() {
+        assert_eq!(
+            other_lines(Some("kitchen")),
+            ["- Family (calendar.family): off"]
+        );
+    }
+
+    /// AC-7.7-3.
+    #[test]
+    fn ac_7_7_3_user_message_without_area_lists_the_calendar() {
+        assert_eq!(other_lines(None), ["- Family (calendar.family): off"]);
     }
 
     /// AC-7.2-5.

@@ -292,7 +292,18 @@ impl Conversation {
         let config = cache.config.as_ref().context("no HA configuration")?;
         let now = self.two.clock.now().in_tz(&config.time_zone)?.datetime();
         let location = &config.location_name;
-        Ok(decide::question(text, area, location, now, &cache))
+        let domains = self.read_domains();
+        Ok(decide::question(
+            text, area, location, now, &cache, &domains,
+        ))
+    }
+
+    /// The domain of each service of `read_services`.
+    fn read_domains(&self) -> Vec<&str> {
+        let services = self.two.read_services.iter();
+        services
+            .filter_map(|service| Some(service.split_once('.')?.0))
+            .collect()
     }
 
     /// The sentences of the System Two answer to `text` from `area`. With `request`, announces
