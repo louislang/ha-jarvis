@@ -159,12 +159,12 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 **Model.**
 
-- `now_playing`: `target = "entities"`, `select = [{ domain = "media_player" }]`, `state = "playing"`. Examples: "what is playing in the [living room](area)", "what song is this", "what is playing", "what is this song". The area is the area slot, else the satellite area. Pool: `{% for player in entities %}{{ player.attributes.media_title }}{% if player.attributes.media_artist is defined %} by {{ player.attributes.media_artist }}{% endif %} is playing on the {{ player.name }}.{{ " " if not loop.last else "" }}{% else %}Nothing is playing in the {{ area }}.{% endfor %}`
+- `now_playing`: `target = "entities"`, `select = [{ domain = "media_player" }]`, `state = "playing"`. Examples: "what is playing in the [living room](area)", "what song is this", "what is playing", "what is this song". The area is the area slot, else the satellite area. HA can leave out `media_title` and `media_artist` or set them to `None`, so the pool checks each one. Pool: `{% for player in entities %}{% if player.attributes.media_title is defined and player.attributes.media_title is string %}{{ player.attributes.media_title }}{% if player.attributes.media_artist is defined and player.attributes.media_artist is string %} by {{ player.attributes.media_artist }}{% endif %}{% else %}Something with no title{% endif %} is playing on the {{ player.name }}.{{ " " if not loop.last else "" }}{% else %}Nothing is playing in the {{ area }}.{% endfor %}`
 - The media player of a satellite device is skipped (sub-phase 4.4b), so the answer names only the other players of the area.
 
 **Acceptance criteria.**
 
-- AC-18.6-1: When `media_player.carson_living_room_media_player` is `playing` with `media_title` "Karma Police" and `media_artist` "Radiohead", and the satellite is in the Living Room, the reply is "Karma Police by Radiohead is playing on the Carson Living Room Media Player."
+- AC-18.6-1: When `media_player.carson_living_room_media_player` is `playing` with `media_title` "Karma Police" and `media_artist` "Radiohead", and the satellite is in the Living Room, the reply is "Karma Police by Radiohead is playing on the Carson Living Room Media Player." When the TV also plays with no `media_title`, the reply adds " Something with no title is playing on the Apple TV."
 - AC-18.6-2: When the TV is `playing` with `media_title` "Bluey" and no `media_artist`, and the request has the area slot "living room", the reply is "Bluey is playing on the Apple TV."
 - AC-18.6-3: When no media player of the area is `playing`, the reply is "Nothing is playing in the living room."
 
