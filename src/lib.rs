@@ -693,7 +693,7 @@ where
     let home = start_home(&config.ha, &secrets.ha_token, startup.connector)?;
     let mut shutdown = pin::pin!(startup.shutdown);
     // The models can load for a long time, so a shutdown stops the start too.
-    let (app, pools_task) = tokio::select! {
+    let (app, pools_task, _) = tokio::select! {
         started = start_app(&config, catalog, pools, home, reasoner(&config, &secrets)?) => started?,
         () = &mut shutdown => return Ok(()),
     };
@@ -770,9 +770,9 @@ fn reasoner(config: &Config, secrets: &Secrets) -> anyhow::Result<Arc<dyn Reason
     )?))
 }
 
-/// The app of `config`, `catalog` and the source pools `pools` on `home` and `reasoner`, and its
-/// pools task. Starts the pools task and the sync, and loads the System One model, then the STT
-/// and TTS models. Then starts the pre-render.
+/// The app of `config`, `catalog` and the source pools `pools` on `home` and `reasoner`, its
+/// pools task and its pre-render task. Starts the pools task and the sync, and loads the System
+/// One model, then the STT and TTS models. Then starts the pre-render.
 ///
 /// # Errors
 ///
@@ -783,11 +783,11 @@ async fn start_app(
     pools: Pools,
     home: Arc<dyn Home>,
     reasoner: Arc<dyn Reasoner>,
-) -> anyhow::Result<(App, JoinHandle<()>)> {
+) -> anyhow::Result<(App, JoinHandle<()>, JoinHandle<()>)> {
     let task = start_pools(config, pools)?;
     let (cache, queues) = start_sync(home, &config.announce);
     let (classifier, listener, speech) = load_models(config, Arc::clone(&reasoner)).await?;
-    start_prerender(&speech, &task.pools, cache.clone());
+    let prerender = start_prerender(&speech, &task.pools, cache.clone());
     let catalog = Arc::new(catalog);
     let backfill = backfill(config, &reasoner, task.changes, &speech, &catalog, cache);
     let two = system_two(&config.openai, reasoner, Arc::new(SystemClock));
@@ -799,7 +799,7 @@ async fn start_app(
         listener,
         speech,
     };
-    Ok((app, task.task))
+    Ok((app, task.task, prerender))
 }
 
 /// Starts the pools task of the source pools `pools` and the saved pools of `config`.
@@ -881,12 +881,12 @@ fn start_sync(
 }
 
 /// Starts a task that pre-renders `pools` with `speech` for the area names of the first snapshot
-/// in `cache`.
+/// in `cache`, and gives its handle.
 fn start_prerender(
     speech: &Arc<Speech>,
     pools: &Arc<ArcSwap<Pools>>,
     mut cache: watch::Receiver<StateCache>,
-) {
+) -> JoinHandle<()> {
     let (speech, pools) = (Arc::clone(speech), Arc::clone(pools));
     tokio::spawn(async move {
         if cache.changed().await.is_err() {
@@ -896,7 +896,7 @@ fn start_prerender(
         if let Err(error) = speech.prerender(&pools.load_full(), &areas).await {
             tracing::warn!("the pre-render failed: {error:#}");
         }
-    });
+    })
 }
 
 /// Runs Jarvis with the configuration file `config`, the environment and TCP, until it fails

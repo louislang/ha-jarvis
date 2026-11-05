@@ -200,7 +200,8 @@ impl Pipeline {
     }
 }
 
-/// Starts the app of `config` on `home` and `reasoner` and serves it on a local port. Gives the
+/// Starts the app of `config` on `home` and `reasoner`, waits for its pre-render and serves it on
+/// a local port. Gives the
 /// address and the tracker of the connection tasks.
 ///
 /// # Errors
@@ -213,11 +214,9 @@ async fn serve(
 ) -> anyhow::Result<(SocketAddr, TaskTracker)> {
     let catalog = crate::load_catalog(&config.intents)?;
     let pools = crate::load_pools(&config.responses, &catalog)?;
-    let app = Arc::new(
-        crate::start_app(config, catalog, pools, home, reasoner)
-            .await?
-            .0,
-    );
+    let (app, _, prerender) = crate::start_app(config, catalog, pools, home, reasoner).await?;
+    prerender.await?;
+    let app = Arc::new(app);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let (address, tracker) = (listener.local_addr()?, TaskTracker::new());
     let tasks = tracker.clone();
@@ -305,12 +304,21 @@ fn config(device: Device, folder: &Path) -> anyhow::Result<Config> {
     Ok(config)
 }
 
-/// `samples` up to the end of the chunk with the last voiced sample, the last sample that is not
-/// 0.
+/// `samples` up to the end of the last voiced 20 ms frame.
 fn voiced(samples: &[i16]) -> &[i16] {
-    let last = samples.iter().rposition(|&sample| sample != 0);
-    let end = (last.unwrap_or_default() / CHUNK_SAMPLES + 1) * CHUNK_SAMPLES;
+    let last = samples.chunks(CHUNK_SAMPLES).rposition(voiced_frame);
+    let end = last.map_or(0, |index| (index + 1) * CHUNK_SAMPLES);
     &samples[..end.min(samples.len())]
+}
+
+/// True when the RMS of `frame` is above -40 dBFS: its mean square is above (32768 / 100)².
+/// The TTS audio has a long, quiet tail that a person does not hear as speech.
+fn voiced_frame(frame: &[i16]) -> bool {
+    let energy: u64 = frame
+        .iter()
+        .map(|sample| u64::from(sample.unsigned_abs()).pow(2))
+        .sum();
+    energy * 10_000 > (1 << 30) * frame.len() as u64
 }
 
 /// The `audio-start` and `audio-chunk` data: 16 kHz, 16-bit, mono.
@@ -379,6 +387,8 @@ fn text_of(data: &Value) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::io::Write;
 
     use serde_json::Map;
 
@@ -464,7 +474,8 @@ mod tests {
     }
 
     /// The p95 of the response latencies of `RUNS` runs of `text` on `pipeline` after one
-    /// warm-up run. Each reply is in `replies`. System Two answers each run after 2 s.
+    /// warm-up run, also written to stderr. Each reply is in `replies`. System Two answers each run
+    /// after 2 s.
     ///
     /// # Errors
     ///
@@ -482,7 +493,10 @@ mod tests {
         }
         latencies.remove(0);
         latencies.sort();
-        Ok(latencies[RUNS - 2])
+        let p95 = latencies[RUNS - 2];
+        // The test harness captures `eprintln!` of a test that passes, but not a direct write.
+        writeln!(std::io::stderr(), "{text:?}: p95 {p95:?}")?;
+        Ok(p95)
     }
 
     /// AC-9.2-1.
