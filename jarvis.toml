@@ -25,7 +25,7 @@ joiner = "joiner.fp16.onnx"
 # Optional. Without it, the final transcript is the first-pass text (CPU machines).
 second_pass_dir = "models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"
 vad_model = "models/silero_vad.onnx"
-vad_threshold = 0.5
+vad_threshold = 0.65
 vad_min_silence_ms = 60
 early_commit_ms = 100
 endpoint_ms = 600
