@@ -117,7 +117,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 
 | ID | Goal |
 |---|---|
-| G1 | The response latency for System One requests is 300 ms or less (p95) on the GPU host. A System One request here has a top intent at or above `model.commit_threshold` and a response in the audio cache. An intent with `needs_speaker` can wait `speaker.wait_ms` more (AC-15.7-9). |
+| G1 | The response latency for System One requests is 300 ms or less (p95) on the GPU host. A System One request here has a top intent at or above `model.commit_threshold` and a response in the audio cache. An intent with `needs_speaker` can wait `speaker.wait_ms` more (AC-15.7-9). The light commands of AC-9.2-5 have a target of 400 ms. |
 | G2 | STT starts when the first audio chunk arrives. STT has two passes: a streaming first pass and an offline second pass at commit. On the GPU host, the first pass is NVIDIA Nemotron Speech Streaming EN 0.6B and the second pass is NVIDIA Parakeet Unified EN 0.6B. |
 | G3 | The System One model classifies common requests locally. It gets the transcript, the satellite area and the habits. It gives a probability for each intent and for `unknown`, and tags the slots. The response path does not call a remote service. |
 | G4 | Each intent has a pool of responses. Jarvis selects with variety and does not repeat the last response. |
@@ -199,7 +199,7 @@ Each line is one PR. The work order follows the rows of this table, not the phas
 | [6 Speech](phase-06.md) | 6.1 Shared ONNX Runtime and GPU recipes · 6.2 TTS adapter · 6.3 Audio chunks and duration · 6.3b Audio cache and speak · 6.4 Commit Quint model · 6.5 Commit policy · 6.6 First-pass STT adapter · 6.6b First-pass voice activity · 6.6c First pass on the GPU host · 6.7 Second-pass STT · 6.8 Listen use case · 6.8b Second pass and wiring · 6.9 Wyoming STT events · 6.10 Wyoming TTS events · 6.11 Logs |
 | [7 System Two](phase-07.md) | 7.1 Reasoner port and warm connection · 7.2 Prompt builder · 7.3 Sentence streaming · 7.4 Tool calls · 7.5 Deferred answers · 7.5b Tool calls through HA · 7.5c Answers without a satellite · 7.6 Area states tool · 7.7 Entities without an area |
 | [8 Response Backfill](phase-08.md) | 8.1 Backfill policy · 8.2 Response generation · 8.3 Backfill Quint model · 8.4 Backfill use case · 8.4b Backfill pre-render and wiring |
-| [9 End-to-End Verification](phase-09.md) | 9.1 Pipeline harness · 9.1b Exact silence · 9.2 Latency tests |
+| [9 End-to-End Verification](phase-09.md) | 9.1 Pipeline harness · 9.1b Exact silence · 9.2 Latency tests · 9.3 Streaming TTS |
 | [17 Plugins](phase-17.md) | 17.1 Plugin port and cache · 17.2 Plugin tools in System Two · 17.3 Open-Meteo weather plugin · 17.4 Weather intent through the plugin |
 | [18 Queries and Media](phase-18.md) | 18.1 List queries · 18.2 Light queries · 18.3 Door, window and lock queries · 18.4 Climate and fan queries · 18.5 Presence and alarm queries · 18.6 Now playing query · 18.7 Music playback · 18.8 Music controls · 18.9 Plex playback · 18.10 TV controls · 18.11 Plex plugin · 18.12 New shows intent |
 | [10 Multi-Turn Dialogs](phase-10.md) | 10.1 Dialog Quint model · 10.2 Dialog state · 10.3 Answer fill and cancel · 10.4 Ask decision and HA ask · 10.5 Dialog routing · 10.6 System Two questions · 10.7 Early commit for answers |
