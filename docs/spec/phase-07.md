@@ -249,6 +249,7 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 - `question` gets the domains of the services in `openai.read_services`, for example `calendar` and `todo`. `Question` gets `unassigned`: each entity whose `entity_area` is `None`, whose domain is one of these domains, and that `select` does not skip, with its name, entity ID and state.
 - `user_message` lists `unassigned` under "Other entities:", in the entity line format of sub-phase 7.4. The list is there with or without an area.
 - A `Call` on one of these entities passes the checks of sub-phase 7.5b as before: the domain is in `openai.allowed_domains`, and the entity is in the hot cache.
+- The model does not know that a read service returns data, so it sometimes gives only the state of the calendar, which is on or off. Thus the description of the `call_service` tool names each service of `openai.read_services` and says that it returns its data. When the list has `calendar.get_events`, the description also gives its data keys, from the HA documentation: `start_date_time` (default now), and `end_date_time` or `duration`, not both. `OpenAiReasoner::try_new` gets the list from `OpenAiConfig` (`[openai]` in `jarvis.toml`).
 
 **Acceptance criteria.**
 
@@ -256,8 +257,9 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 - AC-7.7-2: When the hot cache has a `light` with no area, `question` does not have it in `unassigned`, because `light` is not a domain of `openai.read_services`.
 - AC-7.7-3: When the question has no area, the user message still lists `calendar.family` under "Other entities:".
 - AC-7.7-4: When `calendar.family` is hidden, `question` does not have it in `unassigned`.
+- AC-7.7-5: When the `call_service` tool is built from `read_services = ["calendar.get_events"]`, its description names `calendar.get_events`, says that it returns its data, and names the keys `start_date_time`, `end_date_time` and `duration`.
 
 **Proofs.**
 
 - P-7.7-1, P-7.7-2, P-7.7-4. Ensures: each entity of `unassigned` has no area, a domain of the read services, and is not skipped. Argument: `question` keeps an entity only when `entity_area` gives `None`, its domain is in the set, and `is_skipped` (sub-phase 4.4b) is false.
-- P-7.7-3. Evidence: test.
+- P-7.7-3, P-7.7-5. Evidence: test.
