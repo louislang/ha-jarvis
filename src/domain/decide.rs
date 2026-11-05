@@ -102,6 +102,9 @@ pub struct Question {
     pub entities: Vec<EntityState>,
     /// The names of all areas of the hot cache.
     pub areas: Vec<String>,
+    /// The entities with no area and a domain of the read services that `select` does not skip
+    /// and that have a state.
+    pub unassigned: Vec<EntityState>,
     /// The local time in the HA time zone.
     pub now: DateTime,
 }
@@ -119,12 +122,14 @@ pub struct EntityState {
 }
 
 /// The question `text` from `area` at `location` at the local time `now`, with the entities of
-/// `area` in `cache`.
+/// `area` in `cache` and the entities with no area in `domains`.
 #[verus_spec(asked =>
     ensures
         area is None ==> asked.entities@.len() == 0,
         area matches Some(found) ==> forall|position: int| 0 <= position < asked.entities@.len()
             ==> #[trigger] described(*cache, *found, asked.entities@[position]),
+        forall|position: int| 0 <= position < asked.unassigned@.len()
+            ==> #[trigger] described_unassigned(*cache, domains@, asked.unassigned@[position]),
 )]
 #[must_use]
 pub fn question(
@@ -133,6 +138,7 @@ pub fn question(
     location: &str,
     now: DateTime,
     cache: &StateCache,
+    domains: &[&str],
 ) -> Question {
     let (area, entities) = match area {
         Some(area) => (Some(area.clone()), area_entities(area, cache)),
@@ -144,6 +150,7 @@ pub fn question(
         location: location.to_owned(),
         entities,
         areas: area_names(cache),
+        unassigned: unassigned_entities(domains, cache),
         now,
     }
 }
@@ -209,6 +216,64 @@ fn area_entities(area: &AreaId, cache: &StateCache) -> Vec<EntityState> {
         index += 1;
     }
     found
+}
+
+/// The name, the entity ID and the state of each entity of `cache` with no area and a domain of
+/// `domains` that `select` does not skip and that has a state.
+#[verus_spec(found =>
+    ensures
+        forall|position: int| 0 <= position < found@.len()
+            ==> #[trigger] described_unassigned(*cache, domains@, found@[position]),
+)]
+fn unassigned_entities(domains: &[&str], cache: &StateCache) -> Vec<EntityState> {
+    let mut found = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= cache.entities@.len(),
+            forall|position: int| 0 <= position < found@.len()
+                ==> #[trigger] described_unassigned(*cache, domains@, found@[position]),
+        decreases cache.entities@.len() - index,
+    ))]
+    while index < cache.entities.len() {
+        let entity = &cache.entities[index];
+        let id = entity.entity_id.0.as_str();
+        let kept = !select::is_skipped(cache, entity)
+            && cache.entity_area(entity).is_none()
+            && has_domain(id, domains);
+        if let (true, Some(state)) = (kept, cache.state(id)) {
+            found.push(EntityState {
+                name: entity.name.clone(),
+                entity_id: entity.entity_id.0.clone(),
+                state: state.state.clone(),
+            });
+        }
+        index += 1;
+    }
+    found
+}
+
+/// True when the entity ID `entity_id` is in one of `domains`.
+#[verus_spec(found =>
+    ensures
+        found == in_domains(entity_id@, domains@),
+)]
+fn has_domain(entity_id: &str, domains: &[&str]) -> bool {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= domains@.len(),
+            forall|earlier: int| 0 <= earlier < index
+                ==> !crate::domain::state_cache::in_domain(entity_id@, #[trigger] domains@[earlier]@),
+        decreases domains@.len() - index,
+    ))]
+    while index < domains.len() {
+        if StateCache::in_domain(entity_id, domains[index]) {
+            return true;
+        }
+        index += 1;
+    }
+    false
 }
 
 /// The decision for `prediction` of `request`: a System Two job for an `unknown`, uncertain or
@@ -749,6 +814,26 @@ pub open spec fn described(cache: StateCache, area: AreaId, item: EntityState) -
     exists|index: int| 0 <= index < cache.entities@.len()
         && #[trigger] cache.entities@[index].name == item.name
         && present(cache, area, cache.entities@[index])
+}
+
+/// True when `entity` has no area and a domain of `domains`, and `select` does not skip it.
+pub open spec fn unassigned(cache: StateCache, domains: Seq<&str>, entity: crate::domain::state::Entity) -> bool {
+    &&& !select::skipped(cache, entity)
+    &&& crate::domain::state_cache::entity_area(cache, entity) is None
+    &&& in_domains(entity.entity_id.0@, domains)
+}
+
+/// True when the entity ID `entity_id` is in one of `domains`.
+pub open spec fn in_domains(entity_id: Seq<char>, domains: Seq<&str>) -> bool {
+    exists|index: int| 0 <= index < domains.len()
+        && crate::domain::state_cache::in_domain(entity_id, #[trigger] domains[index]@)
+}
+
+/// True when `item` has the name of an entity of `cache` that is unassigned in `domains`.
+pub open spec fn described_unassigned(cache: StateCache, domains: Seq<&str>, item: EntityState) -> bool {
+    exists|index: int| 0 <= index < cache.entities@.len()
+        && #[trigger] cache.entities@[index].name == item.name
+        && unassigned(cache, domains, cache.entities@[index])
 }
 
 /// True when `item` is described in an area of `cache` with the name or alias `name`.
@@ -1349,6 +1434,70 @@ mod tests {
         };
         assert_eq!(area_states("garage", &cache), Some(vec![light]));
         assert_eq!(area_states("attic", &cache), None);
+    }
+
+    /// The domains of `openai.read_services` in `jarvis.toml`.
+    const READ_DOMAINS: [&str; 2] = ["calendar", "todo"];
+
+    /// The reference house with `calendar.family` and `light.porch`, both with no area and hidden
+    /// by `hidden_by`.
+    fn unassigned_house(hidden_by: Option<&str>) -> StateCache {
+        let mut snapshot = house();
+        for (id, name) in [("calendar.family", "Family"), ("light.porch", "Porch")] {
+            let mut state = snapshot.states[0].clone();
+            state.entity_id = id.to_owned();
+            state.state = "off".to_owned();
+            let mut entity = snapshot.entities[0].clone();
+            entity.entity_id = EntityId(id.to_owned());
+            entity.name = name.to_owned();
+            (entity.area_id, entity.device_id) = (None, None);
+            entity.hidden_by = hidden_by.map(str::to_owned);
+            snapshot.states.push(state);
+            snapshot.entities.push(entity);
+        }
+        StateCache::load(snapshot)
+    }
+
+    /// The unassigned entities of the question from the kitchen in `cache`.
+    fn unassigned_of(cache: &StateCache) -> Vec<EntityState> {
+        let kitchen = AreaId("kitchen".to_owned());
+        let now = jiff::civil::date(2026, 10, 26).at(8, 0, 0, 0);
+        question(
+            "what is on",
+            Some(&kitchen),
+            "Home",
+            now,
+            cache,
+            &READ_DOMAINS,
+        )
+        .unassigned
+    }
+
+    /// AC-7.7-1.
+    #[test]
+    fn ac_7_7_1_question_has_the_calendar_with_no_area() {
+        let family = EntityState {
+            name: "Family".to_owned(),
+            entity_id: "calendar.family".to_owned(),
+            state: "off".to_owned(),
+        };
+        assert_eq!(unassigned_of(&unassigned_house(None)), [family]);
+    }
+
+    /// AC-7.7-2.
+    #[test]
+    fn ac_7_7_2_question_leaves_out_a_light_with_no_area() {
+        let unassigned = unassigned_of(&unassigned_house(None));
+        let lights = unassigned
+            .iter()
+            .filter(|item| item.entity_id.starts_with("light."));
+        assert_eq!(lights.count(), 0, "{unassigned:?}");
+    }
+
+    /// AC-7.7-4.
+    #[test]
+    fn ac_7_7_4_question_leaves_out_a_hidden_calendar() {
+        assert_eq!(unassigned_of(&unassigned_house(Some("user"))), []);
     }
 
     /// AC-4.6-5.
