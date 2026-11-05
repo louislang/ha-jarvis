@@ -233,3 +233,31 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 - P-7.6-3. Ensures: each entity of `area_states` is in the area of the name and is not skipped. Argument: `area_states` uses the entity rule of `question` (P-7.2-2).
 - P-7.6-4. Argument: the `States` arm reads only the hot cache and sends the result on `reply`.
 - P-7.6-5. Evidence: test.
+
+---
+
+### 7.7 Entities Without an Area
+
+**Goal:** Give System Two the entities that have no area and that a read service can read, for example calendars and to-do lists. "What is on my calendar today" then gets the events, from any satellite and in a typed request.
+
+- **Implements:** G7. **Depends on:** 7.6.
+- **Files:** modify `src/domain/decide.rs`, `src/adapters/openai.rs`, `src/app/conversation.rs`.
+
+**Model.**
+
+- A read service (sub-phase 7.5b) needs a target entity ID. A calendar or a to-do list usually has no area, so neither the area entities of the user message nor `get_states` gives its ID.
+- `question` gets the domains of the services in `openai.read_services`, for example `calendar` and `todo`. `Question` gets `unassigned`: each entity whose `entity_area` is `None`, whose domain is one of these domains, and that `select` does not skip, with its name, entity ID and state.
+- `user_message` lists `unassigned` under "Other entities:", in the entity line format of sub-phase 7.4. The list is there with or without an area.
+- A `Call` on one of these entities passes the checks of sub-phase 7.5b as before: the domain is in `openai.allowed_domains`, and the entity is in the hot cache.
+
+**Acceptance criteria.**
+
+- AC-7.7-1: When the hot cache has `calendar.family` with no area, `question` for the Kitchen has it in `unassigned`, and the user message has its line under "Other entities:".
+- AC-7.7-2: When the hot cache has a `light` with no area, `question` does not have it in `unassigned`, because `light` is not a domain of `openai.read_services`.
+- AC-7.7-3: When the question has no area, the user message still lists `calendar.family` under "Other entities:".
+- AC-7.7-4: When `calendar.family` is hidden, `question` does not have it in `unassigned`.
+
+**Proofs.**
+
+- P-7.7-1, P-7.7-2, P-7.7-4. Ensures: each entity of `unassigned` has no area, a domain of the read services, and is not skipped. Argument: `question` keeps an entity only when `entity_area` gives `None`, its domain is in the set, and `is_skipped` (sub-phase 4.4b) is false.
+- P-7.7-3. Evidence: test.
