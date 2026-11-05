@@ -1062,8 +1062,8 @@ mod tests {
             )),
             vad_model: PathBuf::from("models/silero_vad.onnx"),
             vad_threshold: 0.5,
-            vad_min_silence_ms: 100,
-            early_commit_ms: 200,
+            vad_min_silence_ms: 60,
+            early_commit_ms: 100,
             endpoint_ms: 600,
             max_utterance_ms: 8000,
         }
@@ -1229,7 +1229,7 @@ mod tests {
         let cases = [
             (
                 "endpoint_ms = 600",
-                "endpoint_ms = 200",
+                "endpoint_ms = 100",
                 ["asr.endpoint_ms", "asr.early_commit_ms"],
             ),
             (
@@ -1238,7 +1238,7 @@ mod tests {
                 ["model.commit_threshold", "model.threshold"],
             ),
             (
-                "vad_min_silence_ms = 100",
+                "vad_min_silence_ms = 60",
                 "vad_min_silence_ms = 200",
                 ["asr.early_commit_ms", "asr.vad_min_silence_ms"],
             ),
@@ -1255,6 +1255,14 @@ mod tests {
                 "error for {broken} does not name {names:?}: {error}"
             );
         }
+    }
+
+    /// AC-9.1b-3.
+    #[test]
+    fn ac_9_1b_3_jarvis_toml_sets_the_commit_silences() -> anyhow::Result<()> {
+        let asr = Config::parse(VALID)?.asr;
+        assert_eq!((asr.early_commit_ms, asr.vad_min_silence_ms), (100, 60));
+        Ok(())
     }
 
     /// `model.threshold` must be more than 0.5 (sub-phase 2.2).

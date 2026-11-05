@@ -135,8 +135,7 @@ fn vad(config: &AsrConfig) -> VadModelConfig {
         model: Some(config.vad_model.to_string_lossy().into_owned()),
         threshold: config.vad_threshold,
         min_silence_duration: seconds(config.vad_min_silence_ms),
-        // sherpa-onnx replaces 0 with 0.25 s. One frame confirms the speech start, and
-        // `SherpaStream::track` holds that frame.
+        // sherpa-onnx replaces 0 with 0.25 s.
         min_speech_duration: seconds(u64::from(WINDOW) * 1000 / u64::from(RATE)),
         window_size: i32::from(WINDOW),
         // An utterance commits at `max_utterance_ms`, so the VAD never splits a segment.
@@ -240,7 +239,7 @@ struct SherpaStream {
     min_silence: u64,
     /// The number of samples so far.
     fed: u64,
-    /// The end of the audio that the VAD has decided.
+    /// The end of the audio that the VAD has decided: all accepted audio out of a speech segment.
     decided: u64,
     /// The end of the last voiced frame, or `None` before any speech.
     voice_end: Option<u64>,
@@ -267,18 +266,15 @@ impl SherpaStream {
             ended = true;
         }
         let detected = self.vad.detected();
-        // In a segment, the VAD holds the frames that can end it. Out of one, it holds the frame
-        // that can start one.
-        let held = if detected {
-            self.min_silence
+        // In a segment, the VAD holds the frames that can end it. Out of one, speech that the VAD
+        // has not detected yet counts as silence.
+        let decided = if detected {
+            let run = self.fed - self.fed % u64::from(WINDOW);
+            run.saturating_sub(self.min_silence)
         } else {
-            u64::from(WINDOW)
+            self.fed
         };
-        let run = self.fed - self.fed % u64::from(WINDOW);
-        self.decided = self
-            .decided
-            .max(run.saturating_sub(held))
-            .max(self.voice_end.unwrap_or(0));
+        self.decided = self.decided.max(decided);
         if detected {
             self.voice_end = Some(self.decided);
         }
@@ -559,6 +555,24 @@ mod tests {
         Ok(chunks.into_iter().map(decode).collect())
     }
 
+    /// Each partial of `speech(REQUEST)` on the CPU with `vad_ms > voice_end_ms`, with the length
+    /// in ms of the audio that the stream accepted before it.
+    async fn silent_partials() -> anyhow::Result<Vec<(u64, Partial)>> {
+        let audio = fakes::speech(REQUEST).await?;
+        let partials = partials_of(&stt(Device::Cpu)?, &audio)?;
+        let accepted = |index: usize| {
+            let samples = ((index + 1) * CHUNK).min(audio.samples.len());
+            samples as u64 * 1000 / u64::from(RATE)
+        };
+        let silent =
+            |partial: &Partial| partial.voice_end_ms.is_some_and(|end| partial.vad_ms > end);
+        let pairs = partials.into_iter().enumerate();
+        Ok(pairs
+            .filter(|(_, partial)| silent(partial))
+            .map(|(index, partial)| (accepted(index), partial))
+            .collect())
+    }
+
     /// The partial of `speech("lights on")`, then the partial after `reset`.
     async fn reset_partials() -> anyhow::Result<(Partial, Partial)> {
         let audio = fakes::speech("lights on").await?;
@@ -691,6 +705,32 @@ mod tests {
             "the audio is voiced: {before:?}"
         );
         assert_eq!(after.voice_end_ms, None);
+        Ok(())
+    }
+
+    /// AC-9.1b-1.
+    #[tokio::test]
+    async fn ac_9_1b_1_silence_ends_at_the_accepted_audio() -> anyhow::Result<()> {
+        let silent = silent_partials().await?;
+        assert!(!silent.is_empty(), "no partial has silence");
+        for (accepted_ms, partial) in &silent {
+            assert_eq!(partial.vad_ms, *accepted_ms, "{partial:?}");
+        }
+        Ok(())
+    }
+
+    /// AC-9.1b-2.
+    #[tokio::test]
+    async fn ac_9_1b_2_first_silence_is_min_silence_and_less_than_one_frame() -> anyhow::Result<()>
+    {
+        let min_silence = config()?.asr.vad_min_silence_ms;
+        let silent = silent_partials().await?;
+        let (_, first) = silent.first().context("no partial has silence")?;
+        let silence = first.vad_ms - first.voice_end_ms.unwrap_or_default();
+        assert!(
+            (min_silence..min_silence + 32).contains(&silence),
+            "silence {silence} ms, vad_min_silence_ms {min_silence}: {first:?}"
+        );
         Ok(())
     }
 
