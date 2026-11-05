@@ -29,9 +29,14 @@ This phase proves the latency goal for the full pipeline.
 **Goal:** Add the end-to-end latency tests for commands, fetches and System Two fillers. The `gpu-test` job runs them on the GPU host with `device = cuda`, the Nemotron first pass and the Parakeet second pass, against the 300 ms goal.
 
 - **Implements:** G1, G2, G6. **Depends on:** 9.1.
-- **Files:** modify `src/testing/e2e.rs`.
+- **Files:** modify `src/testing/e2e.rs`, `src/lib.rs`.
 
 **Model.** The tests run the harness of sub-phase 9.1 on the GPU host with `device = cuda`, the Nemotron first pass and the Parakeet second pass, at real-time pace. Each phrase runs once as a warm-up, then 20 times. The response latency of a run is the sum of three segments: from the last voiced sample to `transcript`, from `transcript` to `handled`, and from `synthesize` to the first audio chunk. The harness sends each next event at once, so the sum equals the time from the last voiced sample to the first audio chunk. The p95 of 20 runs is the 19th smallest value. The latency to a filler uses the same segments with the filler text.
+
+- The last voiced sample is the last sample of the last 20 ms frame of `speech(text)` with an RMS above -40 dBFS. The TTS audio has a long, quiet tail, and a person does not hear it as speech. This replaces the last sample that is not zero of sub-phase 9.1.
+- `start_app` gives the handle of the startup pre-render task, so the harness waits for the pre-render before the warm-up. Thus no measured run misses the audio cache or shares the TTS with the pre-render.
+- The reference house has no `weather.home` entity, so the harness adds a `weather.home` state to its copy of the house. "What is the weather" then gives the weather fetch and its filler.
+- Each test prints the p95 of each phrase, so a run that passes also gives the numbers.
 
 **Acceptance criteria.**
 
