@@ -220,7 +220,7 @@ A choice is a closed set, so step 2 comes before step 3. Free text can be anythi
 
 ### 10.7 Early Commit for Answers
 
-**Goal:** Let short answers use the early commit wait. "Kitchen" or "never mind" while a dialog is open ends listening after 200 ms instead of 600 ms.
+**Goal:** Let short answers use the early commit wait. "Kitchen" or "never mind" while a dialog is open ends listening after 100 ms instead of 600 ms.
 
 - **Implements:** G1, G13. **Depends on:** 10.6.
 - **Files:** modify `src/domain/speech.rs`, `src/app/speech.rs`.
