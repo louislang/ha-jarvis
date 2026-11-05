@@ -117,7 +117,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 
 | ID | Goal |
 |---|---|
-| G1 | The response latency for System One requests is 300 ms or less (p95) on the GPU host. A System One request here has a top intent at or above `model.commit_threshold` and a response in the audio cache. An intent with `needs_speaker` can wait `speaker.wait_ms` more (AC-15.7-9). The light commands of AC-9.2-5 have a target of 360 ms. |
+| G1 | The response latency for System One requests is 300 ms or less (p95) on the GPU host. A System One request here has a top intent at or above `model.commit_threshold` and a response in the audio cache. An intent with `needs_speaker` can wait `speaker.wait_ms` more (AC-15.7-9). The light commands of AC-9.2-5 have a target of 400 ms. |
 | G2 | STT starts when the first audio chunk arrives. STT has two passes: a streaming first pass and an offline second pass at commit. On the GPU host, the first pass is NVIDIA Nemotron Speech Streaming EN 0.6B and the second pass is NVIDIA Parakeet Unified EN 0.6B. |
 | G3 | The System One model classifies common requests locally. It gets the transcript, the satellite area and the habits. It gives a probability for each intent and for `unknown`, and tags the slots. The response path does not call a remote service. |
 | G4 | Each intent has a pool of responses. Jarvis selects with variety and does not repeat the last response. |

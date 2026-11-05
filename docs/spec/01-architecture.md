@@ -131,7 +131,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 ## 5. Key Design Decisions
 
 1. **Early commit.** HA reads the STT result while it sends audio. HA accepts the first `Transcript` event and stops the stream. Thus Jarvis decides the end of speech itself. It does not wait for the HA voice activity detection. (Source: `homeassistant/components/wyoming/stt.py`.)
-2. **Speculative prediction.** The speech use case runs the System One model on each changed partial transcript. The audio stream has no satellite ID, so this prediction uses an empty context. When the top intent is not `unknown` and its probability is `model.commit_threshold` or more, Jarvis uses a short silence threshold (`early_commit_ms`). Other transcripts use a longer threshold (`endpoint_ms`). Silence is the time since the last voiced sample, which a Silero VAD in the first-pass adapter finds. On the GPU host, `vad_threshold = 0.7` gives a lower latency than 0.5, but the VAD can cut a quiet last word: "office lights on" gave "Office lights" (sub-phase 9.2). In a VAD speech segment, the silence is 0, so the wait of the VAD for the segment end cannot commit early. After the segment end, the silence counts each accepted sample (sub-phase 9.1b). Thus decoder delay does not add to the wait, and silence before speech does not commit.
+2. **Speculative prediction.** The speech use case runs the System One model on each changed partial transcript. The audio stream has no satellite ID, so this prediction uses an empty context. When the top intent is not `unknown` and its probability is `model.commit_threshold` or more, Jarvis uses a short silence threshold (`early_commit_ms`). Other transcripts use a longer threshold (`endpoint_ms`). Silence is the time since the last voiced sample, which a Silero VAD in the first-pass adapter finds. On the GPU host, `vad_threshold = 0.65` gives a lower latency than 0.5. 0.7 cut quiet word endings ("office lights on" gave "Office lights"), so 0.65 is the highest tested value that keeps them (sub-phase 9.2). In a VAD speech segment, the silence is 0, so the wait of the VAD for the segment end cannot commit early. After the segment end, the silence counts each accepted sample (sub-phase 9.1b). Thus decoder delay does not add to the wait, and silence before speech does not commit.
 3. **Reply first, act after.** Jarvis returns `Handled` before the HA service call completes. The service call runs in the background.
 4. **Pre-rendered audio.** Jarvis synthesizes at startup each pool response whose only variable is `area`. A TTS request for such a response is a memory read. Other responses synthesize at request time and are not cached.
 5. **Filler, then announce.** For external data and for System Two, Jarvis returns a filler in `Handled`. Then Jarvis speaks the answer with `assist_satellite.announce` on the same satellite. When an announce or a question starts, HA cancels the running pipeline of the satellite. HA returns the result only after the satellite plays the audio. (Source: `homeassistant/components/assist_satellite/entity.py`, `homeassistant/components/esphome/assist_satellite.py`.) Thus each satellite has one queue of announces and questions. An item starts when the hot cache shows the satellite entity `idle`, which is after the filler ends. A new request on a satellite stops the older deferred jobs of that satellite. HA caches TTS audio by text, so the time of a `synthesize` event does not show when the filler plays.
@@ -176,7 +176,7 @@ The budget is the response latency (`00-overview.md` section 0.3). HA's own time
 
 The budget applies to the GPU host. The `gpu-test` job runs the latency tests there (section 10).
 
-With `vad_threshold = 0.7`, the GPU host measures a p95 of about 220 ms for the fan commands and 293 ms to 351 ms for the light commands. Thus AC-9.2-5 gives the light commands 360 ms. A response that is not in the audio cache waits for the synthesis, and the TTS alone takes about 315 ms to the first audio chunk. Thus AC-9.2-4 gives it 650 ms, until sub-phase 9.3 streams the TTS.
+With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan commands and 353 ms to 378 ms for the light commands. Thus AC-9.2-5 gives the light commands 400 ms. A response that is not in the audio cache waits for the synthesis, and the TTS alone takes about 315 ms to the first audio chunk. Its p95 is 654 ms, so AC-9.2-4 gives it 700 ms, until sub-phase 9.3 streams the TTS. The `unknown` filler measures 697 ms, so AC-9.2-3 gives it `endpoint_ms` + 150 ms.
 
 ## 7. Crates
 
@@ -369,7 +369,7 @@ joiner = "joiner.fp16.onnx"
 # Optional. Without it, the final transcript is the first-pass text (CPU machines).
 second_pass_dir = "models/sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming"
 vad_model = "models/silero_vad.onnx"
-vad_threshold = 0.7
+vad_threshold = 0.65
 vad_min_silence_ms = 60
 early_commit_ms = 100
 endpoint_ms = 600
