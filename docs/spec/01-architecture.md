@@ -49,7 +49,7 @@ Dependency rules:
                                    │   │ intent model training  │ │   Clock ──────────▶ SystemClock (lib.rs)
                                    │   │ decide responses state │ │   Plugin ─────────▶ adapters/open_meteo.rs ─▶ Open-Meteo
                                    │   │ dialog habits feedback │ │                     adapters/plex.rs ─▶ Plex
-                                   │   │ learn speaker speech   │ │
+                                   │   │ learn speaker speech   │ │   Models ─────────▶ LiveModels (lib.rs)
                                    │   └────────────────────────┘ │
                                    └──────────────────────────────┘
 ```
@@ -75,6 +75,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | `InteractionLog` | Driven | `append`, `update`, `list`, `audio`, `mark`, `marked`, `unknowns`, `prune` | `adapters/sqlite.rs` |
 | `Store<T>` | Driven | `load`, `save` | `adapters/files.rs` (TOML or JSON from the file extension) |
 | `Clock` | Driven | `now` | `SystemClock` in `src/lib.rs` |
+| `Models` | Driven | `release`, `restore` | `LiveModels` in `src/lib.rs` |
 
 Tests in the application layer use the fakes in `src/testing/fakes.rs`. Adapter tests use local servers (`wiremock`, a fake HA WebSocket server), in-memory object stores or real models.
 
@@ -141,7 +142,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 9. **Habits are a model input.** The application learns habits from the same event stream as the hot cache. The habit summary for the satellite area and the current time is part of the model context. Habits also rank entities and fill missing slots in `decide`.
 10. **Source from the HA context.** Each `state_changed` event has a context. A `user_id` that is not the Jarvis user means `manual`. A `parent_id` means `automation`. No `user_id` and no `parent_id` means a physical device change, which is `manual`. The Jarvis user means `voice`.
 11. **One joint model.** One model gives the intent probabilities and the slot tags. Thus one CPU pass per transcript gives all System One data. Clusters of `unknown` requests use OpenAI embeddings (sub-phase 14.1). These do not change when System One retrains, and the context does not change them.
-12. **Train locally first.** The process adapter runs `train/train.py` on the GPU of the GPU host. When that run fails (for example, CUDA out of memory), the training use case sends the same training set to the RunPod adapter. Jarvis predicts with the ONNX model through `ort`. The Python script and the inline script of the review page are the only non-Rust code. The training set file is the contract between them.
+12. **Train locally first, with the full GPU.** The process adapter runs `train/train.py` on the GPU of the GPU host. A local run and live Jarvis never share the GPU. Before a local run, Jarvis announces that it is training, stops answering and releases its model sessions. After the run, with success or an error, Jarvis loads them again and answers again. Then it measures the new model (decision 13). When the local run fails (for example, CUDA out of memory), the training use case sends the same training set to the RunPod adapter. A RunPod run does not pause Jarvis. Jarvis predicts with the ONNX model through `ort`. The Python script and the inline script of the review page are the only non-Rust code. The training set file is the contract between them.
 13. **Accept only an equal or better model.** Jarvis assigns each example to the held-out set by a stable hash of its text. Jarvis measures the old model and the new model on the same held-out set. Jarvis keeps the new model only when its intent accuracy and its slot accuracy are both equal or higher.
 14. **Training trigger.** Jarvis counts changes since the last training run. At `train.min_changes`, Jarvis starts a run. A voice request starts a run at any count. Only one run occurs at a time. After each run, accepted or rejected, the count starts again from 0.
 15. **Speaker identification is not on the critical path.** Jarvis calculates the voice embedding in the background after commit. Only intents with `needs_speaker = true` wait for the result.
@@ -282,12 +283,12 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `quint/backfill.qnt` | Model | Response backfill. | 8.3 |
 | `quint/dialog.qnt` | Model | Dialogs. | 10.1 |
 | `quint/feedback.qnt` | Model | Marks and blocked decisions. | 12.2 |
-| `quint/training.qnt` | Model | Training trigger, run, accept and fallback. | 13.4 |
+| `quint/training.qnt` | Model | Training trigger, run, pause, accept and fallback. | 13.4 |
 | `quint/learned.qnt` | Model | Learned intent lifecycle and approval. | 14.3 |
 | `quint/prefetch.qnt` | Model | Prefetch freshness and side effects. | 14.8 |
 | `quint/speaker.qnt` | Model | Speaker identification and enrollment. | 15.5 |
 | `quint/jarvis.qnt` | Model | The system model. It composes the other models. | 16.1 |
-| `src/lib.rs` | Root | Module tree, `Config`, `SystemClock`, `App` (implements `Assistant` by delegation), `run`, the `dataset` command, `main`. | 0.1 |
+| `src/lib.rs` | Root | Module tree, `Config`, `SystemClock`, `LiveModels`, `App` (implements `Assistant` by delegation), `run`, the `dataset` command, `main`. | 0.1 |
 | `src/main.rs` | Root | Binary entry point. `main` only calls `jarvis::main`. | 0.1 |
 | `src/ports.rs` | Ports | All port traits and their data types. | 2.1 |
 | `src/domain/contracts.rs` | Domain | Trusted Verus contracts and axioms for the `std` and domain crate functions that the domain calls. | 0.18 |
@@ -439,7 +440,7 @@ check_interval_s = 600
 holdout = 0.1
 failure_backoff_s = 21600
 timeout_min = 60
-max_vram_gb = 1.0
+max_vram_gb = 4.5 # PyTorch cap of a local run (section 10)
 paraphrases = 50
 unknown_paraphrases = 300
 python = ".venv/bin/python"
@@ -662,6 +663,9 @@ responses = ["I will start training now."]
 [pools.training_busy]
 responses = ["Training is already running."]
 
+[pools.training_pause]
+responses = ["I am training now. I will answer again when training ends."]
+
 [pools.ask_area]
 responses = ["Which room?"]
 
@@ -706,14 +710,14 @@ Training set file (the contract between Jarvis and `train/train.py`):
 
 | Machine | OS | Device | STT model | Use |
 |---|---|---|---|---|
-| GPU host (self-hosted runner `gpu`) | Linux x86-64, RTX 2060 6 GB | `cuda` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, fp16. Second pass: Parakeet Unified EN 0.6B offline, fp16. | Runs Jarvis. Runs local training. |
+| GPU host (self-hosted runner `gpu`) | Linux x86-64, RTX 2060 6 GB | `cuda` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, fp16. Second pass: Parakeet Unified EN 0.6B offline, fp16. | Runs Jarvis. Runs local training while Jarvis pauses. |
 | Test machine | macOS x86-64 (Intel MacBook Pro) | `cpu` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, int8. No second pass. | Development. Runs the pre-commit hook (without `bench` and `gpu-test`). |
 | CI | `ubuntu-latest` | `cpu` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, int8. No second pass. | `just check`. |
 | RunPod | RunPod serverless | GPU | — | Training fallback. |
 
 The GPU host runs Jarvis as the systemd unit `jarvis`: `jarvis serve jarvis.toml` in a checkout of the release tag. An environment file of the unit holds the secrets, `ORT_DYLIB_PATH`, which points to the `libonnxruntime` in the release folder, and `LD_LIBRARY_PATH`, which points to the release folder (sub-phase 6.1). Port 10700 (Wyoming) has no authentication, so the host firewall accepts it only from the HA host.
 
-VRAM budget on the GPU host (6 GB):
+VRAM budget of live Jarvis on the GPU host (6 GB). A local training run does not share the GPU with live Jarvis, so it has no row.
 
 | Use | Budget |
 |---|---|
@@ -722,12 +726,11 @@ VRAM budget on the GPU host (6 GB):
 | System One model | 0.3 GB |
 | TTS (Supertonic-3) and voice identification (CAM++) | 0.4 GB |
 | ONNX Runtime arenas and CUDA context | 0.8 GB |
-| Local training run (MiniLM, fp16, `batch_size = 8`) | 1.0 GB |
 | Margin | 0.5 GB |
 | Reserve (not usable on a 6 GB card) | 0.5 GB |
-| **Total** | **6.0 GB** |
+| **Total** | **5.0 GB** |
 
-The model budgets assume fp16 weights. The GPU host does not run the int8 STT models, because ONNX Runtime runs their int8 operators on the CPU (sub-phase 6.6c). Each fp16 STT session takes about 1.2 GB with the CUDA option `arena_extend_strategy=kSameAsRequested`, and about 2.1 GB with the default arena. With this option on both STT sessions, the measured peak of both STT passes, the System One model and TTS is 3.57 GB (5.23 GB with the default arena). The usable budget is 5.5 GB, below the 5.8 GB limit of AC-13.10-5. GPU host tests measure the real peak and check that each model runs on the CUDA execution provider (AC-3.12b-3, AC-6.1-3, AC-6.2-5, AC-6.6c-4, AC-6.7-5, AC-15.3-7). The process trainer limits the PyTorch memory of a local run to `train.max_vram_gb` (`torch.cuda.set_per_process_memory_fraction`), so a run cannot take the memory of the live models. If a local run fails with "CUDA out of memory", the run moves to RunPod (decision 12). Live STT never stops for training.
+The model budgets assume fp16 weights. The GPU host does not run the int8 STT models, because ONNX Runtime runs their int8 operators on the CPU (sub-phase 6.6c). Each fp16 STT session takes about 1.2 GB with the CUDA option `arena_extend_strategy=kSameAsRequested`, and about 2.1 GB with the default arena. With this option on both STT sessions, the measured peak of both STT passes, the System One model and TTS is 3.57 GB (5.23 GB with the default arena). The usable budget is 5.5 GB. GPU host tests measure the real peak and check that each model runs on the CUDA execution provider (AC-3.12b-3, AC-6.1-3, AC-6.2-5, AC-6.6c-4, AC-6.7-5, AC-15.3-7). Before a local run, Jarvis releases its model sessions, and it loads them again after the run (decision 12, sub-phase 13.10). Thus during the run, the usable 5.5 GB has the CUDA context of the Jarvis process (0.5 GB), the CUDA context of the training process (0.5 GB) and the PyTorch memory of the run. The process trainer limits the PyTorch memory to `train.max_vram_gb` (`torch.cuda.set_per_process_memory_fraction`), 4.5 GB. If a local run fails with "CUDA out of memory", the run moves to RunPod (decision 12).
 
 The GPU host needs the NVIDIA driver, CUDA 12, cuDNN 9, and a Python 3.12 virtual environment in `.venv`. The host has only Python 3.14, so `uv` installs Python 3.12:
 
@@ -793,7 +796,7 @@ Each model has state variables, actions and named invariants. `02-rules.md` sect
 | `backfill.qnt` | Backfill | `app/background.rs` | `OneBackfillPerPool`, `PoolsChangeOnlyOnSuccess` |
 | `dialog.qnt` | Dialogs and deferred jobs | `domain/dialog.rs`, `app/conversation.rs` | `TurnLimit`, `NoCallAfterCancel` |
 | `feedback.qnt` | Marks | `domain/feedback.rs` | `DecideAvoidsBlocked` |
-| `training.qnt` | Training | `domain/training.rs`, `app/training.rs` | `OneRun`, `SwapNeverWorse`, `CountResetsAfterRun`, `FailureKeepsModel`, `FallbackOnce` |
+| `training.qnt` | Training | `domain/training.rs`, `app/training.rs` | `OneRun`, `SwapNeverWorse`, `CountResetsAfterRun`, `FailureKeepsModel`, `FallbackOnce`, `PauseOnlyLocal` |
 | `learned.qnt` | Learned intents | `domain/learn.rs`, `app/background.rs` | `ServiceNeedsApproval`, `NoReproposal`, `ActivationCountsOnce` |
 | `prefetch.qnt` | Prefetch | `domain/learn.rs`, `app/background.rs` | `NoCallFromPrefetch`, `ServedAnswerIsFresh` |
 | `speaker.qnt` | Speaker identification | `domain/speaker.rs` | `SpeakerIsCandidate`, `NoVoiceOnlyEnrollment` |

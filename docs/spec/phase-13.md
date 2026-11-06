@@ -1,6 +1,6 @@
 # Phase 13: Training
 
-This phase improves the System One model. Jarvis builds the training set, trains on the GPU host (RunPod when local training fails), and keeps a new model only when it is equal or better.
+This phase improves the System One model. Jarvis builds the training set, trains on the GPU host (RunPod when local training fails), pauses itself during a local run, and keeps a new model only when it is equal or better.
 
 ---
 
@@ -98,7 +98,7 @@ This phase improves the System One model. Jarvis builds the training set, trains
 
 ### 13.4 Training Quint Model
 
-**Goal:** Add `quint/training.qnt`, the model of the trigger, the run, the local and RunPod attempts, the accept rule and the swap. Prove that only one run occurs at a time and that a swap never installs a worse model.
+**Goal:** Add `quint/training.qnt`, the model of the trigger, the run, the local and RunPod attempts, the pause, the accept rule and the swap. Prove that only one run occurs at a time, that Jarvis pauses only for a local attempt, and that a swap never installs a worse model.
 
 - **Implements:** G16, G19. **Depends on:** 13.3.
 - **Files:** create `quint/training.qnt`.
@@ -107,8 +107,8 @@ This phase improves the System One model. Jarvis builds the training set, trains
 **Model.**
 
 - Constants: `MIN = 2`, `ACC = Set(0, 1, 2)`, `RUNPOD: bool`.
-- State: `changes`, `during` (changes since the run started), `run: Idle | Local | RunPod`, `starts`, `ends`, `modelAcc`, `prevAcc`, `swaps: List[(old, new)]`, `attempts`, `lastAction`.
-- Actions: `change` (`changes += 1`, and `during += 1` when `run != Idle`), `autoStart` (if `Idle` and `changes >= MIN`: `run := Local`, `starts += 1`, `during := 0`), `voiceStart` (if `Idle`: the same), `localDone(a)`, `localFail` (if `RUNPOD`: `run := RunPod`, else end with failure), `runpodDone(a)`, `runpodFail`. Each action first sets `prevAcc := modelAcc` and `lastAction`.
+- State: `changes`, `during` (changes since the run started), `run: Idle | Local | RunPod`, `paused` (Jarvis has released its models for the local attempt), `starts`, `ends`, `modelAcc`, `prevAcc`, `swaps: List[(old, new)]`, `attempts`, `lastAction`.
+- Actions: `change` (`changes += 1`, and `during += 1` when `run != Idle`), `autoStart` (if `Idle` and `changes >= MIN`: `run := Local`, `paused := true`, `starts += 1`, `during := 0`), `voiceStart` (if `Idle`: the same), `localDone(a)`, `localFail` (if `RUNPOD`: `run := RunPod`, else end with failure), `runpodDone(a)`, `runpodFail`. `localDone` and `localFail` also set `paused := false`. Each action first sets `prevAcc := modelAcc` and `lastAction`.
 - A done action with accuracy `a`: if `a >= modelAcc`, append `(modelAcc, a)` to `swaps` and set `modelAcc := a`. Then `run := Idle`, `ends += 1` and `changes := during`.
 - A final failure: `run := Idle`, `ends += 1`, and `changes` and `modelAcc` do not change.
 - Invariants:
@@ -117,16 +117,17 @@ This phase improves the System One model. Jarvis builds the training set, trains
   - `CountResetsAfterRun`: when `lastAction` is a done action, `changes = during`. Changes that arrive during a run stay counted.
   - `FailureKeepsModel`: when `lastAction` is a final failure, `modelAcc = prevAcc`.
   - `FallbackOnce`: one run has at most one RunPod attempt, and only after a local failure.
+  - `PauseOnlyLocal`: `paused` if and only if `run = Local`.
 
 **Acceptance criteria.**
 
 - AC-13.4-1 [Quint]: `quint typecheck` passes.
-- AC-13.4-2 [Quint]: All five invariants hold in simulation and to 10 steps in `quint verify`, with `RUNPOD` true and false.
+- AC-13.4-2 [Quint]: All six invariants hold in simulation and to 10 steps in `quint verify`, with `RUNPOD` true and false.
 - AC-13.4-3 [Quint]: The test `ac_13_4_3_rejected_run_resets_count` passes: a run with a lower accuracy keeps the model and sets `changes` to the changes made during the run.
 
 **Proofs.**
 
-- P-13.4-2. `OneRun`: both start actions are guarded by `run = Idle` and increment `starts`. Every action that sets `run := Idle` from a run increments `ends`, so `starts - ends` is 1 during a run and 0 otherwise. `SwapNeverWorse`: the only append to `swaps` is guarded by `a >= modelAcc` and appends `(modelAcc, a)`. `CountResetsAfterRun`: both done actions end with `changes := during`. `FailureKeepsModel`: each action sets `prevAcc := modelAcc` first, and the failure actions write neither `modelAcc` nor `swaps`. `FallbackOnce`: `run := RunPod` occurs only in `localFail`, which is enabled only when `run = Local`, and no action sets `run := Local` from `RunPod`.
+- P-13.4-2. `OneRun`: both start actions are guarded by `run = Idle` and increment `starts`. Every action that sets `run := Idle` from a run increments `ends`, so `starts - ends` is 1 during a run and 0 otherwise. `SwapNeverWorse`: the only append to `swaps` is guarded by `a >= modelAcc` and appends `(modelAcc, a)`. `CountResetsAfterRun`: both done actions end with `changes := during`. `FailureKeepsModel`: each action sets `prevAcc := modelAcc` first, and the failure actions write neither `modelAcc` nor `swaps`. `FallbackOnce`: `run := RunPod` occurs only in `localFail`, which is enabled only when `run = Local`, and no action sets `run := Local` from `RunPod`. `PauseOnlyLocal`: the two start actions are the only actions that set `run := Local`, and they set `paused := true`. `localDone` and `localFail` are the only actions that move `run` away from `Local`, and they set `paused := false`. No other action writes `paused`.
 - P-13.4-1, P-13.4-3. Evidence: model check.
 
 ---
@@ -276,7 +277,7 @@ This phase improves the System One model. Jarvis builds the training set, trains
 0. Keep `started := now` and the established habit keys at this time.
 1. `refresh` the generated examples.
 2. Build the training set. Upload only the examples that are not held out. When the held-out set is empty, stop with an error before training.
-3. `train` of the local `Trainer`.
+3. `train` of the local `Trainer`. Sub-phase 13.10 pauses Jarvis for this call.
 4. `ModelLoader::load` the new folder.
 5. Predict the held-out set with the old and the new classifier.
 6. If `accept`, swap the classifier, write `current` in the training state, and delete the model folders other than the current and the previous one. Else delete the new folder.
@@ -313,15 +314,28 @@ On a final error, the old model stays and the training state does not change. Th
 
 ---
 
-### 13.10 Training Fallback
+### 13.10 Training Pause and Fallback
 
-**Goal:** Send the same training set to RunPod when the local run fails. A run that does not fit in 6 GB of VRAM still completes, and live STT never pauses for training.
+**Goal:** Pause Jarvis for a local training run, and send the same training set to RunPod when the local run fails. A local run gets the full GPU of the GPU host, and a run that does not fit in it still completes.
 
 - **Implements:** G16, G18, G19. **Depends on:** 13.9.
-- **Files:** modify `src/app/training.rs`, `src/lib.rs`.
+- **Files:** modify `src/ports.rs`, `src/app/training.rs`, `src/app/conversation.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `responses.toml`.
 - **Quint:** `training.qnt` (conformance with `RUNPOD = true`).
 
-**Model.** Step 3 of the run becomes: call the local `Trainer`. If it returns an error and `[train.runpod]` is set, call the RunPod `Trainer` with the same run ID and set.
+**Model.**
+
+- The `Models` port has `release()` and `restore()`. `release` drops the model sessions and returns when no use of them is in progress. `restore` loads them again. `FakeModels` records the calls and can fail the next `restore`.
+- `LiveModels` in `src/lib.rs` implements `Models`. It keeps the sessions of the STT first and second pass, the System One model and TTS in one `tokio::sync::RwLock`. The `Classifier` wrapper of sub-phase 5.4 and new `SpeechToText` and `TextToSpeech` wrappers in `src/lib.rs` take a read guard with `try_read` for each use. A `Listening` session keeps its guard until it ends. When `try_read` fails, the use returns an error at once. `release` takes the write guard, so it waits for the uses in progress, and drops the sessions. `restore` loads them with the load function of `run` and releases the guard.
+- During the pause, `listen` fails, and the Wyoming adapter sends `error` (sub-phase 6.9). `handle` gets the error from `predict` and returns `Err` with a `failure` text (AC-5.3-5). Jarvis does not answer, and it keeps no request for later.
+- Step 3 of the run becomes:
+  1. Put a response from the pool `training_pause` in the announce queue of each satellite in the hot cache (sub-phase 4.9b). Wait until each item ends.
+  2. `Models::release`.
+  3. Call the local `Trainer`.
+  4. `Models::restore`, after a success or an error of the local `Trainer`.
+  5. If the local `Trainer` returned an error and `[train.runpod]` is set, call the RunPod `Trainer` with the same run ID and set. Jarvis answers during this call.
+- When `restore` fails, the training task ends with the error, and `run` returns it, as when a load fails at startup (AC-5.4-3).
+- This sub-phase adds the pool `training_pause` to `responses.toml`.
+- The conformance driver compares `paused` with the release state of `FakeModels`. After a start action, it waits until the local `FakeTrainer` has the call.
 
 **Acceptance criteria.**
 
@@ -329,12 +343,15 @@ On a final error, the old model stays and the training state does not change. Th
 - AC-13.10-2: When the process trainer succeeds, `FakeRunPodTrainer` records no call.
 - AC-13.10-3: When the process trainer returns an error and `[train.runpod]` is not set, the old classifier stays and the log names the local error.
 - AC-13.10-4: When `quint-connect` replays 100 traces of `training.qnt` with `RUNPOD = true`, the state matches the model after each step.
-- AC-13.10-5 [GPU host]: During a local training run, all Phase 9.2 latency tests pass and the peak VRAM use is 5.8 GB or less.
+- AC-13.10-5 [GPU host]: After `LiveModels::release`, Jarvis has no GPU session, and the free GPU memory is `train.max_vram_gb` + 0.5 GB or more, so a local run can use the full GPU. After `restore`, Jarvis answers again, and all Phase 9.2 latency tests pass.
+- AC-13.10-6: When the process trainer runs, `FakeHome` has recorded a `training_pause` announce on each satellite, and `FakeModels` is released. After the process trainer returns, with success or an error, `FakeModels` records one `restore`, before any `FakeRunPodTrainer` call.
+- AC-13.10-7: When `LiveModels::release` returns, no reference to the STT, TTS or classifier fakes exists, and `listen` and `handle` return an error. After `restore`, `handle` answers. When a load fails, `restore` returns the error.
 
 **Proofs.**
 
 - P-13.10-1 to P-13.10-3. Requires: `FallbackOnce`. Argument: the RunPod call is in the `Err` arm of the process call, guarded by `runpod.is_some()`, and it is not in a loop.
-- P-13.10-4, P-13.10-5. Evidence: test.
+- P-13.10-6. Requires: `PauseOnlyLocal`. Argument: step 3 awaits the announces, `release`, the local `Trainer` and `restore` in sequence. `restore` runs after both arms of the local result, and the RunPod call comes after it.
+- P-13.10-4, P-13.10-5, P-13.10-7. Evidence: test.
 
 ---
 
@@ -363,7 +380,7 @@ On a final error, the old model stays and the training state does not change. Th
 These steps are not tests and gate nothing.
 
 1. On the GPU host, make `.venv` with Python 3.12 and install `./train` with `uv` (`01-architecture.md` section 10).
-2. Say "Start training". Record that the run uses the GPU and that the log shows both accuracies and the decision.
+2. Say "Start training". Record that each satellite announces the pause, that Jarvis does not answer during the run, that the run uses the GPU, that Jarvis answers after the run, and that the log shows both accuracies and the decision.
 3. In RunPod, make a network volume, an S3 API key and a serverless endpoint with `ghcr.io/<owner>/jarvis-train:<tag>`. Allow only GPU types with compute capability 9.0 or lower, because torch 2.2.2 has no kernels for newer GPUs (sub-phase 3.5). Set `[train.runpod]`.
 4. Set a base model that is too large for 6 GB. Say "Start training". Record that the run moves to RunPod. Set `train.base_model` back.
 5. Repeat the Phase 9 field log with the trained model.
