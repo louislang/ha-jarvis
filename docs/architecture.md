@@ -10,6 +10,7 @@ flowchart LR
         crate_adapters_onnx[onnx]
         crate_adapters_openai[openai]
         crate_adapters_sherpa[sherpa]
+        crate_adapters_supertonic[supertonic]
         crate_adapters_wyoming[wyoming]
     end
     subgraph app
@@ -77,6 +78,10 @@ flowchart LR
     crate_adapters_sherpa --> crate_adapters_sherpa
     crate_adapters_sherpa --> crate_domain_speech
     crate_adapters_sherpa --> crate_ports
+    crate_adapters_supertonic --> crate
+    crate_adapters_supertonic --> crate_adapters_supertonic
+    crate_adapters_supertonic --> crate_domain_speech
+    crate_adapters_supertonic --> crate_ports
     crate_adapters_wyoming --> crate_domain_speech
     crate_adapters_wyoming --> crate_ports
     crate_app_background --> crate

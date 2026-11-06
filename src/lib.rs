@@ -108,6 +108,7 @@ pub mod adapters {
     pub mod onnx;
     pub mod openai;
     pub mod sherpa;
+    pub mod supertonic;
     pub mod wyoming;
 }
 
