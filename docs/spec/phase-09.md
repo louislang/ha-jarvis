@@ -62,7 +62,7 @@ This phase proves the latency goal for the full pipeline.
 
 - The last voiced sample is the last sample of the last 20 ms frame of `speech(text)` with an RMS above -40 dBFS. The TTS audio has a long, quiet tail, and a person does not hear it as speech. This replaces the last sample that is not zero of sub-phase 9.1.
 - `start_app` gives the handle of the startup pre-render task, so the harness waits for the pre-render before the warm-up. Thus no measured run misses the audio cache or shares the TTS with the pre-render.
-- The reference house has no `weather.home` entity, so the harness adds a `weather.home` state to its copy of the house. "What is the weather" then gives the weather fetch and its filler.
+- The reference house has no `weather.forecast_home` entity, so the harness adds a `weather.forecast_home` state to its copy of the house. "What is the weather" then gives the weather fetch and its filler.
 - Each test prints the p95 of each phrase, so a run that passes also gives the numbers.
 - `jarvis.toml` sets `vad_threshold = 0.65`. With 0.5, the commands had a p95 of 273 ms to 435 ms. With 0.65, they have 213 ms to 378 ms, and each transcript keeps its words. 0.7 cut "on" from "office lights on". The tests that read `jarvis.toml` change with it.
 - AC-9.2-3, AC-9.2-4 and AC-9.2-5 have the measured targets of `01-architecture.md` section 6. Sub-phase 9.3 brings the target of AC-9.2-4 back to 400 ms.

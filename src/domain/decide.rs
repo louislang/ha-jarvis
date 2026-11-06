@@ -1392,7 +1392,7 @@ mod tests {
     fn ac_4_6_3_weather_fetches_with_response() {
         let mut snapshot = house();
         let mut weather = snapshot.states[0].clone();
-        weather.entity_id = "weather.home".to_owned();
+        weather.entity_id = "weather.forecast_home".to_owned();
         snapshot.states.push(weather);
         let cache = StateCache::load(snapshot);
         let mut data = Map::new();
@@ -1400,7 +1400,7 @@ mod tests {
         let call = ServiceCall {
             domain: "weather".to_owned(),
             service: "get_forecasts".to_owned(),
-            target: vec!["weather.home".to_owned()],
+            target: vec!["weather.forecast_home".to_owned()],
             data,
             return_response: true,
         };
