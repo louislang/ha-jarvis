@@ -185,10 +185,11 @@ Each measured command and fetch phrase has a top intent at or above `model.commi
 **Acceptance criteria.**
 
 - AC-9.3c-1 [GPU host]: For a command whose response is not in the audio cache, the response latency has a p95 of 400 ms or less over 20 runs. This replaces AC-9.2-4.
+- AC-9.3c-2 [GPU host]: With `device = cuda`, when one process loads both STT passes, the fixture classifier and `SupertonicTts`, and synthesizes "One moment." and the 142-character sentence of AC-9.3b-3, the peak GPU memory of the process is 5.5 GB or less.
 
 **Proofs.**
 
-- P-9.3c-1. Evidence: test.
+- P-9.3c-1, P-9.3c-2. Evidence: test.
 
 ## Field Log
 
