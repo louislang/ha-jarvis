@@ -1940,7 +1940,7 @@ fn evaluate(name: &str) -> String {
     stdout_in_root("just", &["--evaluate", name])
 }
 
-/// Checks that `models` fetches the archive of the `justfile` variable `sums`, that its folder exists in `models/` and that each file of `sums` has its SHA-256.
+/// Checks that `models` fetches the archive or file of the `justfile` variable `sums`, that its folder or file exists in `models/` and that each file of `sums` has its SHA-256.
 fn assert_fetched(sums: &str) {
     let dependencies = justfile()["recipes"]["models"]["dependencies"].to_string();
     let argument = format!("[\"variable\",\"{sums}\"]");
@@ -1956,7 +1956,7 @@ fn assert_fetched(sums: &str) {
     let folder = root()
         .join("models")
         .join(archive.trim_end_matches(".tar.bz2"));
-    assert!(folder.is_dir(), "{} exists", folder.display());
+    assert!(folder.exists(), "{} exists", folder.display());
     let file = fixture_file("models.sha256", &sums);
     assert_passes(&run(Command::new("shasum")
         .args(["-a", "256", "--check"])
@@ -2011,4 +2011,11 @@ fn ac_6_1_4_linux_archive_has_cuda_libraries() {
 fn ac_6_2_1_models_writes_stt_and_tts_folders() {
     assert_fetched("nemotron_sums");
     assert_fetched("supertonic_sums");
+}
+
+/// After `just models`, the fp32 vector estimator and vocoder are in the Supertonic-3 folder with their SHA-256.
+#[test]
+fn ac_9_3_1_models_writes_fp32_tts_files() {
+    assert_fetched("vector_estimator_sums");
+    assert_fetched("vocoder_sums");
 }

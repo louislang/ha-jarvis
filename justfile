@@ -29,6 +29,10 @@ supertonic_sums := """
     c7befd5ea8c3119769e8a6c1486c4edc6a3bc8365c67621c881bbb774b9902ff  sherpa-onnx-supertonic-3-tts-int8-2026-05-11/text_encoder.int8.onnx
     20cd86fa5c6effedfda0e7cffe5b0569ca401c440a0c3a1d72bf39286c0db3fd  sherpa-onnx-supertonic-3-tts-int8-2026-05-11/vector_estimator.int8.onnx
     e923d60f53f95eb1ce235f1dc33ec56d9c057823c96fa6f8acf98f32b0da6152  sherpa-onnx-supertonic-3-tts-int8-2026-05-11/vocoder.int8.onnx"""
+# The fp32 Supertonic-3 graphs of Hugging Face `Supertone/supertonic-3`, one file for each list.
+supertonic_fp32 := "https://huggingface.co/Supertone/supertonic-3/resolve/3cadd1ee6394adea1bd021217a0e650ede09a323/onnx"
+vector_estimator_sums := "883ac868ea0275ef0e991524dc64f16b3c0376efd7c320af6b53f5b780d7c61c  sherpa-onnx-supertonic-3-tts-int8-2026-05-11/vector_estimator.onnx"
+vocoder_sums := "085de76dd8e8d5836d6ca66826601f615939218f90e519f70ee8a36ed2a4c4ba  sherpa-onnx-supertonic-3-tts-int8-2026-05-11/vocoder.onnx"
 nemotron_sums := """
     0ae73a41cd51599dc7cac9ac083d9d35de53d762ca45923505fde47a3751814b  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25.tar.bz2
     71111f61b18e1e65e01e369434a5c0434868d2f44892742ae54240600c681209  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/encoder.int8.onnx
@@ -71,7 +75,7 @@ cov:
     {{ cpu_runtime }} cargo llvm-cov --workspace --release --fail-under-lines 80.01
 
 # Download the CPU libraries and models.
-models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/tts-models" supertonic_sums) (fetch sherpa_onnx + "/asr-models" silero_sums)
+models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/tts-models" supertonic_sums) (fetch supertonic_fp32 vector_estimator_sums) (fetch supertonic_fp32 vocoder_sums) (fetch sherpa_onnx + "/asr-models" silero_sums)
 
 # Download the GPU models and the CUDA libraries, and copy the fp16 files next to the int8 files of the same model.
 gpu-models: cuda-libraries (fetch sherpa_onnx + "/asr-models" parakeet_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (copy-fp16 nemotron_fp16_sums "nemotron-160ms-" "sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25") (copy-fp16 parakeet_fp16_sums "parakeet-unified-" "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming")
@@ -99,7 +103,7 @@ fetch release sums:
     archive=${line#*  }
     if [ -e "${archive%.tar.bz2}" ] && shasum -a 256 --check --status <<< "{{ sums }}" 2> /dev/null; then exit 0; fi
     if ! shasum -a 256 --check --status <<< "$line" 2> /dev/null; then
-        curl -sSfL -o "$archive" "{{ release }}/$archive"
+        curl -sSfL -o "$archive" "{{ release }}/${archive##*/}"
         shasum -a 256 --check --quiet <<< "$line"
     fi
     [[ "$archive" != *.tar.bz2 ]] || tar -xjf "$archive"

@@ -18,6 +18,7 @@ jiff = { version = "0.2.38", features = ["serde"] }
 minijinja = { version = "3.0.5", features = ["serde"] }
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic", "cuda"] }
 rand = { version = "0.10.3", default-features = false, features = ["std_rng"] }
+rand_distr = "0.6.0"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -30,6 +31,7 @@ tokio-tungstenite = { version = "0.30.0", default-features = false, features = [
 tokio-util = { version = "0.7.20", features = ["rt"] }
 toml = "1.1.8"
 tracing = "0.1.44"
+unicode-normalization = "0.1.26"
 vstd = "=0.0.0-2026-10-25-0158"
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
 dashmap = "6.2.1"
