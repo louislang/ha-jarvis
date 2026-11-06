@@ -71,7 +71,7 @@ This phase composes the component models into one Quint model of the whole reque
 
 - `commit(r)` uses the `commit` instance of `r`. `announce(r)` and `pipelineEnd(s)` use the `announce` instance of `s`.
 - New actions: `ask(r)` and `answer(r)` (from `dialog`; `ask` increments `handled` and moves `Handling` to `Replied`), `mark` (from `feedback`), and `swap` (from `training`: `activeModel := v`).
-- The pause of sub-phase 13.10: the `training` start actions are enabled only when each satellite is `idle` and no request is in `Listening` or `Handling`. The pause announce waits for an idle satellite (sub-phase 4.9b), and `release` waits for the uses in progress. Thus the driver completes a start action without a later trace step. While `training.paused`, `audio`, `handle` and `answer` are not enabled.
+- The pause of sub-phase 13.10: the `training` start actions are enabled only when no request is in `Listening` or `Handling`. `release` waits for the uses in progress, and the mute calls do not wait for a satellite. Thus the driver completes a start action without a later trace step. While `training.paused`, `audio`, `handle` and `answer` are not enabled.
 - The invariants of the imported models also hold in the composition.
 
 **Acceptance criteria.**
@@ -96,7 +96,7 @@ This phase composes the component models into one Quint model of the whole reque
 - **Files:** modify `src/testing/e2e.rs`.
 - **Quint:** `jarvis.qnt` (conformance).
 
-**Model.** The driver of sub-phase 16.2 maps `ask` and `answer` through `Assistant::handle` with an open dialog, `mark` through `Review`, and `swap` through the training use case with `FakeTrainer`. A start action of `training` also runs the pause with `FakeModels`. The driver does not compare the `training_pause` announces, because `jarvis.qnt` has no action for them. After each step, it also reads the dialogs, the marks and the training state.
+**Model.** The driver of sub-phase 16.2 maps `ask` and `answer` through `Assistant::handle` with an open dialog, `mark` through `Review`, and `swap` through the training use case with `FakeTrainer`. A start action of `training` also runs the pause with `FakeModels`. The driver does not compare the `switch` calls of the mute, because `jarvis.qnt` has no action for them. After each step, it also reads the dialogs, the marks and the training state.
 
 **Acceptance criteria.**
 
