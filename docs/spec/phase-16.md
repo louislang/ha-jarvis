@@ -71,6 +71,7 @@ This phase composes the component models into one Quint model of the whole reque
 
 - `commit(r)` uses the `commit` instance of `r`. `announce(r)` and `pipelineEnd(s)` use the `announce` instance of `s`.
 - New actions: `ask(r)` and `answer(r)` (from `dialog`; `ask` increments `handled` and moves `Handling` to `Replied`), `mark` (from `feedback`), and `swap` (from `training`: `activeModel := v`).
+- The pause of sub-phase 13.10: the `training` start actions are enabled only when no request is in `Listening` or `Handling`, because `release` waits for the uses in progress. While `training.paused`, `audio`, `handle` and `answer` are not enabled.
 - The invariants of the imported models also hold in the composition.
 
 **Acceptance criteria.**
@@ -81,7 +82,7 @@ This phase composes the component models into one Quint model of the whole reque
 
 **Proofs.**
 
-- P-16.3-2. Argument: each imported action keeps its own guard and effect, and the composition adds no action that writes the state of an imported model. So each inductive invariant of a component (Phases 4 to 15) still holds.
+- P-16.3-2. Argument: each imported action keeps its own guard and effect, and the composition adds no action that writes the state of an imported model. The pause only adds guards. So each inductive invariant of a component (Phases 4 to 15) still holds.
 - P-16.3-3. Argument: the imported actions replace the simple actions of sub-phase 16.1 with the same guards (P-4.7-2, P-4.7-4), and `ask` increments `handled` only from `Handling`. So the arguments of P-16.1-2 still apply.
 - P-16.3-1. Evidence: model check.
 
@@ -95,7 +96,7 @@ This phase composes the component models into one Quint model of the whole reque
 - **Files:** modify `src/testing/e2e.rs`.
 - **Quint:** `jarvis.qnt` (conformance).
 
-**Model.** The driver of sub-phase 16.2 maps `ask` and `answer` through `Assistant::handle` with an open dialog, `mark` through `Review`, and `swap` through the training use case with `FakeTrainer`. After each step, it also reads the dialogs, the marks and the training state.
+**Model.** The driver of sub-phase 16.2 maps `ask` and `answer` through `Assistant::handle` with an open dialog, `mark` through `Review`, and `swap` through the training use case with `FakeTrainer`. A start action of `training` also runs the pause with `FakeModels`. The driver does not compare the `training_pause` announces, because `jarvis.qnt` has no action for them. After each step, it also reads the dialogs, the marks and the training state.
 
 **Acceptance criteria.**
 

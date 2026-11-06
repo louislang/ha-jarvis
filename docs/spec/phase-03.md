@@ -339,7 +339,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - **Implements:** G3, G16. **Depends on:** 3.7.
 - **Files:** modify `train/train.py`, `train/test_train.py`.
 
-**Model.** `train(set, device, max_vram_gb) -> JointModel` runs `epochs` passes with `batch_size` and AdamW. On `cuda` with `max_vram_gb`, it first calls `torch.cuda.set_per_process_memory_fraction` with `max_vram_gb` divided by the GPU memory, so a run that needs more fails with "CUDA out of memory" (AC-13.10-5 measures it). `export(model, tokenizer, set, out)` writes `model.onnx` (inputs `input_ids`, `attention_mask`, `token_type_ids`; outputs `intent_logits`, `slot_logits`), `tokenizer.json` and `labels.json` (`labels` and `tags` in set order). `main` does `load_set`, `train`, `export`.
+**Model.** `train(set, device, max_vram_gb) -> JointModel` runs `epochs` passes with `batch_size` and AdamW. On `cuda` with `max_vram_gb`, it first calls `torch.cuda.set_per_process_memory_fraction` with `max_vram_gb` divided by the GPU memory, so a run that needs more fails with "CUDA out of memory" (sub-phase 13.10 then sends the run to RunPod). `export(model, tokenizer, set, out)` writes `model.onnx` (inputs `input_ids`, `attention_mask`, `token_type_ids`; outputs `intent_logits`, `slot_logits`), `tokenizer.json` and `labels.json` (`labels` and `tags` in set order). `main` does `load_set`, `train`, `export`.
 
 **Acceptance criteria.**
 

@@ -73,7 +73,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 - **Implements:** G12. **Depends on:** 15.2.
 - **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `justfile`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `VoiceEmbedder::embed(audio) -> Result<Vec<f32>>` with `SpeakerEmbeddingExtractor`. `VoiceProfiles::enroll(person, embedding)` and `similarities(embedding) -> Map<person, f32>` with `SpeakerEmbeddingManager`, saved to `speaker.voices`. A profile keeps the newest `max_samples` embeddings. `just models` also downloads the speaker model and the multi-speaker test voice `vits-piper-en_US-libritts_r-medium`. This sub-phase adds `[speaker]` (`model`, `voices`, `max_samples`, `voice_threshold`). `voice_threshold` is a voice similarity. Sub-phase 15.6 adds `threshold`, which is a combined score.
+**Model.** `VoiceEmbedder::embed(audio) -> Result<Vec<f32>>` with `SpeakerEmbeddingExtractor`. `VoiceProfiles::enroll(person, embedding)` and `similarities(embedding) -> Map<person, f32>` with `SpeakerEmbeddingManager`, saved to `speaker.voices`. A profile keeps the newest `max_samples` embeddings. `just models` also downloads the speaker model and the multi-speaker test voice `vits-piper-en_US-libritts_r-medium`. This sub-phase adds `[speaker]` (`model`, `voices`, `max_samples`, `voice_threshold`). `voice_threshold` is a voice similarity. Sub-phase 15.6 adds `threshold`, which is a combined score. `LiveModels` (sub-phase 13.10) also keeps the voice embedder session, so the training pause releases it and loads it again.
 
 **Acceptance criteria.**
 
@@ -84,11 +84,12 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 - AC-15.3-5: When the adapter starts, it loads all profiles from the voice store.
 - AC-15.3-6 [GPU host]: With `device = cpu`, one embedding of 3 s of audio has a p95 of less than 80 ms.
 - AC-15.3-7 [GPU host]: With `device = cuda`, the voice embedder runs on the CUDA execution provider.
+- AC-15.3-8: When `LiveModels::release` returns, no reference to the `VoiceEmbedder` fake exists. After `restore`, `embed` returns an embedding.
 
 **Proofs.**
 
 - P-15.3-4. Argument: `enroll` pushes to a bounded deque that drops the oldest element when it is full.
-- P-15.3-1 to P-15.3-3, P-15.3-5 to P-15.3-7. Evidence: test.
+- P-15.3-1 to P-15.3-3, P-15.3-5 to P-15.3-8. Evidence: test.
 
 ---
 
