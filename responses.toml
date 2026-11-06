@@ -14,7 +14,7 @@ responses = ["Putting {{ show }} on the TV.", "Playing {{ show }}."]
 responses = ["It is {{ entity.state }} degrees in the {{ area }}."]
 
 [pools.weather]
-responses = ["Today will be {{ response['weather.home'].forecast[0].condition }}."]
+responses = ["Today will be {{ response['weather.forecast_home'].forecast[0].condition }}."]
 
 [pools.filler]
 responses = ["I will check on that for you.", "Let me look into that.", "One moment."]

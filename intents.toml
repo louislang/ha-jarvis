@@ -47,5 +47,5 @@ kind = "fetch"
 examples = ["what is the weather like", "will it rain today", "what is the forecast"]
 service = "weather.get_forecasts"
 target = "entity"
-entity = "weather.home"
+entity = "weather.forecast_home"
 data = { type = "daily" }

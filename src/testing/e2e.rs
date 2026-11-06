@@ -268,7 +268,7 @@ async fn stream_audio(
     }
 }
 
-/// The reference house with a `weather.home` entity for the `weather` intent.
+/// The reference house with a `weather.forecast_home` entity for the `weather` intent.
 ///
 /// # Errors
 ///
@@ -277,7 +277,7 @@ fn house() -> anyhow::Result<Snapshot> {
     let mut house = fakes::house();
     let first = house.states.first().context("the house has no state")?;
     let mut weather = first.clone();
-    "weather.home".clone_into(&mut weather.entity_id);
+    "weather.forecast_home".clone_into(&mut weather.entity_id);
     house.states.push(weather);
     Ok(house)
 }

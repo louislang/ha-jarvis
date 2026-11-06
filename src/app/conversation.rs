@@ -1163,7 +1163,7 @@ mod tests {
     fn weather() -> ServiceCall {
         ServiceCall {
             return_response: true,
-            ..service("weather", "get_forecasts", "weather.home")
+            ..service("weather", "get_forecasts", "weather.forecast_home")
         }
     }
 
@@ -1549,7 +1549,7 @@ mod tests {
 
     /// The text of `handle` for `text` on `home` from the kitchen device with no satellite, when
     /// the classifier gives `label` and the reasoner gives `steps`. The hot cache also has
-    /// `weather.home`.
+    /// `weather.forecast_home`.
     async fn typed(
         label: &str,
         text: &str,
@@ -1560,7 +1560,7 @@ mod tests {
         reasoner.script(steps);
         let (cache, _changes, conversation) =
             still_with(home, "idle", classifier(Some(label)), reasoner);
-        add(&cache, "weather.home");
+        add(&cache, "weather.forecast_home");
         let context = Context {
             device_id: Some(KITCHEN.to_owned()),
             ..Context::default()
