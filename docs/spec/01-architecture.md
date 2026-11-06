@@ -142,7 +142,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 9. **Habits are a model input.** The application learns habits from the same event stream as the hot cache. The habit summary for the satellite area and the current time is part of the model context. Habits also rank entities and fill missing slots in `decide`.
 10. **Source from the HA context.** Each `state_changed` event has a context. A `user_id` that is not the Jarvis user means `manual`. A `parent_id` means `automation`. No `user_id` and no `parent_id` means a physical device change, which is `manual`. The Jarvis user means `voice`.
 11. **One joint model.** One model gives the intent probabilities and the slot tags. Thus one CPU pass per transcript gives all System One data. Clusters of `unknown` requests use OpenAI embeddings (sub-phase 14.1). These do not change when System One retrains, and the context does not change them.
-12. **Train locally first, with the full GPU.** The process adapter runs `train/train.py` on the GPU of the GPU host. A local run and live Jarvis never share the GPU. Before a local run, Jarvis announces that it is training, stops answering and releases its model sessions. After the run, with success or an error, Jarvis loads them again and answers again. Then it measures the new model (decision 13). When the local run fails (for example, CUDA out of memory), the training use case sends the same training set to the RunPod adapter. A RunPod run does not pause Jarvis. Jarvis predicts with the ONNX model through `ort`. The Python script and the inline script of the review page are the only non-Rust code. The training set file is the contract between them.
+12. **Train locally first, with the full GPU.** The process adapter runs `train/train.py` on the GPU of the GPU host. A local run and live Jarvis never share the GPU. Jarvis does not announce a run. Before a local run, Jarvis mutes the microphones of the satellites that are not muted, stops answering and releases its model sessions. After the run, with success or an error, Jarvis loads them again, unmutes only the microphones that it muted, and answers again. Then it measures the new model (decision 13). When the local run fails (for example, CUDA out of memory), the training use case sends the same training set to the RunPod adapter. A RunPod run does not pause Jarvis or mute the satellites. Jarvis predicts with the ONNX model through `ort`. The Python script and the inline script of the review page are the only non-Rust code. The training set file is the contract between them.
 13. **Accept only an equal or better model.** Jarvis assigns each example to the held-out set by a stable hash of its text. Jarvis measures the old model and the new model on the same held-out set. Jarvis keeps the new model only when its intent accuracy and its slot accuracy are both equal or higher.
 14. **Training trigger.** Jarvis counts changes since the last training run. At `train.min_changes`, Jarvis starts a run. A voice request starts a run at any count. Only one run occurs at a time. After each run, accepted or rejected, the count starts again from 0.
 15. **Speaker identification is not on the critical path.** Jarvis calculates the voice embedding in the background after commit. Only intents with `needs_speaker = true` wait for the result.
@@ -667,9 +667,6 @@ responses = ["I will start training now."]
 [pools.training_busy]
 responses = ["Training is already running."]
 
-[pools.training_pause]
-responses = ["I am training now. I will answer again when training ends."]
-
 [pools.ask_area]
 responses = ["Which room?"]
 
@@ -760,7 +757,7 @@ The test fixtures (`FakeHome`, `FakeHaServer`) model this house. The data comes 
 - Areas: Bedroom, Kitchen, Living Room, Office, Bathroom, Garage, Outside.
 - Location: the test location `41.88`, `-87.63`, not the location of the real house. The temperature unit is `°F`.
 - People: two `person` entities.
-- Satellites: four, in the Bedroom, Kitchen, Living Room and Office. Each area has a "<Area> Presence" `binary_sensor` with no device class and no entity area.
+- Satellites: four, in the Bedroom, Kitchen, Living Room and Office. Each area has a "<Area> Presence" `binary_sensor` with no device class and no entity area. Each satellite device has a mute switch, for example `switch.carson_kitchen_mute_microphones` ("Carson Kitchen Mute Microphones"). `on` means muted. Two mute switches are `on`, one is `off` and one is `unavailable` (from the HA instance on 2026-11-06, sub-phase 13.10).
 - Lights: many lights in each area. "Garage Light" is a `switch`.
 - Fans: "Office Fan" is a `fan`. "Living Room Fan" is a `switch`.
 - Climate: one thermostat, in the Kitchen.

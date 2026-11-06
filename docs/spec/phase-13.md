@@ -1,6 +1,6 @@
 # Phase 13: Training
 
-This phase improves the System One model. Jarvis builds the training set, trains on the GPU host (RunPod when local training fails), pauses itself during a local run, and keeps a new model only when it is equal or better.
+This phase improves the System One model. Jarvis builds the training set, trains on the GPU host (RunPod when local training fails), mutes the satellites and pauses itself during a local run, and keeps a new model only when it is equal or better.
 
 ---
 
@@ -277,7 +277,7 @@ This phase improves the System One model. Jarvis builds the training set, trains
 0. Keep `started := now` and the established habit keys at this time.
 1. `refresh` the generated examples.
 2. Build the training set. Upload only the examples that are not held out. When the held-out set is empty, stop with an error before training.
-3. `train` of the local `Trainer`. Sub-phase 13.10 pauses Jarvis for this call.
+3. `train` of the local `Trainer`. Sub-phase 13.10 mutes the satellites and pauses Jarvis for this call.
 4. `ModelLoader::load` the new folder.
 5. Predict the held-out set with the old and the new classifier.
 6. If `accept`, swap the classifier, write `current` in the training state, and delete the model folders other than the current and the previous one. Else delete the new folder.
@@ -316,10 +316,10 @@ On a final error, the old model stays and the training state does not change. Th
 
 ### 13.10 Training Pause and Fallback
 
-**Goal:** Pause Jarvis for a local training run, and send the same training set to RunPod when the local run fails. A local run gets the full GPU of the GPU host, and a run that does not fit in it still completes.
+**Goal:** Mute the satellites and pause Jarvis for a local training run, and send the same training set to RunPod when the local run fails. A local run gets the full GPU of the GPU host, and a run that does not fit in it still completes.
 
 - **Implements:** G16, G18, G19. **Depends on:** 13.9.
-- **Files:** modify `src/ports.rs`, `src/app/training.rs`, `src/app/conversation.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `responses.toml`.
+- **Files:** modify `src/ports.rs`, `src/domain/state_cache.rs`, `src/app/training.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `src/testing/house.json`.
 - **Quint:** `training.qnt` (conformance with `RUNPOD = true`).
 
 **Model.**
@@ -327,14 +327,16 @@ On a final error, the old model stays and the training state does not change. Th
 - The `Models` port has `release()` and `restore()`. `release` drops the model sessions and returns when no use of them is in progress. `restore` loads them again. `FakeModels` records the calls and can fail the next `restore`.
 - `LiveModels` in `src/lib.rs` implements `Models`. It keeps the sessions of the STT first and second pass, the System One model and TTS in one `tokio::sync::RwLock`. The `Classifier` wrapper of sub-phase 5.4 and new `SpeechToText` and `TextToSpeech` wrappers in `src/lib.rs` take a read guard with `try_read` for each use. A `Listening` session keeps its guard until it ends. When `try_read` fails, the use returns an error at once. `release` takes the write guard, so it waits for the uses in progress, and drops the sessions. `restore` loads them with the load function of `run` and releases the guard.
 - During the pause, `listen` fails, and the Wyoming adapter sends `error` (sub-phase 6.9). `handle` gets the error from `predict` and returns `Err` with a `failure` text (AC-5.3-5). Jarvis does not answer, and it keeps no request for later.
+- The mute switch of a satellite is the `switch` entity whose entity ID ends in `_mute_microphones`, on the same device as the `assist_satellite` entity (FutureProofHomes Satellite1, ESPHome). `on` means muted. `mute_switches(cache) -> MuteSwitches { off, missing }` in `src/domain/state_cache.rs` gives the mute switches whose state is `off` and the satellites that have no mute switch. A switch that is `on` (muted by the user) or `unavailable` is in neither list.
 - Step 3 of the run becomes:
-  1. Put a response from the pool `training_pause` in the announce queue of each satellite in the hot cache (sub-phase 4.9b). Wait until each item ends.
+  1. Log one `warn` event for each satellite in `missing`. Call `switch.turn_on` for each switch in `off`. A failed call logs one `warn` event with the switch and the error. Keep the switches whose call succeeded.
   2. `Models::release`.
   3. Call the local `Trainer`.
   4. `Models::restore`, after a success or an error of the local `Trainer`.
-  5. If the local `Trainer` returned an error and `[train.runpod]` is set, call the RunPod `Trainer` with the same run ID and set. Jarvis answers during this call.
-- When `restore` fails, the training task ends with the error, and `run` returns it, as when a load fails at startup (AC-5.4-3).
-- This sub-phase adds the pool `training_pause` to `responses.toml`.
+  5. Call `switch.turn_off` for each switch that step 1 kept, also when `restore` failed. A failed call logs one `warn` event with the switch and the error.
+  6. If the local `Trainer` returned an error and `[train.runpod]` is set, call the RunPod `Trainer` with the same run ID and set. Jarvis answers during this call, and the satellites are not muted.
+- When `restore` fails, the training task ends with the error after step 5, and `run` returns it, as when a load fails at startup (AC-5.4-3).
+- Section 11 of `01-architecture.md` gives the mute switches of the reference house. This sub-phase adds them to `src/testing/house.json`.
 - The conformance driver compares `paused` with the release state of `FakeModels`. After a start action, it waits until the local `FakeTrainer` has the call.
 
 **Acceptance criteria.**
@@ -344,13 +346,17 @@ On a final error, the old model stays and the training state does not change. Th
 - AC-13.10-3: When the process trainer returns an error and `[train.runpod]` is not set, the old classifier stays and the log names the local error.
 - AC-13.10-4: When `quint-connect` replays 100 traces of `training.qnt` with `RUNPOD = true`, the state matches the model after each step.
 - AC-13.10-5 [GPU host]: After `LiveModels::release`, Jarvis has no GPU session, and the free GPU memory is `train.max_vram_gb` + 0.5 GB or more, so a local run can use the full GPU. After `restore`, Jarvis answers again, and all Phase 9.2 latency tests pass.
-- AC-13.10-6: When the process trainer runs, `FakeHome` has recorded a `training_pause` announce on each satellite, and `FakeModels` is released. After the process trainer returns, with success or an error, `FakeModels` records one `restore`, before any `FakeRunPodTrainer` call.
+- AC-13.10-6: When the process trainer runs, `FakeHome` has recorded `switch.turn_on` for exactly the mute switches of the reference house that were `off`, and no announce, and `FakeModels` is released. After the process trainer returns, with success or an error, `FakeModels` records one `restore`, and `FakeHome` records `switch.turn_off` for exactly the same switches, before any `FakeRunPodTrainer` call.
 - AC-13.10-7: When `LiveModels::release` returns, no reference to the STT, TTS or classifier fakes exists, and `listen` and `handle` return an error. After `restore`, `handle` answers. When a load fails, `restore` returns the error.
+- AC-13.10-8: When the `switch.turn_on` call of a mute switch fails, the log has one `warn` event that names the switch, the process trainer runs, and `FakeHome` records no `switch.turn_off` for that switch. When a `switch.turn_off` call fails, the log has one `warn` event that names the switch, and when both new measures are equal or higher, the next `handle` uses the new classifier.
+- AC-13.10-9: When a satellite device has no mute switch, the log has one `warn` event that names the satellite, and `FakeHome` still records `switch.turn_on` for the mute switch of another satellite that is `off`.
 
 **Proofs.**
 
 - P-13.10-1 to P-13.10-3. Requires: `FallbackOnce`. Argument: the RunPod call is in the `Err` arm of the process call, guarded by `runpod.is_some()`, and it is not in a loop.
-- P-13.10-6. Requires: `PauseOnlyLocal`. Argument: step 3 awaits the announces, `release`, the local `Trainer` and `restore` in sequence. `restore` runs after both arms of the local result, and the RunPod call comes after it.
+- P-13.10-6, P-13.10-9. Ensures: `off` is each `switch` entity with the state `off` and an entity ID that ends in `_mute_microphones`, on the device of an `assist_satellite` entity. `missing` is each `assist_satellite` entity that has no device, or whose device has no such `switch` in any state. Argument: `mute_switches` checks these predicates for each entity of the cache.
+- P-13.10-6. Requires: `PauseOnlyLocal`. Argument: step 3 awaits the mute calls, `release`, the local `Trainer`, `restore` and the unmute calls in sequence. `restore` and the unmute calls run after both arms of the local result, and the RunPod call comes after them. The unmute calls use the switches of step 1, which are a subset of `off`.
+- P-13.10-8. Argument: step 1 keeps only the switches whose call returned `Ok`. Each failed call logs and does not return early.
 - P-13.10-4, P-13.10-5, P-13.10-7. Evidence: test.
 
 ---
@@ -380,7 +386,7 @@ On a final error, the old model stays and the training state does not change. Th
 These steps are not tests and gate nothing.
 
 1. On the GPU host, make `.venv` with Python 3.12 and install `./train` with `uv` (`01-architecture.md` section 10).
-2. Say "Start training". Record that each satellite announces the pause, that Jarvis does not answer during the run, that the run uses the GPU, that Jarvis answers after the run, and that the log shows both accuracies and the decision.
+2. Say "Start training". Record that the satellites that were not muted show the mute state during the run, that a satellite that you muted before the run stays muted after it, that the run uses the GPU, that the other satellites are not muted and Jarvis answers after the run, and that the log shows both accuracies and the decision.
 3. In RunPod, make a network volume, an S3 API key and a serverless endpoint with `ghcr.io/<owner>/jarvis-train:<tag>`. Allow only GPU types with compute capability 9.0 or lower, because torch 2.2.2 has no kernels for newer GPUs (sub-phase 3.5). Set `[train.runpod]`.
 4. Set a base model that is too large for 6 GB. Say "Start training". Record that the run moves to RunPod. Set `train.base_model` back.
 5. Repeat the Phase 9 field log with the trained model.
