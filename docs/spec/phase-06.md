@@ -291,7 +291,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - `SpeechToText::transcribe(samples) -> Result<Option<String>>`. `SherpaStt` holds an optional `OfflineRecognizer` from `[asr].second_pass_dir`. Without it, `transcribe` returns `Ok(None)`. `FakeStt` returns a scripted second-pass text.
 - The second pass loads the files `asr.encoder`, `asr.decoder` and `asr.joiner` in `second_pass_dir`, with the provider string of the first pass (sub-phase 6.6c). Thus the GPU host loads the fp16 Parakeet files with `kSameAsRequested`. `gpu-models` copies the `parakeet-unified-` files of `fp16_models` into the folder of the int8 Parakeet files, as sub-phase 6.6c does for Nemotron.
 - Measurements on the GPU host: `transcribe` of 3 s has a p95 of 29.5 ms with fp16 and 44.2 ms with fp32. Over the 50 phrases of AC-6.7-3, fp16 gives the same text as fp32.
-- Before the decode, `transcribe` adds zeros to the samples up to `asr.max_utterance_ms` of audio, so each decode has the same input length. A longer input does not change. ONNX Runtime builds new cuDNN plans for the fp16 encoder at each new input length: on the GPU host, a decode with a new length had a median of 220 ms, and with the zeros to 8 s it has a median of 34 ms.
+- Before the decode, `transcribe` adds zeros to the samples up to one of two input lengths: up to `SHORT_UTTERANCE_MS = 4000` ms of audio when the samples are 4 s or shorter, else up to `asr.max_utterance_ms`. A longer input does not change. ONNX Runtime builds new cuDNN plans for the fp16 encoder at each new input length: on the GPU host, a decode with a new length had a median of 220 ms, and with the zeros to 8 s it has a median of 34 ms. A shorter input decodes faster, and most commands are shorter than 4 s: with the zeros to 4 s, the p95 is 27 ms.
 - Parakeet writes numbers as digits and symbols ("10 minutes", "30%", "7.30", "3 p.m."). Nemotron writes the same speech as words ("ten minutes", "thirty percent", "seven thirty", "three pm"). `normalize` keeps digits. Thus the two passes give different text for the same speech, and digits would reach System One.
 - `transcribe` returns the second-pass text with its numbers as words, in three steps:
   1. A time with a dot becomes a time with a colon: "H.MM" becomes "H:MM", for an hour from 0 to 23 and two minute digits from 00 to 59.
@@ -310,7 +310,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - AC-6.7-5 [GPU host]: With `device = cuda`, the second pass runs on the CUDA execution provider.
 - AC-6.7-6: When the second-pass text is "Set the lights to 30% at 7.30 p.m. and the heat to 72.5 at 3 p.m.", the normalized converted text is "set the lights to thirty percent at seven thirty pm and the heat to seventy two point five at three pm".
 - AC-6.7-7 [GPU host]: Over 20 runs of `transcribe`, each with a different length, the p95 is 50 ms or less. The runs decode the first 1.5 s to 3.4 s, in 0.1 s steps, of `speech("add dentist to my calendar for monday")` with zeros to 3.4 s.
-- AC-6.7-8: When the samples are shorter than `max_utterance_ms`, the second-pass input is the samples, then zeros up to `max_utterance_ms` of audio.
+- AC-6.7-8: When the samples are shorter than 4 s, the second-pass input is the samples, then zeros up to 4 s of audio. When the samples are longer than 4 s and shorter than `max_utterance_ms`, the input is the samples, then zeros up to `max_utterance_ms` of audio.
 
 **Proofs.**
 
