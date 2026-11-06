@@ -133,11 +133,26 @@ struct Generated {
     responses: Vec<String>,
 }
 
-/// The `call_service` tool: one HA service call.
-fn call_service() -> Tool {
+/// The `call_service` tool: one HA service call, with a description that names the
+/// `read_services`.
+fn call_service(read_services: &[String]) -> Tool {
+    let mut description = format!(
+        "Calls a Home Assistant service on entities of the house. These services return their \
+         data: {}.",
+        read_services.join(", ")
+    );
+    if read_services
+        .iter()
+        .any(|service| service == "calendar.get_events")
+    {
+        description.push_str(
+            " The data of calendar.get_events has start_date_time (default now), and \
+             end_date_time or duration, not both.",
+        );
+    }
     Tool::Function(FunctionTool {
         name: "call_service".to_owned(),
-        description: Some("Calls a Home Assistant service on entities of the house.".to_owned()),
+        description: Some(description),
         parameters: Some(json!({
             "type": "object",
             "properties": {
@@ -345,6 +360,8 @@ pub struct OpenAiReasoner {
     bulk_max_output_tokens: u32,
     /// The most tool calls of one answer.
     max_tool_calls: u32,
+    /// The services that a call runs with `return_response`.
+    read_services: Vec<String>,
     /// The time since the last request after which `warm` sends a request.
     warm_idle: Duration,
     /// The time of the last request, or `None` before the first request.
@@ -377,6 +394,7 @@ impl OpenAiReasoner {
             max_output_tokens: config.max_output_tokens,
             bulk_max_output_tokens: config.bulk_max_output_tokens,
             max_tool_calls: config.max_tool_calls,
+            read_services: config.read_services.clone(),
             warm_idle: Duration::from_secs(config.warm_idle_s),
             last_request: Mutex::new(None),
         })
@@ -426,7 +444,7 @@ impl OpenAiReasoner {
             .model(&self.model)
             .instructions(system_prompt())
             .input(user_message(question))
-            .tools([call_service(), get_states()])
+            .tools([call_service(&self.read_services), get_states()])
             .max_output_tokens(self.max_output_tokens)
             .build()
     }
@@ -987,6 +1005,29 @@ mod tests {
     #[test]
     fn ac_7_7_3_user_message_without_area_lists_the_calendar() {
         assert_eq!(other_lines(None), ["- Family (calendar.family): off"]);
+    }
+
+    /// AC-7.7-5.
+    #[test]
+    fn ac_7_7_5_call_service_names_the_read_services_and_the_calendar_keys() -> anyhow::Result<()> {
+        let Tool::Function(tool) = call_service(&["calendar.get_events".to_owned()]) else {
+            anyhow::bail!("call_service is not a function tool");
+        };
+        let description = tool.description.context("no description")?;
+        let wanted = [
+            "calendar.get_events",
+            "return their data",
+            "start_date_time",
+            "end_date_time",
+            "duration",
+        ];
+        for wanted in wanted {
+            assert!(
+                description.contains(wanted),
+                "{wanted:?} is not in {description:?}"
+            );
+        }
+        Ok(())
     }
 
     /// AC-7.2-5.
