@@ -37,7 +37,7 @@ Dependency rules:
  HA Assist ──Wyoming──▶ adapters/  │  Assistant port              │
  pipeline              wyoming.rs ─┼─▶ (listen, handle, speak)    │   Home port ──────▶ adapters/ha.rs ─────▶ HA API
                                    │        │                     │   SpeechToText ───▶ adapters/sherpa.rs
- Browser ──HTTP──────▶ adapters/   │  Review port                 │   TextToSpeech ───▶ adapters/sherpa.rs
+ Browser ──HTTP──────▶ adapters/   │  Review port                 │   TextToSpeech ───▶ adapters/supertonic.rs
                        web.rs ─────┼─▶ (list, mark, proposals)    │   VoiceEmbedder ──▶ adapters/sherpa.rs
                                    │        │                     │   VoiceProfiles ──▶ adapters/sherpa.rs
                                    │   ┌────▼──── app/ ─────────┐ │   Classifier ─────▶ adapters/onnx.rs
@@ -64,7 +64,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | `Review` | Driving | `list`, `audio`, `mark`, `intents`, `proposals`, `resolve` | Implemented by `app/review.rs`. Called by `adapters/web.rs`. |
 | `Home` | Driven | `snapshot`, `events`, `call`, `announce`, `ask`, `history` | `adapters/ha.rs` |
 | `SpeechToText` | Driven | `stream` (first pass: gives `accept`, `partial`, `reset`), `transcribe` (second pass) | `adapters/sherpa.rs` |
-| `TextToSpeech` | Driven | `synth` | `adapters/sherpa.rs` |
+| `TextToSpeech` | Driven | `synth` | `adapters/supertonic.rs` |
 | `VoiceEmbedder` | Driven | `embed` | `adapters/sherpa.rs` |
 | `VoiceProfiles` | Driven | `enroll`, `similarities` | `adapters/sherpa.rs` |
 | `Classifier` | Driven | `predict` | `adapters/onnx.rs` |
@@ -161,6 +161,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 28. **Two-pass STT.** The first pass streams, so Jarvis knows the words while the user speaks. It uses NVIDIA Nemotron Speech Streaming EN 0.6B with 160 ms chunks on the GPU host. The first pass gives the last word only after the VAD ends the segment and flushes the model (sub-phase 6.6c). The VAD ends the segment `vad_min_silence_ms` after the voice end, and an early commit comes `early_commit_ms` after the voice end (sub-phase 9.1b). `vad_min_silence_ms < early_commit_ms` (sub-phase 2.2), so the flush comes before an early commit. At commit, the second pass decodes the whole utterance with NVIDIA Parakeet Unified EN 0.6B in offline mode. The second pass has full context, so it is more accurate. The second pass adds zeros to each utterance up to 4 s, or up to `max_utterance_ms` for a longer utterance, so each decode has one of two input lengths (sub-phase 6.7). On the Open ASR Leaderboard sets, the average word error rate goes from 7.67% to 5.91%, and on LibriSpeech test-clean from 2.56% to 1.63%. HA receives the second-pass text on the GPU host. Both models are official sherpa-onnx exports. The GPU host runs fp16 conversions of them (sub-phase 6.6c). Cloud streaming APIs take about 250 ms to 300 ms to give the final text, so they cannot meet G1. CPU machines use the same first pass and have no second pass.
 29. **Blocking work off the async workers.** STT decoding, the second pass, `predict`, TTS synthesis, voice embedding and SQLite calls run in `tokio::task::spawn_blocking`. The async workers only move bytes and wait. Thus a decode for one satellite does not delay `handle` for another.
 30. **Remote data through plugins.** Data from a remote server, for example a weather forecast, reaches Jarvis only through a `Plugin` adapter. Jarvis code builds the request and parses the reply into a typed result. Thus the result is the same for the same reply, and no model sees a raw API call. System Two gets each plugin as its own tool, for example `get_weather(when)`. A System One fetch intent names a plugin. The plugin registry keeps each result for `plugins.cache_s`. A plugin only reads data, so it has no `allowed_domains` check. System Two still calls HA services directly, within `openai.allowed_domains` (sub-phase 7.5). The weather plugin uses Open-Meteo, which needs no API key, with the location of the HA configuration. The Plex plugin reads the recently added items and the On Deck list of the Plex server with a token (phase 18).
+31. **Fixed TTS input lengths.** ONNX Runtime keeps the cuDNN state of a `Conv` node only for its last input shape, so each new reply length added about 230 ms to the TTS on the GPU host. Jarvis runs the four Supertonic-3 graphs itself through `ort`, with the fp32 vector estimator and vocoder. It adds zeros and masks to each input up to one of two lengths: 64 text ids and 64 latent frames, or 160 text ids and 192 latent frames. Each length has its own set of sessions, so a change of length builds no new plans. A longer input keeps its length (sub-phases 9.3 and 9.3b).
 
 ## 6. Latency Budget (System One)
 
@@ -177,7 +178,7 @@ The budget is the response latency (`00-overview.md` section 0.3). HA's own time
 
 The budget applies to the GPU host. The `gpu-test` job runs the latency tests there (section 10).
 
-With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan commands and 353 ms to 378 ms for the light commands. Thus AC-9.2-5 gives the light commands 400 ms. A response that is not in the audio cache waits for the synthesis, and the TTS alone takes about 315 ms to the first audio chunk. Its p95 is 654 ms, so AC-9.2-4 gives it 700 ms, until sub-phase 9.3 streams the TTS. The `unknown` filler measures 697 ms, so AC-9.2-3 gives it `endpoint_ms` + 150 ms.
+With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan commands and 353 ms to 378 ms for the light commands. Thus AC-9.2-5 gives the light commands 400 ms. A response that is not in the audio cache waits for the synthesis. With sherpa-onnx, the TTS alone took about 315 ms to the first audio chunk, and the p95 was 654 ms, so AC-9.2-4 gave it 700 ms. With fixed input lengths (decision 31), the TTS of a reply in `responses.toml` has a p95 of 53.0 ms on the GPU host. AC-9.3c-1 gives an uncached response 400 ms, the target of the light commands. The `unknown` filler measures 697 ms, so AC-9.2-3 gives it `endpoint_ms` + 150 ms.
 
 ## 7. Crates
 
@@ -201,9 +202,11 @@ With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan c
 | `futures` | Ports, application, adapters | `Stream` for events, partial transcripts and sentences. |
 | `async-trait` | Ports, application, adapters, root | Async methods on port traits behind `Arc<dyn Port>`. |
 | `tokio-tungstenite`, `futures-util` | Adapter | HA WebSocket API. |
-| `sherpa-onnx` (`=2.0.1`, feature `shared`) | Adapter | Streaming STT (`OnlineRecognizer`), TTS (`OfflineTts`, Supertonic-3 model), voice identification (`SpeakerEmbeddingExtractor`, `SpeakerEmbeddingManager`). CUDA or CPU provider. |
+| `sherpa-onnx` (`=2.0.1`, feature `shared`) | Adapter | Streaming STT (`OnlineRecognizer`), voice identification (`SpeakerEmbeddingExtractor`, `SpeakerEmbeddingManager`). CUDA or CPU provider. |
 | `text-processing-rs` | Adapter | Numbers as words in the second-pass text (`tn_normalize_sentence`). |
-| `ort` (features `load-dynamic`, `cuda`), `tokenizers` | Adapter | System One model prediction with ONNX Runtime (CUDA or CPU execution provider). Tokenizer from `tokenizer.json`. |
+| `ort` (features `load-dynamic`, `cuda`), `tokenizers` | Adapter | System One model prediction and the Supertonic-3 TTS graphs with ONNX Runtime (CUDA or CPU execution provider). Tokenizer from `tokenizer.json`. |
+| `rand_distr` | Adapter | Seeded normal noise of the Supertonic-3 latent (`StandardNormal`). |
+| `unicode-normalization` | Adapter | NFKD of the TTS text before the Supertonic-3 indexer. |
 | `reqwest` | Adapter | RunPod serverless REST API. Open-Meteo forecast API (features `json`, `query`). Plex server API. |
 | `object_store` (feature `aws`) | Adapter | RunPod network volume through its S3-compatible API. |
 | `async-openai` | Adapter | OpenAI Responses API: streaming, tools, structured output, `previous_response_id`. |
@@ -317,7 +320,8 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/adapters/onnx.rs` | Adapter | `Classifier` and `ModelLoader` with ONNX Runtime. | 3.12 |
 | `src/adapters/files.rs` | Adapter | `Store<T>` with TOML or JSON files and atomic write. | 4.3 |
 | `src/adapters/wyoming.rs` | Driving adapter | Wyoming TCP server. It calls `Assistant`. | 5.1 |
-| `src/adapters/sherpa.rs` | Adapter | `SpeechToText` (first and second pass), `TextToSpeech`, `VoiceEmbedder`, `VoiceProfiles` with sherpa-onnx. | 6.2 |
+| `src/adapters/sherpa.rs` | Adapter | `SpeechToText` (first and second pass), `VoiceEmbedder`, `VoiceProfiles` with sherpa-onnx. | 6.2 |
+| `src/adapters/supertonic.rs` | Adapter | `TextToSpeech` with the Supertonic-3 graphs in ONNX Runtime and fixed input lengths. | 9.3 |
 | `src/adapters/openai.rs` | Adapter | `Reasoner` with OpenAI. Prompt builders. | 7.1 |
 | `src/adapters/sqlite.rs` | Adapter | `InteractionLog` with SQLite. | 12.4 |
 | `src/adapters/web.rs` | Driving adapter | Review web server with token auth. It calls `Review`. | 12.8 |
@@ -724,13 +728,13 @@ VRAM budget of live Jarvis on the GPU host (6 GB). A local training run does not
 | STT first pass (Nemotron 0.6B, fp16) | 1.25 GB |
 | STT second pass (Parakeet Unified 0.6B, fp16) | 1.25 GB |
 | System One model | 0.3 GB |
-| TTS (Supertonic-3) and voice identification (CAM++) | 0.4 GB |
+| TTS (Supertonic-3 fp32, one session set for each input length) and voice identification (CAM++) | 1.2 GB |
 | ONNX Runtime arenas and CUDA context | 0.8 GB |
 | Margin | 0.5 GB |
 | Reserve (not usable on a 6 GB card) | 0.5 GB |
-| **Total** | **5.0 GB** |
+| **Total** | **5.8 GB** |
 
-The model budgets assume fp16 weights. The GPU host does not run the int8 STT models, because ONNX Runtime runs their int8 operators on the CPU (sub-phase 6.6c). Each fp16 STT session takes about 1.2 GB with the CUDA option `arena_extend_strategy=kSameAsRequested`, and about 2.1 GB with the default arena. With this option on both STT sessions, the measured peak of both STT passes, the System One model and TTS is 3.57 GB (5.23 GB with the default arena). The usable budget is 5.5 GB. GPU host tests measure the real peak and check that each model runs on the CUDA execution provider (AC-3.12b-3, AC-6.1-3, AC-6.2-5, AC-6.6c-4, AC-6.7-5, AC-15.3-7). Before a local run, Jarvis releases its model sessions, and it loads them again after the run (decision 12, sub-phase 13.10). Thus during the run, the usable 5.5 GB has the CUDA context of the Jarvis process (0.5 GB), the CUDA context of the training process (0.5 GB) and the PyTorch memory of the run. The process trainer limits the PyTorch memory to `train.max_vram_gb` (`torch.cuda.set_per_process_memory_fraction`), 4.5 GB. If a local run fails with "CUDA out of memory", the run moves to RunPod (decision 12).
+The model budgets assume fp16 weights. The GPU host does not run the int8 STT models, because ONNX Runtime runs their int8 operators on the CPU (sub-phase 6.6c). Each fp16 STT session takes about 1.2 GB with the CUDA option `arena_extend_strategy=kSameAsRequested`, and about 2.1 GB with the default arena. With this option on both STT sessions, the measured peak of both STT passes, the System One model and the int8 sherpa-onnx TTS is 3.57 GB (5.23 GB with the default arena). The fp32 TTS of sub-phases 9.3 and 9.3b, with one session set for each input length, takes 1694 MiB alone on the GPU host. That figure has its own CUDA context, which the context row counts, so the TTS row has 1.2 GB. The new TTS takes about 1.05 GB more than the int8 TTS, so the peak becomes about 4.6 GB to 4.7 GB. AC-9.3c-2 measures it. The usable budget is 5.5 GB. GPU host tests measure the real peak and check that each model runs on the CUDA execution provider (AC-3.12b-3, AC-6.1-3, AC-6.2-5, AC-6.6c-4, AC-6.7-5, AC-15.3-7). Before a local run, Jarvis releases its model sessions, and it loads them again after the run (decision 12, sub-phase 13.10). Thus during the run, the usable 5.5 GB has the CUDA context of the Jarvis process (0.5 GB), the CUDA context of the training process (0.5 GB) and the PyTorch memory of the run. The process trainer limits the PyTorch memory to `train.max_vram_gb` (`torch.cuda.set_per_process_memory_fraction`), 4.5 GB. If a local run fails with "CUDA out of memory", the run moves to RunPod (decision 12).
 
 The GPU host needs the NVIDIA driver, CUDA 12, cuDNN 9, and a Python 3.12 virtual environment in `.venv`. The host has only Python 3.14, so `uv` installs Python 3.12:
 
