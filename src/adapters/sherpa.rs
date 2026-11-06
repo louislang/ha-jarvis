@@ -46,6 +46,10 @@ const WINDOW: u16 = 512;
 /// the last token about 410 ms of audio after the last voiced sample, and 480 ms is not enough.
 const FLUSH: usize = 10_240;
 
+/// The length of a short second-pass input. A shorter input decodes faster, and most commands
+/// are shorter than 4 s.
+const SHORT_UTTERANCE_MS: u64 = 4000;
+
 /// A `SpeechToText` with a streaming transducer, the Silero VAD and an optional offline
 /// transducer.
 pub struct SherpaStt {
@@ -57,6 +61,8 @@ pub struct SherpaStt {
     vad: VadModelConfig,
     /// The silence in samples that ends a VAD speech segment.
     min_silence: u64,
+    /// The length of a second-pass input longer than `SHORT_UTTERANCE_MS`.
+    max_utterance_ms: u64,
 }
 
 impl SherpaStt {
@@ -68,6 +74,7 @@ impl SherpaStt {
     pub fn try_new(config: &AsrConfig, device: Device) -> anyhow::Result<Self> {
         let vad = vad(config);
         let min_silence = config.vad_min_silence_ms * u64::from(RATE) / 1000;
+        let max_utterance_ms = config.max_utterance_ms;
         let second_pass = second_pass(config, device)?;
         let dir = &config.model_dir;
         let file = |name: &str| Some(file(dir, name));
@@ -94,6 +101,7 @@ impl SherpaStt {
             second_pass,
             vad,
             min_silence,
+            max_utterance_ms,
         })
     }
 }
@@ -169,7 +177,8 @@ impl SpeechToText for SherpaStt {
             return Ok(None);
         };
         let stream = recognizer.create_stream();
-        stream.accept_waveform(i32::from(RATE), &wave(samples));
+        let wave = padded(samples, self.max_utterance_ms)?;
+        stream.accept_waveform(i32::from(RATE), &wave);
         recognizer.decode(&stream);
         let result = stream
             .get_result()
@@ -323,6 +332,26 @@ fn wave(samples: &[i16]) -> Vec<f32> {
         .iter()
         .map(|&sample| f32::from(sample) / f32::from(i16::MAX))
         .collect()
+}
+
+/// The wave of `samples` with zeros up to `SHORT_UTTERANCE_MS`, or up to `max_utterance_ms` for
+/// longer samples. ONNX Runtime builds new cuDNN plans for each new input length of the fp16
+/// encoder, which adds about 190 ms to a decode.
+///
+/// # Errors
+///
+/// A length does not fit in `usize`.
+fn padded(samples: &[i16], max_utterance_ms: u64) -> anyhow::Result<Vec<f32>> {
+    let length = |ms: u64| usize::try_from(ms * u64::from(RATE) / 1000);
+    let short = length(SHORT_UTTERANCE_MS)?;
+    let target = if samples.len() <= short {
+        short
+    } else {
+        length(max_utterance_ms)?
+    };
+    let mut wave = wave(samples);
+    wave.resize(wave.len().max(target), 0.0);
+    Ok(wave)
 }
 
 /// A `TextToSpeech` with the Supertonic-3 model. It runs each synthesis on a blocking thread.
@@ -835,26 +864,79 @@ mod tests {
         Ok(())
     }
 
-    /// AC-6.7-4.
-    #[tokio::test]
-    #[ignore = "GPU host"]
-    async fn ac_6_7_4_three_second_utterance_p95() -> anyhow::Result<()> {
-        let stt = stt(Device::Cuda)?;
+    /// The samples of `speech("add dentist to my calendar for monday")` with zeros or a cut to
+    /// `tenths` tenths of a second.
+    async fn dentist(tenths: usize) -> anyhow::Result<Vec<i16>> {
         let mut samples = fakes::speech("add dentist to my calendar for monday")
             .await?
             .samples;
-        samples.resize(3 * usize::from(RATE), 0);
-        stt.transcribe(&samples)?;
+        samples.resize(tenths * usize::from(RATE) / 10, 0);
+        Ok(samples)
+    }
+
+    /// The p95 of the `transcribe` times of each of `inputs` on CUDA, after a warm-up with
+    /// `warm_up`, and the sorted times.
+    fn cuda_p95(warm_up: &[i16], inputs: &[&[i16]]) -> anyhow::Result<(Duration, Vec<Duration>)> {
+        let stt = stt(Device::Cuda)?;
+        stt.transcribe(warm_up)?;
         let mut times = Vec::new();
-        for _ in 0..20 {
+        for input in inputs {
             let start = Instant::now();
-            stt.transcribe(&samples)?;
+            stt.transcribe(input)?;
             times.push(start.elapsed());
         }
         times.sort();
         // The 95th percentile of 20 times is the 19th.
-        let p95 = times[18];
+        Ok((times[18], times))
+    }
+
+    /// AC-6.7-4.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn ac_6_7_4_three_second_utterance_p95() -> anyhow::Result<()> {
+        let samples = dentist(30).await?;
+        let (p95, times) = cuda_p95(&samples, &[samples.as_slice(); 20])?;
         assert!(p95 < Duration::from_millis(40), "p95 {p95:?} of {times:?}");
+        Ok(())
+    }
+
+    /// AC-6.7-7.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn ac_6_7_7_new_lengths_p95() -> anyhow::Result<()> {
+        use std::io::Write;
+
+        let samples = dentist(34).await?;
+        let prefix = |tenths: usize| &samples[..tenths * usize::from(RATE) / 10];
+        let inputs: Vec<&[i16]> = (15..35).map(prefix).collect();
+        // The warm-up has a length that no run has.
+        let (p95, times) = cuda_p95(prefix(10), &inputs)?;
+        // The test harness captures `eprintln!` of a test that passes, but not a direct write.
+        writeln!(std::io::stderr(), "AC-6.7-7: p95 {p95:?} of {times:?}")?;
+        assert!(p95 <= Duration::from_millis(50), "p95 {p95:?} of {times:?}");
+        Ok(())
+    }
+
+    /// AC-6.7-8.
+    #[tokio::test]
+    async fn ac_6_7_8_input_has_zeros_to_4_s_or_max_utterance() -> anyhow::Result<()> {
+        let max_utterance_ms = config()?.asr.max_utterance_ms;
+        let short = fakes::speech(REQUEST).await?.samples;
+        let long: Vec<i16> = short
+            .iter()
+            .copied()
+            .cycle()
+            .take(5 * usize::from(RATE))
+            .collect();
+        for (samples, ms) in [(short, 4000), (long, max_utterance_ms)] {
+            let length = usize::try_from(ms)? * usize::from(RATE) / 1000;
+            assert!(samples.len() < length, "{} samples", samples.len());
+            let input = padded(&samples, max_utterance_ms)?;
+            assert_eq!(input.len(), length, "{} samples", samples.len());
+            let (speech, zeros) = input.split_at(samples.len());
+            assert_eq!(speech, wave(&samples));
+            assert!(zeros.iter().all(|&zero| zero == 0.0), "{zeros:?}");
+        }
         Ok(())
     }
 
