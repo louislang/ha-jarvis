@@ -46,6 +46,10 @@ const WINDOW: u16 = 512;
 /// the last token about 410 ms of audio after the last voiced sample, and 480 ms is not enough.
 const FLUSH: usize = 10_240;
 
+/// The length of a short second-pass input. A shorter input decodes faster, and most commands
+/// are shorter than 4 s.
+const SHORT_UTTERANCE_MS: u64 = 4000;
+
 /// A `SpeechToText` with a streaming transducer, the Silero VAD and an optional offline
 /// transducer.
 pub struct SherpaStt {
@@ -57,7 +61,7 @@ pub struct SherpaStt {
     vad: VadModelConfig,
     /// The silence in samples that ends a VAD speech segment.
     min_silence: u64,
-    /// The length of each second-pass input.
+    /// The length of a second-pass input longer than `SHORT_UTTERANCE_MS`.
     max_utterance_ms: u64,
 }
 
@@ -172,9 +176,9 @@ impl SpeechToText for SherpaStt {
         let Some(recognizer) = &self.second_pass else {
             return Ok(None);
         };
-        let length = usize::try_from(self.max_utterance_ms * u64::from(RATE) / 1000)?;
         let stream = recognizer.create_stream();
-        stream.accept_waveform(i32::from(RATE), &padded(samples, length));
+        let wave = padded(samples, self.max_utterance_ms)?;
+        stream.accept_waveform(i32::from(RATE), &wave);
         recognizer.decode(&stream);
         let result = stream
             .get_result()
@@ -330,12 +334,24 @@ fn wave(samples: &[i16]) -> Vec<f32> {
         .collect()
 }
 
-/// The wave of `samples` with zeros up to `length` samples. ONNX Runtime builds new cuDNN plans
-/// for each new input length of the fp16 encoder, which adds about 190 ms to a decode.
-fn padded(samples: &[i16], length: usize) -> Vec<f32> {
+/// The wave of `samples` with zeros up to `SHORT_UTTERANCE_MS`, or up to `max_utterance_ms` for
+/// longer samples. ONNX Runtime builds new cuDNN plans for each new input length of the fp16
+/// encoder, which adds about 190 ms to a decode.
+///
+/// # Errors
+///
+/// A length does not fit in `usize`.
+fn padded(samples: &[i16], max_utterance_ms: u64) -> anyhow::Result<Vec<f32>> {
+    let length = |ms: u64| usize::try_from(ms * u64::from(RATE) / 1000);
+    let short = length(SHORT_UTTERANCE_MS)?;
+    let target = if samples.len() <= short {
+        short
+    } else {
+        length(max_utterance_ms)?
+    };
     let mut wave = wave(samples);
-    wave.resize(wave.len().max(length), 0.0);
-    wave
+    wave.resize(wave.len().max(target), 0.0);
+    Ok(wave)
 }
 
 /// A `TextToSpeech` with the Supertonic-3 model. It runs each synthesis on a blocking thread.
@@ -903,15 +919,24 @@ mod tests {
 
     /// AC-6.7-8.
     #[tokio::test]
-    async fn ac_6_7_8_input_has_zeros_to_max_utterance() -> anyhow::Result<()> {
-        let samples = fakes::speech(REQUEST).await?.samples;
-        let length = usize::try_from(config()?.asr.max_utterance_ms)? * usize::from(RATE) / 1000;
-        assert!(samples.len() < length, "{} samples", samples.len());
-        let input = padded(&samples, length);
-        assert_eq!(input.len(), length);
-        let (speech, zeros) = input.split_at(samples.len());
-        assert_eq!(speech, wave(&samples));
-        assert!(zeros.iter().all(|&zero| zero == 0.0), "{zeros:?}");
+    async fn ac_6_7_8_input_has_zeros_to_4_s_or_max_utterance() -> anyhow::Result<()> {
+        let max_utterance_ms = config()?.asr.max_utterance_ms;
+        let short = fakes::speech(REQUEST).await?.samples;
+        let long: Vec<i16> = short
+            .iter()
+            .copied()
+            .cycle()
+            .take(5 * usize::from(RATE))
+            .collect();
+        for (samples, ms) in [(short, 4000), (long, max_utterance_ms)] {
+            let length = usize::try_from(ms)? * usize::from(RATE) / 1000;
+            assert!(samples.len() < length, "{} samples", samples.len());
+            let input = padded(&samples, max_utterance_ms)?;
+            assert_eq!(input.len(), length, "{} samples", samples.len());
+            let (speech, zeros) = input.split_at(samples.len());
+            assert_eq!(speech, wave(&samples));
+            assert!(zeros.iter().all(|&zero| zero == 0.0), "{zeros:?}");
+        }
         Ok(())
     }
 
