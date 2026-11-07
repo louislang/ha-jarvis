@@ -2,7 +2,7 @@
 
 This phase adds System One query intents about the house, Music Assistant playback and Plex playback. The queries read only the hot cache and make no service call. The music intents call `music_assistant.play_media` and the `media_player` services on the speaker of the area. The Plex intents call `media_player.play_media` with a `plex://` content ID on the TV. The list of new Plex shows comes from the Plex server, so it is a plugin (`01-architecture.md` decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 17 and before phase 10.
 
-Each sub-phase that adds an intent adds its seed examples to `intents.toml` and its pool to `responses.toml` (`01-architecture.md` section 12). The training set then changes, so `just fixture-model` trains the fixture model again (sub-phase 3.9), and CI trains it again because the cache key is the hash of the training set. AC-3.12-1 to AC-3.12-4 then check the new seed examples. When the fixture model does not learn a new example, the PR changes the examples, not the tests. Jarvis serves the fixture model until sub-phase 13.9, and the training runs of phase 13 use the same seed examples. Sub-phase 10.4 adds the `ask_<slot>` pools for the new slots (`media`, `movie`, `season`, `episode`, `volume`). The tests of the intent sub-phases decide with the catalog of `intents.toml`, the pools of `responses.toml` and the reference house. A test that needs an entity that the reference house does not have adds it to the snapshot before it loads the cache.
+Each sub-phase that adds an intent adds its seed examples to `intents.toml` and its pool to `responses.toml` (`01-architecture.md` section 12). The training set then changes, so `just fixture-model` trains the fixture model again (sub-phase 3.9), and CI trains it again because the cache key is the hash of the training set. AC-3.12-1 to AC-3.12-4 then check the new seed examples. When the fixture model does not learn a new example, the PR changes the examples, not the tests. Jarvis serves the fixture model until sub-phase 13.9, and the training runs of phase 13 use the same seed examples. Sub-phase 10.4 adds the `ask_<slot>` pools for the new slots (`media`, `movie`, `season`, `episode`, `volume`). The tests of the intent sub-phases decide with the catalog of `intents.toml`, the pools of `responses.toml` and the reference house. A test that needs an entity that the reference house does not have adds it to the snapshot before it loads the cache. The tests of AC-3.2-1 and AC-3.2c-2 in `src/domain/catalog.rs` list the intent names in the order of `intents.toml`, so each such sub-phase adds its names there. The fixture model gives each seed example a context by its position, so a new intent can move the contexts of the examples after it. The order of the new intents can change to keep the existing tests passing.
 
 ---
 
@@ -52,7 +52,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Add the queries about lights. "Is the garage light on", "which lights are on" and "how bright is the office light" then get a local answer.
 
 - **Implements:** G3, G9. **Depends on:** 18.1.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `justfile` (the fixture epochs, sub-phase 3.9).
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/catalog.rs`, `justfile` (the fixture epochs, sub-phase 3.9).
 
 **Model.**
 
@@ -78,7 +78,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Add read-only queries about locks, the garage door and windows. "Is the front door locked" then gets a local answer, and no voice command can lock or unlock a door.
 
 - **Implements:** G3. **Depends on:** 18.2.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/catalog.rs`.
 
 **Model.**
 
@@ -107,7 +107,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Add the queries about the thermostat and the fans. "What is the thermostat set to", "is the AC on" and "is the fan on" then get a local answer.
 
 - **Implements:** G3, G9. **Depends on:** 18.3.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/catalog.rs`.
 
 **Model.**
 
@@ -131,7 +131,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Add the queries "who is home" and "is the alarm set". Jarvis then answers them from the `person` and `alarm_control_panel` states.
 
 - **Implements:** G3. **Depends on:** 18.4.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/catalog.rs`.
 
 **Model.**
 
@@ -155,7 +155,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Add the query "what is playing". Jarvis then names the media that plays in the area.
 
 - **Implements:** G3, G9. **Depends on:** 18.5.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/catalog.rs`.
 
 **Model.**
 
@@ -179,7 +179,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Add Music Assistant playback by name, radio mode and the queue. "Play jazz in the kitchen" then plays on the kitchen speaker.
 
 - **Implements:** G3, G9. **Depends on:** 18.6.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/catalog.rs`.
 
 **Model.**
 
@@ -208,7 +208,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Add the next track, pause and volume commands for the speaker of the area. "Next song" and "turn it up" then act on the music in the room.
 
 - **Implements:** G3, G9. **Depends on:** 18.7.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/catalog.rs`.
 
 **Model.**
 
@@ -236,7 +236,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Add Plex movies, the next episode of a show and one episode by number on the TV. "Put on The Matrix" and "season 2 episode 5 of The Office" then play through Plex.
 
 - **Implements:** G3. **Depends on:** 18.8.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/responses.rs`, `Cargo.toml`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/catalog.rs`, `src/domain/responses.rs`, `Cargo.toml`.
 
 **Model.**
 
@@ -264,7 +264,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Add pause, skip ahead and stop for the TV. "Pause the TV" then acts on the TV of the house.
 
 - **Implements:** G3. **Depends on:** 18.9.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/app/conversation.rs`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/catalog.rs`, `src/app/conversation.rs`.
 
 **Model.**
 
@@ -340,7 +340,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Add the System One fetch intent `new_shows` through the Plex plugin. "Are there any new shows" then gets a filler, and then the new shows and the shows to continue.
 
 - **Implements:** G3, G6. **Depends on:** 18.11.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/app/conversation.rs`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/catalog.rs`, `src/app/conversation.rs`.
 
 **Model.**
 
