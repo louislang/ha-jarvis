@@ -27,11 +27,11 @@ use crate::Device;
 use crate::adapters::sherpa;
 use crate::adapters::wyoming;
 use crate::domain::state::ServiceCall;
-use crate::domain::state::Snapshot;
 use crate::ports::Home;
 use crate::ports::Reasoner;
 use crate::testing::fakes;
 use crate::testing::fakes::FakeHome;
+use crate::testing::fakes::FakePlugin;
 use crate::testing::fakes::FakeReasoner;
 use crate::testing::fakes::FakeWyomingClient;
 
@@ -99,7 +99,7 @@ impl Pipeline {
     pub(crate) async fn start(device: Device) -> anyhow::Result<Self> {
         let folder = tempfile::tempdir()?;
         let config = config(device, folder.path())?;
-        let home = Arc::new(FakeHome::new(house()?));
+        let home = Arc::new(FakeHome::default());
         let reasoner = Arc::new(FakeReasoner::default());
         let (house, two) = (Arc::clone(&home) as _, Arc::clone(&reasoner) as _);
         let (address, tracker) = serve(&config, house, two).await?;
@@ -209,8 +209,9 @@ impl Pipeline {
     }
 }
 
-/// Starts the app of `config` on `home`, `reasoner` and no plugins, waits for its pre-render and
-/// serves it on a local port. Gives the address and the tracker of the connection tasks.
+/// Starts the app of `config` on `home`, `reasoner` and a `get_weather` plugin with no result,
+/// waits for its pre-render and serves it on a local port. Gives the address and the tracker of
+/// the connection tasks.
 ///
 /// # Errors
 ///
@@ -222,7 +223,7 @@ async fn serve(
 ) -> anyhow::Result<(SocketAddr, TaskTracker)> {
     let catalog = crate::load_catalog(&config.intents)?;
     let pools = crate::load_pools(&config.responses, &catalog)?;
-    let plugins = crate::registry(config, Vec::new());
+    let plugins = crate::registry(config, vec![Arc::new(FakePlugin::new("get_weather"))]);
     let (app, _, prerender) =
         crate::start_app(config, catalog, pools, home, reasoner, plugins).await?;
     prerender.await?;
@@ -275,20 +276,6 @@ async fn stream_audio(
     loop {
         send_chunks(writer, &[0; CHUNK_SAMPLES], ticks.as_mut()).await?;
     }
-}
-
-/// The reference house with a `weather.forecast_home` entity for the `weather` intent.
-///
-/// # Errors
-///
-/// The house has no state.
-fn house() -> anyhow::Result<Snapshot> {
-    let mut house = fakes::house();
-    let first = house.states.first().context("the house has no state")?;
-    let mut weather = first.clone();
-    "weather.forecast_home".clone_into(&mut weather.entity_id);
-    house.states.push(weather);
-    Ok(house)
 }
 
 /// The configuration of `device` (`01-architecture.md` section 9) with `pools.json` in `folder`:

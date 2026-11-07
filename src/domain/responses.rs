@@ -869,24 +869,6 @@ mod tests {
         assert_eq!(result, unknown("filler", "area"));
     }
 
-    /// The `weather` pool speaks words for an HA condition, and an unknown condition as it is.
-    #[test]
-    fn weather_speaks_condition_words() {
-        let file: toml::Table = toml::from_str(RESPONSES).expect("responses.toml is TOML");
-        let template = file["pools"]["weather"]["responses"][0].as_str();
-        let template = template.expect("the weather pool has a response");
-        let spoken = |condition: &str| {
-            let forecast = serde_json::json!({ "forecast": [{ "condition": condition }] });
-            let response = serde_json::json!({ "weather.forecast_home": forecast });
-            let context = serde_json::Map::from_iter([("response".to_owned(), response)]);
-            render(template, &context).expect("the weather template renders")
-        };
-        assert_eq!(spoken("partlycloudy"), "Today will be partly cloudy.");
-        assert_eq!(spoken("windy-variant"), "Today will be windy and cloudy.");
-        assert_eq!(spoken("sunny"), "Today will be sunny.");
-        assert_eq!(spoken("smoky"), "Today will be smoky.");
-    }
-
     /// A pool with one unused response for each of `texts`.
     fn texts(texts: &[&str]) -> Pool {
         let responses = texts.iter().map(|text| Response {

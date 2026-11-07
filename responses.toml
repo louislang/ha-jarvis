@@ -14,8 +14,7 @@ responses = ["Putting {{ show }} on the TV.", "Playing {{ show }}."]
 responses = ["It is {{ entity.state }} degrees in the {{ area }}."]
 
 [pools.weather]
-# HA gives a condition value such as `partlycloudy`, which TTS cannot say.
-responses = ["{% set words = {'clear-night': 'clear', 'fog': 'foggy', 'hail': 'stormy with hail', 'lightning': 'stormy', 'lightning-rainy': 'stormy with rain', 'partlycloudy': 'partly cloudy', 'pouring': 'very rainy', 'snowy-rainy': 'snowy with rain', 'windy-variant': 'windy and cloudy'} %}{% set condition = response['weather.forecast_home'].forecast[0].condition %}Today will be {{ words[condition] if condition in words else condition }}."]
+responses = ["Today will be {{ response.condition }}, with a high of {{ response.high }} degrees."]
 
 [pools.filler]
 responses = ["I will check on that for you.", "Let me look into that.", "One moment."]
