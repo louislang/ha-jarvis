@@ -78,6 +78,16 @@ pub enum Job {
     },
 }
 
+/// A call of a plugin.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginCall {
+    /// The tool name of the plugin.
+    pub plugin: String,
+    /// The arguments.
+    pub arguments: Map<String, Value>,
+}
+
 /// The transcript and the satellite area of a request.
 #[verus_verify]
 #[derive(Clone, Debug, PartialEq)]

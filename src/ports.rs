@@ -10,6 +10,7 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use jiff::Timestamp;
 use serde::Deserialize;
+use serde_json::Map;
 use serde_json::Value;
 
 use crate::Device;
@@ -17,6 +18,7 @@ use crate::domain::decide::Question;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
+use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
 
@@ -212,6 +214,31 @@ pub trait Store<T>: Send + Sync {
     ///
     /// The value cannot be serialized or written.
     fn save(&self, value: &T) -> anyhow::Result<()>;
+}
+
+/// A tool that a model can call.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tool {
+    /// The name of the tool.
+    pub name: String,
+    /// What the tool gives, for the model.
+    pub description: String,
+    /// The JSON schema of the arguments.
+    pub parameters: Value,
+}
+
+/// A data source for one remote API.
+#[async_trait]
+pub trait Plugin: Send + Sync {
+    /// The tool that calls the plugin.
+    fn tool(&self) -> Tool;
+
+    /// The typed result for `arguments` in the house with the HA configuration `home`.
+    async fn fetch(
+        &self,
+        arguments: &Map<String, Value>,
+        home: &HomeConfig,
+    ) -> anyhow::Result<Value>;
 }
 
 /// The current time.

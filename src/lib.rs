@@ -98,6 +98,7 @@ pub mod ports;
 pub mod app {
     pub mod background;
     pub mod conversation;
+    pub mod plugins;
     pub mod speech;
 }
 
@@ -143,6 +144,8 @@ pub struct Config {
     pub tts: TtsConfig,
     /// System Two.
     pub openai: OpenAiConfig,
+    /// Plugins.
+    pub plugins: PluginsConfig,
     /// Response backfill.
     pub backfill: BackfillConfig,
     /// Announces.
@@ -365,6 +368,16 @@ pub struct OpenAiConfig {
     pub allowed_domains: Vec<String>,
     /// The services that a System Two call runs with `return_response`.
     pub read_services: Vec<String>,
+}
+
+/// The `[plugins]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsConfig {
+    /// The time that a plugin result stays in the cache.
+    pub cache_s: u64,
+    /// The longest wait for a plugin result.
+    pub timeout_ms: u64,
 }
 
 /// The `[backfill]` section.
@@ -1126,6 +1139,10 @@ mod tests {
                 num_steps: 4,
             },
             openai: expected_openai(),
+            plugins: PluginsConfig {
+                cache_s: 300,
+                timeout_ms: 5000,
+            },
             backfill: BackfillConfig {
                 min_fresh: 3,
                 batch: 5,

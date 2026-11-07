@@ -47,6 +47,10 @@ max_tool_calls = 5
 allowed_domains = ["light", "switch", "fan", "media_player", "climate", "calendar", "todo"]
 read_services = ["calendar.get_events", "todo.get_items"] # called with return_response = true
 
+[plugins]
+cache_s = 300      # a forecast changes slowly
+timeout_ms = 5000
+
 [backfill]
 min_fresh = 3
 batch = 5
