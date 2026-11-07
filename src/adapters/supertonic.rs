@@ -25,13 +25,34 @@ use crate::TtsConfig;
 use crate::domain::speech::Audio;
 use crate::ports::TextToSpeech;
 
+/// The text ids of the short input lengths.
+const SHORT_TEXT: usize = 64;
+/// The latent frames of the short input lengths.
+const SHORT_FRAMES: usize = 64;
+/// The text ids of the long input lengths.
+const LONG_TEXT: usize = 160;
+/// The latent frames of the long input lengths.
+const LONG_FRAMES: usize = 192;
+
 /// A `TextToSpeech` that runs the four Supertonic-3 graphs on a blocking thread, one text at a time.
 pub struct SupertonicTts(Arc<Mutex<Engine>>);
 
-/// The four graphs of `[tts].model_dir`, the indexer and the voice.
+/// The input lengths of the graphs and the set of sessions that runs them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Lengths {
+    /// The set of sessions: the long set, else the short set.
+    long: bool,
+    /// The text ids after the added zeros.
+    text: usize,
+    /// The latent frames after the added zeros.
+    frames: usize,
+}
+
+/// The four graphs of `[tts].model_dir` for each length, the indexer and the voice.
 struct Engine {
-    /// The duration predictor, the text encoder, the fp32 vector estimator and the fp32 vocoder.
-    graphs: [Session; 4],
+    /// The duration predictor, the text encoder, the fp32 vector estimator and the fp32 vocoder,
+    /// for the short lengths, then for the long lengths.
+    graphs: [[Session; 4]; 2],
     /// The text id of each Unicode code point.
     indexer: Vec<i32>,
     /// The `style_ttl` of the voice.
@@ -71,6 +92,18 @@ struct TextToLatent {
     latent_dim: usize,
 }
 
+impl Settings {
+    /// The samples of one latent frame.
+    fn frame_samples(&self) -> usize {
+        self.ae.base_chunk_size * self.ttl.chunk_compress_factor
+    }
+
+    /// The channels of one latent frame.
+    fn channels(&self) -> usize {
+        self.ttl.latent_dim * self.ttl.chunk_compress_factor
+    }
+}
+
 impl SupertonicTts {
     /// Loads the Supertonic-3 files of `config` on `device`.
     ///
@@ -89,7 +122,7 @@ impl Engine {
         let dir = &config.model_dir;
         let [style_ttl, style_dp] = styles(&read(dir, "voice.bin")?, config.voice)?;
         Ok(Self {
-            graphs: graphs(dir, builder)?,
+            graphs: [graphs(dir, builder)?, graphs(dir, builder)?],
             indexer: numbers(&read(dir, "unicode_indexer.bin")?, i32::from_le_bytes),
             style_ttl,
             style_dp,
@@ -104,13 +137,31 @@ impl Engine {
             return Ok(Vec::new());
         }
         let ids = text_ids(text, &self.indexer);
-        let length = ids.len();
-        let mask = Tensor::from_array(([1, 1, length], vec![1.0_f32; length]))?;
-        let ids = Tensor::from_array(([1, length], ids))?;
-        let samples = self.samples(&ids, &mask)?;
-        let text_emb = self.text_emb(&ids, &mask)?;
-        let latent = self.denoise(samples, &text_emb, &mask)?;
-        let [.., vocoder] = &mut self.graphs;
+        self.speak(&ids, lengths)
+    }
+
+    /// The 16-bit samples of the text ids `ids` at the input lengths that `rule` gives.
+    fn speak(
+        &mut self,
+        ids: &[i64],
+        rule: fn(usize, usize) -> Lengths,
+    ) -> anyhow::Result<Vec<i16>> {
+        let texts = ids.len();
+        let first = rule(texts, 0);
+        let text_mask = mask(texts, first.text)?;
+        let ids = Tensor::from_array(([1, first.text], padded(ids, texts, first.text)))?;
+        let samples = self.samples(first.long, &ids, &text_mask)?;
+        let frames = samples.div_ceil(self.settings.frame_samples());
+        let last = rule(texts, frames);
+        let text_emb = self.text_emb(first, &ids, &text_mask, last.text)?;
+        let latent = self.denoise(last, [texts, frames], &text_emb)?;
+        self.vocode(last.long, latent, samples)
+    }
+
+    /// The first `samples` 16-bit samples that the vocoder of the long or the short set gives for
+    /// `latent`.
+    fn vocode(&mut self, long: bool, latent: DynValue, samples: usize) -> anyhow::Result<Vec<i16>> {
+        let [.., vocoder] = &mut self.graphs[usize::from(long)];
         let outputs = vocoder.run(ort::inputs!["latent" => latent])?;
         let wave = outputs["wav_tts"].try_extract_tensor::<f32>()?.1;
         Ok(wave.iter().take(samples).copied().map(pcm).collect())
@@ -122,8 +173,13 @@ impl Engine {
         clippy::cast_sign_loss,
         reason = "saturating cast"
     )]
-    fn samples(&mut self, ids: &Tensor<i64>, mask: &Tensor<f32>) -> anyhow::Result<usize> {
-        let [duration, ..] = &mut self.graphs;
+    fn samples(
+        &mut self,
+        long: bool,
+        ids: &Tensor<i64>,
+        mask: &Tensor<f32>,
+    ) -> anyhow::Result<usize> {
+        let [duration, ..] = &mut self.graphs[usize::from(long)];
         let outputs = duration.run(ort::inputs![
             "text_ids" => ids,
             "style_dp" => &self.style_dp,
@@ -134,36 +190,46 @@ impl Engine {
         Ok(((seconds * f64::from(self.settings.ae.sample_rate)) as usize).max(1))
     }
 
-    /// The `text_emb` that the text encoder gives for the text.
-    fn text_emb(&mut self, ids: &Tensor<i64>, mask: &Tensor<f32>) -> anyhow::Result<DynValue> {
-        let [_, encoder, ..] = &mut self.graphs;
-        let mut outputs = encoder.run(ort::inputs![
+    /// The `text_emb` that the text encoder gives at the lengths `first`, with zeros up to
+    /// `length` text ids.
+    fn text_emb(
+        &mut self,
+        first: Lengths,
+        ids: &Tensor<i64>,
+        mask: &Tensor<f32>,
+        length: usize,
+    ) -> anyhow::Result<Tensor<f32>> {
+        let [_, encoder, ..] = &mut self.graphs[usize::from(first.long)];
+        let outputs = encoder.run(ort::inputs![
             "text_ids" => ids,
             "style_ttl" => &self.style_ttl,
             "text_mask" => mask,
         ])?;
-        outputs.remove("text_emb").context("no text_emb")
+        let values = outputs["text_emb"].try_extract_tensor::<f32>()?.1;
+        let values = padded(values, first.text, length);
+        let shape = [1, values.len() / length, length];
+        Ok(Tensor::from_array((shape, values))?)
     }
 
-    /// The latent of `samples` samples after the denoising steps from the seeded noise.
+    /// The latent at the lengths `last` after the denoising steps from the seeded noise, for the
+    /// real lengths `[texts, frames]`.
     fn denoise(
         &mut self,
-        samples: usize,
-        text_emb: &DynValue,
-        text_mask: &Tensor<f32>,
+        last: Lengths,
+        [texts, frames]: [usize; 2],
+        text_emb: &Tensor<f32>,
     ) -> anyhow::Result<DynValue> {
-        let ttl = &self.settings.ttl;
-        let frames = samples.div_ceil(self.settings.ae.base_chunk_size * ttl.chunk_compress_factor);
-        let mut latent = noise(ttl.latent_dim * ttl.chunk_compress_factor, frames)?;
-        let latent_mask = Tensor::from_array(([1, 1, frames], vec![1.0_f32; frames]))?;
+        let mut latent = noise(self.settings.channels(), frames, last.frames)?;
+        let latent_mask = mask(frames, last.frames)?;
+        let text_mask = mask(texts, last.text)?;
+        let [.., estimator, _] = &mut self.graphs[usize::from(last.long)];
         for step in 0..self.steps {
-            let [.., estimator, _] = &mut self.graphs;
             let mut outputs = estimator.run(ort::inputs![
                 "noisy_latent" => &latent,
                 "text_emb" => text_emb,
                 "style_ttl" => &self.style_ttl,
                 "latent_mask" => &latent_mask,
-                "text_mask" => text_mask,
+                "text_mask" => &text_mask,
                 "current_step" => Tensor::from_array(([1], vec![f32::from(step)]))?,
                 "total_step" => Tensor::from_array(([1], vec![f32::from(self.steps)]))?,
             ])?;
@@ -171,6 +237,44 @@ impl Engine {
         }
         Ok(latent)
     }
+}
+
+/// The input lengths for a text with `texts` ids and a speech with `frames` frames: the short
+/// lengths when both fit, else the long lengths.
+fn lengths(texts: usize, frames: usize) -> Lengths {
+    if texts <= SHORT_TEXT && frames <= SHORT_FRAMES {
+        Lengths {
+            long: false,
+            text: SHORT_TEXT,
+            frames: SHORT_FRAMES,
+        }
+    } else {
+        long_lengths(texts, frames)
+    }
+}
+
+/// The long input lengths, or the real lengths `texts` and `frames` when they are longer.
+fn long_lengths(texts: usize, frames: usize) -> Lengths {
+    Lengths {
+        long: true,
+        text: texts.max(LONG_TEXT),
+        frames: frames.max(LONG_FRAMES),
+    }
+}
+
+/// The rows of `width` values in `values`, each with zeros added up to `length` values.
+fn padded<T: Clone + Default>(values: &[T], width: usize, length: usize) -> Vec<T> {
+    let rows = values.chunks(width.max(1)).map(|row| {
+        let mut row = row.to_vec();
+        row.resize(length, T::default());
+        row
+    });
+    rows.flatten().collect()
+}
+
+/// A mask of shape `[1, 1, length]`: 1 for each of the first `real` positions, else 0.
+fn mask(real: usize, length: usize) -> ort::Result<Tensor<f32>> {
+    Tensor::from_array(([1, 1, length], padded(&vec![1.0; real], real, length)))
 }
 
 /// A session builder that registers the execution provider of `device`.
@@ -234,12 +338,14 @@ fn numbers<const N: usize, T>(bytes: &[u8], decode: fn([u8; N]) -> T) -> Vec<T> 
     bytes.as_chunks().0.iter().copied().map(decode).collect()
 }
 
-/// Seeded latent noise of shape `[1, channels, frames]`, so a text always gives the same samples.
-fn noise(channels: usize, frames: usize) -> ort::Result<DynValue> {
+/// Seeded latent noise of shape `[1, channels, length]` with zeros after the first `frames`
+/// frames, so a text always gives the same samples.
+fn noise(channels: usize, frames: usize, length: usize) -> ort::Result<DynValue> {
     let mut random = StdRng::seed_from_u64(1);
     let noise = (0..channels * frames).map(|_| StandardNormal.sample(&mut random));
     let noise: Vec<f32> = noise.collect();
-    Ok(Tensor::from_array(([1, channels, frames], noise))?.into_dyn())
+    let noise = padded(&noise, frames, length);
+    Ok(Tensor::from_array(([1, channels, length], noise))?.into_dyn())
 }
 
 /// The text of `text` after the replacements of the first text rule of sherpa-onnx 2.0.1.
@@ -304,6 +410,9 @@ impl TextToSpeech for SupertonicTts {
 /// Tests of the TTS adapter with the Supertonic-3 files of `jarvis.toml`.
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+    use std::time::Instant;
+
     use super::*;
     use crate::Config;
 
@@ -366,10 +475,101 @@ mod tests {
         let builder = builder(Device::Cuda)?.with_profiling(folder.path().join("profile"))?;
         let mut engine = Engine::open(&config()?, &builder)?;
         assert!(!engine.synth("Hello")?.is_empty(), "no samples");
-        for session in &mut engine.graphs {
+        let [short, _] = &mut engine.graphs;
+        for session in short {
             let profile = fs::read_to_string(session.end_profiling()?)?;
             assert!(profile.contains("CUDAExecutionProvider"), "{profile}");
         }
+        Ok(())
+    }
+
+    /// AC-9.3b-1. Each case gives the lengths of the first two graphs, then of the last two.
+    #[test]
+    fn ac_9_3b_1_lengths_follow_the_rule() {
+        let short = Lengths {
+            long: false,
+            text: 64,
+            frames: 64,
+        };
+        let long = |text, frames| Lengths {
+            long: true,
+            text,
+            frames,
+        };
+        let cases = [
+            ((20, 20), short, short),
+            ((64, 64), short, short),
+            ((64, 65), short, long(160, 192)),
+            ((65, 64), long(160, 192), long(160, 192)),
+            ((160, 192), long(160, 192), long(160, 192)),
+            ((200, 150), long(200, 192), long(200, 192)),
+            ((100, 250), long(160, 192), long(160, 250)),
+        ];
+        for ((texts, frames), first, last) in cases {
+            let actual = [lengths(texts, 0), lengths(texts, frames)];
+            assert_eq!(actual, [first, last], "n = {texts}, f = {frames}");
+        }
+    }
+
+    /// AC-9.3b-2.
+    #[test]
+    fn ac_9_3b_2_short_and_long_lengths_give_the_same_audio() -> anyhow::Result<()> {
+        let mut engine = Engine::open(&config()?, &builder(Device::Cpu)?)?;
+        let ids = text_ids("I am turning the lights on.", &engine.indexer);
+        let short = engine.speak(&ids, lengths)?;
+        let long = engine.speak(&ids, long_lengths)?;
+        assert_eq!(short.len(), long.len(), "the sample counts");
+        let pairs = short.iter().zip(&long);
+        let difference = pairs.map(|(short, long)| short.abs_diff(*long)).max();
+        assert!(difference <= Some(64), "maximum difference {difference:?}");
+        Ok(())
+    }
+
+    /// The sorted `synth` times on CUDA of the short replies and of the sentences of 40 runs that
+    /// alternate `replies` with `sentence`, after a warm-up.
+    fn alternate_times(replies: &[&str], sentence: &str) -> anyhow::Result<[Vec<Duration>; 2]> {
+        let mut engine = Engine::open(&config()?, &builder(Device::Cuda)?)?;
+        let runs = replies.iter().flat_map(|&reply| [reply, sentence]).cycle();
+        let (warm_up, runs) = (runs.clone().take(2), runs.take(40).enumerate());
+        for text in warm_up {
+            engine.synth(text)?;
+        }
+        let mut times = [Vec::new(), Vec::new()];
+        for (run, text) in runs {
+            let start = Instant::now();
+            engine.synth(text)?;
+            times[run % 2].push(start.elapsed());
+        }
+        Ok(times.map(|mut times| {
+            times.sort();
+            times
+        }))
+    }
+
+    /// AC-9.3b-3. Writes the two p95 times to stderr.
+    #[test]
+    #[ignore = "GPU host"]
+    fn ac_9_3b_3_alternate_lengths_p95_on_cuda() -> anyhow::Result<()> {
+        use std::io::Write;
+
+        let replies = [
+            "Playing jeopardy.",
+            "Putting jeopardy on the TV.",
+            "One moment.",
+            "I am turning the lights on.",
+        ];
+        let sentence = "Tomorrow will be mostly sunny with a light breeze from the west, and the evening should stay clear and mild, so it is a good night for a walk.";
+        let [short, long] = alternate_times(&replies, sentence)?;
+        // The 95th percentile of 20 times is the 19th.
+        let p95 = [short[18], long[18]];
+        writeln!(
+            std::io::stderr(),
+            "p95 short {:?}, sentence {:?}",
+            p95[0],
+            p95[1]
+        )?;
+        assert!(p95[0] <= Duration::from_millis(80), "short {short:?}");
+        assert!(p95[1] <= Duration::from_millis(150), "sentence {long:?}");
         Ok(())
     }
 }
