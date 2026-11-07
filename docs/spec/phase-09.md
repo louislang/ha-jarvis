@@ -179,7 +179,8 @@ Each measured command and fetch phrase has a top intent at or above `model.commi
 
 - `run` builds `SupertonicTts`. `speech(text)` synthesizes with `SupertonicTts`. `sherpa.rs` no longer has `SherpaTts`, its engine configuration or its tests. Thus `TextToSpeech` has one production adapter.
 - AC-9.3-2 and AC-9.3-3 replace AC-6.2-2 and AC-6.2-3, so this sub-phase deletes the tests of AC-6.2-2 and AC-6.2-3. The tests of AC-6.2-4 and AC-6.2-5 load `SupertonicTts`.
-- `speech(text)` gives new audio, so the STT tests get new input. Their criteria do not change.
+- `speech(text)` adds 250 ms of silence before the speech and keeps the 500 ms of silence after it. `speech(text)` gives new audio, so the STT tests get new input. Their criteria do not change.
+- Reason for the lead silence (measured on the CPU, voice 6, 4 steps): the Supertonic speech starts at sample 0, and the int8 Nemotron first pass then gives "turned on the kitchen lights" for AC-6.6-1. With 0 ms and 100 ms of lead silence, AC-6.6-1 fails. With 250 ms, 500 ms and 1000 ms, it passes.
 - AC-9.3c-1 replaces AC-9.2-4, so this sub-phase deletes the test of AC-9.2-4. The command is "turn the tv to jeopardy", whose `tv_show` replies are not in the audio cache.
 
 **Acceptance criteria.**
