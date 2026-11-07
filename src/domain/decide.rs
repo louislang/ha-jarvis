@@ -1142,6 +1142,7 @@ mod tests {
     use crate::domain::model::Slot;
     use crate::domain::responses::Pool;
     use crate::domain::responses::Response;
+    use crate::domain::state::Snapshot;
     use crate::testing::fakes::house;
 
     /// The value of `model.threshold` in `jarvis.toml`.
@@ -1751,6 +1752,91 @@ mod tests {
         let names = ["lights_query", "brightness_query"];
         let pooled = names.iter().all(|name| pools.contains_key(*name));
         assert!(pooled, "the pools {:?} have {names:?}", pools.keys());
+    }
+
+    /// The reference house with the lock, the garage door and the windows of sub-phase 18.3.
+    /// The Kitchen Window has the state `kitchen`, and the Bedroom Window is `off`.
+    fn secured(kitchen: &str) -> StateCache {
+        let mut snapshot = house();
+        let added = [
+            ("lock.front_door", "Front Door", "outside", None, "locked"),
+            (
+                "cover.garage_door",
+                "Garage Door",
+                "garage",
+                Some("garage"),
+                "open",
+            ),
+            (
+                "binary_sensor.kitchen_window",
+                "Kitchen Window",
+                "kitchen",
+                Some("window"),
+                kitchen,
+            ),
+            (
+                "binary_sensor.bedroom_window",
+                "Bedroom Window",
+                "bedroom",
+                Some("window"),
+                "off",
+            ),
+        ];
+        for entity in added {
+            add(&mut snapshot, entity);
+        }
+        StateCache::load(snapshot)
+    }
+
+    /// Adds the entity with the ID, name, area, device class and state of `added` to
+    /// `snapshot`, with no device.
+    fn add(snapshot: &mut Snapshot, added: (&str, &str, &str, Option<&str>, &str)) {
+        let (id, name, area, class, value) = added;
+        let mut entity = snapshot.entities[0].clone();
+        (entity.entity_id, entity.name) = (EntityId(id.to_owned()), name.to_owned());
+        (entity.area_id, entity.device_id) = (Some(AreaId(area.to_owned())), None);
+        let mut state = snapshot.states[0].clone();
+        (state.entity_id, state.state) = (id.to_owned(), value.to_owned());
+        let class = class.map(|class| ("device_class".to_owned(), Value::from(class)));
+        state.attributes = class.into_iter().collect();
+        snapshot.entities.push(entity);
+        snapshot.states.push(state);
+    }
+
+    /// AC-18.3-1.
+    #[test]
+    fn ac_18_3_1_lock_query_names_the_lock_state() {
+        let decision = replied("lock_query", None, "kitchen", &secured("on"));
+        assert_eq!(
+            decision,
+            answered("lock_query", "The Front Door is locked.")
+        );
+    }
+
+    /// AC-18.3-2.
+    #[test]
+    fn ac_18_3_2_garage_door_query_names_the_door_state() {
+        let decision = replied("garage_door_query", None, "kitchen", &secured("on"));
+        let text = "The Garage Door is open.";
+        assert_eq!(decision, answered("garage_door_query", text));
+    }
+
+    /// AC-18.3-3.
+    #[test]
+    fn ac_18_3_3_windows_query_names_each_window_that_is_not_closed() {
+        let cases = [
+            ("on", "Kitchen Window is open."),
+            ("off", "All windows are closed."),
+            ("unavailable", "Kitchen Window is unavailable."),
+        ];
+        for (kitchen, text) in cases {
+            let decision = replied("windows_query", None, "kitchen", &secured(kitchen));
+            assert_eq!(
+                decision,
+                answered("windows_query", text),
+                "Kitchen Window {kitchen}"
+            );
+        }
     }
 
     /// AC-7.6-3.

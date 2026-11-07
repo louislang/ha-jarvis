@@ -63,3 +63,24 @@ examples = ["is the [garage](area) light on", "which lights are on", "are the li
 target = "entities"
 select = [{ domain = "light" }, { domain = "switch", name = "light" }]
 state = "on"
+
+[[intent]]
+name = "lock_query"
+kind = "query"
+examples = ["is the front door locked", "are the doors locked", "is the door locked", "did i lock the door"]
+target = "house"
+select = [{ domain = "lock" }]
+
+[[intent]]
+name = "garage_door_query"
+kind = "query"
+examples = ["is the garage door open", "is the garage door closed", "did i close the garage door"]
+target = "house"
+select = [{ domain = "cover", device_class = "garage" }]
+
+[[intent]]
+name = "windows_query"
+kind = "query"
+examples = ["are any windows open", "is a window open", "are the windows closed"]
+target = "house"
+select = [{ domain = "binary_sensor", device_class = "window" }]

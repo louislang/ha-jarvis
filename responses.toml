@@ -22,6 +22,15 @@ responses = ['{% if entities %}{{ entities | map(attribute="name") | join(", ") 
 [pools.brightness_query]
 responses = ['{% for light in entities %}{{ light.name }} {% if light.attributes.brightness is defined and light.attributes.brightness is number %}is at {{ (light.attributes.brightness / 2.55) | round | int }} percent{% else %}has no brightness value{% endif %}.{{ " " if not loop.last else "" }}{% else %}No lights are on in the {{ area }}.{% endfor %}']
 
+[pools.lock_query]
+responses = ['{% for lock in entities %}The {{ lock.name }} is {{ lock.state }}.{{ " " if not loop.last else "" }}{% endfor %}']
+
+[pools.garage_door_query]
+responses = ['{% for door in entities %}The {{ door.name }} is {{ door.state }}.{{ " " if not loop.last else "" }}{% endfor %}']
+
+[pools.windows_query]
+responses = ['{% set others = entities | rejectattr("state", "eq", "off") | list %}{% for window in others %}{{ window.name }} is {{ "open" if window.state == "on" else window.state }}.{{ " " if not loop.last else "" }}{% else %}All windows are closed.{% endfor %}']
+
 [pools.filler]
 responses = ["I will check on that for you.", "Let me look into that.", "One moment."]
 
