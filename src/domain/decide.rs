@@ -1134,6 +1134,8 @@ pub open spec fn targeted(intent: Intent, cache: StateCache, area: AreaId, selec
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
+
     use rand::SeedableRng;
 
     use crate::domain::catalog::Filter;
@@ -1177,16 +1179,31 @@ mod tests {
                     "details" => DETAILS.to_owned(),
                     _ => format!("The {name} response."),
                 };
-                let pool = Pool {
-                    responses: vec![Response {
-                        text,
-                        uses: 0,
-                        generated: false,
-                    }],
-                    last: None,
-                };
-                (name.to_owned(), pool)
+                (name.to_owned(), pool(&[text]))
             })
+            .collect()
+    }
+
+    /// A pool of `texts` with no uses.
+    fn pool(texts: &[String]) -> Pool {
+        let responses = texts.iter().map(|text| Response {
+            text: text.clone(),
+            uses: 0,
+            generated: false,
+        });
+        Pool {
+            responses: responses.collect(),
+            last: None,
+        }
+    }
+
+    /// The pools of `responses.toml`.
+    fn filed() -> Pools {
+        let file: BTreeMap<String, BTreeMap<String, BTreeMap<String, Vec<String>>>> =
+            toml::from_str(include_str!("../../responses.toml")).expect("responses.toml is TOML");
+        let pools = file["pools"].iter();
+        pools
+            .map(|(name, texts)| (name.clone(), pool(&texts["responses"])))
             .collect()
     }
 
@@ -1194,6 +1211,19 @@ mod tests {
     /// names and values `slots` and `request`.
     fn decided_for(
         catalog: &Catalog,
+        top: (&str, f32),
+        slots: &[(&str, &str)],
+        request: &Request,
+        cache: &StateCache,
+    ) -> Decision {
+        decided_with(catalog, &pools(catalog), top, slots, request, cache)
+    }
+
+    /// The decision of `catalog` with `pools` in `cache` for the top label and probability `top`,
+    /// the slot names and values `slots` and `request`.
+    fn decided_with(
+        catalog: &Catalog,
+        pools: &Pools,
         top: (&str, f32),
         slots: &[(&str, &str)],
         request: &Request,
@@ -1208,13 +1238,12 @@ mod tests {
             slots: slots.collect(),
         };
         let mut rng = StdRng::seed_from_u64(1);
-        let pools = pools(catalog);
         decide(
             &prediction,
             request,
             catalog,
             cache,
-            &pools,
+            pools,
             THRESHOLD,
             &mut rng,
         )
@@ -1656,6 +1685,72 @@ mod tests {
             [Louis's Living Room Lamp off Louis's Living Room Lamp]\
             [Living Room Overhead Light unavailable Living Room Overhead Light][TV Lamp on TV Lamp]";
         assert_eq!(decision, answered("details", text));
+    }
+
+    /// The decision of the intent `label` of `intents.toml` with the pools of `responses.toml`,
+    /// the area slot `slot` and the satellite in `area` of `cache`.
+    fn replied(label: &str, slot: Option<&str>, area: &str, cache: &StateCache) -> Decision {
+        let request = Request {
+            transcript: String::new(),
+            area: Some(AreaId(area.to_owned())),
+        };
+        let slots: Vec<(&str, &str)> = slot.map(|value| ("area", value)).into_iter().collect();
+        decided_with(&catalog(), &filed(), (label, 0.89), &slots, &request, cache)
+    }
+
+    /// AC-18.2-1.
+    #[test]
+    fn ac_18_2_1_lights_query_with_no_light_on_names_the_area() {
+        let cache = StateCache::load(house());
+        let decision = replied("lights_query", Some("garage"), "kitchen", &cache);
+        let text = "No lights are on in the garage.";
+        assert_eq!(decision, answered("lights_query", text));
+    }
+
+    /// AC-18.2-2.
+    #[test]
+    fn ac_18_2_2_lights_query_names_the_light_that_is_on() {
+        let cache = StateCache::load(house());
+        let decision = replied("lights_query", None, "kitchen", &cache);
+        assert_eq!(decision, answered("lights_query", "Strawberry Lamp is on."));
+    }
+
+    /// AC-18.2-3.
+    #[test]
+    fn ac_18_2_3_brightness_query_gives_the_percent_of_each_light() {
+        let mut snapshot = house();
+        for state in &mut snapshot.states {
+            match state.entity_id.as_str() {
+                "light.office_fan_light" | "light.workbench_led" => state.state = "off".to_owned(),
+                "light.office_lamp" => {
+                    let brightness = Value::from(128);
+                    state.attributes.insert("brightness".to_owned(), brightness);
+                }
+                _ => {}
+            }
+        }
+        let office = StateCache::load(snapshot);
+        let decision = replied("brightness_query", None, "office", &office);
+        let text = "Desk LED is at 100 percent. Office Lamp is at 50 percent.";
+        assert_eq!(decision, answered("brightness_query", text));
+        let cache = StateCache::load(house());
+        let decision = replied("brightness_query", None, "bedroom", &cache);
+        let text = "Bedroom Fan Light is at 100 percent. Bedroom Lamp Left has no brightness \
+            value. Bedroom Lamp Right has no brightness value. Bedroom Corner Lamp has no \
+            brightness value.";
+        assert_eq!(decision, answered("brightness_query", text));
+    }
+
+    /// AC-18.2-4.
+    #[test]
+    fn ac_18_2_4_repository_catalog_and_pools_are_valid() {
+        let catalog = catalog();
+        assert_eq!(catalog::validate_catalog(&catalog), Ok(()));
+        let pools = filed();
+        assert_eq!(responses::validate_pools(&pools, &catalog), Ok(()));
+        let names = ["lights_query", "brightness_query"];
+        let pooled = names.iter().all(|name| pools.contains_key(*name));
+        assert!(pooled, "the pools {:?} have {names:?}", pools.keys());
     }
 
     /// AC-7.6-3.
