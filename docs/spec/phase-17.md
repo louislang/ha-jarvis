@@ -84,7 +84,7 @@ This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a
 **Goal:** Add the weather plugin `get_weather(when)` with the Open-Meteo forecast API and the house location from HA. Jarvis can then tell the forecast with no API key and no HA weather integration.
 
 - **Implements:** G6, G7. **Depends on:** 17.2.
-- **Files:** create `src/adapters/open_meteo.rs`. Modify `src/domain/state.rs`, `src/testing/house.json`, `src/testing/e2e.rs`, `src/lib.rs`, `jarvis.toml`, `Cargo.toml`, `benches/domain.rs`.
+- **Files:** create `src/adapters/open_meteo.rs`. Modify `src/domain/state.rs`, `src/domain/contracts.rs`, `src/testing/house.json`, `src/lib.rs`, `jarvis.toml`, `Cargo.toml`, `benches/domain.rs`.
 
 **Model.**
 
@@ -97,8 +97,8 @@ This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a
   3. A status that is not a success gives an error.
   4. `forecast(body, day)` is a pure function. `day` is 0 for `today` and 1 for `tomorrow`. It reads that index of each `daily` array and gives `{ condition, high, low, precipitation_chance }`. `high` and `low` are the temperatures rounded to the nearest integer. `precipitation_chance` is the percent. A missing value, a `null` or a weather code that is not in the table gives an error.
 - `condition(code)` maps the WMO weather code of Open-Meteo to a word: 0 `clear`, 1 `mostly clear`, 2 `partly cloudy`, 3 `cloudy`, 45 and 48 `foggy`, 51 to 57 `drizzly`, 61 to 67 and 80 to 82 `rainy`, 71 to 77 and 85 to 86 `snowy`, 95 to 99 `stormy`.
-- `src/lib.rs` registers `OpenMeteo` in the registry of `run`. Tests that build the application use `FakePlugin`, so no test calls the real API.
-- `run` builds one registry and gives its tools to `OpenAiReasoner` and the registry to System Two. `start_app` takes the registry as a parameter, and the pipeline harness gives it a registry with no plugins until sub-phase 17.4.
+- `src/lib.rs` gets `WeatherConfig`. Sub-phase 17.3b registers `OpenMeteo`.
+- `HomeConfig` derives `Deserialize`, so `src/domain/contracts.rs` gets the external type specification of `UnitSystem` (`02-rules.md` section 5.1).
 - `benches/domain.rs` builds a `HomeConfig`, so it gets the new fields.
 - This sub-phase adds `[plugins.weather]` (`url`) and the `reqwest` features `json` and `query`.
 
@@ -113,7 +113,6 @@ This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a
 - AC-17.3-7: When `when` is `monday`, `fetch` returns an error, and the mock receives no request.
 - AC-17.3-8: When the mock returns status 500, a `null` value or weather code 42, `fetch` returns an error.
 - AC-17.3-9: When `tool` runs, the name is `get_weather` and the `when` parameter allows only `today` and `tomorrow`.
-- AC-17.3-10: When `run` builds the registry from `jarvis.toml`, `tools` has `get_weather`.
 
 **Proofs.**
 
@@ -121,7 +120,30 @@ This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a
 - P-17.3-6. Argument: `forecast` is a pure function of the body and the day.
 - P-17.3-7. Argument: the `when` check returns an error before the request is built.
 - P-17.3-8. Argument: the status check, the `Option` of each value and the `None` arm of `condition` each return an error.
-- P-17.3-1 to P-17.3-3, P-17.3-9, P-17.3-10. Evidence: test.
+- P-17.3-1 to P-17.3-3, P-17.3-9. Evidence: test.
+
+---
+
+### 17.3b One Plugin Registry
+
+**Goal:** Register `OpenMeteo` in one registry that `run` builds, and give the registry to System Two and its tools to `OpenAiReasoner`. System Two can then call `get_weather`.
+
+- **Implements:** G7. **Depends on:** 17.3.
+- **Files:** modify `src/lib.rs`, `src/testing/e2e.rs`.
+
+**Model.**
+
+- The 17.3 change was 442 lines, so it is split. Sub-phase 17.3 adds the adapter, and 17.3b adds the registry.
+- `src/lib.rs` registers `OpenMeteo` in the registry of `run`. Tests that build the application use `FakePlugin`, so no test calls the real API.
+- `run` builds one registry and gives its tools to `OpenAiReasoner` and the registry to System Two. `start_app` takes the registry as a parameter, and the pipeline harness gives it a registry with no plugins until sub-phase 17.4.
+
+**Acceptance criteria.**
+
+- AC-17.3b-1: When `run` builds the registry from `jarvis.toml`, `tools` has `get_weather`.
+
+**Proofs.**
+
+- P-17.3b-1. Evidence: test.
 
 ---
 
@@ -129,7 +151,7 @@ This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a
 
 **Goal:** Make each System One fetch intent name a plugin, and move the `weather` intent from the HA service `weather.get_forecasts` to `get_weather`. "What is the weather like" then gets a filler, and then the Open-Meteo forecast.
 
-- **Implements:** G3, G6. **Depends on:** 17.3.
+- **Implements:** G3, G6. **Depends on:** 17.3b.
 - **Files:** modify `src/domain/decide.rs`, `src/domain/catalog.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`, `src/testing/e2e.rs`, `src/lib.rs`, `intents.toml`, `responses.toml`.
 
 **Model.**
