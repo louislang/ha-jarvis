@@ -62,7 +62,7 @@ This phase proves the latency goal for the full pipeline.
 
 - The voice end is the `voice_end_ms` that the Silero VAD gives for `speech(text)` with the VAD settings of `run`: `asr.vad_model`, `asr.vad_threshold` and `asr.vad_min_silence_ms` (sub-phase 6.6b). Jarvis starts its endpoint timer at this point, so the silence of a commit and the `endpoint_ms` of AC-9.2-3 count from it. Sub-phase 9.3c adds this rule.
 - `start_app` gives the handle of the startup pre-render task, so the harness waits for the pre-render before the warm-up. Thus no measured run misses the audio cache or shares the TTS with the pre-render.
-- The reference house has no `weather.forecast_home` entity, so the harness adds a `weather.forecast_home` state to its copy of the house. "What is the weather" then gives the weather fetch and its filler.
+- The reference house has no `weather.forecast_home` entity, so the harness adds a `weather.forecast_home` state to its copy of the house. "What is the weather" then gives the weather fetch and its filler. From sub-phase 17.4, the weather fetch uses `FakePlugin`, and the harness does not add this state.
 - Each test prints the p95 of each phrase, so a run that passes also gives the numbers.
 - `jarvis.toml` sets `vad_threshold = 0.65`. With 0.5, the commands had a p95 of 273 ms to 435 ms. With 0.65, they have 213 ms to 378 ms, and each transcript keeps its words. 0.7 cut "on" from "office lights on". The tests that read `jarvis.toml` change with it.
 - AC-9.2-3, AC-9.2-4 and AC-9.2-5 have the measured targets of `01-architecture.md` section 6. AC-9.3c-1 of sub-phase 9.3c replaces AC-9.2-4 with a target of 400 ms.
