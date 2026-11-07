@@ -197,7 +197,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - `SherpaStt` wraps `OnlineRecognizer` with the streaming transducer in `[asr].model_dir`. This sub-phase adds `asr.model_dir`.
 - CPU machines and the GPU host use the same first-pass model: Nemotron 160 ms. CPU machines load its int8 files. The GPU host loads its fp16 files (sub-phase 6.6c). The 20M zipformer does not recognize the first word of `speech(text)`. `just models` downloads the int8 Nemotron model. `gpu-models` downloads the fp16 files of the same model. `just models` does not download the 20M zipformer. The structure test of AC-6.2-1 checks the Nemotron folder.
 - `FakeStt` returns scripted partials.
-- `speech(text)` in `fakes.rs` synthesizes text with `SherpaTts`, resamples it from 44.1 kHz to 16 kHz with `rubato`, and adds 500 ms of silence. The fixed TTS seed makes `speech(text)` bit-identical on every run.
+- `speech(text)` in `fakes.rs` synthesizes text with `SherpaTts`, resamples it from 44.1 kHz to 16 kHz with `rubato`, and adds 500 ms of silence. The fixed TTS seed makes `speech(text)` bit-identical on every run. From sub-phase 9.3c, `speech(text)` synthesizes with `SupertonicTts` and also adds 250 ms of silence before the speech.
 
 **Acceptance criteria.**
 
