@@ -12,19 +12,21 @@ use crate::domain::state::EntityId;
 use crate::domain::state_cache::StateCache;
 
 /// The entities that `intent` acts on in `area`: the `entity` template of the intent, the
-/// matches in `area`, the match in `area` with the lowest entity ID, or the only match of the
-/// house.
+/// matches of the house for `target = "house"`, the matches in `area`, the match in `area` with
+/// the lowest entity ID, or the only match of the house.
 #[verus_spec(selected =>
     ensures
         !fixed(*intent) ==> forall|position: int| 0 <= position < selected@.len()
             ==> #[trigger] picked(*intent, *cache, selected@[position]),
+        intent.target is House ==> housed(*intent, *cache, selected@),
         intent.target is Entities && any_local(*intent, *cache, *area) ==> (forall|position: int|
             0 <= position < selected@.len()
                 ==> #[trigger] picked_local(*intent, *cache, *area, selected@[position]))
             && forall|index: int| 0 <= index < cache.entities@.len()
                 && local_match(*intent, *cache, *area, #[trigger] cache.entities@[index])
                 ==> selected@.contains(cache.entities@[index].entity_id),
-        !fixed(*intent) && !any_local(*intent, *cache, *area) ==> selected@.len() <= 1
+        !fixed(*intent) && !(intent.target is House) && !any_local(*intent, *cache, *area)
+            ==> selected@.len() <= 1
             && (selected@.len() == 1 <==> count(*intent, *cache, cache.entities@.len() as int) == 1),
         intent.target is Entity && intent.entity is None && any_local(*intent, *cache, *area)
             ==> selected@.len() == 1 && picked_local(*intent, *cache, *area, selected@[0])
@@ -38,6 +40,9 @@ pub fn select(intent: &Intent, area: &AreaId, cache: &StateCache) -> Vec<EntityI
     if let (Target::Entity, Some(entity)) = (intent.target, &intent.entity) {
         selected.push(EntityId(entity.clone()));
         return selected;
+    }
+    if let Target::House = intent.target {
+        return house_matches(intent, cache);
     }
     let local = local_matches(intent, area, cache);
     if local.is_empty() {
@@ -93,8 +98,7 @@ fn local_matches(intent: &Intent, area: &AreaId, cache: &StateCache) -> Vec<Enti
 #[verus_spec(house =>
     ensures
         house@.len() == count(*intent, *cache, cache.entities@.len() as int),
-        forall|position: int| 0 <= position < house@.len()
-            ==> #[trigger] picked(*intent, *cache, house@[position]),
+        housed(*intent, *cache, house@),
 )]
 fn house_matches(intent: &Intent, cache: &StateCache) -> Vec<EntityId> {
     let mut house = Vec::new();
@@ -105,6 +109,9 @@ fn house_matches(intent: &Intent, cache: &StateCache) -> Vec<EntityId> {
             house@.len() == count(*intent, *cache, index as int),
             forall|position: int| 0 <= position < house@.len()
                 ==> #[trigger] picked(*intent, *cache, house@[position]),
+            forall|earlier: int| 0 <= earlier < index
+                && candidate(*intent, *cache, #[trigger] cache.entities@[earlier])
+                ==> house@.contains(cache.entities@[earlier].entity_id),
         decreases cache.entities@.len() - index,
     ))]
     while index < cache.entities.len() {
@@ -548,6 +555,15 @@ pub open spec fn picked(intent: Intent, cache: StateCache, id: EntityId) -> bool
         && candidate(intent, cache, cache.entities@[index])
 }
 
+/// True when `selected` has only candidates of `intent` and has each candidate of `cache`.
+pub open spec fn housed(intent: Intent, cache: StateCache, selected: Seq<EntityId>) -> bool {
+    &&& forall|position: int| 0 <= position < selected.len()
+        ==> #[trigger] picked(intent, cache, selected[position])
+    &&& forall|index: int| 0 <= index < cache.entities@.len()
+        && candidate(intent, cache, #[trigger] cache.entities@[index])
+        ==> selected.contains(cache.entities@[index].entity_id)
+}
+
 /// True when `id` is the ID of a candidate of `intent` in `area`.
 pub open spec fn picked_local(intent: Intent, cache: StateCache, area: AreaId, id: EntityId) -> bool {
     exists|index: int| 0 <= index < cache.entities@.len()
@@ -723,6 +739,24 @@ mod tests {
     fn ac_4_4c_3_two_matches_in_house() {
         let ids = selected(&intent("fan_on"), "bedroom", house());
         assert!(ids.is_empty(), "{ids:?}");
+    }
+
+    /// AC-18.1-1.
+    #[test]
+    fn ac_18_1_1_house_target_ignores_the_area() {
+        let mut people = intent("temperature_query");
+        people.target = Target::House;
+        people.select = vec![Filter {
+            domain: "person".to_owned(),
+            name: None,
+            device_class: None,
+        }];
+        for area in ["kitchen", "garage"] {
+            assert_eq!(
+                selected(&people, area, house()),
+                ["person.ali", "person.louis"]
+            );
+        }
     }
 
     /// AC-4.4c-4.

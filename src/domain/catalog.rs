@@ -54,6 +54,8 @@ pub struct Intent {
     /// The entity IDs that `select` never matches.
     #[serde(default)]
     pub exclude: Vec<String>,
+    /// The state that a list query keeps, for example `on` or `home`.
+    pub state: Option<String>,
     /// The service data templates, or the plugin argument templates of a fetch.
     #[serde(default)]
     pub data: BTreeMap<String, String>,
@@ -87,6 +89,8 @@ pub enum Target {
     Entity,
     /// All matching entities in the area.
     Entities,
+    /// All matching entities of the house.
+    House,
 }
 
 /// An entity filter of `select`.
