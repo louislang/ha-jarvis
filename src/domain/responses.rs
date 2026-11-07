@@ -297,6 +297,8 @@ fn variables(name: &str, catalog: &Catalog) -> BTreeSet<String> {
     variables.insert("area".to_owned());
     if intent.target == Target::Entity {
         variables.insert("entity".to_owned());
+    } else if intent.kind == Kind::Query {
+        variables.insert("entities".to_owned());
     }
     if intent.kind == Kind::Fetch {
         variables.insert("response".to_owned());
@@ -867,6 +869,29 @@ mod tests {
         assert_eq!(result, unknown("fan_on", "response"));
         let result = validate(|pools, _| set(pools, "filler", &["One moment, {{ area }}."]));
         assert_eq!(result, unknown("filler", "area"));
+    }
+
+    /// The result of `validate_pools` when the pool `pool` is `template` and `temperature_query`
+    /// has `target`.
+    fn targeted(target: Target, pool: &str, template: &str) -> Result<(), PoolError> {
+        validate(|pools, catalog| {
+            catalog.intents[4].target = target;
+            set(pools, pool, &[template]);
+        })
+    }
+
+    /// AC-18.1-7.
+    #[test]
+    fn ac_18_1_7_list_variables_belong_to_list_pools() {
+        let query = "temperature_query";
+        let result = targeted(Target::Entity, query, "{{ entities }}");
+        assert_eq!(result, unknown(query, "entities"));
+        let result = targeted(Target::Entity, "lights_on", "{{ entities }}");
+        assert_eq!(result, unknown("lights_on", "entities"));
+        let result = targeted(Target::House, query, "{{ entity.state }}");
+        assert_eq!(result, unknown(query, "entity"));
+        let result = targeted(Target::House, query, "{{ entities | length }}");
+        assert_eq!(result, Ok(()));
     }
 
     /// A pool with one unused response for each of `texts`.

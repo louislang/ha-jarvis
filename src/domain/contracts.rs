@@ -438,6 +438,12 @@ pub fn ex_value_from_map(map: Map<String, Value>) -> Value {
     <Value as From<Map<String, Value>>>::from(map)
 }
 
+/// Makes the JSON array `items`. <https://docs.rs/serde_json/1/serde_json/enum.Value.html#impl-From%3CVec%3CT%3E%3E-for-Value>
+#[verifier::external_fn_specification]
+pub fn ex_value_from_vec<Item: Into<Value>>(items: Vec<Item>) -> Value {
+    <Value as From<Vec<Item>>>::from(items)
+}
+
 /// The text of the JSON string `value`, or `None` for another JSON type.
 pub uninterp spec fn text(value: Value) -> Option<Seq<char>>;
 

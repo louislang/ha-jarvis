@@ -343,7 +343,8 @@ pub fn decide(
 }
 
 /// The decision of `intent` in the area of the area slot, else of the satellite, or `Fallback`
-/// when the slot names no area, or a query or a service has no area. A fetch needs no area.
+/// when the slot names no area, or a query or a service has no area. A fetch and a `house` query
+/// need no area.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
@@ -366,7 +367,7 @@ fn act(
     };
     match (intent.kind, &intent.service, area) {
         (Kind::Fetch, _, _) => fetch(intent, &context, pools, rng),
-        (Kind::Query, _, Some(area)) => query(intent, area, context, cache, pools, rng),
+        (Kind::Query, _, _) => query(intent, area, context, cache, pools, rng),
         (Kind::Command, None, _) => respond(intent, &context, None, pools, rng),
         (_, Some(service), Some(area)) => {
             call(intent, service.as_str(), area, context, cache, pools, rng)
@@ -398,27 +399,41 @@ fn situation<'a>(
 }
 
 /// The reply of the query `intent` rendered with its selection in `area`, or `Fallback` when the
-/// selection is empty or the reply does not render.
+/// selection is empty, the reply does not render, or `area` is `None` for a target that is not
+/// `house`. A list query also gets the kept entities of its selection as `entities`.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
         pools@.contains_key(crate::domain::contracts::string_key("fallback"@)),
         responses::filled(pools@),
     ensures
+        area is None && !(intent.target is House) ==> decision is Fallback,
         decision is Fallback || (decision matches Decision::Reply { call: None, .. }
-            && exists|selected: Seq<EntityId>| selected.len() > 0
-                && #[trigger] targeted(*intent, *cache, *area, selected)),
+            && exists|known: AreaId, selected: Seq<EntityId>| selected.len() > 0
+                && #[trigger] targeted(*intent, *cache, known, selected)
+                && (area matches Some(area) ==> known == *area)),
 )]
 fn query(
     intent: &Intent,
-    area: &AreaId,
+    area: Option<&AreaId>,
     mut context: Map<String, Value>,
     cache: &StateCache,
     pools: &Pools,
     rng: &mut StdRng,
 ) -> Decision {
-    if selection(intent, area, &mut context, cache).is_none() {
+    let anywhere = AreaId(String::new());
+    let area = match (area, intent.target) {
+        (Some(area), _) => area,
+        // `select` does not read the area of a `house` target.
+        (None, Target::House) => &anywhere,
+        (None, _) => return fallback(pools, rng),
+    };
+    let Some(selected) = selection(intent, area, &mut context, cache) else {
         return fallback(pools, rng);
+    };
+    if !matches!(intent.target, Target::Entity) {
+        let ids = kept(&selected, intent.state.as_ref(), cache);
+        context.insert("entities".to_owned(), entities(&ids, cache));
     }
     respond(intent, &context, None, pools, rng)
 }
@@ -687,6 +702,63 @@ fn entity(cache: &StateCache, id: &EntityId) -> Option<Value> {
     Some(Value::from(entity))
 }
 
+/// The IDs of `ids` that have a state in `cache`, and the state `state` when it is `Some`, in
+/// order.
+#[verus_spec(found =>
+    ensures
+        forall|position: int| 0 <= position < found@.len() ==> ids@.contains(#[trigger] found@[position])
+            && stated(*cache, crate::domain::state_cache::optional(state), found@[position]),
+        forall|index: int| 0 <= index < ids@.len()
+            && stated(*cache, crate::domain::state_cache::optional(state), #[trigger] ids@[index])
+            ==> found@.contains(ids@[index]),
+)]
+fn kept(ids: &[EntityId], state: Option<&String>, cache: &StateCache) -> Vec<EntityId> {
+    let mut found = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= ids@.len(),
+            forall|position: int| 0 <= position < found@.len() ==> ids@.contains(#[trigger] found@[position])
+                && stated(*cache, crate::domain::state_cache::optional(state), found@[position]),
+            forall|earlier: int| 0 <= earlier < index
+                && stated(*cache, crate::domain::state_cache::optional(state), #[trigger] ids@[earlier])
+                ==> found@.contains(ids@[earlier]),
+        decreases ids@.len() - index,
+    ))]
+    while index < ids.len() {
+        if is_stated(&ids[index], state, cache) {
+            found.push(EntityId(ids[index].0.clone()));
+        }
+        index += 1;
+    }
+    found
+}
+
+/// True when `cache` has a state for `id`, and it is `state` when `state` is `Some`.
+#[verus_spec(found =>
+    ensures
+        found == stated(*cache, crate::domain::state_cache::optional(state), *id),
+)]
+fn is_stated(id: &EntityId, state: Option<&String>, cache: &StateCache) -> bool {
+    match (cache.states.get(id.0.as_str()), state) {
+        (Some(known), Some(state)) => known.state.as_str() == state.as_str(),
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
+/// The `entity` object of each ID of `ids` that has a state in `cache`, in order.
+#[verus_verify]
+fn entities(ids: &[EntityId], cache: &StateCache) -> Value {
+    let mut entities = Vec::new();
+    for id in ids {
+        if let Some(found) = entity(cache, id) {
+            entities.push(found);
+        }
+    }
+    Value::from(entities)
+}
+
 /// The text of each ID of `ids`.
 #[verus_spec(texts =>
     ensures
@@ -829,6 +901,11 @@ broadcast use {
     crate::domain::contracts::axiom_string_maps_borrowed_key,
     crate::domain::contracts::axiom_char_pattern,
     crate::domain::contracts::axiom_str_pattern,
+    crate::domain::contracts::axiom_arc_str_obeys_cmp,
+    crate::domain::contracts::axiom_arc_str_borrow,
+    crate::domain::contracts::axiom_arc_str_contains_borrowed_key,
+    crate::domain::contracts::axiom_arc_str_maps_borrowed_key,
+    vstd::seq_lib::lemma_seq_contains_after_push,
 };
 
 /// True when `catalog` has an intent with the name `name`.
@@ -900,24 +977,40 @@ pub open spec fn handled(prediction: Prediction, catalog: Catalog, threshold: f3
 /// service without an area, gives `Fallback`, and no service gives no call. A call makes the
 /// service of the intent on its selection in the area of the request. A query gives no call and
 /// reads a selection in the area of the request. A fetch needs no area and gives `Fallback` or a
-/// fetch job, and a fetch with no plugin gives `Fallback`.
+/// fetch job, and a fetch with no plugin gives `Fallback`. A `house` query needs no area and reads
+/// the selection of the house.
 pub open spec fn acted(intent: Intent, prediction: Prediction, request: Request, cache: StateCache, decision: Decision) -> bool {
     &&& forall|slot: int| #[trigger] first_area(prediction.slots@, slot)
         && !area_named(cache, prediction.slots@[slot].value@) ==> decision is Fallback
     &&& unslotted(prediction.slots@) && request.area is None && intent.service is Some
-        && !(intent.kind is Fetch) ==> decision is Fallback
+        && !(intent.kind is Fetch) && !housing(intent) ==> decision is Fallback
     &&& intent.service is None && !(intent.kind is Fetch)
         ==> (decision is Fallback || decision matches Decision::Reply { call: None, .. })
     &&& decision matches Decision::Reply { call: Some(made), .. } ==> made.target@.len() > 0
         && (intent.service matches Some(service) && served(service@, made))
         && aimed(intent, prediction, request, cache, made) && stringed(intent, made.data)
-    &&& intent.kind is Query ==> decision is Fallback || (decision matches Decision::Reply { call: None, .. }
+    &&& housing(intent) ==> decision is Fallback || (decision matches Decision::Reply { call: None, .. }
+        && exists|selected: Seq<EntityId>| selected.len() > 0 && #[trigger] select::housed(intent, cache, selected))
+    &&& intent.kind is Query && !housing(intent) ==> decision is Fallback
+        || (decision matches Decision::Reply { call: None, .. }
         && exists|area: AreaId, selected: Seq<EntityId>|
             #![trigger located(prediction, request, cache, area), targeted(intent, cache, area, selected)]
             located(prediction, request, cache, area) && selected.len() > 0
             && targeted(intent, cache, area, selected))
     &&& intent.kind is Fetch && intent.plugin is None ==> decision is Fallback
     &&& intent.kind is Fetch ==> decision is Fallback || fetched(intent, decision)
+}
+
+/// True when `intent` is a query with `target = "house"`.
+pub open spec fn housing(intent: Intent) -> bool {
+    intent.kind is Query && intent.target is House
+}
+
+/// True when the cache has a state for `id`, and it is `state` when `state` is `Some`.
+pub open spec fn stated(cache: StateCache, state: Option<Seq<char>>, id: EntityId) -> bool {
+    let key = crate::domain::contracts::str_key(id.0@);
+    &&& cache.states@.contains_key(key)
+    &&& state matches Some(wanted) ==> cache.states@[key].state@ == wanted
 }
 
 /// True when `decision` defers a fetch of the plugin of `intent` with the pool of `intent`.
@@ -1023,7 +1116,9 @@ pub open spec fn targeted(intent: Intent, cache: StateCache, area: AreaId, selec
         && forall|index: int| 0 <= index < cache.entities@.len()
             && select::local_match(intent, cache, area, #[trigger] cache.entities@[index])
             ==> selected.contains(cache.entities@[index].entity_id)
-    &&& !select::fixed(intent) && !select::any_local(intent, cache, area) ==> selected.len() <= 1
+    &&& intent.target is House ==> select::housed(intent, cache, selected)
+    &&& !select::fixed(intent) && !(intent.target is House) && !select::any_local(intent, cache, area)
+        ==> selected.len() <= 1
         && (selected.len() == 1 <==> select::count(intent, cache, cache.entities@.len() as int) == 1)
     &&& intent.target is Entity && intent.entity is None && select::any_local(intent, cache, area)
         ==> selected.len() == 1 && select::picked_local(intent, cache, area, selected[0])
@@ -1041,6 +1136,7 @@ mod tests {
 
     use rand::SeedableRng;
 
+    use crate::domain::catalog::Filter;
     use crate::domain::model::Slot;
     use crate::domain::responses::Pool;
     use crate::domain::responses::Response;
@@ -1051,6 +1147,10 @@ mod tests {
 
     /// The temperature sensor of the kitchen thermostat.
     const THERMOSTAT: &str = "sensor.thermostat_current_temperature";
+
+    /// The pool `details`: the name, the state and the friendly name of each entity of a list.
+    const DETAILS: &str = "{% for entity in entities %}[{{ entity.name }} {{ entity.state }} \
+        {{ entity.attributes.friendly_name }}]{% else %}No entities.{% endfor %}";
 
     /// The kitchen lights of the reference house.
     const KITCHEN: [&str; 2] = ["light.kitchen", "light.strawberry_lamp"];
@@ -1073,6 +1173,8 @@ mod tests {
                         "It is {{ entity.state }} degrees in the {{ area }}.".to_owned()
                     }
                     "fan_on" => "The {{ entity.name }} is {{ entity.state }}.".to_owned(),
+                    "names" => r#"{{ entities | map(attribute="name") | join(", ") }}"#.to_owned(),
+                    "details" => DETAILS.to_owned(),
                     _ => format!("The {name} response."),
                 };
                 let pool = Pool {
@@ -1183,12 +1285,36 @@ mod tests {
 
     /// The `temperature_query` reply `text` with no call.
     fn queried(text: &str) -> Decision {
+        answered("temperature_query", text)
+    }
+
+    /// The reply `text` of the pool `pool` with no call.
+    fn answered(pool: &str, text: &str) -> Decision {
         let reply = Chosen {
             text: text.to_owned(),
-            pool: "temperature_query".to_owned(),
+            pool: pool.to_owned(),
             index: 0,
         };
         Decision::Reply { reply, call: None }
+    }
+
+    /// The catalog with the list query `name`: the filters of `lights_on`, `target` and `state`.
+    fn listing(name: &str, target: Target, state: Option<&str>) -> Catalog {
+        let mut catalog = catalog();
+        let mut list = catalog.intents[0].clone();
+        list.name = name.to_owned();
+        list.kind = Kind::Query;
+        list.service = None;
+        list.target = target;
+        list.state = state.map(str::to_owned);
+        catalog.intents.push(list);
+        catalog
+    }
+
+    /// The decision of the list query `name` of `catalog` on the satellite in `area` of the
+    /// reference house.
+    fn listed(catalog: &Catalog, name: &str, area: &str) -> Decision {
+        decided_at(catalog, name, area, &StateCache::load(house()))
     }
 
     /// The `lights_on` reply `text` with a `homeassistant.turn_on` call for `target`, if any.
@@ -1470,6 +1596,66 @@ mod tests {
         let cache = kitchen_temperature("21");
         let decision = decided_at(&catalog, "temperature_query", "kitchen", &cache);
         assert_eq!(decision, queried("It is 21 degrees in the kitchen."));
+    }
+
+    /// AC-18.1-2.
+    #[test]
+    fn ac_18_1_2_list_query_names_the_kept_entities() {
+        let catalog = listing("names", Target::Entities, Some("on"));
+        let names = "Ali's Living Room Lamp, TV Lamp";
+        assert_eq!(
+            listed(&catalog, "names", "living_room"),
+            answered("names", names)
+        );
+    }
+
+    /// AC-18.1-3.
+    #[test]
+    fn ac_18_1_3_no_kept_entity_gives_empty_entities() {
+        let catalog = listing("details", Target::Entities, Some("dimmed"));
+        assert_eq!(
+            listed(&catalog, "details", "living_room"),
+            answered("details", "No entities.")
+        );
+    }
+
+    /// AC-18.1-4.
+    #[test]
+    fn ac_18_1_4_empty_list_selection_falls_back() {
+        let catalog = listing("names", Target::Entities, Some("on"));
+        assert_eq!(listed(&catalog, "names", "bathroom"), fallback());
+    }
+
+    /// AC-18.1-5.
+    #[test]
+    fn ac_18_1_5_house_query_needs_no_area() {
+        let mut catalog = listing("names", Target::House, Some("home"));
+        let people = catalog
+            .intents
+            .last_mut()
+            .expect("the catalog has the list query");
+        people.select = vec![Filter {
+            domain: "person".to_owned(),
+            name: None,
+            device_class: None,
+        }];
+        let decision = decided_in(&catalog, "names", None, None);
+        assert_eq!(decision, answered("names", "Ali, Louis"));
+    }
+
+    /// AC-18.1-6.
+    #[test]
+    fn ac_18_1_6_list_without_state_keeps_each_entity_with_a_state() {
+        let catalog = listing("details", Target::Entities, None);
+        let mut snapshot = house();
+        let corner = "light.living_room_corner_lamp";
+        snapshot.states.retain(|state| state.entity_id != corner);
+        let cache = StateCache::load(snapshot);
+        let decision = decided_at(&catalog, "details", "living_room", &cache);
+        let text = "[Ali's Living Room Lamp on Ali's Living Room Lamp]\
+            [Louis's Living Room Lamp off Louis's Living Room Lamp]\
+            [Living Room Overhead Light unavailable Living Room Overhead Light][TV Lamp on TV Lamp]";
+        assert_eq!(decision, answered("details", text));
     }
 
     /// AC-7.6-3.
