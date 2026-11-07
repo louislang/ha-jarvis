@@ -84,7 +84,7 @@ This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a
 **Goal:** Add the weather plugin `get_weather(when)` with the Open-Meteo forecast API and the house location from HA. Jarvis can then tell the forecast with no API key and no HA weather integration.
 
 - **Implements:** G6, G7. **Depends on:** 17.2.
-- **Files:** create `src/adapters/open_meteo.rs`. Modify `src/domain/state.rs`, `src/testing/house.json`, `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
+- **Files:** create `src/adapters/open_meteo.rs`. Modify `src/domain/state.rs`, `src/testing/house.json`, `src/testing/e2e.rs`, `src/lib.rs`, `jarvis.toml`, `Cargo.toml`, `benches/domain.rs`.
 
 **Model.**
 
@@ -98,6 +98,8 @@ This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a
   4. `forecast(body, day)` is a pure function. `day` is 0 for `today` and 1 for `tomorrow`. It reads that index of each `daily` array and gives `{ condition, high, low, precipitation_chance }`. `high` and `low` are the temperatures rounded to the nearest integer. `precipitation_chance` is the percent. A missing value, a `null` or a weather code that is not in the table gives an error.
 - `condition(code)` maps the WMO weather code of Open-Meteo to a word: 0 `clear`, 1 `mostly clear`, 2 `partly cloudy`, 3 `cloudy`, 45 and 48 `foggy`, 51 to 57 `drizzly`, 61 to 67 and 80 to 82 `rainy`, 71 to 77 and 85 to 86 `snowy`, 95 to 99 `stormy`.
 - `src/lib.rs` registers `OpenMeteo` in the registry of `run`. Tests that build the application use `FakePlugin`, so no test calls the real API.
+- `run` builds one registry and gives its tools to `OpenAiReasoner` and the registry to System Two. `start_app` takes the registry as a parameter, and the pipeline harness gives it a registry with no plugins until sub-phase 17.4.
+- `benches/domain.rs` builds a `HomeConfig`, so it gets the new fields.
 - This sub-phase adds `[plugins.weather]` (`url`) and the `reqwest` features `json` and `query`.
 
 **Acceptance criteria.**
