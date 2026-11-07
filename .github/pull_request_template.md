@@ -16,6 +16,7 @@
 - [ ] `quint`
 - [ ] `python`
 - [ ] `verus`
+- [ ] `fixture-model`
 - [ ] `rust-test`
 - [ ] `bench`
 - [ ] `workflow-lint`
