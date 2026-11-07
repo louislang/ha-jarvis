@@ -41,6 +41,8 @@ pub struct Intent {
     pub optional: Vec<String>,
     /// The HA service, for example `homeassistant.turn_on`.
     pub service: Option<String>,
+    /// The tool name of the plugin of a fetch, for example `get_weather`.
+    pub plugin: Option<String>,
     /// The entities that the service gets.
     #[serde(default)]
     pub target: Target,
@@ -52,7 +54,7 @@ pub struct Intent {
     /// The entity IDs that `select` never matches.
     #[serde(default)]
     pub exclude: Vec<String>,
-    /// The service data templates.
+    /// The service data templates, or the plugin argument templates of a fetch.
     #[serde(default)]
     pub data: BTreeMap<String, String>,
     /// The habit action of each slot that has a habit default.
@@ -68,7 +70,7 @@ pub enum Kind {
     Command,
     /// Reply with data from the hot cache.
     Query,
-    /// Reply with a filler, call the service and announce the answer.
+    /// Reply with a filler, fetch from the plugin and announce the answer.
     Fetch,
     /// Reply with the prefetched answer when it is fresh.
     Prefetch,

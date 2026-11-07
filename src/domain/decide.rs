@@ -69,10 +69,10 @@ pub struct Chosen {
 pub enum Job {
     /// Ask System Two this question.
     Llm(String),
-    /// Make the call and announce its response with a reply from the pool.
+    /// Fetch from the plugin and announce its result with a reply from the pool.
     Fetch {
-        /// The service call with `return_response`.
-        call: ServiceCall,
+        /// The plugin call.
+        call: PluginCall,
         /// The pool name of the announced reply.
         pool: String,
     },
@@ -343,7 +343,7 @@ pub fn decide(
 }
 
 /// The decision of `intent` in the area of the area slot, else of the satellite, or `Fallback`
-/// when the slot names no area, or a query or a service has no area.
+/// when the slot names no area, or a query or a service has no area. A fetch needs no area.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
@@ -365,6 +365,7 @@ fn act(
         return fallback(pools, rng);
     };
     match (intent.kind, &intent.service, area) {
+        (Kind::Fetch, _, _) => fetch(intent, &context, pools, rng),
         (Kind::Query, _, Some(area)) => query(intent, area, context, cache, pools, rng),
         (Kind::Command, None, _) => respond(intent, &context, None, pools, rng),
         (_, Some(service), Some(area)) => {
@@ -422,22 +423,19 @@ fn query(
     respond(intent, &context, None, pools, rng)
 }
 
-/// The reply, or for a fetch the filler, and the call of `service` with the data of `intent` on its
-/// selection in `area`, or `Fallback` when `service` has no dot, the selection is empty or a
-/// template does not render.
+/// The reply and the call of `service` with the data of `intent` on its selection in `area`, or
+/// `Fallback` when `service` has no dot, the selection is empty or a template does not render.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
         pools@.contains_key(crate::domain::contracts::string_key("fallback"@)),
-        pools@.contains_key(crate::domain::contracts::string_key("filler"@)),
         responses::filled(pools@),
     ensures
-        !(intent.kind is Fetch) ==> decision is Fallback
+        decision is Fallback
             || (decision matches Decision::Reply { call: Some(made), .. }
             && made.target@.len() > 0 && served(service@, made)
             && targeted(*intent, *cache, *area, entity_ids(made.target@))
             && stringed(*intent, made.data)),
-        intent.kind is Fetch ==> decision is Fallback || fetched(*intent, decision),
 )]
 fn call(
     intent: &Intent,
@@ -457,23 +455,48 @@ fn call(
     let Some(data) = data(intent, &context) else {
         return fallback(pools, rng);
     };
-    let fetch = matches!(intent.kind, Kind::Fetch);
     let call = ServiceCall {
         domain: domain.to_owned(),
         service: name.to_owned(),
         target: texts(&selection),
         data,
-        return_response: fetch,
+        return_response: false,
     };
-    if fetch {
-        let pool = intent.name.clone();
-        let job = Job::Fetch { call, pool };
-        return Decision::Defer {
-            filler: choose(pools, "filler", rng),
-            job,
-        };
-    }
     respond(intent, &context, Some(call), pools, rng)
+}
+
+/// The filler and the fetch of the plugin of `intent` with its `data` rendered with `context` as
+/// the arguments, or `Fallback` when `intent` has no plugin or a data value does not render.
+#[verus_spec(decision =>
+    requires
+        pools@.contains_key(crate::domain::contracts::string_key("fallback"@)),
+        pools@.contains_key(crate::domain::contracts::string_key("filler"@)),
+        responses::filled(pools@),
+    ensures
+        intent.plugin is None ==> decision is Fallback,
+        decision is Fallback || fetched(*intent, decision),
+)]
+fn fetch(
+    intent: &Intent,
+    context: &Map<String, Value>,
+    pools: &Pools,
+    rng: &mut StdRng,
+) -> Decision {
+    let Some(plugin) = &intent.plugin else {
+        return fallback(pools, rng);
+    };
+    let Some(arguments) = data(intent, context) else {
+        return fallback(pools, rng);
+    };
+    let call = PluginCall {
+        plugin: plugin.clone(),
+        arguments,
+    };
+    let pool = intent.name.clone();
+    Decision::Defer {
+        filler: choose(pools, "filler", rng),
+        job: Job::Fetch { call, pool },
+    }
 }
 
 /// The selection of `intent` in `area`, with the `entity` text rendered with `context`, and with
@@ -876,13 +899,14 @@ pub open spec fn handled(prediction: Prediction, catalog: Catalog, threshold: f3
 /// True when `decision` for `intent` obeys the area rules: an area slot that names no area, or a
 /// service without an area, gives `Fallback`, and no service gives no call. A call makes the
 /// service of the intent on its selection in the area of the request. A query gives no call and
-/// reads a selection in the area of the request. A fetch gives `Fallback` or a fetch job.
+/// reads a selection in the area of the request. A fetch needs no area and gives `Fallback` or a
+/// fetch job, and a fetch with no plugin gives `Fallback`.
 pub open spec fn acted(intent: Intent, prediction: Prediction, request: Request, cache: StateCache, decision: Decision) -> bool {
     &&& forall|slot: int| #[trigger] first_area(prediction.slots@, slot)
         && !area_named(cache, prediction.slots@[slot].value@) ==> decision is Fallback
     &&& unslotted(prediction.slots@) && request.area is None && intent.service is Some
-        ==> decision is Fallback
-    &&& intent.service is None
+        && !(intent.kind is Fetch) ==> decision is Fallback
+    &&& intent.service is None && !(intent.kind is Fetch)
         ==> (decision is Fallback || decision matches Decision::Reply { call: None, .. })
     &&& decision matches Decision::Reply { call: Some(made), .. } ==> made.target@.len() > 0
         && (intent.service matches Some(service) && served(service@, made))
@@ -892,13 +916,14 @@ pub open spec fn acted(intent: Intent, prediction: Prediction, request: Request,
             #![trigger located(prediction, request, cache, area), targeted(intent, cache, area, selected)]
             located(prediction, request, cache, area) && selected.len() > 0
             && targeted(intent, cache, area, selected))
+    &&& intent.kind is Fetch && intent.plugin is None ==> decision is Fallback
     &&& intent.kind is Fetch ==> decision is Fallback || fetched(intent, decision)
 }
 
-/// True when `decision` defers the call with `return_response` and the pool of `intent`.
+/// True when `decision` defers a fetch of the plugin of `intent` with the pool of `intent`.
 pub open spec fn fetched(intent: Intent, decision: Decision) -> bool {
     decision matches Decision::Defer { job: Job::Fetch { call, pool }, .. }
-        && call.return_response && pool@ == intent.name@
+        && intent.plugin matches Some(plugin) && call.plugin@ == plugin@ && pool@ == intent.name@
 }
 
 /// True when each `data` value of `intent` that is not braced is a JSON string in `data`.
@@ -1397,30 +1422,44 @@ mod tests {
         assert_eq!(decision, fallback());
     }
 
-    /// AC-4.6-3.
+    /// The filler and the `get_weather` fetch with `when = today` of the pool `weather`.
+    fn weather() -> Decision {
+        let arguments = Map::from_iter([("when".to_owned(), Value::from("today"))]);
+        let call = PluginCall {
+            plugin: "get_weather".to_owned(),
+            arguments,
+        };
+        let pool = "weather".to_owned();
+        let job = Job::Fetch { call, pool };
+        Decision::Defer {
+            filler: filler(),
+            job,
+        }
+    }
+
+    /// AC-17.4-1.
     #[test]
-    fn ac_4_6_3_weather_fetches_with_response() {
-        let mut snapshot = house();
-        let mut weather = snapshot.states[0].clone();
-        weather.entity_id = "weather.forecast_home".to_owned();
-        snapshot.states.push(weather);
-        let cache = StateCache::load(snapshot);
-        let mut data = Map::new();
-        data.insert("type".to_owned(), Value::from("daily"));
-        let call = ServiceCall {
-            domain: "weather".to_owned(),
-            service: "get_forecasts".to_owned(),
-            target: vec!["weather.forecast_home".to_owned()],
-            data,
-            return_response: true,
-        };
-        let job = Job::Fetch {
-            call,
-            pool: "weather".to_owned(),
-        };
-        let filler = filler();
+    fn ac_17_4_1_weather_fetches_from_the_plugin() {
+        let cache = StateCache::load(house());
         let decision = decided_at(&catalog(), "weather", "kitchen", &cache);
-        assert_eq!(decision, Decision::Defer { filler, job });
+        assert_eq!(decision, weather());
+    }
+
+    /// AC-17.4-2.
+    #[test]
+    fn ac_17_4_2_weather_needs_no_area() {
+        assert_eq!(decided_in(&catalog(), "weather", None, None), weather());
+    }
+
+    /// AC-17.4-3.
+    #[test]
+    fn ac_17_4_3_fetch_without_plugin_falls_back() {
+        let mut catalog = catalog();
+        for intent in &mut catalog.intents {
+            intent.plugin = None;
+        }
+        let decision = decided_in(&catalog, "weather", None, Some("kitchen"));
+        assert_eq!(decision, fallback());
     }
 
     /// AC-4.6-4.

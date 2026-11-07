@@ -45,7 +45,5 @@ select = [{ domain = "sensor", device_class = "temperature" }]
 name = "weather"
 kind = "fetch"
 examples = ["what is the weather like", "will it rain today", "what is the forecast"]
-service = "weather.get_forecasts"
-target = "entity"
-entity = "weather.forecast_home"
-data = { type = "daily" }
+plugin = "get_weather"
+data = { when = "today" }

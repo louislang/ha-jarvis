@@ -185,7 +185,7 @@ impl Conversation {
     ) -> Handled {
         let answer = match (decision, satellite) {
             (Decision::Defer { job, .. }, None) => match job {
-                Job::Fetch { call, pool } => self.fetched(call, &pool).await,
+                Job::Fetch { call, pool } => self.fetched(&call, &pool).await,
                 Job::Llm(text) => self
                     .answer(&text, area, None)
                     .await
@@ -250,16 +250,16 @@ impl Conversation {
         .boxed()
     }
 
-    /// Makes `call` while `request` is the newest of its satellite. Queues its answer of `pool`,
+    /// Fetches `call` while `request` is the newest of its satellite. Queues its answer of `pool`,
     /// or a `failure` answer when it fails, with the generation of `request`.
-    fn fetch(&self, call: ServiceCall, pool: String, request: (String, u64)) -> Work {
+    fn fetch(&self, call: PluginCall, pool: String, request: (String, u64)) -> Work {
         let conversation = self.clone();
         async move {
             let (satellite, generation) = request;
             if !conversation.queues.is_current(&satellite, generation) {
                 return Ok(());
             }
-            let answer = conversation.fetched(call, &pool).await;
+            let answer = conversation.fetched(&call, &pool).await;
             let text = conversation.or_failure(answer);
             let queues = &conversation.queues;
             queues.announce(&satellite, generation, &text).await
@@ -360,7 +360,7 @@ impl Conversation {
             }
             Step::Plugin(call, reply) => {
                 // The send fails only when the answer has ended, so the result is not needed.
-                let _ = reply.send(self.plugin(&call).await);
+                let _ = reply.send(self.plugin(&call).await.map(Some));
             }
             Step::Done => return Ok(false),
         }
@@ -452,22 +452,22 @@ impl Conversation {
     /// # Errors
     ///
     /// The HA configuration is not known, or the registry fails.
-    async fn plugin(&self, call: &PluginCall) -> anyhow::Result<Option<Value>> {
+    async fn plugin(&self, call: &PluginCall) -> anyhow::Result<Value> {
         use anyhow::Context as _;
         let home = self.queues.cache.borrow().config().cloned();
         let home = home.context("no HA configuration")?;
-        Ok(Some(self.two.plugins.fetch(call, &home).await?))
+        self.two.plugins.fetch(call, &home).await
     }
 
-    /// An answer of the pool `pool` rendered with the response data of `call` as `response`.
+    /// An answer of the pool `pool` rendered with the result of the plugin `call` as `response`.
     ///
     /// # Errors
     ///
-    /// The call or the render fails.
-    async fn fetched(&self, call: ServiceCall, pool: &str) -> anyhow::Result<String> {
-        let response = self.queues.home.call(call).await?;
+    /// The plugin or the render fails.
+    async fn fetched(&self, call: &PluginCall, pool: &str) -> anyhow::Result<String> {
+        let response = self.plugin(call).await?;
         let template = self.pick(pool);
-        let context = Map::from_iter([("response".to_owned(), response.unwrap_or_default())]);
+        let context = Map::from_iter([("response".to_owned(), response)]);
         Ok(responses::render(&template, &context)?)
     }
 
@@ -671,6 +671,7 @@ fn generated(saved: &[Response], source: &[Response]) -> Vec<Response> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
     use std::thread;
     use std::time::Duration;
 
@@ -1182,31 +1183,47 @@ mod tests {
         assert_eq!(Instant::now(), start, "select waited for the backfill");
     }
 
-    /// The `weather` call with `return_response`.
-    fn weather() -> ServiceCall {
-        ServiceCall {
-            return_response: true,
-            ..service("weather", "get_forecasts", "weather.forecast_home")
+    /// The call of the plugin `plugin` with `when = today`.
+    fn today(plugin: &str) -> PluginCall {
+        PluginCall {
+            plugin: plugin.to_owned(),
+            arguments: Map::from_iter([("when".to_owned(), "today".into())]),
         }
     }
 
-    /// The work of a dispatch on `satellite` of a `weather` fetch.
-    fn fetch(conversation: &Conversation, satellite: Option<&str>) -> anyhow::Result<Work> {
-        let job = Job::Fetch {
-            call: weather(),
-            pool: "weather".to_owned(),
-        };
-        let filler = chosen("filler", 0);
-        work(conversation, Decision::Defer { filler, job }, satellite)
+    /// The `get_weather` plugin with `result` scripted, in the registry of `conversation`.
+    fn weather(conversation: &mut Conversation, result: anyhow::Result<Value>) -> Arc<FakePlugin> {
+        let plugin = Arc::new(FakePlugin::new("get_weather"));
+        plugin.script(result);
+        conversation.two.plugins = registry(vec![Arc::clone(&plugin) as Arc<dyn Plugin>]);
+        plugin
     }
 
-    /// AC-4.9d-1.
+    /// The work of a dispatch on the satellite of a `weather` fetch of `get_weather`.
+    fn fetch(conversation: &Conversation) -> anyhow::Result<Work> {
+        let job = Job::Fetch {
+            call: today("get_weather"),
+            pool: "weather".to_owned(),
+        };
+        let defer = Decision::Defer {
+            filler: chosen("filler", 0),
+            job,
+        };
+        work(conversation, defer, Some(SATELLITE))
+    }
+
+    /// AC-17.4-4.
     #[tokio::test(start_paused = true)]
-    async fn ac_4_9d_1_fetch_calls_with_return_response() -> anyhow::Result<()> {
+    async fn ac_17_4_4_fetch_runs_the_plugin_and_no_call() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
-        let (_cache, _changes, conversation) = still(&home, "idle");
-        fetch(&conversation, Some(SATELLITE))?.await?;
-        assert_eq!(home.calls().first(), Some(&weather()));
+        let (_cache, _changes, mut conversation) = still(&home, "idle");
+        let plugin = weather(&mut conversation, Ok(serde_json::json!({ "sky": "sunny" })));
+        fetch(&conversation)?.await?;
+        let fetches = plugin.fetches();
+        assert_eq!(fetches.len(), 1, "{fetches:?}");
+        assert_eq!(fetches[0].0, today("get_weather").arguments);
+        assert_eq!(announces(&home), ["It is sunny."]);
+        assert_eq!(home.calls().len(), 1, "a call that is not the announce");
         Ok(())
     }
 
@@ -1214,8 +1231,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_4_9d_2_fetch_announces_rendered_answer_when_idle() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
-        home.respond(serde_json::json!({ "sky": "sunny" }));
-        let (cache, _changes, conversation) = still(&home, "responding");
+        let (cache, _changes, mut conversation) = still(&home, "responding");
+        weather(&mut conversation, Ok(serde_json::json!({ "sky": "sunny" })));
         let idle = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
             assert_eq!(
@@ -1225,7 +1242,7 @@ mod tests {
             );
             set(&cache, "idle");
         };
-        tokio::join!(fetch(&conversation, Some(SATELLITE))?, idle).0?;
+        tokio::join!(fetch(&conversation)?, idle).0?;
         assert_eq!(announces(&home), ["It is sunny."]);
         let preannounce = home
             .calls()
@@ -1239,9 +1256,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_4_9d_3_failed_fetch_announces_failure() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
-        let (_cache, _changes, conversation) = still(&home, "idle");
-        drop(home.delay());
-        fetch(&conversation, Some(SATELLITE))?.await?;
+        let (_cache, _changes, mut conversation) = still(&home, "idle");
+        weather(&mut conversation, Err(anyhow::anyhow!("server down")));
+        fetch(&conversation)?.await?;
         assert_eq!(announces(&home), ["Failed."]);
         Ok(())
     }
@@ -1596,11 +1613,7 @@ mod tests {
     ) -> anyhow::Result<(Arc<FakePlugin>, Reasoning)> {
         let plugin = Arc::new(FakePlugin::new("get_test"));
         plugin.script(result);
-        let call = PluginCall {
-            plugin: "get_test".to_owned(),
-            arguments: Map::from_iter([("when".to_owned(), "today".into())]),
-        };
-        let mut steps = vec![Scripted::Plugin(call)];
+        let mut steps = vec![Scripted::Plugin(today("get_test"))];
         steps.extend(more);
         let reasoning = plugged("idle", steps, vec![Arc::clone(&plugin) as Arc<dyn Plugin>])?;
         Ok((plugin, reasoning))
@@ -1634,8 +1647,8 @@ mod tests {
     }
 
     /// The text of `handle` for `text` on `home` from the kitchen device with no satellite, when
-    /// the classifier gives `label` and the reasoner gives `steps`. The hot cache also has
-    /// `weather.forecast_home`.
+    /// the classifier gives `label`, the reasoner gives `steps` and `get_weather` gives
+    /// `{ sky: sunny }`.
     async fn typed(
         label: &str,
         text: &str,
@@ -1644,9 +1657,9 @@ mod tests {
     ) -> anyhow::Result<String> {
         let reasoner = Arc::new(FakeReasoner::default());
         reasoner.script(steps);
-        let (cache, _changes, conversation) =
+        let (_cache, _changes, mut conversation) =
             still_with(home, "idle", classifier(Some(label)), reasoner);
-        add(&cache, "weather.forecast_home");
+        weather(&mut conversation, Ok(serde_json::json!({ "sky": "sunny" })));
         let context = Context {
             device_id: Some(KITCHEN.to_owned()),
             ..Context::default()
@@ -1669,9 +1682,42 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_7_5c_2_no_satellite_returns_the_fetch_answer() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
-        home.respond(serde_json::json!({ "sky": "sunny" }));
         let text = typed("weather", "what is the weather like", &home, Vec::new()).await?;
         assert_eq!(text, "It is sunny.");
+        Ok(())
+    }
+
+    /// A conversation on `home` with an idle satellite, a classifier that gives `weather` and the
+    /// pools of `responses.toml`.
+    fn forecaster(home: &Arc<FakeHome>) -> anyhow::Result<Conversation> {
+        let classifier = classifier(Some("weather"));
+        let (_cache, _changes, mut conversation) =
+            still_with(home, "idle", classifier, Arc::default());
+        let catalog = crate::load_catalog(Path::new("intents.toml"))?;
+        let pools = crate::load_pools(Path::new("responses.toml"), &catalog)?;
+        conversation.pools = Arc::new(ArcSwap::from_pointee(pools));
+        Ok(conversation)
+    }
+
+    /// AC-17.4-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_17_4_5_weather_announces_the_forecast() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let mut conversation = forecaster(&home)?;
+        let forecast = serde_json::json!({
+            "condition": "partly cloudy", "high": 72, "low": 54, "precipitation_chance": 20
+        });
+        weather(&mut conversation, Ok(forecast));
+        let context = Context {
+            device_id: Some(KITCHEN.to_owned()),
+            satellite_id: Some(SATELLITE.to_owned()),
+            ..Context::default()
+        };
+        let text = "what is the weather like";
+        let after = conversation.handle(text, context).await?.after;
+        after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
+        let answer = "Today will be partly cloudy, with a high of 72 degrees.";
+        assert_eq!(announces(&home), [answer]);
         Ok(())
     }
 
