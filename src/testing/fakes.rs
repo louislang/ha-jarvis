@@ -27,6 +27,7 @@ use rubato::Fft;
 use rubato::FixedSync;
 use rubato::Resampler;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 use tempfile::NamedTempFile;
@@ -47,6 +48,7 @@ use crate::domain::decide::Question;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
+use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
 use crate::ports::Assistant;
@@ -59,12 +61,14 @@ use crate::ports::Info;
 use crate::ports::Listening;
 use crate::ports::ModelLoader;
 use crate::ports::Partial;
+use crate::ports::Plugin;
 use crate::ports::Reasoner;
 use crate::ports::SpeechToText;
 use crate::ports::Step;
 use crate::ports::Store;
 use crate::ports::SttStream;
 use crate::ports::TextToSpeech;
+use crate::ports::Tool;
 
 /// The reference house snapshot.
 #[must_use]
@@ -391,6 +395,67 @@ impl Reasoner for FakeReasoner {
     }
 }
 
+/// The arguments and the HA configuration of one plugin fetch.
+pub(crate) type Fetch = (Map<String, Value>, HomeConfig);
+
+/// A `Plugin` with a tool that gives the scripted results in order and records each fetch. A
+/// fetch with no scripted result waits without end.
+pub(crate) struct FakePlugin {
+    /// The tool of the plugin.
+    tool: Tool,
+    /// The results of the next fetches, in order.
+    results: Mutex<VecDeque<anyhow::Result<Value>>>,
+    /// The arguments and the HA configuration of each fetch, in order.
+    fetches: Mutex<Vec<Fetch>>,
+}
+
+impl FakePlugin {
+    /// A plugin with the tool `name`.
+    #[must_use]
+    pub(crate) fn new(name: &str) -> Self {
+        Self {
+            tool: Tool {
+                name: name.to_owned(),
+                description: format!("Gives {name} test data."),
+                parameters: json!({ "type": "object" }),
+            },
+            results: Mutex::default(),
+            fetches: Mutex::default(),
+        }
+    }
+
+    /// Makes the next fetch without an earlier scripted result give `result`.
+    pub(crate) fn script(&self, result: anyhow::Result<Value>) {
+        lock(&self.results).push_back(result);
+    }
+
+    /// The arguments and the HA configuration of each fetch, in order.
+    #[must_use]
+    pub(crate) fn fetches(&self) -> Vec<Fetch> {
+        lock(&self.fetches).clone()
+    }
+}
+
+#[async_trait]
+impl Plugin for FakePlugin {
+    fn tool(&self) -> Tool {
+        self.tool.clone()
+    }
+
+    async fn fetch(
+        &self,
+        arguments: &Map<String, Value>,
+        home: &HomeConfig,
+    ) -> anyhow::Result<Value> {
+        lock(&self.fetches).push((arguments.clone(), home.clone()));
+        let result = lock(&self.results).pop_front();
+        match result {
+            Some(result) => result,
+            None => futures::future::pending().await,
+        }
+    }
+}
+
 /// A `TextToSpeech` that gives audio with no samples and records each text.
 #[derive(Default)]
 pub(crate) struct FakeTts {
@@ -558,6 +623,15 @@ pub struct FakeClock(pub Timestamp);
 impl Clock for FakeClock {
     fn now(&self) -> Timestamp {
         self.0
+    }
+}
+
+/// A `Clock` that gives the time that a test sets.
+pub(crate) struct SetClock(pub(crate) Mutex<Timestamp>);
+
+impl Clock for SetClock {
+    fn now(&self) -> Timestamp {
+        *lock(&self.0)
     }
 }
 
