@@ -11,7 +11,7 @@ This phase proves the latency goal for the full pipeline.
 - **Implements:** G10. **Depends on:** 8.4.
 - **Files:** create `src/testing/e2e.rs`. Modify `src/lib.rs`.
 
-**Model.** The harness sends `speech(text)` in 20 ms chunks, sends the transcript to `handle` on a second connection, then sends `synthesize` with the reply. `[GPU host]` tests send the chunks at real-time pace. The other tests send them with no pause, so they do not wait on the wall clock. The harness uses the real Wyoming adapter, the real application, the real sherpa-onnx adapters, the ONNX adapter with the fixture model, `FakeHome` and `FakeReasoner`. It records the time of the last voiced sample and of each event of the response latency (`00-overview.md` section 0.3).
+**Model.** The harness sends `speech(text)` in 20 ms chunks, sends the transcript to `handle` on a second connection, then sends `synthesize` with the reply. `[GPU host]` tests send the chunks at real-time pace. The other tests send them with no pause, so they do not wait on the wall clock. The harness uses the real Wyoming adapter, the real application, the real sherpa-onnx adapters, the ONNX adapter with the fixture model, `FakeHome` and `FakeReasoner`. It records the time of the voice end of `speech(text)` (sub-phase 9.2) and of each event of the response latency (`00-overview.md` section 0.3).
 
 **Acceptance criteria.**
 
@@ -58,9 +58,9 @@ This phase proves the latency goal for the full pipeline.
 - **Implements:** G1, G2, G6. **Depends on:** 9.1b.
 - **Files:** modify `src/testing/e2e.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** The tests run the harness of sub-phase 9.1 on the GPU host with `device = cuda`, the Nemotron first pass and the Parakeet second pass, at real-time pace. Each phrase runs once as a warm-up, then 20 times. The response latency of a run is the sum of three segments: from the last voiced sample to `transcript`, from `transcript` to `handled`, and from `synthesize` to the first audio chunk. The harness sends each next event at once, so the sum equals the time from the last voiced sample to the first audio chunk. The p95 of 20 runs is the 19th smallest value. The latency to a filler uses the same segments with the filler text.
+**Model.** The tests run the harness of sub-phase 9.1 on the GPU host with `device = cuda`, the Nemotron first pass and the Parakeet second pass, at real-time pace. Each phrase runs once as a warm-up, then 20 times. The response latency of a run is the sum of three segments: from the voice end to `transcript`, from `transcript` to `handled`, and from `synthesize` to the first audio chunk. The harness sends each next event at once, so the sum equals the time from the voice end to the first audio chunk. The p95 of 20 runs is the 19th smallest value. The latency to a filler uses the same segments with the filler text.
 
-- The last voiced sample is the last sample of the last 20 ms frame of `speech(text)` with an RMS above -40 dBFS. The TTS audio has a long, quiet tail, and a person does not hear it as speech. This replaces the last sample that is not zero of sub-phase 9.1.
+- The voice end is the `voice_end_ms` that the Silero VAD gives for `speech(text)` with the VAD settings of `run`: `asr.vad_model`, `asr.vad_threshold` and `asr.vad_min_silence_ms` (sub-phase 6.6b). Jarvis starts its endpoint timer at this point, so the silence of a commit and the `endpoint_ms` of AC-9.2-3 count from it. Sub-phase 9.3c adds this rule.
 - `start_app` gives the handle of the startup pre-render task, so the harness waits for the pre-render before the warm-up. Thus no measured run misses the audio cache or shares the TTS with the pre-render.
 - The reference house has no `weather.forecast_home` entity, so the harness adds a `weather.forecast_home` state to its copy of the house. "What is the weather" then gives the weather fetch and its filler.
 - Each test prints the p95 of each phrase, so a run that passes also gives the numbers.
@@ -181,6 +181,7 @@ Each measured command and fetch phrase has a top intent at or above `model.commi
 - AC-9.3-2 and AC-9.3-3 replace AC-6.2-2 and AC-6.2-3, so this sub-phase deletes the tests of AC-6.2-2 and AC-6.2-3. The tests of AC-6.2-4 and AC-6.2-5 load `SupertonicTts`.
 - `speech(text)` adds 250 ms of silence before the speech and keeps the 500 ms of silence after it. `speech(text)` gives new audio, so the STT tests get new input. Their criteria do not change.
 - Reason for the lead silence (measured on the CPU, voice 6, 4 steps): the Supertonic speech starts at sample 0, and the int8 Nemotron first pass then gives "turned on the kitchen lights" for AC-6.6-1. With 0 ms and 100 ms of lead silence, AC-6.6-1 fails. With 250 ms, 500 ms and 1000 ms, it passes.
+- The harness measures from the VAD voice end of sub-phase 9.2, not from the last 20 ms frame of `speech(text)` with an RMS above -40 dBFS. Reason (measured in `gpu-test`): the Supertonic voice ends words with quiet sounds below -40 dBFS. With the -40 dBFS rule, "start the office fan" had a p95 of 361.9 ms (AC-9.2-1) and "what is the meaning of life" had 762.0 ms (AC-9.2-3). Both misses were in the segment to `transcript`. The VAD voice end is 36 ms earlier to 200 ms later than the -40 dBFS end: 80 ms later for "start the office fan" and 200 ms later for "what is the meaning of life". The VAD runs on the CPU on every machine, so the harness gets the same voice end on the CPU and on the GPU host.
 - AC-9.3c-1 replaces AC-9.2-4, so this sub-phase deletes the test of AC-9.2-4. The command is "turn the tv to jeopardy", whose `tv_show` replies are not in the audio cache.
 
 **Acceptance criteria.**

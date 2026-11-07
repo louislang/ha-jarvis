@@ -75,7 +75,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | Announce | The HA service `assist_satellite.announce`. It speaks text on one satellite. |
 | Ask | The HA service `assist_satellite.start_conversation`. It speaks a question on one satellite, then listens without the wake word. |
 | Dialog | The state of one open conversation on one satellite. |
-| Response latency | The time that Jarvis adds to a request: from the last voiced audio sample to the `transcript` event, from `transcript` to `handled`, and from `synthesize` to the first audio chunk. The time that HA takes between these events is not part of it. |
+| Response latency | The time that Jarvis adds to a request: from the voice end that the VAD detects to the `transcript` event, from `transcript` to `handled`, and from `synthesize` to the first audio chunk. The time that HA takes between these events is not part of it. |
 | Habit | A learned pattern: an entity action that occurs at a specified time of the week. |
 | Bucket | One time slot for habits: the day type (weekday or weekend) and the hour. |
 | Established habit | A habit with a score of `habits.min_score` or more in one or more buckets. |
