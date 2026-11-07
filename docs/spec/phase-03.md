@@ -514,7 +514,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - `device = cuda` registers the CUDA execution provider. `device = cpu` registers only the CPU provider.
 - `predict` checks the session output before it calls `softmax`.
 - This sub-phase turns on the `cuda` feature of `ort`. On Linux, the binary then loads `libonnxruntime.so` at run time. Until sub-phase 6.1, the release job copies the ONNX Runtime libraries next to `jarvis` in the Linux archive, and the binary finds them in its own folder.
-- The `gpu-test` job needs the fixture model, and its checkout removes the ignored `models/` folder. Thus `gpu-test` runs after `rust-test` and restores `models/system-one/fixture/` from the `rust-test` cache.
+- The `gpu-test` job needs the fixture model, and its checkout removes the ignored `models/` folder. Thus the CI job `fixture-model` on `ubuntu-latest` runs `jarvis dataset` and `just fixture-model`, and saves `models/system-one/fixture/` in the CI cache with the hash of the training set as the key. `gpu-test` runs after `fixture-model` and restores the folder from this cache. It does not wait for `rust-test`, and it does not train.
 
 **Acceptance criteria.**
 
