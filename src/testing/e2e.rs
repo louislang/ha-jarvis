@@ -209,8 +209,8 @@ impl Pipeline {
     }
 }
 
-/// Starts the app of `config` on `home` and `reasoner`, waits for its pre-render and serves it on
-/// a local port. Gives the address and the tracker of the connection tasks.
+/// Starts the app of `config` on `home`, `reasoner` and no plugins, waits for its pre-render and
+/// serves it on a local port. Gives the address and the tracker of the connection tasks.
 ///
 /// # Errors
 ///
@@ -222,7 +222,9 @@ async fn serve(
 ) -> anyhow::Result<(SocketAddr, TaskTracker)> {
     let catalog = crate::load_catalog(&config.intents)?;
     let pools = crate::load_pools(&config.responses, &catalog)?;
-    let (app, _, prerender) = crate::start_app(config, catalog, pools, home, reasoner).await?;
+    let plugins = crate::registry(config, Vec::new());
+    let (app, _, prerender) =
+        crate::start_app(config, catalog, pools, home, reasoner, plugins).await?;
     prerender.await?;
     let app = Arc::new(app);
     let listener = TcpListener::bind("127.0.0.1:0").await?;

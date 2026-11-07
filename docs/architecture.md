@@ -47,6 +47,7 @@ flowchart LR
     crate --> crate_adapters_files
     crate --> crate_adapters_ha
     crate --> crate_adapters_onnx
+    crate --> crate_adapters_open_meteo
     crate --> crate_adapters_openai
     crate --> crate_adapters_sherpa
     crate --> crate_adapters_supertonic

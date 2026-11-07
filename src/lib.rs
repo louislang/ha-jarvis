@@ -43,6 +43,7 @@ use tracing_subscriber::fmt::MakeWriter;
 use crate::adapters::files::FileStore;
 use crate::adapters::ha::HaHome;
 use crate::adapters::onnx::OnnxLoader;
+use crate::adapters::open_meteo::OpenMeteo;
 use crate::adapters::openai::OpenAiReasoner;
 use crate::adapters::sherpa::SherpaStt;
 use crate::adapters::supertonic::SupertonicTts;
@@ -74,6 +75,7 @@ use crate::ports::Home;
 use crate::ports::Info;
 use crate::ports::Listening;
 use crate::ports::ModelLoader;
+use crate::ports::Plugin;
 use crate::ports::Reasoner;
 use crate::ports::SpeechToText;
 
@@ -720,7 +722,7 @@ where
     let mut shutdown = pin::pin!(startup.shutdown);
     // The models can load for a long time, so a shutdown stops the start too.
     let (app, pools_task, _) = tokio::select! {
-        started = start_app(&config, catalog, pools, home, reasoner(&config, &secrets)?) => started?,
+        started = start_live_app(&config, &secrets, catalog, pools, home) => started?,
         () = &mut shutdown => return Ok(()),
     };
     serve_until(config.listen, app, pools_task, shutdown).await
@@ -784,29 +786,48 @@ where
     Ok(HaHome::start(move || connector(&host, port), token, ha))
 }
 
-/// The reasoner of `config` with the `OpenAI` API key of `secrets` and the tools of the plugin
-/// registry of `config`.
+/// The app of `config`, `catalog` and the source pools `pools` on `home`, the plugin registry of
+/// `config` and the reasoner of `config` with the tools of that registry and the `OpenAI` API key
+/// of `secrets`. Gives the app, its pools task and its pre-render task.
 ///
 /// # Errors
 ///
-/// The HTTP client cannot be built.
-fn reasoner(config: &Config, secrets: &Secrets) -> anyhow::Result<Arc<dyn Reasoner>> {
-    let tools = registry(config, Arc::new(SystemClock)).tools();
-    Ok(Arc::new(OpenAiReasoner::try_new(
-        &config.openai,
-        &secrets.openai_key,
-        tools,
-    )?))
+/// An HTTP client cannot be built, or the saved pools or a model cannot load.
+async fn start_live_app(
+    config: &Config,
+    secrets: &Secrets,
+    catalog: Catalog,
+    pools: Pools,
+    home: Arc<dyn Home>,
+) -> anyhow::Result<(App, JoinHandle<()>, JoinHandle<()>)> {
+    let plugins = registry(config, plugins(config)?);
+    let tools = plugins.tools();
+    let reasoner = OpenAiReasoner::try_new(&config.openai, &secrets.openai_key, tools)?;
+    start_app(config, catalog, pools, home, Arc::new(reasoner), plugins).await
 }
 
-/// The plugin registry with the `[plugins]` of `config` and the time of `clock`.
-fn registry(config: &Config, clock: Arc<dyn Clock>) -> Plugins {
-    Plugins::new(config.plugins.clone(), clock, Vec::new())
+/// The plugins of `config`: the Open-Meteo weather plugin.
+///
+/// # Errors
+///
+/// An HTTP client cannot be built.
+fn plugins(config: &Config) -> anyhow::Result<Vec<Arc<dyn Plugin>>> {
+    Ok(vec![Arc::new(OpenMeteo::try_new(&config.plugins.weather)?)])
 }
 
-/// The app of `config`, `catalog` and the source pools `pools` on `home` and `reasoner`, its
-/// pools task and its pre-render task. Starts the pools task and the sync, and loads the System
-/// One model, then the STT and TTS models. Then starts the pre-render.
+/// The registry of `plugins` with the `[plugins]` of `config` and the system time.
+fn registry(config: &Config, plugins: Vec<Arc<dyn Plugin>>) -> Arc<Plugins> {
+    Arc::new(Plugins::new(
+        config.plugins.clone(),
+        Arc::new(SystemClock),
+        plugins,
+    ))
+}
+
+/// The app of `config`, `catalog` and the source pools `pools` on `home`, `reasoner` and the
+/// plugin registry `plugins`, its pools task and its pre-render task. Starts the pools task and
+/// the sync, and loads the System One model, then the STT and TTS models. Then starts the
+/// pre-render.
 ///
 /// # Errors
 ///
@@ -817,6 +838,7 @@ async fn start_app(
     pools: Pools,
     home: Arc<dyn Home>,
     reasoner: Arc<dyn Reasoner>,
+    plugins: Arc<Plugins>,
 ) -> anyhow::Result<(App, JoinHandle<()>, JoinHandle<()>)> {
     let task = start_pools(config, pools)?;
     let (cache, queues) = start_sync(home, &config.announce);
@@ -824,11 +846,16 @@ async fn start_app(
     let prerender = start_prerender(&speech, &task.pools, cache.clone());
     let catalog = Arc::new(catalog);
     let backfill = backfill(config, &reasoner, task.changes, &speech, &catalog, cache);
-    let two = system_two(config, reasoner, Arc::new(SystemClock));
-    let threshold = config.model.threshold;
+    let two = system_two(config, reasoner, plugins, Arc::new(SystemClock));
     let app = App {
         conversation: Conversation::new(
-            task.pools, backfill, queues, classifier, catalog, threshold, two,
+            task.pools,
+            backfill,
+            queues,
+            classifier,
+            catalog,
+            config.model.threshold,
+            two,
         ),
         listener,
         speech,
@@ -863,13 +890,18 @@ fn backfill(
     ))
 }
 
-/// System Two on `reasoner` and `clock` with the timeout and the call rules of `config.openai`
-/// and the plugin registry of `config`.
-fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, clock: Arc<dyn Clock>) -> SystemTwo {
+/// System Two on `reasoner`, the plugin registry `plugins` and `clock` with the timeout and the
+/// call rules of `config.openai`.
+fn system_two(
+    config: &Config,
+    reasoner: Arc<dyn Reasoner>,
+    plugins: Arc<Plugins>,
+    clock: Arc<dyn Clock>,
+) -> SystemTwo {
     let openai = &config.openai;
     SystemTwo {
         reasoner,
-        plugins: Arc::new(registry(config, Arc::clone(&clock))),
+        plugins,
         clock,
         timeout: Duration::from_millis(openai.timeout_ms),
         allowed_domains: openai.allowed_domains.clone(),
@@ -1477,7 +1509,18 @@ mod tests {
     /// System Two of `config` on `FakeReasoner` at the Unix epoch.
     fn two(config: &Config) -> SystemTwo {
         let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
-        system_two(config, Arc::new(FakeReasoner::default()), clock)
+        let reasoner = Arc::new(FakeReasoner::default());
+        system_two(config, reasoner, registry(config, Vec::new()), clock)
+    }
+
+    /// AC-17.3b-1.
+    #[test]
+    fn ac_17_3b_1_registry_has_weather() -> anyhow::Result<()> {
+        let config = Config::parse(VALID)?;
+        let tools = registry(&config, plugins(&config)?).tools();
+        let weather = tools.iter().find(|tool| tool.name == "get_weather");
+        assert!(weather.is_some(), "{tools:?}");
+        Ok(())
     }
 
     /// The conversation of `config` with `classifier`, `queues()`, `two(config)`, the pools of
