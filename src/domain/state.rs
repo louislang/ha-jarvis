@@ -105,6 +105,19 @@ pub struct HomeConfig {
     pub time_zone: String,
     /// Name of the house.
     pub location_name: String,
+    /// Latitude of the house in degrees.
+    pub latitude: f64,
+    /// Longitude of the house in degrees.
+    pub longitude: f64,
+    /// The units of the house.
+    pub unit_system: UnitSystem,
+}
+
+/// The units of the HA configuration that Jarvis uses.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct UnitSystem {
+    /// `°C` or `°F`.
+    pub temperature: String,
 }
 
 /// A change in HA.
@@ -270,5 +283,13 @@ mod tests {
             .collect();
         states.sort_unstable();
         assert_eq!(states, ["64.0", "76.6"]);
+    }
+
+    /// AC-17.3-1.
+    #[test]
+    fn ac_17_3_1_house_location_and_unit() {
+        let config = house().config;
+        assert_eq!((config.latitude, config.longitude), (41.88, -87.63));
+        assert_eq!(config.unit_system.temperature, "°F");
     }
 }

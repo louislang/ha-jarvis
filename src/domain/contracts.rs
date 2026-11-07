@@ -43,6 +43,7 @@ use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
 use crate::domain::state::State;
+use crate::domain::state::UnitSystem;
 use crate::domain::state_cache::StateCache;
 use crate::domain::training::Example;
 use crate::domain::training::ExampleFile;
@@ -123,6 +124,10 @@ pub struct ExServiceCall(ServiceCall);
 /// The HA configuration that Jarvis uses.
 #[verifier::external_type_specification]
 pub struct ExHomeConfig(HomeConfig);
+
+/// The units of the HA configuration that Jarvis uses.
+#[verifier::external_type_specification]
+pub struct ExUnitSystem(UnitSystem);
 
 /// The intent catalog of `intents.toml`.
 #[verifier::external_type_specification]

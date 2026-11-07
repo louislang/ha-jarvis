@@ -108,6 +108,7 @@ pub mod adapters {
     pub mod files;
     pub mod ha;
     pub mod onnx;
+    pub mod open_meteo;
     pub mod openai;
     pub mod sherpa;
     pub mod supertonic;
@@ -379,6 +380,16 @@ pub struct PluginsConfig {
     pub cache_s: u64,
     /// The longest wait for a plugin result.
     pub timeout_ms: u64,
+    /// The weather plugin.
+    pub weather: WeatherConfig,
+}
+
+/// The `[plugins.weather]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WeatherConfig {
+    /// The Open-Meteo forecast API.
+    pub url: String,
 }
 
 /// The `[backfill]` section.
@@ -1119,6 +1130,17 @@ mod tests {
         }
     }
 
+    /// The `[plugins]` section of `jarvis.toml`.
+    fn expected_plugins() -> PluginsConfig {
+        PluginsConfig {
+            cache_s: 300,
+            timeout_ms: 5000,
+            weather: WeatherConfig {
+                url: "https://api.open-meteo.com/v1/forecast".to_owned(),
+            },
+        }
+    }
+
     /// AC-1.1-1.
     #[test]
     fn ac_1_1_1_parse_returns_each_value() -> anyhow::Result<()> {
@@ -1147,10 +1169,7 @@ mod tests {
                 num_steps: 4,
             },
             openai: expected_openai(),
-            plugins: PluginsConfig {
-                cache_s: 300,
-                timeout_ms: 5000,
-            },
+            plugins: expected_plugins(),
             backfill: BackfillConfig {
                 min_fresh: 3,
                 batch: 5,

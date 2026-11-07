@@ -8,6 +8,7 @@ flowchart LR
         crate_adapters_files[files]
         crate_adapters_ha[ha]
         crate_adapters_onnx[onnx]
+        crate_adapters_open_meteo[open_meteo]
         crate_adapters_openai[openai]
         crate_adapters_sherpa[sherpa]
         crate_adapters_supertonic[supertonic]
@@ -71,6 +72,10 @@ flowchart LR
     crate_adapters_onnx --> crate_adapters_onnx
     crate_adapters_onnx --> crate_domain_model
     crate_adapters_onnx --> crate_ports
+    crate_adapters_open_meteo --> crate
+    crate_adapters_open_meteo --> crate_adapters_open_meteo
+    crate_adapters_open_meteo --> crate_domain_state
+    crate_adapters_open_meteo --> crate_ports
     crate_adapters_openai --> crate
     crate_adapters_openai --> crate_adapters_openai
     crate_adapters_openai --> crate_domain_decide

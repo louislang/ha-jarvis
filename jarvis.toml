@@ -51,6 +51,9 @@ read_services = ["calendar.get_events", "todo.get_items"] # called with return_r
 cache_s = 300      # a forecast changes slowly
 timeout_ms = 5000
 
+[plugins.weather]
+url = "https://api.open-meteo.com/v1/forecast"
+
 [backfill]
 min_fresh = 3
 batch = 5

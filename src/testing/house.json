@@ -1525,7 +1525,12 @@
   ],
   "config": {
     "time_zone": "America/Chicago",
-    "location_name": "Home"
+    "location_name": "Home",
+    "latitude": 41.88,
+    "longitude": -87.63,
+    "unit_system": {
+      "temperature": "°F"
+    }
   },
   "user_id": "66509b3a4d6b5712c2dcce831f723833"
 }

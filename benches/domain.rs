@@ -33,6 +33,7 @@ use jarvis::domain::state::Event;
 use jarvis::domain::state::HomeConfig;
 use jarvis::domain::state::Snapshot;
 use jarvis::domain::state::State;
+use jarvis::domain::state::UnitSystem;
 use jarvis::domain::state_cache::StateCache;
 use jarvis::ports::TextToSpeech;
 use jiff::Timestamp;
@@ -111,6 +112,11 @@ fn cache() -> StateCache {
         config: HomeConfig {
             time_zone: "UTC".to_owned(),
             location_name: "Bench".to_owned(),
+            latitude: 0.0,
+            longitude: 0.0,
+            unit_system: UnitSystem {
+                temperature: "°C".to_owned(),
+            },
         },
         user_id: String::new(),
     })
