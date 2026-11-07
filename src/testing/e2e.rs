@@ -21,8 +21,10 @@ use tokio::net::TcpStream;
 use tokio::time::Interval;
 use tokio_util::task::TaskTracker;
 
+use crate::AsrConfig;
 use crate::Config;
 use crate::Device;
+use crate::adapters::sherpa;
 use crate::adapters::wyoming;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
@@ -44,8 +46,8 @@ const KITCHEN_SATELLITE: &str = "assist_satellite.carson_kitchen";
 
 /// The times of the events of one run.
 pub(crate) struct Times {
-    /// The send of the chunk with the last voiced sample.
-    pub(crate) last_voiced: Instant,
+    /// The send of the chunk with the VAD voice end.
+    pub(crate) voice_end: Instant,
     /// The `transcript` event of the `asr` connection.
     pub(crate) transcript: Instant,
     /// The send of `transcript` on the `handle` connection.
@@ -78,6 +80,8 @@ pub(crate) struct Pipeline {
     home: Arc<FakeHome>,
     /// The System Two of the app.
     pub(crate) reasoner: Arc<FakeReasoner>,
+    /// The STT settings of the app, with its VAD.
+    asr: AsrConfig,
     /// The time between two chunks: real time on CUDA, none on the CPU.
     pace: Option<Duration>,
     /// The connection tasks and the work after their replies.
@@ -103,6 +107,7 @@ impl Pipeline {
             address,
             home,
             reasoner,
+            asr: config.asr,
             pace: (device == Device::Cuda).then_some(Duration::from_millis(20)),
             tracker,
             _folder: folder,
@@ -116,11 +121,11 @@ impl Pipeline {
     ///
     /// A connection fails, or an answer is not the next event of the pipeline.
     pub(crate) async fn run(&self, speech: &[i16]) -> anyhow::Result<Run> {
-        let (transcript, last_voiced, transcribed) = self.transcribe(speech).await?;
+        let (transcript, voice_end, transcribed) = self.transcribe(speech).await?;
         let (reply, handle, handled) = self.handle(&transcript).await?;
         let (chunks, synthesize, first_chunk) = self.synthesize(&reply).await?;
         let times = Times {
-            last_voiced,
+            voice_end,
             transcript: transcribed,
             handle,
             handled,
@@ -135,27 +140,28 @@ impl Pipeline {
         })
     }
 
-    /// Sends `speech` up to its last voiced chunk, then silence, in 20 ms chunks at the pace of
-    /// the pipeline, until the `transcript` event. Gives its text, the time after the send of the
-    /// last voiced sample and the time of the event.
+    /// Sends `speech`, then silence, in 20 ms chunks at the pace of the pipeline, until the
+    /// `transcript` event. Gives its text, the time after the send of the chunk with the VAD
+    /// voice end and the time of the event.
     ///
     /// # Errors
     ///
-    /// The connection or the transcript fails.
+    /// The VAD fails or finds no voice, or the connection or the transcript fails.
     async fn transcribe(&self, speech: &[i16]) -> anyhow::Result<(String, Instant, Instant)> {
+        let parts = voice_parts(&self.asr, speech)?;
         let (mut reader, mut writer) = start_asr(self.address).await?;
         let ticks = self.pace.map(tokio::time::interval);
-        let mut last_voiced = None;
+        let mut voice_end = None;
         let transcript = tokio::select! {
-            sent = stream_audio(&mut writer, speech, ticks, &mut last_voiced) => {
+            sent = stream_audio(&mut writer, parts, ticks, &mut voice_end) => {
                 let Err(error) = sent;
                 return Err(error);
             }
             transcript = next(&mut reader, "transcript") => transcript?,
         };
         let transcribed = Instant::now();
-        let last_voiced = last_voiced.context("the transcript came before the end of the voice")?;
-        Ok((text_of(&transcript)?, last_voiced, transcribed))
+        let voice_end = voice_end.context("the transcript came before the end of the voice")?;
+        Ok((text_of(&transcript)?, voice_end, transcribed))
     }
 
     /// Sends `transcript` with `text` from the kitchen satellite. Gives the text of `handled`,
@@ -248,21 +254,22 @@ async fn start_asr(
     Ok((reader, writer))
 }
 
-/// Sends `speech` up to its last voiced chunk on `writer`, then silence, as HA streams the audio
-/// until the transcript comes. Sends each chunk after the next tick of `ticks`, and sets
-/// `last_voiced` after the send of the last voiced chunk. Ends only when a write fails.
+/// Sends the two `parts` of the speech on `writer`, then silence, as HA streams the audio until
+/// the transcript comes. Sends each chunk after the next tick of `ticks`, and sets `voice_end`
+/// after the send of the first part. Ends only when a write fails.
 ///
 /// # Errors
 ///
 /// A write fails.
 async fn stream_audio(
     writer: &mut FakeWyomingClient<impl AsyncRead + AsyncWrite + Unpin>,
-    speech: &[i16],
+    [voiced, rest]: [&[i16]; 2],
     mut ticks: Option<Interval>,
-    last_voiced: &mut Option<Instant>,
+    voice_end: &mut Option<Instant>,
 ) -> anyhow::Result<Infallible> {
-    send_chunks(writer, voiced(speech), ticks.as_mut()).await?;
-    *last_voiced = Some(Instant::now());
+    send_chunks(writer, voiced, ticks.as_mut()).await?;
+    *voice_end = Some(Instant::now());
+    send_chunks(writer, rest, ticks.as_mut()).await?;
     loop {
         send_chunks(writer, &[0; CHUNK_SAMPLES], ticks.as_mut()).await?;
     }
@@ -304,21 +311,20 @@ fn config(device: Device, folder: &Path) -> anyhow::Result<Config> {
     Ok(config)
 }
 
-/// `samples` up to the end of the last voiced 20 ms frame.
-fn voiced(samples: &[i16]) -> &[i16] {
-    let last = samples.chunks(CHUNK_SAMPLES).rposition(voiced_frame);
-    let end = last.map_or(0, |index| (index + 1) * CHUNK_SAMPLES);
-    &samples[..end.min(samples.len())]
-}
-
-/// True when the RMS of `frame` is above -40 dBFS: its mean square is above (32768 / 100)².
-/// The TTS audio has a long, quiet tail that a person does not hear as speech.
-fn voiced_frame(frame: &[i16]) -> bool {
-    let energy: u64 = frame
-        .iter()
-        .map(|sample| u64::from(sample.unsigned_abs()).pow(2))
-        .sum();
-    energy * 10_000 > (1 << 30) * frame.len() as u64
+/// `speech` up to the end of the 20 ms chunk with the voice end that the VAD of `asr` gives, and
+/// the rest of `speech`.
+///
+/// # Errors
+///
+/// The VAD cannot load or finds no voice.
+fn voice_parts<'speech>(
+    asr: &AsrConfig,
+    speech: &'speech [i16],
+) -> anyhow::Result<[&'speech [i16]; 2]> {
+    let end = sherpa::voice_end(asr, speech)?.context("the VAD finds no voice")?;
+    let end = usize::try_from(end)?.next_multiple_of(CHUNK_SAMPLES);
+    let (voiced, rest) = speech.split_at(end.min(speech.len()));
+    Ok([voiced, rest])
 }
 
 /// The `audio-start` and `audio-chunk` data: 16 kHz, 16-bit, mono.
@@ -441,7 +447,7 @@ mod tests {
         assert!(run.chunks > 0, "no audio for {reply:?}");
         let times = &run.times;
         let order = [
-            times.last_voiced,
+            times.voice_end,
             times.transcript,
             times.handle,
             times.handled,
@@ -464,11 +470,11 @@ mod tests {
         Ok(())
     }
 
-    /// The response latency segments of `times`: the last voiced sample to `transcript`,
+    /// The response latency segments of `times`: the voice end to `transcript`,
     /// `transcript` to `handled`, and `synthesize` to the first audio chunk.
     fn segments(times: &Times) -> [Duration; 3] {
         [
-            times.transcript - times.last_voiced,
+            times.transcript - times.voice_end,
             times.handled - times.handle,
             times.first_chunk - times.synthesize,
         ]

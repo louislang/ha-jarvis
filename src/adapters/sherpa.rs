@@ -147,9 +147,45 @@ fn vad(config: &AsrConfig) -> VadModelConfig {
     }
 }
 
+/// A new VAD of `config`.
+///
+/// # Errors
+///
+/// The VAD cannot load.
+fn detector(config: &VadModelConfig) -> anyhow::Result<VoiceActivityDetector> {
+    VoiceActivityDetector::create(config, 30.0).context("cannot load the VAD")
+}
+
+/// Removes the first finished speech segment of `vad` and gives its end in samples.
+fn pop_segment_end(vad: &VoiceActivityDetector) -> Option<u64> {
+    let segment = vad.front()?;
+    vad.pop();
+    Some(segment.start().unsigned_abs() + u64::from(segment.n().unsigned_abs()))
+}
+
+/// The voice end in samples that a stream of `config` gives for the 16 kHz `samples`, or `None`
+/// when the VAD finds no speech. The latency tests measure from it (sub-phase 9.2).
+///
+/// # Errors
+///
+/// The VAD cannot load.
+#[cfg(test)]
+pub(crate) fn voice_end(config: &AsrConfig, samples: &[i16]) -> anyhow::Result<Option<u64>> {
+    let vad = detector(&vad(config))?;
+    let mut end = None;
+    // A stream gives the VAD at most one frame in each call.
+    for window in wave(samples).chunks(usize::from(WINDOW)) {
+        vad.accept_waveform(window);
+        while let Some(segment_end) = pop_segment_end(&vad) {
+            end = Some(segment_end);
+        }
+    }
+    Ok(end)
+}
+
 impl SpeechToText for SherpaStt {
     fn stream(&self) -> anyhow::Result<Box<dyn SttStream>> {
-        let vad = VoiceActivityDetector::create(&self.vad, 30.0).context("cannot load the VAD")?;
+        let vad = detector(&self.vad)?;
         Ok(Box::new(SherpaStream {
             stream: self.recognizer.create_stream(),
             recognizer: Arc::clone(&self.recognizer),
@@ -257,10 +293,8 @@ impl SherpaStream {
     fn track(&mut self, count: usize) -> bool {
         self.fed += count as u64;
         let mut ended = false;
-        while let Some(segment) = self.vad.front() {
-            let end = segment.start().unsigned_abs() + u64::from(segment.n().unsigned_abs());
+        while let Some(end) = pop_segment_end(&self.vad) {
             self.voice_end = Some(end);
-            self.vad.pop();
             ended = true;
         }
         let detected = self.vad.detected();
