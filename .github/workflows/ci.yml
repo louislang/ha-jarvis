@@ -65,6 +65,38 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: just architecture
 
+  fixture-model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: extractions/setup-just@v4
+        with:
+          just-version: "1.59.0"
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: just install-python
+      # The fixture model has its own cache.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            models
+            !models/system-one
+          key: models-${{ runner.os }}-${{ hashFiles('justfile') }}
+          restore-keys: models-${{ runner.os }}-
+      - run: just models
+      # `jarvis` links the sherpa-onnx libraries, so `jarvis dataset` needs them at run time.
+      - run: |
+          echo "SHERPA_ONNX_LIB_DIR=$(just --evaluate cpu_libraries)" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$(just --evaluate cpu_libraries)" >> "$GITHUB_ENV"
+      - run: mkdir -p target/fixture && cargo run --release -- dataset jarvis.toml target/fixture/train.json --house src/testing/house.json
+      - uses: actions/cache@v6
+        with:
+          path: models/system-one/fixture
+          key: fixture-model-${{ hashFiles('target/fixture/train.json', 'train/**') }}
+      - run: just fixture-model
+
   rust-test:
     runs-on: ubuntu-latest
     steps:
@@ -182,8 +214,8 @@ jobs:
   gpu-test:
     # The repository is public: a fork pull request must not run code on the GPU host.
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    # The fixture model comes from the cache that `rust-test` writes.
-    needs: rust-test
+    # The fixture model comes from the cache that `fixture-model` writes.
+    needs: fixture-model
     runs-on: [self-hosted, linux, gpu]
     steps:
       - uses: actions/checkout@v7
