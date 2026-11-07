@@ -45,7 +45,7 @@ use crate::adapters::ha::HaHome;
 use crate::adapters::onnx::OnnxLoader;
 use crate::adapters::openai::OpenAiReasoner;
 use crate::adapters::sherpa::SherpaStt;
-use crate::adapters::sherpa::SherpaTts;
+use crate::adapters::supertonic::SupertonicTts;
 use crate::app::background::Backfill;
 use crate::app::conversation::Change;
 use crate::app::conversation::Conversation;
@@ -861,7 +861,7 @@ async fn load_models(
     let classifier: Arc<dyn Classifier> = Arc::new(CurrentClassifier(ArcSwap::from_pointee(model)));
     let (asr, tts, device) = (config.asr.clone(), config.tts.clone(), config.device);
     let stt = tokio::task::spawn_blocking(move || SherpaStt::try_new(&asr, device)).await??;
-    let tts = tokio::task::spawn_blocking(move || SherpaTts::try_new(&tts, device)).await??;
+    let tts = tokio::task::spawn_blocking(move || SupertonicTts::try_new(&tts, device)).await??;
     let listener = listener(config, Arc::new(stt), Arc::clone(&classifier), reasoner);
     Ok((classifier, listener, Arc::new(Speech::new(Arc::new(tts)))))
 }
@@ -1831,7 +1831,10 @@ mod tests {
     }
 
     /// Runs one prediction of `classifier` and one synthesis of `tts`.
-    async fn predict_and_synth(classifier: &dyn Classifier, tts: &SherpaTts) -> anyhow::Result<()> {
+    async fn predict_and_synth(
+        classifier: &dyn Classifier,
+        tts: &SupertonicTts,
+    ) -> anyhow::Result<()> {
         classifier
             .predict("area: kitchen | habits: none", "turn on the lights")
             .await?;
@@ -1840,9 +1843,9 @@ mod tests {
         Ok(())
     }
 
-    /// The `SherpaTts` of `VALID` on `device`.
-    fn voice(device: Device) -> anyhow::Result<SherpaTts> {
-        SherpaTts::try_new(&Config::parse(VALID)?.tts, device)
+    /// The `SupertonicTts` of `VALID` on `device`.
+    fn voice(device: Device) -> anyhow::Result<SupertonicTts> {
+        SupertonicTts::try_new(&Config::parse(VALID)?.tts, device)
     }
 
     /// The GPU memory in MiB that `nvidia-smi` reports for this process.
@@ -1891,9 +1894,9 @@ mod tests {
         predict_and_synth(classifier.as_ref(), &voice(Device::Cpu)?).await
     }
 
-    /// AC-6.2-5. sherpa-onnx falls back to the CPU with only a log line, so the GPU memory of
-    /// this process shows that each model loads on CUDA. The other GPU tests change the memory
-    /// of their process, so the test runs again alone in a child process.
+    /// AC-6.2-5. The GPU memory of this process shows that each model loads on CUDA. The other
+    /// GPU tests change the memory of their process, so the test runs again alone in a child
+    /// process.
     #[tokio::test]
     #[ignore = "GPU host"]
     async fn ac_6_2_5_cuda_runs_classifier_and_tts_in_one_process() -> anyhow::Result<()> {
@@ -1955,6 +1958,46 @@ mod tests {
         assert!(
             memory[3] - memory[2] > memory[2] - memory[1],
             "GPU memory in MiB at the start and after each load: {memory:?}"
+        );
+        Ok(())
+    }
+
+    /// The GPU memory in MiB of this process before and after each synthesis of `tts` in
+    /// AC-9.3c-2.
+    async fn synth_memory(tts: &SupertonicTts) -> anyhow::Result<Vec<u64>> {
+        let mut memory = vec![gpu_memory()?];
+        let sentence = "Tomorrow will be mostly sunny with a light breeze from the west, and the evening should stay clear and mild, so it is a good night for a walk.";
+        for text in ["One moment.", sentence] {
+            tts.synth(text).await?;
+            memory.push(gpu_memory()?);
+        }
+        Ok(memory)
+    }
+
+    /// AC-9.3c-2. ONNX Runtime keeps the memory of its arenas, so the largest reading after each
+    /// step is the peak. The other GPU tests change the memory of their process, so the test runs
+    /// again alone in a child process.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn ac_9_3c_2_cuda_peak_memory_is_5_5_gb_or_less() -> anyhow::Result<()> {
+        use std::io::Write;
+
+        if !alone("tests::ac_9_3c_2_cuda_peak_memory_is_5_5_gb_or_less")? {
+            return Ok(());
+        }
+        let config = Config::parse(VALID)?;
+        let _stt = SherpaStt::try_new(&config.asr, Device::Cuda)?;
+        let _classifier = OnnxLoader
+            .load(Path::new("models/system-one/fixture"), Device::Cuda)
+            .await?;
+        let tts = SupertonicTts::try_new(&config.tts, Device::Cuda)?;
+        let memory = synth_memory(&tts).await?;
+        let peak = memory.iter().max().copied().unwrap_or_default();
+        writeln!(io::stderr(), "peak GPU memory {peak} MiB")?;
+        // 5.5 GB in MiB.
+        assert!(
+            peak <= 5_500_000_000 >> 20,
+            "GPU memory in MiB after the loads and after each synthesis: {memory:?}"
         );
         Ok(())
     }

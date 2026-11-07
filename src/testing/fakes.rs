@@ -42,7 +42,7 @@ use tracing::subscriber::NoSubscriber;
 
 use crate::Config;
 use crate::Device;
-use crate::adapters::sherpa::SherpaTts;
+use crate::adapters::supertonic::SupertonicTts;
 use crate::domain::decide::Question;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
@@ -419,15 +419,17 @@ impl TextToSpeech for FakeTts {
     }
 }
 
-/// The 16 kHz audio of `text` from the `SherpaTts` of `jarvis.toml` on the CPU, with 500 ms of
-/// silence after it.
+/// The 16 kHz audio of `text` from the `SupertonicTts` of `jarvis.toml` on the CPU, with 250 ms
+/// of silence before it and 500 ms after it.
 pub(crate) async fn speech(text: &str) -> anyhow::Result<Audio> {
     let config = Config::parse(include_str!("../../jarvis.toml"))?;
-    let audio = SherpaTts::try_new(&config.tts, Device::Cpu)?
+    let audio = SupertonicTts::try_new(&config.tts, Device::Cpu)?
         .synth(text)
         .await?;
     let rate = 16_000;
-    let mut samples = resample(&audio, rate)?;
+    // The int8 first pass mishears a first word that starts at sample 0 (sub-phase 9.3c).
+    let mut samples = vec![0; rate / 4];
+    samples.extend(resample(&audio, rate)?);
     samples.resize(samples.len() + rate / 2, 0);
     Ok(Audio {
         samples,
