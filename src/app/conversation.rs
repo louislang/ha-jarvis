@@ -18,11 +18,13 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::app::background::Backfill;
+use crate::app::plugins::Plugins;
 use crate::domain::catalog::Catalog;
 use crate::domain::decide;
 use crate::domain::decide::Chosen;
 use crate::domain::decide::Decision;
 use crate::domain::decide::Job;
+use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::decide::Request;
 use crate::domain::intent;
@@ -52,6 +54,8 @@ pub type Change = Box<dyn FnOnce(Pools) -> Pools + Send>;
 pub struct SystemTwo {
     /// The remote model.
     pub reasoner: Arc<dyn Reasoner>,
+    /// The plugins that the remote model can call.
+    pub plugins: Arc<Plugins>,
     /// The current time.
     pub clock: Arc<dyn Clock>,
     /// The longest wait for each step of an answer.
@@ -289,7 +293,7 @@ impl Conversation {
     fn question(&self, text: &str, area: Option<&AreaId>) -> anyhow::Result<Question> {
         use anyhow::Context as _;
         let cache = self.queues.cache.borrow();
-        let config = cache.config.as_ref().context("no HA configuration")?;
+        let config = cache.config().context("no HA configuration")?;
         let now = self.two.clock.now().in_tz(&config.time_zone)?.datetime();
         let location = &config.location_name;
         let domains = self.read_domains();
@@ -353,6 +357,10 @@ impl Conversation {
             Step::States(area, reply) => {
                 // The send fails only when the answer has ended, so the result is not needed.
                 let _ = reply.send(self.states(&area));
+            }
+            Step::Plugin(call, reply) => {
+                // The send fails only when the answer has ended, so the result is not needed.
+                let _ = reply.send(self.plugin(&call).await);
             }
             Step::Done => return Ok(false),
         }
@@ -437,6 +445,18 @@ impl Conversation {
             serde_json::json!({"name": item.name, "entity_id": item.entity_id, "state": item.state})
         });
         Ok(Some(Value::Array(states.collect())))
+    }
+
+    /// The result of the plugin `call` in the house of the HA configuration of the hot cache.
+    ///
+    /// # Errors
+    ///
+    /// The HA configuration is not known, or the registry fails.
+    async fn plugin(&self, call: &PluginCall) -> anyhow::Result<Option<Value>> {
+        use anyhow::Context as _;
+        let home = self.queues.cache.borrow().config().cloned();
+        let home = home.context("no HA configuration")?;
+        Ok(Some(self.two.plugins.fetch(call, &home).await?))
     }
 
     /// An answer of the pool `pool` rendered with the response data of `call` as `response`.
@@ -670,9 +690,11 @@ mod tests {
     use crate::domain::responses::Pool;
     use crate::domain::state::ServiceCall;
     use crate::domain::state::State;
+    use crate::ports::Plugin;
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
+    use crate::testing::fakes::FakePlugin;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeTts;
@@ -744,6 +766,7 @@ mod tests {
             0.6,
             SystemTwo {
                 reasoner,
+                plugins: registry(Vec::new()),
                 clock,
                 timeout,
                 allowed_domains: ALLOWED.map(str::to_owned).to_vec(),
@@ -1344,10 +1367,28 @@ mod tests {
     /// A System Two job on the satellite in the state `value` whose reasoner gives `steps`: its
     /// house, hot cache, reasoner and work.
     fn reasoning(value: &str, steps: Vec<Scripted>) -> anyhow::Result<Reasoning> {
+        plugged(value, steps, Vec::new())
+    }
+
+    /// The plugin registry of `plugins` with the `[plugins]` of `jarvis.toml` at the Unix epoch.
+    fn registry(plugins: Vec<Arc<dyn Plugin>>) -> Arc<Plugins> {
+        let config = crate::Config::parse(include_str!("../../jarvis.toml")).expect("valid");
+        let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
+        Arc::new(Plugins::new(config.plugins, clock, plugins))
+    }
+
+    /// `reasoning` with the plugin registry of `plugins`.
+    fn plugged(
+        value: &str,
+        steps: Vec<Scripted>,
+        plugins: Vec<Arc<dyn Plugin>>,
+    ) -> anyhow::Result<Reasoning> {
         let (home, reasoner) = (Arc::default(), Arc::new(FakeReasoner::default()));
         reasoner.script(steps);
         let classifier = Arc::new(FakeClassifier::default());
-        let (cache, _, conversation) = still_with(&home, value, classifier, Arc::clone(&reasoner));
+        let (cache, _, mut conversation) =
+            still_with(&home, value, classifier, Arc::clone(&reasoner));
+        conversation.two.plugins = registry(plugins);
         let (filler, job) = (chosen("filler", 0), Job::Llm("tell me".to_owned()));
         let defer = Decision::Defer { filler, job };
         Ok((
@@ -1544,6 +1585,51 @@ mod tests {
         ]);
         let states = format!("{:?}", Ok::<_, ()>(Some(Ok::<_, ()>(Some(light)))));
         assert_eq!(reasoner.results(), [states, "unknown area".to_owned()]);
+        Ok(())
+    }
+
+    /// The test plugin with `result` scripted, and a System Two job on an idle satellite whose
+    /// reasoner gives a call of it with `when = today` and then `more`.
+    fn plugin_job(
+        result: anyhow::Result<Value>,
+        more: Vec<Scripted>,
+    ) -> anyhow::Result<(Arc<FakePlugin>, Reasoning)> {
+        let plugin = Arc::new(FakePlugin::new("get_test"));
+        plugin.script(result);
+        let call = PluginCall {
+            plugin: "get_test".to_owned(),
+            arguments: Map::from_iter([("when".to_owned(), "today".into())]),
+        };
+        let mut steps = vec![Scripted::Plugin(call)];
+        steps.extend(more);
+        let reasoning = plugged("idle", steps, vec![Arc::clone(&plugin) as Arc<dyn Plugin>])?;
+        Ok((plugin, reasoning))
+    }
+
+    /// AC-17.2-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_17_2_4_plugin_step_fetches_with_the_hot_cache_config() -> anyhow::Result<()> {
+        let result = serde_json::json!({ "high": 72 });
+        let (plugin, (home, _cache, reasoner, work)) = plugin_job(Ok(result.clone()), Vec::new())?;
+        work.await?;
+        let fetches = plugin.fetches();
+        assert_eq!(fetches.len(), 1, "{fetches:?}");
+        assert_eq!(fetches[0].1, house().config);
+        assert_eq!(home.calls(), []);
+        let sent = format!("{:?}", Ok::<_, ()>(Some(Ok::<_, ()>(Some(result)))));
+        assert_eq!(reasoner.results(), [sent]);
+        Ok(())
+    }
+
+    /// AC-17.2-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_17_2_5_plugin_error_is_the_result_and_the_answer_goes_on() -> anyhow::Result<()> {
+        let error = Err(anyhow::anyhow!("server down"));
+        let more = vec![Scripted::Sentence("One.")];
+        let (_plugin, (home, _cache, reasoner, work)) = plugin_job(error, more)?;
+        work.await?;
+        assert_eq!(reasoner.results(), ["server down"]);
+        assert_eq!(announces(&home), ["One."]);
         Ok(())
     }
 

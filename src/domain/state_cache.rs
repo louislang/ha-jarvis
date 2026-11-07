@@ -104,6 +104,12 @@ impl StateCache {
         self
     }
 
+    /// The HA configuration of the snapshot, after the first load.
+    #[must_use]
+    pub fn config(&self) -> Option<&HomeConfig> {
+        self.config.as_ref()
+    }
+
     /// The state of `entity_id`.
     #[must_use]
     pub fn state(&self, entity_id: &str) -> Option<&State> {

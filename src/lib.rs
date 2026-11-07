@@ -52,6 +52,7 @@ use crate::app::conversation::Conversation;
 use crate::app::conversation::PoolsTask;
 use crate::app::conversation::Queues;
 use crate::app::conversation::SystemTwo;
+use crate::app::plugins::Plugins;
 use crate::app::speech::Listener;
 use crate::app::speech::Speech;
 use crate::domain::catalog::Catalog;
@@ -772,16 +773,24 @@ where
     Ok(HaHome::start(move || connector(&host, port), token, ha))
 }
 
-/// The reasoner of `config` with the `OpenAI` API key of `secrets`.
+/// The reasoner of `config` with the `OpenAI` API key of `secrets` and the tools of the plugin
+/// registry of `config`.
 ///
 /// # Errors
 ///
 /// The HTTP client cannot be built.
 fn reasoner(config: &Config, secrets: &Secrets) -> anyhow::Result<Arc<dyn Reasoner>> {
+    let tools = registry(config, Arc::new(SystemClock)).tools();
     Ok(Arc::new(OpenAiReasoner::try_new(
         &config.openai,
         &secrets.openai_key,
+        tools,
     )?))
+}
+
+/// The plugin registry with the `[plugins]` of `config` and the time of `clock`.
+fn registry(config: &Config, clock: Arc<dyn Clock>) -> Plugins {
+    Plugins::new(config.plugins.clone(), clock, Vec::new())
 }
 
 /// The app of `config`, `catalog` and the source pools `pools` on `home` and `reasoner`, its
@@ -804,7 +813,7 @@ async fn start_app(
     let prerender = start_prerender(&speech, &task.pools, cache.clone());
     let catalog = Arc::new(catalog);
     let backfill = backfill(config, &reasoner, task.changes, &speech, &catalog, cache);
-    let two = system_two(&config.openai, reasoner, Arc::new(SystemClock));
+    let two = system_two(config, reasoner, Arc::new(SystemClock));
     let threshold = config.model.threshold;
     let app = App {
         conversation: Conversation::new(
@@ -843,14 +852,13 @@ fn backfill(
     ))
 }
 
-/// System Two on `reasoner` and `clock` with the timeout and the call rules of `openai`.
-fn system_two(
-    openai: &OpenAiConfig,
-    reasoner: Arc<dyn Reasoner>,
-    clock: Arc<dyn Clock>,
-) -> SystemTwo {
+/// System Two on `reasoner` and `clock` with the timeout and the call rules of `config.openai`
+/// and the plugin registry of `config`.
+fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, clock: Arc<dyn Clock>) -> SystemTwo {
+    let openai = &config.openai;
     SystemTwo {
         reasoner,
+        plugins: Arc::new(registry(config, Arc::clone(&clock))),
         clock,
         timeout: Duration::from_millis(openai.timeout_ms),
         allowed_domains: openai.allowed_domains.clone(),
@@ -1450,7 +1458,7 @@ mod tests {
     /// System Two of `config` on `FakeReasoner` at the Unix epoch.
     fn two(config: &Config) -> SystemTwo {
         let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
-        system_two(&config.openai, Arc::new(FakeReasoner::default()), clock)
+        system_two(config, Arc::new(FakeReasoner::default()), clock)
     }
 
     /// The conversation of `config` with `classifier`, `queues()`, `two(config)`, the pools of

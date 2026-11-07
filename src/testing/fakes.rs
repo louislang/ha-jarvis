@@ -44,6 +44,7 @@ use tracing::subscriber::NoSubscriber;
 use crate::Config;
 use crate::Device;
 use crate::adapters::supertonic::SupertonicTts;
+use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
@@ -282,6 +283,8 @@ pub(crate) enum Scripted {
     Call(ServiceCall),
     /// A read of the states of the area with this name.
     States(&'static str),
+    /// A plugin call.
+    Plugin(PluginCall),
     /// An error with this text.
     Error(&'static str),
     /// A wait of this time before the next step.
@@ -351,6 +354,21 @@ fn reply(replies: &Mutex<Vec<Reply>>) -> oneshot::Sender<anyhow::Result<Option<V
     sender
 }
 
+/// The answer step of `step`, with its reply receiver kept in `replies`, or `None` after a wait.
+async fn answered(step: Scripted, replies: Arc<Mutex<Vec<Reply>>>) -> Option<anyhow::Result<Step>> {
+    match step {
+        Scripted::Sentence(text) => Some(Ok(Step::Sentence(text.to_owned()))),
+        Scripted::Call(call) => Some(Ok(Step::Call(call, reply(&replies)))),
+        Scripted::States(area) => Some(Ok(Step::States(area.to_owned(), reply(&replies)))),
+        Scripted::Plugin(call) => Some(Ok(Step::Plugin(call, reply(&replies)))),
+        Scripted::Error(text) => Some(Err(anyhow::anyhow!(text))),
+        Scripted::Wait(time) => {
+            tokio::time::sleep(time).await;
+            None
+        }
+    }
+}
+
 #[async_trait]
 impl Reasoner for FakeReasoner {
     async fn warm(&self) -> anyhow::Result<()> {
@@ -361,23 +379,7 @@ impl Reasoner for FakeReasoner {
     fn answer(&self, _question: &Question) -> BoxStream<'static, anyhow::Result<Step>> {
         let steps = mem::take(&mut *lock(&self.script));
         let replies = Arc::clone(&self.replies);
-        let step = move |step| {
-            let replies = Arc::clone(&replies);
-            async move {
-                match step {
-                    Scripted::Sentence(text) => Some(Ok(Step::Sentence(text.to_owned()))),
-                    Scripted::Call(call) => Some(Ok(Step::Call(call, reply(&replies)))),
-                    Scripted::States(area) => {
-                        Some(Ok(Step::States(area.to_owned(), reply(&replies))))
-                    }
-                    Scripted::Error(text) => Some(Err(anyhow::anyhow!(text))),
-                    Scripted::Wait(time) => {
-                        tokio::time::sleep(time).await;
-                        None
-                    }
-                }
-            }
-        };
+        let step = move |step| answered(step, Arc::clone(&replies));
         futures::stream::iter(steps).filter_map(step).boxed()
     }
 

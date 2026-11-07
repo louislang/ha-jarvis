@@ -42,9 +42,11 @@ use tokio::time::Instant;
 
 use crate::OpenAiConfig;
 use crate::domain::decide::EntityState;
+use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::speech;
 use crate::domain::state::ServiceCall;
+use crate::ports;
 use crate::ports::Reasoner;
 use crate::ports::Step;
 
@@ -187,6 +189,17 @@ fn get_states() -> Tool {
     })
 }
 
+/// The strict function tool of the plugin tool `tool`.
+fn plugin_tool(tool: &ports::Tool) -> Tool {
+    Tool::Function(FunctionTool {
+        name: tool.name.clone(),
+        description: Some(tool.description.clone()),
+        parameters: Some(tool.parameters.clone()),
+        strict: Some(true),
+        ..FunctionTool::default()
+    })
+}
+
 /// The arguments of a `get_states` tool call.
 #[derive(Deserialize)]
 struct StatesArguments {
@@ -251,6 +264,8 @@ struct Answer {
     outputs: Vec<InputItem>,
     /// The number of tool calls that the answer can still make.
     calls_left: u32,
+    /// The tool names of the plugins.
+    plugins: Vec<String>,
     /// The channel of the steps to the consumer.
     steps: mpsc::UnboundedSender<anyhow::Result<Step>>,
 }
@@ -327,6 +342,11 @@ impl Answer {
             let arguments: StatesArguments = serde_json::from_str(&call.arguments)?;
             return Ok(Step::States(arguments.area, reply));
         }
+        if self.plugins.contains(&call.name) {
+            let arguments: Map<String, Value> = serde_json::from_str(&call.arguments)?;
+            let plugin = call.name.clone();
+            return Ok(Step::Plugin(PluginCall { plugin, arguments }, reply));
+        }
         let arguments: Arguments = serde_json::from_str(&call.arguments)?;
         let service_call = ServiceCall {
             domain: arguments.domain,
@@ -362,6 +382,8 @@ pub struct OpenAiReasoner {
     max_tool_calls: u32,
     /// The services that a call runs with `return_response`.
     read_services: Vec<String>,
+    /// The tools of the plugins.
+    plugins: Vec<ports::Tool>,
     /// The time since the last request after which `warm` sends a request.
     warm_idle: Duration,
     /// The time of the last request, or `None` before the first request.
@@ -369,21 +391,29 @@ pub struct OpenAiReasoner {
 }
 
 impl OpenAiReasoner {
-    /// A reasoner of `config` with the `OpenAI` API key `key`.
+    /// A reasoner of `config` with the `OpenAI` API key `key` and the plugin tools `plugins`.
     ///
     /// # Errors
     ///
     /// The HTTP client cannot be built.
-    pub fn try_new(config: &OpenAiConfig, key: &str) -> anyhow::Result<Self> {
-        Self::try_with_api(config, OpenAIConfig::new().with_api_key(key))
+    pub fn try_new(
+        config: &OpenAiConfig,
+        key: &str,
+        plugins: Vec<ports::Tool>,
+    ) -> anyhow::Result<Self> {
+        Self::try_with_api(config, OpenAIConfig::new().with_api_key(key), plugins)
     }
 
-    /// A reasoner of `config` on the API of `api`.
+    /// A reasoner of `config` on the API of `api` with the plugin tools `plugins`.
     ///
     /// # Errors
     ///
     /// The HTTP client cannot be built.
-    fn try_with_api(config: &OpenAiConfig, api: OpenAIConfig) -> anyhow::Result<Self> {
+    fn try_with_api(
+        config: &OpenAiConfig,
+        api: OpenAIConfig,
+        plugins: Vec<ports::Tool>,
+    ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .pool_idle_timeout(None)
             .tcp_keepalive(KEEPALIVE)
@@ -395,6 +425,7 @@ impl OpenAiReasoner {
             bulk_max_output_tokens: config.bulk_max_output_tokens,
             max_tool_calls: config.max_tool_calls,
             read_services: config.read_services.clone(),
+            plugins,
             warm_idle: Duration::from_secs(config.warm_idle_s),
             last_request: Mutex::new(None),
         })
@@ -434,17 +465,20 @@ impl OpenAiReasoner {
         Ok(true)
     }
 
-    /// The first response request of the answer to `question`, with both tools.
+    /// The first response request of the answer to `question`, with `call_service`, `get_states`
+    /// and the plugin tools.
     ///
     /// # Errors
     ///
     /// The request cannot be built.
     fn request(&self, question: &Question) -> Result<CreateResponse, OpenAIError> {
+        let mut tools = vec![call_service(&self.read_services), get_states()];
+        tools.extend(self.plugins.iter().map(plugin_tool));
         CreateResponseArgs::default()
             .model(&self.model)
             .instructions(system_prompt())
             .input(user_message(question))
-            .tools([call_service(&self.read_services), get_states()])
+            .tools(tools)
             .max_output_tokens(self.max_output_tokens)
             .build()
     }
@@ -471,6 +505,7 @@ impl Reasoner for OpenAiReasoner {
         let recorded = self.record_when_idle(Duration::ZERO);
         let client = self.client.clone();
         let calls_left = self.max_tool_calls;
+        let plugins = self.plugins.iter().map(|tool| tool.name.clone()).collect();
         let (steps, receiver) = mpsc::unbounded();
         let errors = steps.clone();
         let run = async move {
@@ -480,6 +515,7 @@ impl Reasoner for OpenAiReasoner {
                 request: request?,
                 outputs: Vec::new(),
                 calls_left,
+                plugins,
                 steps,
             };
             while answer.round().await? {}
@@ -532,6 +568,7 @@ mod tests {
     use crate::domain::decide;
     use crate::domain::state::AreaId;
     use crate::domain::state_cache::StateCache;
+    use crate::testing::fakes::FakePlugin;
     use crate::testing::fakes::house;
 
     /// A response object with `status`.
@@ -552,9 +589,13 @@ mod tests {
         serve(ResponseTemplate::new(200).set_body_json(response(status))).await
     }
 
+    /// The tool name of the test plugin.
+    const PLUGIN: &str = "get_test";
+
     /// A mock `OpenAI` server that answers each response request with `template`, and a reasoner
-    /// of `jarvis.toml` on it.
+    /// of `jarvis.toml` with the tool of the test plugin on it.
     async fn serve(template: ResponseTemplate) -> anyhow::Result<(MockServer, OpenAiReasoner)> {
+        use crate::ports::Plugin;
         let server = MockServer::start().await;
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/responses"))
@@ -565,7 +606,8 @@ mod tests {
         let api = OpenAIConfig::new()
             .with_api_key("key")
             .with_api_base(server.uri());
-        Ok((server, OpenAiReasoner::try_with_api(&config, api)?))
+        let tools = vec![FakePlugin::new(PLUGIN).tool()];
+        Ok((server, OpenAiReasoner::try_with_api(&config, api, tools)?))
     }
 
     /// The number of requests that `server` received.
@@ -679,6 +721,8 @@ mod tests {
         Call(ServiceCall),
         /// A read of the states of an area.
         States(String),
+        /// A plugin call.
+        Plugin(PluginCall),
         /// The end of the answer.
         Done,
     }
@@ -702,20 +746,29 @@ mod tests {
         let mut steps = reasoner.answer(&question(Some("kitchen")));
         let mut seen = Vec::new();
         while let Some(step) = steps.try_next().await? {
-            seen.push(match step {
-                Step::Sentence(text) => Seen::Sentence(text),
-                Step::Call(call, reply) => {
-                    on(reply)?;
-                    Seen::Call(call)
-                }
-                Step::States(area, reply) => {
-                    on(reply)?;
-                    Seen::States(area)
-                }
-                Step::Done => Seen::Done,
-            });
+            seen.push(observed(step)?);
         }
         Ok((server, seen))
+    }
+
+    /// `step` with its reply left out. Sends `{"state": "on"}` on the reply of a tool call.
+    fn observed(step: Step) -> anyhow::Result<Seen> {
+        Ok(match step {
+            Step::Sentence(text) => Seen::Sentence(text),
+            Step::Call(call, reply) => {
+                on(reply)?;
+                Seen::Call(call)
+            }
+            Step::States(area, reply) => {
+                on(reply)?;
+                Seen::States(area)
+            }
+            Step::Plugin(call, reply) => {
+                on(reply)?;
+                Seen::Plugin(call)
+            }
+            Step::Done => Seen::Done,
+        })
     }
 
     /// The steps of an answer that a mock `OpenAI` server streams as `deltas` of the event `kind`.
@@ -723,10 +776,10 @@ mod tests {
         Ok(served(spoken(kind, deltas)).await?.1)
     }
 
-    /// The steps of an answer whose first response has a call `call_<n>` of the tool `tool` for
-    /// each of `arguments`, and the body of each request.
-    async fn requested(tool: &str, arguments: &[&str]) -> anyhow::Result<(Vec<Seen>, Vec<Value>)> {
-        let calls = arguments.iter().zip(1..).map(|(arguments, number)| {
+    /// The steps of an answer whose first response has a call `call_<n>` for each tool name and
+    /// arguments of `calls`, and the body of each request.
+    async fn requested(calls: &[(&str, &str)]) -> anyhow::Result<(Vec<Seen>, Vec<Value>)> {
+        let calls = calls.iter().zip(1..).map(|((tool, arguments), number)| {
             json!({
                 "type": "response.output_item.done",
                 "sequence_number": 0,
@@ -746,13 +799,10 @@ mod tests {
         Ok((seen, bodies?))
     }
 
-    /// The steps of an answer whose first response has a call `call_<n>` of the tool `tool` for
-    /// each of `arguments`, and the tool outputs of the last request.
-    async fn tool_called(
-        tool: &str,
-        arguments: &[&str],
-    ) -> anyhow::Result<(Vec<Seen>, Vec<Value>)> {
-        let (seen, bodies) = requested(tool, arguments).await?;
+    /// The steps of an answer whose first response has a call `call_<n>` for each tool name and
+    /// arguments of `calls`, and the tool outputs of the last request.
+    async fn tool_called(calls: &[(&str, &str)]) -> anyhow::Result<(Vec<Seen>, Vec<Value>)> {
+        let (seen, bodies) = requested(calls).await?;
         let input = bodies.last().context("no request")?["input"]
             .as_array()
             .context("the input is not a list")?;
@@ -762,9 +812,13 @@ mod tests {
         Ok((seen, outputs.cloned().collect()))
     }
 
-    /// `tool_called` for `call_service`.
+    /// `tool_called` for a `call_service` call with each of `arguments`.
     async fn called(arguments: &[&str]) -> anyhow::Result<(Vec<Seen>, Vec<Value>)> {
-        tool_called("call_service", arguments).await
+        let calls: Vec<(&str, &str)> = arguments
+            .iter()
+            .map(|&arguments| ("call_service", arguments))
+            .collect();
+        tool_called(&calls).await
     }
 
     /// Valid `call_service` arguments.
@@ -830,7 +884,7 @@ mod tests {
     /// AC-7.6-1.
     #[tokio::test(start_paused = true)]
     async fn ac_7_6_1_each_answer_request_has_strict_get_states() -> anyhow::Result<()> {
-        let (_seen, bodies) = requested("get_states", &[GARAGE]).await?;
+        let (_seen, bodies) = requested(&[("get_states", GARAGE)]).await?;
         assert_eq!(bodies.len(), 2);
         for body in bodies {
             let tools = body["tools"].as_array().context("no tools")?;
@@ -843,13 +897,64 @@ mod tests {
     /// AC-7.6-2.
     #[tokio::test(start_paused = true)]
     async fn ac_7_6_2_get_states_gives_states_step_then_final_text() -> anyhow::Result<()> {
-        let (seen, outputs) = tool_called("get_states", &[GARAGE]).await?;
+        let (seen, outputs) = tool_called(&[("get_states", GARAGE)]).await?;
         let sentence = Seen::Sentence("It is on.".to_owned());
         assert_eq!(
             seen,
             [Seen::States("Garage".to_owned()), sentence, Seen::Done]
         );
         assert_eq!(outputs[0]["output"], r#"{"state":"on"}"#);
+        Ok(())
+    }
+
+    /// Valid arguments of the test plugin.
+    const TODAY: &str = r#"{"when": "today"}"#;
+
+    /// AC-17.2-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_17_2_1_each_answer_request_has_the_strict_plugin_tool() -> anyhow::Result<()> {
+        use crate::ports::Plugin;
+        let (_seen, bodies) = requested(&[(PLUGIN, TODAY)]).await?;
+        assert_eq!(bodies.len(), 2);
+        let wanted = FakePlugin::new(PLUGIN).tool();
+        for body in bodies {
+            let tools = body["tools"].as_array().context("no tools")?;
+            let found = tools.iter().find(|tool| tool["name"] == PLUGIN);
+            let found = found.context("no plugin tool")?;
+            assert_eq!(found["type"], "function", "{body}");
+            assert_eq!(found["description"], wanted.description.as_str(), "{body}");
+            assert_eq!(found["parameters"], wanted.parameters, "{body}");
+            assert_eq!(found["strict"], true, "{body}");
+        }
+        Ok(())
+    }
+
+    /// AC-17.2-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_17_2_2_plugin_call_gives_plugin_step_then_final_text() -> anyhow::Result<()> {
+        let (seen, outputs) = tool_called(&[(PLUGIN, TODAY)]).await?;
+        let call = PluginCall {
+            plugin: PLUGIN.to_owned(),
+            arguments: serde_json::from_str(TODAY)?,
+        };
+        let sentence = Seen::Sentence("It is on.".to_owned());
+        assert_eq!(seen, [Seen::Plugin(call), sentence, Seen::Done]);
+        assert_eq!(outputs[0]["output"], r#"{"state":"on"}"#);
+        Ok(())
+    }
+
+    /// AC-17.2-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_17_2_3_plugin_calls_count_toward_the_limit() -> anyhow::Result<()> {
+        let mut calls = vec![(PLUGIN, TODAY); 5];
+        calls.push(("call_service", LIGHT_ON));
+        let (seen, outputs) = tool_called(&calls).await?;
+        let plugins = seen.iter().filter(|step| matches!(step, Seen::Plugin(_)));
+        assert_eq!(plugins.count(), 5);
+        let calls = seen.iter().filter(|step| matches!(step, Seen::Call(_)));
+        assert_eq!(calls.count(), 0, "{seen:?}");
+        assert_eq!(outputs[5]["call_id"], "call_6");
+        assert_eq!(outputs[5]["output"], "error: limit reached");
         Ok(())
     }
 

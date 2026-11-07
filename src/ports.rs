@@ -14,6 +14,7 @@ use serde_json::Map;
 use serde_json::Value;
 
 use crate::Device;
+use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
@@ -130,6 +131,8 @@ pub enum Step {
     /// A read of the entity states of the area with this name or alias. The answer continues
     /// after the consumer sends the states on the sender.
     States(String, oneshot::Sender<anyhow::Result<Option<Value>>>),
+    /// A plugin call. The answer continues after the consumer sends the result on the sender.
+    Plugin(PluginCall, oneshot::Sender<anyhow::Result<Option<Value>>>),
     /// The answer is complete.
     Done,
 }
