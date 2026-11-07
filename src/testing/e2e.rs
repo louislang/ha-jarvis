@@ -1,4 +1,4 @@
-//! The pipeline harness: the real Wyoming server, use cases, sherpa-onnx adapters and fixture
+//! The pipeline harness: the real Wyoming server, use cases, STT and TTS adapters and fixture
 //! model on `FakeHome` and `FakeReasoner`, driven in the event order of HA.
 
 use std::convert::Infallible;
@@ -555,19 +555,19 @@ mod tests {
         .await
     }
 
-    /// AC-9.2-4. Only `tv_show` responses have a variable other than `area`.
-    #[tokio::test(flavor = "multi_thread")]
-    #[ignore = "GPU host"]
-    async fn ac_9_2_4_uncached_command_response_latency_p95_is_700_ms_or_less() -> anyhow::Result<()>
-    {
-        within(&["turn the tv to jeopardy"], "tv_show", "kitchen", 700).await
-    }
-
     /// AC-9.2-5.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "GPU host"]
     async fn ac_9_2_5_light_command_response_latency_p95_is_400_ms_or_less() -> anyhow::Result<()> {
         within(&LIGHT_COMMANDS, "lights_on", "office", 400).await
+    }
+
+    /// AC-9.3c-1. Only `tv_show` responses have a variable other than `area`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "GPU host"]
+    async fn ac_9_3c_1_uncached_command_response_latency_p95_is_400_ms_or_less()
+    -> anyhow::Result<()> {
+        within(&["turn the tv to jeopardy"], "tv_show", "kitchen", 400).await
     }
 
     /// Asserts that each of `texts` in `area` on CUDA, with a reply of `pool`, has a p95 latency

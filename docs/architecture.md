@@ -47,6 +47,7 @@ flowchart LR
     crate --> crate_adapters_onnx
     crate --> crate_adapters_openai
     crate --> crate_adapters_sherpa
+    crate --> crate_adapters_supertonic
     crate --> crate_app_background
     crate --> crate_app_conversation
     crate --> crate_app_speech
@@ -76,7 +77,6 @@ flowchart LR
     crate_adapters_openai --> crate_ports
     crate_adapters_sherpa --> crate
     crate_adapters_sherpa --> crate_adapters_sherpa
-    crate_adapters_sherpa --> crate_domain_speech
     crate_adapters_sherpa --> crate_ports
     crate_adapters_supertonic --> crate
     crate_adapters_supertonic --> crate_adapters_supertonic
