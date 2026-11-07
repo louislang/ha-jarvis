@@ -51,6 +51,7 @@ flowchart LR
     crate --> crate_adapters_supertonic
     crate --> crate_app_background
     crate --> crate_app_conversation
+    crate --> crate_app_plugins
     crate --> crate_app_speech
     crate --> crate_domain_catalog
     crate --> crate_domain_model
@@ -96,6 +97,7 @@ flowchart LR
     crate_app_background --> crate_ports
     crate_app_conversation --> crate_app_background
     crate_app_conversation --> crate_app_conversation
+    crate_app_conversation --> crate_app_plugins
     crate_app_conversation --> crate_domain_catalog
     crate_app_conversation --> crate_domain_decide
     crate_app_conversation --> crate_domain_intent
