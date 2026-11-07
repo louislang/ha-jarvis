@@ -198,6 +198,7 @@ CI runs each check as a separate job. "Push" is a push to `main`. `just merge` r
 | `complexity` | `just complexity` | Push, PR | Yes |
 | `duplication` | `just duplication` | Push, PR | Yes |
 | `architecture` | `just architecture` | Push, PR | Yes |
+| `fixture-model` | `just fixture-model` (the fixture model for `gpu-test`, saved in the CI cache) | Push, PR | Yes |
 | `rust-test` | `just cov` (tests, gate tests, structure tests, conformance tests, coverage more than 80%) | Push, PR | Yes |
 | `bench` | `just bench` (Gungraun instruction budgets) | Push, PR | Linux only (Valgrind does not run on macOS) |
 | `python` | `just python` | Push, PR | Yes |
