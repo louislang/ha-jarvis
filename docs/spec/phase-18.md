@@ -52,7 +52,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Add the queries about lights. "Is the garage light on", "which lights are on" and "how bright is the office light" then get a local answer.
 
 - **Implements:** G3, G9. **Depends on:** 18.1.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `justfile` (the fixture epochs, sub-phase 3.9).
 
 **Model.**
 
