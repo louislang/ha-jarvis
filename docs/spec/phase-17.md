@@ -152,7 +152,7 @@ This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a
 **Goal:** Make each System One fetch intent name a plugin, and move the `weather` intent from the HA service `weather.get_forecasts` to `get_weather`. "What is the weather like" then gets a filler, and then the Open-Meteo forecast.
 
 - **Implements:** G3, G6. **Depends on:** 17.3b.
-- **Files:** modify `src/domain/decide.rs`, `src/domain/catalog.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`, `src/testing/e2e.rs`, `src/lib.rs`, `intents.toml`, `responses.toml`.
+- **Files:** modify `src/domain/decide.rs`, `src/domain/catalog.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`, `src/testing/e2e.rs`, `src/lib.rs`, `src/domain/responses.rs`, `intents.toml`, `responses.toml`.
 
 **Model.**
 
@@ -165,7 +165,8 @@ This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a
 - A fetch needs no area and no selection. Its `service`, `target`, `entity` and `select` are not used.
 - A command call always has `return_response: false`.
 - The `after` work of `Defer(Fetch)` (sub-phase 4.9d) runs `Plugins::fetch` with the `HomeConfig` of the hot cache instead of `Home::call`. The plugin result is `response` in the answer pool. The tests of AC-4.9d-2 and AC-4.9d-3 get the result from `FakePlugin`.
-- The pipeline harness (sub-phase 9.1) builds its registry with `FakePlugin`. Thus AC-9.2-2 makes no remote call.
+- The pipeline harness (sub-phase 9.1) builds its registry with `FakePlugin`. Thus AC-9.2-2 makes no remote call. The harness no longer adds a `weather.forecast_home` state to its house.
+- The test of the HA condition words in `src/domain/responses.rs` (fix PR "Weather Condition Words") reads the old `weather` pool, so this sub-phase deletes it. The plugin gives the condition words (sub-phase 17.3), and AC-17.4-5 checks the new pool.
 - The `weather` intent of `intents.toml` gets `plugin = "get_weather"` and `data = { when = "today" }`, and loses `service`, `target`, `entity` and the old `data`. Its pool in `responses.toml` is "Today will be {{ response.condition }}, with a high of {{ response.high }} degrees."
 
 **Acceptance criteria.**
