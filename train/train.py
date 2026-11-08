@@ -252,6 +252,20 @@ def limit_vram(device: str, max_vram_gb: float | None) -> None:
         torch.cuda.set_per_process_memory_fraction(max_vram_gb * 2**30 / total)
 
 
+def shuffled_batches(
+    training_set: TrainingSet, generator: torch.Generator
+) -> list[list[Example]]:
+    """Give the examples in a random order of `generator`, in groups of `batch_size`."""
+    examples, batch_size = training_set["examples"], training_set["batch_size"]
+    # The set is grouped by intent, so a fixed order pulls the model to the last ones.
+    order: list[int] = torch.randperm(len(examples), generator=generator).tolist()
+    shuffled = [examples[index] for index in order]
+    return [
+        shuffled[start : start + batch_size]
+        for start in range(0, len(shuffled), batch_size)
+    ]
+
+
 def train(
     training_set: TrainingSet, device: str, max_vram_gb: float | None
 ) -> JointModel:
@@ -266,15 +280,12 @@ def train(
     labels, tags = training_set["labels"], training_set["tags"]
     model = JointModel(base, len(labels), len(tags)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-    examples, batch_size = training_set["examples"], training_set["batch_size"]
-    batches = [
-        encode(tokenizer, training_set, examples[start : start + batch_size], model)
-        for start in range(0, len(examples), batch_size)
-    ]
-    epochs = training_set["epochs"]
+    generator = torch.Generator().manual_seed(0)
     model.train()
-    for _epoch in range(epochs):
-        for inputs, batch in batches:
+    for _epoch in range(training_set["epochs"]):
+        groups = shuffled_batches(training_set, generator)
+        for group in groups:
+            inputs, batch = encode(tokenizer, training_set, group, model)
             intent_logits, slot_logits = model(*inputs)
             torch.autograd.backward(loss(intent_logits, slot_logits, batch))
             optimizer.step()
