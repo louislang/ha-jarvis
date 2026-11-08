@@ -1871,6 +1871,65 @@ mod tests {
         }
     }
 
+    /// The speaker of the Living Room that is not on the satellite device.
+    const SPEAKER: &str = "media_player.carson_living_room_media_player";
+
+    /// The TV of the Living Room.
+    const TV: &str = "media_player.apple_tv";
+
+    /// The reference house with each player of `players` `playing` with its media attributes.
+    fn playing(players: &[(&str, &[(&str, Value)])]) -> StateCache {
+        let mut snapshot = house();
+        for state in &mut snapshot.states {
+            let found = players.iter().find(|(id, _)| state.entity_id == *id);
+            if let Some((_, media)) = found {
+                state.state = "playing".to_owned();
+                let media = media
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), value.clone()));
+                state.attributes.extend(media);
+            }
+        }
+        StateCache::load(snapshot)
+    }
+
+    /// AC-18.6-1.
+    #[test]
+    fn ac_18_6_1_now_playing_names_each_player_that_plays_in_the_area() {
+        let title = ("media_title", Value::from("Karma Police"));
+        let song = [title, ("media_artist", Value::from("Radiohead"))];
+        let cache = playing(&[(SPEAKER, &song)]);
+        let decision = replied("now_playing", None, "living_room", &cache);
+        let text = "Karma Police by Radiohead is playing on the Carson Living Room Media Player.";
+        assert_eq!(decision, answered("now_playing", text));
+        let satellite = "media_player.carson_living_room";
+        let cache = playing(&[(SPEAKER, &song), (TV, &[]), (satellite, &[])]);
+        let decision = replied("now_playing", None, "living_room", &cache);
+        let text = format!("{text} Something with no title is playing on the Apple TV.");
+        assert_eq!(decision, answered("now_playing", &text));
+    }
+
+    /// AC-18.6-2.
+    #[test]
+    fn ac_18_6_2_now_playing_reads_the_area_of_the_slot() {
+        let show = [
+            ("media_title", Value::from("Bluey")),
+            ("media_artist", Value::Null),
+        ];
+        let cache = playing(&[(TV, &show)]);
+        let decision = replied("now_playing", Some("living room"), "office", &cache);
+        let text = "Bluey is playing on the Apple TV.";
+        assert_eq!(decision, answered("now_playing", text));
+    }
+
+    /// AC-18.6-3.
+    #[test]
+    fn ac_18_6_3_now_playing_with_nothing_playing_names_the_area() {
+        let decision = replied("now_playing", None, "living_room", &playing(&[]));
+        let text = "Nothing is playing in the living room.";
+        assert_eq!(decision, answered("now_playing", text));
+    }
+
     /// AC-7.6-3.
     #[test]
     fn ac_7_6_3_area_states_give_the_unskipped_entities_of_the_area() {
