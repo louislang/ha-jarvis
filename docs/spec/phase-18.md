@@ -160,7 +160,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Model.**
 
 - `now_playing`: `target = "entities"`, `select = [{ domain = "media_player" }]`, `state = "playing"`. Examples: "what is playing in the [living room](area)", "what is playing on the [living room](area) tv", "what song is this", "what is playing", "what is this song". The area is the area slot, else the satellite area. HA can leave out `media_title` and `media_artist` or set them to `None`, so the pool checks each one. Pool: `{% for player in entities %}{% if player.attributes.media_title is defined and player.attributes.media_title is string %}{{ player.attributes.media_title }}{% if player.attributes.media_artist is defined and player.attributes.media_artist is string %} by {{ player.attributes.media_artist }}{% endif %}{% else %}Something with no title{% endif %} is playing on the {{ player.name }}.{{ " " if not loop.last else "" }}{% else %}Nothing is playing in the {{ area }}.{% endfor %}`
-- The media player of a satellite device is skipped (sub-phase 4.4b), so the answer names only the other players of the area.
+- The media player of a satellite device is not skipped (sub-phase 4.4b), so the answer also names it when it plays.
 
 **Acceptance criteria.**
 
@@ -170,7 +170,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 **Proofs.**
 
-- P-18.6-1 to P-18.6-3. Evidence: test. The rules are P-18.1-2 and P-4.4b-5.
+- P-18.6-1 to P-18.6-3. Evidence: test. The rules are P-18.1-2 and P-4.4b-6.
 
 ---
 
@@ -184,22 +184,22 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Model.**
 
 - The service is `music_assistant.play_media`. `media_id` is the name of an artist, an album, a track or a playlist. Without `media_type`, Music Assistant finds the type itself. Thus one intent plays each type.
-- The player is the speaker of the area: `target = "entity"` and `select = [{ domain = "media_player", device_class = "speaker" }]`. The area is the area slot, else the satellite area. The speaker of a satellite device is skipped (sub-phase 4.4b). A speaker that Music Assistant does not control goes in `exclude`.
+- The player is the speaker of the area: `target = "entity"` and `select = [{ domain = "media_player", device_class = "speaker" }]`. The area is the area slot, else the satellite area. The speaker of a satellite device is not skipped (sub-phase 4.4b). Of two or more speakers in the area, the player is the one with the lowest entity ID (sub-phase 4.4c). A speaker that Music Assistant does not control goes in `exclude`.
 - `play_music`: examples "play [radiohead](media)", "play [jazz](media) in the [kitchen](area)", "play the album [abbey road](media)", "play my [workout](media) playlist", "play the song [yesterday](media)". `data = { media_id = "{{ media }}" }`. Pool: `Playing {{ media }}.`
 - `play_radio`: examples "play music like [radiohead](media)", "play something like [miles davis](media)", "start a radio station for [taylor swift](media)". `data = { media_id = "{{ media }}", radio_mode = "{{ true }}" }`. Pool: `Playing music like {{ media }}.`
 - `queue_music`: examples "add [yesterday](media) to the queue", "queue [abbey road](media)", "put [hey jude](media) in the queue". `data = { media_id = "{{ media }}", enqueue = "add" }`. Pool: `Adding {{ media }} to the queue.`
 
 **Acceptance criteria.**
 
-- AC-18.7-1: When the intent is `play_music` with the slot `media = radiohead` and the satellite is in the Kitchen, the call is `music_assistant.play_media` with the target `media_player.carson_kitchen_media_player` and the data `{ media_id: "radiohead" }`.
-- AC-18.7-2: When the request is from the Office satellite and has the area slot "kitchen", the target is `media_player.carson_kitchen_media_player`.
+- AC-18.7-1: When the intent is `play_music` with the slot `media = radiohead` and the satellite is in the Kitchen, the call is `music_assistant.play_media` with the target `media_player.carson_kitchen` and the data `{ media_id: "radiohead" }`. `media_player.carson_kitchen` is the speaker of the Kitchen satellite device, and its entity ID is lower than `media_player.carson_kitchen_media_player`.
+- AC-18.7-2: When the request is from the Office satellite and has the area slot "kitchen", the target is `media_player.carson_kitchen`.
 - AC-18.7-3: When the intent is `play_radio`, the data has `radio_mode = true` as a boolean.
 - AC-18.7-4: When the intent is `queue_music`, the data has `enqueue = "add"`.
-- AC-18.7-5: When the satellite is in the Bedroom, which has no speaker that is not on a satellite device, the result is `Defer` with `Job::Llm`.
+- AC-18.7-5: When the satellite is in the Bedroom, whose only speaker is on the satellite device, the target is `media_player.carson_bedroom`.
 
 **Proofs.**
 
-- P-18.7-1 to P-18.7-5. Evidence: test. The rules are P-4.5c-1, P-4.5c-2, P-4.4b-5 and P-4.5d-1.
+- P-18.7-1 to P-18.7-5. Evidence: test. The rules are P-4.5c-1, P-4.5c-2, P-4.4b-6, P-4.4c-4 and P-4.5d-1.
 
 ---
 
@@ -221,13 +221,13 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 **Acceptance criteria.**
 
-- AC-18.8-1: When the intent is `music_next` and the satellite is in the Kitchen, the call is `media_player.media_next_track` with the target `media_player.carson_kitchen_media_player`.
+- AC-18.8-1: When the intent is `music_next` and the satellite is in the Kitchen, the call is `media_player.media_next_track` with the target `media_player.carson_kitchen`.
 - AC-18.8-2: When the intent is `music_pause`, `volume_up` or `volume_down`, the call has the service of the intent and the same target.
 - AC-18.8-3: When the intent is `volume_set` with the slot `volume = 50`, the call data has `volume_level = 0.5` as a number.
 
 **Proofs.**
 
-- P-18.8-1 to P-18.8-3. Evidence: test. The rules are P-4.5c-1 and P-4.5d-1.
+- P-18.8-1 to P-18.8-3. Evidence: test. The rules are P-4.5c-1, P-4.4b-6, P-4.4c-4 and P-4.5d-1.
 
 ---
 
