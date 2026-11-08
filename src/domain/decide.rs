@@ -1337,14 +1337,19 @@ mod tests {
         catalog
     }
 
-    /// The data of the call of `decision`.
-    fn data(decision: Decision) -> Map<String, Value> {
+    /// The call of `decision`.
+    fn called(decision: Decision) -> ServiceCall {
         match decision {
             Decision::Reply {
                 call: Some(call), ..
-            } => call.data,
+            } => call,
             other => panic!("the decision makes a call: {other:?}"),
         }
+    }
+
+    /// The data of the call of `decision`.
+    fn data(decision: Decision) -> Map<String, Value> {
+        called(decision).data
     }
 
     /// The `media_content_id` of the `tv_show` call of `catalog` with `slots` in the office.
@@ -1928,6 +1933,64 @@ mod tests {
         let decision = replied("now_playing", None, "living_room", &playing(&[]));
         let text = "Nothing is playing in the living room.";
         assert_eq!(decision, answered("now_playing", text));
+    }
+
+    /// The Kitchen speaker that is not on the satellite device.
+    const KITCHEN_SPEAKER: &str = "media_player.carson_kitchen_media_player";
+
+    /// The decision for `label` with the slots `slots` on the satellite in `area`.
+    fn played(label: &str, slots: &[(&str, &str)], area: &str) -> Decision {
+        let request = Request {
+            transcript: String::new(),
+            area: Some(AreaId(area.to_owned())),
+        };
+        let cache = StateCache::load(house());
+        decided_for(&catalog(), (label, 0.89), slots, &request, &cache)
+    }
+
+    /// AC-18.7-1.
+    #[test]
+    fn ac_18_7_1_play_music_calls_music_assistant_on_the_speaker_of_the_area() {
+        let call = called(played("play_music", &[("media", "radiohead")], "kitchen"));
+        let mut data = Map::new();
+        data.insert("media_id".to_owned(), Value::from("radiohead"));
+        let expected = ServiceCall {
+            domain: "music_assistant".to_owned(),
+            service: "play_media".to_owned(),
+            target: vec![KITCHEN_SPEAKER.to_owned()],
+            data,
+            return_response: false,
+        };
+        assert_eq!(call, expected);
+    }
+
+    /// AC-18.7-2.
+    #[test]
+    fn ac_18_7_2_play_music_plays_in_the_area_of_the_slot() {
+        let slots = [("media", "jazz"), ("area", "kitchen")];
+        let call = called(played("play_music", &slots, "office"));
+        assert_eq!(call.target, [KITCHEN_SPEAKER]);
+    }
+
+    /// AC-18.7-3.
+    #[test]
+    fn ac_18_7_3_play_radio_sends_radio_mode_as_a_boolean() {
+        let data = data(played("play_radio", &[("media", "radiohead")], "kitchen"));
+        assert_eq!(data["radio_mode"], Value::Bool(true));
+    }
+
+    /// AC-18.7-4.
+    #[test]
+    fn ac_18_7_4_queue_music_adds_to_the_queue() {
+        let data = data(played("queue_music", &[("media", "yesterday")], "kitchen"));
+        assert_eq!(data["enqueue"], Value::from("add"));
+    }
+
+    /// AC-18.7-5.
+    #[test]
+    fn ac_18_7_5_play_music_with_only_a_satellite_speaker_defers() {
+        let decision = played("play_music", &[("media", "radiohead")], "bedroom");
+        assert_eq!(decision, deferral(""));
     }
 
     /// AC-7.6-3.
