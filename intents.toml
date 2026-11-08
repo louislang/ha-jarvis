@@ -84,3 +84,17 @@ examples = ["is the [garage](area) light on", "which lights are on", "are the li
 target = "entities"
 select = [{ domain = "light" }, { domain = "switch", name = "light" }]
 state = "on"
+
+[[intent]]
+name = "climate_query"
+kind = "query"
+examples = ["what is the thermostat set to", "is the ac on", "is the heat on", "what temperature is the thermostat set to"]
+target = "entity"
+select = [{ domain = "climate" }]
+
+[[intent]]
+name = "fan_query"
+kind = "query"
+examples = ["is the fan on", "is the [office](area) fan on", "is the fan running"]
+target = "entity"
+select = [{ domain = "fan" }, { domain = "switch", name = "fan" }]

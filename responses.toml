@@ -31,6 +31,12 @@ responses = ['{% for door in entities %}The {{ door.name }} is {{ door.state }}.
 [pools.windows_query]
 responses = ['{% set others = entities | rejectattr("state", "eq", "off") | list %}{% for window in others %}{{ window.name }} is {{ "open" if window.state == "on" else window.state }}.{{ " " if not loop.last else "" }}{% else %}All windows are closed.{% endfor %}']
 
+[pools.climate_query]
+responses = ['{% if entity.state == "off" %}The thermostat is off.{% else %}The thermostat is set to {{ entity.attributes.temperature | int }} degrees in {{ entity.state | replace("_", " ") }} mode.{% endif %}']
+
+[pools.fan_query]
+responses = ["The {{ entity.name }} is {{ entity.state }}."]
+
 [pools.filler]
 responses = ["I will check on that for you.", "Let me look into that.", "One moment."]
 

@@ -542,7 +542,8 @@ mod tests {
         let catalog = catalog();
         let names: Vec<&str> = catalog.intents.iter().map(|i| i.name.as_str()).collect();
         let expected = "lights_on fan_on climate_down tv_show temperature_query weather \
-            windows_query lock_query garage_door_query brightness_query lights_query";
+            windows_query lock_query garage_door_query brightness_query lights_query \
+            climate_query fan_query";
         assert_eq!(names.join(" "), expected);
         assert_eq!(validate_catalog(&catalog), Ok(()));
     }
@@ -626,7 +627,8 @@ mod tests {
     #[test]
     fn ac_3_2c_2_labels_are_unknown_then_intent_names() {
         let expected = "unknown lights_on fan_on climate_down tv_show temperature_query weather \
-            windows_query lock_query garage_door_query brightness_query lights_query";
+            windows_query lock_query garage_door_query brightness_query lights_query \
+            climate_query fan_query";
         assert_eq!(labels(&catalog()).join(" "), expected);
     }
 

@@ -1303,12 +1303,12 @@ mod tests {
         decided_for(catalog, (label, 0.89), &[], &request, cache)
     }
 
-    /// The reference house with the kitchen temperature `state`.
-    fn kitchen_temperature(state: &str) -> StateCache {
+    /// The reference house with the state `state` for the entity `id`.
+    fn changed(id: &str, state: &str) -> StateCache {
         let mut snapshot = house();
         let mut states = snapshot.states.iter();
-        let position = states.position(|known| known.entity_id == THERMOSTAT);
-        let position = position.expect("the house has the kitchen temperature sensor");
+        let position = states.position(|known| known.entity_id == id);
+        let position = position.expect("the house has the entity");
         snapshot.states[position].state = state.to_owned();
         StateCache::load(snapshot)
     }
@@ -1561,7 +1561,7 @@ mod tests {
     /// AC-4.6-1.
     #[test]
     fn ac_4_6_1_temperature_query_reads_sensor() {
-        let cache = kitchen_temperature("21");
+        let cache = changed(THERMOSTAT, "21");
         let decision = decided_at(&catalog(), "temperature_query", "kitchen", &cache);
         assert_eq!(decision, queried("It is 21 degrees in the kitchen."));
     }
@@ -1623,7 +1623,7 @@ mod tests {
     fn ac_4_6_4_query_has_no_call() {
         let mut catalog = catalog();
         catalog.intents[4].service = Some("homeassistant.turn_on".to_owned());
-        let cache = kitchen_temperature("21");
+        let cache = changed(THERMOSTAT, "21");
         let decision = decided_at(&catalog, "temperature_query", "kitchen", &cache);
         assert_eq!(decision, queried("It is 21 degrees in the kitchen."));
     }
@@ -1837,6 +1837,33 @@ mod tests {
                 "Kitchen Window {kitchen}"
             );
         }
+    }
+
+    /// AC-18.4-1.
+    #[test]
+    fn ac_18_4_1_climate_query_gives_the_target_and_the_mode() {
+        let cache = StateCache::load(house());
+        let decision = replied("climate_query", None, "bedroom", &cache);
+        let text = "The thermostat is set to 66 degrees in heat mode.";
+        assert_eq!(decision, answered("climate_query", text));
+    }
+
+    /// AC-18.4-2.
+    #[test]
+    fn ac_18_4_2_climate_query_with_the_thermostat_off() {
+        let cache = changed("climate.thermostat", "off");
+        let decision = replied("climate_query", None, "bedroom", &cache);
+        let text = "The thermostat is off.";
+        assert_eq!(decision, answered("climate_query", text));
+    }
+
+    /// AC-18.4-3.
+    #[test]
+    fn ac_18_4_3_fan_query_names_the_fan_state() {
+        let cache = StateCache::load(house());
+        let decision = replied("fan_query", None, "living_room", &cache);
+        let text = "The Living Room Fan is off.";
+        assert_eq!(decision, answered("fan_query", text));
     }
 
     /// AC-7.6-3.
