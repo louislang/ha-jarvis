@@ -43,6 +43,9 @@ responses = ['{% if entities %}{{ entities | map(attribute="name") | join(" and 
 [pools.alarm_query]
 responses = ['{% if entity.state == "disarmed" %}The alarm is off.{% else %}The alarm is {{ entity.state | replace("_", " ") }}.{% endif %}']
 
+[pools.now_playing]
+responses = ['{% for player in entities %}{% if player.attributes.media_title is defined and player.attributes.media_title is string %}{{ player.attributes.media_title }}{% if player.attributes.media_artist is defined and player.attributes.media_artist is string %} by {{ player.attributes.media_artist }}{% endif %}{% else %}Something with no title{% endif %} is playing on the {{ player.name }}.{{ " " if not loop.last else "" }}{% else %}Nothing is playing in the {{ area }}.{% endfor %}']
+
 [pools.filler]
 responses = ["I will check on that for you.", "Let me look into that.", "One moment."]
 
