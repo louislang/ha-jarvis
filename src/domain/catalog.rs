@@ -544,7 +544,7 @@ mod tests {
         let expected = "lights_on fan_on climate_down tv_show temperature_query weather \
             windows_query lock_query garage_door_query brightness_query lights_query \
             climate_query fan_query who_is_home alarm_query now_playing play_music play_radio \
-            queue_music";
+            queue_music music_next music_pause volume_up volume_down volume_set";
         assert_eq!(names.join(" "), expected);
         assert_eq!(validate_catalog(&catalog), Ok(()));
     }
@@ -621,7 +621,8 @@ mod tests {
     #[test]
     fn ac_3_2c_1_tags_are_o_then_bio_of_sorted_slots() {
         let expected = [
-            "O", "B-area", "I-area", "B-media", "I-media", "B-show", "I-show",
+            "O", "B-area", "I-area", "B-media", "I-media", "B-show", "I-show", "B-volume",
+            "I-volume",
         ];
         assert_eq!(tags(&catalog()), expected);
     }
@@ -632,7 +633,7 @@ mod tests {
         let expected = "unknown lights_on fan_on climate_down tv_show temperature_query weather \
             windows_query lock_query garage_door_query brightness_query lights_query \
             climate_query fan_query who_is_home alarm_query now_playing play_music play_radio \
-            queue_music";
+            queue_music music_next music_pause volume_up volume_down volume_set";
         assert_eq!(labels(&catalog()).join(" "), expected);
     }
 

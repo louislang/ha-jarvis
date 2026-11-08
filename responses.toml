@@ -55,6 +55,21 @@ responses = ["Playing music like {{ media }}."]
 [pools.queue_music]
 responses = ["Adding {{ media }} to the queue."]
 
+[pools.music_next]
+responses = ["Next song."]
+
+[pools.music_pause]
+responses = ["Pausing the music."]
+
+[pools.volume_up]
+responses = ["Turning it up."]
+
+[pools.volume_down]
+responses = ["Turning it down."]
+
+[pools.volume_set]
+responses = ["Setting the volume to {{ volume }} percent."]
+
 [pools.filler]
 responses = ["I will check on that for you.", "Let me look into that.", "One moment."]
 
