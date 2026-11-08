@@ -339,7 +339,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - **Implements:** G3, G16. **Depends on:** 3.7.
 - **Files:** modify `train/train.py`, `train/test_train.py`.
 
-**Model.** `train(set, device, max_vram_gb) -> JointModel` runs `epochs` passes with `batch_size` and AdamW. On `cuda` with `max_vram_gb`, it first calls `torch.cuda.set_per_process_memory_fraction` with `max_vram_gb` divided by the GPU memory, so a run that needs more fails with "CUDA out of memory" (sub-phase 13.10 then sends the run to RunPod). `export(model, tokenizer, set, out)` writes `model.onnx` (inputs `input_ids`, `attention_mask`, `token_type_ids`; outputs `intent_logits`, `slot_logits`), `tokenizer.json` and `labels.json` (`labels` and `tags` in set order). `main` does `load_set`, `train`, `export`.
+**Model.** `train(set, device, max_vram_gb) -> JointModel` runs `epochs` passes with `batch_size` and AdamW. Before each pass, `train` shuffles the examples with a random generator. It seeds the generator with 0 once for each run. Then it splits the examples into batches in that order. The training set is grouped by intent in file order, and without the shuffle the last intents pull the model toward them on every pass. On `cuda` with `max_vram_gb`, it first calls `torch.cuda.set_per_process_memory_fraction` with `max_vram_gb` divided by the GPU memory, so a run that needs more fails with "CUDA out of memory" (sub-phase 13.10 then sends the run to RunPod). `export(model, tokenizer, set, out)` writes `model.onnx` (inputs `input_ids`, `attention_mask`, `token_type_ids`; outputs `intent_logits`, `slot_logits`), `tokenizer.json` and `labels.json` (`labels` and `tags` in set order). `main` does `load_set`, `train`, `export`.
 
 **Acceptance criteria.**
 
@@ -347,12 +347,13 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - AC-3.8-2: When ONNX Runtime and PyTorch run the same input, the outputs are equal within 0.0001.
 - AC-3.8-3: When `labels.json` is read, its `labels` and `tags` equal those of the training set, in order.
 - AC-3.8-4: When the set has 2 epochs, the training loop runs 2 passes.
+- AC-3.8-5: When the loop runs 2 passes on a set of 6 examples with batch size 2, each pass trains on every example once, the two passes use different orders, and a second run uses the same orders.
 
 **Proofs.**
 
 - P-3.8-3 (AC-3.8-3). Ensures: `labels.json` has the labels and the tags of the set, in order. Argument: `export` writes `set.labels` and `set.tags` without change.
 - P-3.8-4 (AC-3.8-4). Ensures: the loop runs `set.epochs` passes. Argument: the loop is `for epoch in range(set.epochs)`.
-- P-3.8-1, P-3.8-2. Evidence: test.
+- P-3.8-1, P-3.8-2, P-3.8-5. Evidence: test.
 
 ---
 
