@@ -542,7 +542,7 @@ mod tests {
         let catalog = catalog();
         let names: Vec<&str> = catalog.intents.iter().map(|i| i.name.as_str()).collect();
         let expected = "lights_on fan_on climate_down tv_show temperature_query weather \
-            brightness_query lights_query";
+            windows_query lock_query garage_door_query brightness_query lights_query";
         assert_eq!(names.join(" "), expected);
         assert_eq!(validate_catalog(&catalog), Ok(()));
     }
@@ -626,7 +626,24 @@ mod tests {
     #[test]
     fn ac_3_2c_2_labels_are_unknown_then_intent_names() {
         let expected = "unknown lights_on fan_on climate_down tv_show temperature_query weather \
-            brightness_query lights_query";
+            windows_query lock_query garage_door_query brightness_query lights_query";
         assert_eq!(labels(&catalog()).join(" "), expected);
+    }
+
+    /// AC-18.3-4.
+    #[test]
+    fn ac_18_3_4_no_intent_can_lock_or_unlock() {
+        let catalog = catalog();
+        let queries = ["lock_query", "garage_door_query", "windows_query"];
+        for name in queries {
+            let intent = catalog.intents.iter().find(|intent| intent.name == name);
+            let service = intent.map(|intent| intent.service.as_deref());
+            assert_eq!(service, Some(None), "{name} is an intent with no service");
+        }
+        let locking = catalog.intents.iter().find(|intent| {
+            let service = intent.service.as_deref().unwrap_or_default();
+            service.starts_with("lock.")
+        });
+        assert_eq!(locking, None, "no intent has a service in the lock domain");
     }
 }
