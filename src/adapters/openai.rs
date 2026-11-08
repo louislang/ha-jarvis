@@ -1041,6 +1041,7 @@ mod tests {
         assert_eq!(
             entity_lines(&asked(Some("kitchen"))),
             [
+                "- Carson Kitchen (media_player.carson_kitchen): idle",
                 "- Carson Kitchen Media Player (media_player.carson_kitchen_media_player): idle",
                 "- Thermostat (climate.thermostat): heat",
                 "- Thermostat Current Temperature (sensor.thermostat_current_temperature): 63.5",
