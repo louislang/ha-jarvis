@@ -179,7 +179,8 @@ fn lowest(ids: &[EntityId]) -> EntityId {
     EntityId(ids[best].0.clone())
 }
 
-/// True when `entity` has an entity category, is hidden or disabled, or is on a satellite device.
+/// True when `entity` has an entity category, is hidden or disabled, or is on a satellite device
+/// and is not a media player.
 #[verus_spec(found =>
     ensures
         found == skipped(*cache, *entity),
@@ -189,7 +190,8 @@ pub fn is_skipped(cache: &StateCache, entity: &Entity) -> bool {
     entity.entity_category.is_some()
         || entity.hidden_by.is_some()
         || entity.disabled_by.is_some()
-        || matches!(&entity.device_id, Some(device) if is_satellite(cache, device.as_str()))
+        || (!StateCache::in_domain(entity.entity_id.0.as_str(), "media_player")
+            && matches!(&entity.device_id, Some(device) if is_satellite(cache, device.as_str())))
 }
 
 /// True when the device `device` has an `assist_satellite` entity.
@@ -478,12 +480,14 @@ pub open spec fn satellite(cache: StateCache, device: Seq<char>) -> bool {
         && satellite_of(#[trigger] cache.entities@[index], device)
 }
 
-/// True when `entity` has an entity category, is hidden or disabled, or is on a satellite device.
+/// True when `entity` has an entity category, is hidden or disabled, or is on a satellite device
+/// and is not a media player.
 pub open spec fn skipped(cache: StateCache, entity: Entity) -> bool {
     ||| entity.entity_category is Some
     ||| entity.hidden_by is Some
     ||| entity.disabled_by is Some
-    ||| entity.device_id matches Some(device) && satellite(cache, device@)
+    ||| !crate::domain::state_cache::in_domain(entity.entity_id.0@, "media_player"@)
+        && (entity.device_id matches Some(device) && satellite(cache, device@))
 }
 
 /// True when `entity` is not excluded by `intent`, is not skipped and is in `area`.
@@ -713,6 +717,18 @@ mod tests {
         assert_eq!(
             selected(&intent("lights_on"), "kitchen", house),
             ["light.kitchen", "light.strawberry_lamp"]
+        );
+    }
+
+    /// AC-4.4b-6.
+    #[test]
+    fn ac_4_4b_6_satellite_media_player() {
+        assert_eq!(
+            selected(&intent("now_playing"), "kitchen", house()),
+            [
+                "media_player.carson_kitchen",
+                "media_player.carson_kitchen_media_player"
+            ]
         );
     }
 

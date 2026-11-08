@@ -1907,8 +1907,7 @@ mod tests {
         let decision = replied("now_playing", None, "living_room", &cache);
         let text = "Karma Police by Radiohead is playing on the Carson Living Room Media Player.";
         assert_eq!(decision, answered("now_playing", text));
-        let satellite = "media_player.carson_living_room";
-        let cache = playing(&[(SPEAKER, &song), (TV, &[]), (satellite, &[])]);
+        let cache = playing(&[(SPEAKER, &song), (TV, &[])]);
         let decision = replied("now_playing", None, "living_room", &cache);
         let text = format!("{text} Something with no title is playing on the Apple TV.");
         assert_eq!(decision, answered("now_playing", &text));
@@ -1935,8 +1934,8 @@ mod tests {
         assert_eq!(decision, answered("now_playing", text));
     }
 
-    /// The Kitchen speaker that is not on the satellite device.
-    const KITCHEN_SPEAKER: &str = "media_player.carson_kitchen_media_player";
+    /// The speaker of the Kitchen satellite device, the lowest entity ID of the Kitchen speakers.
+    const KITCHEN_SPEAKER: &str = "media_player.carson_kitchen";
 
     /// The decision for `label` with the slots `slots` on the satellite in `area`.
     fn played(label: &str, slots: &[(&str, &str)], area: &str) -> Decision {
@@ -1988,9 +1987,9 @@ mod tests {
 
     /// AC-18.7-5.
     #[test]
-    fn ac_18_7_5_play_music_with_only_a_satellite_speaker_defers() {
-        let decision = played("play_music", &[("media", "radiohead")], "bedroom");
-        assert_eq!(decision, deferral(""));
+    fn ac_18_7_5_play_music_on_the_only_speaker_of_the_satellite() {
+        let call = called(played("play_music", &[("media", "radiohead")], "bedroom"));
+        assert_eq!(call.target, ["media_player.carson_bedroom"]);
     }
 
     /// AC-7.6-3.
