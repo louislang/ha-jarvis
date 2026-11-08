@@ -121,3 +121,30 @@ examples = ["what is playing in the [living room](area)", "what song is this", "
 target = "entities"
 select = [{ domain = "media_player" }]
 state = "playing"
+
+[[intent]]
+name = "play_music"
+kind = "command"
+examples = ["play [radiohead](media)", "play [jazz](media) in the [kitchen](area)", "play the album [abbey road](media)", "play my [workout](media) playlist", "play the song [yesterday](media)"]
+service = "music_assistant.play_media"
+target = "entity"
+select = [{ domain = "media_player", device_class = "speaker" }]
+data = { media_id = "{{ media }}" }
+
+[[intent]]
+name = "play_radio"
+kind = "command"
+examples = ["play music like [radiohead](media)", "play something like [miles davis](media)", "start a radio station for [taylor swift](media)"]
+service = "music_assistant.play_media"
+target = "entity"
+select = [{ domain = "media_player", device_class = "speaker" }]
+data = { media_id = "{{ media }}", radio_mode = "{{ true }}" }
+
+[[intent]]
+name = "queue_music"
+kind = "command"
+examples = ["add [yesterday](media) to the queue", "queue [abbey road](media)", "put [hey jude](media) in the queue"]
+service = "music_assistant.play_media"
+target = "entity"
+select = [{ domain = "media_player", device_class = "speaker" }]
+data = { media_id = "{{ media }}", enqueue = "add" }
