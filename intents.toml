@@ -117,7 +117,7 @@ select = [{ domain = "alarm_control_panel" }]
 [[intent]]
 name = "now_playing"
 kind = "query"
-examples = ["what is playing in the [living room](area)", "what song is this", "what is playing", "what is this song"]
+examples = ["what is playing in the [living room](area)", "what is playing on the [living room](area) tv", "what song is this", "what is playing", "what is this song"]
 target = "entities"
 select = [{ domain = "media_player" }]
 state = "playing"
