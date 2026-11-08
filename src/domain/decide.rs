@@ -44,11 +44,6 @@ pub enum Decision {
         /// The deferred work.
         job: Job,
     },
-    /// Speak the reply from the pool `fallback`: Jarvis knows the intent but cannot act.
-    Fallback {
-        /// The reply.
-        reply: Chosen,
-    },
 }
 
 /// A selected response.
@@ -342,13 +337,12 @@ pub fn decide(
     }
 }
 
-/// The decision of `intent` in the area of the area slot, else of the satellite, or `Fallback`
-/// when the slot names no area, or a query or a service has no area. A fetch and a `house` query
-/// need no area.
+/// The decision of `intent` in the area of the area slot, else of the satellite, or a System Two
+/// job when System One cannot act: the slot names no area, a query or a service has no area, or a
+/// later step fails. A fetch and a `house` query need no area.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
-        pools@.contains_key(crate::domain::contracts::string_key("fallback"@)),
         pools@.contains_key(crate::domain::contracts::string_key("filler"@)),
         responses::filled(pools@),
     ensures
@@ -363,16 +357,20 @@ fn act(
     rng: &mut StdRng,
 ) -> Decision {
     let Some((area, context)) = situation(intent, prediction, request, cache) else {
-        return fallback(pools, rng);
+        return defer(request, pools, rng);
     };
-    match (intent.kind, &intent.service, area) {
+    let decision = match (intent.kind, &intent.service, area) {
         (Kind::Fetch, _, _) => fetch(intent, &context, pools, rng),
         (Kind::Query, _, _) => query(intent, area, context, cache, pools, rng),
         (Kind::Command, None, _) => respond(intent, &context, None, pools, rng),
         (_, Some(service), Some(area)) => {
             call(intent, service.as_str(), area, context, cache, pools, rng)
         }
-        _ => fallback(pools, rng),
+        _ => None,
+    };
+    match decision {
+        Some(decision) => decision,
+        None => defer(request, pools, rng),
     }
 }
 
@@ -398,17 +396,16 @@ fn situation<'a>(
     Some((area, context(intent, prediction, area, cache)?))
 }
 
-/// The reply of the query `intent` rendered with its selection in `area`, or `Fallback` when the
+/// The reply of the query `intent` rendered with its selection in `area`, or `None` when the
 /// selection is empty, the reply does not render, or `area` is `None` for a target that is not
 /// `house`. A list query also gets the kept entities of its selection as `entities`.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
-        pools@.contains_key(crate::domain::contracts::string_key("fallback"@)),
         responses::filled(pools@),
     ensures
-        area is None && !(intent.target is House) ==> decision is Fallback,
-        decision is Fallback || (decision matches Decision::Reply { call: None, .. }
+        area is None && !(intent.target is House) ==> decision is None,
+        decision is None || (decision matches Some(Decision::Reply { call: None, .. })
             && exists|known: AreaId, selected: Seq<EntityId>| selected.len() > 0
                 && #[trigger] targeted(*intent, *cache, known, selected)
                 && (area matches Some(area) ==> known == *area)),
@@ -420,17 +417,15 @@ fn query(
     cache: &StateCache,
     pools: &Pools,
     rng: &mut StdRng,
-) -> Decision {
+) -> Option<Decision> {
     let anywhere = AreaId(String::new());
     let area = match (area, intent.target) {
         (Some(area), _) => area,
         // `select` does not read the area of a `house` target.
         (None, Target::House) => &anywhere,
-        (None, _) => return fallback(pools, rng),
+        (None, _) => return None,
     };
-    let Some(selected) = selection(intent, area, &mut context, cache) else {
-        return fallback(pools, rng);
-    };
+    let selected = selection(intent, area, &mut context, cache)?;
     if !matches!(intent.target, Target::Entity) {
         let ids = kept(&selected, intent.state.as_ref(), cache);
         context.insert("entities".to_owned(), entities(&ids, cache));
@@ -439,15 +434,14 @@ fn query(
 }
 
 /// The reply and the call of `service` with the data of `intent` on its selection in `area`, or
-/// `Fallback` when `service` has no dot, the selection is empty or a template does not render.
+/// `None` when `service` has no dot, the selection is empty or a template does not render.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
-        pools@.contains_key(crate::domain::contracts::string_key("fallback"@)),
         responses::filled(pools@),
     ensures
-        decision is Fallback
-            || (decision matches Decision::Reply { call: Some(made), .. }
+        decision is None
+            || (decision matches Some(Decision::Reply { call: Some(made), .. })
             && made.target@.len() > 0 && served(service@, made)
             && targeted(*intent, *cache, *area, entity_ids(made.target@))
             && stringed(*intent, made.data)),
@@ -460,16 +454,10 @@ fn call(
     cache: &StateCache,
     pools: &Pools,
     rng: &mut StdRng,
-) -> Decision {
-    let Some((domain, name)) = service.split_once('.') else {
-        return fallback(pools, rng);
-    };
-    let Some(selection) = selection(intent, area, &mut context, cache) else {
-        return fallback(pools, rng);
-    };
-    let Some(data) = data(intent, &context) else {
-        return fallback(pools, rng);
-    };
+) -> Option<Decision> {
+    let (domain, name) = service.split_once('.')?;
+    let selection = selection(intent, area, &mut context, cache)?;
+    let data = data(intent, &context)?;
     let call = ServiceCall {
         domain: domain.to_owned(),
         service: name.to_owned(),
@@ -481,37 +469,32 @@ fn call(
 }
 
 /// The filler and the fetch of the plugin of `intent` with its `data` rendered with `context` as
-/// the arguments, or `Fallback` when `intent` has no plugin or a data value does not render.
+/// the arguments, or `None` when `intent` has no plugin or a data value does not render.
 #[verus_spec(decision =>
     requires
-        pools@.contains_key(crate::domain::contracts::string_key("fallback"@)),
         pools@.contains_key(crate::domain::contracts::string_key("filler"@)),
         responses::filled(pools@),
     ensures
-        intent.plugin is None ==> decision is Fallback,
-        decision is Fallback || fetched(*intent, decision),
+        intent.plugin is None ==> decision is None,
+        decision matches Some(decision) ==> fetched(*intent, decision),
 )]
 fn fetch(
     intent: &Intent,
     context: &Map<String, Value>,
     pools: &Pools,
     rng: &mut StdRng,
-) -> Decision {
-    let Some(plugin) = &intent.plugin else {
-        return fallback(pools, rng);
-    };
-    let Some(arguments) = data(intent, context) else {
-        return fallback(pools, rng);
-    };
+) -> Option<Decision> {
+    let plugin = intent.plugin.as_ref()?;
+    let arguments = data(intent, context)?;
     let call = PluginCall {
         plugin: plugin.clone(),
         arguments,
     };
     let pool = intent.name.clone();
-    Decision::Defer {
+    Some(Decision::Defer {
         filler: choose(pools, "filler", rng),
         job: Job::Fetch { call, pool },
-    }
+    })
 }
 
 /// The selection of `intent` in `area`, with the `entity` text rendered with `context`, and with
@@ -616,15 +599,14 @@ fn evaluate(source: &str, context: &Map<String, Value>) -> Option<Value> {
     serde_json::to_value(value).ok()
 }
 
-/// `Reply` with `call` and the reply of `intent` rendered with `context`, or `Fallback` when the
+/// `Reply` with `call` and the reply of `intent` rendered with `context`, or `None` when the
 /// reply does not render.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
-        pools@.contains_key(crate::domain::contracts::string_key("fallback"@)),
         responses::filled(pools@),
     ensures
-        decision is Fallback || (decision matches Decision::Reply { call: made, .. } && made == call),
+        decision is None || (decision matches Some(Decision::Reply { call: made, .. }) && made == call),
 )]
 fn respond(
     intent: &Intent,
@@ -632,13 +614,10 @@ fn respond(
     call: Option<ServiceCall>,
     pools: &Pools,
     rng: &mut StdRng,
-) -> Decision {
+) -> Option<Decision> {
     let mut reply = choose(pools, intent.name.as_str(), rng);
-    let Ok(text) = responses::render(reply.text.as_str(), context) else {
-        return fallback(pools, rng);
-    };
-    reply.text = text;
-    Decision::Reply { reply, call }
+    reply.text = responses::render(reply.text.as_str(), context).ok()?;
+    Some(Decision::Reply { reply, call })
 }
 
 /// The template context of `intent`: the name of `area` in lowercase and the slots of
@@ -821,20 +800,6 @@ fn area_slot(slots: &[Slot]) -> Option<usize> {
     None
 }
 
-/// The reply from the pool `fallback`.
-#[verus_spec(decision =>
-    requires
-        pools@.contains_key(crate::domain::contracts::string_key("fallback"@)),
-        responses::filled(pools@),
-    ensures
-        decision is Fallback,
-)]
-fn fallback(pools: &Pools, rng: &mut StdRng) -> Decision {
-    Decision::Fallback {
-        reply: choose(pools, "fallback", rng),
-    }
-}
-
 /// A filler and a System Two job with the transcript of `request`.
 #[verus_spec(decision =>
     requires
@@ -974,31 +939,32 @@ pub open spec fn handled(prediction: Prediction, catalog: Catalog, threshold: f3
 }
 
 /// True when `decision` for `intent` obeys the area rules: an area slot that names no area, or a
-/// service without an area, gives `Fallback`, and no service gives no call. A call makes the
-/// service of the intent on its selection in the area of the request. A query gives no call and
-/// reads a selection in the area of the request. A fetch needs no area and gives `Fallback` or a
-/// fetch job, and a fetch with no plugin gives `Fallback`. A `house` query needs no area and reads
-/// the selection of the house.
+/// service without an area, defers the request to System Two, and no service gives no call. A
+/// call makes the service of the intent on its selection in the area of the request. A query gives
+/// no call and reads a selection in the area of the request. A fetch needs no area and defers to
+/// System Two or gives a fetch job, and a fetch with no plugin defers to System Two. A `house`
+/// query needs no area and reads the selection of the house.
 pub open spec fn acted(intent: Intent, prediction: Prediction, request: Request, cache: StateCache, decision: Decision) -> bool {
     &&& forall|slot: int| #[trigger] first_area(prediction.slots@, slot)
-        && !area_named(cache, prediction.slots@[slot].value@) ==> decision is Fallback
+        && !area_named(cache, prediction.slots@[slot].value@) ==> deferred(decision, request.transcript)
     &&& unslotted(prediction.slots@) && request.area is None && intent.service is Some
-        && !(intent.kind is Fetch) && !housing(intent) ==> decision is Fallback
-    &&& intent.service is None && !(intent.kind is Fetch)
-        ==> (decision is Fallback || decision matches Decision::Reply { call: None, .. })
+        && !(intent.kind is Fetch) && !housing(intent) ==> deferred(decision, request.transcript)
+    &&& intent.service is None && !(intent.kind is Fetch) ==> (deferred(decision, request.transcript)
+        || decision matches Decision::Reply { call: None, .. })
     &&& decision matches Decision::Reply { call: Some(made), .. } ==> made.target@.len() > 0
         && (intent.service matches Some(service) && served(service@, made))
         && aimed(intent, prediction, request, cache, made) && stringed(intent, made.data)
-    &&& housing(intent) ==> decision is Fallback || (decision matches Decision::Reply { call: None, .. }
+    &&& housing(intent) ==> deferred(decision, request.transcript)
+        || (decision matches Decision::Reply { call: None, .. }
         && exists|selected: Seq<EntityId>| selected.len() > 0 && #[trigger] select::housed(intent, cache, selected))
-    &&& intent.kind is Query && !housing(intent) ==> decision is Fallback
+    &&& intent.kind is Query && !housing(intent) ==> deferred(decision, request.transcript)
         || (decision matches Decision::Reply { call: None, .. }
         && exists|area: AreaId, selected: Seq<EntityId>|
             #![trigger located(prediction, request, cache, area), targeted(intent, cache, area, selected)]
             located(prediction, request, cache, area) && selected.len() > 0
             && targeted(intent, cache, area, selected))
-    &&& intent.kind is Fetch && intent.plugin is None ==> decision is Fallback
-    &&& intent.kind is Fetch ==> decision is Fallback || fetched(intent, decision)
+    &&& intent.kind is Fetch && intent.plugin is None ==> deferred(decision, request.transcript)
+    &&& intent.kind is Fetch ==> deferred(decision, request.transcript) || fetched(intent, decision)
 }
 
 /// True when `intent` is a query with `target = "house"`.
@@ -1168,7 +1134,7 @@ mod tests {
     fn pools(catalog: &Catalog) -> Pools {
         let names = catalog.intents.iter().map(|intent| intent.name.as_str());
         names
-            .chain(["filler", "failure", "fallback"])
+            .chain(["filler", "failure"])
             .map(|name| {
                 let text = match name {
                     "lights_on" => "The {{ area }} lights.".to_owned(),
@@ -1371,16 +1337,6 @@ mod tests {
         catalog
     }
 
-    /// The decision from the pool `fallback`.
-    fn fallback() -> Decision {
-        let reply = Chosen {
-            text: "The fallback response.".to_owned(),
-            pool: "fallback".to_owned(),
-            index: 0,
-        };
-        Decision::Fallback { reply }
-    }
-
     /// The data of the call of `decision`.
     fn data(decision: Decision) -> Map<String, Value> {
         match decision {
@@ -1436,15 +1392,18 @@ mod tests {
 
     /// AC-4.5b-3.
     #[test]
-    fn ac_4_5b_3_unknown_slot_area_falls_back() {
+    fn ac_4_5b_3_unknown_slot_area_defers() {
         let decision = decided_in(&catalog(), "lights_on", Some("attic"), Some("kitchen"));
-        assert_eq!(decision, fallback());
+        assert_eq!(decision, deferral(""));
     }
 
     /// AC-4.5b-4.
     #[test]
-    fn ac_4_5b_4_no_area_falls_back() {
-        assert_eq!(decided_in(&catalog(), "lights_on", None, None), fallback());
+    fn ac_4_5b_4_no_area_defers() {
+        assert_eq!(
+            decided_in(&catalog(), "lights_on", None, None),
+            deferral("")
+        );
     }
 
     /// AC-4.5b-5.
@@ -1482,9 +1441,9 @@ mod tests {
 
     /// AC-4.5c-3.
     #[test]
-    fn ac_4_5c_3_empty_selection_falls_back() {
+    fn ac_4_5c_3_empty_selection_defers() {
         let decision = decided_in(&catalog(), "lights_on", None, Some("bathroom"));
-        assert_eq!(decision, fallback());
+        assert_eq!(decision, deferral(""));
     }
 
     /// AC-4.5d-1.
@@ -1523,7 +1482,7 @@ mod tests {
     fn ac_4_5d_3_missing_slots() {
         let mut catalog = catalog();
         let decision = decided_in(&catalog, "tv_show", None, Some("office"));
-        assert_eq!(decision, fallback());
+        assert_eq!(decision, deferral(""));
         catalog.intents[3].optional = vec!["show".to_owned()];
         let id = content_id(&catalog, &[]);
         assert!(
@@ -1532,18 +1491,18 @@ mod tests {
         );
     }
 
-    /// A `service` without a dot, an unregistered area or an entity without a state gives
-    /// `Fallback`, and a reply renders the selected entity.
+    /// A `service` without a dot, an unregistered area or an entity without a state gives `Defer`
+    /// with `Job::Llm`, and a reply renders the selected entity.
     #[test]
-    fn fallbacks_and_entity_reply() {
+    fn deferrals_and_entity_reply() {
         let undotted = serviced(Some("turn_on"));
         assert_eq!(
             decided_in(&undotted, "lights_on", None, Some("kitchen")),
-            fallback()
+            deferral("")
         );
         assert_eq!(
             decided_in(&serviced(None), "lights_on", None, Some("attic")),
-            fallback()
+            deferral("")
         );
         let mut catalog = catalog();
         let Decision::Reply { reply, .. } = decided_in(&catalog, "fan_on", None, Some("office"))
@@ -1554,7 +1513,7 @@ mod tests {
         catalog.intents[1].entity = Some("fan.missing".to_owned());
         assert_eq!(
             decided_in(&catalog, "fan_on", None, Some("office")),
-            fallback()
+            deferral("")
         );
     }
 
@@ -1568,14 +1527,14 @@ mod tests {
 
     /// AC-4.6-2.
     #[test]
-    fn ac_4_6_2_missing_query_entity_falls_back() {
+    fn ac_4_6_2_missing_query_entity_defers() {
         let mut catalog = catalog();
         let cache = StateCache::load(house());
         let decision = decided_at(&catalog, "temperature_query", "bathroom", &cache);
-        assert_eq!(decision, fallback());
+        assert_eq!(decision, deferral(""));
         catalog.intents[4].entity = Some("sensor.missing".to_owned());
         let decision = decided_at(&catalog, "temperature_query", "kitchen", &cache);
-        assert_eq!(decision, fallback());
+        assert_eq!(decision, deferral(""));
     }
 
     /// The filler and the `get_weather` fetch with `when = today` of the pool `weather`.
@@ -1609,13 +1568,13 @@ mod tests {
 
     /// AC-17.4-3.
     #[test]
-    fn ac_17_4_3_fetch_without_plugin_falls_back() {
+    fn ac_17_4_3_fetch_without_plugin_defers() {
         let mut catalog = catalog();
         for intent in &mut catalog.intents {
             intent.plugin = None;
         }
         let decision = decided_in(&catalog, "weather", None, Some("kitchen"));
-        assert_eq!(decision, fallback());
+        assert_eq!(decision, deferral(""));
     }
 
     /// AC-4.6-4.
@@ -1651,9 +1610,9 @@ mod tests {
 
     /// AC-18.1-4.
     #[test]
-    fn ac_18_1_4_empty_list_selection_falls_back() {
+    fn ac_18_1_4_empty_list_selection_defers() {
         let catalog = listing("names", Target::Entities, Some("on"));
-        assert_eq!(listed(&catalog, "names", "bathroom"), fallback());
+        assert_eq!(listed(&catalog, "names", "bathroom"), deferral(""));
     }
 
     /// AC-18.1-5.

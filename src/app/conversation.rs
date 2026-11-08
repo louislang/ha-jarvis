@@ -224,7 +224,6 @@ impl Conversation {
                 let llm = request.map(|request| self.llm(text, area.cloned(), request));
                 (filler, llm)
             }
-            Decision::Fallback { reply } => (reply, None),
         };
         let Chosen { text, pool, index } = chosen;
         self.backfill.record_use(pool, index);
@@ -499,7 +498,6 @@ fn kind(decision: &Decision) -> &'static str {
     match decision {
         Decision::Reply { .. } => "reply",
         Decision::Defer { .. } => "defer",
-        Decision::Fallback { .. } => "fallback",
     }
 }
 
@@ -776,9 +774,9 @@ mod tests {
         )
     }
 
-    /// The pool `lights_on` with the responses and use counts `lights`, the pool `fallback` with
-    /// one response used `fallback` times, and the pool `failure`.
-    fn pools(lights: &[(&str, u64)], fallback: u64) -> Pools {
+    /// The pool `lights_on` with the responses and use counts `lights`, and the pool `failure` with
+    /// one response used `failure` times.
+    fn pools(lights: &[(&str, u64)], failure: u64) -> Pools {
         let pool = |texts: &[(&str, u64)]| {
             let responses = texts.iter().map(|&(text, uses)| Response {
                 text: text.to_owned(),
@@ -790,11 +788,9 @@ mod tests {
                 last: None,
             }
         };
-        let (lights, fallback) = (pool(lights), pool(&[("Sorry.", fallback)]));
         Pools::from([
-            ("lights_on".to_owned(), lights),
-            ("fallback".to_owned(), fallback),
-            ("failure".to_owned(), pool(&[("Failed.", 0)])),
+            ("lights_on".to_owned(), pool(lights)),
+            ("failure".to_owned(), pool(&[("Failed.", failure)])),
             ("filler".to_owned(), pool(&[("One moment.", 0)])),
             (
                 "weather".to_owned(),
@@ -907,17 +903,6 @@ mod tests {
         let handled = conversation.dispatch(reply(None), None, None);
         assert!(handled.after.is_none(), "a reply with no call has work");
         assert_eq!(home.calls(), []);
-        Ok(())
-    }
-
-    /// AC-4.8-5.
-    #[tokio::test(start_paused = true)]
-    async fn ac_4_8_5_fallback_has_text_and_no_after() -> anyhow::Result<()> {
-        let (_task, _store, conversation) = start(&Arc::new(FakeHome::default()))?;
-        let reply = chosen("fallback", 0);
-        let handled = conversation.dispatch(Decision::Fallback { reply }, None, None);
-        assert_eq!(handled.text, "Sorry.");
-        assert!(handled.after.is_none(), "a fallback has work");
         Ok(())
     }
 
