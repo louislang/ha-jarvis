@@ -131,6 +131,7 @@ This phase selects responses, selects entities and decides the action from a pre
 
 - A filter `name` matches an entity when each word of `normalized(name)` is a word of `normalized` of the entity name, or each is a word of `normalized` of one alias (sub-phase 3.1). The words of a text are its parts between spaces. The words can be in any order. Thus the match is on whole words, without case sensitivity. "Kitchen-Light" has the words "kitchen" and "light". `fan` matches "Office Fan", not "Infant Monitor".
 - `select` skips an entity that has an entity category, that is hidden or disabled, or that is on a satellite device (a device with an `assist_satellite` entity). Thus "turn on the lights" does not switch on the LED of a satellite, and a query does not read the warm sensor of a satellite.
+- The satellite device skip does not apply to a `media_player` entity, because the speaker of a satellite is often the only speaker of a room. The entity category, hidden and disabled skips apply to all domains.
 - `matching` is now `filter(cache, filters) \ (exclude ∪ skipped)`, where `filter` applies the `name` of each filter.
 
 **Acceptance criteria.**
@@ -140,10 +141,12 @@ This phase selects responses, selects entities and decides the action from a pre
 - AC-4.4b-3: When a filter has `name = "tv"`, an entity with the alias "the TV" matches.
 - AC-4.4b-4: When a filter has `name = "fan"`, an entity named "Infant Monitor" does not match.
 - AC-4.4b-5: When a Kitchen light has an entity category, is hidden, is disabled or is on a satellite device, `select` for `lights_on` in the Kitchen does not return it.
+- AC-4.4b-6: When a `media_player` is on a satellite device in the Kitchen, `select` for a `target = "entities"` intent with the filter `{ domain = "media_player" }` in the Kitchen returns it.
 
 **Proofs.**
 
 - P-4.4b-2, P-4.4b-5 (AC-4.4b-2, AC-4.4b-5). Ensures: every result entity matches a filter with its `name`, is not excluded and is not skipped. Argument: the result draws only from `matching = filter(cache, filters) \ (exclude ∪ skipped)`. "Living Room Fan" does not have the word "light", so the filter `{ domain = "switch", name = "light" }` does not match it.
+- P-4.4b-6 (AC-4.4b-6). Ensures: an entity is skipped if and only if it has an entity category, is hidden or disabled, or is not a `media_player` and is on a satellite device. Argument: `is_skipped` checks the satellite device only for an entity that is not in the domain `media_player`. Thus the Kitchen satellite player is in `matching ∩ area`, and P-4.4-1 returns it.
 - P-4.4b-1, P-4.4b-3, P-4.4b-4 (AC-4.4b-1, AC-4.4b-3, AC-4.4b-4). Ensures: a filter with a `name` matches an entity if and only if the entity has the domain and the device class of the filter, and each word of `normalized(name)` is a word of `normalized` of the entity name, or each is a word of `normalized` of one alias. Argument: `is_named` compares these words, and `normalize` gives `normalized` (P-3.1-2). The second filter of `lights_on` is `{ domain = "switch", name = "light" }`, and "Garage Light" has the whole word "light". `normalized("the TV")` is "the tv", which has the word "tv". The words of `normalized("Infant Monitor")` are "infant" and "monitor", and neither is "fan".
 - P-4.4-1 holds with this `matching`. For `target = "entities"` and a `matching ∩ area` that is not empty, the result is all of `matching ∩ area`, also the entities that match only a filter with a `name`. Argument: `select` returns each entity of `matching ∩ area`.
 - The fix PR `Fix: Full normalize Spec` writes these Verus clauses and the clause of P-3.1-2 for the code on `main`. It modifies `src/domain/intent.rs`, `src/domain/contracts.rs` and `src/domain/select.rs`. It does not change behavior.

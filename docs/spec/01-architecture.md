@@ -612,7 +612,7 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 - `kind = "fetch"`: Jarvis replies with a filler. Then it fetches the result of the `plugin` of the intent, with the rendered `data` as the arguments, and announces the answer (decision 30). A fetch needs no area.
 - `kind = "prefetch"`: Jarvis replies with the prefetched answer when it is fresh. Else Jarvis treats the request as System Two. Only learned intents use this kind.
 - `kind = "train"`: Jarvis replies from the pool and starts a training run (sub-phase 13.11).
-- `select` is a list of entity filters. A filter has a `domain`, an optional `name` and an optional `device_class`. `name` matches whole words of the entity name or an alias, without case sensitivity (`fan` matches "Office Fan", not "Infant Monitor"). An entity matches when one filter matches. `select` skips an entity that has an entity category, that is hidden or disabled, or that is on a satellite device (a device with an `assist_satellite` entity).
+- `select` is a list of entity filters. A filter has a `domain`, an optional `name` and an optional `device_class`. `name` matches whole words of the entity name or an alias, without case sensitivity (`fan` matches "Office Fan", not "Infant Monitor"). An entity matches when one filter matches. `select` skips an entity that has an entity category, that is hidden or disabled, or that is on a satellite device (a device with an `assist_satellite` entity) and is not a `media_player`.
 - `exclude` is a list of entity IDs that `select` never matches. Use it for a sensor that gives bad values.
 - `plugin` is the tool name of the plugin of a fetch intent, for example `get_weather`.
 - The area is the area slot. If no slot, it is the satellite area. The area slot matches an area name or alias without case sensitivity.
@@ -752,7 +752,7 @@ The test fixtures (`FakeHome`, `FakeHaServer`) model this house. The data comes 
 - TV: one media player in the Living Room with the aliases "the TV" and "plex".
 - Speakers: each satellite area has speaker media players.
 - Locks, garage doors and windows: none. The tests of sub-phase 18.3 add them to the hot cache.
-- Office: two temperature sensors with different values (64.0 °F and 76.6 °F). The higher value is probably the satellite sensor, which the device makes warm. Entity selection skips the entities of a satellite device (section 9).
+- Office: two temperature sensors with different values (64.0 °F and 76.6 °F). The higher value is probably the satellite sensor, which the device makes warm. Entity selection skips the entities of a satellite device, except its media players (section 9).
 
 ---
 
