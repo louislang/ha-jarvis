@@ -98,3 +98,18 @@ kind = "query"
 examples = ["is the fan on", "is the [office](area) fan on", "is the fan running"]
 target = "entity"
 select = [{ domain = "fan" }, { domain = "switch", name = "fan" }]
+
+[[intent]]
+name = "who_is_home"
+kind = "query"
+examples = ["who is home", "is anyone home", "who is in the house", "is anybody home"]
+target = "house"
+select = [{ domain = "person" }]
+state = "home"
+
+[[intent]]
+name = "alarm_query"
+kind = "query"
+examples = ["is the alarm set", "is the alarm on", "is the house armed", "did i set the alarm"]
+target = "entity"
+select = [{ domain = "alarm_control_panel" }]
