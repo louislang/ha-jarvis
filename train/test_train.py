@@ -25,7 +25,9 @@ from train import (
     Example,
     JointModel,
     Span,
+    TrainingSet,
     align,
+    encode,
     export,
     load_set,
     load_tokenizer,
@@ -86,6 +88,8 @@ NOT_LIGHTS: list[Example] = [
 ]
 
 TEN = LIGHTS + UNKNOWN + NOT_LIGHTS
+
+SIX = LIGHTS[:2] + UNKNOWN + NOT_LIGHTS[:1]
 
 PASSES = 2
 """The epochs of the set of `set_path`."""
@@ -375,3 +379,40 @@ def test_epochs_option_replaces_set_epochs(
         ]
     )
     assert len(batches) == BATCHES
+
+
+def record_texts(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Make `train` record the text of each example it encodes, and give the list."""
+    texts: list[str] = []
+
+    def recorded(
+        tokenizer: PreTrainedTokenizerFast,
+        training_set: TrainingSet,
+        examples: list[Example],
+        model: JointModel,
+    ) -> tuple[list[torch.Tensor], Batch]:
+        """Record the texts of `examples` and encode them."""
+        texts.extend(example["text"] for example in examples)
+        return encode(tokenizer, training_set, examples, model)
+
+    monkeypatch.setattr("train.encode", recorded)
+    return texts
+
+
+def test_ac_3_8_5_each_pass_shuffles_examples(
+    set_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each pass trains on every example once, in a new order that each run repeats."""
+    texts = record_texts(monkeypatch)
+    training_set = load_set(set_path)
+    training_set["examples"] = SIX
+    training_set["batch_size"] = 2
+    train(training_set, "cpu", None)
+    train(training_set, "cpu", None)
+    passes = [
+        texts[start : start + len(SIX)] for start in range(0, len(texts), len(SIX))
+    ]
+    assert len(passes) == 2 * PASSES, f"passes of two runs: {passes}"
+    assert all(sorted(p) == sorted(e["text"] for e in SIX) for p in passes), passes
+    assert passes[0] != passes[1], f"both passes use the order {passes[0]}"
+    assert passes[2:] == passes[:2], f"second run {passes[2:]}, first {passes[:2]}"
