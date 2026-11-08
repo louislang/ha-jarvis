@@ -159,8 +159,8 @@ This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a
 - `Intent` gets `plugin`: the tool name of the plugin of a fetch intent, for example `get_weather`.
 - `Job::Fetch { call: PluginCall, pool }` replaces the service call of sub-phase 4.6.
 - `decide` for a fetch intent, after the slots of step 3 (sub-phase 4.5d):
-  1. An intent without `plugin` gives `Fallback`.
-  2. Render the `data` of the intent as in step 8 of sub-phase 4.5d. The rendered data is the `arguments`. A data value that does not render gives `Fallback`.
+  1. An intent without `plugin` gives `Defer` with `Job::Llm`.
+  2. Render the `data` of the intent as in step 8 of sub-phase 4.5d. The rendered data is the `arguments`. A data value that does not render gives `Defer` with `Job::Llm`.
   3. Return `Defer` with a filler and `Job::Fetch { call: PluginCall { plugin, arguments }, pool: intent.name }`.
 - A fetch needs no area and no selection. Its `service`, `target`, `entity` and `select` are not used.
 - A command call always has `return_response: false`.
@@ -173,15 +173,15 @@ This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a
 
 - AC-17.4-1: When the intent is `weather`, the result is `Defer` with a filler and `Job::Fetch` with the plugin `get_weather`, the arguments `{ when: "today" }` and the pool `weather`. This replaces AC-4.6-3.
 - AC-17.4-2: When the intent is `weather` and the request has no area, the result is `Defer` with `Job::Fetch`.
-- AC-17.4-3: When a fetch intent has no `plugin`, the result is `Fallback`.
+- AC-17.4-3: When a fetch intent has no `plugin`, the result is `Defer` with `Job::Llm`.
 - AC-17.4-4: When dispatch gets `Defer` with `Job::Fetch`, `FakePlugin` records the fetch with the arguments, and `FakeHome` records no call. This replaces AC-4.9d-1.
 - AC-17.4-5: When `FakePlugin` gives `{ condition: "partly cloudy", high: 72, low: 54, precipitation_chance: 20 }` for the `weather` intent of `intents.toml` and the pools of `responses.toml`, `FakeHome` records the announce "Today will be partly cloudy, with a high of 72 degrees."
 
 **Proofs.**
 
-- P-17.4-1 (AC-17.4-1). Ensures: a fetch intent gives `Fallback`, or `Defer` with `Job::Fetch` whose `call.plugin` is the `plugin` of the intent and whose `pool` is the intent name. Argument: the fetch branch builds the `PluginCall` from `intent.plugin` and the rendered data, and the pool from `intent.name`. This replaces P-4.6-3.
+- P-17.4-1 (AC-17.4-1). Ensures: a fetch intent gives `Defer` with `Job::Llm`, or `Defer` with `Job::Fetch` whose `call.plugin` is the `plugin` of the intent and whose `pool` is the intent name. Argument: the fetch branch builds the `PluginCall` from `intent.plugin` and the rendered data, and the pool from `intent.name`. This replaces P-4.6-3.
 - P-17.4-2 (AC-17.4-2). Ensures: the decision of a fetch intent does not depend on the area. Argument: `act` matches `Kind::Fetch` before the arms that need an area.
-- P-17.4-3 (AC-17.4-3). Ensures: a fetch intent with `plugin = None` gives `Fallback`. Argument: the fetch branch returns `Fallback` in its `None` arm, before it builds a `Job`.
+- P-17.4-3 (AC-17.4-3). Ensures: a fetch intent with `plugin = None` gives `Defer` with `Job::Llm`. Argument: the fetch branch returns `Defer` with `Job::Llm` in its `None` arm, before it builds a `Job::Fetch`.
 - P-17.4-4. Argument: the `Fetch` arm of `after` calls only `Plugins::fetch`. It has no `Home::call`.
 - P-17.4-5. Evidence: test.
 

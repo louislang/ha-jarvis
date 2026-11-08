@@ -130,20 +130,20 @@ This phase logs each request with its audio, action and response. You mark the a
 
 ---
 
-### 12.5 Marks, Unknowns and Pruning
+### 12.5 Marks, Deferred Requests and Pruning
 
-**Goal:** Add `mark`, `marked`, `unknowns` and `prune` to the log. Marks are stored with corrections, unknown requests can be clustered later, and old audio is deleted while marked records are kept.
+**Goal:** Add `mark`, `marked`, `deferred` and `prune` to the log. Marks are stored with corrections, requests that System Two answered can be clustered later, and old audio is deleted while marked records are kept.
 
 - **Implements:** G14, G15. **Depends on:** 12.4.
 - **Files:** modify `src/ports.rs`, `src/adapters/sqlite.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `mark(mark)` (stores the mark with its time), `marked() -> Vec<Interaction>`, `unknowns(since) -> Vec<Unknown { id, text, time }>` (interactions after `since` whose top label is `unknown`, without a bad action mark and without a `link`; `Unknown` is in `src/domain/feedback.rs`), `prune(now)`: delete audio older than `audio_days` and unmarked records older than `record_days`. A dialog answer is not a request, so `unknowns` leaves it out. The marks are migration step 2 of the schema (sub-phase 12.4). This sub-phase adds `log.audio_days` and `log.record_days`.
+**Model.** `mark(mark)` (stores the mark with its time), `marked() -> Vec<Interaction>`, `deferred(since) -> Vec<Deferred { id, text, time }>` (interactions after `since` whose decision is `Defer` with `Job::Llm`, without a bad action mark and without a `link`; `Deferred` is in `src/domain/feedback.rs`), `prune(now)`: delete audio older than `audio_days` and unmarked records older than `record_days`. Thus `deferred` gives each request that System Two answered: a top label `unknown`, a top probability less than `model.threshold`, a label that is not in the catalog, a blocked decision (sub-phase 12.10), or an intent that System One cannot act on (sub-phase 4.5). A dialog answer is not a request, so `deferred` leaves it out. The marks are migration step 2 of the schema (sub-phase 12.4). This sub-phase adds `log.audio_days` and `log.record_days`.
 
 **Acceptance criteria.**
 
 - AC-12.5-1: When `mark` sets the action mark to `bad` with the correction `tv_show`, `marked` returns the interaction with the correction.
 - AC-12.5-2: When `list` gets the filter `bad`, it returns only interactions with a bad mark.
-- AC-12.5-3: When `unknowns(since)` runs, it returns only interactions after `since` whose top label is `unknown`, without a bad action mark and without a `link`. A System Two interaction whose top label is a known intent with a low probability is not in the result.
+- AC-12.5-3: When `deferred(since)` runs, it returns only interactions after `since` whose decision is `Defer` with `Job::Llm`, without a bad action mark and without a `link`. A System Two interaction whose top label is a known intent with a low probability, or a known intent that System One cannot act on, is in the result. A fetch (`Defer` with `Job::Fetch`) is not in the result.
 - AC-12.5-4: When `prune` runs, it deletes audio older than `audio_days` and unmarked records older than `record_days`.
 - AC-12.5-5: When `prune` runs, it keeps every marked record, at any age.
 - AC-12.5-6: When the database has schema version 1 with records, the adapter migrates it to version 2 and keeps every record.

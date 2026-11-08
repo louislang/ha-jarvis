@@ -72,7 +72,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | `Trainer` | Driven | `train` (gives a model folder for a training set) | `adapters/process.rs` (local GPU) and `adapters/runpod.rs` (fallback) |
 | `Reasoner` | Driven | `warm`, `answer` (gives steps: sentence, call, plugin, ask, done), `generate`, `paraphrase`, `embed`, `propose` | `adapters/openai.rs` |
 | `Plugin` | Driven | `tool`, `fetch` | One adapter for each remote API: `adapters/open_meteo.rs` (weather), `adapters/plex.rs` (new shows) |
-| `InteractionLog` | Driven | `append`, `update`, `list`, `audio`, `mark`, `marked`, `unknowns`, `prune` | `adapters/sqlite.rs` |
+| `InteractionLog` | Driven | `append`, `update`, `list`, `audio`, `mark`, `marked`, `deferred`, `prune` | `adapters/sqlite.rs` |
 | `Store<T>` | Driven | `load`, `save` | `adapters/files.rs` (TOML or JSON from the file extension) |
 | `Clock` | Driven | `now` | `SystemClock` in `src/lib.rs` |
 | `Models` | Driven | `release`, `restore` | `LiveModels` in `src/lib.rs` |
@@ -113,7 +113,7 @@ Rules:
 1. The ONNX outputs are `intent_logits` (one for each label) and `slot_logits` (one for each token and tag).
 2. Slot tags use the BIO scheme (`O`, `B-area`, `I-area`, ...). Only segment B tokens get tags.
 3. `labels.json` in the model folder lists the labels and the tags in output order.
-4. When the top label is `unknown`, or the top intent probability is less than `model.threshold`, the request goes to System Two.
+4. When the top label is `unknown`, the top intent probability is less than `model.threshold`, or System One cannot act on the top intent, the request goes to System Two.
 5. The base model is `train.base_model`. The default is `sentence-transformers/all-MiniLM-L12-v2`, which has `model.safetensors`. The pinned `transformers` does not load a `pytorch_model.bin` with the pinned `torch` (CVE-2025-32434). It predicts in less than 15 ms on the CPU and in less than 5 ms on the GPU host.
 6. Real training runs use the GPU of the GPU host. When local training fails, they use a RunPod GPU. The training script runs on the CPU only for the fixture model and the script tests.
 
@@ -141,7 +141,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 8. **Time is an input.** Domain functions receive the current time as an argument. The application gets the time from the `Clock` port. Tests use `FakeClock`.
 9. **Habits are a model input.** The application learns habits from the same event stream as the hot cache. The habit summary for the satellite area and the current time is part of the model context. Habits also rank entities and fill missing slots in `decide`.
 10. **Source from the HA context.** Each `state_changed` event has a context. A `user_id` that is not the Jarvis user means `manual`. A `parent_id` means `automation`. No `user_id` and no `parent_id` means a physical device change, which is `manual`. The Jarvis user means `voice`.
-11. **One joint model.** One model gives the intent probabilities and the slot tags. Thus one CPU pass per transcript gives all System One data. Clusters of `unknown` requests use OpenAI embeddings (sub-phase 14.1). These do not change when System One retrains, and the context does not change them.
+11. **One joint model.** One model gives the intent probabilities and the slot tags. Thus one CPU pass per transcript gives all System One data. Clusters of the requests that System Two answers use OpenAI embeddings (sub-phase 14.1). These do not change when System One retrains, and the context does not change them.
 12. **Train locally first, with the full GPU.** The process adapter runs `train/train.py` on the GPU of the GPU host. A local run and live Jarvis never share the GPU. Jarvis does not announce a run. Before a local run, Jarvis mutes the microphones of the satellites that are not muted, stops answering and releases its model sessions. After the run, with success or an error, Jarvis loads them again, unmutes only the microphones that it muted, and answers again. Then it measures the new model (decision 13). When the local run fails (for example, CUDA out of memory), the training use case sends the same training set to the RunPod adapter. A RunPod run does not pause Jarvis or mute the satellites. Jarvis predicts with the ONNX model through `ort`. The Python script and the inline script of the review page are the only non-Rust code. The training set file is the contract between them.
 13. **Accept only an equal or better model.** Jarvis assigns each example to the held-out set by a stable hash of its text. Jarvis measures the old model and the new model on the same held-out set. Jarvis keeps the new model only when its intent accuracy and its slot accuracy are both equal or higher.
 14. **Training trigger.** Jarvis counts changes since the last training run. At `train.min_changes`, Jarvis starts a run. A voice request starts a run at any count. Only one run occurs at a time. After each run, accepted or rejected, the count starts again from 0.
@@ -150,7 +150,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 17. **Ask through `start_conversation`.** The HA Wyoming conversation agent does not set `continue_conversation`. Thus `Handled` cannot open the microphone again. To ask a question, Jarvis returns `Handled` with empty text. Then, when the satellite is idle (decision 5), Jarvis calls `assist_satellite.start_conversation` with the question and `preannounce = false`. The satellite speaks the question and listens. (Source: `homeassistant/components/wyoming/conversation.py`.)
 18. **Dialogs by satellite.** `start_conversation` starts a new pipeline run with a new `conversation_id`. Thus Jarvis keys each dialog by `satellite_id`. When the context has no `satellite_id` (for example, text from the HA UI), Jarvis keys the dialog by `conversation_id` and puts the question in `Handled`. A dialog closes on completion, on cancel, after `dialog.max_turns` questions, or `dialog.timeout_s` after the last question.
 19. **System Two asks with a tool.** The OpenAI request has an `ask_user` tool. When the model calls it, Jarvis asks the question and keeps the dialog open. The next turn sends the answer as the `function_call_output` of that call, with `previous_response_id`.
-20. **System Two teaches System One.** Jarvis clusters the OpenAI embeddings of recent `unknown` requests. For each large cluster, System Two writes a proposal: name, kind, examples, responses and an optional service. Jarvis validates it and saves it to `learned.toml`. The next training run adds it to the model.
+20. **System Two teaches System One.** Jarvis clusters the OpenAI embeddings of recent requests that System Two answered: `unknown` requests and requests that System One cannot act on. For each large cluster, System Two writes a proposal for a new intent: name, kind, examples, responses and an optional service. Jarvis validates it and saves it to `learned.toml`. The next training run adds it to the model, so System One handles these requests.
 21. **Device control needs approval.** A proposal with a `service` waits for your approval on the review page. Other proposals become active immediately.
 22. **Prefetch has no side effects.** A prefetch answer must not change the house. A `Call` step during a prefetch runs only when its service is in `learn.prefetch_services` (read-only services such as `calendar.get_events`). Any other `Call` discards that prefetch. A `Plugin` step always runs, because a plugin only reads data (decision 30). A `States` step also always runs, because it only reads the hot cache (sub-phase 7.6).
 23. **Discovery from HA.** Jarvis reads the HA registries in the hot cache. Each `person` entity lists its `device_trackers`. The sensors on the same device as a tracker give its area and distance (for example from Bermuda with the satellites as Bluetooth proxies). The `binary_sensor` entities with device class `occupancy`, `presence` or `motion` on the satellite device are its presence sensors. Configuration can override discovery. In the reference house (section 11) the presence sensors have no device class. Set their device class to `occupancy` in HA, or list them in `[[satellites]]`.
@@ -190,7 +190,7 @@ With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan c
 | `text2num` | Domain | Number words to digits in the template filter `number` (sub-phase 18.9). |
 | `strsim` | Domain, adapter tests | Fuzzy match of a spoken answer to a list of choices. Word edit distance for the second-pass word error rate (AC-6.7-3). |
 | `dashmap` | Application | Concurrent audio cache. |
-| `ndarray`, `linfa`, `linfa-clustering` | Domain | DBSCAN clusters of `unknown` embeddings. |
+| `ndarray`, `linfa`, `linfa-clustering` | Domain | DBSCAN clusters of the embeddings of System Two requests. |
 | `xxhash-rust` | Domain | Stable hash for the held-out split. |
 | `vstd` | Domain | Verus: `#[verus_spec]`, `#[verus_verify]`, `verus!`, spec types and the `vstd` specifications of `std`. A normal build erases the proof code. |
 | `serde`, `serde_json` | All | Data types and messages. |
@@ -619,14 +619,14 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 - `target = "entities"` uses all matching entities in the area.
 - `target = "entity"` uses `entity`, or the matching entity in the area with the lowest entity ID. Sub-phase 11.6 replaces "lowest entity ID" with "highest habit score". `target` is `entity` when it is absent.
 - `target = "house"` uses all matching entities of the house, in any area. A query with it needs no area.
-- A list query is a query with `target = "entities"` or `target = "house"`. `state` is the state that it keeps, for example `on`. Its pool gets `entities`: the state, the attributes and the name of each selected entity with that state. An empty selection gives `Fallback`. An empty `entities` list does not (sub-phase 18.1).
-- A command or query whose selection is empty gives `Fallback`: Jarvis replies from the pool `fallback` and makes no call.
+- A list query is a query with `target = "entities"` or `target = "house"`. `state` is the state that it keeps, for example `on`. Its pool gets `entities`: the state, the attributes and the name of each selected entity with that state. An empty selection gives `Defer`. An empty `entities` list does not (sub-phase 18.1).
+- When System One knows the intent but cannot act, the result is `Defer`: Jarvis speaks a filler, makes no call, and System Two answers the request (sub-phase 4.5). Examples: an empty selection, a missing slot, a missing `person`, or a template that does not render.
 - When the area has no matching entity and the house has exactly one, Jarvis uses that entity. Example: one thermostat for the house.
 - `habit_defaults` maps a slot to a habit action. When the slot is empty, Jarvis uses the most frequent value of that action now.
 - `needs_speaker = true` makes the `person` variable available. Jarvis waits up to `speaker.wait_ms` for it.
 - `next_date(day, plus_days)` returns the ISO date of the next `day` plus `plus_days`. An empty `day` means today. A `day` that is not a day name, `today` or `tomorrow` gives an error.
 - Template variables are the built-ins `area` (the area name in lowercase), `entity`, `person` and `response`, the slots of the intent, and the keys of `habit_defaults`.
-- A slot that the prediction does not have is missing, unless the intent lists it in `optional`. A missing optional slot is an empty string. A missing `habit_defaults` key uses the habit value. Phase 10 makes Jarvis ask for any other missing slot, and for a missing `area` or `person`. Before Phase 10, a missing slot gives `Fallback`.
+- A slot that the prediction does not have is missing, unless the intent lists it in `optional`. A missing optional slot is an empty string. A missing `habit_defaults` key uses the habit value. Another missing slot gives `Defer`. Phase 10 makes Jarvis ask for a missing `area`. Before Phase 10, a missing `area` gives `Defer`.
 - A data value that is one `{{ expression }}` keeps the type of the expression result. One `{{ expression }}` starts with `{{`, ends with `}}`, and has no other `}}`. Other data values render as strings.
 
 `responses.toml` (example entries):
@@ -655,9 +655,6 @@ responses = [
 [pools.failure]
 responses = ["Sorry, I could not do that."]
 
-[pools.fallback]
-responses = ["Sorry, I could not find that."]
-
 [pools.calendar_add]
 responses = ["I added {{ summary }} to your calendar, {{ person.name }}."]
 
@@ -670,20 +667,11 @@ responses = ["Training is already running."]
 [pools.ask_area]
 responses = ["Which room?"]
 
-[pools.ask_person]
-responses = ["Who is asking?"]
-
-[pools.ask_show]
-responses = ["What would you like to watch?"]
-
-[pools.ask_summary]
-responses = ["What should I add?"]
-
 [pools.cancelled]
 responses = ["Okay, never mind."]
 ```
 
-A pool named `ask_<slot>` holds the questions for one missing slot. A pool that is not an intent pool uses no template variable.
+The pool `ask_area` holds the questions for a missing area. A pool that is not an intent pool uses no template variable.
 
 Template variables of an intent pool: `area` (area name), slot names, `entity` (state, attributes, name), `entities` (a list of `entity` objects), `response` (the plugin result of a fetch), `person` (name and the fields of its `[[people]]` entry). `entity` exists only for `target = "entity"`, `entities` only for a list query, `response` only for `kind = "fetch"`, and `person` only for `needs_speaker = true`.
 

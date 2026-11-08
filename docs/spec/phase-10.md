@@ -1,6 +1,6 @@
 # Phase 10: Multi-Turn Dialogs
 
-This phase lets Jarvis ask questions. Jarvis asks when it does not understand, when a slot is missing, or when System Two needs more data. It continues to ask until the request is clear, the user cancels, or the turn limit occurs.
+This phase lets Jarvis ask questions. Jarvis asks when the area is missing or when System Two needs more data. It continues to ask until the request is clear, the user cancels, or the turn limit occurs.
 
 ---
 
@@ -57,7 +57,7 @@ This phase lets Jarvis ask questions. Jarvis asks when it does not understand, w
 - `Pending`: `Slot { intent, slots, missing, choices }`, `Llm { response_id, call_id }`.
 - `Dialog { pending, turns, asked }`. `asked` is the time of the last question. `Dialogs: Map<Key, Dialog>` and a generation number for each key. `Key` is the `satellite_id`, else the `conversation_id`. The generations of sub-phase 4.9b now use `Key`, so a conversation without a satellite also has one.
 - `open(key, pending, now)`, `take(key, now) -> Option<Dialog>` (removes it; `None` when `now - asked >= timeout_s`), `next_turn(dialog, max_turns, now) -> Option<Dialog>` (`turns + 1` and `asked := now`), `close(key)` (removes the dialog and increases the generation of the key).
-- `turns` counts the questions of one dialog: questions for later missing slots and System Two questions also count.
+- `turns` counts the questions of one dialog: System Two questions also count.
 - This sub-phase adds `[dialog]` (`max_turns`, `timeout_s`).
 
 **Acceptance criteria.**
@@ -115,30 +115,31 @@ This phase lets Jarvis ask questions. Jarvis asks when it does not understand, w
 
 **Model.**
 
-- `Decision::Ask { question: Chosen, pending }`. A missing `area`, a missing `person`, or a missing template slot that is not `optional` and has no habit value gives `Ask` from the pool `ask_<slot>`. These cases replace the `Fallback` of sub-phase 4.5b for a missing area and of sub-phase 4.5d for a missing slot. Jarvis asks for one missing value at a time, in this order: `area`, `person`, then the other slots in name order.
-- The choices for `area` are the area names and their aliases. `decide` maps a filled alias to its area with `area_by_name`. The choices for `person` are the names of the `person` entities in the cache. Other slots have no choices.
+- `Decision::Ask { question: Chosen, pending }`. A missing `area`, or an area slot that matches no area, gives `Ask` from the pool `ask_area`. These cases replace the `Defer` of sub-phase 4.5b. A missing `area` is a real ambiguity: the intent is clear, and only the room is not.
+- A missing `person` and any other missing template slot do not ask. They still give `Defer` with `Job::Llm` (sub-phases 4.5d and 15.7), because a missing value usually means that System One has the wrong intent.
+- The choices for `area` are the area names and their aliases. `decide` maps a filled alias to its area with `area_by_name`.
 - `Home::ask(satellite, question)` calls `start_conversation` with `preannounce = false` and the deadline `ha.announce_timeout_s`.
 - With a `satellite_id`, `handle` returns empty text and puts the question in the announce queue of the satellite (sub-phase 4.9b), which calls `ask` when the satellite is idle. HA cancels a running pipeline when a question starts, so the question waits. Without a `satellite_id`, `handle` returns the question text.
-- `validate_pools` checks that each slot that can be missing has an `ask_<slot>` pool.
+- `validate_pools` checks that the pool `ask_area` exists.
 - HA does not send an empty transcript to `handle` (`stt-no-text-recognized`), so Jarvis has no dialog for empty input.
 
 **Acceptance criteria.**
 
 - AC-10.4-1: When a `target = "entities"` intent has no area, `decide` returns `Ask` from `ask_area` with the area names as choices. This replaces AC-4.5b-4.
 - AC-10.4-2: When the area slot matches no area, `decide` returns `Ask` from `ask_area`. This replaces AC-4.5b-3.
-- AC-10.4-3: When a slot that can be missing has no pool `ask_<slot>`, `validate_pools` returns an error with the slot name.
+- AC-10.4-3: When the pool `ask_area` is missing, `validate_pools` returns an error that names it.
 - AC-10.4-4: When the result is `Ask` and the context has a `satellite_id`, `handle` returns empty text and `FakeHome` records `ask` with the question.
 - AC-10.4-5: When the result is `Ask` and the context has no `satellite_id`, `handle` returns the question text.
 - AC-10.4-6: When `HaHome::ask` runs, `FakeHaServer` receives `assist_satellite.start_conversation` with the question and `preannounce = false`.
-- AC-10.4-7: When an intent has a template slot that is not `optional` and the prediction does not have it, `decide` returns `Ask` from `ask_<slot>` with no choices. This replaces the second sentence of AC-4.5d-3.
+- AC-10.4-7: When an intent has a template slot that is not `optional` and not `area`, and the prediction does not have it, `decide` returns `Defer` with `Job::Llm`, not `Ask`.
 - AC-10.4-8: When `decide` returns `Ask` with a `satellite_id`, `FakeHome` records `ask` after the satellite state becomes idle, and not before.
 - AC-10.4-9: When the user answers with an area alias, `decide` uses the area of that alias.
 
 **Proofs.**
 
-- P-10.4-1, P-10.4-2. Ensures: a missing area, or an area slot that matches no area, gives `Ask` from `ask_area` with the area names and aliases as choices. Argument: the two `Fallback` returns of sub-phase 4.5b become `Ask { ask_area, choices }`. No other branch changes.
+- P-10.4-1, P-10.4-2. Ensures: a missing area, or an area slot that matches no area, gives `Ask` from `ask_area` with the area names and aliases as choices. Argument: the two `Defer` returns of sub-phase 4.5b become `Ask { ask_area, choices }`. No other branch changes.
 - P-10.4-4, P-10.4-5. Argument: `handle` matches `(Ask, ctx.satellite_id)` with two arms.
-- P-10.4-7. Ensures: a missing template slot that is not `optional` and has no habit value gives `Ask` from `ask_<slot>`. Argument: `decide` checks each template slot of the intent against the prediction, `optional` and `habit_defaults` before it renders.
+- P-10.4-7. Ensures: a missing template slot that is not `optional`, not `area` and has no habit value gives `Defer` with `Job::Llm`. Argument: `decide` checks each template slot of the intent against the prediction, `optional` and `habit_defaults` before it renders, and the only `Ask` is from `ask_area`.
 - P-10.4-8. Requires: `AnnounceWhenIdle` (P-4.7-2). Argument: the question is an item of the announce queue, which waits for `idle` (P-4.9c-1).
 - P-10.4-9. Ensures: a filled alias gives the area of the alias. Argument: the choices contain the aliases, and `decide` resolves the filled value with `area_by_name` (P-2.8b-1).
 - P-10.4-3, P-10.4-6. Evidence: test.
@@ -158,23 +159,20 @@ This phase lets Jarvis ask questions. Jarvis asks when it does not understand, w
 1. If a dialog is open and `is_cancel`, reply from `cancelled` and close the dialog.
 2. If a `Slot` dialog with choices is open and `fill` returns a value, add it to the slots and run `decide` again.
 3. If the top label is not `unknown` and its probability is at least `model.threshold`, close the dialog and process the text as a new request.
-4. If a `Slot` dialog without choices is open, add the normalized text to the slots and run `decide` again.
-5. If an `Llm` dialog is open, send the text to System Two as the answer to its question (sub-phase 10.6).
-6. If a `Slot` dialog with choices is open, ask again with `next_turn`. If it returns none, reply from `failure`.
-7. Else, process the text as a new request.
+4. If an `Llm` dialog is open, send the text to System Two as the answer to its question (sub-phase 10.6).
+5. If a `Slot` dialog is open, ask again with `next_turn`. If it returns none, reply from `failure`.
+6. Else, process the text as a new request.
 
-A choice is a closed set, so step 2 comes before step 3. Free text can be anything, so step 3 comes before step 4.
+A choice is a closed set, so step 2 comes before step 3. The answer to System Two is free text, so step 3 comes before step 4. Each `Slot` dialog asks for the area, so it has choices (sub-phase 10.4).
 
 `close` increases the generation of the key, as each new request on a satellite does (sub-phase 4.9c). A deferred job keeps the generation of its key when it starts. Before each announce, question or call, it compares the generation. When the generation changed, the job stops and makes no announce, no question and no further call. A call that already started is not undone.
 
 **Acceptance criteria.**
 
 - AC-10.5-1: When the user answers "the kitchen" to "Which room?", `FakeHome` records `homeassistant.turn_on` with the kitchen lights and the dialog closes.
-- AC-10.5-2: When an intent has two missing slots, Jarvis asks for the first, then the second, then acts.
 - AC-10.5-3: When the user answers "turn on the fan" to "Which room?" and `FakeClassifier` gives `fan_on` 0.9, Jarvis closes the dialog and processes the new request.
 - AC-10.5-4: When the user answers "never mind", Jarvis replies from `cancelled` and `FakeHome` records no call.
 - AC-10.5-5: When the user gives `max_turns` answers that do not fill the slot, Jarvis replies from `failure` and closes the dialog.
-- AC-10.5-6: When the user says "turn on the lights" to "What would you like to watch?" and `FakeClassifier` gives `lights_on` 0.9, Jarvis closes the dialog and processes the new request.
 - AC-10.5-7: When an `Llm` dialog is open and the answer has the top label `unknown`, `FakeReasoner` receives the answer.
 - AC-10.5-8: When the user cancels a dialog while its System Two job runs, `FakeHome` records no announce and no `ask` from that job.
 - AC-10.5-9: When `quint-connect` replays 100 traces of `dialog.qnt`, the calls that `FakeHome` records and the generations match the model after each step.
@@ -184,9 +182,9 @@ A choice is a closed set, so step 2 comes before step 3. Free text can be anythi
 - P-10.5-9. Evidence: test. With P-10.1-2, it gives `NoCallAfterCancel` for the Rust code on the replayed traces.
 
 - P-10.5-4. Requires: `NoCallAfterCancel` (P-10.1-2). Argument: step 1 returns before any step that dispatches a call.
-- P-10.5-5. Requires: `TurnLimit`. Argument: step 6 uses `next_turn` (P-10.2-4).
+- P-10.5-5. Requires: `TurnLimit`. Argument: step 5 uses `next_turn` (P-10.2-4).
 - P-10.5-8. Requires: P-10.2-6. Argument: the job compares its generation before each announce, question and call, and `close` changed it.
-- P-10.5-1 to P-10.5-3, P-10.5-6, P-10.5-7. Evidence: test.
+- P-10.5-1, P-10.5-3, P-10.5-7. Evidence: test.
 
 ---
 
@@ -213,7 +211,7 @@ A choice is a closed set, so step 2 comes before step 3. Free text can be anythi
 
 - P-10.6-2. Argument: the request builder has two branches. With a previous ID, it sends only the tool output for the call ID.
 - P-10.6-6. Requires: `TurnLimit`. Argument: each `Ask` step goes through `next_turn`.
-- P-10.6-7. Requires: `NoCallAfterCancel`. Argument: routing step 1 closes the dialog before step 2 can call `answer`.
+- P-10.6-7. Requires: `NoCallAfterCancel`. Argument: routing step 1 closes the dialog before step 4 can call `answer`.
 - P-10.6-1, P-10.6-3 to P-10.6-5. Evidence: test.
 
 ---

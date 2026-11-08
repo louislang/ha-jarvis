@@ -1,12 +1,12 @@
 # Phase 14: Learned Intents
 
-This phase makes System Two teach System One. Jarvis clusters frequent `unknown` requests, System Two proposes an intent for each cluster, and the next training run adds it to the model. Prefetch intents get their answers before the usual time.
+This phase makes System Two teach System One. Jarvis clusters frequent requests that System Two answers, System Two proposes a new intent for each cluster, and the next training run adds it to the model. Then System One handles these requests. Prefetch intents get their answers before the usual time.
 
 ---
 
 ### 14.1 Clusters
 
-**Goal:** Group the OpenAI embeddings of recent `unknown` requests into clusters with DBSCAN, and skip clusters that a learned entry already covers. Jarvis can see which unknown requests are frequent.
+**Goal:** Group the OpenAI embeddings of recent requests that System Two answered into clusters with DBSCAN, and skip clusters that a learned entry already covers. Jarvis can see which System Two requests are frequent.
 
 - **Implements:** G14. **Depends on:** 13.11.
 - **Files:** create `src/domain/learn.rs`. Modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
@@ -124,7 +124,7 @@ This phase makes System Two teach System One. Jarvis clusters frequent `unknown`
 - **Files:** modify `src/app/background.rs`, `src/lib.rs`, `jarvis.toml`.
 - **Quint:** `learned.qnt` (conformance).
 
-**Model.** Each `learn.check_interval_s`: read `unknowns(now - window_days)`, `embed` their texts, compute `clusters`, skip `covered` clusters, call `propose`, then `validate_proposal`. A valid proposal is saved with `status = pending` if `needs_approval`, else `active`. `kind = none` is saved with `status = none`. An invalid proposal is logged and saved with `status = none`, so the next check does not ask again. Each entry has the cluster `texts` and `centroid`. The pools task (sub-phase 4.8) owns `learned.toml` writes too. This sub-phase adds `learn.file` and `learn.check_interval_s`.
+**Model.** Each `learn.check_interval_s`: read `deferred(now - window_days)` (sub-phase 12.5), `embed` their texts, compute `clusters`, skip `covered` clusters, call `propose`, then `validate_proposal`. A valid proposal is saved with `status = pending` if `needs_approval`, else `active`. `kind = none` is saved with `status = none`. An invalid proposal is logged and saved with `status = none`, so the next check does not ask again. Each entry has the cluster `texts` and `centroid`. The pools task (sub-phase 4.8) owns `learned.toml` writes too. This sub-phase adds `learn.file` and `learn.check_interval_s`.
 
 **Acceptance criteria.**
 

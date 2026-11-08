@@ -157,19 +157,19 @@ This phase learns the habits of the house. Habits go into the model context, hel
 - **Implements:** G11. **Depends on:** 11.5.
 - **Files:** modify `src/domain/select.rs`, `src/domain/decide.rs`, `intents.toml`.
 
-**Model.** The habit action of an intent comes from its service: `turn_on` gives `on`, `turn_off` gives `off`, `media_player.play_media` gives `play`, and `climate.set_temperature` gives `set_temperature`. Another service scores 0. `target = "entity"` picks the matching entity with the highest score of that action now. Equal scores pick the lowest entity ID. `habit_defaults` maps a slot to a habit action. An empty slot takes the value of that action with the highest score now, for the selected entity. No such habit gives `Ask` from `ask_<slot>`.
+**Model.** The habit action of an intent comes from its service: `turn_on` gives `on`, `turn_off` gives `off`, `media_player.play_media` gives `play`, and `climate.set_temperature` gives `set_temperature`. Another service scores 0. `target = "entity"` picks the matching entity with the highest score of that action now. Equal scores pick the lowest entity ID. `habit_defaults` maps a slot to a habit action. An empty slot takes the value of that action with the highest score now, for the selected entity. No such habit gives `Defer` with `Job::Llm` (sub-phase 4.5d).
 
 **Acceptance criteria.**
 
 - AC-11.6-1: When an area has two media players, `select` returns the one with the higher score now.
 - AC-11.6-2: When two entities have equal scores, `select` returns the one with the lowest entity ID.
 - AC-11.6-3: When `tv_on` has no `show` slot and the top `play` value at 20:00 is `Bluey`, the call data `media_content_id` has `"show_name": "Bluey"`.
-- AC-11.6-4: When no habit exists for a `habit_defaults` slot, `decide` returns `Ask` from the pool `ask_<slot>`.
+- AC-11.6-4: When no habit exists for an empty `habit_defaults` slot, `decide` returns `Defer` with `Job::Llm`.
 
 **Proofs.**
 
 - P-11.6-1, P-11.6-2. Ensures: `select` gives the candidate with the highest score, and of equal scores the lowest entity ID. Argument: `select` sorts the candidates by entity ID, then uses a `max_by` on the score that keeps the first of equal elements.
-- P-11.6-3, P-11.6-4. Ensures: an empty `habit_defaults` slot takes the value with the highest score now, and no such value gives `Ask`. Argument: the slot value is `slot.or(top_value(habits, action, now))`. `None` from both gives `Ask`.
+- P-11.6-3, P-11.6-4. Ensures: an empty `habit_defaults` slot takes the value with the highest score now, and no such value gives `Defer` with `Job::Llm`. Argument: the slot value is `slot.or(top_value(habits, action, now))`. `None` from both gives `Defer`.
 
 ---
 
