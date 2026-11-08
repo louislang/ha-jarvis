@@ -49,20 +49,11 @@ plugin = "get_weather"
 data = { when = "today" }
 
 [[intent]]
-name = "brightness_query"
+name = "windows_query"
 kind = "query"
-examples = ["how bright is the [office](area) light", "how bright are the lights", "what is the brightness of the [bedroom](area) lights"]
-target = "entities"
-select = [{ domain = "light" }]
-state = "on"
-
-[[intent]]
-name = "lights_query"
-kind = "query"
-examples = ["is the [garage](area) light on", "which lights are on", "are the lights on in the [kitchen](area)", "are any lights on"]
-target = "entities"
-select = [{ domain = "light" }, { domain = "switch", name = "light" }]
-state = "on"
+examples = ["are any windows open", "is a window open", "are the windows closed"]
+target = "house"
+select = [{ domain = "binary_sensor", device_class = "window" }]
 
 [[intent]]
 name = "lock_query"
@@ -79,8 +70,17 @@ target = "house"
 select = [{ domain = "cover", device_class = "garage" }]
 
 [[intent]]
-name = "windows_query"
+name = "brightness_query"
 kind = "query"
-examples = ["are any windows open", "is a window open", "are the windows closed"]
-target = "house"
-select = [{ domain = "binary_sensor", device_class = "window" }]
+examples = ["how bright is the [office](area) light", "how bright are the lights", "what is the brightness of the [bedroom](area) lights"]
+target = "entities"
+select = [{ domain = "light" }]
+state = "on"
+
+[[intent]]
+name = "lights_query"
+kind = "query"
+examples = ["is the [garage](area) light on", "which lights are on", "are the lights on in the [kitchen](area)", "are any lights on"]
+target = "entities"
+select = [{ domain = "light" }, { domain = "switch", name = "light" }]
+state = "on"
