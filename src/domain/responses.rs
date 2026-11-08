@@ -222,7 +222,6 @@ pub fn validate_pools(pools: &Pools, catalog: &Catalog) -> Result<(), PoolError>
     }
     require(pools, "filler")?;
     require(pools, "failure")?;
-    require(pools, "fallback")?;
     check_pools(pools, catalog)
 }
 
@@ -494,13 +493,12 @@ pub open spec fn pooled(pools: Map<String, Pool>, catalog: Catalog, count: int) 
         ==> pools.contains_key(crate::domain::contracts::string_key(#[trigger] catalog.intents@[index].name@))
 }
 
-/// True when each intent of `catalog` has a pool, the `filler`, `failure` and `fallback` pools
-/// exist, and each pool has one or more responses.
+/// True when each intent of `catalog` has a pool, the `filler` and `failure` pools exist, and each
+/// pool has one or more responses.
 pub open spec fn valid_pools(pools: Map<String, Pool>, catalog: Catalog) -> bool {
     &&& pooled(pools, catalog, catalog.intents@.len() as int)
     &&& pools.contains_key(crate::domain::contracts::string_key("filler"@))
     &&& pools.contains_key(crate::domain::contracts::string_key("failure"@))
-    &&& pools.contains_key(crate::domain::contracts::string_key("fallback"@))
     &&& filled(pools)
 }
 
@@ -829,7 +827,7 @@ mod tests {
     /// AC-4.2-5.
     #[test]
     fn ac_4_2_5_missing_required_pool_names_it() {
-        for name in ["filler", "failure", "fallback"] {
+        for name in ["filler", "failure"] {
             let result = validate(|pools, _| _ = pools.remove(name));
             assert_eq!(result, Err(PoolError::Missing(name.to_owned())));
         }
@@ -856,8 +854,8 @@ mod tests {
     /// AC-4.2-7.
     #[test]
     fn ac_4_2_7_empty_pool_names_pool() {
-        let result = validate(|pools, _| set(pools, "fallback", &[]));
-        assert_eq!(result, Err(PoolError::Empty("fallback".to_owned())));
+        let result = validate(|pools, _| set(pools, "failure", &[]));
+        assert_eq!(result, Err(PoolError::Empty("failure".to_owned())));
     }
 
     /// AC-4.2-8.

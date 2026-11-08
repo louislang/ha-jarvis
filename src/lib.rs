@@ -1494,7 +1494,7 @@ mod tests {
                 },
             )
         };
-        let names = names.chain(["filler", "failure", "fallback"]);
+        let names = names.chain(["filler", "failure"]);
         names.map(pool).collect()
     }
 
