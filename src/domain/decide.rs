@@ -1825,6 +1825,52 @@ mod tests {
         assert_eq!(decision, answered("fan_query", text));
     }
 
+    /// The reference house with each person of `people` `not_home`.
+    fn away(people: &[&str]) -> StateCache {
+        let mut snapshot = house();
+        for state in &mut snapshot.states {
+            if people.contains(&state.entity_id.as_str()) {
+                state.state = "not_home".to_owned();
+            }
+        }
+        StateCache::load(snapshot)
+    }
+
+    /// AC-18.5-1.
+    #[test]
+    fn ac_18_5_1_who_is_home_names_each_person_at_home() {
+        let decision = replied("who_is_home", None, "kitchen", &away(&[]));
+        let text = "Ali and Louis are home.";
+        assert_eq!(decision, answered("who_is_home", text));
+    }
+
+    /// AC-18.5-2.
+    #[test]
+    fn ac_18_5_2_who_is_home_leaves_out_each_person_away() {
+        let cases = [
+            (&["person.louis"][..], "Ali is home."),
+            (&["person.ali", "person.louis"][..], "Nobody is home."),
+        ];
+        for (people, text) in cases {
+            let decision = replied("who_is_home", None, "kitchen", &away(people));
+            assert_eq!(decision, answered("who_is_home", text), "away {people:?}");
+        }
+    }
+
+    /// AC-18.5-3.
+    #[test]
+    fn ac_18_5_3_alarm_query_names_the_alarm_state() {
+        let cases = [
+            ("armed_home", "The alarm is armed home."),
+            ("disarmed", "The alarm is off."),
+        ];
+        for (state, text) in cases {
+            let cache = changed("alarm_control_panel.spring_alarm", state);
+            let decision = replied("alarm_query", None, "kitchen", &cache);
+            assert_eq!(decision, answered("alarm_query", text), "alarm {state}");
+        }
+    }
+
     /// AC-7.6-3.
     #[test]
     fn ac_7_6_3_area_states_give_the_unskipped_entities_of_the_area() {
