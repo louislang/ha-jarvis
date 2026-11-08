@@ -44,7 +44,7 @@ This phase selects responses, selects entities and decides the action from a pre
 **Model.**
 
 - `render(template, context) -> Result<String>`. Undefined variables are errors. The environment uses `UndefinedBehavior::Strict` and debug mode, because `minijinja` names the undefined variable only in debug mode. `Cargo.toml` turns on the `serde` feature of `minijinja`, so the context is a `serde_json` value.
-- `validate_pools(pools, catalog) -> Result<()>`: each intent has a pool, the `filler`, `failure` and `fallback` pools exist, each pool has one or more responses, every template parses, and every template uses only the variables of its pool (`minijinja` `undeclared_variables`).
+- `validate_pools(pools, catalog) -> Result<()>`: each intent has a pool, the `filler` and `failure` pools exist, each pool has one or more responses, every template parses, and every template uses only the variables of its pool (`minijinja` `undeclared_variables`).
 - Template variables of an intent pool: `area` (the area name in lowercase), the slots and the `habit_defaults` keys of its intent, `entity` when the intent has `target = "entity"`, `response` when it has `kind = "fetch"`, and `person` when it has `needs_speaker` (sub-phase 15.7). A pool that is not an intent pool uses no variable. Thus a template that validates also renders. The slots of an intent come from the same function that check 4 of `validate_catalog` uses (sub-phase 3.2b), so `catalog.rs` makes it public.
 
 **Acceptance criteria.**
@@ -53,7 +53,7 @@ This phase selects responses, selects entities and decides the action from a pre
 - AC-4.2-2: When a template uses a variable that the context does not have, `render` returns an error that names the variable.
 - AC-4.2-3: When an intent has no pool, `validate_pools` returns an error that contains the intent name.
 - AC-4.2-4: When a template has a syntax error, `validate_pools` returns an error that contains the pool name.
-- AC-4.2-5: When `filler`, `failure` or `fallback` is missing, `validate_pools` returns an error that names it.
+- AC-4.2-5: When `filler` or `failure` is missing, `validate_pools` returns an error that names it.
 - AC-4.2-6: When a template of an intent pool uses a variable that is not a built-in, a slot or a `habit_defaults` key of the intent, `validate_pools` returns an error with the pool and the variable.
 - AC-4.2-7: When a pool has no responses, `validate_pools` returns an error that names the pool.
 - AC-4.2-8: When a pool of a `target = "entities"` intent uses `entity`, a pool of an intent that is not `fetch` uses `response`, or a pool that is not an intent pool uses a variable, `validate_pools` returns an error with the pool and the variable.
@@ -62,7 +62,7 @@ This phase selects responses, selects entities and decides the action from a pre
 
 - P-4.2-1. Evidence: test (`minijinja`).
 - P-4.2-2. Evidence: test. The error and its text come from `minijinja` (`UndefinedBehavior::Strict` and debug mode), which Verus cannot see.
-- P-4.2-3, P-4.2-5, P-4.2-7. Ensures: when `validate_pools` returns `Ok`, each intent has a pool, the `filler`, `failure` and `fallback` pools exist, and each pool has one or more responses. Argument: `validate_pools` checks the intents, then the required pools, then the size and the templates of each pool in loops, and returns the first failure.
+- P-4.2-3, P-4.2-5, P-4.2-7. Ensures: when `validate_pools` returns `Ok`, each intent has a pool, the `filler` and `failure` pools exist, and each pool has one or more responses. Argument: `validate_pools` checks the intents, then the required pools, then the size and the templates of each pool in loops, and returns the first failure.
 - P-4.2-4, P-4.2-6, P-4.2-8. Evidence: test. The template checks depend on `minijinja` `template_from_str` and `undeclared_variables`, and on the slot names, which the `ensures` of `parse_example` does not state (P-3.2b).
 
 ---
@@ -188,17 +188,19 @@ This phase selects responses, selects entities and decides the action from a pre
 
 **Model.**
 
-- `Decision`: `Reply { reply: Chosen, call: Option<ServiceCall> }`, `Defer { filler: Chosen, job: Job }`, `Fallback { reply: Chosen }`. `Chosen { text, pool, index }` is the selected response (sub-phase 4.1), so dispatch can record its use and the log can store its pool and template. `Fallback` means that Jarvis knows the intent but cannot act: the reply is from the pool `fallback`, and dispatch makes no call.
+- `Decision`: `Reply { reply: Chosen, call: Option<ServiceCall> }`, `Defer { filler: Chosen, job: Job }`. `Chosen { text, pool, index }` is the selected response (sub-phase 4.1), so dispatch can record its use and the log can store its pool and template.
+- When System One knows the intent but cannot act, `decide` returns `Defer` with a filler and `Job::Llm`, as in step 1. Sub-phases 4.5b to 4.6 give these cases. Thus System Two answers the request. A request that System One cannot act on often has the wrong intent, so it is also input for learned intents (sub-phase 14.5).
 - `Job::Llm(question)`: the question is the transcript. Sub-phase 7.2 makes it a `Question`. Sub-phase 4.6 adds `Job::Fetch`, because 4.6 creates it.
 - `Request { transcript, area: Option<AreaId> }` is the request that `decide` gets: the transcript and the satellite area. Its name is not `Context`, because `state::Context` exists.
-- `decide(prediction, request, catalog, pools, threshold, rng) -> Decision`. `threshold` is `model.threshold`. `decide` requires that each intent of the catalog has a pool, and that the pools `filler` and `fallback` exist with one or more responses (P-4.2-3, P-4.2-5, P-4.2-7).
+- `decide(prediction, request, catalog, pools, threshold, rng) -> Decision`. `threshold` is `model.threshold`. `decide` requires that each intent of the catalog has a pool, and that the pool `filler` exists with one or more responses (P-4.2-3, P-4.2-5, P-4.2-7).
   1. If the top label is `unknown`, is not in the catalog, or its probability is less than `threshold`, return `Defer` with a filler and `Job::Llm`. A label of the model that the catalog no longer has (an intent removed before a retrain) thus goes to System Two.
   2. An intent that is not `kind = "command"` also gives `Defer` with a filler and `Job::Llm`. Sub-phase 4.6 handles `query` and `fetch`, and sub-phase 13.11 handles `train`.
   3. A command gives `Reply` with a response from its pool and no call. Sub-phases 4.5b to 4.5d replace this step.
-- The pools `filler` and `fallback` use no variables (sub-phase 4.2), so their `Chosen.text` is the template as written. Until sub-phase 4.5b, the reply text of a command is also the template as written.
+- The pool `filler` uses no variables (sub-phase 4.2), so its `Chosen.text` is the template as written. Until sub-phase 4.5b, the reply text of a command is also the template as written.
 - `Decision` holds a `ServiceCall`. Thus `src/domain/contracts.rs` gets a `#[verifier::external_type_specification]` for `ServiceCall`, the same as for the other types of `src/domain/state.rs` (`02-rules.md` section 5.1, rule 8).
 - This sub-phase adds `[model]` with `threshold` to `jarvis.toml` and to `Config` in `src/lib.rs`.
 - `Config::validate` (sub-phase 2.2) rejects a `model.threshold` outside `[0, 1]`. The error names the field and the range. Sub-phase 4.5 did not add this check, so the fix PR `Fix: Threshold Range` adds it to the code on `main`.
+- The code on `main` still has `Decision::Fallback` and the pool `fallback` from sub-phases 4.2 to 4.8, 17.4 and 18.1. The fix PR `Fix: Defer When System One Cannot Act` changes it to `Defer` with `Job::Llm`. It modifies `src/domain/decide.rs` with its Verus clauses and tests, `src/domain/responses.rs`, `src/app/conversation.rs`, `src/lib.rs` and `responses.toml`. No Quint model has `Fallback`.
 
 **Acceptance criteria.**
 
@@ -225,24 +227,24 @@ This phase selects responses, selects entities and decides the action from a pre
 **Model.**
 
 - `decide` gets the parameter `cache` after `catalog`. Step 3 of sub-phase 4.5 becomes steps 3 to 5 for a command:
-  3. The area is the area slot if present, else `request.area`. `area_by_name` gives the area of the slot (sub-phase 2.8b). An area slot that matches no area gives `Fallback`.
+  3. The area is the area slot if present, else `request.area`. `area_by_name` gives the area of the slot (sub-phase 2.8b). An area slot that matches no area gives `Defer` with `Job::Llm`.
   4. A command without `service` gives `Reply` with the rendered reply and no call. It does not select entities.
-  5. A command with a `service` needs an area for both targets, because `select` needs an area (sub-phase 4.5c). No area gives `Fallback`.
+  5. A command with a `service` needs an area for both targets, because `select` needs an area (sub-phase 4.5c). No area gives `Defer` with `Job::Llm`.
 - Until sub-phase 4.5c, a command with a `service` and an area gives `Reply` with the rendered reply and no call.
-- The render context of the reply has `area` (the area name in lowercase) when the area is known. An area ID that is not in the area registry gives no `area` in the context. Thus a template with `area` does not render for it. When the reply does not render, the result is `Fallback`. `Chosen.text` of the reply is the rendered text.
+- The render context of the reply has `area` (the area name in lowercase) when the area is known. An area ID that is not in the area registry gives no `area` in the context. Thus a template with `area` does not render for it. When the reply does not render, the result is `Defer` with `Job::Llm`. `Chosen.text` of the reply is the rendered text.
 - The render context is a JSON object. Thus `src/domain/contracts.rs` gets contracts for the `serde_json` functions `Map::new`, `Map::insert` and `Value::from` (`02-rules.md` section 5.1, rule 8).
-- Verus treats the `f32` comparison `>=` as an uninterpreted relation. Thus a clause cannot state that a confident top command gets to step 3. The clauses of `decide` state the reverse: each `Reply` and each `Fallback` comes from the top command and obeys steps 3 to 5. Sub-phase 4.5c adds steps 6 to 8 to these clauses.
+- Verus treats the `f32` comparison `>=` as an uninterpreted relation. Thus a clause cannot state that a confident top command gets to step 3. The clauses of `decide` state the reverse: each `Reply` comes from the top command and obeys steps 3 to 5. A top command that steps 3 to 5 cannot act on gives `Defer` with `Job::Llm`, from step 1, step 2 or that step. Sub-phase 4.5c adds steps 6 to 8 to these clauses.
 
 **Acceptance criteria.**
 
-- AC-4.5b-3: When the area slot matches no area, the result is `Fallback`.
-- AC-4.5b-4: When a `target = "entities"` intent has no slot area and no satellite area, the result is `Fallback`.
+- AC-4.5b-3: When the area slot matches no area, the result is `Defer` with `Job::Llm`.
+- AC-4.5b-4: When a `target = "entities"` intent has no slot area and no satellite area, the result is `Defer` with `Job::Llm`.
 - AC-4.5b-5: When a command has no `service`, the result is `Reply` with no call.
 
 **Proofs.**
 
-- P-4.5b-3, P-4.5b-4 (AC-4.5b-3, AC-4.5b-4). Ensures: each `Reply` and each `Fallback` comes from the top command. For this command, an area slot that matches no area gives `Fallback`. No area slot and no `request.area` for a command with a `service` also gives `Fallback`. Thus each of these requests gives `Fallback` or `Defer`. Argument: step 3 takes `area_by_name(slot)` for the first area slot of the prediction, else `request.area`. A slot with `area_by_name = None` returns `Fallback`. Step 5 returns `Fallback` when the area is `None`. Steps 1 and 2 return `Defer` before step 3.
-- P-4.5b-5 (AC-4.5b-5). Ensures: an intent without `service` gives `Reply` with `call = None`, `Fallback` or `Defer`, and never a call. Argument: step 4 returns `Reply { call: None }`, or `Fallback` when the reply does not render, before any step that builds a call. Step 3 is the only earlier step of a command that can return `Fallback`.
+- P-4.5b-3, P-4.5b-4 (AC-4.5b-3, AC-4.5b-4). Ensures: each `Reply` comes from the top command. For a top command, an area slot that matches no area gives `Defer` with `Job::Llm`. No area slot and no `request.area` for a command with a `service` also gives `Defer` with `Job::Llm`. Argument: step 3 takes `area_by_name(slot)` for the first area slot of the prediction, else `request.area`. A slot with `area_by_name = None` returns `Defer`. Step 5 returns `Defer` when the area is `None`. Steps 1 and 2 return `Defer` before step 3.
+- P-4.5b-5 (AC-4.5b-5). Ensures: an intent without `service` gives `Reply` with `call = None` or `Defer`, and never a call. Argument: step 4 returns `Reply { call: None }`, or `Defer` when the reply does not render, before any step that builds a call. Steps 1 to 3 return only `Defer`.
 
 ---
 
@@ -256,23 +258,23 @@ This phase selects responses, selects entities and decides the action from a pre
 **Model.**
 
 - A command with a `service` and an area continues after step 5 of sub-phase 4.5b with steps 6 to 8. They replace the `Reply` with no call of sub-phase 4.5b:
-  6. The `service` of the intent is `domain.service`. `str::split_once` splits it at the first dot. The text before the dot is `ServiceCall.domain`, and the text after it is `ServiceCall.service`. A `service` without a dot gives `Fallback`.
-  7. `select(intent, area, cache)` gives the selection. An empty selection (sub-phases 4.4 to 4.4c) gives `Fallback`. Until sub-phase 4.5d, `decide` does not render the `entity` text of an intent.
+  6. The `service` of the intent is `domain.service`. `str::split_once` splits it at the first dot. The text before the dot is `ServiceCall.domain`, and the text after it is `ServiceCall.service`. A `service` without a dot gives `Defer` with `Job::Llm`.
+  7. `select(intent, area, cache)` gives the selection. An empty selection (sub-phases 4.4 to 4.4c) gives `Defer` with `Job::Llm`. Until sub-phase 4.5d, `decide` does not render the `entity` text of an intent.
   8. Render the reply from the pool of the intent. Return `Reply` with the reply and `ServiceCall { domain, service, target: selection, data: {}, return_response: false }`. Sub-phase 4.5d adds the data.
-- With a selection and `target = "entity"`, the render context also has `entity`: the state, the attributes and the name of the selected entity. An entity without an entry in the entity registry has no `entity.name`. When the cache has no state for the selected entity, the result is `Fallback`.
+- With a selection and `target = "entity"`, the render context also has `entity`: the state, the attributes and the name of the selected entity. An entity without an entry in the entity registry has no `entity.name`. When the cache has no state for the selected entity, the result is `Defer` with `Job::Llm`.
 - `src/domain/contracts.rs` gets contracts for `Map::clone`, `Value::from` of a `Map` and `str::split_once` (`02-rules.md` section 5.1, rule 8). The contract of `split_once` needs the unstable `pattern` feature. Thus `src/lib.rs` turns on `pattern` for Verus only (`02-rules.md` section 5.1, rule 10).
-- The clauses of `decide` have the form of sub-phase 4.5b: each `Reply` and each `Fallback` comes from the top command and obeys steps 3 to 8.
+- The clauses of `decide` have the form of sub-phase 4.5b: each `Reply` comes from the top command and obeys steps 3 to 8, and a top command that these steps cannot act on gives `Defer` with `Job::Llm`.
 
 **Acceptance criteria.**
 
 - AC-4.5c-1: When the prediction is `lights_on` 0.89 and the satellite is in the Kitchen, the call is `homeassistant.turn_on` with all kitchen lights.
 - AC-4.5c-2: When the prediction has an area slot, the slot area replaces the satellite area.
-- AC-4.5c-3: When the selection of a command is empty, the result is `Fallback`.
+- AC-4.5c-3: When the selection of a command is empty, the result is `Defer` with `Job::Llm`.
 
 **Proofs.**
 
 - P-4.5c-2 (AC-4.5c-2). Ensures: the target of a call is the selection in the area of the first area slot when the prediction has an area slot, else in `request.area`. Argument: step 3 takes `area_by_name(slot)` for the first area slot, else `request.area` (P-4.5b-3). Step 7 selects in this area.
-- P-4.5c-3 (AC-4.5c-3). Ensures: a `Reply` with a call has a target that is not empty. Thus an empty selection gives `Fallback` or `Defer`. Argument: step 7 returns `Fallback` when `select` is empty, before step 8 builds the call.
+- P-4.5c-3 (AC-4.5c-3). Ensures: a `Reply` with a call has a target that is not empty. An empty selection gives `Defer` with `Job::Llm`. Argument: step 7 returns `Defer` when `select` is empty, before step 8 builds the call.
 - P-4.5c-1 (AC-4.5c-1). Ensures: a `Reply` with a call has the domain and the service of the intent: its `domain`, a dot and its `service` are the `service` of the intent, and its `domain` has no dot. Its target is the `select` result. Argument: step 6 splits the `service` of the intent at the first dot (the contract of `split_once`). Step 7 takes the selection, and step 8 builds the call from both. For `lights_on` in the Kitchen, the selection is all kitchen lights (P-4.4-1).
 
 ---
@@ -286,15 +288,15 @@ This phase selects responses, selects entities and decides the action from a pre
 
 **Model.**
 
-- Step 3 also reads the slots of the intent (`catalog::insert_slots`, sub-phase 4.2). The `area` slot is not part of this check, because step 3 already gives the area or `Fallback`. Another missing slot that is not `optional` gives `Fallback`. A missing `optional` slot is an empty string. The render context of steps 4, 7 and 8 gets each other slot. Its `area` stays the area name.
-- Step 7: when the intent has `entity`, `decide` renders the text that `select` returns with the context (sub-phase 4.4c). The rendered text is the selected entity. An `entity` template that does not render gives `Fallback`.
-- Step 8 also renders the `data` of the intent. A data value that is one `{{ expression }}` keeps the type of the result (`minijinja` `compile_expression`). One `{{ expression }}` is a value that starts with `{{`, ends with `}}`, and has no other `}}`. Thus a `}}` inside a string literal of the expression is not supported, and such a value renders as a string. An expression with an undefined result gives `Fallback`. Other values render as strings. A data value that does not render gives `Fallback`. The call gets the rendered data.
+- Step 3 also reads the slots of the intent (`catalog::insert_slots`, sub-phase 4.2). The `area` slot is not part of this check, because step 3 already gives the area or `Defer`. Another missing slot that is not `optional` gives `Defer` with `Job::Llm`. A missing `optional` slot is an empty string. The render context of steps 4, 7 and 8 gets each other slot. Its `area` stays the area name.
+- Step 7: when the intent has `entity`, `decide` renders the text that `select` returns with the context (sub-phase 4.4c). The rendered text is the selected entity. An `entity` template that does not render gives `Defer` with `Job::Llm`.
+- Step 8 also renders the `data` of the intent. A data value that is one `{{ expression }}` keeps the type of the result (`minijinja` `compile_expression`). One `{{ expression }}` is a value that starts with `{{`, ends with `}}`, and has no other `}}`. Thus a `}}` inside a string literal of the expression is not supported, and such a value renders as a string. An expression with an undefined result gives `Defer` with `Job::Llm`. Other values render as strings. A data value that does not render gives `Defer` with `Job::Llm`. The call gets the rendered data.
 
 **Acceptance criteria.**
 
 - AC-4.5d-1: When the intent is `climate_down` and the target temperature is 72, the call data has `temperature = 70` as a number.
 - AC-4.5d-2: When the `show` slot is "24", the rendered `media_content_id` is a string that contains `"show_name": "24"`.
-- AC-4.5d-3: When an `optional` slot is missing, the template renders it as an empty string. When a slot that is not `optional` and not `area` is missing, the result is `Fallback`.
+- AC-4.5d-3: When an `optional` slot is missing, the template renders it as an empty string. When a slot that is not `optional` and not `area` is missing, the result is `Defer` with `Job::Llm`.
 
 **Proofs.**
 
@@ -312,19 +314,19 @@ This phase selects responses, selects entities and decides the action from a pre
 - **Implements:** G3, G6. **Depends on:** 4.5d.
 - **Files:** modify `src/domain/decide.rs`.
 
-**Model.** `query`: select the entity (`target = "entity"`), render the pool response with `entity`, return `Reply` with no call. A missing entity gives `Fallback`. `fetch`: return `Defer` with a filler and `Job::Fetch(call, pool)`. This sub-phase adds `Job::Fetch` to `Job`.
+**Model.** `query`: select the entity (`target = "entity"`), render the pool response with `entity`, return `Reply` with no call. A missing entity gives `Defer` with `Job::Llm`. `fetch`: return `Defer` with a filler and `Job::Fetch(call, pool)`. This sub-phase adds `Job::Fetch` to `Job`.
 
 **Acceptance criteria.**
 
 - AC-4.6-1: When the intent is `temperature_query` and the sensor state is 21, the text is "It is 21 degrees in the kitchen."
-- AC-4.6-2: When the query entity is not in the cache, the result is `Fallback`.
+- AC-4.6-2: When the query entity is not in the cache, the result is `Defer` with `Job::Llm`.
 - AC-4.6-3: When the intent is `weather`, the result is `Defer` with a filler and `Job::Fetch` with `return_response = true`.
 - AC-4.6-4: When the intent is a query, the result has no service call.
 - AC-4.6-5: When the area is the Office, which has two temperature sensors, the query reads the sensor with the lowest entity ID among the sensors that are not on a satellite device and not in `exclude`.
 
 **Proofs.**
 
-- P-4.6-2. Ensures: an empty selection gives `Fallback`. Argument: the query branch returns `Fallback` when `select` is empty.
+- P-4.6-2. Ensures: an empty selection gives `Defer` with `Job::Llm`. Argument: the query branch returns `Defer` when `select` is empty.
 - P-4.6-3. Ensures: a fetch intent gives `Defer` with `Job::Fetch` and `return_response = true`. Argument: the fetch branch builds the call with `return_response = true`.
 - P-4.6-4. Ensures: a query gives `Reply` with `call = None`. Argument: the query branch constructs `Reply { call: None }`.
 - P-4.6-1 (AC-4.6-1). Ensures: the text is the pool template rendered with `entity` and `area`. Argument: the query branch renders "It is {{ entity.state }} degrees in the {{ area }}." with `entity.state = 21` and `area = kitchen`.
@@ -383,7 +385,7 @@ This phase selects responses, selects entities and decides the action from a pre
 
 - `Clock::now()`. `SystemClock` is in `src/lib.rs`. `FakeClock` is in `fakes.rs`.
 - `dispatch(decision) -> Handled { text, after: Option<Work> }`. `after` is the background work. The caller sends the text first and starts `after` only after the send. Thus no call can come before the reply (`ReplyBeforeCall`, sub-phase 16.1). For the `Chosen` of the decision, dispatch sends `record_use(pool, index)` to the pools task.
-- `Reply`: `after` is `home.call(call)`. `Fallback`: the text is from `fallback`, and `after` is none.
+- `Reply`: `after` is `home.call(call)`.
 - A pools task owns `Pools`. `record_use` and the later backfill merges and marks are messages to it. It applies each change in order, publishes the result through `ArcSwap` and saves it to `pools.json` through `Store`. Thus no change overwrites another.
 - `responses.toml` is the source and stays unchanged in Git. At startup, the pools task merges it into the saved pools: a response in both keeps its use count; a new source response starts at 0; a source response that is no longer in `responses.toml` leaves its pool; a generated response stays. This sub-phase adds `responses` and `pools`.
 
@@ -393,14 +395,13 @@ This phase selects responses, selects entities and decides the action from a pre
 - AC-4.8-2: When dispatch gets a `Reply` with a call and the caller starts `after`, `FakeHome` records the call. Before the start, `FakeHome` records no call.
 - AC-4.8-3: When dispatch gets a `Reply`, the response store receives the pools with the new use count.
 - AC-4.8-4: When dispatch gets a `Reply` with no call, `FakeHome` records no call.
-- AC-4.8-5: When dispatch gets `Fallback`, the text is from `fallback`, and `after` is none.
 - AC-4.8-6: When 100 dispatches record uses at the same time, the saved pools have all 100 uses.
 - AC-4.8-7: When `responses.toml` gets one new response and loses one old response, the merged pools have the new response with `uses = 0`, do not have the old one, and keep the use counts of the others. `responses.toml` does not change.
 
 **Proofs.**
 
 - P-4.8-1. Argument: dispatch returns the call as `after` and does not await it, so it returns without a timer.
-- P-4.8-4, P-4.8-5. Argument: `after` is `Some` only inside `if let Some(call)`.
+- P-4.8-4. Argument: `after` is `Some` only inside `if let Some(call)`.
 - P-4.8-6. Argument: the pools task applies messages one at a time, so each use is applied to the result of the one before.
 - P-4.8-2, P-4.8-3, P-4.8-7. Evidence: test.
 

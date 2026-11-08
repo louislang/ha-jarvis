@@ -2,7 +2,7 @@
 
 This phase adds System One query intents about the house, Music Assistant playback and Plex playback. The queries read only the hot cache and make no service call. The music intents call `music_assistant.play_media` and the `media_player` services on the speaker of the area. The Plex intents call `media_player.play_media` with a `plex://` content ID on the TV. The list of new Plex shows comes from the Plex server, so it is a plugin (`01-architecture.md` decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 17 and before phase 10.
 
-Each sub-phase that adds an intent adds its seed examples to `intents.toml` and its pool to `responses.toml` (`01-architecture.md` section 12). The training set then changes, so `just fixture-model` trains the fixture model again (sub-phase 3.9), and CI trains it again because the cache key is the hash of the training set. AC-3.12-1 to AC-3.12-4 then check the new seed examples. When the fixture model does not learn a new example, the PR changes the examples, not the tests. Jarvis serves the fixture model until sub-phase 13.9, and the training runs of phase 13 use the same seed examples. Sub-phase 10.4 adds the `ask_<slot>` pools for the new slots (`media`, `movie`, `season`, `episode`, `volume`). The tests of the intent sub-phases decide with the catalog of `intents.toml`, the pools of `responses.toml` and the reference house. A test that needs an entity that the reference house does not have adds it to the snapshot before it loads the cache. The tests of AC-3.2-1 and AC-3.2c-2 in `src/domain/catalog.rs` list the intent names in the order of `intents.toml`, so each such sub-phase adds its names there. The fixture model gives each seed example a context by its position, so a new intent can move the contexts of the examples after it. The order of the new intents can change to keep the existing tests passing.
+Each sub-phase that adds an intent adds its seed examples to `intents.toml` and its pool to `responses.toml` (`01-architecture.md` section 12). The training set then changes, so `just fixture-model` trains the fixture model again (sub-phase 3.9), and CI trains it again because the cache key is the hash of the training set. AC-3.12-1 to AC-3.12-4 then check the new seed examples. When the fixture model does not learn a new example, the PR changes the examples, not the tests. Jarvis serves the fixture model until sub-phase 13.9, and the training runs of phase 13 use the same seed examples. The tests of the intent sub-phases decide with the catalog of `intents.toml`, the pools of `responses.toml` and the reference house. A test that needs an entity that the reference house does not have adds it to the snapshot before it loads the cache. The tests of AC-3.2-1 and AC-3.2c-2 in `src/domain/catalog.rs` list the intent names in the order of `intents.toml`, so each such sub-phase adds its names there. The fixture model gives each seed example a context by its position, so a new intent can move the contexts of the examples after it. The order of the new intents can change to keep the existing tests passing.
 
 ---
 
@@ -17,12 +17,12 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 - `Target::House`: all matching entities of the house. `select` with `target = "house"` returns the house matches (the `house_matches` of sub-phase 4.4c). The result does not depend on the area.
 - `Intent.state: Option<String>`: the state that a list query keeps, for example `on` or `home`.
-- A list query is a query with `target = "entities"` or `target = "house"`. A query with `target = "house"` needs no area. Step 3 of sub-phase 4.5b still applies: an area slot that matches no area gives `Fallback`, and a known area gives the `area` variable.
+- A list query is a query with `target = "entities"` or `target = "house"`. A query with `target = "house"` needs no area. Step 3 of sub-phase 4.5b still applies: an area slot that matches no area gives `Defer` with `Job::Llm`, and a known area gives the `area` variable.
 - The branch of a list query:
-  1. `select` gives the selection. An empty selection gives `Fallback` (P-4.6-2).
+  1. `select` gives the selection. An empty selection gives `Defer` with `Job::Llm` (P-4.6-2).
   2. `kept(selection, state, cache)` gives the IDs of the selection that have a state in the cache, in selection order. When `state` is `Some(s)`, it keeps only the IDs whose state is `s`.
   3. The render context gets `entities`: a list with one object for each kept ID. Each object has the state, the attributes and the name, as `entity` (sub-phase 4.5c).
-  4. Return `Reply` with the rendered reply and no call. An empty `entities` list is not a `Fallback`, so the pool can say "No lights are on."
+  4. Return `Reply` with the rendered reply and no call. An empty `entities` list does not give `Defer`, so the pool can say "No lights are on."
 - `state` applies only to a list query.
 - `validate_pools` (sub-phase 4.2): `entities` is a variable only of the pool of a list query. `entity` stays a variable only of an intent with `target = "entity"`, so a `house` pool cannot use it.
 - The templates use the `minijinja` filters `map`, `join`, `length`, `round`, `int` and `replace`, the inline `if`, and `{% for %}` with `{% else %}`. These are built in, so this sub-phase adds no crate feature.
@@ -32,7 +32,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - AC-18.1-1: When an intent has `target = "house"` and the filter `{ domain = "person" }`, `select` returns `person.ali` and `person.louis` for the Kitchen and for the Garage.
 - AC-18.1-2: When a query has the filters of `lights_on`, `target = "entities"`, `state = "on"` and the pool `{{ entities | map(attribute="name") | join(", ") }}`, and the satellite is in the Living Room, the result is `Reply` with the text "Ali's Living Room Lamp, TV Lamp" and no call.
 - AC-18.1-3: When no selected entity has the `state` of a list query, the render context has an empty `entities`, and the result is `Reply` with no call.
-- AC-18.1-4: When the selection of a list query is empty, the result is `Fallback`.
+- AC-18.1-4: When the selection of a list query is empty, the result is `Defer` with `Job::Llm`.
 - AC-18.1-5: When a query has `target = "house"`, and the request has no area slot and no satellite area, the result is `Reply`.
 - AC-18.1-6: When a list query has no `state`, `entities` has each selected entity that has a state, with its name, state and attributes.
 - AC-18.1-7: When the pool of a `target = "entity"` query or of a command uses `entities`, or the pool of a `target = "house"` query uses `entity`, `validate_pools` returns an error with the pool and the variable.
@@ -41,7 +41,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 - P-18.1-1 (AC-18.1-1). Ensures: for `target = "house"`, each result entity is a candidate (`picked`), and each candidate entity of the cache is in the result, for any area. Argument: the `House` arm returns `house_matches`, which does not read the area. Its loop adds the invariant that each candidate before `index` is in `house`.
 - P-18.1-2 (AC-18.1-2, AC-18.1-3, AC-18.1-6). Ensures: each ID of `kept(ids, state, cache)` is in `ids` and has a state in the cache. When `state` is `Some(s)`, that state is `s`. Each ID of `ids` that has such a state is in the result. Argument: `kept` is one pass over `ids` with this condition. The loop invariant states both directions for the IDs before `index`.
-- P-18.1-3 (AC-18.1-4). Ensures: a list query gives `Fallback`, or `Reply` with `call = None` and a selection that is not empty. Argument: the branch returns `Fallback` when `select` is empty, before it builds the reply, and it builds `Reply { call: None }`.
+- P-18.1-3 (AC-18.1-4). Ensures: a list query gives `Defer` with `Job::Llm`, or `Reply` with `call = None` and a selection that is not empty. Argument: the branch returns `Defer` when `select` is empty, before it builds the reply, and it builds `Reply { call: None }`.
 - P-18.1-4 (AC-18.1-5). Ensures: for a `house` query, a `Reply` has `call = None` and a selection that `targeted` gives for the house, also when the area is `None`. Argument: `act` matches a `house` query before the arm that needs an area, as for a fetch (P-17.4-2).
 - P-18.1-5 (AC-18.1-7). Evidence: test. The variables of a template come from `minijinja` `undeclared_variables` (P-4.2-6).
 
@@ -57,7 +57,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Model.**
 
 - `lights_query`: `target = "entities"` with the filters of `lights_on`, `state = "on"`. It answers "is the garage light on" and "which lights are on". Examples: "is the [garage](area) light on", "which lights are on", "are the lights on in the [kitchen](area)", "are any lights on". Pool: `{% if entities %}{{ entities | map(attribute="name") | join(", ") }} {{ "is" if entities | length == 1 else "are" }} on.{% else %}No lights are on in the {{ area }}.{% endif %}`
-- `brightness_query`: `target = "entities"`, `select = [{ domain = "light" }]`, `state = "on"`. Examples: "how bright is the [office](area) light", "how bright are the lights", "what is the brightness of the [bedroom](area) lights". HA gives `brightness` from 0 to 255. An on/off light has no `brightness`, and the pool names it without a value, so one such light does not make the whole reply `Fallback`. Pool: `{% for light in entities %}{{ light.name }} {% if light.attributes.brightness is defined and light.attributes.brightness is number %}is at {{ (light.attributes.brightness / 2.55) | round | int }} percent{% else %}has no brightness value{% endif %}.{{ " " if not loop.last else "" }}{% else %}No lights are on in the {{ area }}.{% endfor %}`
+- `brightness_query`: `target = "entities"`, `select = [{ domain = "light" }]`, `state = "on"`. Examples: "how bright is the [office](area) light", "how bright are the lights", "what is the brightness of the [bedroom](area) lights". HA gives `brightness` from 0 to 255. An on/off light has no `brightness`, and the pool names it without a value, so one such light does not send the whole request to System Two. Pool: `{% for light in entities %}{{ light.name }} {% if light.attributes.brightness is defined and light.attributes.brightness is number %}is at {{ (light.attributes.brightness / 2.55) | round | int }} percent{% else %}has no brightness value{% endif %}.{{ " " if not loop.last else "" }}{% else %}No lights are on in the {{ area }}.{% endfor %}`
 - The area of both intents is the area slot, else the satellite area (sub-phase 4.5b).
 
 **Acceptance criteria.**
@@ -195,7 +195,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - AC-18.7-2: When the request is from the Office satellite and has the area slot "kitchen", the target is `media_player.carson_kitchen_media_player`.
 - AC-18.7-3: When the intent is `play_radio`, the data has `radio_mode = true` as a boolean.
 - AC-18.7-4: When the intent is `queue_music`, the data has `enqueue = "add"`.
-- AC-18.7-5: When the satellite is in the Bedroom, which has no speaker that is not on a satellite device, the result is `Fallback`.
+- AC-18.7-5: When the satellite is in the Bedroom, which has no speaker that is not on a satellite device, the result is `Defer` with `Job::Llm`.
 
 **Proofs.**
 
@@ -244,7 +244,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - `play_movie`: examples "put on [the matrix](movie)", "play the movie [inception](movie)", "watch [toy story](movie)", "put on the movie [up](movie)". `data = { media_content_type = "movie", media_content_id = 'plex://{"library_name": "Movies", "title": "{{ movie }}"}' }`. Pool: `Putting on {{ movie }}.`
 - `continue_show`: examples "continue [the office](show)", "play the next episode of [bluey](show)", "keep watching [severance](show)", "next episode of [the office](show)". `data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "resume": 1}' }`. With `resume`, Plex starts the On Deck episode of the show, else the first episode. Pool: `Continuing {{ show }}.`
 - `play_episode`: examples "play season [two](season) episode [five](episode) of [the office](show)", "put on [bluey](show) season [one](season) episode [three](episode)", "watch [severance](show) season [1](season) episode [1](episode)". `data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "season_number": {{ season | number }}, "episode_number": {{ episode | number }}}' }`. Pool: `Playing {{ show }}, season {{ season }}, episode {{ episode }}.`
-- The second pass writes numbers as words (`tn_normalize_sentence`, sub-phase 6.7), and HA refuses "two" as a number. Thus the render environments of `responses.rs` and `decide.rs` get the `minijinja` filter `number`: the `text2num` `text2digits` of the value with `Language::english()` ("two" gives "2"). Digits stay unchanged, and other text does not render, which gives `Fallback`. This sub-phase also changes the `volume_set` data to `{{ volume | number | int / 100 }}`.
+- The second pass writes numbers as words (`tn_normalize_sentence`, sub-phase 6.7), and HA refuses "two" as a number. Thus the render environments of `responses.rs` and `decide.rs` get the `minijinja` filter `number`: the `text2num` `text2digits` of the value with `Language::english()` ("two" gives "2"). Digits stay unchanged, and other text does not render, which gives `Defer` with `Job::Llm`. This sub-phase also changes the `volume_set` data to `{{ volume | number | int / 100 }}`.
 
 **Acceptance criteria.**
 
@@ -281,13 +281,13 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - AC-18.10-2: When the TV is `paused` with `media_position = 600`, the `tv_skip` call is `media_player.media_seek` with `seek_position = 630` as a number.
 - AC-18.10-3: When the TV is `playing` with `media_position = 600` and `media_position_updated_at` 60 s before `now`, the `tv_skip` call has `seek_position = 690`.
 - AC-18.10-4: When the intent is `tv_stop`, the call is `media_player.media_stop` with the target `media_player.apple_tv`.
-- AC-18.10-5: When the TV has no `media_position`, the result of `tv_skip` is `Fallback`.
+- AC-18.10-5: When the TV has no `media_position`, the result of `tv_skip` is `Defer` with `Job::Llm`.
 
 **Proofs.**
 
 - P-18.10-2, P-18.10-3 (AC-18.10-2, AC-18.10-3). Ensures: `position` is `media_position + (now - updated)` in seconds when `state` is `playing`, else `media_position`, and `None` when a value is missing or does not parse (rule 5.1.9). Argument: `position` matches on the state, the two attributes and the parse result. The tests check the values 630 and 690.
 - P-18.10-1, P-18.10-4. Evidence: test. The rules are P-4.5c-1 and P-4.5d-1.
-- P-18.10-5. Evidence: test. Without `position`, the expression is undefined, which gives `Fallback` (sub-phase 4.5d).
+- P-18.10-5. Evidence: test. Without `position`, the expression is undefined, which gives `Defer` with `Job::Llm` (sub-phase 4.5d).
 
 ---
 

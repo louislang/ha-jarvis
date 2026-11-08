@@ -126,10 +126,10 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 **Model.**
 
 - Constants: `PEOPLE = Set("alex", "sam")`.
-- State: `home: Option[Set[PERSON]]` (`None` when presence is not known), `occupied: Option[bool]`, `proximity: PERSON -> int`, `voice: PERSON -> int`, `result: Option[PERSON]`, `source: Presence | Proximity | Voice | Answer | NoSource`, `enrolled: List[(PERSON, source)]`.
-- Actions: `setSignals(...)`, `identify` (rules 1 to 4 of sub-phase 15.6), `enroll` (rule 5), `answer(p)` (the user answers `ask_person`).
+- State: `home: Option[Set[PERSON]]` (`None` when presence is not known), `occupied: Option[bool]`, `proximity: PERSON -> int`, `voice: PERSON -> int`, `result: Option[PERSON]`, `source: Presence | Proximity | Voice | NoSource`, `enrolled: List[(PERSON, source)]`.
+- Actions: `setSignals(...)`, `identify` (rules 1 to 4 of sub-phase 15.6), `enroll` (rule 5).
 - Invariants:
-  - `SpeakerIsCandidate`: `result = Some(p)` implies `p` is in `home`, or `home = None`, or `source = Answer`. The user can name a person who is not home.
+  - `SpeakerIsCandidate`: `result = Some(p)` implies `p` is in `home`, or `home = None`.
   - `NoVoiceOnlyEnrollment`: no entry in `enrolled` has source `Voice`.
 
 **Acceptance criteria.**
@@ -139,7 +139,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Proofs.**
 
-- P-15.5-2. `SpeakerIsCandidate`: `identify` chooses only from the candidate set, which is `home` when presence is known (rule 1). `answer(p)` sets `source = Answer`. `NoVoiceOnlyEnrollment`: `enroll` is enabled only when `source` is `Presence`, `Proximity` or `Answer`.
+- P-15.5-2. `SpeakerIsCandidate`: `identify` chooses only from the candidate set, which is `home` when presence is known (rule 1). `NoVoiceOnlyEnrollment`: `enroll` is enabled only when `source` is `Presence` or `Proximity`.
 - P-15.5-1. Evidence: model check.
 
 ---
@@ -158,7 +158,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 2. One candidate gives that person with confidence 1.0 and source `Presence`.
 3. If `occupied` is `Some(false)`, proximity counts 0.
 4. With more than one candidate, score = proximity + voice similarity. The top score must be more than `threshold` and more than the second score plus `margin`. The source is `Proximity` when proximity alone is at least `enroll_threshold` (`0.5` is 1 m or less), else `Voice`.
-5. Jarvis enrolls the embedding only when all of these are true: the source is `Presence`, `Proximity` or `Answer`; the utterance has `min_enroll_ms` of voice or more; and, when the person has `min_profile` samples or more, the voice similarity to that person is at least `voice_threshold` and higher than to each other person. Thus a guest, a TV or stale presence cannot change a profile that has samples.
+5. Jarvis enrolls the embedding only when all of these are true: the source is `Presence` or `Proximity`; the utterance has `min_enroll_ms` of voice or more; and, when the person has `min_profile` samples or more, the voice similarity to that person is at least `voice_threshold` and higher than to each other person. Thus a guest, a TV or stale presence cannot change a profile that has samples.
 
 The interaction record gets the speaker and the source. This sub-phase adds `speaker.threshold`, `speaker.margin`, `speaker.enroll_threshold`, `speaker.min_enroll_ms` and `speaker.min_profile`.
 
@@ -192,21 +192,20 @@ The interaction record gets the speaker and the source. This sub-phase adds `spe
 
 ### 15.7 Person-Specific Intents
 
-**Goal:** Add `needs_speaker`, the `person` template variable, `next_date` and the `ask_person` question. "Add dentist to my calendar for Monday" adds the event to the speaker's calendar.
+**Goal:** Add `needs_speaker`, the `person` template variable and `next_date`. "Add dentist to my calendar for Monday" adds the event to the speaker's calendar.
 
-- **Implements:** G12, G13. **Depends on:** 15.6.
+- **Implements:** G12. **Depends on:** 15.6.
 - **Files:** modify `src/domain/catalog.rs`, `src/domain/responses.rs`, `src/domain/decide.rs`, `src/app/conversation.rs`, `intents.toml`, `responses.toml`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** An intent with `needs_speaker = true` waits up to `speaker.wait_ms` for the embedding, then calls `identify`. The `person` variable has the name and the fields of its `[[people]]` entry. No speaker gives `Ask` from `ask_person`. `next_date(day, plus_days)`: the ISO date of the next `day` (a day name, `today` or `tomorrow`) plus `plus_days`. An empty `day` is today. Another value is an error that gives `Fallback`. This sub-phase adds `speaker.wait_ms`.
+**Model.** An intent with `needs_speaker = true` waits up to `speaker.wait_ms` for the embedding, then calls `identify`. The `person` variable has the name and the fields of its `[[people]]` entry. No speaker gives `Defer` with a filler and `Job::Llm`, because a missing `person` usually means that System One has the wrong intent (sub-phase 4.5). `next_date(day, plus_days)`: the ISO date of the next `day` (a day name, `today` or `tomorrow`) plus `plus_days`. An empty `day` is today. Another value is an error that gives `Defer` with `Job::Llm`. This sub-phase adds `speaker.wait_ms`.
 
 **Acceptance criteria.**
 
 - AC-15.7-1: When Alex says "add dentist to my calendar for monday", `FakeHome` records `calendar.create_event` for `calendar.alex` with `summary = dentist`.
 - AC-15.7-2: When the date is Wednesday 2026-10-28, `next_date("monday", 0)` returns `2026-11-02` and `next_date("monday", 1)` returns `2026-11-03`.
 - AC-15.7-3: When `day` is empty, `next_date` uses today.
-- AC-15.7-4: When `day` is "someday", `next_date` returns an error and `decide` returns `Fallback`.
-- AC-15.7-5: When `identify` returns no speaker, `decide` returns `Ask` from `ask_person` and `FakeHome` records no service call.
-- AC-15.7-6: When the user answers "Alex" to `ask_person`, Jarvis acts for Alex and `FakeVoiceProfiles` records an enroll of the first utterance for Alex.
+- AC-15.7-4: When `day` is "someday", `next_date` returns an error and `decide` returns `Defer` with `Job::Llm`.
+- AC-15.7-5: When `identify` returns no speaker, `decide` returns `Defer` with `Job::Llm` and `FakeHome` records no service call.
 - AC-15.7-7: When the embedding does not complete within `speaker.wait_ms`, Jarvis uses presence and proximity only.
 - AC-15.7-8: When the intent does not have `needs_speaker`, Jarvis does not wait for the speaker.
 - AC-15.7-9 [GPU host]: For "add dentist to my calendar", the response latency has a p95 of 400 ms or less.
@@ -214,9 +213,8 @@ The interaction record gets the speaker and the source. This sub-phase adds `spe
 **Proofs.**
 
 - P-15.7-2, P-15.7-3. Requires: `day` is a day name. Ensures: the result is the first date after today with that weekday, plus `plus_days`. Argument: `next_date` adds `(target - today_weekday + 6) mod 7 + 1` days, which is in `1..=7`. Wednesday to Monday is `(0 - 2 + 6) mod 7 + 1 = 5` days, so 2026-10-28 plus 5 days is 2026-11-02.
-- P-15.7-4. Ensures: a `day` that is not a day name, `today` or `tomorrow` gives `Err`, and `decide` gives `Fallback`. Argument: the parser matches the allowed words and returns `Err` for others, and `decide` maps the error to `Fallback`.
-- P-15.7-5. Ensures: no speaker gives `Ask` from `ask_person` and no call. Argument: `decide` returns `Ask` before it builds a call when the speaker is `None`.
-- P-15.7-6. Requires: `NoVoiceOnlyEnrollment`. Argument: the answer sets the source to `Answer`, which rule 5 allows.
+- P-15.7-4. Ensures: a `day` that is not a day name, `today` or `tomorrow` gives `Err`, and `decide` gives `Defer` with `Job::Llm`. Argument: the parser matches the allowed words and returns `Err` for others, and `decide` maps the error to `Defer`.
+- P-15.7-5. Ensures: no speaker gives `Defer` with `Job::Llm` and no call. Argument: `decide` returns `Defer` before it builds a call when the speaker is `None`.
 - P-15.7-8. Argument: the wait is inside `if intent.needs_speaker`.
 - P-15.7-1, P-15.7-7, P-15.7-9. Evidence: test.
 
