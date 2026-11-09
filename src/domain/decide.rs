@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use jiff::Timestamp;
 use jiff::civil::DateTime;
 use minijinja::value::Serde;
 use rand::rngs::StdRng;
@@ -81,7 +82,7 @@ pub struct PluginCall {
     pub arguments: Map<String, Value>,
 }
 
-/// The transcript and the satellite area of a request.
+/// The transcript, the satellite area and the time of a request.
 #[verus_verify]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Request {
@@ -89,6 +90,8 @@ pub struct Request {
     pub transcript: String,
     /// The area of the satellite.
     pub area: Option<AreaId>,
+    /// The time of the request.
+    pub now: Timestamp,
 }
 
 /// A System Two question with the context of its area.
@@ -309,7 +312,7 @@ pub fn decide(
         return defer(request, pools, rng);
     };
     let confident = *probability >= threshold;
-    match position(catalog, label.as_str()) {
+    match intent_index(catalog, label.as_str()) {
         Some(index)
             if confident
                 && label.as_str() != "unknown"
@@ -359,11 +362,9 @@ fn act(
     };
     let decision = match (intent.kind, &intent.service, area) {
         (Kind::Fetch, _, _) => fetch(intent, &context, pools, rng),
-        (Kind::Query, _, _) => query(intent, area, context, cache, pools, rng),
+        (Kind::Query, _, _) => query(intent, area, context, cache, request.now, pools, rng),
         (Kind::Command, None, _) => respond(intent, &context, None, pools, rng),
-        (_, Some(service), Some(area)) => {
-            call(intent, service.as_str(), area, context, cache, pools, rng)
-        }
+        (_, Some(_), Some(area)) => call(intent, area, context, cache, request.now, pools, rng),
         _ => None,
     };
     match decision {
@@ -394,8 +395,8 @@ fn situation<'a>(
     Some((area, context(intent, prediction, area, cache)?))
 }
 
-/// The reply of the query `intent` rendered with its selection in `area`, or `None` when the
-/// selection is empty, the reply does not render, or `area` is `None` for a target that is not
+/// The reply of the query `intent` rendered with its selection in `area` at `now`, or `None` when
+/// the selection is empty, the reply does not render, or `area` is `None` for a target that is not
 /// `house`. A list query also gets the kept entities of its selection as `entities`.
 #[verus_spec(decision =>
     requires
@@ -413,6 +414,7 @@ fn query(
     area: Option<&AreaId>,
     mut context: Map<String, Value>,
     cache: &StateCache,
+    now: Timestamp,
     pools: &Pools,
     rng: &mut StdRng,
 ) -> Option<Decision> {
@@ -423,16 +425,17 @@ fn query(
         (None, Target::House) => &anywhere,
         (None, _) => return None,
     };
-    let selected = selection(intent, area, &mut context, cache)?;
+    let selected = selection(intent, area, &mut context, cache, now)?;
     if !matches!(intent.target, Target::Entity) {
         let ids = kept(&selected, intent.state.as_ref(), cache);
-        context.insert("entities".to_owned(), entities(&ids, cache));
+        context.insert("entities".to_owned(), entities(&ids, cache, now));
     }
     respond(intent, &context, None, pools, rng)
 }
 
-/// The reply and the call of `service` with the data of `intent` on its selection in `area`, or
-/// `None` when `service` has no dot, the selection is empty or a template does not render.
+/// The reply and the call of the service of `intent` with its data on its selection in `area` at
+/// `now`, or `None` when `intent` has no service, the service has no dot, the selection is empty
+/// or a template does not render.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
@@ -440,21 +443,23 @@ fn query(
     ensures
         decision is None
             || (decision matches Some(Decision::Reply { call: Some(made), .. })
-            && made.target@.len() > 0 && served(service@, made)
+            && made.target@.len() > 0
+            && (intent.service matches Some(service) && served(service@, made))
             && targeted(*intent, *cache, *area, entity_ids(made.target@))
             && stringed(*intent, made.data)),
 )]
 fn call(
     intent: &Intent,
-    service: &str,
     area: &AreaId,
     mut context: Map<String, Value>,
     cache: &StateCache,
+    now: Timestamp,
     pools: &Pools,
     rng: &mut StdRng,
 ) -> Option<Decision> {
-    let (domain, name) = service.split_once('.')?;
-    let selection = selection(intent, area, &mut context, cache)?;
+    let service = intent.service.as_ref()?;
+    let (domain, name) = service.as_str().split_once('.')?;
+    let selection = selection(intent, area, &mut context, cache, now)?;
     let data = data(intent, &context)?;
     let call = ServiceCall {
         domain: domain.to_owned(),
@@ -496,8 +501,9 @@ fn fetch(
 }
 
 /// The selection of `intent` in `area`, with the `entity` text rendered with `context`, and with
-/// the first selected entity as `entity` in `context` for `target = "entity"`. `None` when the
-/// selection is empty, the `entity` text does not render or the cache has no state for `entity`.
+/// the first selected entity at `now` as `entity` in `context` for `target = "entity"`. `None`
+/// when the selection is empty, the `entity` text does not render or the cache has no state for
+/// `entity`.
 #[verus_spec(selected =>
     ensures
         selected matches Some(selected)
@@ -508,6 +514,7 @@ fn selection(
     area: &AreaId,
     context: &mut Map<String, Value>,
     cache: &StateCache,
+    now: Timestamp,
 ) -> Option<Vec<EntityId>> {
     let selected = match (intent.target, &intent.entity) {
         (Target::Entity, Some(entity)) => {
@@ -517,7 +524,7 @@ fn selection(
     };
     let first = selected.first()?;
     if let Target::Entity = intent.target {
-        context.insert("entity".to_owned(), entity(cache, first)?);
+        context.insert("entity".to_owned(), entity(cache, first, now)?);
     }
     Some(selected)
 }
@@ -657,10 +664,10 @@ fn slots(intent: &Intent, prediction: &Prediction) -> Option<Map<String, Value>>
     Some(slots)
 }
 
-/// The state, the attributes and the name of the entity `id`, or `None` when the cache has no
-/// state for it.
+/// The state, the attributes, the name and the play position at `now` of the entity `id`, or
+/// `None` when the cache has no state for it.
 #[verus_verify]
-fn entity(cache: &StateCache, id: &EntityId) -> Option<Value> {
+fn entity(cache: &StateCache, id: &EntityId, now: Timestamp) -> Option<Value> {
     let state = cache.state(id.0.as_str())?;
     let mut entity = Map::new();
     entity.insert("state".to_owned(), Value::from(state.state.clone()));
@@ -668,6 +675,9 @@ fn entity(cache: &StateCache, id: &EntityId) -> Option<Value> {
         "attributes".to_owned(),
         Value::from(state.attributes.clone()),
     );
+    if let Some(seconds) = position(state.state.as_str(), &state.attributes, now) {
+        entity.insert("position".to_owned(), Value::from(seconds));
+    }
     let registered = cache
         .entities
         .iter()
@@ -723,12 +733,39 @@ fn is_stated(id: &EntityId, state: Option<&String>, cache: &StateCache) -> bool 
     }
 }
 
-/// The `entity` object of each ID of `ids` that has a state in `cache`, in order.
+/// The play position in seconds of a player in `state` with `attributes` at `now`:
+/// `media_position`, plus the seconds from `media_position_updated_at` to `now` when `state` is
+/// `playing`. `None` when a value is missing or does not parse.
+#[verus_spec(found =>
+    ensures
+        match (reading(*attributes), found) {
+            (Some((start, updated)), Some(found)) => if state@ == "playing"@ {
+                vstd::std_specs::ops::add_ensures::<f64>(start, elapsed(now, updated), found)
+            } else {
+                found == start
+            },
+            (None, None) => true,
+            _ => false,
+        },
+)]
+fn position(state: &str, attributes: &Map<String, Value>, now: Timestamp) -> Option<f64> {
+    use std::str::FromStr;
+    let start = attributes.get("media_position")?.as_f64()?;
+    let updated = attributes.get("media_position_updated_at")?.as_str()?;
+    let updated = Timestamp::from_str(updated).ok()?;
+    if state == "playing" {
+        Some(start + now.duration_since(updated).as_secs_f64())
+    } else {
+        Some(start)
+    }
+}
+
+/// The `entity` object at `now` of each ID of `ids` that has a state in `cache`, in order.
 #[verus_verify]
-fn entities(ids: &[EntityId], cache: &StateCache) -> Value {
+fn entities(ids: &[EntityId], cache: &StateCache, now: Timestamp) -> Value {
     let mut entities = Vec::new();
     for id in ids {
-        if let Some(found) = entity(cache, id) {
+        if let Some(found) = entity(cache, id, now) {
             entities.push(found);
         }
     }
@@ -836,7 +873,7 @@ fn choose(pools: &Pools, name: &str, rng: &mut StdRng) -> Chosen {
             None => !cataloged(*catalog, name@),
         },
 )]
-fn position(catalog: &Catalog, name: &str) -> Option<usize> {
+fn intent_index(catalog: &Catalog, name: &str) -> Option<usize> {
     let mut index = 0;
     #[cfg_attr(verus_only, verus_spec(
         invariant
@@ -967,6 +1004,31 @@ pub open spec fn acted(intent: Intent, prediction: Prediction, request: Request,
 /// True when `intent` is a query with `target = "house"`.
 pub open spec fn housing(intent: Intent) -> bool {
     intent.kind is Query && intent.target is House
+}
+
+/// The `media_position` of `attributes` and the time of its `media_position_updated_at`, or `None`
+/// when one is missing or does not parse.
+pub open spec fn reading(attributes: Map<String, Value>) -> Option<(f64, Timestamp)> {
+    let start = crate::domain::contracts::attribute(attributes, "media_position");
+    let updated = crate::domain::contracts::attribute(attributes, "media_position_updated_at");
+    match (start, updated) {
+        (Some(start), Some(updated)) => match (
+            crate::domain::contracts::number(start),
+            crate::domain::contracts::text(updated),
+        ) {
+            (Some(start), Some(updated)) => match crate::domain::contracts::instant(updated) {
+                Some(updated) => Some((start, updated)),
+                None => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The seconds from `updated` to `now`.
+pub open spec fn elapsed(now: Timestamp, updated: Timestamp) -> f64 {
+    crate::domain::contracts::seconds(crate::domain::contracts::since(now, updated))
 }
 
 /// True when the cache has a state for `id`, and it is `state` when `state` is `Some`.
@@ -1219,6 +1281,7 @@ mod tests {
         let request = Request {
             transcript: transcript.to_owned(),
             area: Some(AreaId("kitchen".to_owned())),
+            now: Timestamp::UNIX_EPOCH,
         };
         let cache = StateCache::load(house());
         decided_for(&catalog(), (label, probability), &[], &request, &cache)
@@ -1234,6 +1297,7 @@ mod tests {
         let request = Request {
             transcript: String::new(),
             area: area.map(|area| AreaId(area.to_owned())),
+            now: Timestamp::UNIX_EPOCH,
         };
         let slots: Vec<(&str, &str)> = slot.map(|value| ("area", value)).into_iter().collect();
         let cache = StateCache::load(house());
@@ -1262,6 +1326,7 @@ mod tests {
         let request = Request {
             transcript: String::new(),
             area: Some(AreaId(area.to_owned())),
+            now: Timestamp::UNIX_EPOCH,
         };
         decided_for(catalog, (label, 0.89), &[], &request, cache)
     }
@@ -1354,6 +1419,7 @@ mod tests {
         let request = Request {
             transcript: String::new(),
             area: Some(AreaId("office".to_owned())),
+            now: Timestamp::UNIX_EPOCH,
         };
         let cache = StateCache::load(house());
         let decision = decided_for(catalog, ("tv_show", 0.89), slots, &request, &cache);
@@ -1463,6 +1529,7 @@ mod tests {
         let request = Request {
             transcript: String::new(),
             area: Some(AreaId("office".to_owned())),
+            now: Timestamp::UNIX_EPOCH,
         };
         let cache = StateCache::load(snapshot);
         let decision = decided_for(&catalog(), ("climate_down", 0.89), &[], &request, &cache);
@@ -1655,6 +1722,7 @@ mod tests {
         let request = Request {
             transcript: String::new(),
             area: Some(AreaId(area.to_owned())),
+            now: Timestamp::UNIX_EPOCH,
         };
         let slots: Vec<(&str, &str)> = slot.map(|value| ("area", value)).into_iter().collect();
         decided_with(&catalog(), &filed(), (label, 0.89), &slots, &request, cache)
@@ -1939,6 +2007,7 @@ mod tests {
         let request = Request {
             transcript: String::new(),
             area: Some(AreaId(area.to_owned())),
+            now: Timestamp::UNIX_EPOCH,
         };
         let cache = StateCache::load(house());
         decided_for(&catalog(), (label, 0.89), slots, &request, &cache)
@@ -2088,6 +2157,73 @@ mod tests {
         assert_eq!(plex_id("play_episode", &slots), EPISODE);
         let data = data(played("volume_set", &[("volume", "fifty")], "kitchen"));
         assert_eq!(data["volume_level"], Value::from(0.5));
+    }
+
+    /// The call of `media_player.<service>` on the TV with no data.
+    fn on_tv(service: &str) -> ServiceCall {
+        ServiceCall {
+            domain: "media_player".to_owned(),
+            service: service.to_owned(),
+            target: vec![TV.to_owned()],
+            data: Map::new(),
+            return_response: false,
+        }
+    }
+
+    /// The `seek_position` of the `tv_skip` call from the Office when the TV is in `state` at the
+    /// media position 600, updated 60 s before `Timestamp::UNIX_EPOCH`.
+    fn seek(state: &str) -> Value {
+        let mut snapshot = house();
+        let tv = snapshot
+            .states
+            .iter_mut()
+            .find(|known| known.entity_id == TV);
+        let tv = tv.expect("the house has the TV");
+        tv.state = state.to_owned();
+        let updated = Value::from("1969-12-31T23:59:00.000000+00:00");
+        tv.attributes
+            .insert("media_position".to_owned(), Value::from(600));
+        tv.attributes
+            .insert("media_position_updated_at".to_owned(), updated);
+        let cache = StateCache::load(snapshot);
+        let decision = decided_at(&catalog(), "tv_skip", "office", &cache);
+        data(decision)["seek_position"].clone()
+    }
+
+    /// AC-18.10-1.
+    #[test]
+    fn ac_18_10_1_tv_pause_pauses_the_tv() {
+        assert_eq!(
+            called(played("tv_pause", &[], "office")),
+            on_tv("media_pause")
+        );
+    }
+
+    /// AC-18.10-2.
+    #[test]
+    fn ac_18_10_2_tv_skip_seeks_30_s_past_the_paused_position() {
+        assert_eq!(seek("paused"), Value::from(630.0));
+    }
+
+    /// AC-18.10-3.
+    #[test]
+    fn ac_18_10_3_tv_skip_adds_the_time_since_the_update_while_playing() {
+        assert_eq!(seek("playing"), Value::from(690.0));
+    }
+
+    /// AC-18.10-4.
+    #[test]
+    fn ac_18_10_4_tv_stop_stops_the_tv() {
+        assert_eq!(
+            called(played("tv_stop", &[], "office")),
+            on_tv("media_stop")
+        );
+    }
+
+    /// AC-18.10-5.
+    #[test]
+    fn ac_18_10_5_tv_skip_without_a_position_defers() {
+        assert_eq!(played("tv_skip", &[], "office"), deferral(""));
     }
 
     /// AC-7.6-3.

@@ -137,6 +137,7 @@ impl Conversation {
         let request = Request {
             transcript: text.to_owned(),
             area,
+            now: self.two.clock.now(),
         };
         let decision = self.decide(&prediction, &request);
         let (kind, area) = (kind(&decision), request.area.as_ref());

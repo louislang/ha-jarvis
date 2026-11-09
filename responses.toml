@@ -79,6 +79,15 @@ responses = ["Continuing {{ show }}."]
 [pools.play_episode]
 responses = ["Playing {{ show }}, season {{ season }}, episode {{ episode }}."]
 
+[pools.tv_pause]
+responses = ["Pausing the TV."]
+
+[pools.tv_skip]
+responses = ["Skipping ahead."]
+
+[pools.tv_stop]
+responses = ["Stopping the TV."]
+
 [pools.filler]
 responses = ["I will check on that for you.", "Let me look into that.", "One moment."]
 

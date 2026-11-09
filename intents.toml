@@ -216,3 +216,28 @@ service = "media_player.play_media"
 target = "entity"
 select = [{ domain = "media_player", name = "tv" }]
 data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "season_number": {{ season | number }}, "episode_number": {{ episode | number }}}' }
+
+[[intent]]
+name = "tv_pause"
+kind = "command"
+examples = ["pause the tv", "pause the show", "pause the movie"]
+service = "media_player.media_pause"
+target = "entity"
+select = [{ domain = "media_player", name = "tv" }]
+
+[[intent]]
+name = "tv_skip"
+kind = "command"
+examples = ["skip ahead", "skip ahead on the tv", "fast forward the movie"]
+service = "media_player.media_seek"
+target = "entity"
+select = [{ domain = "media_player", name = "tv" }]
+data = { seek_position = "{{ entity.position + 30 }}" }
+
+[[intent]]
+name = "tv_stop"
+kind = "command"
+examples = ["stop the tv", "stop the movie", "stop the show"]
+service = "media_player.media_stop"
+target = "entity"
+select = [{ domain = "media_player", name = "tv" }]

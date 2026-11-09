@@ -12,6 +12,7 @@ use std::str::pattern::Pattern;
 use std::sync::Arc;
 use std::time::Duration;
 
+use jiff::SignedDuration;
 use jiff::Timestamp;
 use jiff::civil::DateTime;
 use minijinja::Environment;
@@ -414,6 +415,55 @@ pub fn ex_timestamp_as_nanosecond(timestamp: Timestamp) -> (result: i128)
     Timestamp::as_nanosecond(timestamp)
 }
 
+/// A `jiff` error. <https://docs.rs/jiff/0.2/jiff/struct.Error.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExJiffError(jiff::Error);
+
+/// The instant that `text` gives, or `None` when it does not parse.
+pub uninterp spec fn instant(text: Seq<char>) -> Option<Timestamp>;
+
+/// Parses `text` into an instant. <https://docs.rs/jiff/0.2/jiff/struct.Timestamp.html#impl-FromStr-for-Timestamp>
+#[verifier::external_fn_specification]
+pub fn ex_timestamp_from_str(text: &str) -> (result: Result<Timestamp, jiff::Error>)
+    ensures
+        match result {
+            Ok(parsed) => instant(text@) == Some(parsed),
+            Err(_) => instant(text@) is None,
+        },
+{
+    <Timestamp as FromStr>::from_str(text)
+}
+
+/// A signed duration in nanoseconds. <https://docs.rs/jiff/0.2/jiff/struct.SignedDuration.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExSignedDuration(SignedDuration);
+
+/// The duration from `earlier` to `later`.
+pub uninterp spec fn since(later: Timestamp, earlier: Timestamp) -> SignedDuration;
+
+/// Gives the duration from `other` to `timestamp`. <https://docs.rs/jiff/0.2/jiff/struct.Timestamp.html#method.duration_since>
+#[verifier::external_fn_specification]
+pub fn ex_timestamp_duration_since(timestamp: Timestamp, other: Timestamp) -> (duration: SignedDuration)
+    ensures
+        duration == since(timestamp, other),
+{
+    timestamp.duration_since(other)
+}
+
+/// The seconds of `duration`, with the fraction.
+pub uninterp spec fn seconds(duration: SignedDuration) -> f64;
+
+/// Gives the seconds of `duration`, with the fraction, as an `f64`. <https://docs.rs/jiff/0.2/jiff/struct.SignedDuration.html#method.as_secs_f64>
+#[verifier::external_fn_specification]
+pub fn ex_signed_duration_as_secs_f64(duration: &SignedDuration) -> (result: f64)
+    ensures
+        result == seconds(*duration),
+{
+    duration.as_secs_f64()
+}
+
 /// The `Arc<str>` with the text `text`.
 pub uninterp spec fn str_key(text: Seq<char>) -> Arc<str>;
 
@@ -547,6 +597,24 @@ pub fn ex_value_from_map(map: Map<String, Value>) -> Value {
 #[verifier::external_fn_specification]
 pub fn ex_value_from_vec<Item: Into<Value>>(items: Vec<Item>) -> Value {
     <Value as From<Vec<Item>>>::from(items)
+}
+
+/// The value of the JSON number `value` as an `f64`, or `None` for another JSON type.
+pub uninterp spec fn number(value: Value) -> Option<f64>;
+
+/// Gives the value of a JSON number as an `f64`. <https://docs.rs/serde_json/1/serde_json/enum.Value.html#method.as_f64>
+#[verifier::external_fn_specification]
+pub fn ex_value_as_f64(value: &Value) -> (result: Option<f64>)
+    ensures
+        result == number(*value),
+{
+    value.as_f64()
+}
+
+/// Makes the JSON number `number`, or `null` when it is infinite or NaN. <https://docs.rs/serde_json/1/serde_json/enum.Value.html#impl-From%3Cf64%3E-for-Value>
+#[verifier::external_fn_specification]
+pub fn ex_value_from_f64(number: f64) -> Value {
+    <Value as From<f64>>::from(number)
 }
 
 /// The text of the JSON string `value`, or `None` for another JSON type.
