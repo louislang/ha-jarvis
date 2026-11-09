@@ -106,7 +106,7 @@ module dialog {
     cancelled' = cancelled,
   }
 
-  /// A new request on `k` starts a deferred job.
+  /// A new request on `k` starts a deferred job and closes the dialog of `k`.
   action defer(k: KEY): bool = all {
     REQUESTS.contains(nextRequest),
     gen' = bump(k),
@@ -115,7 +115,7 @@ module dialog {
     jobGen' = jobGen.set(nextRequest, gen.get(k) + 1),
     nextRequest' = nextRequest + 1,
     now' = now,
-    turns' = turns,
+    turns' = turns.set(k, 0),
     asked' = asked,
     request' = request,
     calls' = calls,
@@ -268,11 +268,15 @@ module dialog {
     .then(fill("s1"))
     .expect(turns.get("s2") == 1 and asked.get("s2") == 0 and request.get("s2") == 1)
 
-  /// A job that asked before a cancel makes no call after it.
+  /// A job that asked before a cancel makes no call after it, and a request that a deferred request replaced cannot fill.
   run ac_10_1_4_job_after_cancel = init
     .then(defer("s1"))
     .then(ask(1))
     .then(cancel("s1"))
     .then(jobAct(1))
     .expect(not(calls.get(1)) and cancelled.get(1) and not(running.get(1)))
+    .then(open("s2"))
+    .then(defer("s2"))
+    .expect(turns.get("s2") == 0)
+    .then(fill("s2").fail())
 }
