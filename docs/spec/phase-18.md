@@ -236,7 +236,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Add Plex movies, the next episode of a show and one episode by number on the TV. "Put on The Matrix" and "season 2 episode 5 of The Office" then play through Plex.
 
 - **Implements:** G3. **Depends on:** 18.8.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/catalog.rs`, `src/domain/responses.rs`, `Cargo.toml`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/decide.rs`, `src/domain/catalog.rs`, `src/domain/responses.rs`, `Cargo.toml`, `xtask/src/rules.rs` (`text2num` in the domain crate list).
 
 **Model.**
 
