@@ -9,37 +9,46 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 **Goal:** Add `quint/dialog.qnt`, the model of open dialogs on several satellites with turns, cancel, timeout and deferred jobs in flight. Prove the turn limit and that a cancelled or replaced request never acts, before the Rust code exists.
 
 - **Implements:** G13, G19. **Depends on:** 17.4.
-- **Files:** create `quint/dialog.qnt`.
+- **Files:** create `quint/dialog.qnt`. Modify `justfile`.
 - **Quint:** `dialog.qnt`.
 
 **Model.**
 
-- Constants: `KEYS = Set("s1", "s2")`, `MAX_TURNS = 3`, `TIMEOUT = 3`.
-- State: `now`, `dialogs: KEY -> { turns: int, asked: int, request: int }` (a partial map), `gen: KEY -> int`, `jobs: Set[{ key, gen, request }]` (deferred jobs in flight), `calls: Set[int]` (requests that acted), `cancelled: Set[int]`, `nextRequest: int`.
+- Constants: `KEYS = Set("s1", "s2")`, `REQUESTS = 1.to(3)`, `MAX_TURNS = 3`, `TIMEOUT = 3`.
+- State: each variable is a map with a fixed domain or a number, so that Apalache can check an inductive invariant.
+  - `now`, `nextRequest`.
+  - For each key: the dialog `turns` (0 is no open dialog), `asked` and `request`, and `gen`.
+  - For each request: its deferred job `running`, `jobKey` and `jobGen`, and `calls` and `cancelled` (booleans).
 - Actions:
-  - `open(k)`: a new request on `k`. `gen[k] += 1`, and `dialogs[k] := { turns: 1, asked: now, request }`.
-  - `defer(k)`: a new request on `k` with a deferred job. `gen[k] += 1`, and add `{ key: k, gen: gen[k], request }` to `jobs`.
-  - `ask(j)` (when `j.gen = gen[j.key]`): the job asks the user and ends. `gen[j.key] += 1`, and `dialogs[j.key] := { turns: 1, asked: now, request: j.request }`. Only `fill` can then act for the request.
-  - `jobAct(j)`: remove `j` from `jobs`. When `j.gen = gen[j.key]`, add `j.request` to `calls`.
-  - `askAgain(k)`: if `turns < MAX_TURNS`, `turns += 1` and `asked := now`, else remove `k`.
-  - `fill(k)`: the answer is a new request on `k`. `gen[k] += 1`. Add the request of the dialog to `calls` and remove `k`.
-  - `cancel(k)`: `gen[k] += 1`. Add the request of the dialog to `cancelled` and remove `k`.
-  - `tick`: `now += 1`. Remove every dialog with `now - asked >= TIMEOUT`.
+  - `open(k)` (when `nextRequest` is in `REQUESTS`): a new request on `k`. `gen[k] += 1`, and the dialog of `k` gets `turns = 1`, `asked = now` and the request.
+  - `defer(k)` (when `nextRequest` is in `REQUESTS`): a new request `r` on `k` with a deferred job. `gen[k] += 1`, `running[r] := true`, `jobKey[r] := k` and `jobGen[r] := gen[k]`.
+  - `ask(r)` (when `running[r]` and `jobGen[r] = gen[jobKey[r]]`): the job asks the user and ends. `gen[jobKey[r]] += 1`, and the dialog of `jobKey[r]` gets `turns = 1`, `asked = now` and `r`. Only `fill` can then act for `r`.
+  - `jobAct(r)` (when `running[r]`): `running[r] := false`. When `jobGen[r] = gen[jobKey[r]]`, `calls[r] := true`.
+  - `askAgain(k)`: if `turns < MAX_TURNS`, `turns += 1` and `asked := now`, else close the dialog.
+  - `fill(k)`: the answer is a new request on `k`. `gen[k] += 1`, `calls[request[k]] := true`, and close the dialog.
+  - `cancel(k)`: `gen[k] += 1`, `cancelled[request[k]] := true`, and close the dialog.
+  - `tick`: `now += 1`. Close every dialog with `now - asked >= TIMEOUT`.
 - One dialog for each key is a property of the map type, so it needs no invariant.
 - Invariants:
-  - `TurnLimit`: every dialog has `turns <= MAX_TURNS`.
-  - `NoCallAfterCancel`: `calls ∩ cancelled = ∅`. A job that started before a cancel can still try to act after it, so the invariant fails without the generation check.
+  - `TurnLimit`: every key has `turns <= MAX_TURNS`.
+  - `NoCallAfterCancel`: no request has both `calls` and `cancelled`. A job that started before a cancel can still try to act after it, so the invariant fails without the generation check.
+  - `Inductive`: the inductive invariant that `quint verify` checks (`02-rules.md` section 4, rule 5). It has the range of each variable, `NoCallAfterCancel` and these facts:
+    - A request at or after `nextRequest` has no job, dialog, call or cancel.
+    - A running job has `jobGen <= gen` of its key.
+    - A live job (running, with the current generation of its key) has no dialog, call or cancel.
+    - The request of an open dialog has no call or cancel, and no other open dialog.
+- A 10-step `quint verify` of this model takes more than 22 minutes on the test machine. The inductive check takes 11 seconds.
 
 **Acceptance criteria.**
 
 - AC-10.1-1 [Quint]: `quint typecheck` passes.
-- AC-10.1-2 [Quint]: `TurnLimit` and `NoCallAfterCancel` hold in simulation and to 10 steps in `quint verify`.
+- AC-10.1-2 [Quint]: `TurnLimit` and `NoCallAfterCancel` hold in simulation. `quint verify` proves that `Inductive` holds in `init`, that each step keeps it, and that it implies both invariants.
 - AC-10.1-3 [Quint]: The test `ac_10_1_3_two_satellites_independent` passes: actions on `s1` do not change the dialog of `s2`.
 - AC-10.1-4 [Quint]: The test `ac_10_1_4_job_after_cancel` passes: a job that asked before a cancel makes no call after it.
 
 **Proofs.**
 
-- P-10.1-2 (AC-10.1-2). `TurnLimit` by induction: `open` and `ask` set 1. `askAgain` increases only when `turns < MAX_TURNS`, so the result is at most `MAX_TURNS`. `NoCallAfterCancel`: a request enters `calls` only in `fill`, or in `jobAct` with the current generation. It enters `cancelled` only in `cancel`. Each request ID comes from one `open` or `defer`, so a request has at most one job. A request gets a dialog from `open`, with no job, or from `ask` of its job. `jobAct` removes the job, so a job that acted cannot ask. `ask` increases the generation, so a job that asked cannot act or ask again. Thus a request has at most one dialog, and a request with a dialog acts only through `fill`. `fill` and `cancel` both remove that dialog, so no request takes both actions.
+- P-10.1-2 (AC-10.1-2). `TurnLimit` by induction: `open` and `ask` set 1. `askAgain` increases only when `turns < MAX_TURNS`, so the result is at most `MAX_TURNS`. `NoCallAfterCancel` by induction on `Inductive`: a request gets `calls` only in `fill`, or in `jobAct` with a live job. It gets `cancelled` only in `cancel`. `open` and `defer` use a new request, which has no job, dialog, call or cancel. `ask` needs a live job, so its request has no dialog, call or cancel. `ask` increases the generation, so the job is no longer live. `fill` and `cancel` close the dialog and increase the generation. Thus a request with a live job or an open dialog has no call or cancel, and no request takes both actions.
 - P-10.1-1, P-10.1-3, P-10.1-4. Evidence: model check.
 
 ---
@@ -66,7 +75,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 - AC-10.2-2: When `take` runs `timeout_s` after the last question, it returns none. When it runs `timeout_s` after `open` but less than `timeout_s` after the last `next_turn`, it returns the dialog.
 - AC-10.2-3: When two satellites have open dialogs, `take` for one does not change the other.
 - AC-10.2-4: When the dialog has `max_turns` turns, `next_turn` returns none.
-- AC-10.2-5: When `quint-connect` replays 100 traces of `dialog.qnt`, `Dialogs` matches the model `dialogs` after each step.
+- AC-10.2-5: When `quint-connect` replays 100 traces of `dialog.qnt`, `Dialogs` matches the open dialogs of the model (`turns`, `asked`, `request`) after each step.
 - AC-10.2-6: When `close` runs for a key, the generation of that key increases by 1 and other keys do not change.
 
 **Proofs.**
