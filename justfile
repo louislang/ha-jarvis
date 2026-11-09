@@ -138,7 +138,11 @@ quint:
         quint typecheck "$model"
         quint test --seed=1 --match='^ac_' "$model"
         quint run --seed=1 --invariant=allInvariants --max-samples=10000 --max-steps=30 "$model"
-        quint verify --invariant=allInvariants --max-steps=10 "$model"
+        if grep -q '^  val Inductive ' "$model"; then
+            quint verify --inductive-invariant=Inductive --invariant=allInvariants "$model"
+        else
+            quint verify --invariant=allInvariants --max-steps=10 "$model"
+        fi
     done
 
 # Check the Python code with the tools of `02-rules.md` section 3.
