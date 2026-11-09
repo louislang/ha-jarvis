@@ -21,7 +21,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
   - For each request: its deferred job `running`, `jobKey` and `jobGen`, and `calls` and `cancelled` (booleans).
 - Actions:
   - `open(k)` (when `nextRequest` is in `REQUESTS`): a new request on `k`. `gen[k] += 1`, and the dialog of `k` gets `turns = 1`, `asked = now` and the request.
-  - `defer(k)` (when `nextRequest` is in `REQUESTS`): a new request `r` on `k` with a deferred job. `gen[k] += 1`, `running[r] := true`, `jobKey[r] := k` and `jobGen[r] := gen[k]`.
+  - `defer(k)` (when `nextRequest` is in `REQUESTS`): a new request `r` on `k` with a deferred job. `gen[k] += 1`, `running[r] := true`, `jobKey[r] := k` and `jobGen[r] := gen[k]`. It also closes the dialog of `k`.
   - `ask(r)` (when `running[r]` and `jobGen[r] = gen[jobKey[r]]`): the job asks the user and ends. `gen[jobKey[r]] += 1`, and the dialog of `jobKey[r]` gets `turns = 1`, `asked = now` and `r`. Only `fill` can then act for `r`.
   - `jobAct(r)` (when `running[r]`): `running[r] := false`. When `jobGen[r] = gen[jobKey[r]]`, `calls[r] := true`.
   - `askAgain(k)`: if `turns < MAX_TURNS`, `turns += 1` and `asked := now`, else close the dialog.
@@ -44,7 +44,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 - AC-10.1-1 [Quint]: `quint typecheck` passes.
 - AC-10.1-2 [Quint]: `TurnLimit` and `NoCallAfterCancel` hold in simulation. `quint verify` proves that `Inductive` holds in `init`, that each step keeps it, and that it implies both invariants.
 - AC-10.1-3 [Quint]: The test `ac_10_1_3_two_satellites_independent` passes: actions on `s1` do not change the dialog of `s2`.
-- AC-10.1-4 [Quint]: The test `ac_10_1_4_job_after_cancel` passes: a job that asked before a cancel makes no call after it.
+- AC-10.1-4 [Quint]: The test `ac_10_1_4_job_after_cancel` passes: a job that asked before a cancel makes no call after it. After `open(k)` and `defer(k)`, `fill(k)` cannot give the replaced request a call.
 
 **Proofs.**
 
