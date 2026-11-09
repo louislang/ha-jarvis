@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use minijinja::Environment;
+use minijinja::ErrorKind;
 use minijinja::UndefinedBehavior;
 use minijinja::value::Serde;
 use rand::Rng;
@@ -11,6 +12,7 @@ use rand::rngs::StdRng;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use text2num::Language;
 use vstd::prelude::*;
 
 use crate::domain::catalog;
@@ -191,11 +193,40 @@ pub fn render(
     template: &str,
     context: &serde_json::Map<String, Value>,
 ) -> Result<String, minijinja::Error> {
-    let mut environment = Environment::new();
-    environment.set_undefined_behavior(UndefinedBehavior::Strict);
+    let mut environment = environment();
     // Without debug mode, an undefined error does not name the variable.
     environment.set_debug(true);
     environment.render_str(template, Serde(context))
+}
+
+/// A template environment where an undefined value is an error, with the filter `number`.
+#[must_use]
+#[verus_verify]
+pub fn environment<'source>() -> Environment<'source> {
+    let mut environment = Environment::new();
+    environment.set_undefined_behavior(UndefinedBehavior::Strict);
+    environment.add_filter("number", number);
+    environment
+}
+
+/// `value` with number words as digits: "two" gives "2". Digits stay unchanged.
+///
+/// # Errors
+///
+/// `value` is not a number.
+#[verus_verify]
+fn number(value: &str) -> Result<String, minijinja::Error> {
+    // The second pass writes numbers as words, and HA refuses "two" as a number.
+    if let Ok(digits) = text2num::text2digits(value, &Language::english()) {
+        return Ok(digits);
+    }
+    if value.parse::<u64>().is_ok() {
+        return Ok(value.to_owned());
+    }
+    Err(minijinja::Error::new(
+        ErrorKind::InvalidOperation,
+        "not a number",
+    ))
 }
 
 /// Checks that each intent of `catalog` and each required pool has a pool, and that each pool has

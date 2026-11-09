@@ -1,10 +1,13 @@
 //! Trusted Verus contracts and axioms for the `std` and domain crate functions that the domain calls.
 
 use std::borrow::Borrow;
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::convert::Infallible;
 use std::hash::Hash;
+use std::num::ParseIntError;
 use std::slice::SliceIndex;
+use std::str::FromStr;
 use std::str::pattern::Pattern;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,9 +16,13 @@ use jiff::Timestamp;
 use jiff::civil::DateTime;
 use minijinja::Environment;
 use minijinja::Error;
+use minijinja::ErrorKind;
 use minijinja::Expression;
 use minijinja::Template;
 use minijinja::UndefinedBehavior;
+use minijinja::functions::Function;
+use minijinja::value::FunctionArgs;
+use minijinja::value::FunctionResult;
 use minijinja::value::Serde;
 use rand::Rng;
 use rand::TryRng;
@@ -23,6 +30,8 @@ use rand::rngs::StdRng;
 use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
+use text2num::LangInterpreter;
+use text2num::Language;
 
 use crate::domain::catalog::Catalog;
 use crate::domain::catalog::Filter;
@@ -295,6 +304,102 @@ pub fn ex_environment_render_str<'source, Context: Into<minijinja::Value>>(
     context: Context,
 ) -> Result<String, Error> {
     environment.render_str(source, context)
+}
+
+/// The arguments of a template function. <https://docs.rs/minijinja/3/minijinja/value/trait.FunctionArgs.html>
+#[verifier::external_trait_specification]
+pub trait ExFunctionArgs<'a> {
+    /// The trait that this specification is for.
+    type ExternalTraitSpecificationFor: FunctionArgs<'a>;
+
+    /// The type of the arguments.
+    type Output;
+}
+
+/// The result of a template function. <https://docs.rs/minijinja/3/minijinja/value/trait.FunctionResult.html>
+#[verifier::external_trait_specification]
+pub trait ExFunctionResult {
+    /// The trait that this specification is for.
+    type ExternalTraitSpecificationFor: FunctionResult;
+}
+
+/// A function that a template can call. <https://docs.rs/minijinja/3/minijinja/functions/trait.Function.html>
+#[verifier::external_trait_specification]
+pub trait ExFunction<Rv, Args: for<'a> FunctionArgs<'a>>: Send + Sync + 'static {
+    /// The trait that this specification is for.
+    type ExternalTraitSpecificationFor: Function<Rv, Args>;
+}
+
+/// Adds the filter `f` with the name `name`. <https://docs.rs/minijinja/3/minijinja/struct.Environment.html#method.add_filter>
+#[verifier::external_fn_specification]
+pub fn ex_environment_add_filter<'source, N, F, Rv, Args>(environment: &mut Environment<'source>, name: N, f: F)
+where
+    N: Into<Cow<'source, str>>,
+    F: Function<Rv, Args>,
+    Rv: FunctionResult,
+    Args: for<'a> FunctionArgs<'a>,
+{
+    environment.add_filter(name, f)
+}
+
+/// The kind of a template error. <https://docs.rs/minijinja/3/minijinja/enum.ErrorKind.html>
+#[verifier::external_type_specification]
+pub struct ExErrorKind(ErrorKind);
+
+/// Creates a template error of the kind `kind` with the text `detail`. <https://docs.rs/minijinja/3/minijinja/struct.Error.html#method.new>
+#[verifier::external_fn_specification]
+pub fn ex_error_new<Detail: Into<Cow<'static, str>>>(kind: ErrorKind, detail: Detail) -> Error {
+    Error::new(kind, detail)
+}
+
+/// A language of number words. <https://docs.rs/text2num/2/text2num/lang/enum.Language.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExLanguage(Language);
+
+/// An error of number word conversion. <https://docs.rs/text2num/2/text2num/error/enum.Error.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExNumberError(text2num::error::Error);
+
+/// A language that converts number words. <https://docs.rs/text2num/2/text2num/lang/trait.LangInterpreter.html>
+#[verifier::external_trait_specification]
+pub trait ExLangInterpreter {
+    /// The trait that this specification is for.
+    type ExternalTraitSpecificationFor: LangInterpreter;
+}
+
+/// Gives the English language. <https://docs.rs/text2num/2/text2num/lang/enum.Language.html#method.english>
+#[verifier::external_fn_specification]
+pub fn ex_language_english() -> Language {
+    Language::english()
+}
+
+/// Converts the number words of `text` into digits, or fails when `text` is not a number. <https://docs.rs/text2num/2/text2num/word_to_digit/fn.text2digits.html>
+#[verifier::external_fn_specification]
+pub fn ex_text2digits<T: LangInterpreter>(text: &str, lang: &T) -> Result<String, text2num::error::Error> {
+    text2num::text2digits(text, lang)
+}
+
+/// A type that parses from a string. <https://doc.rust-lang.org/std/str/trait.FromStr.html>
+#[verifier::external_trait_specification]
+pub trait ExFromStr: Sized {
+    /// The trait that this specification is for.
+    type ExternalTraitSpecificationFor: FromStr;
+
+    /// The type of a parse error.
+    type Err;
+}
+
+/// An error of integer parsing. <https://doc.rust-lang.org/std/num/struct.ParseIntError.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExParseIntError(ParseIntError);
+
+/// Parses `text` into a value of the type `F`. <https://doc.rust-lang.org/std/primitive.str.html#method.parse>
+#[verifier::external_fn_specification]
+pub fn ex_str_parse<F: FromStr>(text: &str) -> Result<F, F::Err> {
+    text.parse()
 }
 
 /// The number of nanoseconds from the Unix epoch to `timestamp`.

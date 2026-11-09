@@ -188,4 +188,31 @@ examples = ["set the volume to [50](volume)", "volume [30](volume)", "set the mu
 service = "media_player.volume_set"
 target = "entity"
 select = [{ domain = "media_player", device_class = "speaker" }]
-data = { volume_level = "{{ volume | int / 100 }}" }
+data = { volume_level = "{{ volume | number | int / 100 }}" }
+
+[[intent]]
+name = "play_movie"
+kind = "command"
+examples = ["put on [the matrix](movie)", "play the movie [inception](movie)", "watch [toy story](movie)", "put on the movie [up](movie)"]
+service = "media_player.play_media"
+target = "entity"
+select = [{ domain = "media_player", name = "tv" }]
+data = { media_content_type = "movie", media_content_id = 'plex://{"library_name": "Movies", "title": "{{ movie }}"}' }
+
+[[intent]]
+name = "continue_show"
+kind = "command"
+examples = ["continue [the office](show)", "play the next episode of [bluey](show)", "keep watching [severance](show)", "next episode of [the office](show)"]
+service = "media_player.play_media"
+target = "entity"
+select = [{ domain = "media_player", name = "tv" }]
+data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "resume": 1}' }
+
+[[intent]]
+name = "play_episode"
+kind = "command"
+examples = ["play season [two](season) episode [five](episode) of [the office](show)", "put on [bluey](show) season [one](season) episode [three](episode)", "watch [severance](show) season [1](season) episode [1](episode)"]
+service = "media_player.play_media"
+target = "entity"
+select = [{ domain = "media_player", name = "tv" }]
+data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "season_number": {{ season | number }}, "episode_number": {{ episode | number }}}' }
