@@ -3,8 +3,6 @@
 use std::collections::BTreeSet;
 
 use jiff::civil::DateTime;
-use minijinja::Environment;
-use minijinja::UndefinedBehavior;
 use minijinja::value::Serde;
 use rand::rngs::StdRng;
 use serde_json::Map;
@@ -589,8 +587,7 @@ fn expression(template: &str) -> Option<&str> {
 /// evaluate, or its result is undefined.
 #[verus_verify]
 fn evaluate(source: &str, context: &Map<String, Value>) -> Option<Value> {
-    let mut environment = Environment::new();
-    environment.set_undefined_behavior(UndefinedBehavior::Strict);
+    let environment = responses::environment();
     let expression = environment.compile_expression(source).ok()?;
     let value = expression.eval(Serde(context)).ok()?;
     if value.is_undefined() {
@@ -2032,6 +2029,64 @@ mod tests {
     #[test]
     fn ac_18_8_3_volume_set_sends_the_level_as_a_number() {
         let data = data(played("volume_set", &[("volume", "50")], "kitchen"));
+        assert_eq!(data["volume_level"], Value::from(0.5));
+    }
+
+    /// The `media_content_id` of the `label` call with `slots` from the Office satellite.
+    fn plex_id(label: &str, slots: &[(&str, &str)]) -> String {
+        let id = &data(played(label, slots, "office"))["media_content_id"];
+        id.as_str()
+            .expect("media_content_id is a string")
+            .to_owned()
+    }
+
+    /// AC-18.9-1.
+    #[test]
+    fn ac_18_9_1_play_movie_plays_the_movie_on_the_tv() {
+        let call = called(played("play_movie", &[("movie", "the matrix")], "office"));
+        let id = r#"plex://{"library_name": "Movies", "title": "the matrix"}"#;
+        let mut data = Map::new();
+        data.insert("media_content_type".to_owned(), Value::from("movie"));
+        data.insert("media_content_id".to_owned(), Value::from(id));
+        let expected = ServiceCall {
+            domain: "media_player".to_owned(),
+            service: "play_media".to_owned(),
+            target: vec![TV.to_owned()],
+            data,
+            return_response: false,
+        };
+        assert_eq!(call, expected);
+    }
+
+    /// AC-18.9-2.
+    #[test]
+    fn ac_18_9_2_continue_show_resumes_the_show() {
+        let id = plex_id("continue_show", &[("show", "the office")]);
+        let expected =
+            r#"plex://{"library_name": "TV Shows", "show_name": "the office", "resume": 1}"#;
+        assert_eq!(id, expected);
+    }
+
+    /// The `media_content_id` of season 2, episode 5 of The Office.
+    const EPISODE: &str = r#"plex://{"library_name": "TV Shows", "show_name": "the office", "season_number": 2, "episode_number": 5}"#;
+
+    /// AC-18.9-3.
+    #[test]
+    fn ac_18_9_3_play_episode_plays_the_episode_by_number() {
+        let slots = [("show", "the office"), ("season", "2"), ("episode", "5")];
+        assert_eq!(plex_id("play_episode", &slots), EPISODE);
+    }
+
+    /// AC-18.9-4.
+    #[test]
+    fn ac_18_9_4_number_words_become_digits() {
+        let slots = [
+            ("show", "the office"),
+            ("season", "two"),
+            ("episode", "five"),
+        ];
+        assert_eq!(plex_id("play_episode", &slots), EPISODE);
+        let data = data(played("volume_set", &[("volume", "fifty")], "kitchen"));
         assert_eq!(data["volume_level"], Value::from(0.5));
     }
 

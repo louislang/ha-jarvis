@@ -70,6 +70,15 @@ responses = ["Turning it down."]
 [pools.volume_set]
 responses = ["Setting the volume to {{ volume }} percent."]
 
+[pools.play_movie]
+responses = ["Putting on {{ movie }}."]
+
+[pools.continue_show]
+responses = ["Continuing {{ show }}."]
+
+[pools.play_episode]
+responses = ["Playing {{ show }}, season {{ season }}, episode {{ episode }}."]
+
 [pools.filler]
 responses = ["I will check on that for you.", "Let me look into that.", "One moment."]
 
