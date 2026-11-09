@@ -386,7 +386,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
   5. A search error, or a response that does not parse, is logged. `resolve` then gives `call` unchanged.
 - `SearchResults { playlists, artists, albums, tracks }` holds a `Vec<MediaItem>` for each key. `MediaItem { media_type, uri, name }` holds the fields of one item. Both are in `src/domain/decide.rs` and derive `Deserialize`. A missing list is empty. The other keys of the response (`radio`, `audiobooks`, `podcasts`, `image`, `favorite` and more) are ignored.
 - `best_match(results, name) -> Option<&MediaItem>` is a pure function. With `normalize` of each name (sub-phase 3.1), it gives the first playlist whose name equals the name, else the first playlist whose name contains it, else the first artist, then album, then track whose name equals it.
-- `HaHome::call` (sub-phase 2.5) sends `target` only when `call.target` is not empty. HA adds the target to the service data, and the schema of `music_assistant.search` does not accept `entity_id`.
+- `HaHome::call` (sub-phase 2.5) sends `target` only when `call.target` is not empty. HA adds the target to the service data, and the schema of `music_assistant.search` does not accept `entity_id`. Verified on the real HA on 2026-11-09: `music_assistant.search` succeeds with no `target` key, and fails with `target: {"entity_id": []}` and with an entity target.
 - Each search takes 1 s to 2 s on the real house. Each call has the deadline `ha.request_timeout_ms` (sub-phase 18.7).
 - `FakeHome` can give different responses to consecutive calls, so a test can give two different search responses.
 

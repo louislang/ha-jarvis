@@ -332,7 +332,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - `Listener` in `src/app/speech.rs` holds the `SpeechToText`, the `Classifier`, the `CommitPolicy` and `model.commit_threshold`. `Listener::listen() -> Result<Box<dyn Listening>>` starts a session on a new first-pass stream. It returns `Result`, because `stream()` can fail (sub-phase 6.6b). A session starts with no last text and `confident` false.
 - `push`: accept the samples. If the partial text changed and is not empty, predict `normalize(text)` with `context_text(None, [])`, keep `confident`, and keep the text as the last text. `silence_ms` is `vad_ms - voice_end_ms`, and `None` when `voice_end_ms` is `None`. `audio_ms` is the duration of the pushed samples at 16 kHz. If `should_commit`, return the transcript, else `None`.
 - `confident` is true when the top label is not `unknown` and `p(top) >= model.commit_threshold` (decision 2). `push` calculates it from the ranked labels of the prediction. No domain function is necessary.
-- `confident` is also false when a slot value of the prediction ends the normalized partial text. A name can continue: "play hip" is a confident command, and in the field test on 2026-11-09 the early commit cut "play hip hop" after "hip". Such an utterance ends at `endpoint_ms`. The prediction gives the slot values and no spans. Each value is a character range of the normalized text (P-3.11b-3), so the end test needs no span. A command that ends with a slot, for example "turn on the lights in the kitchen", thus waits `endpoint_ms`. The phrases of AC-9.2-1 and AC-9.2-5 do not end with a slot. The fix PR `Fix: Endpoint After a Final Slot` adds this rule to `src/app/speech.rs`. `should_commit` and `commit.qnt` do not change, because `confident` is an input of both.
+- `confident` is also false when the value of a `media`, `movie` or `show` slot of the prediction ends the normalized partial text. A name can continue: "play hip" is a confident command, and in the field test on 2026-11-09 the early commit cut "play hip hop" after "hip". Such an utterance ends at `endpoint_ms`. The prediction gives the slot values and no spans. Each value is a character range of the normalized text (P-3.11b-3), so the end test needs no span. The three slot names are a constant in `src/app/speech.rs`. An `area`, `volume`, `season` or `episode` value at the end keeps the early commit, so "turn on the lights in the kitchen" and "set the volume to 50" stay fast. The user accepts the remaining risk: "turn on the lights in the living" can still commit before "room". The fix PR `Fix: Endpoint After a Final Name` adds this rule to `src/app/speech.rs`. `should_commit` and `commit.qnt` do not change, because `confident` is an input of both.
 - A `predict` error is logged, and the partial is not confident. Thus the commit still occurs at `endpoint_ms`.
 - The transcript is the text of the last partial. `finish` returns it at once.
 - The session keeps no commit state. After `push` returns a transcript, the caller drops the session. Sub-phase 6.9 sends one `transcript` for each session (P-6.9-3).
@@ -350,7 +350,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - AC-6.8-11: When the partial is "Turn on the", `FakeClassifier` records the text "turn on the".
 - AC-6.8-12: When `predict` returns an error, `push` commits only at `endpoint_ms` of silence.
 - AC-6.8-13: When the partial is "play hip" and `FakeClassifier` gives `play_music` 0.95 with the slot `media = hip`, `push` commits only at `endpoint_ms` of silence.
-- AC-6.8-14: When the partial is "turn on the kitchen lights" and `FakeClassifier` gives `lights_on` 0.95 with the slot `area = kitchen`, `push` commits `early_commit_ms` after the last voiced sample.
+- AC-6.8-14: When the partial is "turn on the lights in the kitchen" and `FakeClassifier` gives `lights_on` 0.95 with the slot `area = kitchen`, `push` commits `early_commit_ms` after the last voiced sample.
 
 **Proofs.**
 
@@ -361,7 +361,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - P-6.8-6. Argument: `finish` builds the transcript without checking `should_commit`.
 - P-6.8-7 to P-6.8-9. Requires: P-6.5-1, P-6.5-2, P-6.5-5. Evidence: test.
 - P-6.8-12. Argument: a `predict` error sets `confident` to false, and with `confident` false, `should_commit` is true for silence only at `endpoint_ms` (P-6.5-2).
-- P-6.8-13, P-6.8-14. Argument: "play hip" ends with the value "hip", so `confident` is false, and `should_commit` is true for silence only at `endpoint_ms` (P-6.5-2). "turn on the kitchen lights" does not end with "kitchen", so `confident` comes from the ranked labels, and the commit occurs at `early_commit_ms` (P-6.5-1).
+- P-6.8-13, P-6.8-14. Argument: "play hip" ends with the `media` value "hip", so `confident` is false, and `should_commit` is true for silence only at `endpoint_ms` (P-6.5-2). "turn on the lights in the kitchen" ends with an `area` value, which is not one of the three slot names, so `confident` comes from the ranked labels, and the commit occurs at `early_commit_ms` (P-6.5-1).
 
 ---
 
