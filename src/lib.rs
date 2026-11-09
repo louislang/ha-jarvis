@@ -214,11 +214,16 @@ impl Config {
             vad_threshold > 0.0,
             "asr.vad_threshold = {vad_threshold} is out of range: it must be more than 0"
         );
-        let holdout = self.train.holdout;
-        anyhow::ensure!(
-            (0.0..=1.0).contains(&holdout),
-            "train.holdout = {holdout} is out of range: it must be in [0, 1]"
-        );
+        let fractions = [
+            ("train.holdout", self.train.holdout),
+            ("dialog.choice_similarity", self.dialog.choice_similarity),
+        ];
+        for (name, value) in fractions {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&value),
+                "{name} = {value} is out of range: it must be in [0, 1]"
+            );
+        }
         self.validate_relations()
     }
 
@@ -1341,6 +1346,22 @@ mod tests {
             assert!(
                 error.contains(name) && error.contains("more than 0"),
                 "error for {broken} has no field or range: {error}"
+            );
+        }
+    }
+
+    /// `parse` rejects a `dialog.choice_similarity` outside `[0, 1]` and names the field.
+    #[test]
+    fn choice_similarity_out_of_range_names_field_and_range() {
+        for similarity in ["-0.1", "1.1", "nan"] {
+            let text = VALID.replace(
+                "choice_similarity = 0.85",
+                &format!("choice_similarity = {similarity}"),
+            );
+            let error = parse_error(&text);
+            assert!(
+                error.contains("dialog.choice_similarity") && error.contains("[0, 1]"),
+                "error for {similarity} has no field or range: {error}"
             );
         }
     }
