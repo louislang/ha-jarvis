@@ -1096,7 +1096,7 @@ mod tests {
         let _next = network.accept().await;
         assert_eq!(network.event().await, Event::Reconnected);
         let wait = network.attempt(1) - network.attempt(0);
-        assert_eq!(wait, Duration::from_millis(30_000 + 30_000 + 5000 + 100));
+        assert_eq!(wait, Duration::from_millis(30_000 + 30_000 + 30_000 + 100));
         drop(server);
     }
 
