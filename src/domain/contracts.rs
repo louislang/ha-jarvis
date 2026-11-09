@@ -39,6 +39,7 @@ use crate::domain::catalog::Filter;
 use crate::domain::catalog::Intent;
 use crate::domain::catalog::Kind;
 use crate::domain::catalog::Target;
+use crate::domain::dialog::Key;
 use crate::domain::intent::Span;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Response;
@@ -506,6 +507,12 @@ pub broadcast axiom fn axiom_arc_str_maps_borrowed_key<Item>(map: vstd::map::Map
 pub broadcast axiom fn axiom_string_obeys_cmp()
     ensures
         #[trigger] vstd::laws_cmp::obeys_cmp::<String>(),
+;
+
+/// `Key` derives `Ord`, so it compares by its `String`, which has a total order. <https://doc.rust-lang.org/std/cmp/trait.Ord.html#derivable>
+pub broadcast axiom fn axiom_key_obeys_cmp()
+    ensures
+        #[trigger] vstd::laws_cmp::obeys_cmp::<Key>(),
 ;
 
 /// The `String` key with the text `text`.
