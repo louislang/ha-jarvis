@@ -86,6 +86,7 @@ pub mod domain {
     #[cfg(verus_only)]
     pub mod contracts;
     pub mod decide;
+    pub mod dialog;
     pub mod intent;
     pub mod model;
     pub mod responses;
@@ -156,6 +157,8 @@ pub struct Config {
     pub backfill: BackfillConfig,
     /// Announces.
     pub announce: AnnounceConfig,
+    /// Dialogs.
+    pub dialog: DialogConfig,
     /// Training.
     pub train: TrainConfig,
 }
@@ -430,6 +433,16 @@ pub struct AnnounceConfig {
     pub margin_ms: u64,
     /// The deadline for the satellite to become idle. After it, the announce is dropped.
     pub idle_wait_s: u64,
+}
+
+/// The `[dialog]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct DialogConfig {
+    /// The most questions of one dialog.
+    pub max_turns: u32,
+    /// The time after the last question that closes a dialog.
+    pub timeout_s: u64,
 }
 
 /// The `[train]` section.
@@ -1239,6 +1252,10 @@ mod tests {
             announce: AnnounceConfig {
                 margin_ms: 300,
                 idle_wait_s: 30,
+            },
+            dialog: DialogConfig {
+                max_turns: 3,
+                timeout_s: 15,
             },
             train: TrainConfig {
                 base_model: "sentence-transformers/all-MiniLM-L12-v2".to_owned(),
