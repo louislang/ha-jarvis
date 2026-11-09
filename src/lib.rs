@@ -45,6 +45,7 @@ use crate::adapters::ha::HaHome;
 use crate::adapters::onnx::OnnxLoader;
 use crate::adapters::open_meteo::OpenMeteo;
 use crate::adapters::openai::OpenAiReasoner;
+use crate::adapters::plex::Plex;
 use crate::adapters::sherpa::SherpaStt;
 use crate::adapters::supertonic::SupertonicTts;
 use crate::app::background::Backfill;
@@ -112,6 +113,7 @@ pub mod adapters {
     pub mod onnx;
     pub mod open_meteo;
     pub mod openai;
+    pub mod plex;
     pub mod sherpa;
     pub mod supertonic;
     pub mod wyoming;
@@ -384,6 +386,8 @@ pub struct PluginsConfig {
     pub timeout_ms: u64,
     /// The weather plugin.
     pub weather: WeatherConfig,
+    /// The Plex plugin. Without it, Jarvis has no Plex plugin.
+    pub plex: Option<PlexConfig>,
 }
 
 /// The `[plugins.weather]` section.
@@ -392,6 +396,16 @@ pub struct PluginsConfig {
 pub struct WeatherConfig {
     /// The Open-Meteo forecast API.
     pub url: String,
+}
+
+/// The `[plugins.plex]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PlexConfig {
+    /// The Plex server.
+    pub url: String,
+    /// The environment variable of the Plex token.
+    pub token_env: String,
 }
 
 /// The `[backfill]` section.
@@ -511,6 +525,8 @@ pub struct Secrets {
     pub ha_token: String,
     /// `OpenAI` API key.
     pub openai_key: String,
+    /// Plex token, when `[plugins.plex]` is set.
+    pub plex_token: Option<String>,
 }
 
 impl Secrets {
@@ -529,9 +545,11 @@ impl Secrets {
                 "environment variable {name} is not set or is empty"
             )),
         };
+        let plex = config.plugins.plex.as_ref();
         Ok(Self {
             ha_token: secret(&config.ha.token_env)?,
             openai_key: secret(&config.openai.api_key_env)?,
+            plex_token: plex.map(|plex| secret(&plex.token_env)).transpose()?,
         })
     }
 }
@@ -800,19 +818,25 @@ async fn start_live_app(
     pools: Pools,
     home: Arc<dyn Home>,
 ) -> anyhow::Result<(App, JoinHandle<()>, JoinHandle<()>)> {
-    let plugins = registry(config, plugins(config)?);
+    let plugins = registry(config, plugins(config, secrets)?);
     let tools = plugins.tools();
     let reasoner = OpenAiReasoner::try_new(&config.openai, &secrets.openai_key, tools)?;
     start_app(config, catalog, pools, home, Arc::new(reasoner), plugins).await
 }
 
-/// The plugins of `config`: the Open-Meteo weather plugin.
+/// The plugins of `config`: the Open-Meteo weather plugin, and the Plex plugin with the token of
+/// `secrets` when `[plugins.plex]` is set.
 ///
 /// # Errors
 ///
 /// An HTTP client cannot be built.
-fn plugins(config: &Config) -> anyhow::Result<Vec<Arc<dyn Plugin>>> {
-    Ok(vec![Arc::new(OpenMeteo::try_new(&config.plugins.weather)?)])
+fn plugins(config: &Config, secrets: &Secrets) -> anyhow::Result<Vec<Arc<dyn Plugin>>> {
+    let mut plugins: Vec<Arc<dyn Plugin>> =
+        vec![Arc::new(OpenMeteo::try_new(&config.plugins.weather)?)];
+    if let (Some(plex), Some(token)) = (&config.plugins.plex, &secrets.plex_token) {
+        plugins.push(Arc::new(Plex::try_new(plex, token, Arc::new(SystemClock))?));
+    }
+    Ok(plugins)
 }
 
 /// The registry of `plugins` with the `[plugins]` of `config` and the system time.
@@ -1170,6 +1194,10 @@ mod tests {
             weather: WeatherConfig {
                 url: "https://api.open-meteo.com/v1/forecast".to_owned(),
             },
+            plex: Some(PlexConfig {
+                url: "http://plex.local:32400".to_owned(),
+                token_env: "PLEX_TOKEN".to_owned(),
+            }),
         }
     }
 
@@ -1374,7 +1402,11 @@ mod tests {
     /// AC-1.2-1.
     #[test]
     fn ac_1_2_1_resolve_returns_ha_token() -> anyhow::Result<()> {
-        let secrets = resolve(&[("HA_TOKEN", "abc"), ("OPENAI_API_KEY", "key")])?;
+        let secrets = resolve(&[
+            ("HA_TOKEN", "abc"),
+            ("OPENAI_API_KEY", "k"),
+            ("PLEX_TOKEN", "p"),
+        ])?;
         assert_eq!(secrets.ha_token, "abc");
         Ok(())
     }
@@ -1513,13 +1545,35 @@ mod tests {
         system_two(config, reasoner, registry(config, Vec::new()), clock)
     }
 
+    /// The tool names of the registry of the configuration `text` with every variable set.
+    fn tool_names(text: &str) -> anyhow::Result<Vec<String>> {
+        let config = Config::parse(text)?;
+        let secrets = Secrets::resolve(&config, |_| Some("token".to_owned()))?;
+        let tools = registry(&config, plugins(&config, &secrets)?).tools();
+        Ok(tools.into_iter().map(|tool| tool.name).collect())
+    }
+
     /// AC-17.3b-1.
     #[test]
     fn ac_17_3b_1_registry_has_weather() -> anyhow::Result<()> {
-        let config = Config::parse(VALID)?;
-        let tools = registry(&config, plugins(&config)?).tools();
-        let weather = tools.iter().find(|tool| tool.name == "get_weather");
-        assert!(weather.is_some(), "{tools:?}");
+        let names = tool_names(VALID)?;
+        assert!(names.contains(&"get_weather".to_owned()), "{names:?}");
+        Ok(())
+    }
+
+    /// AC-18.11-7.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_11_7_plex_needs_its_section_and_token() -> anyhow::Result<()> {
+        let plex = "get_new_shows".to_owned();
+        assert!(tool_names(VALID)?.contains(&plex), "no Plex plugin");
+        let section =
+            "[plugins.plex]\nurl = \"http://plex.local:32400\"\ntoken_env = \"PLEX_TOKEN\"\n";
+        assert!(VALID.contains(section), "jarvis.toml has no [plugins.plex]");
+        let names = tool_names(&VALID.replace(section, ""))?;
+        assert!(!names.contains(&plex), "{names:?}");
+        let lookup = |name: &str| (name != "PLEX_TOKEN").then(|| "token".to_owned());
+        let error = run_error_with(VALID, lookup).await?;
+        assert!(error.contains("PLEX_TOKEN"), "{error}");
         Ok(())
     }
 
@@ -1691,10 +1745,18 @@ mod tests {
 
     /// The error of `run` for the configuration `text`, with no HA.
     async fn run_error(text: &str) -> anyhow::Result<String> {
+        run_error_with(text, |_: &str| Some("token".to_owned())).await
+    }
+
+    /// The error of `run` for the configuration `text` and the environment `lookup`, with no HA.
+    async fn run_error_with(
+        text: &str,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<String> {
         let folder = tempfile::tempdir()?;
         let config = config_in(folder.path(), text)?;
         let startup = Startup {
-            lookup: |_: &str| Some("token".to_owned()),
+            lookup,
             connector: no_ha(mpsc::unbounded_channel().0),
             shutdown: future::pending(),
         };

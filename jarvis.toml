@@ -54,6 +54,11 @@ timeout_ms = 5000
 [plugins.weather]
 url = "https://api.open-meteo.com/v1/forecast"
 
+# Optional. Without this section, Jarvis has no Plex plugin.
+[plugins.plex]
+url = "http://plex.local:32400"
+token_env = "PLEX_TOKEN"
+
 [backfill]
 min_fresh = 3
 batch = 5

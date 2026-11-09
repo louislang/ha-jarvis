@@ -10,6 +10,7 @@ flowchart LR
         crate_adapters_onnx[onnx]
         crate_adapters_open_meteo[open_meteo]
         crate_adapters_openai[openai]
+        crate_adapters_plex[plex]
         crate_adapters_sherpa[sherpa]
         crate_adapters_supertonic[supertonic]
         crate_adapters_wyoming[wyoming]
@@ -49,6 +50,7 @@ flowchart LR
     crate --> crate_adapters_onnx
     crate --> crate_adapters_open_meteo
     crate --> crate_adapters_openai
+    crate --> crate_adapters_plex
     crate --> crate_adapters_sherpa
     crate --> crate_adapters_supertonic
     crate --> crate_app_background
@@ -83,6 +85,10 @@ flowchart LR
     crate_adapters_openai --> crate_domain_speech
     crate_adapters_openai --> crate_domain_state
     crate_adapters_openai --> crate_ports
+    crate_adapters_plex --> crate
+    crate_adapters_plex --> crate_adapters_plex
+    crate_adapters_plex --> crate_domain_state
+    crate_adapters_plex --> crate_ports
     crate_adapters_sherpa --> crate
     crate_adapters_sherpa --> crate_adapters_sherpa
     crate_adapters_sherpa --> crate_ports
