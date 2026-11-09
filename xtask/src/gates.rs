@@ -1749,11 +1749,16 @@ const STAMP: &str = "models/system-one/fixture/inputs.sha256";
 /// The files of the fixture model that `train.py` writes.
 const MODEL_FILES: [&str; 3] = ["model.onnx", "tokenizer.json", "labels.json"];
 
-/// Makes a Git repository with a training set file, the model files and the tracked files `train/train.py` and `src/lib.rs`.
+/// Makes a Git repository with a training set file, the model files and the tracked files `train/train.py`, `src/lib.rs` and `justfile`.
 fn fixture_repository() -> TempDir {
     let repository = TempDir::new().expect("a temporary folder");
     let models = MODEL_FILES.map(|file| format!("{FIXTURE_FOLDER}/{file}"));
-    let inputs = ["target/fixture/train.json", "train/train.py", "src/lib.rs"];
+    let inputs = [
+        "target/fixture/train.json",
+        "train/train.py",
+        "src/lib.rs",
+        "justfile",
+    ];
     for file in models.iter().map(String::as_str).chain(inputs) {
         let path = repository.path().join(file);
         fs::create_dir_all(path.parent().expect("the file is in a folder"))
@@ -1761,7 +1766,10 @@ fn fixture_repository() -> TempDir {
         fs::write(path, file).expect("the file is written");
     }
     assert_passes(&git(repository.path(), &["init", "--quiet"]));
-    assert_passes(&git(repository.path(), &["add", "train", "src"]));
+    assert_passes(&git(
+        repository.path(),
+        &["add", "train", "src", "justfile"],
+    ));
     repository
 }
 
@@ -1874,6 +1882,26 @@ fn ac_3_9_6_source_change_keeps_model() {
     let hash = write_stamp(repository.path());
     fs::write(repository.path().join("src/lib.rs"), "changed").expect("the source is written");
     assert_eq!(fixture_stale(repository.path()), (Some(1), hash));
+}
+
+/// `fixture-stale` exits with code 0 when only `justfile` changes, and each CI cache key of the fixture model hashes `justfile`.
+#[test]
+fn ac_3_9_7_justfile_change_trains_again() {
+    let repository = fixture_repository();
+    write_stamp(repository.path());
+    fs::write(repository.path().join("justfile"), "changed").expect("the justfile is written");
+    let (code, _) = fixture_stale(repository.path());
+    assert_eq!(code, Some(0), "a new justfile is stale");
+    let ci = yaml(".github/workflows/ci.yml");
+    let keys: Vec<&str> = steps(&ci)
+        .into_iter()
+        .filter(|step| step["with"]["path"].as_str() == Some(FIXTURE_FOLDER))
+        .filter_map(|step| step["with"]["key"].as_str())
+        .collect();
+    assert!(
+        !keys.is_empty() && keys.iter().all(|key| key.contains("'justfile'")),
+        "the fixture model cache keys: {keys:?}"
+    );
 }
 
 /// `train-image` builds the image after CI, pushes it, then inspects its manifest.

@@ -94,7 +94,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: models/system-one/fixture
-          key: fixture-model-${{ hashFiles('target/fixture/train.json', 'train/**') }}
+          key: fixture-model-${{ hashFiles('target/fixture/train.json', 'justfile', 'train/**') }}
       - run: just fixture-model
 
   rust-test:
@@ -133,7 +133,7 @@ jobs:
       - uses: actions/cache@v6
         with:
           path: models/system-one/fixture
-          key: fixture-model-${{ hashFiles('target/fixture/train.json', 'train/**') }}
+          key: fixture-model-${{ hashFiles('target/fixture/train.json', 'justfile', 'train/**') }}
       - run: just fixture-model
       - run: just cov
 
@@ -237,7 +237,7 @@ jobs:
       - uses: actions/cache/restore@v6
         with:
           path: models/system-one/fixture
-          key: fixture-model-${{ hashFiles('target/fixture/train.json', 'train/**') }}
+          key: fixture-model-${{ hashFiles('target/fixture/train.json', 'justfile', 'train/**') }}
           fail-on-cache-miss: true
       - run: sudo systemctl stop jarvis
       - run: just gpu-test

@@ -187,11 +187,11 @@ fixture-model:
         echo "$hash" > "$stamp"
     fi
 
-# Print the hash of the training set file and the tracked files of `train/`. Exit with code 0 when it differs from the file `stamp` or a model file next to `stamp` is missing.
+# Print the hash of the training set file, `justfile` and the tracked files of `train/`. Exit with code 0 when it differs from the file `stamp` or a model file next to `stamp` is missing.
 fixture-stale stamp:
     #!/usr/bin/env bash
     set -euo pipefail
-    hash=$(cat target/fixture/train.json $(git ls-files train) | shasum -a 256 | cut -d ' ' -f 1)
+    hash=$(cat target/fixture/train.json $(git ls-files justfile train) | shasum -a 256 | cut -d ' ' -f 1)
     echo "$hash"
     folder=$(dirname "{{ stamp }}")
     for file in model.onnx tokenizer.json labels.json; do
