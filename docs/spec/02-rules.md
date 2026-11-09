@@ -84,7 +84,7 @@ Do not turn off a rule with `# noqa` or `# type: ignore` to pass a check. Change
    - `quint typecheck`.
    - `quint test --seed=1 --match='^ac_'` (the `run` tests in the model). Without `--match`, Quint runs only the names that end with `Test`. Section 6.1 names the tests `ac_<phase>_<n>_<k>_<words>`.
    - `quint run --seed=1 --invariant=allInvariants --max-samples=10000 --max-steps=30`.
-   - `quint verify --invariant=allInvariants --max-steps=10` (Apalache).
+   - `quint verify --invariant=allInvariants --max-steps=10` (Apalache). A model that defines `val Inductive` runs `quint verify --inductive-invariant=Inductive --invariant=allInvariants` instead. This check is a proof for all executions, not a step bound.
 6. A conformance test uses `quint-connect` to replay 100 traces of 30 steps, from fixed seeds, against the Rust code. After each step, the Rust state must equal the model state. The driver is in the test block of the Rust module. The system driver (sub-phases 16.2 and 16.4) is in `src/testing/e2e.rs`, because it uses all modules.
 7. A change to a stateful rule changes the Rust code, the model and the driver in the same PR.
 
