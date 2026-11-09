@@ -443,6 +443,10 @@ pub struct DialogConfig {
     pub max_turns: u32,
     /// The time after the last question that closes a dialog.
     pub timeout_s: u64,
+    /// The lowest Jaro-Winkler similarity of an answer to the choice that it fills.
+    pub choice_similarity: f64,
+    /// The normalized phrases that cancel a dialog.
+    pub cancel: Vec<String>,
 }
 
 /// The `[train]` section.
@@ -1214,6 +1218,18 @@ mod tests {
         }
     }
 
+    /// The `[dialog]` section of `jarvis.toml`.
+    fn expected_dialog() -> DialogConfig {
+        DialogConfig {
+            max_turns: 3,
+            timeout_s: 15,
+            choice_similarity: 0.85,
+            cancel: ["never mind", "cancel", "forget it", "stop"]
+                .map(str::to_owned)
+                .to_vec(),
+        }
+    }
+
     /// AC-1.1-1.
     #[test]
     fn ac_1_1_1_parse_returns_each_value() -> anyhow::Result<()> {
@@ -1253,10 +1269,7 @@ mod tests {
                 margin_ms: 300,
                 idle_wait_s: 30,
             },
-            dialog: DialogConfig {
-                max_turns: 3,
-                timeout_s: 15,
-            },
+            dialog: expected_dialog(),
             train: TrainConfig {
                 base_model: "sentence-transformers/all-MiniLM-L12-v2".to_owned(),
                 epochs: 8,

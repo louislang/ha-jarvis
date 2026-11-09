@@ -72,6 +72,8 @@ idle_wait_s = 30
 [dialog]
 max_turns = 3
 timeout_s = 15
+choice_similarity = 0.85
+cancel = ["never mind", "cancel", "forget it", "stop"]
 
 [train]
 base_model = "sentence-transformers/all-MiniLM-L12-v2"

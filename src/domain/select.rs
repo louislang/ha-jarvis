@@ -225,7 +225,8 @@ fn is_satellite(cache: &StateCache, device: &str) -> bool {
     ensures
         found == listed(items@, text@),
 )]
-fn is_listed(items: &[String], text: &str) -> bool {
+#[must_use]
+pub fn is_listed(items: &[String], text: &str) -> bool {
     let mut index = 0;
     #[cfg_attr(verus_only, verus_spec(
         invariant
@@ -319,7 +320,8 @@ fn is_named(entity: &Entity, name: &str) -> bool {
     ensures
         found == has_all(views(words@), views(wanted@)),
 )]
-fn has_words(words: &[String], wanted: &[String]) -> bool {
+#[must_use]
+pub fn has_words(words: &[String], wanted: &[String]) -> bool {
     let mut index = 0;
     #[cfg_attr(verus_only, verus_spec(
         invariant
@@ -346,7 +348,8 @@ fn has_words(words: &[String], wanted: &[String]) -> bool {
     ensures
         views(words@) == split(text@),
 )]
-fn words(text: &str) -> Vec<String> {
+#[must_use]
+pub fn words(text: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let mut words = Vec::new();
     let mut word = String::new();
