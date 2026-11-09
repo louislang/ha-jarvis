@@ -241,3 +241,9 @@ examples = ["stop the tv", "stop the movie", "stop the show"]
 service = "media_player.media_stop"
 target = "entity"
 select = [{ domain = "media_player", name = "tv" }]
+
+[[intent]]
+name = "new_shows"
+kind = "fetch"
+examples = ["are there any new shows", "what is new on plex", "is there anything new to watch", "what shows can i continue"]
+plugin = "get_new_shows"

@@ -1179,7 +1179,16 @@ mod tests {
 
     /// The `get_weather` plugin with `result` scripted, in the registry of `conversation`.
     fn weather(conversation: &mut Conversation, result: anyhow::Result<Value>) -> Arc<FakePlugin> {
-        let plugin = Arc::new(FakePlugin::new("get_weather"));
+        with_plugin(conversation, "get_weather", result)
+    }
+
+    /// The plugin `name` with `result` scripted, in the registry of `conversation`.
+    fn with_plugin(
+        conversation: &mut Conversation,
+        name: &str,
+        result: anyhow::Result<Value>,
+    ) -> Arc<FakePlugin> {
+        let plugin = Arc::new(FakePlugin::new(name));
         plugin.script(result);
         conversation.two.plugins = registry(vec![Arc::clone(&plugin) as Arc<dyn Plugin>]);
         plugin
@@ -1673,37 +1682,67 @@ mod tests {
         Ok(())
     }
 
-    /// A conversation on `home` with an idle satellite, a classifier that gives `weather` and the
-    /// pools of `responses.toml`.
-    fn forecaster(home: &Arc<FakeHome>) -> anyhow::Result<Conversation> {
-        let classifier = classifier(Some("weather"));
+    /// The announces after a conversation with an idle satellite and the catalog and pools of
+    /// `intents.toml` and `responses.toml` handles `text` from the kitchen satellite, when the
+    /// classifier gives `label` and the plugin `plugin` gives `result`.
+    async fn announced(
+        label: &str,
+        plugin: &str,
+        result: Value,
+        text: &str,
+    ) -> anyhow::Result<Vec<String>> {
+        let home = Arc::new(FakeHome::default());
+        let classifier = classifier(Some(label));
         let (_cache, _changes, mut conversation) =
-            still_with(home, "idle", classifier, Arc::default());
+            still_with(&home, "idle", classifier, Arc::default());
         let catalog = crate::load_catalog(Path::new("intents.toml"))?;
         let pools = crate::load_pools(Path::new("responses.toml"), &catalog)?;
         conversation.pools = Arc::new(ArcSwap::from_pointee(pools));
-        Ok(conversation)
-    }
-
-    /// AC-17.4-5.
-    #[tokio::test(start_paused = true)]
-    async fn ac_17_4_5_weather_announces_the_forecast() -> anyhow::Result<()> {
-        let home = Arc::new(FakeHome::default());
-        let mut conversation = forecaster(&home)?;
-        let forecast = serde_json::json!({
-            "condition": "partly cloudy", "high": 72, "low": 54, "precipitation_chance": 20
-        });
-        weather(&mut conversation, Ok(forecast));
+        with_plugin(&mut conversation, plugin, Ok(result));
         let context = Context {
             device_id: Some(KITCHEN.to_owned()),
             satellite_id: Some(SATELLITE.to_owned()),
             ..Context::default()
         };
-        let text = "what is the weather like";
         let after = conversation.handle(text, context).await?.after;
         after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
+        Ok(announces(&home))
+    }
+
+    /// AC-17.4-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_17_4_5_weather_announces_the_forecast() -> anyhow::Result<()> {
+        let forecast = serde_json::json!({
+            "condition": "partly cloudy", "high": 72, "low": 54, "precipitation_chance": 20
+        });
+        let text = "what is the weather like";
+        let announces = announced("weather", "get_weather", forecast, text).await?;
         let answer = "Today will be partly cloudy, with a high of 72 degrees.";
-        assert_eq!(announces(&home), [answer]);
+        assert_eq!(announces, [answer]);
+        Ok(())
+    }
+
+    /// The announces of a `new_shows` request when `get_new_shows` gives `added` and `on_deck`.
+    async fn new_shows(added: &[&str], on_deck: &[&str]) -> anyhow::Result<Vec<String>> {
+        let shows = serde_json::json!({ "added": added, "on_deck": on_deck });
+        let text = "are there any new shows";
+        announced("new_shows", "get_new_shows", shows, text).await
+    }
+
+    /// AC-18.12-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_12_2_new_shows_announces_the_added_and_continued_shows() -> anyhow::Result<()> {
+        let answer = "New on Plex: Bluey. You can continue The Office, Severance.";
+        let announces = new_shows(&["Bluey"], &["The Office", "Severance"]).await?;
+        assert_eq!(announces, [answer]);
+        Ok(())
+    }
+
+    /// AC-18.12-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_12_3_no_new_shows_announces_nothing_new() -> anyhow::Result<()> {
+        let answer = "Nothing new was added to Plex in the last day.";
+        assert_eq!(new_shows(&[], &[]).await?, [answer]);
         Ok(())
     }
 

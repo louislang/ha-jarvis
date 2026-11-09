@@ -1609,11 +1609,16 @@ mod tests {
     /// The filler and the `get_weather` fetch with `when = today` of the pool `weather`.
     fn weather() -> Decision {
         let arguments = Map::from_iter([("when".to_owned(), Value::from("today"))]);
+        fetching("get_weather", arguments, "weather")
+    }
+
+    /// The filler and the fetch of `plugin` with `arguments` of the pool `pool`.
+    fn fetching(plugin: &str, arguments: Map<String, Value>, pool: &str) -> Decision {
         let call = PluginCall {
-            plugin: "get_weather".to_owned(),
+            plugin: plugin.to_owned(),
             arguments,
         };
-        let pool = "weather".to_owned();
+        let pool = pool.to_owned();
         let job = Job::Fetch { call, pool };
         Decision::Defer {
             filler: filler(),
@@ -2224,6 +2229,13 @@ mod tests {
     #[test]
     fn ac_18_10_5_tv_skip_without_a_position_defers() {
         assert_eq!(played("tv_skip", &[], "office"), deferral(""));
+    }
+
+    /// AC-18.12-1.
+    #[test]
+    fn ac_18_12_1_new_shows_fetches_from_the_plugin() {
+        let fetch = fetching("get_new_shows", Map::new(), "new_shows");
+        assert_eq!(decided_in(&catalog(), "new_shows", None, None), fetch);
     }
 
     /// AC-7.6-3.
