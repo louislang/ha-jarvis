@@ -880,6 +880,48 @@ pub axiom fn axiom_total_order_is_total()
         total(total_order()),
 ;
 
+/// The IEEE 754 totalOrder of two `f64` floats.
+pub uninterp spec fn total_order_f64() -> spec_fn(f64, f64) -> Ordering;
+
+/// Gives the IEEE 754 totalOrder of `left` and `right`. <https://doc.rust-lang.org/std/primitive.f64.html#method.total_cmp>
+#[verifier::external_fn_specification]
+pub fn ex_f64_total_cmp(left: &f64, right: &f64) -> (ordering: Ordering)
+    ensures
+        ordering == total_order_f64()(*left, *right),
+{
+    left.total_cmp(right)
+}
+
+/// IEEE 754 totalOrder is a total order. <https://doc.rust-lang.org/std/primitive.f64.html#method.total_cmp>
+pub axiom fn axiom_total_order_f64_is_total()
+    ensures
+        total(total_order_f64()),
+;
+
+/// The Jaro-Winkler similarity of `a` and `b`.
+pub uninterp spec fn jaro_winkler(a: Seq<char>, b: Seq<char>) -> f64;
+
+/// Gives the Jaro-Winkler similarity of `a` and `b`. <https://docs.rs/strsim/0.11/strsim/fn.jaro_winkler.html>
+#[verifier::external_fn_specification]
+pub fn ex_jaro_winkler(a: &str, b: &str) -> (similarity: f64)
+    ensures
+        similarity == jaro_winkler(a@, b@),
+{
+    strsim::jaro_winkler(a, b)
+}
+
+/// Gives `text` without the prefix `prefix`, or `None` when `text` does not start with it. <https://doc.rust-lang.org/std/primitive.str.html#method.strip_prefix>
+#[verifier::external_fn_specification]
+pub fn ex_str_strip_prefix<'text, Prefix: Pattern>(text: &'text str, prefix: Prefix) -> (rest: Option<&'text str>)
+    ensures
+        pattern_text(prefix) matches Some(found) ==> match rest {
+            Some(rest) => text@ == found + rest@,
+            None => !found.is_prefix_of(text@),
+        },
+{
+    text.strip_prefix(prefix)
+}
+
 /// The length of `duration` in nanoseconds.
 pub uninterp spec fn nanoseconds(duration: Duration) -> nat;
 

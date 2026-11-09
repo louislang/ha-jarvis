@@ -214,11 +214,16 @@ impl Config {
             vad_threshold > 0.0,
             "asr.vad_threshold = {vad_threshold} is out of range: it must be more than 0"
         );
-        let holdout = self.train.holdout;
-        anyhow::ensure!(
-            (0.0..=1.0).contains(&holdout),
-            "train.holdout = {holdout} is out of range: it must be in [0, 1]"
-        );
+        let fractions = [
+            ("train.holdout", self.train.holdout),
+            ("dialog.choice_similarity", self.dialog.choice_similarity),
+        ];
+        for (name, value) in fractions {
+            anyhow::ensure!(
+                (0.0..=1.0).contains(&value),
+                "{name} = {value} is out of range: it must be in [0, 1]"
+            );
+        }
         self.validate_relations()
     }
 
@@ -443,6 +448,10 @@ pub struct DialogConfig {
     pub max_turns: u32,
     /// The time after the last question that closes a dialog.
     pub timeout_s: u64,
+    /// The lowest Jaro-Winkler similarity of an answer to the choice that it fills.
+    pub choice_similarity: f64,
+    /// The normalized phrases that cancel a dialog.
+    pub cancel: Vec<String>,
 }
 
 /// The `[train]` section.
@@ -1214,6 +1223,18 @@ mod tests {
         }
     }
 
+    /// The `[dialog]` section of `jarvis.toml`.
+    fn expected_dialog() -> DialogConfig {
+        DialogConfig {
+            max_turns: 3,
+            timeout_s: 15,
+            choice_similarity: 0.85,
+            cancel: ["never mind", "cancel", "forget it", "stop"]
+                .map(str::to_owned)
+                .to_vec(),
+        }
+    }
+
     /// AC-1.1-1.
     #[test]
     fn ac_1_1_1_parse_returns_each_value() -> anyhow::Result<()> {
@@ -1253,10 +1274,7 @@ mod tests {
                 margin_ms: 300,
                 idle_wait_s: 30,
             },
-            dialog: DialogConfig {
-                max_turns: 3,
-                timeout_s: 15,
-            },
+            dialog: expected_dialog(),
             train: TrainConfig {
                 base_model: "sentence-transformers/all-MiniLM-L12-v2".to_owned(),
                 epochs: 8,
@@ -1328,6 +1346,22 @@ mod tests {
             assert!(
                 error.contains(name) && error.contains("more than 0"),
                 "error for {broken} has no field or range: {error}"
+            );
+        }
+    }
+
+    /// `parse` rejects a `dialog.choice_similarity` outside `[0, 1]` and names the field.
+    #[test]
+    fn choice_similarity_out_of_range_names_field_and_range() {
+        for similarity in ["-0.1", "1.1", "nan"] {
+            let text = VALID.replace(
+                "choice_similarity = 0.85",
+                &format!("choice_similarity = {similarity}"),
+            );
+            let error = parse_error(&text);
+            assert!(
+                error.contains("dialog.choice_similarity") && error.contains("[0, 1]"),
+                "error for {similarity} has no field or range: {error}"
             );
         }
     }
