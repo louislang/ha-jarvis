@@ -1992,6 +1992,49 @@ mod tests {
         assert_eq!(call.target, ["media_player.carson_bedroom"]);
     }
 
+    /// AC-18.8-1.
+    #[test]
+    fn ac_18_8_1_music_next_skips_on_the_speaker_of_the_area() {
+        let call = called(played("music_next", &[], "kitchen"));
+        let expected = ServiceCall {
+            domain: "media_player".to_owned(),
+            service: "media_next_track".to_owned(),
+            target: vec![KITCHEN_SPEAKER.to_owned()],
+            data: Map::new(),
+            return_response: false,
+        };
+        assert_eq!(call, expected);
+    }
+
+    /// AC-18.8-2.
+    #[test]
+    fn ac_18_8_2_pause_and_volume_call_their_service_on_the_speaker() {
+        for (label, service) in [
+            ("music_pause", "media_pause"),
+            ("volume_up", "volume_up"),
+            ("volume_down", "volume_down"),
+        ] {
+            let call = called(played(label, &[], "kitchen"));
+            assert_eq!(
+                (call.domain.as_str(), call.service.as_str()),
+                ("media_player", service),
+                "{label} calls media_player.{service}"
+            );
+            assert_eq!(
+                call.target,
+                [KITCHEN_SPEAKER],
+                "{label} targets the speaker"
+            );
+        }
+    }
+
+    /// AC-18.8-3.
+    #[test]
+    fn ac_18_8_3_volume_set_sends_the_level_as_a_number() {
+        let data = data(played("volume_set", &[("volume", "50")], "kitchen"));
+        assert_eq!(data["volume_level"], Value::from(0.5));
+    }
+
     /// AC-7.6-3.
     #[test]
     fn ac_7_6_3_area_states_give_the_unskipped_entities_of_the_area() {

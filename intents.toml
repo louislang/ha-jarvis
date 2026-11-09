@@ -148,3 +148,44 @@ service = "music_assistant.play_media"
 target = "entity"
 select = [{ domain = "media_player", device_class = "speaker" }]
 data = { media_id = "{{ media }}", enqueue = "add" }
+
+[[intent]]
+name = "music_next"
+kind = "command"
+examples = ["next song", "skip this song", "play the next track", "skip to the next song in the [kitchen](area)"]
+service = "media_player.media_next_track"
+target = "entity"
+select = [{ domain = "media_player", device_class = "speaker" }]
+
+[[intent]]
+name = "music_pause"
+kind = "command"
+examples = ["pause the music", "stop the music", "pause the music in the [kitchen](area)"]
+service = "media_player.media_pause"
+target = "entity"
+select = [{ domain = "media_player", device_class = "speaker" }]
+
+[[intent]]
+name = "volume_up"
+kind = "command"
+examples = ["turn it up", "volume up", "turn up the music", "make the music louder"]
+service = "media_player.volume_up"
+target = "entity"
+select = [{ domain = "media_player", device_class = "speaker" }]
+
+[[intent]]
+name = "volume_down"
+kind = "command"
+examples = ["turn it down", "volume down", "turn down the music", "make the music quieter"]
+service = "media_player.volume_down"
+target = "entity"
+select = [{ domain = "media_player", device_class = "speaker" }]
+
+[[intent]]
+name = "volume_set"
+kind = "command"
+examples = ["set the volume to [50](volume)", "volume [30](volume)", "set the music volume to [20](volume) percent"]
+service = "media_player.volume_set"
+target = "entity"
+select = [{ domain = "media_player", device_class = "speaker" }]
+data = { volume_level = "{{ volume | int / 100 }}" }
