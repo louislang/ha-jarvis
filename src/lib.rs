@@ -1226,7 +1226,7 @@ mod tests {
             ha: HaConfig {
                 url: "ws://homeassistant.local:8123/api/websocket".to_owned(),
                 token_env: "HA_TOKEN".to_owned(),
-                request_timeout_ms: 5000,
+                request_timeout_ms: 30000,
                 announce_timeout_s: 60,
                 ping_interval_s: 30,
             },
@@ -1313,7 +1313,7 @@ mod tests {
     fn ac_2_2_6_out_of_range_names_field_and_range() {
         let cases = [
             (
-                "request_timeout_ms = 5000",
+                "request_timeout_ms = 30000",
                 "request_timeout_ms = 0",
                 "ha.request_timeout_ms",
             ),
@@ -1384,6 +1384,13 @@ mod tests {
     fn ac_9_1b_3_jarvis_toml_sets_the_commit_silences() -> anyhow::Result<()> {
         let asr = Config::parse(VALID)?.asr;
         assert_eq!((asr.early_commit_ms, asr.vad_min_silence_ms), (100, 60));
+        Ok(())
+    }
+
+    /// AC-18.7-6.
+    #[test]
+    fn ac_18_7_6_jarvis_toml_waits_30_s_for_an_ha_call() -> anyhow::Result<()> {
+        assert_eq!(Config::parse(VALID)?.ha.request_timeout_ms, 30000);
         Ok(())
     }
 
@@ -1791,7 +1798,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_5_4_1_invalid_configuration_fails_before_a_port_opens() -> anyhow::Result<()> {
         let cases = [
-            ("= 5000", "= 0", "ha.request_timeout_ms"),
+            ("= 30000", "= 0", "ha.request_timeout_ms"),
             ("ws:", "wss:", "ha.url"),
         ];
         for (from, to, field) in cases {
