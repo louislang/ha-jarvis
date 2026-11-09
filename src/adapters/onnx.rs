@@ -389,6 +389,30 @@ mod tests {
         assert_top(|intent| intent == "unknown").await
     }
 
+    /// AC-18.7-7.
+    #[tokio::test]
+    async fn ac_18_7_7_slots_contain_the_whole_media_name() -> anyhow::Result<()> {
+        let classifier = OnnxLoader.load(Path::new(FIXTURE), Device::Cpu).await?;
+        let cases = [
+            ("play hip hop", "hip hop"),
+            ("play red hot chili peppers", "red hot chili peppers"),
+            ("play some lo fi beats", "lo fi beats"),
+        ];
+        for (text, media) in cases {
+            let prediction = classifier.predict(CONTEXT, text).await?;
+            let expected = Slot {
+                name: "media".to_owned(),
+                value: media.to_owned(),
+            };
+            assert!(
+                prediction.slots.contains(&expected),
+                "{expected:?} is not in {:?} of {text}",
+                prediction.slots
+            );
+        }
+        Ok(())
+    }
+
     /// AC-3.12-11.
     #[tokio::test]
     async fn ac_3_12_11_long_text_is_truncated() -> anyhow::Result<()> {
