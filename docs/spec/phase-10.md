@@ -19,7 +19,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 - Actions:
   - `open(k)`: a new request on `k`. `gen[k] += 1`, and `dialogs[k] := { turns: 1, asked: now, request }`.
   - `defer(k)`: a new request on `k` with a deferred job. `gen[k] += 1`, and add `{ key: k, gen: gen[k], request }` to `jobs`.
-  - `ask(j)` (when `j.gen = gen[j.key]`): the job asks the user. `dialogs[j.key] := { turns: 1, asked: now, request: j.request }`.
+  - `ask(j)` (when `j.gen = gen[j.key]`): the job asks the user and ends. `gen[j.key] += 1`, and `dialogs[j.key] := { turns: 1, asked: now, request: j.request }`. Only `fill` can then act for the request.
   - `jobAct(j)`: remove `j` from `jobs`. When `j.gen = gen[j.key]`, add `j.request` to `calls`.
   - `askAgain(k)`: if `turns < MAX_TURNS`, `turns += 1` and `asked := now`, else remove `k`.
   - `fill(k)`: the answer is a new request on `k`. `gen[k] += 1`. Add the request of the dialog to `calls` and remove `k`.
@@ -39,7 +39,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 
 **Proofs.**
 
-- P-10.1-2 (AC-10.1-2). `TurnLimit` by induction: `open` and `ask` set 1. `askAgain` increases only when `turns < MAX_TURNS`, so the result is at most `MAX_TURNS`. `NoCallAfterCancel`: a request enters `calls` only in `fill`, or in `jobAct` with the current generation. It enters `cancelled` only in `cancel`. `fill` and `cancel` remove the dialog and increase the generation, so the jobs of that request can no longer act or ask. Each request ID comes from one `open` or `defer`, so no request can take both actions.
+- P-10.1-2 (AC-10.1-2). `TurnLimit` by induction: `open` and `ask` set 1. `askAgain` increases only when `turns < MAX_TURNS`, so the result is at most `MAX_TURNS`. `NoCallAfterCancel`: a request enters `calls` only in `fill`, or in `jobAct` with the current generation. It enters `cancelled` only in `cancel`. Each request ID comes from one `open` or `defer`, so a request has at most one job. A request gets a dialog from `open`, with no job, or from `ask` of its job. `jobAct` removes the job, so a job that acted cannot ask. `ask` increases the generation, so a job that asked cannot act or ask again. Thus a request has at most one dialog, and a request with a dialog acts only through `fill`. `fill` and `cancel` both remove that dialog, so no request takes both actions.
 - P-10.1-1, P-10.1-3, P-10.1-4. Evidence: model check.
 
 ---
@@ -165,7 +165,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 
 A choice is a closed set, so step 2 comes before step 3. The answer to System Two is free text, so step 3 comes before step 4. Each `Slot` dialog asks for the area, so it has choices (sub-phase 10.4).
 
-`close` increases the generation of the key, as each new request on a satellite does (sub-phase 4.9c). A deferred job keeps the generation of its key when it starts. Before each announce, question or call, it compares the generation. When the generation changed, the job stops and makes no announce, no question and no further call. A call that already started is not undone.
+`close` increases the generation of the key, as each new request on a satellite does (sub-phase 4.9c). A deferred job keeps the generation of its key when it starts. Before each announce, question or call, it compares the generation. When the generation changed, the job stops and makes no announce, no question and no further call. A call that already started is not undone. A job that asks increases the generation of its key and ends. The answer continues the request through the dialog.
 
 **Acceptance criteria.**
 
@@ -195,7 +195,7 @@ A choice is a closed set, so step 2 comes before step 3. The answer to System Tw
 - **Implements:** G7, G13. **Depends on:** 10.5.
 - **Files:** modify `src/ports.rs`, `src/adapters/openai.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`.
 
-**Model.** `Step::Ask { question, response_id, call_id }`. The consumer puts the question in the announce queue (sub-phase 4.9b), so it asks when the satellite is idle after the filler. It opens a dialog with `Pending::Llm { response_id, call_id }`. An answer to that dialog sends a `Question` with `previous_response_id` and one `function_call_output` item with `call_id` and the answer text. Each request sets `parallel_tool_calls = false`, so one response has at most one open tool call. When the dialog times out or is cancelled, Jarvis sends nothing for the open call.
+**Model.** `Step::Ask { question, response_id, call_id }`. The consumer increases the generation of the key and ends the job (sub-phase 10.5). It puts the question in the announce queue (sub-phase 4.9b) with the new generation, so it asks when the satellite is idle after the filler. It opens a dialog with `Pending::Llm { response_id, call_id }`. An answer to that dialog sends a `Question` with `previous_response_id` and one `function_call_output` item with `call_id` and the answer text. Each request sets `parallel_tool_calls = false`, so one response has at most one open tool call. When the dialog times out or is cancelled, Jarvis sends nothing for the open call.
 
 **Acceptance criteria.**
 
