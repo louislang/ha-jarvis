@@ -6,6 +6,7 @@ use jiff::Timestamp;
 use jiff::civil::DateTime;
 use minijinja::value::Serde;
 use rand::rngs::StdRng;
+use serde::Deserialize;
 use serde_json::Map;
 use serde_json::Value;
 use vstd::prelude::*;
@@ -16,6 +17,7 @@ use crate::domain::catalog::Intent;
 use crate::domain::catalog::Kind;
 use crate::domain::catalog::Target;
 use crate::domain::dialog::Pending;
+use crate::domain::intent;
 use crate::domain::model::Prediction;
 use crate::domain::model::Slot;
 use crate::domain::responses;
@@ -88,6 +90,41 @@ pub struct PluginCall {
     pub plugin: String,
     /// The arguments.
     pub arguments: Map<String, Value>,
+}
+
+/// The lists of a Music Assistant search response that `best_match` reads. A missing list is empty.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct SearchResults {
+    /// The playlists.
+    pub playlists: Vec<MediaItem>,
+    /// The artists.
+    pub artists: Vec<MediaItem>,
+    /// The albums.
+    pub albums: Vec<MediaItem>,
+    /// The tracks.
+    pub tracks: Vec<MediaItem>,
+}
+
+/// One item of a Music Assistant search response.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct MediaItem {
+    /// For example `playlist` or `artist`.
+    pub media_type: String,
+    /// For example `library://playlist/82`.
+    pub uri: String,
+    /// The name that Music Assistant shows.
+    pub name: String,
+}
+
+/// How the name of an item matches a searched name.
+#[verus_verify]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Matching {
+    /// The names are equal.
+    Equal,
+    /// The name of the item contains the searched name.
+    Containing,
 }
 
 /// The transcript, the satellite area and the time of a request.
@@ -974,6 +1011,84 @@ fn intent_index(catalog: &Catalog, name: &str) -> Option<usize> {
     None
 }
 
+/// The best item of `results` for `name`, with `normalize` of each name: the first playlist with
+/// the name, else the first playlist whose name contains it, else the first artist, album or track
+/// with the name.
+#[verus_spec(found =>
+    ensures
+        match found {
+            Some(item) => candidates(*results, name@).len() > 0 && *item == candidates(*results, name@)[0],
+            None => candidates(*results, name@).len() == 0,
+        },
+)]
+#[must_use]
+pub fn best_match<'a>(results: &'a SearchResults, name: &str) -> Option<&'a MediaItem> {
+    use Matching::Containing;
+    use Matching::Equal;
+    let normal = intent::normalize(name);
+    let (name, playlists) = (normal.as_str(), results.playlists.as_slice());
+    if let Some(found) = first_match(playlists, name, Equal) {
+        return Some(found);
+    }
+    if let Some(found) = first_match(playlists, name, Containing) {
+        return Some(found);
+    }
+    if let Some(found) = first_match(results.artists.as_slice(), name, Equal) {
+        return Some(found);
+    }
+    if let Some(found) = first_match(results.albums.as_slice(), name, Equal) {
+        return Some(found);
+    }
+    first_match(results.tracks.as_slice(), name, Equal)
+}
+
+/// The first item of `items` whose normalized name matches `name` as `how` says.
+#[verus_spec(found =>
+    ensures
+        match found {
+            Some(item) => matched(items@, name@, how).len() > 0 && *item == matched(items@, name@, how)[0],
+            None => matched(items@, name@, how).len() == 0,
+        },
+)]
+fn first_match<'a>(items: &'a [MediaItem], name: &str, how: Matching) -> Option<&'a MediaItem> {
+    let mut index = 0;
+    proof! {
+        assert(items@.skip(0) =~= items@);
+    }
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= items@.len(),
+            matched(items@, name@, how) == matched(items@.skip(index as int), name@, how),
+        decreases items@.len() - index,
+    ))]
+    while index < items.len() {
+        proof! {
+            lemma_matched_step(items@, index as int, name@, how);
+        }
+        if is_match(&items[index], name, how) {
+            return Some(&items[index]);
+        }
+        index += 1;
+    }
+    proof! {
+        items@.skip(index as int).lemma_filter_len(matcher(name@, how));
+    }
+    None
+}
+
+/// True when the normalized name of `item` matches `name` as `how` says.
+#[verus_spec(found =>
+    ensures
+        found == matches_name(*item, name@, how),
+)]
+fn is_match(item: &MediaItem, name: &str, how: Matching) -> bool {
+    let normal = intent::normalize(item.name.as_str());
+    match how {
+        Matching::Equal => normal.as_str() == name,
+        Matching::Containing => normal.as_str().contains(name),
+    }
+}
+
 verus! {
 
 broadcast use {
@@ -1253,6 +1368,49 @@ pub open spec fn targeted(intent: Intent, cache: StateCache, area: AreaId, selec
             && forall|index: int| 0 <= index < cache.entities@.len()
                 && select::local_match(intent, cache, area, #[trigger] cache.entities@[index])
                 ==> !select::lower(cache.entities@[index].entity_id.0, selected[0].0)
+}
+
+/// True when the normalized name of `item` is `name`, or contains `name`, as `how` says.
+pub open spec fn matches_name(item: MediaItem, name: Seq<char>, how: Matching) -> bool {
+    match how {
+        Matching::Equal => intent::normalized(item.name@) == name,
+        Matching::Containing => crate::domain::contracts::infix(name, intent::normalized(item.name@)),
+    }
+}
+
+/// The test of `matches_name` with `name` and `how`.
+pub open spec fn matcher(name: Seq<char>, how: Matching) -> spec_fn(MediaItem) -> bool {
+    |item: MediaItem| matches_name(item, name, how)
+}
+
+/// The items of `items` that match `name` as `how` says, in order.
+pub open spec fn matched(items: Seq<MediaItem>, name: Seq<char>, how: Matching) -> Seq<MediaItem> {
+    items.filter(matcher(name, how))
+}
+
+/// The matches from `index` are the item at `index` when it matches, then the matches after it.
+pub proof fn lemma_matched_step(items: Seq<MediaItem>, index: int, name: Seq<char>, how: Matching)
+    requires
+        0 <= index < items.len(),
+    ensures
+        matched(items.skip(index), name, how) == (if matches_name(items[index], name, how) {
+            seq![items[index]]
+        } else {
+            Seq::empty()
+        }) + matched(items.skip(index + 1), name, how),
+{
+    assert(items.skip(index) =~= seq![items[index]] + items.skip(index + 1));
+    items.skip(index + 1).lemma_filter_prepend(items[index], matcher(name, how));
+}
+
+/// The items that `best_match` can give for `name`, best first.
+pub open spec fn candidates(results: SearchResults, name: Seq<char>) -> Seq<MediaItem> {
+    let name = intent::normalized(name);
+    matched(results.playlists@, name, Matching::Equal)
+        + matched(results.playlists@, name, Matching::Containing)
+        + matched(results.artists@, name, Matching::Equal)
+        + matched(results.albums@, name, Matching::Equal)
+        + matched(results.tracks@, name, Matching::Equal)
 }
 
 } // verus!
@@ -2477,5 +2635,53 @@ mod tests {
         catalog.intents[4].exclude = vec!["sensor.climate_sensor_air_temperature".to_owned()];
         let decision = decided_at(&catalog, "temperature_query", "office", &cache);
         assert_eq!(decision, queried("It is 63.5 degrees in the office."));
+    }
+
+    /// The media type and the name of `best_match` of `name` in the playlists, the artists, the
+    /// albums and the tracks with the names of `lists`.
+    fn best(lists: [&[&str]; 4], name: &str) -> Option<String> {
+        let types = ["playlist", "artist", "album", "track"].into_iter();
+        let pairs = types.zip(lists).map(|(media_type, names)| {
+            let item =
+                |name| serde_json::json!({ "media_type": media_type, "uri": "", "name": name });
+            (format!("{media_type}s"), names.iter().map(item).collect())
+        });
+        let results = serde_json::from_value(Value::Object(pairs.collect())).expect("the results");
+        let found = best_match(&results, name)?;
+        Some(format!("{} {}", found.media_type, found.name))
+    }
+
+    /// AC-18.13-1.
+    #[test]
+    fn ac_18_13_1_playlist_with_the_name_comes_before_one_that_contains_it() {
+        let found = best([&["Hip Hop Mix", "Hip Hop"], &[], &[], &[]], "hip hop");
+        assert_eq!(found.as_deref(), Some("playlist Hip Hop"));
+    }
+
+    /// AC-18.13-2.
+    #[test]
+    fn ac_18_13_2_playlist_that_contains_the_name_matches() {
+        let found = best([&["jazzy"], &[], &[], &[]], "jazz");
+        assert_eq!(found.as_deref(), Some("playlist jazzy"));
+    }
+
+    /// AC-18.13-3.
+    #[test]
+    fn ac_18_13_3_artist_comes_before_album_and_track() {
+        let all = ["Radiohead"].as_slice();
+        let found = best([&[], all, all, all], "radiohead");
+        assert_eq!(found.as_deref(), Some("artist Radiohead"));
+        let found = best([&[], &[], &[], &["Jazz"]], "jazz");
+        assert_eq!(found.as_deref(), Some("track Jazz"));
+    }
+
+    /// AC-18.13-4.
+    #[test]
+    fn ac_18_13_4_no_match_gives_none() {
+        let found = best(
+            [&["Rock"], &["Jazz Messengers"], &[], &["Jazz Standards"]],
+            "jazz",
+        );
+        assert_eq!(found, None);
     }
 }

@@ -102,6 +102,7 @@ fn cache() -> StateCache {
             entity_category: None,
             hidden_by: None,
             disabled_by: None,
+            config_entry_id: None,
         })
         .collect();
     StateCache::load(Snapshot {
