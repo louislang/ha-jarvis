@@ -8,7 +8,6 @@ use std::time::Duration;
 use anyhow::Context as _;
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
-use async_openai::error::OpenAIError;
 use async_openai::types::responses::CreateResponse;
 use async_openai::types::responses::CreateResponseArgs;
 use async_openai::types::responses::FunctionTool;
@@ -189,8 +188,24 @@ fn get_states() -> Tool {
     })
 }
 
-/// The strict function tool of the plugin tool `tool`.
-fn plugin_tool(tool: &ports::Tool) -> Tool {
+/// The `ask_user` tool: one question to the user. Its output is the answer.
+fn ask_user() -> Tool {
+    strict(&ports::Tool {
+        name: "ask_user".to_owned(),
+        description: "Asks the user one short question when the request needs more data. The \
+                      output is the answer of the user."
+            .to_owned(),
+        parameters: json!({
+            "type": "object",
+            "properties": {"question": {"type": "string", "description": "The question to speak."}},
+            "required": ["question"],
+            "additionalProperties": false,
+        }),
+    })
+}
+
+/// The strict function tool of `tool`.
+fn strict(tool: &ports::Tool) -> Tool {
     Tool::Function(FunctionTool {
         name: tool.name.clone(),
         description: Some(tool.description.clone()),
@@ -198,6 +213,23 @@ fn plugin_tool(tool: &ports::Tool) -> Tool {
         strict: Some(true),
         ..FunctionTool::default()
     })
+}
+
+/// The arguments of an `ask_user` tool call.
+#[derive(Deserialize)]
+struct AskArguments {
+    /// The question to speak.
+    question: String,
+}
+
+/// The `function_call_output` item with the output `output` of the call `call_id`.
+///
+/// # Errors
+///
+/// The item does not parse.
+fn output(call_id: &str, output: &str) -> anyhow::Result<InputItem> {
+    let item = json!({"type": "function_call_output", "call_id": call_id, "output": output});
+    Ok(serde_json::from_value(item)?)
 }
 
 /// The arguments of a `get_states` tool call.
@@ -262,6 +294,8 @@ struct Answer {
     request: CreateResponse,
     /// The tool outputs of the current response.
     outputs: Vec<InputItem>,
+    /// The `ask_user` call of the current response.
+    asked: Option<FunctionToolCall>,
     /// The number of tool calls that the answer can still make.
     calls_left: u32,
     /// The tool names of the plugins.
@@ -297,20 +331,46 @@ impl Answer {
                 ..
             }) => self.call(call).await?,
             ResponseStreamEvent::ResponseCompleted(ResponseCompletedEvent { response, .. })
-                if !self.outputs.is_empty() =>
+                if self.asked.is_some() || !self.outputs.is_empty() =>
             {
-                self.request.previous_response_id = Some(response.id);
-                self.request.input = InputParam::Items(mem::take(&mut self.outputs));
-                self.send(rest(buffer))?;
-                return Ok(true);
+                return self.completed(buffer, response.id);
             }
             event => self.send(steps(buffer, event)?)?,
         }
         Ok(false)
     }
 
-    /// Runs the tool call `call` through the consumer and keeps its output.
+    /// Sends the text in `buffer` at the end of the response `response_id` with a tool call. Then
+    /// sends the question of its `ask_user` call, or makes the next request with the tool outputs.
+    /// True when the answer continues.
+    ///
+    /// # Errors
+    ///
+    /// The arguments of the `ask_user` call are not valid.
+    fn completed(&mut self, buffer: &mut String, response_id: String) -> anyhow::Result<bool> {
+        let Some(call) = self.asked.take() else {
+            self.request.previous_response_id = Some(response_id);
+            self.request.input = InputParam::Items(mem::take(&mut self.outputs));
+            self.send(rest(buffer))?;
+            return Ok(true);
+        };
+        let arguments: AskArguments = serde_json::from_str(&call.arguments)?;
+        let ask = Step::Ask {
+            question: arguments.question,
+            response_id,
+            call_id: call.call_id,
+        };
+        self.send(rest(buffer).into_iter().chain([ask]))?;
+        Ok(false)
+    }
+
+    /// Runs the tool call `call` through the consumer and keeps its output. Keeps an `ask_user`
+    /// call for the end of the response.
     async fn call(&mut self, call: FunctionToolCall) -> anyhow::Result<()> {
+        if call.name == "ask_user" {
+            self.asked = Some(call);
+            return Ok(());
+        }
         let (reply, result) = oneshot::channel();
         let result = match self.step(&call, reply) {
             Ok(step) => {
@@ -319,14 +379,12 @@ impl Answer {
             }
             Err(error) => Err(error),
         };
-        let output = match result {
+        let text = match result {
             Ok(Some(response)) => response.to_string(),
             Ok(None) => "done".to_owned(),
             Err(error) => format!("error: {error:#}"),
         };
-        let output =
-            json!({"type": "function_call_output", "call_id": call.call_id, "output": output});
-        self.outputs.push(serde_json::from_value(output)?);
+        self.outputs.push(output(&call.call_id, &text)?);
         Ok(())
     }
 
@@ -465,22 +523,33 @@ impl OpenAiReasoner {
         Ok(true)
     }
 
-    /// The first response request of the answer to `question`, with `call_service`, `get_states`
-    /// and the plugin tools.
+    /// The first response request of the answer to `question`, with `call_service`, `get_states`,
+    /// `ask_user` and the plugin tools, and one tool call at a time. When `question` answers an
+    /// `ask_user` call, only its text as the output of the call, after the response of the call.
     ///
     /// # Errors
     ///
     /// The request cannot be built.
-    fn request(&self, question: &Question) -> Result<CreateResponse, OpenAIError> {
-        let mut tools = vec![call_service(&self.read_services), get_states()];
-        tools.extend(self.plugins.iter().map(plugin_tool));
-        CreateResponseArgs::default()
+    fn request(&self, question: &Question) -> anyhow::Result<CreateResponse> {
+        let mut tools = vec![call_service(&self.read_services), get_states(), ask_user()];
+        tools.extend(self.plugins.iter().map(strict));
+        let mut request = CreateResponseArgs::default();
+        request
             .model(&self.model)
             .instructions(system_prompt())
-            .input(user_message(question))
             .tools(tools)
             .max_output_tokens(self.max_output_tokens)
-            .build()
+            .parallel_tool_calls(false);
+        match &question.answers {
+            Some(call) => request
+                .previous_response_id(&call.response_id)
+                .input(InputParam::Items(vec![output(
+                    &call.call_id,
+                    &question.text,
+                )?])),
+            None => request.input(user_message(question)),
+        };
+        Ok(request.build()?)
     }
 }
 
@@ -514,6 +583,7 @@ impl Reasoner for OpenAiReasoner {
                 client,
                 request: request?,
                 outputs: Vec::new(),
+                asked: None,
                 calls_left,
                 plugins,
                 steps,
@@ -566,6 +636,7 @@ mod tests {
 
     use crate::Config;
     use crate::domain::decide;
+    use crate::domain::decide::AskCall;
     use crate::domain::state::AreaId;
     use crate::domain::state_cache::StateCache;
     use crate::testing::fakes::FakePlugin;
@@ -723,6 +794,15 @@ mod tests {
         States(String),
         /// A plugin call.
         Plugin(PluginCall),
+        /// A question to the user.
+        Ask {
+            /// The question text.
+            question: String,
+            /// The ID of the response that asks.
+            response_id: String,
+            /// The ID of the `ask_user` call.
+            call_id: String,
+        },
         /// The end of the answer.
         Done,
     }
@@ -767,7 +847,15 @@ mod tests {
                 on(reply)?;
                 Seen::Plugin(call)
             }
-            Step::Ask { .. } => anyhow::bail!("the answer asks"),
+            Step::Ask {
+                question,
+                response_id,
+                call_id,
+            } => Seen::Ask {
+                question,
+                response_id,
+                call_id,
+            },
             Step::Done => Seen::Done,
         })
     }
@@ -956,6 +1044,45 @@ mod tests {
         assert_eq!(calls.count(), 0, "{seen:?}");
         assert_eq!(outputs[5]["call_id"], "call_6");
         assert_eq!(outputs[5]["output"], "error: limit reached");
+        Ok(())
+    }
+
+    /// AC-10.6b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_6b_1_ask_user_call_gives_ask() -> anyhow::Result<()> {
+        let arguments = r#"{"question": "How many people?"}"#;
+        let (seen, bodies) = requested(&[("ask_user", arguments)]).await?;
+        let ask = Seen::Ask {
+            question: "How many people?".to_owned(),
+            response_id: "resp_1".to_owned(),
+            call_id: "call_1".to_owned(),
+        };
+        assert_eq!(seen, [ask]);
+        assert_eq!(bodies.len(), 1);
+        Ok(())
+    }
+
+    /// AC-10.6b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_6b_2_answer_is_the_output_of_the_ask_user_call() -> anyhow::Result<()> {
+        let (server, reasoner) = serve(spoken(TEXT, &["Done."])).await?;
+        let answers = Some(AskCall {
+            response_id: "resp_0".to_owned(),
+            call_id: "call_0".to_owned(),
+        });
+        let text = "four".to_owned();
+        let answer = Question {
+            text,
+            answers,
+            ..question(Some("kitchen"))
+        };
+        let _steps: Vec<anyhow::Result<Step>> = reasoner.answer(&answer).collect().await;
+        let requests = server.received_requests().await.context("no requests")?;
+        let body: Value = requests[0].body_json()?;
+        assert_eq!(body["previous_response_id"], "resp_0");
+        let output = json!({"type": "function_call_output", "call_id": "call_0", "output": "four"});
+        assert_eq!(body["input"], json!([output]));
+        assert_eq!(body["parallel_tool_calls"], false);
         Ok(())
     }
 

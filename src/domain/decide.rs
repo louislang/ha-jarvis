@@ -158,6 +158,18 @@ pub struct Question {
     pub unassigned: Vec<EntityState>,
     /// The local time in the HA time zone.
     pub now: DateTime,
+    /// The `ask_user` call that `text` answers, or `None` for a new request.
+    pub answers: Option<AskCall>,
+}
+
+/// One `ask_user` call of System Two.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct AskCall {
+    /// The ID of the response that asked.
+    pub response_id: String,
+    /// The ID of the tool call.
+    pub call_id: String,
 }
 
 /// The name, the entity ID and the state of one entity.
@@ -203,6 +215,7 @@ pub fn question(
         areas: area_names(cache),
         unassigned: unassigned_entities(domains, cache),
         now,
+        answers: None,
     }
 }
 
