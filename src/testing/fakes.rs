@@ -316,12 +316,15 @@ pub(crate) enum Scripted {
 /// The receiver of the tool result of one call.
 type Reply = oneshot::Receiver<anyhow::Result<Option<Value>>>;
 
-/// A `Reasoner` that counts the `warm` calls, answers with the scripted steps, keeps the reply of
-/// each call, records the pool of each `generate` call and holds it until `release`.
+/// A `Reasoner` that counts the `warm` calls, records the text of each question, answers with the
+/// scripted steps, keeps the reply of each call, records the pool of each `generate` call and holds
+/// it until `release`.
 #[derive(Default)]
 pub(crate) struct FakeReasoner {
     /// The number of `warm` calls.
     warms: AtomicUsize,
+    /// The text of each question, in order.
+    questions: Mutex<Vec<String>>,
     /// The steps of the next answer, in order.
     script: Mutex<Vec<Scripted>>,
     /// The reply of each call, in order.
@@ -337,6 +340,12 @@ impl FakeReasoner {
     #[must_use]
     pub(crate) fn warms(&self) -> usize {
         self.warms.load(Ordering::SeqCst)
+    }
+
+    /// The text of each question, in order.
+    #[must_use]
+    pub(crate) fn questions(&self) -> Vec<String> {
+        lock(&self.questions).clone()
     }
 
     /// Makes the next answer give `steps`.
@@ -398,7 +407,8 @@ impl Reasoner for FakeReasoner {
         Ok(())
     }
 
-    fn answer(&self, _question: &Question) -> BoxStream<'static, anyhow::Result<Step>> {
+    fn answer(&self, question: &Question) -> BoxStream<'static, anyhow::Result<Step>> {
+        lock(&self.questions).push(question.text.clone());
         let steps = mem::take(&mut *lock(&self.script));
         let replies = Arc::clone(&self.replies);
         let step = move |step| answered(step, Arc::clone(&replies));

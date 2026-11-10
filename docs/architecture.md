@@ -108,11 +108,13 @@ flowchart LR
     crate_app_background --> crate_domain_state
     crate_app_background --> crate_domain_state_cache
     crate_app_background --> crate_ports
+    crate_app_conversation --> crate
     crate_app_conversation --> crate_app_background
     crate_app_conversation --> crate_app_conversation
     crate_app_conversation --> crate_app_plugins
     crate_app_conversation --> crate_domain_catalog
     crate_app_conversation --> crate_domain_decide
+    crate_app_conversation --> crate_domain_dialog
     crate_app_conversation --> crate_domain_intent
     crate_app_conversation --> crate_domain_model
     crate_app_conversation --> crate_domain_responses

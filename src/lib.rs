@@ -887,7 +887,7 @@ async fn start_app(
     plugins: Arc<Plugins>,
 ) -> anyhow::Result<(App, JoinHandle<()>, JoinHandle<()>)> {
     let task = start_pools(config, pools)?;
-    let (cache, queues) = start_sync(home, &config.announce);
+    let (cache, queues) = start_sync(home, config);
     let (classifier, listener, speech) = load_models(config, Arc::clone(&reasoner)).await?;
     let prerender = start_prerender(&speech, &task.pools, cache.clone());
     let catalog = Arc::new(catalog);
@@ -977,17 +977,15 @@ async fn load_models(
 }
 
 /// Starts the sync of a hot cache with `home`. Gives the hot cache and the announce queues of
-/// `announce` on it.
-fn start_sync(
-    home: Arc<dyn Home>,
-    announce: &AnnounceConfig,
-) -> (watch::Receiver<StateCache>, Arc<Queues>) {
+/// `config` on it.
+fn start_sync(home: Arc<dyn Home>, config: &Config) -> (watch::Receiver<StateCache>, Arc<Queues>) {
     let (cache, receiver) = watch::channel(StateCache::default());
     let sync = Arc::clone(&home);
     tokio::spawn(async move { app::background::sync(sync.as_ref(), &cache).await });
-    let margin = Duration::from_millis(announce.margin_ms);
-    let idle_wait = Duration::from_secs(announce.idle_wait_s);
-    let queues = Queues::new(home, receiver.clone(), margin, idle_wait);
+    let margin = Duration::from_millis(config.announce.margin_ms);
+    let idle_wait = Duration::from_secs(config.announce.idle_wait_s);
+    let dialog = config.dialog.clone();
+    let queues = Queues::new(home, receiver.clone(), margin, idle_wait, dialog);
     (receiver, Arc::new(queues))
 }
 
@@ -1588,12 +1586,14 @@ mod tests {
         names.map(pool).collect()
     }
 
-    /// Queues on `FakeHome` and the hot cache of the reference house.
-    fn queues() -> Arc<Queues> {
+    /// Queues on `FakeHome` and the hot cache of the reference house, with the `[dialog]` of
+    /// `config`.
+    fn queues(config: &Config) -> Arc<Queues> {
         let (_cache, receiver) = watch::channel(StateCache::load(fakes::house()));
         let wait = Duration::from_secs(1);
         let home = Arc::new(FakeHome::default());
-        Arc::new(Queues::new(home, receiver, wait, wait))
+        let dialog = config.dialog.clone();
+        Arc::new(Queues::new(home, receiver, wait, wait, dialog))
     }
 
     /// System Two of `config` on `FakeReasoner` at the Unix epoch.
@@ -1635,8 +1635,8 @@ mod tests {
         Ok(())
     }
 
-    /// The conversation of `config` with `classifier`, `queues()`, `two(config)`, the pools of
-    /// `catalog` and a backfill on `FakeReasoner` and `speech`.
+    /// The conversation of `config` with `classifier`, `queues(config)`, `two(config)`, the pools
+    /// of `catalog` and a backfill on `FakeReasoner` and `speech`.
     fn conversation(
         config: &Config,
         catalog: Catalog,
@@ -1647,7 +1647,7 @@ mod tests {
         let (catalog, cache) = (Arc::new(catalog), watch::channel(StateCache::default()).1);
         let reasoner: Arc<dyn Reasoner> = Arc::new(FakeReasoner::default());
         let backfill = backfill(config, &reasoner, task.changes, speech, &catalog, cache);
-        let (queues, threshold) = (queues(), config.model.threshold);
+        let (queues, threshold) = (queues(config), config.model.threshold);
         Ok(Conversation::new(
             task.pools,
             backfill,
