@@ -179,7 +179,7 @@ impl Conversation {
             Decision::Ask { pending, .. } => Some(pending.clone()),
             _ => None,
         };
-        let handled = self.reply(decision, area, satellite).await;
+        let handled = self.reply(decision, area, satellite, key.clone()).await;
         if let (Some(key), Some(pending)) = (key, pending) {
             self.queues.dialogs().open(key, pending, request.now);
         }
@@ -334,20 +334,23 @@ impl Conversation {
     }
 
     /// The dispatch of `decision` from `area` on `satellite`. Without `satellite`, the answer of a
-    /// deferred job, or a `failure` answer when the job fails.
+    /// deferred job, whose question opens a dialog for `key`, or a `failure` answer when the job
+    /// fails.
     async fn reply(
         &self,
         decision: Decision,
         area: Option<&AreaId>,
         satellite: Option<&str>,
+        key: Option<Key>,
     ) -> Handled {
         let answer = match (decision, satellite) {
             (Decision::Defer { job, .. }, None) => match job {
                 Job::Fetch { call, pool } => self.fetched(&call, &pool).await,
-                Job::Llm(text) => self
-                    .answer(&text, area, None)
-                    .await
-                    .map(|all| all.join(" ")),
+                Job::Llm(text) => {
+                    let thread = Thread { request: None, key };
+                    let answer = self.answer(&text, area, &thread).await;
+                    answer.map(|all| all.join(" "))
+                }
             },
             (decision, satellite) => return self.dispatch(decision, area, satellite),
         };
@@ -379,7 +382,10 @@ impl Conversation {
                 filler,
                 job: Job::Llm(text),
             } => {
-                let llm = request.map(|request| self.llm(text, area.cloned(), request));
+                let llm = request.map(|request| {
+                    let (request, key) = (Some(request), None);
+                    self.llm(text, area.cloned(), Thread { request, key })
+                });
                 (filler, llm)
             }
             Decision::Ask { question, .. } => self.ask(question, request),
@@ -504,20 +510,18 @@ impl Conversation {
         .boxed()
     }
 
-    /// Announces each sentence of the System Two answer to `text` from `area` on the satellite
-    /// of `request` as it arrives, or a `failure` answer when the answer fails.
-    fn llm(&self, text: String, area: Option<AreaId>, request: (String, u64)) -> Work {
+    /// Announces each sentence of the System Two answer to `text` from `area` in `thread` on the
+    /// satellite of its request as it arrives, or a `failure` answer when the answer fails.
+    fn llm(&self, text: String, area: Option<AreaId>, thread: Thread) -> Work {
         let conversation = self.clone();
         async move {
-            let Err(error) = conversation
-                .answer(&text, area.as_ref(), Some(&request))
-                .await
-            else {
+            let answer = conversation.answer(&text, area.as_ref(), &thread).await;
+            let (Err(error), Some((satellite, generation))) = (answer, &thread.request) else {
                 return Ok(());
             };
-            let (text, (satellite, generation)) = (conversation.or_failure(Err(error)), request);
+            let text = conversation.or_failure(Err(error));
             let queues = &conversation.queues;
-            queues.announce(&satellite, generation, &text).await
+            queues.announce(satellite, *generation, &text).await
         }
         .boxed()
     }
@@ -547,20 +551,20 @@ impl Conversation {
             .collect()
     }
 
-    /// The sentences of the System Two answer to `text` from `area`. With `request`, announces
-    /// each sentence on its satellite as it arrives instead. Makes each call before the next step
-    /// and sends back its result. Ends before a call when `request` is no longer the newest of
-    /// its satellite.
+    /// The sentences of the System Two answer to `text` from `area` in `thread`. With a request,
+    /// announces each sentence on its satellite as it arrives instead. Makes each call before the
+    /// next step and sends back its result. Ends before a call when the request is no longer the
+    /// newest of its satellite.
     ///
     /// # Errors
     ///
     /// The HA configuration or its time zone is not known, the answer fails, no step comes
-    /// within the timeout, or an announce fails.
+    /// within the timeout, or an announce or a question fails.
     async fn answer(
         &self,
         text: &str,
         area: Option<&AreaId>,
-        request: Option<&(String, u64)>,
+        thread: &Thread,
     ) -> anyhow::Result<Vec<String>> {
         use anyhow::Context as _;
         use futures::StreamExt;
@@ -569,25 +573,26 @@ impl Conversation {
         while more {
             let next = tokio::time::timeout(self.two.timeout, steps.next()).await;
             more = match next.context("no step of the answer within the timeout")? {
-                Some(step) => self.step(step?, request, &mut sentences).await?,
+                Some(step) => self.step(step?, thread, &mut sentences).await?,
                 None => false,
             };
         }
         Ok(sentences)
     }
 
-    /// Runs `step` of the System Two answer for `request`, as `answer` describes. False when the
+    /// Runs `step` of the System Two answer in `thread`, as `answer` describes. False when the
     /// answer ends.
     ///
     /// # Errors
     ///
-    /// An announce fails.
+    /// An announce or a question fails.
     async fn step(
         &self,
         step: Step,
-        request: Option<&(String, u64)>,
+        thread: &Thread,
         sentences: &mut Vec<String>,
     ) -> anyhow::Result<bool> {
+        let request = thread.request.as_ref();
         match step {
             Step::Sentence(sentence) => self.say(sentence, request, sentences).await?,
             Step::Call(call, reply) => return Ok(self.step_call(call, reply, request).await),
@@ -599,9 +604,52 @@ impl Conversation {
                 // The send fails only when the answer has ended, so the result is not needed.
                 let _ = reply.send(self.plugin(&call).await.map(Some));
             }
+            Step::Ask {
+                question,
+                response_id,
+                call_id,
+            } => {
+                let pending = Pending::Llm {
+                    response_id,
+                    call_id,
+                };
+                self.asked(question, pending, thread, sentences).await?;
+                return Ok(false);
+            }
             Step::Done => return Ok(false),
         }
         Ok(true)
+    }
+
+    /// Asks `question` of System Two in `thread` and opens its dialog, which waits for `pending`.
+    /// With a request that is still the newest of its satellite, puts it in the queue of the
+    /// satellite with a new generation. Without a request, adds it to `sentences`.
+    ///
+    /// # Errors
+    ///
+    /// The question fails.
+    async fn asked(
+        &self,
+        question: String,
+        pending: Pending,
+        thread: &Thread,
+        sentences: &mut Vec<String>,
+    ) -> anyhow::Result<()> {
+        let now = self.two.clock.now();
+        let Some((satellite, generation)) = &thread.request else {
+            if let Some(key) = thread.key.clone() {
+                self.queues.dialogs().open(key, pending, now);
+            }
+            sentences.push(question);
+            return Ok(());
+        };
+        let Some(generation) = self.queues.reopen(satellite, *generation, pending, now) else {
+            return Ok(());
+        };
+        let speak = self.queues.home.ask(satellite, &question);
+        self.queues
+            .queued(satellite, generation, &question, speak)
+            .await
     }
 
     /// Announces `sentence` on the satellite of `request`, or adds it to `sentences` with no
@@ -737,6 +785,14 @@ impl Conversation {
     }
 }
 
+/// Where a System Two answer goes.
+struct Thread {
+    /// The satellite and the generation of the request, or `None` without a satellite.
+    request: Option<(String, u64)>,
+    /// The key of the dialog that a question opens without a satellite.
+    key: Option<Key>,
+}
+
 /// The name of the kind of `decision`.
 fn kind(decision: &Decision) -> &'static str {
     match decision {
@@ -820,6 +876,24 @@ impl Queues {
         let (mut dialogs, key) = (self.dialogs(), Key(satellite.to_owned()));
         dialogs.close(key.clone());
         dialogs.generation(&key)
+    }
+
+    /// When the generation of `satellite` is `generation`, closes its dialog, which increases the
+    /// generation, and opens a dialog for `pending` at `now`. The new generation, else `None`.
+    fn reopen(
+        &self,
+        satellite: &str,
+        generation: u64,
+        pending: Pending,
+        now: Timestamp,
+    ) -> Option<u64> {
+        let (mut dialogs, key) = (self.dialogs(), Key(satellite.to_owned()));
+        if dialogs.generation(&key) != generation {
+            return None;
+        }
+        dialogs.close(key.clone());
+        dialogs.open(key.clone(), pending, now);
+        Some(dialogs.generation(&key))
     }
 
     /// Announces `text` on `satellite` after the earlier items of its queue, when the satellite
@@ -1871,6 +1945,97 @@ mod tests {
         Ok(())
     }
 
+    /// Runs `after` while the satellite of `cache` is busy for 1 s, then idle, and checks that
+    /// `home` asks nothing while it is busy.
+    async fn busy_then_idle(
+        home: &FakeHome,
+        cache: &watch::Sender<StateCache>,
+        after: Work,
+    ) -> anyhow::Result<()> {
+        let idle = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            assert_eq!(asks(home), [] as [&str; 0], "a question came while busy");
+            set(cache, "idle");
+        };
+        tokio::join!(after, idle).0
+    }
+
+    /// AC-10.6-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_6_3_question_asks_when_idle_and_opens_an_llm_dialog() -> anyhow::Result<()> {
+        let (home, reasoner) = (
+            Arc::new(FakeHome::default()),
+            Arc::new(FakeReasoner::default()),
+        );
+        reasoner.script(vec![Scripted::Ask("How many people?")]);
+        let classifier = scripted(&["unknown"]);
+        let (cache, _changes, conversation) = still_with(&home, "responding", classifier, reasoner);
+        let handled = conversation.handle("plan dinner", on_satellite()).await?;
+        let after = handled.after.ok_or_else(|| anyhow::anyhow!("no after"))?;
+        busy_then_idle(&home, &cache, after).await?;
+        assert_eq!(asks(&home), ["How many people?"]);
+        let dialog = &open_dialogs(&conversation)[&Key(SATELLITE.to_owned())];
+        assert!(matches!(dialog.pending, Pending::Llm { .. }), "{dialog:?}");
+        Ok(())
+    }
+
+    /// Without a satellite, a System Two question is the reply, and its dialog has the key of the
+    /// conversation.
+    #[tokio::test(start_paused = true)]
+    async fn question_without_a_satellite_is_the_reply() -> anyhow::Result<()> {
+        let reasoner = Arc::new(FakeReasoner::default());
+        reasoner.script(vec![Scripted::Ask("How many people?")]);
+        let classifier = scripted(&["unknown"]);
+        let (_cache, _changes, conversation) =
+            still_with(&Arc::default(), "idle", classifier, reasoner);
+        let context = Context {
+            conversation_id: Some("chat".to_owned()),
+            ..Context::default()
+        };
+        let handled = conversation.handle("plan dinner", context).await?;
+        assert_eq!(handled.text, "How many people?");
+        let dialog = &open_dialogs(&conversation)[&Key("chat".to_owned())];
+        assert!(matches!(dialog.pending, Pending::Llm { .. }), "{dialog:?}");
+        Ok(())
+    }
+
+    /// The house, the reasoner and the conversation after "plan dinner" and each of `answers` on
+    /// the idle satellite, with the work of each reply done, when the classifier gives `unknown`
+    /// and the reasoner gives each of `scripts` in order.
+    async fn dinner(
+        scripts: Vec<Vec<Scripted>>,
+        answers: &[&str],
+    ) -> anyhow::Result<(Arc<FakeHome>, Arc<FakeReasoner>, Conversation)> {
+        let (home, reasoner) = (
+            Arc::new(FakeHome::default()),
+            Arc::new(FakeReasoner::default()),
+        );
+        for steps in scripts {
+            reasoner.script(steps);
+        }
+        let classifier = scripted(&vec!["unknown"; answers.len() + 1]);
+        let (_cache, _changes, conversation) =
+            still_with(&home, "idle", classifier, Arc::clone(&reasoner));
+        let texts = ["plan dinner"].into_iter().chain(answers.iter().copied());
+        for text in texts {
+            if let Some(after) = conversation.handle(text, on_satellite()).await?.after {
+                after.await?;
+            }
+        }
+        Ok((home, reasoner, conversation))
+    }
+
+    /// AC-10.6-7.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_6_7_cancel_ends_the_system_two_dialog() -> anyhow::Result<()> {
+        let scripts = vec![vec![Scripted::Ask("How many?")]];
+        let (home, reasoner, conversation) = dinner(scripts, &["cancel"]).await?;
+        assert_eq!(reasoner.questions(), ["plan dinner"]);
+        assert_eq!(asks(&home), ["How many?"]);
+        assert_eq!(open_dialogs(&conversation), BTreeMap::new());
+        Ok(())
+    }
+
     /// A System Two job on the satellite in the state `value` whose reasoner gives `steps`: its
     /// house, hot cache, reasoner and work.
     fn reasoning(value: &str, steps: Vec<Scripted>) -> anyhow::Result<Reasoning> {
@@ -2476,10 +2641,13 @@ mod tests {
     }
 
     impl ModelState<JobDriver> for Jobs {
-        /// The generation of each satellite and the requests whose calls `FakeHome` recorded.
+        /// The generation of each satellite without the extra generations of the System Two
+        /// questions again, and the requests whose calls `FakeHome` recorded.
         fn from_driver(driver: &JobDriver) -> anyhow::Result<Self> {
             let queues = &driver.conversation.queues;
-            let generations = KEYS.map(|key| (key.to_owned(), queues.generation(key)));
+            let generation =
+                |key: &str| queues.generation(key) - driver.extra.get(key).copied().unwrap_or(0);
+            let generations = KEYS.map(|key| (key.to_owned(), generation(key)));
             let calls = (1..=3).map(|request| (request, driver.calls.contains(&request)));
             Ok(Self {
                 generations: generations.into(),
@@ -2510,6 +2678,8 @@ mod tests {
         jobs: BTreeMap<i64, (String, Work)>,
         /// The requests whose calls `FakeHome` recorded.
         calls: BTreeSet<i64>,
+        /// The generations of each satellite that `askAgain` of the model does not have.
+        extra: BTreeMap<String, u64>,
     }
 
     impl JobDriver {
@@ -2538,6 +2708,7 @@ mod tests {
                 request: BTreeMap::new(),
                 jobs: BTreeMap::new(),
                 calls: BTreeSet::new(),
+                extra: BTreeMap::new(),
             }
         }
 
@@ -2572,11 +2743,59 @@ mod tests {
                 .insert(self.requests, (satellite, work.expect("a job")));
         }
 
-        /// Runs the job of `request`, whose answer has one call.
+        /// Runs the job of `request`, whose answer has one call. A job that asked has ended.
         fn act_job(&mut self, request: i64) -> anyhow::Result<()> {
-            let (_, work) = self.jobs.remove(&request).expect("the job runs");
+            let Some((_, work)) = self.jobs.remove(&request) else {
+                return Ok(());
+            };
             self.reasoner.script(vec![Scripted::Call(call())]);
             self.act(Some(work), request)
+        }
+
+        /// Runs the job of `request`, whose answer asks. The answer of its dialog continues
+        /// `request`.
+        fn ask_job(&mut self, request: i64) -> anyhow::Result<()> {
+            let (satellite, work) = self.jobs.remove(&request).expect("the job runs");
+            self.reasoner.script(vec![Scripted::Ask("How many?")]);
+            self.runtime.block_on(work)?;
+            self.request.insert(satellite, request);
+            Ok(())
+        }
+
+        /// True when the dialog of `satellite` waits for System Two.
+        fn waits_for_llm(&self, satellite: &str) -> bool {
+            let dialogs = self.conversation.queues.dialogs();
+            let dialog = dialogs.dialogs.get(&Key(satellite.to_owned()));
+            dialog.is_some_and(|dialog| matches!(dialog.pending, Pending::Llm { .. }))
+        }
+
+        /// The work of the answer `text` on `satellite`: to System Two, whose next answer gives
+        /// `steps`, when the dialog waits for it, else to System One with `label`.
+        fn answer(
+            &self,
+            satellite: &str,
+            text: &str,
+            label: Option<&str>,
+            steps: Vec<Scripted>,
+        ) -> Option<Work> {
+            if !self.waits_for_llm(satellite) {
+                return self.handle(satellite, text, label);
+            }
+            self.reasoner.script(steps);
+            self.handle(satellite, text, Some("unknown"))
+        }
+
+        /// An unclear answer on `satellite`. A System Two answer asks again, which is a new
+        /// request and a new question: two generations that `askAgain` of the model does not have.
+        fn ask_again(&mut self, satellite: &str) -> anyhow::Result<()> {
+            if self.waits_for_llm(satellite) {
+                *self.extra.entry(satellite.to_owned()).or_default() += 2;
+            }
+            let ask = vec![Scripted::Ask("How many?")];
+            if let Some(work) = self.answer(satellite, "zzz", Some("unknown"), ask) {
+                self.runtime.block_on(work)?;
+            }
+            Ok(())
         }
 
         /// Runs `work`, and marks `request` when `FakeHome` records a call that is not an
@@ -2611,11 +2830,11 @@ mod tests {
                     self.ask(k, self.requests);
                 },
                 defer(k: String) => self.defer(k),
-                ask(r: i64) => self.ask(self.jobs[&r].0.clone(), r),
+                ask(r: i64) => self.ask_job(r)?,
                 jobAct(r: i64) => self.act_job(r)?,
-                askAgain(k: String) => _ = self.handle(&k, "zzz", Some("unknown")),
+                askAgain(k: String) => self.ask_again(&k)?,
                 fill(k: String) => {
-                    let work = self.handle(&k, "kitchen", None);
+                    let work = self.answer(&k, "kitchen", None, vec![Scripted::Call(call())]);
                     self.act(work, self.request[&k])?;
                 },
                 cancel(k: String) => _ = self.handle(&k, "never mind", None),

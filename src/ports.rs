@@ -136,6 +136,15 @@ pub enum Step {
     States(String, oneshot::Sender<anyhow::Result<Option<Value>>>),
     /// A plugin call. The answer continues after the consumer sends the result on the sender.
     Plugin(PluginCall, oneshot::Sender<anyhow::Result<Option<Value>>>),
+    /// A question to the user. The answer ends, and the next answer continues it.
+    Ask {
+        /// The question text.
+        question: String,
+        /// The ID of the response that asks.
+        response_id: String,
+        /// The ID of the `ask_user` call.
+        call_id: String,
+    },
     /// The answer is complete.
     Done,
 }
