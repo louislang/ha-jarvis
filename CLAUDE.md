@@ -25,6 +25,7 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 12. The Codex GitHub app reviews each PR. Resolve every thread.
 13. Merge only with `just merge <pr>`: it checks every required check, every review thread, every check box, the title, the branch and the summary, then squash merges the PR (the bottom layer of a stack, a spec PR or a fix PR) at the inspected head commit. The commit message is the PR title, a blank line and the PR summary. Never add "Co-Authored-By" or any AI attribution. Phase 0 layers before `just merge` exists follow the bootstrap rule in `02-rules.md` section 7.1.
 14. Never skip the hooks (`--no-verify`). The pre-push hook refuses pushes to `main`.
+15. A PR that adds or changes a capability or a setup step updates `README.md` in the same PR. A spec PR does not change `README.md`.
 
 ## Required Checks
 
