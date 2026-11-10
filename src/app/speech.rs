@@ -28,6 +28,10 @@ use crate::ports::TextToSpeech;
 /// The number of samples in one millisecond of 16 kHz audio.
 const SAMPLES_PER_MS: u64 = 16;
 
+/// The slots whose value can continue after the end of a partial, so a partial that ends with
+/// one commits only at `endpoint_ms`.
+const NAME_SLOTS: [&str; 3] = ["media", "movie", "show"];
+
 /// Starts listen sessions that warm System Two, predict on each changed first-pass partial,
 /// commit by the policy and give the second-pass transcript.
 pub struct Listener {
@@ -175,14 +179,21 @@ fn accept(stream: &Mutex<Box<dyn SttStream>>, samples: &[i16]) -> anyhow::Result
 }
 
 /// True when the top label of the `classifier` prediction of `text` in no context is not
-/// `unknown` and its probability is `threshold` or more. False when the prediction fails.
+/// `unknown` and its probability is `threshold` or more, and no value of a `NAME_SLOTS` slot ends
+/// the normalized text. False when the prediction fails.
 async fn confident(classifier: &dyn Classifier, threshold: f32, text: &str) -> bool {
     let context = training::context_text(None, &[]);
-    match classifier.predict(&context, &intent::normalize(text)).await {
-        Ok(prediction) => prediction
-            .ranked
-            .first()
-            .is_some_and(|(label, probability)| label != "unknown" && *probability >= threshold),
+    let text = intent::normalize(text);
+    match classifier.predict(&context, &text).await {
+        Ok(prediction) => {
+            prediction
+                .ranked
+                .first()
+                .is_some_and(|(label, probability)| label != "unknown" && *probability >= threshold)
+                && !prediction.slots.iter().any(|slot| {
+                    NAME_SLOTS.contains(&slot.name.as_str()) && text.ends_with(&slot.value)
+                })
+        }
         Err(error) => {
             tracing::warn!("the speculative prediction failed: {error:#}");
             false
@@ -284,6 +295,7 @@ mod tests {
 
     use super::*;
     use crate::domain::model::Prediction;
+    use crate::domain::model::Slot;
     use crate::domain::responses::Pool;
     use crate::domain::responses::Response;
     use crate::testing::fakes::FakeClassifier;
@@ -548,6 +560,49 @@ mod tests {
         ];
         let (results, _) = pushes(partials, Vec::new()).await?;
         assert_eq!(results, commit_after(3, TEXT));
+        Ok(())
+    }
+
+    /// The result of each push of `text` with each of `silences` ms after its last voiced
+    /// sample, when the classifier gives `label` 0.95 with the slot `name = value`.
+    async fn slot_pushes(
+        text: &str,
+        label: &str,
+        name: &str,
+        value: &str,
+        silences: &[u64],
+    ) -> anyhow::Result<Vec<Option<String>>> {
+        let partials: Vec<Partial> = silences
+            .iter()
+            .map(|silence| partial(text, Some(500), 500 + silence))
+            .collect();
+        let slot = Slot {
+            name: name.to_owned(),
+            value: value.to_owned(),
+        };
+        let prediction = Prediction {
+            slots: vec![slot],
+            ..prediction(label, 0.95)
+        };
+        let (results, _) = pushes(partials, vec![prediction]).await?;
+        Ok(results)
+    }
+
+    /// AC-6.8-13.
+    #[tokio::test(start_paused = true)]
+    async fn ac_6_8_13_final_media_name_commits_at_endpoint_ms() -> anyhow::Result<()> {
+        let text = "play hip";
+        let results = slot_pushes(text, "play_music", "media", "hip", &[0, 200, 599, 600]).await?;
+        assert_eq!(results, commit_after(3, text));
+        Ok(())
+    }
+
+    /// AC-6.8-14.
+    #[tokio::test(start_paused = true)]
+    async fn ac_6_8_14_final_area_commits_at_early_commit_ms() -> anyhow::Result<()> {
+        let text = "turn on the lights in the kitchen";
+        let results = slot_pushes(text, "lights_on", "area", "kitchen", &[0, 199, 200]).await?;
+        assert_eq!(results, commit_after(2, text));
         Ok(())
     }
 
