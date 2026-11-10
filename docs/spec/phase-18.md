@@ -551,6 +551,71 @@ Speaker groups were one sub-phase. With the controls, its tests and its Verus pr
 - P-18.15b-5, P-18.15b-6 (AC-18.15b-5, AC-18.15b-6). Ensures: the call of P-18.15-1 targets the group player when the `service` of the intent is in the domain `music_assistant`, else `played(group, cache)`. Argument: step 3 checks the domain of the `service` before it selects the target.
 - P-18.15b-7. Evidence: test.
 
+---
+
+### 18.16 Opposite Commands
+
+**Goal:** Add the local opposites of the existing commands: lights off, fan off, heat up, resume, previous track and TV off. Without them, the System One model gives the opposite intent, and "turn off the lights" turns the lights on.
+
+- **Implements:** G3, G9. **Depends on:** 18.14.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/catalog.rs`, `src/domain/decide.rs`, `src/adapters/onnx.rs`.
+
+**Model.**
+
+- The catalog has no opposite of `lights_on`, `fan_on`, `climate_down`, `music_pause`, `music_next` and `tv_show`. Thus the model gives the nearest label. On 2026-11-10, the fixture model of `main` gave these top labels with the context `area: none | habits: none`:
+
+  | Phrase | Top label | Probability |
+  |---|---|---|
+  | "turn off the lights" | `lights_on` | 0.924 |
+  | "turn the lights off" | `lights_on` | 0.910 |
+  | "lights off" | `lights_on` | 0.928 |
+  | "turn off the fan" | `fan_on` | 0.959 |
+  | "turn the air up" | `climate_down` | 0.905 |
+  | "make it warmer" | `climate_down` | 0.970 |
+  | "turn the heat up" | `climate_down` | 0.882 |
+  | "previous song" | `music_next` | 0.959 |
+  | "unpause the music" | `volume_down` | 0.689 |
+  | "resume the music" | `music_pause` | 0.540 |
+  | "turn off the tv" | `volume_down` | 0.365 |
+
+- A probability of `model.threshold` (0.6) or more makes Jarvis act on the wrong intent. A probability of `model.commit_threshold` (0.9) or more also commits early (sub-phase 6.5).
+- This sub-phase adds six commands after `new_shows` at the end of `intents.toml`. Thus the contexts of the existing examples do not change (the preface of this phase). Each command has the target and the filters of its opposite:
+  - `lights_off`: `homeassistant.turn_off`, the `target` and `select` of `lights_on`. Examples: "turn off the lights", "turn off the [kitchen](area) lights", "lights off", "turn the lights off", "switch the lights off in the [living room](area)", "can you turn the [office](area) lights off". Pool: `I am turning the lights off.`, `I will turn off the lights.`, `Turning off the {{ area }} lights.`
+  - `fan_off`: `homeassistant.turn_off`, the `target` and `select` of `fan_on`. Examples: "turn off the fan", "turn off the [office](area) fan", "fan off please", "turn the fan off", "stop the fan". Pool: `I am turning the fan off.`, `Stopping the {{ area }} fan.`
+  - `climate_up`: `climate.set_temperature`, the `target` and `select` of `climate_down`, `data = { temperature = "{{ entity.attributes.temperature + 2 }}" }`. Examples: "turn the air up", "turn the heat up", "make it warmer", "raise the temperature". Pool: `I am turning the heat up.`, `Making it warmer.`
+  - `music_resume`: `media_player.media_play`, the speaker filter of sub-phase 18.7. Examples: "unpause the music", "resume the music", "resume the music in the [kitchen](area)", "start the music again". Pool: `Resuming the music.`
+  - `music_previous`: `media_player.media_previous_track`, the speaker filter. Examples: "previous song", "go back a song", "play the previous track", "go back to the previous song in the [kitchen](area)". Pool: `Previous song.`
+  - `tv_off`: `media_player.turn_off`, the TV filter of sub-phase 18.9. Examples: "turn off the tv", "turn the tv off", "switch off the tv", "tv off". Pool: `Turning off the TV.` `tv_stop` already calls `media_player.media_stop`, which stops the media and keeps the TV on. "Turn off the TV" asks for the power state, so `tv_off` calls `turn_off`. `tv_on` of sub-phase 11.6 is its opposite.
+- The new commands use the existing service shapes, so `decide` and `validate_catalog` do not change.
+- Of the examples, "turn off the fan", "resume the music" and "switch the lights off in the living room" are held out (sub-phase 3.3). They measure the accuracy of a training run (sub-phase 13.2). The fixture model does not train on them, so AC-18.16-7 does not check them (sub-phase 3.9). "turn the fan off" and "unpause the music" are the trained phrases of these intents.
+- Each "on" command keeps its examples. AC-3.12-1 checks that each trained example of each intent still has its intent as the top label. AC-9.2-5 checks that the light commands keep an early commit.
+
+**Acceptance criteria.**
+
+- AC-18.16-1: When the intent is `lights_off` and the satellite is in the Kitchen, the call is `homeassistant.turn_off` with all kitchen lights, the target of AC-4.5c-1.
+- AC-18.16-2: When the intent is `fan_off` and the satellite is in the Office, the call is `homeassistant.turn_off` with the target `fan.office_fan`. In the Living Room, the target is `switch.living_room_fan`.
+- AC-18.16-3: When the intent is `climate_up` and the target temperature is 72, the call is `climate.set_temperature` with `temperature = 74` as a number.
+- AC-18.16-4: When the intent is `music_resume` and the satellite is in the Kitchen, the call is `media_player.media_play` with the target `media_player.carson_kitchen`.
+- AC-18.16-5: When the intent is `music_previous` and the satellite is in the Kitchen, the call is `media_player.media_previous_track` with the target `media_player.carson_kitchen`.
+- AC-18.16-6: When the intent is `tv_off`, the call is `media_player.turn_off` with the target `media_player.apple_tv`.
+- AC-18.16-7: When the fixture model gets each phrase of this table with the context `area: none | habits: none`, the top label is the new intent, with a probability of `model.commit_threshold` or more:
+
+  | Phrase | New intent | Old wrong intent |
+  |---|---|---|
+  | "turn off the lights", "turn the lights off", "lights off" | `lights_off` | `lights_on` |
+  | "turn the fan off" | `fan_off` | `fan_on` |
+  | "turn the air up", "make it warmer", "turn the heat up" | `climate_up` | `climate_down` |
+  | "previous song" | `music_previous` | `music_next` |
+  | "unpause the music" | `music_resume` | `volume_down` |
+  | "turn off the tv" | `tv_off` | `volume_down` |
+
+- AC-18.16-8: When the fixture model gets each phrase of the table of AC-18.16-7, the top label is not the old wrong intent of the phrase.
+
+**Proofs.**
+
+- P-18.16-1 to P-18.16-6. Evidence: test. The rules are P-4.5c-1, P-4.4c-4 and P-4.5d-1.
+- P-18.16-7, P-18.16-8. Evidence: test. The probabilities come from the model file (`02-rules.md` section 5, rule 5).
+
 ## Field Log
 
 These steps are not tests and gate nothing.
