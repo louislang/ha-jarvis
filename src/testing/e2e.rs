@@ -408,13 +408,13 @@ mod tests {
     /// The number of measured runs of each phrase.
     const RUNS: usize = 20;
 
-    /// The responses of `pool` in `responses.toml`, rendered in `area` with the show `jeopardy`.
+    /// The responses of `pool` in `responses.toml`, rendered in `area` with the show `bluey`.
     fn responses(pool: &str, area: &str) -> anyhow::Result<Vec<String>> {
         let config = Config::parse(include_str!("../../jarvis.toml"))?;
         let catalog = crate::load_catalog(&config.intents)?;
         let pools = crate::load_pools(&config.responses, &catalog)?;
         let pool = pools.get(pool).with_context(|| format!("no {pool} pool"))?;
-        let variables = [("area", json!(area)), ("show", json!("jeopardy"))];
+        let variables = [("area", json!(area)), ("show", json!("bluey"))];
         let variables = Map::from_iter(variables.map(|(name, value)| (name.to_owned(), value)));
         let render = |template: &str| responses::render(template, &variables);
         let texts = pool.responses.iter().map(|response| render(&response.text));
@@ -562,7 +562,7 @@ mod tests {
     #[ignore = "GPU host"]
     async fn ac_9_3c_1_uncached_command_response_latency_p95_is_400_ms_or_less()
     -> anyhow::Result<()> {
-        within(&["turn the tv to jeopardy"], "tv_show", "kitchen", 400).await
+        within(&["play bluey on the tv"], "tv_show", "kitchen", 400).await
     }
 
     /// Asserts that each of `texts` in `area` on CUDA, with a reply of `pool`, has a p95 latency
