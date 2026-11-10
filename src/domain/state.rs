@@ -96,6 +96,8 @@ pub struct Entity {
     pub hidden_by: Option<String>,
     /// Who disabled the entity.
     pub disabled_by: Option<String>,
+    /// The config entry of the integration of the entity.
+    pub config_entry_id: Option<String>,
 }
 
 /// The HA configuration that Jarvis uses.

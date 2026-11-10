@@ -240,17 +240,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         serde_json::from_value(snapshot).context("protocol error: the snapshot is not valid")
     }
 
-    /// Calls a service. Gives the response data when `call.return_response` is true.
+    /// Calls a service, with a target only when `call.target` is not empty. Gives the response
+    /// data when `call.return_response` is true.
     ///
     /// # Errors
     ///
     /// A connection, HA or timeout error.
     pub async fn call(&self, call: ServiceCall) -> anyhow::Result<Option<Value>> {
-        let command = json!({
+        let mut command = json!({
             "type": "call_service", "domain": call.domain, "service": call.service,
-            "target": { "entity_id": call.target }, "service_data": call.data,
-            "return_response": call.return_response,
+            "service_data": call.data, "return_response": call.return_response,
         });
+        // HA adds the target to the service data, and `music_assistant.search` refuses `entity_id`.
+        if !call.target.is_empty() {
+            command["target"] = json!({ "entity_id": call.target });
+        }
         let mut result = self.request(command).await?;
         let response = || result.get_mut("response").map_or(Value::Null, Value::take);
         Ok(call.return_response.then(response))
@@ -681,8 +685,12 @@ mod tests {
         }
 
         /// Answers each request from `house.json` as HA does, until the client closes.
-        async fn serve_house(mut self) {
-            let house = house();
+        async fn serve_house(self) {
+            self.serve(house()).await;
+        }
+
+        /// Answers each request from `house` as HA does, until the client closes.
+        async fn serve(mut self, house: Value) {
             while let Some(request) = self.request().await {
                 let result = house_result(&house, &request);
                 self.reply(&request, result).await;
@@ -1213,6 +1221,29 @@ mod tests {
     async fn ac_2_5_3_no_return_response_gives_none() -> anyhow::Result<()> {
         let (_, result) = serve_call(turn_on(false)).await?;
         assert_eq!(result, None);
+        Ok(())
+    }
+
+    /// AC-18.13-9.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_13_9_call_without_target_sends_no_target_key() -> anyhow::Result<()> {
+        let call = ServiceCall {
+            target: Vec::new(),
+            ..turn_on(true)
+        };
+        let (request, _) = serve_call(call).await?;
+        assert_eq!(request.get("target"), None, "{request}");
+        Ok(())
+    }
+
+    /// AC-18.13-10.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_13_10_snapshot_entity_has_its_config_entry() -> anyhow::Result<()> {
+        let mut house = house();
+        house["entities"][0]["config_entry_id"] = json!("music_assistant");
+        let home = ready(move |server| server.serve(house)).await;
+        let entity = home.snapshot().await?.entities.remove(0);
+        assert_eq!(entity.config_entry_id.as_deref(), Some("music_assistant"));
         Ok(())
     }
 

@@ -39,6 +39,8 @@ use crate::domain::catalog::Filter;
 use crate::domain::catalog::Intent;
 use crate::domain::catalog::Kind;
 use crate::domain::catalog::Target;
+use crate::domain::decide::MediaItem;
+use crate::domain::decide::SearchResults;
 use crate::domain::dialog::Key;
 use crate::domain::intent::Span;
 use crate::domain::responses::Pool;
@@ -171,6 +173,14 @@ pub struct ExFilter(Filter);
 /// One slot value in the text of an example.
 #[verifier::external_type_specification]
 pub struct ExSpan(Span);
+
+/// The lists of a Music Assistant search response.
+#[verifier::external_type_specification]
+pub struct ExSearchResults(SearchResults);
+
+/// One item of a Music Assistant search response.
+#[verifier::external_type_specification]
+pub struct ExMediaItem(MediaItem);
 
 /// The training set file.
 #[verifier::external_type_specification]
@@ -920,6 +930,21 @@ pub fn ex_str_strip_prefix<'text, Prefix: Pattern>(text: &'text str, prefix: Pre
         },
 {
     text.strip_prefix(prefix)
+}
+
+/// True when `part` is a sequence of consecutive characters of `text`.
+pub open spec fn infix(part: Seq<char>, text: Seq<char>) -> bool {
+    exists|start: int| 0 <= start <= text.len() - part.len()
+        && #[trigger] text.subrange(start, start + part.len()) == part
+}
+
+/// True when `pattern` matches a part of `text`. <https://doc.rust-lang.org/std/primitive.str.html#method.contains>
+#[verifier::external_fn_specification]
+pub fn ex_str_contains<Part: Pattern>(text: &str, pattern: Part) -> (found: bool)
+    ensures
+        pattern_text(pattern) matches Some(part) ==> found == infix(part, text@),
+{
+    text.contains(pattern)
 }
 
 /// The length of `duration` in nanoseconds.
