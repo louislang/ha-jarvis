@@ -323,24 +323,32 @@ A choice is a closed set, so step 2 comes before step 3. The answer to System Tw
 
 ### 10.7 Early Commit for Answers
 
-**Goal:** Let short answers use the early commit wait. "Kitchen" or "never mind" while a dialog is open ends listening after 100 ms instead of 600 ms.
+**Goal:** Let short answers to a System One question use the early commit wait. "Kitchen" while a `Slot` dialog is open, or "never mind" while any dialog is open, ends listening after 100 ms instead of 600 ms.
 
 - **Implements:** G1, G13. **Depends on:** 10.6b.
-- **Files:** modify `src/domain/speech.rs`, `src/app/speech.rs`.
+- **Files:** modify `src/app/speech.rs`, `src/app/conversation.rs`, `src/lib.rs`, `src/testing/e2e.rs`.
 - **Quint:** `commit.qnt` (unchanged: `confident` is abstract).
 
-**Model.** The audio stream has no satellite ID. Thus `confident` is also true when `fill(partial, choices)` of any open dialog returns a value, or when `is_cancel(partial)` is true.
+**Model.**
+
+- The audio stream has no satellite ID. Thus the listen use case checks the open dialogs of all keys. A dialog is open when `timeout_s` did not pass since its last question, as `take` gives it (sub-phase 10.2).
+- `Queues::is_answer(text, now)` is true when `is_cancel(text)` and one or more dialogs are open, or when `fill(text, choices)` of an open `Pending::Slot` dialog returns a value.
+- A `Pending::Llm` dialog has no choices, and `fill` with no choices returns the normalized answer. Thus `fill` accepts any partial text for such a dialog. An answer to System Two is free text with several words, so a `Pending::Llm` dialog does not count for `fill`. Such an answer keeps the `endpoint_ms` wait. A cancel phrase counts for each open dialog.
+- `push` sets `confident` to true when `is_answer(partial, now)` is true. Else `confident` comes from the prediction (sub-phase 6.8). `Listener` gets the `Queues` of the conversation and the `Clock`.
+- `Queues::open(key, pending, now)` opens a dialog. `handle` uses it when `decide` gives `Ask`.
+- AC-10.7-4 opens the dialog with a `transcript` from the kitchen satellite with no `device_id`. Thus "turn on the lights" has no area and asks "Which room?". Then the harness runs the speech "the kitchen" from the kitchen satellite.
 
 **Acceptance criteria.**
 
-- AC-10.7-1: When a dialog has the choice "kitchen" and the partial text is "kitchen", the commit uses `early_commit_ms`.
-- AC-10.7-2: When no dialog is open and the top label is `unknown`, the partial text "kitchen" uses `endpoint_ms`.
-- AC-10.7-3: When a dialog is open, the partial text "never mind" uses `early_commit_ms`.
+- AC-10.7-1: When a `Slot` dialog has the choice "kitchen" and the partial text is "kitchen", the commit uses `early_commit_ms`.
+- AC-10.7-2: When no dialog is open, or the only dialog timed out, and the top label is `unknown`, the partial text "kitchen" uses `endpoint_ms`.
+- AC-10.7-3: When a `Slot` dialog or a System Two dialog is open, the partial text "never mind" uses `early_commit_ms`.
 - AC-10.7-4 [GPU host]: In the Phase 9 harness, the answer "the kitchen" to "Which room?" has a response latency p95 of 300 ms or less.
+- AC-10.7-5: When only a System Two dialog is open and the top label is `unknown`, the partial text "fifteen" uses `endpoint_ms`.
 
 **Proofs.**
 
-- P-10.7-1 to P-10.7-3. Ensures: `confident` is true when the model is confident, when `fill` of an open dialog returns a value, or when the partial is a cancel phrase. Argument: `confident = model_confident or any(fill(partial, choices).is_some()) or is_cancel(partial)` (P-10.3-1, P-10.3-2). `should_commit` does not change (P-6.5-1), so the commit invariants of `commit.qnt` still hold.
+- P-10.7-1 to P-10.7-3, P-10.7-5. Argument: `push` sets `confident = is_answer(partial, now) or model_confident`. `is_answer` is true only for a cancel phrase while a dialog is open (P-10.3-1), or for a value of `fill` of an open `Slot` dialog (P-10.3-2). An `Llm` dialog does not count for `fill`, and "fifteen" is not a cancel phrase. `take` gives no dialog after the timeout (P-10.2-2). `should_commit` does not change (P-6.5-1), so the commit invariants of `commit.qnt` still hold.
 - P-10.7-4. Evidence: test.
 
 ## Field Log
