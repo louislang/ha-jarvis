@@ -317,15 +317,15 @@ pub(crate) enum Scripted {
 /// The receiver of the tool result of one call.
 type Reply = oneshot::Receiver<anyhow::Result<Option<Value>>>;
 
-/// A `Reasoner` that counts the `warm` calls, records the text of each question, answers with the
-/// scripted steps, keeps the reply of each call, records the pool of each `generate` call and holds
+/// A `Reasoner` that counts the `warm` calls, records each question, answers with the scripted
+/// steps, keeps the reply of each call, records the pool of each `generate` call and holds
 /// it until `release`.
 #[derive(Default)]
 pub(crate) struct FakeReasoner {
     /// The number of `warm` calls.
     warms: AtomicUsize,
-    /// The text of each question, in order.
-    questions: Mutex<Vec<String>>,
+    /// Each question, in order.
+    questions: Mutex<Vec<Question>>,
     /// The steps of each next answer, in order.
     scripts: Mutex<VecDeque<Vec<Scripted>>>,
     /// The reply of each call, in order.
@@ -346,7 +346,19 @@ impl FakeReasoner {
     /// The text of each question, in order.
     #[must_use]
     pub(crate) fn questions(&self) -> Vec<String> {
-        lock(&self.questions).clone()
+        let questions = lock(&self.questions);
+        questions
+            .iter()
+            .map(|question| question.text.clone())
+            .collect()
+    }
+
+    /// The call ID that each question answers, in order.
+    #[must_use]
+    pub(crate) fn answered(&self) -> Vec<Option<String>> {
+        let questions = lock(&self.questions);
+        let calls = questions.iter().map(|question| question.answers.as_ref());
+        calls.map(|call| Some(call?.call_id.clone())).collect()
     }
 
     /// Makes the next answer without earlier scripted steps give `steps`.
@@ -414,7 +426,7 @@ impl Reasoner for FakeReasoner {
     }
 
     fn answer(&self, question: &Question) -> BoxStream<'static, anyhow::Result<Step>> {
-        lock(&self.questions).push(question.text.clone());
+        lock(&self.questions).push(question.clone());
         let steps = lock(&self.scripts).pop_front().unwrap_or_default();
         let replies = Arc::clone(&self.replies);
         let step = move |step| answered(step, Arc::clone(&replies));
