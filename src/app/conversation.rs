@@ -6,8 +6,6 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -741,11 +739,9 @@ fn kind(decision: &Decision) -> &'static str {
     }
 }
 
-/// The announce queue and the generation of one satellite.
+/// The announce queue of one satellite.
 #[derive(Default)]
 struct Queue {
-    /// The generation of the satellite.
-    generation: AtomicU64,
     /// The turn to announce. Its waiters are the items of the queue, in order.
     turn: tokio::sync::Mutex<()>,
 }
@@ -801,9 +797,9 @@ impl Queues {
         self.dialogs.lock().expect("no lock holder panics")
     }
 
-    /// The generation of `satellite`.
+    /// The generation of the dialog key of `satellite`.
     fn generation(&self, satellite: &str) -> u64 {
-        self.queue(satellite).generation.load(Ordering::SeqCst)
+        self.dialogs().generation(&Key(satellite.to_owned()))
     }
 
     /// True when the generation of `satellite` is `generation`.
@@ -811,12 +807,12 @@ impl Queues {
         self.generation(satellite) == generation
     }
 
-    /// Increases the generation of `satellite` and returns it.
+    /// Closes the dialog of `satellite`, which increases its generation, and returns the
+    /// generation.
     pub fn next_generation(&self, satellite: &str) -> u64 {
-        self.queue(satellite)
-            .generation
-            .fetch_add(1, Ordering::SeqCst)
-            + 1
+        let (mut dialogs, key) = (self.dialogs(), Key(satellite.to_owned()));
+        dialogs.close(key.clone());
+        dialogs.generation(&key)
     }
 
     /// Announces `text` on `satellite` after the earlier items of its queue, when the satellite
@@ -937,6 +933,7 @@ fn generated(saved: &[Response], source: &[Response]) -> Vec<Response> {
 /// Tests of dispatch and the pools task.
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
     use std::path::Path;
     use std::thread;
@@ -969,6 +966,7 @@ mod tests {
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeTts;
     use crate::testing::fakes::Scripted;
+    use crate::testing::fakes::SetClock;
     use crate::testing::fakes::house;
     use crate::testing::fakes::log_dispatch;
 
@@ -1812,6 +1810,15 @@ mod tests {
         let classifier = scripted(&["unknown"]);
         let (_cache, _changes, conversation) =
             still_with(&Arc::default(), "idle", classifier, Arc::clone(&reasoner));
+        open_llm(&conversation);
+        let after = conversation.handle("four", on_satellite()).await?.after;
+        after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
+        assert_eq!(reasoner.questions(), ["four"]);
+        Ok(())
+    }
+
+    /// Opens a System Two dialog on the satellite of `conversation` at the Unix epoch.
+    fn open_llm(conversation: &Conversation) {
         let pending = Pending::Llm {
             response_id: "response".to_owned(),
             call_id: "call".to_owned(),
@@ -1821,9 +1828,26 @@ mod tests {
             .queues
             .dialogs()
             .open(key, pending, Timestamp::UNIX_EPOCH);
-        let after = conversation.handle("four", on_satellite()).await?.after;
-        after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
-        assert_eq!(reasoner.questions(), ["four"]);
+    }
+
+    /// AC-10.5b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_5b_1_cancel_stops_the_system_two_job() -> anyhow::Result<()> {
+        let (home, reasoner) = (Arc::default(), Arc::new(FakeReasoner::default()));
+        reasoner.script(vec![Scripted::Sentence("One."), Scripted::Call(call())]);
+        let (_cache, _changes, conversation) =
+            still_with(&home, "idle", Arc::<FakeClassifier>::default(), reasoner);
+        let (filler, job) = (chosen("filler", 0), Job::Llm("plan dinner".to_owned()));
+        let job = work(
+            &conversation,
+            Decision::Defer { filler, job },
+            Some(SATELLITE),
+        )?;
+        open_llm(&conversation);
+        let cancelled = conversation.handle("never mind", on_satellite()).await?;
+        assert_eq!(cancelled.text, "Cancelled.");
+        job.await?;
+        assert_eq!(home.calls(), []);
         Ok(())
     }
 
@@ -2353,6 +2377,13 @@ mod tests {
         }
     }
 
+    /// A current-thread runtime with time and a paused clock.
+    fn paused() -> Runtime {
+        let mut runtime = tokio::runtime::Builder::new_current_thread();
+        let runtime = runtime.enable_time().start_paused(true).build();
+        runtime.expect("the runtime builds")
+    }
+
     /// Replays `announce.qnt` against the queue of one satellite, with `FakeHome` as HA.
     struct AnnounceDriver {
         /// The paused runtime that runs the items.
@@ -2370,12 +2401,10 @@ mod tests {
     impl AnnounceDriver {
         /// A driver with an idle satellite, on a new runtime.
         fn new() -> Self {
-            let mut runtime = tokio::runtime::Builder::new_current_thread();
-            let runtime = runtime.enable_time().start_paused(true).build();
             let home = Arc::new(FakeHome::default());
             let (cache, queues) = queues(&home, "idle");
             Self {
-                runtime: runtime.expect("the runtime builds"),
+                runtime: paused(),
                 home,
                 cache,
                 queues: Arc::new(queues),
@@ -2411,5 +2440,176 @@ mod tests {
     #[quint_run(spec = "quint/announce.qnt", max_steps = 30, seed = "1")]
     fn ac_4_9b_2_conformance() -> impl Driver {
         AnnounceDriver::new()
+    }
+
+    /// The satellites of `dialog.qnt`.
+    const KEYS: [&str; 2] = ["s1", "s2"];
+
+    /// The generations and the calls of `dialog.qnt`.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Jobs {
+        /// The generation of each key.
+        #[serde(rename = "gen")]
+        generations: BTreeMap<String, u64>,
+        /// True for each request that acted.
+        calls: BTreeMap<i64, bool>,
+    }
+
+    impl ModelState<JobDriver> for Jobs {
+        /// The generation of each satellite and the requests whose calls `FakeHome` recorded.
+        fn from_driver(driver: &JobDriver) -> anyhow::Result<Self> {
+            let queues = &driver.conversation.queues;
+            let generations = KEYS.map(|key| (key.to_owned(), queues.generation(key)));
+            let calls = (1..=3).map(|request| (request, driver.calls.contains(&request)));
+            Ok(Self {
+                generations: generations.into(),
+                calls: calls.collect(),
+            })
+        }
+    }
+
+    /// Replays `dialog.qnt` against `handle` on two satellites, with `FakeHome` as HA.
+    struct JobDriver {
+        /// The paused runtime that runs `handle` and the jobs.
+        runtime: Runtime,
+        /// HA.
+        home: Arc<FakeHome>,
+        /// The System One model.
+        classifier: Arc<FakeClassifier>,
+        /// System Two.
+        reasoner: Arc<FakeReasoner>,
+        /// The clock of the dialogs.
+        clock: Arc<SetClock>,
+        /// The use case.
+        conversation: Conversation,
+        /// The number of requests so far, which is the ID of the last request.
+        requests: i64,
+        /// The request of the dialog of each satellite.
+        request: BTreeMap<String, i64>,
+        /// The satellite and the work of the deferred job of each request.
+        jobs: BTreeMap<i64, (String, Work)>,
+        /// The requests whose calls `FakeHome` recorded.
+        calls: BTreeSet<i64>,
+    }
+
+    impl JobDriver {
+        /// A driver with no dialogs, on a new runtime, with a dialog timeout of 3 s.
+        fn new() -> Self {
+            let (home, reasoner) = (Arc::default(), Arc::new(FakeReasoner::default()));
+            let (_cache, mut queues) = queues(&home, "idle");
+            queues.dialog.timeout_s = 3;
+            let classifier = Arc::new(FakeClassifier::default());
+            let pools = Arc::new(ArcSwap::from_pointee(unused()));
+            let changes = mpsc::channel().0;
+            let reasoning = Arc::clone(&reasoner);
+            let classifying = Arc::clone(&classifier) as _;
+            let mut conversation =
+                conversation(pools, changes, usize::MAX, queues, classifying, reasoning);
+            let clock = Arc::new(SetClock(Mutex::new(Timestamp::UNIX_EPOCH)));
+            conversation.two.clock = Arc::clone(&clock) as _;
+            Self {
+                runtime: paused(),
+                home,
+                classifier,
+                reasoner,
+                clock,
+                conversation,
+                requests: 0,
+                request: BTreeMap::new(),
+                jobs: BTreeMap::new(),
+                calls: BTreeSet::new(),
+            }
+        }
+
+        /// The work of `handle` for `text` on `satellite` when the classifier gives `label`.
+        fn handle(&self, satellite: &str, text: &str, label: Option<&str>) -> Option<Work> {
+            if let Some(label) = label {
+                let ranked = vec![(label.to_owned(), 0.9)];
+                let slots = Vec::new();
+                self.classifier.script(Prediction { ranked, slots });
+            }
+            let context = Context {
+                satellite_id: Some(satellite.to_owned()),
+                ..Context::default()
+            };
+            let handled = self
+                .runtime
+                .block_on(self.conversation.handle(text, context));
+            handled.expect("the prediction is scripted").after
+        }
+
+        /// A new request on `satellite` whose decision is a question, for `request`.
+        fn ask(&mut self, satellite: String, request: i64) {
+            let _ = self.handle(&satellite, "turn on the lights", Some("lights_on"));
+            self.request.insert(satellite, request);
+        }
+
+        /// A new request on `satellite` whose decision is a System Two job.
+        fn defer(&mut self, satellite: String) {
+            self.requests += 1;
+            let work = self.handle(&satellite, "tell me a joke", Some("removed"));
+            self.jobs
+                .insert(self.requests, (satellite, work.expect("a job")));
+        }
+
+        /// Runs the job of `request`, whose answer has one call.
+        fn act_job(&mut self, request: i64) -> anyhow::Result<()> {
+            let (_, work) = self.jobs.remove(&request).expect("the job runs");
+            self.reasoner.script(vec![Scripted::Call(call())]);
+            self.act(Some(work), request)
+        }
+
+        /// Runs `work`, and marks `request` when `FakeHome` records a call that is not an
+        /// announce or a question.
+        fn act(&mut self, work: Option<Work>, request: i64) -> anyhow::Result<()> {
+            let calls = |home: &FakeHome| {
+                let calls = home.calls();
+                calls
+                    .iter()
+                    .filter(|call| call.domain != "assist_satellite")
+                    .count()
+            };
+            let before = calls(&self.home);
+            if let Some(work) = work {
+                self.runtime.block_on(work)?;
+            }
+            if calls(&self.home) > before {
+                self.calls.insert(request);
+            }
+            Ok(())
+        }
+    }
+
+    impl Driver for JobDriver {
+        type State = Jobs;
+
+        fn step(&mut self, step: &Step) -> anyhow::Result<()> {
+            switch!(step {
+                init => *self = Self::new(),
+                open(k: String) => {
+                    self.requests += 1;
+                    self.ask(k, self.requests);
+                },
+                defer(k: String) => self.defer(k),
+                ask(r: i64) => self.ask(self.jobs[&r].0.clone(), r),
+                jobAct(r: i64) => self.act_job(r)?,
+                askAgain(k: String) => _ = self.handle(&k, "zzz", Some("unknown")),
+                fill(k: String) => {
+                    let work = self.handle(&k, "kitchen", None);
+                    self.act(work, self.request[&k])?;
+                },
+                cancel(k: String) => _ = self.handle(&k, "never mind", None),
+                tick => {
+                    let mut now = self.clock.0.lock().expect("no lock holder panics");
+                    *now += Duration::from_secs(1);
+                },
+            })
+        }
+    }
+
+    /// AC-10.5b-2. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/dialog.qnt", max_steps = 30, seed = "1")]
+    fn ac_10_5b_2_conformance() -> impl Driver {
+        JobDriver::new()
     }
 }
