@@ -961,11 +961,12 @@ impl Queues {
             .iter()
             .filter_map(|key| dialogs.take(key, now, rules.timeout_s))
             .collect();
+        // As in `filled`, a `Slot` dialog with no choices takes no answer.
         let fills = |dialog: &Dialog| match &dialog.pending {
-            Pending::Slot { choices, .. } => {
+            Pending::Slot { choices, .. } if !choices.is_empty() => {
                 dialog::fill(text, choices, rules.choice_similarity).is_some()
             }
-            Pending::Llm { .. } => false,
+            _ => false,
         };
         (!open.is_empty() && dialog::is_cancel(text, &rules.cancel)) || open.iter().any(fills)
     }
