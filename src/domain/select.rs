@@ -1,5 +1,6 @@
 //! Entity selection for an intent and an area.
 
+use serde_json::Value;
 use vstd::prelude::*;
 
 use crate::domain::catalog::Filter;
@@ -92,6 +93,76 @@ pub fn group(intent: &Intent, text: &str, cache: &StateCache) -> Option<EntityId
         return None;
     }
     Some(lowest(&groups))
+}
+
+/// The target of a control on the group player `group`: `group` when it plays, else its members
+/// that play, in the order of `group_members`, else `group`.
+#[verus_spec(target =>
+    ensures
+        texts_of(target@) == control_target(*cache, group.0@),
+)]
+#[must_use]
+pub fn played(group: &EntityId, cache: &StateCache) -> Vec<EntityId> {
+    let members = match cache.states.get(group.0.as_str()) {
+        Some(state) if !is_playing(cache, group.0.as_str()) => {
+            match state.attributes.get("group_members") {
+                Some(members) => members.as_array(),
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    let mut target = match members {
+        Some(members) => playing(members, cache),
+        None => Vec::new(),
+    };
+    if target.is_empty() {
+        target.push(EntityId(group.0.clone()));
+    }
+    target
+}
+
+/// The members of `members` whose state is `playing`, in order.
+#[verus_spec(found =>
+    ensures
+        texts_of(found@) == playing_members(*cache, members@),
+)]
+fn playing(members: &[Value], cache: &StateCache) -> Vec<EntityId> {
+    let mut found = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= members@.len(),
+            texts_of(found@) == playing_members(*cache, members@.take(index as int)),
+        decreases members@.len() - index,
+    ))]
+    while index < members.len() {
+        proof! {
+            assert(members@.take(index + 1).drop_last() =~= members@.take(index as int));
+            assert(members@.take(index + 1).last() == members@[index as int]);
+        }
+        match members[index].as_str() {
+            Some(id) if is_playing(cache, id) => found.push(EntityId(id.to_owned())),
+            Some(_) | None => {}
+        }
+        proof! {
+            assert(texts_of(found@) =~= playing_members(*cache, members@.take(index + 1)));
+        }
+        index += 1;
+    }
+    proof! {
+        assert(members@.take(index as int) =~= members@);
+    }
+    found
+}
+
+/// True when the state of the entity `id` is `playing`.
+#[verus_spec(found =>
+    ensures
+        found == plays(*cache, id@),
+)]
+fn is_playing(cache: &StateCache, id: &str) -> bool {
+    matches!(cache.states.get(id), Some(state) if state.state.as_str() == "playing")
 }
 
 /// True when `entity` is a group player with members and the name `wanted`, as `group_of` states.
@@ -650,6 +721,51 @@ pub open spec fn leading(intent: Intent, cache: StateCache, text: Seq<char>, id:
     &&& forall|index: int| 0 <= index < cache.entities@.len()
         && grouping(intent, cache, text, #[trigger] cache.entities@[index])
         ==> !lower(cache.entities@[index].entity_id.0, id.0)
+}
+
+/// The texts of `ids`.
+pub open spec fn texts_of(ids: Seq<EntityId>) -> Seq<Seq<char>> {
+    ids.map_values(|id: EntityId| id.0@)
+}
+
+/// True when the state of the entity `id` is `playing` in `cache`.
+pub open spec fn plays(cache: StateCache, id: Seq<char>) -> bool {
+    let key = crate::domain::contracts::str_key(id);
+    cache.states@.contains_key(key) && cache.states@[key].state@ == "playing"@
+}
+
+/// The items of the `group_members` list of the state of `group` in `cache`.
+pub open spec fn members_of(cache: StateCache, group: Seq<char>) -> Seq<Value> {
+    let key = crate::domain::contracts::str_key(group);
+    let members = crate::domain::contracts::attribute(cache.states@[key].attributes, "group_members");
+    match members {
+        Some(members) if cache.states@.contains_key(key) => match crate::domain::contracts::array(members) {
+            Some(items) => items,
+            None => Seq::empty(),
+        },
+        _ => Seq::empty(),
+    }
+}
+
+/// The JSON strings of `members` that name an entity that plays in `cache`, in order.
+pub open spec fn playing_members(cache: StateCache, members: Seq<Value>) -> Seq<Seq<char>>
+    decreases members.len(),
+{
+    if members.len() == 0 {
+        Seq::empty()
+    } else {
+        let before = playing_members(cache, members.drop_last());
+        match crate::domain::contracts::text(members.last()) {
+            Some(id) => if plays(cache, id) { before.push(id) } else { before },
+            None => before,
+        }
+    }
+}
+
+/// The texts of the target of a control on the group player `group`.
+pub open spec fn control_target(cache: StateCache, group: Seq<char>) -> Seq<Seq<char>> {
+    let playing = playing_members(cache, members_of(cache, group));
+    if plays(cache, group) || playing.len() == 0 { seq![group] } else { playing }
 }
 
 /// True when an entity of `cache` is a candidate of `intent` in `area`.

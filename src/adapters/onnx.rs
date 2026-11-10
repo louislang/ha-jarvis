@@ -436,6 +436,20 @@ mod tests {
         .await
     }
 
+    /// AC-18.15b-7.
+    #[tokio::test]
+    async fn ac_18_15b_7_slots_contain_the_group_of_a_control() -> anyhow::Result<()> {
+        assert_slots(&[
+            ("stop the music downstairs", "area", "downstairs"),
+            (
+                "pause the music on the downstairs speakers",
+                "area",
+                "downstairs speakers",
+            ),
+        ])
+        .await
+    }
+
     /// AC-3.12-11.
     #[tokio::test]
     async fn ac_3_12_11_long_text_is_truncated() -> anyhow::Result<()> {
