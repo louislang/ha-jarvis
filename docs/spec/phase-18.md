@@ -365,30 +365,22 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 ---
 
-### 18.13 Music Search
+### 18.13 Music Search Data
 
-**Goal:** Before `play_music` plays a name, find the best Music Assistant match: a library playlist first, then an artist, an album or a track with the same name. "Play jazz" then plays the playlist "jazzy" of the library, not the first track with the name "Jazz".
+**Goal:** Add the data that a Music Assistant search needs: the best match of a name in a search response, the config entry of each entity, and service calls with no target. Sub-phase 18.13b then plays the best match.
 
 - **Implements:** G3, G9. **Depends on:** 18.12.
-- **Files:** modify `intents.toml`, `src/domain/catalog.rs`, `src/domain/state.rs`, `src/domain/state_cache.rs` and `benches/domain.rs` (the new field in their `Entity` values), `src/domain/decide.rs`, `src/app/conversation.rs`, `src/adapters/ha.rs`, `src/testing/fakes.rs`.
+- **Files:** modify `src/domain/decide.rs`, `src/domain/state.rs`, `src/domain/state_cache.rs` and `benches/domain.rs` (the new field in their `Entity` values), `src/adapters/ha.rs`.
+
+The search was one sub-phase. With its tests and its Verus proof, it changes about 465 lines, which is more than the limit of 400 (`02-rules.md` section 7.1, rule 8). Thus 18.13 has the domain and adapter part (about 255 lines), and 18.13b has the use case part (about 210 lines). The criteria keep their numbers.
 
 **Model.**
 
 - Without `media_type`, `music_assistant.play_media` plays the best match of any type. In the field test on 2026-11-09, "play jazz" played the track "Jazz" by Mick Jenkins.
-- `Intent.search: bool`, default false. `play_music` has `search = true`. `play_radio` and `queue_music` do not.
 - `Entity.config_entry_id: Option<String>` is the config entry of the entity in `config/entity_registry/list`. `music_assistant.play_media` acts only on a Music Assistant player, so the config entry of the target is the config entry of Music Assistant. `music_assistant.search` needs it. Thus Jarvis needs no configuration for it.
-- `decide` does not change. The reply of a `Reply` comes from the pool of its intent (sub-phase 4.5c), and that pool has the name of the intent (sub-phase 4.2). Thus `dispatch` finds the intent in the catalog by the pool of the reply. When the intent has `search`, the background work of the call runs `resolve` before the call. `dispatch` returns the reply first (P-4.8-1), so the search adds no response latency.
-- `resolve(call) -> ServiceCall`:
-  1. The name is the `media_id` string of `call.data`. The config entry is the `config_entry_id` of the registry entry of the first target in the hot cache. When one is missing, `resolve` gives `call` unchanged.
-  2. Call `music_assistant.search` with no target, `return_response: true` and the data `{ config_entry_id, name, media_type: ["playlist"], library_only: true }`. The match is `best_match` of the response.
-  3. With no match, call `music_assistant.search` with the data `{ config_entry_id, name, media_type: ["artist", "album", "track"] }`. The match is `best_match` of this response. The media types keep the playlists of the streaming providers out of this step.
-  4. With a match, `resolve` gives `call` with `media_id` set to the `uri` of the match and `media_type` set to its `media_type`. With no match, it gives `call` unchanged, so Music Assistant plays the name as before.
-  5. A search error, or a response that does not parse, is logged. `resolve` then gives `call` unchanged.
 - `SearchResults { playlists, artists, albums, tracks }` holds a `Vec<MediaItem>` for each key. `MediaItem { media_type, uri, name }` holds the fields of one item. Both are in `src/domain/decide.rs` and derive `Deserialize`. A missing list is empty. The other keys of the response (`radio`, `audiobooks`, `podcasts`, `image`, `favorite` and more) are ignored.
 - `best_match(results, name) -> Option<&MediaItem>` is a pure function. With `normalize` of each name (sub-phase 3.1), it gives the first playlist whose name equals the name, else the first playlist whose name contains it, else the first artist, then album, then track whose name equals it.
 - `HaHome::call` (sub-phase 2.5) sends `target` only when `call.target` is not empty. HA adds the target to the service data, and the schema of `music_assistant.search` does not accept `entity_id`. Verified on the real HA on 2026-11-09: `music_assistant.search` succeeds with no `target` key, and fails with `target: {"entity_id": []}` and with an entity target.
-- Each search takes 1 s to 2 s on the real house. Each call has the deadline `ha.request_timeout_ms` (sub-phase 18.7).
-- `FakeHome` can give different responses to consecutive calls, so a test can give two different search responses.
 
 **Acceptance criteria.**
 
@@ -396,20 +388,51 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - AC-18.13-2: When `best_match` gets the playlist "jazzy" and the name "jazz", the result is "jazzy".
 - AC-18.13-3: When there is no playlist, and the artists, the albums and the tracks each have an item "Radiohead", the result for "radiohead" is the artist. When only the tracks have "Jazz", the result for "jazz" is that track.
 - AC-18.13-4: When no playlist contains the name, and no artist, album or track has the same name, the result is `None`. The track "Jazz Standards" is not a match for "jazz".
-- AC-18.13-5: When the intent is `play_music` with `media = hip hop` from the Kitchen satellite, the registry entry of `media_player.carson_kitchen` has `config_entry_id = "music_assistant"` (the test sets it in its copy of the reference house), and the first search gives the playlist "Hip Hop" (`library://playlist/82`), the reply is "Playing hip hop." Then `FakeHome` records `music_assistant.search` with no target, `return_response: true` and the data `{ config_entry_id: "music_assistant", name: "hip hop", media_type: ["playlist"], library_only: true }`. Then it records `music_assistant.play_media` on `media_player.carson_kitchen` with `{ media_id: "library://playlist/82", media_type: "playlist" }`.
-- AC-18.13-6: When the first search gives no match and the second gives the artist "Radiohead" (`spotify--x7LaiKmM://artist/4Z8W4fKeB5YxbusRsdQVPb`), `FakeHome` records the second search with `media_type: ["artist", "album", "track"]` and no `library_only`. Then it records `play_media` with `{ media_id: "spotify--x7LaiKmM://artist/4Z8W4fKeB5YxbusRsdQVPb", media_type: "artist" }`.
-- AC-18.13-7: When no search gives a match, when a search fails, or when the target has no `config_entry_id`, `FakeHome` records `play_media` with the data `{ media_id: "radiohead" }` of AC-18.7-1.
-- AC-18.13-8: When the intent is `play_radio` or `queue_music`, `FakeHome` records no `music_assistant.search`.
 - AC-18.13-9: When `call` runs with no target, the `call_service` message that `FakeHaServer` receives has no `target` key.
 - AC-18.13-10: When `FakeHaServer` gives an entity registry entry with `config_entry_id`, the entity of the snapshot has that `config_entry_id`.
 
 **Proofs.**
 
 - P-18.13-1 to P-18.13-4 (AC-18.13-1 to AC-18.13-4). Ensures: `best_match(results, name)` is the first item of `equal(playlists) + containing(playlists) + equal(artists) + equal(albums) + equal(tracks)`, and `None` when this sequence is empty. `equal(items)` keeps each item with `normalized(item.name) = normalized(name)`. `containing(items)` keeps each item whose `normalized(item.name)` contains `normalized(name)`. Argument: `best_match` makes the five passes in this order and returns the first item that passes. The loop invariant of each pass states that no earlier item of its list passes. `normalize` gives `normalized` (P-3.1-2).
+- P-18.13-9, P-18.13-10. Evidence: test.
+
+---
+
+### 18.13b Music Search Playback
+
+**Goal:** Before `play_music` plays a name, find the best Music Assistant match: a library playlist first, then an artist, an album or a track with the same name. "Play jazz" then plays the playlist "jazzy" of the library, not the first track with the name "Jazz".
+
+- **Implements:** G3, G9. **Depends on:** 18.13.
+- **Files:** modify `intents.toml`, `src/domain/catalog.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`.
+
+The criteria of this part keep the numbers AC-18.13-5 to AC-18.13-8 from before the split, so their tests are named `ac_18_13_5_...` to `ac_18_13_8_...`.
+
+**Model.**
+
+- `Intent.search: bool`, default false. `play_music` has `search = true`. `play_radio` and `queue_music` do not.
+- `decide` does not change. The reply of a `Reply` comes from the pool of its intent (sub-phase 4.5c), and that pool has the name of the intent (sub-phase 4.2). Thus `dispatch` finds the intent in the catalog by the pool of the reply. When the intent has `search`, the background work of the call runs `resolve` before the call. `dispatch` returns the reply first (P-4.8-1), so the search adds no response latency.
+- `resolve(call) -> ServiceCall`:
+  1. The name is the `media_id` string of `call.data`. The config entry is the `config_entry_id` of the registry entry of the first target in the hot cache. When one is missing, `resolve` gives `call` unchanged.
+  2. Call `music_assistant.search` with no target, `return_response: true` and the data `{ config_entry_id, name, media_type: ["playlist"], library_only: true }`. The match is `best_match` of the response.
+  3. With no match, call `music_assistant.search` with the data `{ config_entry_id, name, media_type: ["artist", "album", "track"] }`. The match is `best_match` of this response. The media types keep the playlists of the streaming providers out of this step.
+  4. With a match, `resolve` gives `call` with `media_id` set to the `uri` of the match and `media_type` set to its `media_type`. With no match, it gives `call` unchanged, so Music Assistant plays the name as before.
+  5. A search error, or a response that does not parse, is logged. `resolve` then gives `call` unchanged.
+- The search call has no target, so `HaHome::call` sends no `target` key (sub-phase 18.13).
+- Each search takes 1 s to 2 s on the real house. Each call has the deadline `ha.request_timeout_ms` (sub-phase 18.7).
+- `FakeHome` can give different responses to consecutive calls, so a test can give two different search responses.
+
+**Acceptance criteria.**
+
+- AC-18.13-5: When the intent is `play_music` with `media = hip hop` from the Kitchen satellite, the registry entry of `media_player.carson_kitchen` has `config_entry_id = "music_assistant"` (the test sets it in its copy of the reference house), and the first search gives the playlist "Hip Hop" (`library://playlist/82`), the reply is "Playing hip hop." Then `FakeHome` records `music_assistant.search` with no target, `return_response: true` and the data `{ config_entry_id: "music_assistant", name: "hip hop", media_type: ["playlist"], library_only: true }`. Then it records `music_assistant.play_media` on `media_player.carson_kitchen` with `{ media_id: "library://playlist/82", media_type: "playlist" }`.
+- AC-18.13-6: When the first search gives no match and the second gives the artist "Radiohead" (`spotify--x7LaiKmM://artist/4Z8W4fKeB5YxbusRsdQVPb`), `FakeHome` records the second search with `media_type: ["artist", "album", "track"]` and no `library_only`. Then it records `play_media` with `{ media_id: "spotify--x7LaiKmM://artist/4Z8W4fKeB5YxbusRsdQVPb", media_type: "artist" }`.
+- AC-18.13-7: When no search gives a match, when a search fails, or when the target has no `config_entry_id`, `FakeHome` records `play_media` with the data `{ media_id: "radiohead" }` of AC-18.7-1.
+- AC-18.13-8: When the intent is `play_radio` or `queue_music`, `FakeHome` records no `music_assistant.search`.
+
+**Proofs.**
+
 - P-18.13-5, P-18.13-6. Argument: `dispatch` returns the reply before the background work runs (P-4.8-1). `resolve` makes the playlist search first, and the second search only when `best_match` gives `None`.
 - P-18.13-7. Argument: each missing value, each error and the `None` of the second `best_match` give `call` unchanged.
 - P-18.13-8. Argument: `dispatch` runs `resolve` only when the intent of the reply pool has `search`, and only `play_music` has it.
-- P-18.13-9, P-18.13-10. Evidence: test.
 
 ## Field Log
 
