@@ -220,6 +220,18 @@ impl Home for FakeHome {
         });
         Ok(())
     }
+
+    async fn ask(&self, satellite: &str, question: &str) -> anyhow::Result<()> {
+        let data = json!({ "start_message": question, "preannounce": false });
+        lock(&self.calls).push(ServiceCall {
+            domain: "assist_satellite".to_owned(),
+            service: "start_conversation".to_owned(),
+            target: vec![satellite.to_owned()],
+            data: serde_json::from_value(data)?,
+            return_response: false,
+        });
+        Ok(())
+    }
 }
 
 /// A `Classifier` that gives scripted predictions in order and records each `(context, text)`.

@@ -1,6 +1,7 @@
 //! The `handle` use case, dispatch of decisions, the announce queues and the pools task.
 
 use std::collections::BTreeMap;
+use std::mem;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
@@ -11,6 +12,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use futures::FutureExt;
 use futures::channel::oneshot;
+use futures::future::BoxFuture;
 use rand::rngs::StdRng;
 use serde_json::Map;
 use serde_json::Value;
@@ -198,8 +200,8 @@ impl Conversation {
         Handled { text, after: None }
     }
 
-    /// The reply or filler of `decision` and its service call from `area` as background work,
-    /// and its fetch or System Two answer only with `satellite`. Records the use of the reply.
+    /// The reply, filler or question of `decision` and its service call from `area` as background
+    /// work, and its fetch, answer or question only with `satellite`. Records the use of the reply.
     /// Increases the generation of `satellite`, the satellite entity of the request.
     pub fn dispatch(
         &self,
@@ -225,10 +227,25 @@ impl Conversation {
                 let llm = request.map(|request| self.llm(text, area.cloned(), request));
                 (filler, llm)
             }
+            Decision::Ask { question, .. } => self.ask(question, request),
         };
         let Chosen { text, pool, index } = chosen;
         self.backfill.record_use(pool, index);
         Handled { text, after }
+    }
+
+    /// Empty text and `question` in the queue of the satellite of `request` with the generation of
+    /// `request`, or the text of `question` with no `request`.
+    fn ask(&self, mut question: Chosen, request: Option<(String, u64)>) -> (Chosen, Option<Work>) {
+        let Some((satellite, generation)) = request else {
+            return (question, None);
+        };
+        let (queues, text) = (Arc::clone(&self.queues), mem::take(&mut question.text));
+        let ask = async move {
+            let speak = queues.home.ask(&satellite, &text);
+            queues.queued(&satellite, generation, &text, speak).await
+        };
+        (question, Some(ask.boxed()))
     }
 
     /// Makes `call`. When it fails, logs the error, queues a `failure` answer on the satellite
@@ -499,6 +516,7 @@ fn kind(decision: &Decision) -> &'static str {
     match decision {
         Decision::Reply { .. } => "reply",
         Decision::Defer { .. } => "defer",
+        Decision::Ask { .. } => "ask",
     }
 }
 
@@ -576,6 +594,18 @@ impl Queues {
         generation: u64,
         text: &str,
     ) -> anyhow::Result<()> {
+        let speak = self.home.announce(satellite, text);
+        self.queued(satellite, generation, text, speak).await
+    }
+
+    /// Runs `speak`, which speaks `text` on `satellite`, as `announce` describes.
+    async fn queued(
+        &self,
+        satellite: &str,
+        generation: u64,
+        text: &str,
+        speak: BoxFuture<'_, anyhow::Result<()>>,
+    ) -> anyhow::Result<()> {
         let queue = self.queue(satellite);
         let _turn = queue.turn.lock().await;
         let mut cache = self.cache.clone();
@@ -599,7 +629,7 @@ impl Queues {
         if !self.is_current(satellite, generation) {
             return Ok(());
         }
-        self.home.announce(satellite, text).await
+        speak.await
     }
 }
 
@@ -793,6 +823,7 @@ mod tests {
             ("lights_on".to_owned(), pool(lights)),
             ("failure".to_owned(), pool(&[("Failed.", failure)])),
             ("filler".to_owned(), pool(&[("One moment.", 0)])),
+            ("ask_area".to_owned(), pool(&[("Which room?", 0)])),
             (
                 "weather".to_owned(),
                 pool(&[("It is {{ response.sky }}.", 0)]),
@@ -1373,6 +1404,69 @@ mod tests {
         let (handled, _) = handled(Some("unknown"), "tell me a joke", Some(KITCHEN)).await;
         assert_eq!(Instant::now(), start, "handle waited");
         assert_eq!(handled?.text, "One moment.");
+        Ok(())
+    }
+
+    /// The hot cache and the result of `handle` for "turn on the lights" from no device on the
+    /// satellite in the state `value`, when the classifier gives `lights_on`.
+    async fn unplaced(
+        home: &Arc<FakeHome>,
+        value: &str,
+    ) -> anyhow::Result<(watch::Sender<StateCache>, Handled)> {
+        let classifier = classifier(Some("lights_on"));
+        let (cache, _changes, conversation) = still_with(home, value, classifier, Arc::default());
+        let context = Context {
+            satellite_id: Some(SATELLITE.to_owned()),
+            ..Context::default()
+        };
+        let handled = conversation.handle("turn on the lights", context).await?;
+        Ok((cache, handled))
+    }
+
+    /// The questions that `home` asked, in order.
+    fn asks(home: &FakeHome) -> Vec<String> {
+        let calls = home.calls();
+        let texts = calls
+            .iter()
+            .filter_map(|call| call.data.get("start_message")?.as_str());
+        texts.map(str::to_owned).collect()
+    }
+
+    /// AC-10.4-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_4_4_ask_on_a_satellite_gives_empty_text_and_asks() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (_cache, handled) = unplaced(&home, "idle").await?;
+        assert_eq!(handled.text, "");
+        let after = handled.after.ok_or_else(|| anyhow::anyhow!("no after"))?;
+        after.await?;
+        assert_eq!(asks(&home), ["Which room?"]);
+        Ok(())
+    }
+
+    /// AC-10.4-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_4_5_ask_without_a_satellite_returns_the_question() -> anyhow::Result<()> {
+        let (handled, _) = handled(Some("lights_on"), "turn on the lights", None).await;
+        assert_eq!(handled?.text, "Which room?");
+        Ok(())
+    }
+
+    /// AC-10.4-8.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_4_8_ask_waits_for_the_idle_satellite() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (cache, handled) = unplaced(&home, "responding").await?;
+        let after = handled.after.ok_or_else(|| anyhow::anyhow!("no after"))?;
+        let (start, busy_for) = (Instant::now(), Duration::from_secs(1));
+        let idle = async {
+            tokio::time::sleep(busy_for).await;
+            assert_eq!(asks(&home), [] as [&str; 0], "a question came while busy");
+            set(&cache, "idle");
+        };
+        tokio::join!(after, idle).0?;
+        assert_eq!(Instant::now() - start, busy_for + MARGIN);
+        assert_eq!(asks(&home), ["Which room?"]);
         Ok(())
     }
 

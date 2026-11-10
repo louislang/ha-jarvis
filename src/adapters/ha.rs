@@ -263,10 +263,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
     ///
     /// A connection, HA or timeout error.
     pub async fn announce(&self, satellite: &str, text: &str) -> anyhow::Result<()> {
+        let data = json!({ "message": text, "preannounce": false });
+        self.speak(satellite, "announce", data).await
+    }
+
+    /// Speaks `question` on the satellite entity `satellite` with
+    /// `assist_satellite.start_conversation` and no preannounce sound. The satellite then listens
+    /// without the wake word.
+    ///
+    /// # Errors
+    ///
+    /// A connection, HA or timeout error.
+    pub async fn ask(&self, satellite: &str, question: &str) -> anyhow::Result<()> {
+        let data = json!({ "start_message": question, "preannounce": false });
+        self.speak(satellite, "start_conversation", data).await
+    }
+
+    /// Calls the `assist_satellite` service `service` on `satellite` with `data`.
+    async fn speak(&self, satellite: &str, service: &str, data: Value) -> anyhow::Result<()> {
         let command = json!({
-            "type": "call_service", "domain": "assist_satellite", "service": "announce",
-            "target": { "entity_id": [satellite] },
-            "service_data": { "message": text, "preannounce": false },
+            "type": "call_service", "domain": "assist_satellite", "service": service,
+            "target": { "entity_id": [satellite] }, "service_data": data,
         });
         self.request_within(command, self.announce_deadline).await?;
         Ok(())
@@ -376,6 +393,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Home for HaHome<S> {
 
     async fn announce(&self, satellite: &str, text: &str) -> anyhow::Result<()> {
         HaHome::announce(self, satellite, text).await
+    }
+
+    async fn ask(&self, satellite: &str, question: &str) -> anyhow::Result<()> {
+        HaHome::ask(self, satellite, question).await
     }
 }
 
@@ -1217,5 +1238,17 @@ mod tests {
         let (home, _request) = answer_after(Duration::from_secs(10)).await;
         home.announce("assist_satellite.kitchen", "It is sunny.")
             .await
+    }
+
+    /// AC-10.4-6.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_4_6_ask_sends_start_conversation() -> anyhow::Result<()> {
+        let (home, request) = answer_after(Duration::ZERO).await;
+        home.ask("assist_satellite.kitchen", "Which room?").await?;
+        let request = request.await?;
+        let data = json!({ "start_message": "Which room?", "preannounce": false });
+        assert_eq!(request["service"], "start_conversation");
+        assert_eq!(request["service_data"], data);
+        Ok(())
     }
 }

@@ -96,3 +96,6 @@ responses = ["I will check on that for you.", "Let me look into that.", "One mom
 
 [pools.failure]
 responses = ["Sorry, I could not do that."]
+
+[pools.ask_area]
+responses = ["Which room?", "In which room?"]
