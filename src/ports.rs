@@ -90,6 +90,9 @@ pub trait Home: Send + Sync {
     /// Speaks `text` on the satellite entity `satellite` with no preannounce sound. Returns
     /// after the satellite plays the audio.
     async fn announce(&self, satellite: &str, text: &str) -> anyhow::Result<()>;
+
+    /// Speaks `question` on the satellite entity `satellite`, then listens without the wake word.
+    async fn ask(&self, satellite: &str, question: &str) -> anyhow::Result<()>;
 }
 
 /// The System One model.

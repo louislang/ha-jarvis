@@ -253,6 +253,7 @@ pub fn validate_pools(pools: &Pools, catalog: &Catalog) -> Result<(), PoolError>
     }
     require(pools, "filler")?;
     require(pools, "failure")?;
+    require(pools, "ask_area")?;
     check_pools(pools, catalog)
 }
 
@@ -524,12 +525,13 @@ pub open spec fn pooled(pools: Map<String, Pool>, catalog: Catalog, count: int) 
         ==> pools.contains_key(crate::domain::contracts::string_key(#[trigger] catalog.intents@[index].name@))
 }
 
-/// True when each intent of `catalog` has a pool, the `filler` and `failure` pools exist, and each
-/// pool has one or more responses.
+/// True when each intent of `catalog` has a pool, the `filler`, `failure` and `ask_area` pools
+/// exist, and each pool has one or more responses.
 pub open spec fn valid_pools(pools: Map<String, Pool>, catalog: Catalog) -> bool {
     &&& pooled(pools, catalog, catalog.intents@.len() as int)
     &&& pools.contains_key(crate::domain::contracts::string_key("filler"@))
     &&& pools.contains_key(crate::domain::contracts::string_key("failure"@))
+    &&& pools.contains_key(crate::domain::contracts::string_key("ask_area"@))
     &&& filled(pools)
 }
 
@@ -898,6 +900,13 @@ mod tests {
         assert_eq!(result, unknown("fan_on", "response"));
         let result = validate(|pools, _| set(pools, "filler", &["One moment, {{ area }}."]));
         assert_eq!(result, unknown("filler", "area"));
+    }
+
+    /// AC-10.4-3.
+    #[test]
+    fn ac_10_4_3_missing_ask_area_names_it() {
+        let result = validate(|pools, _| _ = pools.remove("ask_area"));
+        assert_eq!(result, Err(PoolError::Missing("ask_area".to_owned())));
     }
 
     /// The result of `validate_pools` when the pool `pool` is `template` and `temperature_query`

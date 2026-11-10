@@ -15,6 +15,7 @@ use crate::domain::catalog::Catalog;
 use crate::domain::catalog::Intent;
 use crate::domain::catalog::Kind;
 use crate::domain::catalog::Target;
+use crate::domain::dialog::Pending;
 use crate::domain::model::Prediction;
 use crate::domain::model::Slot;
 use crate::domain::responses;
@@ -42,6 +43,13 @@ pub enum Decision {
         filler: Chosen,
         /// The deferred work.
         job: Job,
+    },
+    /// Ask the question and wait for the answer.
+    Ask {
+        /// The question.
+        question: Chosen,
+        /// What the answer fills.
+        pending: Pending,
     },
 }
 
@@ -296,7 +304,7 @@ fn has_domain(entity_id: &str, domains: &[&str]) -> bool {
             ==> deferred(decision, request.transcript),
         !(decision matches Decision::Defer { job: Job::Llm(_), .. }) ==> exists|index: int|
             #[trigger] handled(*prediction, *catalog, threshold, index)
-            && acted(catalog.intents@[index], *prediction, *request, *cache, decision),
+            && placed(catalog.intents@[index], *prediction, *request, *cache, decision),
 )]
 #[must_use]
 pub fn decide(
@@ -338,16 +346,17 @@ pub fn decide(
     }
 }
 
-/// The decision of `intent` in the area of the area slot, else of the satellite, or a System Two
-/// job when System One cannot act: the slot names no area, a query or a service has no area, or a
-/// later step fails. A fetch and a `house` query need no area.
+/// The decision of `intent` in the area of the area slot, else of the satellite, or the decision of
+/// `situation`. A System Two job when a query has no area or a later step fails. A fetch and a
+/// `house` query need no area.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
         pools@.contains_key(crate::domain::contracts::string_key("filler"@)),
+        pools@.contains_key(crate::domain::contracts::string_key("ask_area"@)),
         responses::filled(pools@),
     ensures
-        acted(*intent, *prediction, *request, *cache, decision),
+        placed(*intent, *prediction, *request, *cache, decision),
 )]
 fn act(
     intent: &Intent,
@@ -357,15 +366,15 @@ fn act(
     pools: &Pools,
     rng: &mut StdRng,
 ) -> Decision {
-    let Some((area, context)) = situation(intent, prediction, request, cache) else {
-        return defer(request, pools, rng);
-    };
-    let decision = match (intent.kind, &intent.service, area) {
-        (Kind::Fetch, _, _) => fetch(intent, &context, pools, rng),
-        (Kind::Query, _, _) => query(intent, area, context, cache, request.now, pools, rng),
-        (Kind::Command, None, _) => respond(intent, &context, None, pools, rng),
-        (_, Some(_), Some(area)) => call(intent, area, context, cache, request.now, pools, rng),
-        _ => None,
+    let decision = match situation(intent, prediction, request, cache, pools, rng) {
+        Err(decision) => return *decision,
+        Ok((area, context)) => match (intent.kind, &intent.service, area) {
+            (Kind::Fetch, _, _) => fetch(intent, &context, pools, rng),
+            (Kind::Query, _, _) => query(intent, area, context, cache, request.now, pools, rng),
+            (Kind::Command, None, _) => respond(intent, &context, None, pools, rng),
+            (_, Some(_), Some(area)) => call(intent, area, context, cache, request.now, pools, rng),
+            _ => None,
+        },
     };
     match decision {
         Some(decision) => decision,
@@ -373,13 +382,22 @@ fn act(
     }
 }
 
+/// The area of a request and its template context.
+type Situated<'a> = (Option<&'a AreaId>, Map<String, Value>);
+
 /// The area of the first area slot of `prediction`, else of `request`, and the template context of
-/// `intent` in it, or `None` when the slot names no area or a slot is missing.
+/// `intent` in it. Else the decision: a System Two job when a slot is missing, or a question for
+/// the area when the slot names no area or a command service has no area.
 #[verus_spec(found =>
+    requires
+        pools@.contains_key(crate::domain::contracts::string_key("filler"@)),
+        pools@.contains_key(crate::domain::contracts::string_key("ask_area"@)),
+        responses::filled(pools@),
     ensures
-        found matches Some((area, _)) ==> match area {
-            Some(area) => located(*prediction, *request, *cache, *area),
-            None => unslotted(prediction.slots@) && request.area is None,
+        match found {
+            Ok((Some(area), _)) => located(*prediction, *request, *cache, *area),
+            Ok((None, _)) => unslotted(prediction.slots@) && request.area is None,
+            Err(decision) => deferred(*decision, request.transcript) || asked(*intent, *cache, *decision),
         },
 )]
 fn situation<'a>(
@@ -387,12 +405,78 @@ fn situation<'a>(
     prediction: &Prediction,
     request: &'a Request,
     cache: &'a StateCache,
-) -> Option<(Option<&'a AreaId>, Map<String, Value>)> {
+    pools: &Pools,
+    rng: &mut StdRng,
+) -> Result<Situated<'a>, Box<Decision>> {
+    let Some(slots) = slots(intent, prediction) else {
+        return Err(Box::new(defer(request, pools, rng)));
+    };
     let area = match area_slot(&prediction.slots) {
-        Some(slot) => Some(cache.area_by_name(prediction.slots[slot].value.as_str())?),
+        Some(slot) => match cache.area_by_name(prediction.slots[slot].value.as_str()) {
+            Some(area) => Some(area),
+            None => return Err(Box::new(ask(intent, prediction, cache, pools, rng))),
+        },
         None => request.area.as_ref(),
     };
-    Some((area, context(intent, prediction, area, cache)?))
+    if area.is_none() && matches!((intent.kind, &intent.service), (Kind::Command, Some(_))) {
+        return Err(Box::new(ask(intent, prediction, cache, pools, rng)));
+    }
+    Ok((area, context(slots, area, cache)))
+}
+
+/// The question from `ask_area` for the area of `intent`, with the slots of `prediction`, and the
+/// name and the aliases of each area of `cache` as the choices.
+#[verus_spec(decision =>
+    requires
+        pools@.contains_key(crate::domain::contracts::string_key("ask_area"@)),
+        responses::filled(pools@),
+    ensures
+        asked(*intent, *cache, decision),
+)]
+fn ask(
+    intent: &Intent,
+    prediction: &Prediction,
+    cache: &StateCache,
+    pools: &Pools,
+    rng: &mut StdRng,
+) -> Decision {
+    Decision::Ask {
+        question: choose(pools, "ask_area", rng),
+        pending: Pending::Slot {
+            intent: intent.name.clone(),
+            slots: prediction.slots.clone(),
+            missing: "area".to_owned(),
+            choices: area_choices(cache),
+        },
+    }
+}
+
+/// The name and then the aliases of each area of `cache`.
+#[verus_spec(choices =>
+    ensures
+        choices@ == offered(cache.areas@),
+)]
+fn area_choices(cache: &StateCache) -> Vec<String> {
+    let mut choices = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= cache.areas@.len(),
+            choices@ == offered(cache.areas@.take(index as int)),
+        decreases cache.areas@.len() - index,
+    ))]
+    while index < cache.areas.len() {
+        proof! {
+            assert(cache.areas@.take(index + 1).drop_last() =~= cache.areas@.take(index as int));
+        }
+        choices.push(cache.areas[index].name.clone());
+        choices.extend_from_slice(cache.areas[index].aliases.as_slice());
+        index += 1;
+    }
+    proof! {
+        assert(cache.areas@.take(index as int) =~= cache.areas@);
+    }
+    choices
 }
 
 /// The reply of the query `intent` rendered with its selection in `area` at `now`, or `None` when
@@ -624,16 +708,13 @@ fn respond(
     Some(Decision::Reply { reply, call })
 }
 
-/// The template context of `intent`: the name of `area` in lowercase and the slots of
-/// `prediction`, or `None` when a slot is missing.
+/// The template context: the slots of `context` and the name of `area` in lowercase.
 #[verus_verify]
 fn context(
-    intent: &Intent,
-    prediction: &Prediction,
+    mut context: Map<String, Value>,
     area: Option<&AreaId>,
     cache: &StateCache,
-) -> Option<Map<String, Value>> {
-    let mut context = slots(intent, prediction)?;
+) -> Map<String, Value> {
     let found = match area {
         Some(area) => cache.areas.iter().find(|known| known.area_id.0 == area.0),
         None => None,
@@ -641,7 +722,7 @@ fn context(
     if let Some(found) = found {
         context.insert("area".to_owned(), Value::from(found.name.to_lowercase()));
     }
-    Some(context)
+    context
 }
 
 /// The value in `prediction` of each slot of `intent` except `area`, with an empty string for a
@@ -850,10 +931,12 @@ fn defer(request: &Request, pools: &Pools, rng: &mut StdRng) -> Decision {
 }
 
 /// A random response of the pool `name`, with its template as the text.
-#[verus_spec(
+#[verus_spec(chosen =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(name@)),
         responses::filled(pools@),
+    ensures
+        chosen.pool@ == name@,
 )]
 fn choose(pools: &Pools, name: &str, rng: &mut StdRng) -> Chosen {
     let pool = pools.get(name).expect("the pool exists");
@@ -999,6 +1082,26 @@ pub open spec fn acted(intent: Intent, prediction: Prediction, request: Request,
             && targeted(intent, cache, area, selected))
     &&& intent.kind is Fetch && intent.plugin is None ==> deferred(decision, request.transcript)
     &&& intent.kind is Fetch ==> deferred(decision, request.transcript) || fetched(intent, decision)
+}
+
+/// True when `decision` asks for the area of `intent`, or is not a question and obeys `acted`.
+pub open spec fn placed(intent: Intent, prediction: Prediction, request: Request, cache: StateCache, decision: Decision) -> bool {
+    if decision is Ask { asked(intent, cache, decision) } else { acted(intent, prediction, request, cache, decision) }
+}
+
+/// True when `decision` asks from `ask_area` for the area of `intent`, with the name and the
+/// aliases of each area of `cache` as the choices.
+pub open spec fn asked(intent: Intent, cache: StateCache, decision: Decision) -> bool {
+    decision matches Decision::Ask { question, pending: Pending::Slot { intent: name, missing, choices, .. } }
+        && question.pool@ == "ask_area"@ && name@ == intent.name@ && missing@ == "area"@
+        && choices@ == offered(cache.areas@)
+}
+
+/// The name and then the aliases of each area of `areas`, in order.
+pub open spec fn offered(areas: Seq<crate::domain::state::Area>) -> Seq<String>
+    decreases areas.len(),
+{
+    if areas.len() == 0 { Seq::empty() } else { offered(areas.drop_last()).push(areas.last().name) + areas.last().aliases@ }
 }
 
 /// True when `intent` is a query with `target = "house"`.
@@ -1193,7 +1296,7 @@ mod tests {
     fn pools(catalog: &Catalog) -> Pools {
         let names = catalog.intents.iter().map(|intent| intent.name.as_str());
         names
-            .chain(["filler", "failure"])
+            .chain(["filler", "failure", "ask_area"])
             .map(|name| {
                 let text = match name {
                     "lights_on" => "The {{ area }} lights.".to_owned(),
@@ -1458,20 +1561,69 @@ mod tests {
         );
     }
 
-    /// AC-4.5b-3.
-    #[test]
-    fn ac_4_5b_3_unknown_slot_area_defers() {
-        let decision = decided_in(&catalog(), "lights_on", Some("attic"), Some("kitchen"));
-        assert_eq!(decision, deferral(""));
+    /// The `ask_area` question for the area of `lights_on` with `slots` and the area names of the
+    /// reference house as the choices.
+    fn asking(slots: Vec<Slot>) -> Decision {
+        let names = house().areas.into_iter().map(|area| area.name);
+        let question = Chosen {
+            text: "The ask_area response.".to_owned(),
+            pool: "ask_area".to_owned(),
+            index: 0,
+        };
+        let pending = Pending::Slot {
+            intent: "lights_on".to_owned(),
+            slots,
+            missing: "area".to_owned(),
+            choices: names.collect(),
+        };
+        Decision::Ask { question, pending }
     }
 
-    /// AC-4.5b-4.
+    /// AC-10.4-1.
     #[test]
-    fn ac_4_5b_4_no_area_defers() {
-        assert_eq!(
-            decided_in(&catalog(), "lights_on", None, None),
-            deferral("")
-        );
+    fn ac_10_4_1_no_area_asks_for_the_area() {
+        let decision = decided_in(&catalog(), "lights_on", None, None);
+        assert_eq!(decision, asking(Vec::new()));
+    }
+
+    /// AC-10.4-2.
+    #[test]
+    fn ac_10_4_2_unknown_slot_area_asks_for_the_area() {
+        let decision = decided_in(&catalog(), "lights_on", Some("attic"), Some("kitchen"));
+        let (name, value) = ("area".to_owned(), "attic".to_owned());
+        assert_eq!(decision, asking(vec![Slot { name, value }]));
+    }
+
+    /// AC-10.4-7.
+    #[test]
+    fn ac_10_4_7_missing_template_slot_defers() {
+        for slot in [None, Some("attic")] {
+            let decision = decided_in(&catalog(), "tv_show", slot, None);
+            assert_eq!(decision, deferral(""), "area slot {slot:?}");
+        }
+    }
+
+    /// AC-10.4-9.
+    #[test]
+    fn ac_10_4_9_alias_answer_uses_its_area() {
+        let mut snapshot = house();
+        snapshot.areas[3].aliases = vec!["Study".to_owned()];
+        let cache = StateCache::load(snapshot);
+        let request = Request {
+            transcript: String::new(),
+            area: None,
+            now: Timestamp::UNIX_EPOCH,
+        };
+        let decided = |area: &str| {
+            decided_for(
+                &catalog(),
+                ("lights_on", 0.89),
+                &[("area", area)],
+                &request,
+                &cache,
+            )
+        };
+        assert_eq!(decided("study"), decided("Office"));
     }
 
     /// AC-4.5b-5.
