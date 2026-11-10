@@ -434,6 +434,40 @@ The criteria of this part keep the numbers AC-18.13-5 to AC-18.13-8 from before 
 - P-18.13-7. Argument: each missing value, each error and the `None` of the second `best_match` give `call` unchanged.
 - P-18.13-8. Argument: `dispatch` runs `resolve` only when the intent of the reply pool has `search`, and only `play_music` has it.
 
+---
+
+### 18.14 Fast Artist Start
+
+**Goal:** Start the music of an artist match in about 3 s, not in 13 s to 17 s. "Play Radiohead" then plays one track of the artist immediately and adds the artist to the queue.
+
+- **Implements:** G3, G9. **Depends on:** 18.13b.
+- **Files:** modify `src/domain/decide.rs`, `src/domain/contracts.rs`, `src/app/conversation.rs`.
+
+**Model.**
+
+- On the Office speaker, `music_assistant.play_media` with a Spotify artist `uri` took 13.4 s (warm) and 17.1 s (cold) before the music started. Music Assistant first loads all tracks of the artist. One track took about 2.9 s. A second `play_media` with the artist `uri` and `enqueue = "add"` returned in 0.1 s and did not stop the track.
+- The response of the artist, album and track search (sub-phase 18.13b, step 3) also has tracks. Each track item has an `artists` list. Each entry of this list has the `name` of one artist of the track.
+- `MediaItem.artists: Vec<Artist>` holds this list. A missing list is empty. `Artist { name }` is in `src/domain/decide.rs` and derives `Deserialize`. The other keys of an entry are ignored.
+- The `uri` of a track artist can be different from the `uri` of the artist match (`library://` and `spotify--x7LaiKmM://`). Thus Jarvis compares the names, as `best_match` does (sub-phase 18.13).
+- `first_track(results, artist) -> Option<&MediaItem>` is a pure function. With `normalize` of each name (sub-phase 3.1), it gives the first track of `results.tracks` that has an artist whose name equals `artist`. It does not read the name of the track. A search for "the national" also gives the track "The National Anthem" by Radiohead, and that track is not a match.
+- `resolve` (sub-phase 18.13b) now gives a list of calls. When the match has `media_type = "artist"` and `first_track` of the same response with the name of the match gives a track, the list has two calls:
+  1. `call` with `media_id` set to the `uri` of the track and `media_type = "track"`.
+  2. `call` with `media_id` set to the `uri` of the match, `media_type = "artist"` and `enqueue = "add"`.
+- With no such track, and for a playlist, an album or a track match, the list has the one call of sub-phase 18.13b.
+- The background work makes the calls in order. When a call fails, it makes no more calls and announces `failure` (sub-phase 4.9c).
+- The first track can play again later in the queue of the artist. This is accepted.
+
+**Acceptance criteria.**
+
+- AC-18.14-1: When the first search gives no match, and the second gives the artist "Radiohead" (`library://artist/5`) and the track "Karma Police" (`spotify--x7LaiKmM://track/63OQupATfueTdZMWTxW03A`) with the artist "Radiohead", `FakeHome` records two `play_media` calls on `media_player.carson_kitchen` after the searches. The first has the data `{ media_id: "spotify--x7LaiKmM://track/63OQupATfueTdZMWTxW03A", media_type: "track" }`. The second has the data `{ media_id: "library://artist/5", media_type: "artist", enqueue: "add" }`.
+- AC-18.14-2: When the second search gives the artist "The National" (`library://artist/7`) and only the track "The National Anthem" with the artist "Radiohead", `FakeHome` records one `play_media` call after the searches, with the data `{ media_id: "library://artist/7", media_type: "artist" }`.
+- AC-18.14-3: When `first_track` gets the tracks "The National Anthem" by "Radiohead" and "Bloodbuzz Ohio" by "The National", and the artist "the national", the result is "Bloodbuzz Ohio". When no track has an artist with the name, the result is `None`.
+
+**Proofs.**
+
+- P-18.14-1, P-18.14-2. Argument: `resolve` gives two calls only when the match is an artist and `first_track` gives a track (P-18.14-3). Else it gives the one call of P-18.13-6. The background work makes the calls in order.
+- P-18.14-3 (AC-18.14-3). Ensures: `first_track(results, artist)` is the first item of `credited(results.tracks)`, and `None` when this sequence is empty. `credited(items)` keeps each item that has an entry in `artists` with `normalized(entry.name) = normalized(artist)`. Argument: `first_track` makes one pass over the tracks and returns the first track that passes. The loop invariant states that no earlier track passes. The pass over the artists of one track has the loop invariant that no earlier artist has the name. `normalize` gives `normalized` (P-3.1-2).
+
 ## Field Log
 
 These steps are not tests and gate nothing.
