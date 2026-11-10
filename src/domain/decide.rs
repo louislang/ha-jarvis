@@ -115,6 +115,16 @@ pub struct MediaItem {
     pub uri: String,
     /// The name that Music Assistant shows.
     pub name: String,
+    /// The artists of a track. A missing list is empty.
+    #[serde(default)]
+    pub artists: Vec<Artist>,
+}
+
+/// One artist of a track in a Music Assistant search response.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct Artist {
+    /// The name that Music Assistant shows.
+    pub name: String,
 }
 
 /// How the name of an item matches a searched name.
@@ -125,6 +135,8 @@ pub enum Matching {
     Equal,
     /// The name of the item contains the searched name.
     Containing,
+    /// An artist of the item has the searched name.
+    Artist,
 }
 
 /// The transcript, the satellite area and the time of a request.
@@ -1057,6 +1069,22 @@ pub fn best_match<'a>(results: &'a SearchResults, name: &str) -> Option<&'a Medi
     first_match(results.tracks.as_slice(), name, Equal)
 }
 
+/// The first track of `results` with an artist whose name is `artist`, with `normalize` of each
+/// name.
+#[verus_spec(found =>
+    ensures
+        match found {
+            Some(item) => credited_tracks(*results, artist@).len() > 0
+                && *item == credited_tracks(*results, artist@)[0],
+            None => credited_tracks(*results, artist@).len() == 0,
+        },
+)]
+#[must_use]
+pub fn first_track<'a>(results: &'a SearchResults, artist: &str) -> Option<&'a MediaItem> {
+    let normal = intent::normalize(artist);
+    first_match(results.tracks.as_slice(), normal.as_str(), Matching::Artist)
+}
+
 /// The first item of `items` whose normalized name matches `name` as `how` says.
 #[verus_spec(found =>
     ensures
@@ -1101,7 +1129,32 @@ fn is_match(item: &MediaItem, name: &str, how: Matching) -> bool {
     match how {
         Matching::Equal => normal.as_str() == name,
         Matching::Containing => normal.as_str().contains(name),
+        Matching::Artist => credits(item.artists.as_slice(), name),
     }
+}
+
+/// True when the normalized name of an artist of `artists` is `name`.
+#[verus_spec(found =>
+    ensures
+        found == credited(artists@, name@),
+)]
+fn credits(artists: &[Artist], name: &str) -> bool {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= artists@.len(),
+            forall|earlier: int| 0 <= earlier < index
+                ==> intent::normalized(#[trigger] artists@[earlier].name@) != name@,
+        decreases artists@.len() - index,
+    ))]
+    while index < artists.len() {
+        let normal = intent::normalize(artists[index].name.as_str());
+        if normal.as_str() == name {
+            return true;
+        }
+        index += 1;
+    }
+    false
 }
 
 verus! {
@@ -1390,7 +1443,13 @@ pub open spec fn matches_name(item: MediaItem, name: Seq<char>, how: Matching) -
     match how {
         Matching::Equal => intent::normalized(item.name@) == name,
         Matching::Containing => crate::domain::contracts::infix(name, intent::normalized(item.name@)),
+        Matching::Artist => credited(item.artists@, name),
     }
+}
+
+/// True when the normalized name of an artist of `artists` is `name`.
+pub open spec fn credited(artists: Seq<Artist>, name: Seq<char>) -> bool {
+    exists|index: int| 0 <= index < artists.len() && intent::normalized(#[trigger] artists[index].name@) == name
 }
 
 /// The test of `matches_name` with `name` and `how`.
@@ -1426,6 +1485,11 @@ pub open spec fn candidates(results: SearchResults, name: Seq<char>) -> Seq<Medi
         + matched(results.artists@, name, Matching::Equal)
         + matched(results.albums@, name, Matching::Equal)
         + matched(results.tracks@, name, Matching::Equal)
+}
+
+/// The tracks that `first_track` can give for `artist`, in order.
+pub open spec fn credited_tracks(results: SearchResults, artist: Seq<char>) -> Seq<MediaItem> {
+    matched(results.tracks@, intent::normalized(artist), Matching::Artist)
 }
 
 } // verus!
@@ -2719,5 +2783,23 @@ mod tests {
             "jazz",
         );
         assert_eq!(found, None);
+    }
+
+    /// AC-18.14-3.
+    #[test]
+    fn ac_18_14_3_track_is_chosen_by_its_artist_not_its_name() {
+        let track = |name, artist| {
+            serde_json::json!({ "media_type": "track", "uri": "", "name": name,
+                "artists": [{ "media_type": "artist", "name": artist }] })
+        };
+        let tracks = [
+            track("The National Anthem", "Radiohead"),
+            track("Bloodbuzz Ohio", "The National"),
+        ];
+        let results = serde_json::from_value(serde_json::json!({ "tracks": tracks }));
+        let results: SearchResults = results.expect("the results");
+        let found = first_track(&results, "the national").map(|track| track.name.as_str());
+        assert_eq!(found, Some("Bloodbuzz Ohio"));
+        assert_eq!(first_track(&results, "muse"), None);
     }
 }
