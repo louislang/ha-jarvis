@@ -767,6 +767,7 @@ mod tests {
                 on(reply)?;
                 Seen::Plugin(call)
             }
+            Step::Ask { .. } => anyhow::bail!("the answer asks"),
             Step::Done => Seen::Done,
         })
     }

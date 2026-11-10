@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::io;
-use std::mem;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -240,7 +239,7 @@ impl Home for FakeHome {
             data: serde_json::from_value(data)?,
             return_response: false,
         });
-        Ok(())
+        self.wait().await
     }
 }
 
@@ -307,6 +306,8 @@ pub(crate) enum Scripted {
     States(&'static str),
     /// A plugin call.
     Plugin(PluginCall),
+    /// A question with this text, from the response `response`, with the text as the call ID.
+    Ask(&'static str),
     /// An error with this text.
     Error(&'static str),
     /// A wait of this time before the next step.
@@ -325,8 +326,8 @@ pub(crate) struct FakeReasoner {
     warms: AtomicUsize,
     /// The text of each question, in order.
     questions: Mutex<Vec<String>>,
-    /// The steps of the next answer, in order.
-    script: Mutex<Vec<Scripted>>,
+    /// The steps of each next answer, in order.
+    scripts: Mutex<VecDeque<Vec<Scripted>>>,
     /// The reply of each call, in order.
     replies: Arc<Mutex<Vec<Reply>>>,
     /// The pool of each `generate` call, in order.
@@ -348,9 +349,9 @@ impl FakeReasoner {
         lock(&self.questions).clone()
     }
 
-    /// Makes the next answer give `steps`.
+    /// Makes the next answer without earlier scripted steps give `steps`.
     pub(crate) fn script(&self, steps: Vec<Scripted>) {
-        *lock(&self.script) = steps;
+        lock(&self.scripts).push_back(steps);
     }
 
     /// The tool result of each call that came back: the error text, else the result.
@@ -392,6 +393,11 @@ async fn answered(step: Scripted, replies: Arc<Mutex<Vec<Reply>>>) -> Option<any
         Scripted::Call(call) => Some(Ok(Step::Call(call, reply(&replies)))),
         Scripted::States(area) => Some(Ok(Step::States(area.to_owned(), reply(&replies)))),
         Scripted::Plugin(call) => Some(Ok(Step::Plugin(call, reply(&replies)))),
+        Scripted::Ask(text) => Some(Ok(Step::Ask {
+            question: text.to_owned(),
+            response_id: "response".to_owned(),
+            call_id: text.to_owned(),
+        })),
         Scripted::Error(text) => Some(Err(anyhow::anyhow!(text))),
         Scripted::Wait(time) => {
             tokio::time::sleep(time).await;
@@ -409,7 +415,7 @@ impl Reasoner for FakeReasoner {
 
     fn answer(&self, question: &Question) -> BoxStream<'static, anyhow::Result<Step>> {
         lock(&self.questions).push(question.text.clone());
-        let steps = mem::take(&mut *lock(&self.script));
+        let steps = lock(&self.scripts).pop_front().unwrap_or_default();
         let replies = Arc::clone(&self.replies);
         let step = move |step| answered(step, Arc::clone(&replies));
         futures::stream::iter(steps).filter_map(step).boxed()
