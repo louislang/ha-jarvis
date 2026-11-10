@@ -450,6 +450,62 @@ mod tests {
         .await
     }
 
+    /// The phrases of AC-18.16-7 with their new intent and their old wrong intent.
+    const OPPOSITES: [(&str, &str, &str); 10] = [
+        ("turn off the lights", "lights_off", "lights_on"),
+        ("turn the lights off", "lights_off", "lights_on"),
+        ("lights off", "lights_off", "lights_on"),
+        ("turn the fan off", "fan_off", "fan_on"),
+        ("turn the air up", "climate_up", "climate_down"),
+        ("make it warmer", "climate_up", "climate_down"),
+        ("turn the heat up", "climate_up", "climate_down"),
+        ("previous song", "music_previous", "music_next"),
+        ("unpause the music", "music_resume", "volume_down"),
+        ("turn off the tv", "tv_off", "volume_down"),
+    ];
+
+    /// The top label and its probability for each phrase of `OPPOSITES`, with the context of the
+    /// speculative prediction.
+    async fn opposite_tops() -> anyhow::Result<Vec<(String, f32)>> {
+        let classifier = OnnxLoader.load(Path::new(FIXTURE), Device::Cpu).await?;
+        let mut tops = Vec::new();
+        for (text, _, _) in OPPOSITES {
+            let prediction = classifier
+                .predict("area: none | habits: none", text)
+                .await?;
+            tops.push(prediction.ranked[0].clone());
+        }
+        Ok(tops)
+    }
+
+    /// AC-18.16-7.
+    #[tokio::test]
+    async fn ac_18_16_7_opposite_phrases_give_the_new_intent_with_confidence() -> anyhow::Result<()>
+    {
+        let threshold = crate::Config::load(Path::new("jarvis.toml"))?
+            .model
+            .commit_threshold;
+        let tops = opposite_tops().await?;
+        for ((text, intent, _), (top, probability)) in OPPOSITES.iter().zip(tops) {
+            assert_eq!(top, *intent, "top label of {text}");
+            assert!(
+                probability >= threshold,
+                "{text} gives {intent} {probability}, under {threshold}"
+            );
+        }
+        Ok(())
+    }
+
+    /// AC-18.16-8.
+    #[tokio::test]
+    async fn ac_18_16_8_opposite_phrases_do_not_give_the_old_intent() -> anyhow::Result<()> {
+        let tops = opposite_tops().await?;
+        for ((text, _, old), (top, _)) in OPPOSITES.iter().zip(tops) {
+            assert_ne!(top, *old, "top label of {text}");
+        }
+        Ok(())
+    }
+
     /// AC-3.12-11.
     #[tokio::test]
     async fn ac_3_12_11_long_text_is_truncated() -> anyhow::Result<()> {

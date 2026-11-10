@@ -248,3 +248,52 @@ name = "new_shows"
 kind = "fetch"
 examples = ["are there any new shows", "what is new on plex", "is there anything new to watch", "what shows can i continue"]
 plugin = "get_new_shows"
+
+[[intent]]
+name = "lights_off"
+kind = "command"
+examples = ["turn off the lights", "turn off the [kitchen](area) lights", "lights off", "turn the lights off", "switch the lights off in the [living room](area)", "can you turn the [office](area) lights off"]
+service = "homeassistant.turn_off"
+target = "entities"
+select = [{ domain = "light" }, { domain = "switch", name = "light" }]
+
+[[intent]]
+name = "fan_off"
+kind = "command"
+examples = ["turn off the fan", "turn off the [office](area) fan", "fan off please", "turn the fan off", "stop the fan"]
+service = "homeassistant.turn_off"
+target = "entity"
+select = [{ domain = "fan" }, { domain = "switch", name = "fan" }]
+
+[[intent]]
+name = "climate_up"
+kind = "command"
+examples = ["turn the air up", "turn the heat up", "make it warmer", "raise the temperature"]
+service = "climate.set_temperature"
+target = "entity"
+select = [{ domain = "climate" }]
+data = { temperature = "{{ entity.attributes.temperature + 2 }}" }
+
+[[intent]]
+name = "music_resume"
+kind = "command"
+examples = ["unpause the music", "resume the music", "resume the music in the [kitchen](area)", "start the music again"]
+service = "media_player.media_play"
+target = "entity"
+select = [{ domain = "media_player", device_class = "speaker" }]
+
+[[intent]]
+name = "music_previous"
+kind = "command"
+examples = ["previous song", "go back a song", "play the previous track", "go back to the previous song in the [kitchen](area)"]
+service = "media_player.media_previous_track"
+target = "entity"
+select = [{ domain = "media_player", device_class = "speaker" }]
+
+[[intent]]
+name = "tv_off"
+kind = "command"
+examples = ["turn off the tv", "turn the tv off", "switch off the tv", "tv off"]
+service = "media_player.turn_off"
+target = "entity"
+select = [{ domain = "media_player", name = "tv" }]

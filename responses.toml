@@ -91,6 +91,24 @@ responses = ["Stopping the TV."]
 [pools.new_shows]
 responses = ['{% if response.added %}New on Plex: {{ response.added | join(", ") }}.{% else %}Nothing new was added to Plex in the last day.{% endif %}{% if response.on_deck %} You can continue {{ response.on_deck | join(", ") }}.{% endif %}']
 
+[pools.lights_off]
+responses = ["I am turning the lights off.", "I will turn off the lights.", "Turning off the lights in the {{ area }}."]
+
+[pools.fan_off]
+responses = ["I am turning the fan off.", "Stopping the {{ area }} fan."]
+
+[pools.climate_up]
+responses = ["I am turning the heat up.", "Making it warmer."]
+
+[pools.music_resume]
+responses = ["Resuming the music."]
+
+[pools.music_previous]
+responses = ["Previous song."]
+
+[pools.tv_off]
+responses = ["Turning off the TV."]
+
 [pools.filler]
 responses = ["I will check on that for you.", "Let me look into that.", "One moment."]
 

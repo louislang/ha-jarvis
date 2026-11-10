@@ -548,7 +548,8 @@ mod tests {
             windows_query lock_query garage_door_query brightness_query lights_query \
             climate_query fan_query who_is_home alarm_query now_playing play_music play_radio \
             queue_music music_next music_pause volume_up volume_down volume_set play_movie \
-            continue_show play_episode tv_pause tv_skip tv_stop new_shows";
+            continue_show play_episode tv_pause tv_skip tv_stop new_shows lights_off fan_off \
+            climate_up music_resume music_previous tv_off";
         assert_eq!(names.join(" "), expected);
         assert_eq!(validate_catalog(&catalog), Ok(()));
     }
@@ -651,7 +652,8 @@ mod tests {
             windows_query lock_query garage_door_query brightness_query lights_query \
             climate_query fan_query who_is_home alarm_query now_playing play_music play_radio \
             queue_music music_next music_pause volume_up volume_down volume_set play_movie \
-            continue_show play_episode tv_pause tv_skip tv_stop new_shows";
+            continue_show play_episode tv_pause tv_skip tv_stop new_shows lights_off fan_off \
+            climate_up music_resume music_previous tv_off";
         assert_eq!(labels(&catalog()).join(" "), expected);
     }
 
