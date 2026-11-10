@@ -167,7 +167,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 1. If a dialog is open and `is_cancel`, reply from `cancelled` and close the dialog.
 2. If a `Slot` dialog with choices is open and `fill` returns a value, add it to the slots and run `decide` again.
 3. If the top label is not `unknown` and its probability is at least `model.threshold`, close the dialog and process the text as a new request.
-4. If an `Llm` dialog is open, send the text to System Two as the answer to its question (sub-phase 10.6).
+4. If an `Llm` dialog is open, send the text to System Two as the answer to its question (sub-phase 10.6b).
 5. If a `Slot` dialog is open, ask again with `next_turn`. If it returns none, reply from `failure`.
 6. Else, process the text as a new request.
 
@@ -175,7 +175,7 @@ A choice is a closed set, so step 2 comes before step 3. The answer to System Tw
 
 - `handle` takes the dialog of the key of the context (`Key`, sub-phase 10.2) before step 1. Steps 2 to 6 thus close it. Step 5 stores the dialog that `next_turn` gives.
 - The filled value replaces each slot with the name of the missing slot, so `decide` reads the filled area (sub-phase 10.4). The intent of the dialog gets the probability 1.
-- Until sub-phase 10.6, step 4 sends the text as a new System Two request.
+- Until sub-phase 10.6b, step 4 sends the text as a new System Two request.
 - Step 5 asks again from `ask_area` as sub-phase 10.4 asks, with the current generation of the satellite.
 - When `decide` gives `Ask`, `handle` opens a dialog with its `pending` for the key.
 - `start_app` gives the `[dialog]` configuration to the use case. `FakeReasoner` records the text of each question.
@@ -259,29 +259,65 @@ A choice is a closed set, so step 2 comes before step 3. The answer to System Tw
 
 ### 10.6 System Two Questions
 
-**Goal:** Add the `ask_user` tool and `Step::Ask`, so System Two can ask the user for missing data. The next turn sends the answer as the output of the `ask_user` call, with `previous_response_id`.
+**Goal:** Add `Step::Ask`, so a System Two job can ask the user for missing data. The question waits in the announce queue of the satellite, and a dialog opens for the answer.
 
 - **Implements:** G7, G13. **Depends on:** 10.5c.
-- **Files:** modify `src/ports.rs`, `src/adapters/openai.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`.
+- **Files:** modify `src/ports.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`, `src/adapters/openai.rs` (only the test that matches each step).
+- **Quint:** `dialog.qnt` (conformance of the questions of the jobs).
 
-**Model.** `Step::Ask { question, response_id, call_id }`. The consumer increases the generation of the key and ends the job (sub-phase 10.5b). It puts the question in the announce queue (sub-phase 4.9b) with the new generation, so it asks when the satellite is idle after the filler. It opens a dialog with `Pending::Llm { response_id, call_id }`. An answer to that dialog sends a `Question` with `previous_response_id` and one `function_call_output` item with `call_id` and the answer text. Each request sets `parallel_tool_calls = false`, so one response has at most one open tool call. When the dialog times out or is cancelled, Jarvis sends nothing for the open call.
+**Model.**
+
+- `Step::Ask { question, response_id, call_id }`. Before the question, the consumer compares the generation (sub-phase 10.5b). The consumer increases the generation of the key and ends the job. It puts the question in the announce queue (sub-phase 4.9b) with the new generation, so it asks when the satellite is idle after the filler. It opens a dialog with `Pending::Llm { response_id, call_id }` for the key.
+- Without a `satellite_id`, the answer of the job is the question text, and the dialog has the key of the conversation (decision 18).
+- `FakeReasoner` gives `Ask` from its script. It keeps one script for each answer, in order.
+- Until sub-phase 10.6b, no adapter gives `Ask`, and an answer to an `Llm` dialog is a new System Two request (routing step 4, sub-phase 10.5).
+- The conformance driver of sub-phase 10.5b maps `ask(r)` to the job of `r`, whose answer gives `Ask`. A `jobAct(r)` after `ask(r)` does nothing, because the job ended. On an `Llm` dialog:
+  - `fill(k)` is the answer "kitchen", and its System Two job has one call.
+  - `askAgain(k)` is an answer with the top label `unknown`, and its System Two job asks again. This answer is a new request with a new question, so it increases the generation of the key by 2. The model has no new generation in `askAgain`, so the driver subtracts these 2 from the generation that it compares.
 
 **Acceptance criteria.**
 
-- AC-10.6-1: When the mock returns an `ask_user` tool call, `answer` gives `Ask` with the question, the response ID and the call ID.
-- AC-10.6-2: When the `Question` has a previous response ID and a call ID, the request has `previous_response_id`, one `function_call_output` item with that call ID and the user text, and `parallel_tool_calls = false`.
 - AC-10.6-3: When `FakeReasoner` gives `Ask`, `FakeHome` records `ask` after the satellite becomes idle, and the dialog has `Pending::Llm`.
-- AC-10.6-4: When the user answers, `handle` returns a filler before `FakeReasoner` completes.
-- AC-10.6-5: When `FakeReasoner` asks three questions and then answers, `FakeHome` records three `ask` calls, then the announce.
-- AC-10.6-6: When `FakeReasoner` asks more than `max_turns` questions, `FakeHome` records an announce from `failure` and the dialog closes.
 - AC-10.6-7: When the user says "cancel" during a System Two dialog, `FakeReasoner` records no more calls for that dialog.
 
 **Proofs.**
 
-- P-10.6-2. Argument: the request builder has two branches. With a previous ID, it sends only the tool output for the call ID.
-- P-10.6-6. Requires: `TurnLimit`. Argument: each `Ask` step goes through `next_turn`.
 - P-10.6-7. Requires: `NoCallAfterCancel`. Argument: routing step 1 closes the dialog before step 4 can call `answer`.
-- P-10.6-1, P-10.6-3 to P-10.6-5. Evidence: test.
+- P-10.6-3. Evidence: test.
+
+---
+
+### 10.6b System Two Answers
+
+**Goal:** Add the `ask_user` tool, and send the answer of the user as the output of the `ask_user` call, with `previous_response_id`. System Two can then ask several questions, up to the turn limit.
+
+- **Implements:** G7, G13. **Depends on:** 10.6.
+- **Files:** modify `src/domain/decide.rs`, `src/adapters/openai.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`.
+- **Quint:** `dialog.qnt` (the driver of sub-phase 10.6 does not change).
+
+**Model.**
+
+- `Question` gets `answers: Option<AskCall>`, the `ask_user` call that the text answers. `AskCall` has `response_id` and `call_id`. `question` gives `None`.
+- `ask_user(question)` is a strict tool. When a response completes with an `ask_user` call, `answer` gives `Ask` with the question, the ID of the response and the call ID, and ends. Each request sets `parallel_tool_calls = false`, so one response has at most one open tool call.
+- The request builder has two branches. Without `answers`, the input is the user message (sub-phase 7.2). With `answers`, the request has `previous_response_id`, and its input is only one `function_call_output` item with `call_id` and the text. Both branches have the system message and the tools.
+- Routing step 4 (sub-phase 10.5) sends the answer to an `Llm` dialog as a new request on the satellite: a filler, and a System Two job whose `Question` has the call of the dialog. Without a `satellite_id`, `handle` waits for the answer and returns its text (sub-phase 7.5c).
+- The job keeps the turns of the dialog. Each question of the job goes through `next_turn`. At the turn limit, the job announces from `failure`, and the dialog stays closed.
+- When the dialog times out or is cancelled, Jarvis sends nothing for the open call.
+- `FakeReasoner` records the call ID that each question answers.
+
+**Acceptance criteria.**
+
+- AC-10.6b-1: When the mock returns an `ask_user` tool call, `answer` gives `Ask` with the question, the response ID and the call ID.
+- AC-10.6b-2: When the `Question` has a previous response ID and a call ID, the request has `previous_response_id`, one `function_call_output` item with that call ID and the user text, and `parallel_tool_calls = false`.
+- AC-10.6b-3: When the user answers, `handle` returns a filler before `FakeReasoner` completes.
+- AC-10.6b-4: When `FakeReasoner` asks three questions and then answers, `FakeHome` records three `ask` calls, then the announce.
+- AC-10.6b-5: When `FakeReasoner` asks more than `max_turns` questions, `FakeHome` records an announce from `failure` and the dialog closes.
+
+**Proofs.**
+
+- P-10.6b-2. Argument: the request builder has two branches. With a previous ID, it sends only the tool output for the call ID.
+- P-10.6b-5. Requires: `TurnLimit`. Argument: each `Ask` step goes through `next_turn`.
+- P-10.6b-1, P-10.6b-3, P-10.6b-4. Evidence: test.
 
 ---
 
@@ -289,7 +325,7 @@ A choice is a closed set, so step 2 comes before step 3. The answer to System Tw
 
 **Goal:** Let short answers use the early commit wait. "Kitchen" or "never mind" while a dialog is open ends listening after 100 ms instead of 600 ms.
 
-- **Implements:** G1, G13. **Depends on:** 10.6.
+- **Implements:** G1, G13. **Depends on:** 10.6b.
 - **Files:** modify `src/domain/speech.rs`, `src/app/speech.rs`.
 - **Quint:** `commit.qnt` (unchanged: `confident` is abstract).
 
