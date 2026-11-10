@@ -62,6 +62,9 @@ pub struct Intent {
     /// The habit action of each slot that has a habit default.
     #[serde(default)]
     pub habit_defaults: BTreeMap<String, String>,
+    /// True when Jarvis plays the best Music Assistant match of the `media_id` of the call.
+    #[serde(default)]
+    pub search: bool,
 }
 
 /// How Jarvis replies to an intent and acts on it.

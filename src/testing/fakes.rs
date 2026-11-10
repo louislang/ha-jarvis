@@ -115,6 +115,8 @@ pub(crate) struct FakeHome {
     calls: Mutex<Vec<ServiceCall>>,
     /// The response data that `call` gives.
     response: Mutex<Option<Value>>,
+    /// The response data of the next calls, in order, before `response`.
+    next: Mutex<VecDeque<Value>>,
 }
 
 impl FakeHome {
@@ -130,6 +132,7 @@ impl FakeHome {
             gates: Mutex::default(),
             calls: Mutex::default(),
             response: Mutex::default(),
+            next: Mutex::default(),
         }
     }
 
@@ -155,6 +158,12 @@ impl FakeHome {
     /// Makes the later calls give `response` as their response data.
     pub(crate) fn respond(&self, response: Value) {
         *lock(&self.response) = Some(response);
+    }
+
+    /// Makes the next call without an earlier queued response give `response` as its response
+    /// data.
+    pub(crate) fn respond_next(&self, response: Value) {
+        lock(&self.next).push_back(response);
     }
 
     /// The number of `snapshot` calls.
@@ -203,7 +212,8 @@ impl Home for FakeHome {
     async fn call(&self, call: ServiceCall) -> anyhow::Result<Option<Value>> {
         lock(&self.calls).push(call);
         self.wait().await?;
-        Ok(lock(&self.response).clone())
+        let next = lock(&self.next).pop_front();
+        Ok(next.or_else(|| lock(&self.response).clone()))
     }
 
     async fn announce(&self, satellite: &str, text: &str) -> anyhow::Result<()> {
