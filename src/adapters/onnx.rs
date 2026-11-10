@@ -389,20 +389,15 @@ mod tests {
         assert_top(|intent| intent == "unknown").await
     }
 
-    /// AC-18.7-7.
-    #[tokio::test]
-    async fn ac_18_7_7_slots_contain_the_whole_media_name() -> anyhow::Result<()> {
+    /// Fails when the fixture model does not give the slot name and value of a case for the text of
+    /// that case.
+    async fn assert_slots(cases: &[(&str, &str, &str)]) -> anyhow::Result<()> {
         let classifier = OnnxLoader.load(Path::new(FIXTURE), Device::Cpu).await?;
-        let cases = [
-            ("play hip hop", "hip hop"),
-            ("play red hot chili peppers", "red hot chili peppers"),
-            ("play some lo fi beats", "lo fi beats"),
-        ];
-        for (text, media) in cases {
+        for (text, name, value) in cases {
             let prediction = classifier.predict(CONTEXT, text).await?;
             let expected = Slot {
-                name: "media".to_owned(),
-                value: media.to_owned(),
+                name: (*name).to_owned(),
+                value: (*value).to_owned(),
             };
             assert!(
                 prediction.slots.contains(&expected),
@@ -411,6 +406,34 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// AC-18.7-7.
+    #[tokio::test]
+    async fn ac_18_7_7_slots_contain_the_whole_media_name() -> anyhow::Result<()> {
+        assert_slots(&[
+            ("play hip hop", "media", "hip hop"),
+            (
+                "play red hot chili peppers",
+                "media",
+                "red hot chili peppers",
+            ),
+            ("play some lo fi beats", "media", "lo fi beats"),
+        ])
+        .await
+    }
+
+    /// AC-18.15-9.
+    #[tokio::test]
+    async fn ac_18_15_9_slots_contain_the_group_name() -> anyhow::Result<()> {
+        let speakers = "play radiohead on the downstairs speakers";
+        assert_slots(&[
+            ("play jazz downstairs", "media", "jazz"),
+            ("play jazz downstairs", "area", "downstairs"),
+            (speakers, "media", "radiohead"),
+            (speakers, "area", "downstairs speakers"),
+        ])
+        .await
     }
 
     /// AC-3.12-11.

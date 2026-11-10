@@ -654,6 +654,21 @@ pub fn ex_value_as_str(value: &Value) -> (result: Option<&str>)
     value.as_str()
 }
 
+/// The items of the JSON array `value`, or `None` for another JSON type.
+pub uninterp spec fn array(value: Value) -> Option<Seq<Value>>;
+
+/// Gives the items of a JSON array. <https://docs.rs/serde_json/1/serde_json/enum.Value.html#method.as_array>
+#[verifier::external_fn_specification]
+pub fn ex_value_as_array(value: &Value) -> (result: Option<&Vec<Value>>)
+    ensures
+        match result {
+            Some(items) => array(*value) == Some(items@),
+            None => array(*value) is None,
+        },
+{
+    value.as_array()
+}
+
 /// Gives the UTF-8 bytes of `text`. <https://doc.rust-lang.org/std/string/struct.String.html#method.as_bytes>
 #[verifier::external_fn_specification]
 pub fn ex_string_as_bytes(text: &String) -> (bytes: &[u8])

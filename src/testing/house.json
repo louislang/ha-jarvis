@@ -644,6 +644,60 @@
       }
     },
     {
+      "entity_id": "media_player.downstairs",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Downstairs Speakers",
+        "device_class": "speaker",
+        "mass_player_type": "group",
+        "group_members": [
+          "media_player.carson_kitchen",
+          "media_player.carson_living_room"
+        ]
+      },
+      "last_updated": "2026-10-25T12:47:00.000000Z",
+      "context": {
+        "id": "3C8E1F0A9B2D4E5F60718293A4",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "media_player.office_speakers",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Office Speakers",
+        "device_class": "speaker",
+        "mass_player_type": "group",
+        "group_members": [
+          "media_player.office",
+          "media_player.carson_office"
+        ]
+      },
+      "last_updated": "2026-10-25T12:48:00.000000Z",
+      "context": {
+        "id": "4D9F2A1B0C3E5F607182934AB5",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "media_player.office_speakers_2",
+      "state": "idle",
+      "attributes": {
+        "friendly_name": "Office Speakers",
+        "device_class": "speaker",
+        "mass_player_type": "group",
+        "group_members": []
+      },
+      "last_updated": "2026-10-25T12:49:00.000000Z",
+      "context": {
+        "id": "5EA03B2C1D4F60718293A4B5C6",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
       "entity_id": "binary_sensor.bedroom_motion",
       "state": "off",
       "attributes": {
@@ -1372,6 +1426,36 @@
     {
       "entity_id": "media_player.downstairs_speakers",
       "name": "Downstairs Speakers",
+      "aliases": [],
+      "area_id": null,
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "media_player.downstairs",
+      "name": "Downstairs Speakers",
+      "aliases": [],
+      "area_id": null,
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "media_player.office_speakers",
+      "name": "Office Speakers",
+      "aliases": [],
+      "area_id": null,
+      "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "media_player.office_speakers_2",
+      "name": "Office Speakers",
       "aliases": [],
       "area_id": null,
       "device_id": null,

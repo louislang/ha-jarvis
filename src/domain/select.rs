@@ -56,6 +56,69 @@ pub fn select(intent: &Intent, area: &AreaId, cache: &StateCache) -> Vec<EntityI
     selected
 }
 
+/// The candidate of `intent` that is a group player of `text`, with the lowest entity ID.
+#[verus_spec(found =>
+    ensures
+        match found {
+            Some(id) => leading(*intent, *cache, text@, id),
+            None => forall|index: int| 0 <= index < cache.entities@.len()
+                ==> !#[trigger] grouping(*intent, *cache, text@, cache.entities@[index]),
+        },
+)]
+#[must_use]
+pub fn group(intent: &Intent, text: &str, cache: &StateCache) -> Option<EntityId> {
+    let wanted = intent::normalize(text);
+    let mut groups = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= cache.entities@.len(),
+            wanted@ == intent::normalized(text@),
+            forall|position: int| 0 <= position < groups@.len()
+                ==> #[trigger] grouped_id(*intent, *cache, text@, groups@[position]),
+            forall|earlier: int| 0 <= earlier < index
+                && grouping(*intent, *cache, text@, #[trigger] cache.entities@[earlier])
+                ==> groups@.contains(cache.entities@[earlier].entity_id),
+        decreases cache.entities@.len() - index,
+    ))]
+    while index < cache.entities.len() {
+        let entity = &cache.entities[index];
+        if is_candidate(intent, cache, entity) && is_group(cache, entity, wanted.as_str()) {
+            groups.push(EntityId(entity.entity_id.0.clone()));
+        }
+        index += 1;
+    }
+    if groups.is_empty() {
+        return None;
+    }
+    Some(lowest(&groups))
+}
+
+/// True when `entity` is a group player with members and the name `wanted`, as `group_of` states.
+#[verus_spec(found =>
+    ensures
+        found == group_of(*cache, *entity, wanted@),
+)]
+fn is_group(cache: &StateCache, entity: &Entity, wanted: &str) -> bool {
+    let Some(state) = cache.states.get(entity.entity_id.0.as_str()) else {
+        return false;
+    };
+    let kind = match state.attributes.get("mass_player_type") {
+        Some(kind) => kind.as_str(),
+        None => None,
+    };
+    let members = match state.attributes.get("group_members") {
+        Some(members) => members.as_array(),
+        None => None,
+    };
+    let name = intent::normalize(entity.name.as_str());
+    let mut longer = wanted.to_owned();
+    longer.push_str(" speakers");
+    matches!(kind, Some(kind) if kind == "group")
+        && matches!(members, Some(members) if !members.is_empty())
+        && (name.as_str() == wanted || name == longer)
+}
+
 /// The IDs of the entities in `area` that fit a filter of `intent`, are not excluded and are not
 /// skipped.
 #[verus_spec(local =>
@@ -382,7 +445,13 @@ pub fn words(text: &str) -> Vec<String> {
 
 verus! {
 
-broadcast use vstd::seq_lib::lemma_seq_contains_after_push;
+broadcast use {
+    vstd::seq_lib::lemma_seq_contains_after_push,
+    crate::domain::contracts::axiom_arc_str_obeys_cmp,
+    crate::domain::contracts::axiom_arc_str_borrow,
+    crate::domain::contracts::axiom_arc_str_contains_borrowed_key,
+    crate::domain::contracts::axiom_arc_str_maps_borrowed_key,
+};
 
 /// True when `entity` has the domain, the device class and the name words of `filter`.
 pub open spec fn fits(cache: StateCache, filter: Filter, entity: Entity) -> bool {
@@ -547,6 +616,40 @@ proof fn lemma_string_order()
     assert(vstd::laws_cmp::obeys_cmp::<String>());
     reveal(vstd::laws_cmp::obeys_cmp_partial_ord);
     reveal(vstd::laws_cmp::obeys_partial_cmp_spec_properties);
+}
+
+/// True when the state of `entity` names a Music Assistant group with one or more members, and
+/// the normalized name of `entity` is `wanted` or `wanted` followed by " speakers".
+pub open spec fn group_of(cache: StateCache, entity: Entity, wanted: Seq<char>) -> bool {
+    let key = crate::domain::contracts::str_key(entity.entity_id.0@);
+    let attributes = cache.states@[key].attributes;
+    let name = intent::normalized(entity.name@);
+    &&& cache.states@.contains_key(key)
+    &&& crate::domain::contracts::attribute(attributes, "mass_player_type") matches Some(kind)
+        && crate::domain::contracts::text(kind) == Some("group"@)
+    &&& crate::domain::contracts::attribute(attributes, "group_members") matches Some(members)
+        && crate::domain::contracts::array(members) matches Some(items) && items.len() > 0
+    &&& name == wanted || name == wanted + " speakers"@
+}
+
+/// True when `entity` is a candidate of `intent` and a Music Assistant group player of `text`.
+pub open spec fn grouping(intent: Intent, cache: StateCache, text: Seq<char>, entity: Entity) -> bool {
+    candidate(intent, cache, entity) && group_of(cache, entity, intent::normalized(text))
+}
+
+/// True when `id` is the ID of an entity of `cache` that is `grouping`.
+pub open spec fn grouped_id(intent: Intent, cache: StateCache, text: Seq<char>, id: EntityId) -> bool {
+    exists|index: int| 0 <= index < cache.entities@.len()
+        && #[trigger] cache.entities@[index].entity_id == id
+        && grouping(intent, cache, text, cache.entities@[index])
+}
+
+/// True when `id` is the lowest ID of the entities of `cache` that are `grouping`.
+pub open spec fn leading(intent: Intent, cache: StateCache, text: Seq<char>, id: EntityId) -> bool {
+    &&& grouped_id(intent, cache, text, id)
+    &&& forall|index: int| 0 <= index < cache.entities@.len()
+        && grouping(intent, cache, text, #[trigger] cache.entities@[index])
+        ==> !lower(cache.entities@[index].entity_id.0, id.0)
 }
 
 /// True when an entity of `cache` is a candidate of `intent` in `area`.

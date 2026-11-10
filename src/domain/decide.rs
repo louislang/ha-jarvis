@@ -448,10 +448,10 @@ fn act(
 type Situated<'a> = (Option<&'a AreaId>, Map<String, Value>);
 
 /// The area of the first area slot of `prediction`, else of `request`, and the template context of
-/// `intent` in it. Else the decision: a System Two job when a slot is missing, or a question for
-/// the area when the slot names no area or a command service has no area.
+/// `intent` in it. Else the decision for a missing slot, of `place`, or for a service with no area.
 #[verus_spec(found =>
     requires
+        pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
         pools@.contains_key(crate::domain::contracts::string_key("filler"@)),
         pools@.contains_key(crate::domain::contracts::string_key("ask_area"@)),
         responses::filled(pools@),
@@ -459,7 +459,8 @@ type Situated<'a> = (Option<&'a AreaId>, Map<String, Value>);
         match found {
             Ok((Some(area), _)) => located(*prediction, *request, *cache, *area),
             Ok((None, _)) => unslotted(prediction.slots@) && request.area is None,
-            Err(decision) => deferred(*decision, request.transcript) || asked(*intent, *request, *cache, *decision),
+            Err(decision) => deferred(*decision, request.transcript) || asked(*intent, *request, *cache, *decision)
+                || unplaced(*intent, *prediction, *cache, *decision),
         },
 )]
 fn situation<'a>(
@@ -473,13 +474,7 @@ fn situation<'a>(
     let Some(slots) = slots(intent, prediction) else {
         return Err(Box::new(defer(request, pools, rng)));
     };
-    let area = match area_slot(&prediction.slots) {
-        Some(slot) => match cache.area_by_name(prediction.slots[slot].value.as_str()) {
-            Some(area) => Some(area),
-            None => return Err(ask(intent, prediction, request, cache, pools, rng)),
-        },
-        None => request.area.as_ref(),
-    };
+    let area = place(intent, prediction, request, &slots, cache, pools, rng)?;
     if area.is_none() && matches!((intent.kind, &intent.service), (Kind::Command, Some(_))) {
         return Err(ask(intent, prediction, request, cache, pools, rng));
     }
@@ -513,6 +508,47 @@ fn ask(
             transcript: request.transcript.clone(),
         },
     })
+}
+
+/// The area of the first area slot of `prediction`, else of `request`. Else the call of the command
+/// `intent` with `slots` on the group player that the slot names, or a question for the area.
+#[verus_spec(found =>
+    requires
+        pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
+        pools@.contains_key(crate::domain::contracts::string_key("ask_area"@)),
+        responses::filled(pools@),
+    ensures
+        match found {
+            Ok(Some(area)) => located(*prediction, *request, *cache, *area),
+            Ok(None) => unslotted(prediction.slots@) && request.area is None,
+            Err(decision) => asked(*intent, *request, *cache, *decision)
+                || unplaced(*intent, *prediction, *cache, *decision),
+        },
+)]
+fn place<'a>(
+    intent: &Intent,
+    prediction: &Prediction,
+    request: &'a Request,
+    slots: &Map<String, Value>,
+    cache: &'a StateCache,
+    pools: &Pools,
+    rng: &mut StdRng,
+) -> Result<Option<&'a AreaId>, Box<Decision>> {
+    let Some(slot) = area_slot(&prediction.slots) else {
+        return Ok(request.area.as_ref());
+    };
+    let name = prediction.slots[slot].value.as_str();
+    if let Some(area) = cache.area_by_name(name) {
+        return Ok(Some(area));
+    }
+    let decision = match (intent.kind, select::group(intent, name, cache)) {
+        (Kind::Command, Some(group)) => serve(intent, &[group], slots, pools, rng),
+        _ => None,
+    };
+    match decision {
+        Some(decision) => Err(Box::new(decision)),
+        None => Err(ask(intent, prediction, request, cache, pools, rng)),
+    }
 }
 
 /// The name and then the aliases of each area of `cache`.
@@ -605,18 +641,41 @@ fn call(
     pools: &Pools,
     rng: &mut StdRng,
 ) -> Option<Decision> {
+    let selection = selection(intent, area, &mut context, cache, now)?;
+    serve(intent, &selection, &context, pools, rng)
+}
+
+/// The reply of `intent` and the call of its service with its data on `selection`, rendered with
+/// `context`, or `None` when it has no service with a dot or a template does not render.
+#[verus_spec(decision =>
+    requires
+        pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
+        responses::filled(pools@),
+    ensures
+        decision is None
+            || (decision matches Some(Decision::Reply { call: Some(made), .. })
+            && entity_ids(made.target@) == selection@
+            && (intent.service matches Some(service) && served(service@, made))
+            && stringed(*intent, made.data)),
+)]
+fn serve(
+    intent: &Intent,
+    selection: &[EntityId],
+    context: &Map<String, Value>,
+    pools: &Pools,
+    rng: &mut StdRng,
+) -> Option<Decision> {
     let service = intent.service.as_ref()?;
     let (domain, name) = service.as_str().split_once('.')?;
-    let selection = selection(intent, area, &mut context, cache, now)?;
-    let data = data(intent, &context)?;
+    let data = data(intent, context)?;
     let call = ServiceCall {
         domain: domain.to_owned(),
         service: name.to_owned(),
-        target: texts(&selection),
+        target: texts(selection),
         data,
         return_response: false,
     };
-    respond(intent, &context, Some(call), pools, rng)
+    respond(intent, context, Some(call), pools, rng)
 }
 
 /// The filler and the fetch of the plugin of `intent` with its `data` rendered with `context` as
@@ -1247,13 +1306,15 @@ pub open spec fn handled(prediction: Prediction, catalog: Catalog, threshold: f3
 pub open spec fn acted(intent: Intent, prediction: Prediction, request: Request, cache: StateCache, decision: Decision) -> bool {
     &&& forall|slot: int| #[trigger] first_area(prediction.slots@, slot)
         && !area_named(cache, prediction.slots@[slot].value@) ==> deferred(decision, request.transcript)
+            || unplaced(intent, prediction, cache, decision)
     &&& unslotted(prediction.slots@) && request.area is None && intent.service is Some
         && !(intent.kind is Fetch) && !housing(intent) ==> deferred(decision, request.transcript)
     &&& intent.service is None && !(intent.kind is Fetch) ==> (deferred(decision, request.transcript)
         || decision matches Decision::Reply { call: None, .. })
     &&& decision matches Decision::Reply { call: Some(made), .. } ==> made.target@.len() > 0
         && (intent.service matches Some(service) && served(service@, made))
-        && aimed(intent, prediction, request, cache, made) && stringed(intent, made.data)
+        && (aimed(intent, prediction, request, cache, made) || unplaced(intent, prediction, cache, decision))
+        && stringed(intent, made.data)
     &&& housing(intent) ==> deferred(decision, request.transcript)
         || (decision matches Decision::Reply { call: None, .. }
         && exists|selected: Seq<EntityId>| selected.len() > 0 && #[trigger] select::housed(intent, cache, selected))
@@ -1265,6 +1326,23 @@ pub open spec fn acted(intent: Intent, prediction: Prediction, request: Request,
             && targeted(intent, cache, area, selected))
     &&& intent.kind is Fetch && intent.plugin is None ==> deferred(decision, request.transcript)
     &&& intent.kind is Fetch ==> deferred(decision, request.transcript) || fetched(intent, decision)
+}
+
+/// True when the first area slot of `prediction` names no area and `decision` is `grouped` for it.
+pub open spec fn unplaced(intent: Intent, prediction: Prediction, cache: StateCache, decision: Decision) -> bool {
+    exists|slot: int| #[trigger] first_area(prediction.slots@, slot)
+        && !area_named(cache, prediction.slots@[slot].value@)
+        && grouped(intent, cache, prediction.slots@[slot].value@, decision)
+}
+
+/// True when `decision` calls the command `intent` on the group player of `text` in `cache`.
+pub open spec fn grouped(intent: Intent, cache: StateCache, text: Seq<char>, decision: Decision) -> bool {
+    decision matches Decision::Reply { call: Some(made), .. }
+        && intent.kind is Command
+        && (intent.service matches Some(service) && served(service@, made))
+        && entity_ids(made.target@).len() == 1
+        && select::leading(intent, cache, text, entity_ids(made.target@)[0])
+        && stringed(intent, made.data)
 }
 
 /// True when `decision` asks for the area of `intent`, or is not a question and obeys `acted`.
@@ -2419,13 +2497,17 @@ mod tests {
 
     /// The decision for `label` with the slots `slots` on the satellite in `area`.
     fn played(label: &str, slots: &[(&str, &str)], area: &str) -> Decision {
+        played_in(label, slots, area, &StateCache::load(house()))
+    }
+
+    /// The decision for `label` with the slots `slots` on the satellite in `area` of `cache`.
+    fn played_in(label: &str, slots: &[(&str, &str)], area: &str, cache: &StateCache) -> Decision {
         let request = Request {
             transcript: String::new(),
             area: Some(AreaId(area.to_owned())),
             now: Timestamp::UNIX_EPOCH,
         };
-        let cache = StateCache::load(house());
-        decided_for(&catalog(), (label, 0.89), slots, &request, &cache)
+        decided_for(&catalog(), (label, 0.89), slots, &request, cache)
     }
 
     /// AC-18.7-1.
@@ -2514,6 +2596,123 @@ mod tests {
     fn ac_18_8_3_volume_set_sends_the_level_as_a_number() {
         let data = data(played("volume_set", &[("volume", "50")], "kitchen"));
         assert_eq!(data["volume_level"], Value::from(0.5));
+    }
+
+    /// The Music Assistant group player "Downstairs Speakers".
+    const DOWNSTAIRS: &str = "media_player.downstairs";
+
+    /// Sets the `group_members` of the group player `id` of `snapshot` to `members`.
+    fn regroup(snapshot: &mut Snapshot, id: &str, members: &[&str]) {
+        let mut states = snapshot.states.iter_mut();
+        let state = states.find(|state| state.entity_id == id);
+        let attributes = &mut state.expect("the house has the group player").attributes;
+        attributes.insert("group_members".to_owned(), Value::from(members.to_vec()));
+    }
+
+    /// The target of `play_music` with the area slot "office speakers" in `snapshot`.
+    fn office_target(snapshot: Snapshot) -> Vec<String> {
+        let slots = [("media", "jazz"), ("area", "office speakers")];
+        let cache = StateCache::load(snapshot);
+        called(played_in("play_music", &slots, "kitchen", &cache)).target
+    }
+
+    /// True when `decision` asks from `ask_area`.
+    fn asks_area(decision: &Decision) -> bool {
+        matches!(decision, Decision::Ask { question, .. } if question.pool == "ask_area")
+    }
+
+    /// AC-18.15-1.
+    #[test]
+    fn ac_18_15_1_play_music_downstairs_plays_on_the_group() {
+        let request = Request {
+            transcript: String::new(),
+            area: Some(AreaId("kitchen".to_owned())),
+            now: Timestamp::UNIX_EPOCH,
+        };
+        let cache = StateCache::load(house());
+        let slots = [("media", "jazz"), ("area", "downstairs")];
+        let top = ("play_music", 0.89);
+        let decision = decided_with(&catalog(), &filed(), top, &slots, &request, &cache);
+        let replied =
+            matches!(&decision, Decision::Reply { reply, .. } if reply.text == "Playing jazz.");
+        assert!(replied, "{decision:?}");
+        let call = called(decision);
+        let service = format!("{}.{}", call.domain, call.service);
+        assert_eq!(service, "music_assistant.play_media");
+        assert_eq!(call.target, [DOWNSTAIRS]);
+        let data = Value::from(call.data);
+        assert_eq!(data, serde_json::json!({ "media_id": "jazz" }));
+    }
+
+    /// AC-18.15-2.
+    #[test]
+    fn ac_18_15_2_downstairs_speakers_plays_on_the_group() {
+        let slots = [("media", "jazz"), ("area", "downstairs speakers")];
+        let call = called(played("play_music", &slots, "kitchen"));
+        assert_eq!(call.target, [DOWNSTAIRS]);
+    }
+
+    /// AC-18.15-3.
+    #[test]
+    fn ac_18_15_3_radio_and_queue_play_on_the_group() {
+        for label in ["play_radio", "queue_music"] {
+            let slots = [("media", "jazz"), ("area", "downstairs")];
+            let call = called(played(label, &slots, "kitchen"));
+            assert_eq!(call.target, [DOWNSTAIRS], "{label}");
+        }
+    }
+
+    /// AC-18.15-4.
+    #[test]
+    fn ac_18_15_4_unknown_name_asks_for_the_area() {
+        let slots = [("media", "jazz"), ("area", "upstairs")];
+        let decision = played("play_music", &slots, "kitchen");
+        assert!(asks_area(&decision), "{decision:?}");
+    }
+
+    /// AC-18.15-5.
+    #[test]
+    fn ac_18_15_5_lights_downstairs_ask_for_the_area() {
+        let decision = decided_in(&catalog(), "lights_on", Some("downstairs"), Some("kitchen"));
+        assert!(asks_area(&decision), "{decision:?}");
+    }
+
+    /// AC-18.15-6.
+    #[test]
+    fn ac_18_15_6_two_groups_give_the_lower_entity_id() {
+        let mut snapshot = house();
+        regroup(
+            &mut snapshot,
+            "media_player.office_speakers_2",
+            &["media_player.carson_office"],
+        );
+        assert_eq!(office_target(snapshot), ["media_player.office_speakers"]);
+    }
+
+    /// AC-18.15-7.
+    #[test]
+    fn ac_18_15_7_group_with_no_members_is_skipped() {
+        let mut snapshot = house();
+        regroup(
+            &mut snapshot,
+            "media_player.office_speakers_2",
+            &["media_player.carson_office"],
+        );
+        regroup(&mut snapshot, "media_player.office_speakers", &[]);
+        assert_eq!(office_target(snapshot), ["media_player.office_speakers_2"]);
+    }
+
+    /// AC-18.15-8.
+    #[test]
+    fn ac_18_15_8_player_that_is_no_group_asks() {
+        let mut snapshot = house();
+        snapshot
+            .states
+            .retain(|state| state.entity_id != DOWNSTAIRS);
+        let cache = StateCache::load(snapshot);
+        let slots = [("media", "jazz"), ("area", "downstairs speakers")];
+        let decision = played_in("play_music", &slots, "kitchen", &cache);
+        assert!(asks_area(&decision), "{decision:?}");
     }
 
     /// The `media_content_id` of the `label` call with `slots` from the Office satellite.

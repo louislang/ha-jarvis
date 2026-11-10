@@ -125,7 +125,7 @@ state = "playing"
 [[intent]]
 name = "play_music"
 kind = "command"
-examples = ["play [radiohead](media)", "play [jazz](media) in the [kitchen](area)", "play the album [abbey road](media)", "play my [workout](media) playlist", "play the song [yesterday](media)", "play [hip hop](media)", "play [red hot chili peppers](media)", "play some [lo fi beats](media)"]
+examples = ["play [radiohead](media)", "play [jazz](media) in the [kitchen](area)", "play the album [abbey road](media)", "play my [workout](media) playlist", "play the song [yesterday](media)", "play [hip hop](media)", "play [red hot chili peppers](media)", "play some [lo fi beats](media)", "play [jazz](media) [downstairs](area)", "play [radiohead](media) on the [downstairs speakers](area)", "play [hip hop](media) on the [office speakers](area)"]
 service = "music_assistant.play_media"
 target = "entity"
 select = [{ domain = "media_player", device_class = "speaker" }]
