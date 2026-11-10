@@ -124,7 +124,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 
 **Model.**
 
-- `Decision::Ask { question: Chosen, pending }`. A missing `area`, or an area slot that matches no area, gives `Ask` from the pool `ask_area`. These cases replace the `Defer` of sub-phase 4.5b. A missing `area` is a real ambiguity: the intent is clear, and only the room is not.
+- `Decision::Ask { question: Chosen, pending }`. A missing `area`, or an area slot that matches no area, gives `Ask` from the pool `ask_area`. These cases replace the `Defer` of sub-phase 4.5b. A missing `area` is a real ambiguity: the intent is clear, and only the room is not. Sub-phase 18.15 adds one exception: for a command, an area slot that names a Music Assistant speaker group gives a call on the group.
 - A missing `person` and any other missing template slot do not ask. They still give `Defer` with `Job::Llm` (sub-phases 4.5d and 15.7), because a missing value usually means that System One has the wrong intent.
 - The choices for `area` are the area names and their aliases. `decide` maps a filled alias to its area with `area_by_name`.
 - `Home::ask(satellite, question)` calls `start_conversation` with `preannounce = false` and the deadline `ha.announce_timeout_s`.

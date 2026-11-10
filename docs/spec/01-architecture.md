@@ -616,7 +616,7 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 - `exclude` is a list of entity IDs that `select` never matches. Use it for a sensor that gives bad values.
 - `plugin` is the tool name of the plugin of a fetch intent, for example `get_weather`.
 - `search = true` makes Jarvis search Music Assistant for the `media_id` of the call and play the best match (sub-phase 18.13b). An artist match starts with one track of the artist (sub-phase 18.14). Only `play_music` has it.
-- The area is the area slot. If no slot, it is the satellite area. The area slot matches an area name or alias without case sensitivity.
+- The area is the area slot. If no slot, it is the satellite area. The area slot matches an area name or alias without case sensitivity. For a command, an area slot that matches no area can name a Music Assistant speaker group (sub-phase 18.15).
 - `target = "entities"` uses all matching entities in the area.
 - `target = "entity"` uses `entity`, or the matching entity in the area with the lowest entity ID. Sub-phase 11.6 replaces "lowest entity ID" with "highest habit score". `target` is `entity` when it is absent.
 - `target = "house"` uses all matching entities of the house, in any area. A query with it needs no area.
@@ -751,7 +751,7 @@ The test fixtures (`FakeHome`, `FakeHaServer`) model this house. The data comes 
 - Fans: "Office Fan" is a `fan`. "Living Room Fan" is a `switch`.
 - Climate: one thermostat, in the Kitchen.
 - TV: one media player in the Living Room with the aliases "the TV" and "plex".
-- Speakers: each satellite area has speaker media players.
+- Speakers: each satellite area has speaker media players. Three Music Assistant group players have no area: "Downstairs Speakers" and two "Office Speakers". One "Office Speakers" has no members (sub-phase 18.15).
 - Locks, garage doors and windows: none. The tests of sub-phase 18.3 add them to the hot cache.
 - Office: two temperature sensors with different values (64.0 °F and 76.6 °F). The higher value is probably the satellite sensor, which the device makes warm. Entity selection skips the entities of a satellite device, except its media players (section 9).
 

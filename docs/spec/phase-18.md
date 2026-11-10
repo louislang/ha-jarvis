@@ -1,6 +1,6 @@
 # Phase 18: Queries and Media
 
-This phase adds System One query intents about the house, Music Assistant playback and Plex playback. The queries read only the hot cache and make no service call. The music intents call `music_assistant.play_media` and the `media_player` services on the speaker of the area. The Plex intents call `media_player.play_media` with a `plex://` content ID on the TV. The list of new Plex shows comes from the Plex server, so it is a plugin (`01-architecture.md` decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 17 and before phase 10.
+This phase adds System One query intents about the house, Music Assistant playback and Plex playback. The queries read only the hot cache and make no service call. The music intents call `music_assistant.play_media` and the `media_player` services on the speaker of the area, or on a Music Assistant speaker group. The Plex intents call `media_player.play_media` with a `plex://` content ID on the TV. The list of new Plex shows comes from the Plex server, so it is a plugin (`01-architecture.md` decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 17 and before phase 10.
 
 Each sub-phase that adds an intent adds its seed examples to `intents.toml` and its pool to `responses.toml` (`01-architecture.md` section 12). The training set then changes, so `just fixture-model` trains the fixture model again (sub-phase 3.9), and CI trains it again because the cache key is the hash of the training set. AC-3.12-1 to AC-3.12-4 then check the new seed examples. When the fixture model does not learn a new example, the PR changes the examples, not the tests. Jarvis serves the fixture model until sub-phase 13.9, and the training runs of phase 13 use the same seed examples. The tests of the intent sub-phases decide with the catalog of `intents.toml`, the pools of `responses.toml` and the reference house. A test that needs an entity that the reference house does not have adds it to the snapshot before it loads the cache. The tests of AC-3.2-1 and AC-3.2c-2 in `src/domain/catalog.rs` list the intent names in the order of `intents.toml`, so each such sub-phase adds its names there. The fixture model gives each seed example a context by its position, so a new intent can move the contexts of the examples after it. The order of the new intents can change to keep the existing tests passing.
 
@@ -468,6 +468,89 @@ The criteria of this part keep the numbers AC-18.13-5 to AC-18.13-8 from before 
 - P-18.14-1, P-18.14-2. Argument: `resolve` gives two calls only when the match is an artist and `first_track` gives a track (P-18.14-3). Else it gives the one call of P-18.13-6. The background work makes the calls in order.
 - P-18.14-3 (AC-18.14-3). Ensures: `first_track(results, artist)` is the first item of `credited(results.tracks)`, and `None` when this sequence is empty. `credited(items)` keeps each item that has an entry in `artists` with `normalized(entry.name) = normalized(artist)`. Argument: `first_track` makes one pass over the tracks and returns the first track that passes. The loop invariant states that no earlier track passes. The pass over the artists of one track has the loop invariant that no earlier artist has the name. `normalize` gives `normalized` (P-3.1-2).
 
+---
+
+### 18.15 Speaker Groups
+
+**Goal:** Play music on a Music Assistant speaker group. "Play jazz downstairs" and "play jazz on the downstairs speakers" then play on all speakers of the group "Downstairs Speakers".
+
+- **Implements:** G3, G9. **Depends on:** 18.14.
+- **Files:** modify `intents.toml`, `src/domain/select.rs`, `src/domain/decide.rs`, `src/domain/contracts.rs`, `src/adapters/onnx.rs`, `src/testing/house.json`.
+
+Speaker groups were one sub-phase. With the controls, its tests and its Verus proofs, it changes about 480 lines, which is more than the limit of 400 (`02-rules.md` section 7.1, rule 8). Thus 18.15 plays on a group (about 270 lines), and 18.15b selects the target of the music controls on a group (about 210 lines).
+
+**Model.**
+
+- Music Assistant can join speakers in a group player. `music_assistant.play_media` on a group player plays on all members of the group, and Music Assistant keeps them in sync.
+- HA has no floors, and no area has the name "Downstairs". Thus "play jazz downstairs" gave an area slot that matches no area, and `decide` asked "Which room?" (sub-phase 10.4).
+- Each Music Assistant player has the state attribute `mass_player_type`: `player` or `group`. A group player has no area, the device class `speaker` and the attribute `group_members`: the list of the entity IDs of its members. On the real house on 2026-11-10, `media_player.downstairs` ("Downstairs Speakers") has three members, `media_player.office_speakers` ("Office Speakers") has two, and `media_player.office_speakers_2` ("Office Speakers") has none. The last one is a stale copy.
+- The name of an entity is its registry name, else its `friendly_name` (sub-phase 2.3). Thus the hot cache already has all the data of this sub-phase.
+- An entity is a group of a text when the state of the entity has `mass_player_type = "group"` and a `group_members` list with one or more items, and `normalized` of its name (sub-phase 3.1) is `normalized(text)` or `normalized(text)` followed by " speakers". Thus "downstairs" and "downstairs speakers" both match "Downstairs Speakers".
+- `group(intent, text, cache) -> Option<EntityId>` in `src/domain/select.rs` is a pure function. It gives the candidate of `intent` (sub-phase 4.4b: it fits a filter, is not excluded and is not skipped) that is a group of `text`, with the lowest entity ID (the rule of sub-phase 4.4c). It gives `None` when no candidate is a group of `text`. A group player is a `media_player` with the device class `speaker`, so it is a candidate of each intent with the speaker filter of sub-phase 18.7, and of no other intent of `intents.toml`.
+- Step 3 of `decide` (sub-phase 4.5b) changes for an area slot that matches no area. For a command with a `service`, when `group` of the slot value gives a player, the result is `Reply` with the reply of the intent and the call of its service on that player, with the data of the intent. Else the result is `Ask` from `ask_area`, as before (sub-phase 10.4). The template context has the slots, and no `area` and no `entity`. The pools of the speaker intents do not use them. A data value or a reply that does not render also gives `Ask`.
+- An area name comes first. "Play jazz in the office" plays on the speaker of the Office, not on "Office Speakers".
+- A query does not change. "What is playing downstairs" still asks for the area.
+- Until sub-phase 18.15b, the music controls of sub-phase 18.8 also call their service on the group player.
+- The choices of the area question do not change (sub-phase 10.4). Thus the answer "downstairs" to "Which room?" does not fill the area (sub-phase 10.5).
+- The group player is a Music Assistant entity, so `resolve` (sub-phases 18.13b and 18.14) finds its config entry and searches as before.
+- `play_music` gets the examples "play [jazz](media) [downstairs](area)", "play [radiohead](media) on the [downstairs speakers](area)" and "play [hip hop](media) on the [office speakers](area)". None of them is held out.
+- The reference house (`src/testing/house.json`) gets the three group players of the real house, with no area and no device. `media_player.downstairs` has the members `media_player.carson_kitchen` and `media_player.carson_living_room`. `media_player.office_speakers` has the members `media_player.office` and `media_player.carson_office`. `media_player.office_speakers_2` has no members. The player `media_player.downstairs_speakers` ("Downstairs Speakers") of the reference house has no `mass_player_type`, so it is not a group.
+- `src/domain/contracts.rs` gets a contract for `Value::as_array`.
+
+**Acceptance criteria.**
+
+- AC-18.15-1: When the intent is `play_music` with the slots `media = jazz` and `area = downstairs` from the Kitchen satellite, the reply is "Playing jazz." and the call is `music_assistant.play_media` with the target `media_player.downstairs` and the data `{ media_id: "jazz" }`.
+- AC-18.15-2: When the area slot is "downstairs speakers", the target is `media_player.downstairs`.
+- AC-18.15-3: When the intent is `play_radio` or `queue_music` with the area slot "downstairs", the target is `media_player.downstairs`.
+- AC-18.15-4: When the intent is `play_music` with the area slot "upstairs", `decide` returns `Ask` from `ask_area`.
+- AC-18.15-5: When the intent is `lights_on` with the area slot "downstairs", `decide` returns `Ask` from `ask_area`.
+- AC-18.15-6: When the test gives `media_player.office_speakers_2` the member `media_player.carson_office`, the target of `play_music` with the area slot "office speakers" is `media_player.office_speakers`, the lower entity ID.
+- AC-18.15-7: When the test also sets `group_members = []` on `media_player.office_speakers`, the target is `media_player.office_speakers_2`.
+- AC-18.15-8: When the test removes the state of `media_player.downstairs`, `play_music` with the area slot "downstairs speakers" gives `Ask` from `ask_area`. `media_player.downstairs_speakers` has the name "Downstairs Speakers" and no `mass_player_type`.
+- AC-18.15-9: When the fixture model gets "play jazz downstairs" and "play radiohead on the downstairs speakers", the slots contain `media = jazz` and `area = downstairs`, and `media = radiohead` and `area = downstairs speakers`.
+
+**Proofs.**
+
+- P-18.15-1 to P-18.15-5 (AC-18.15-1 to AC-18.15-5). Ensures: for a top command whose first area slot matches no area, `decide` gives `Ask` from `ask_area`, `Defer` with `Job::Llm`, or `Reply` with a call. The call has the domain and the service of the intent (P-4.5c-1), its target is the one entity that `group` gives for the intent and the slot value, and each data value that is not braced is a string (P-4.5d-1). A `Reply` call whose target is not the selection in the area of the request (P-4.5c-2) has such a slot. Argument: step 3 calls `group` only when `area_by_name` of the slot gives `None` (P-2.8b-2). It gives `ask` when `group` gives `None` or a template does not render. "upstairs" matches no group, and a group player is not a candidate of `lights_on` (P-18.15-6).
+- P-18.15-6 to P-18.15-8 (AC-18.15-6 to AC-18.15-8). Ensures: `group(intent, text, cache)` is `Some(id)` if and only if `id` is the entity ID of a candidate of `intent` that is a group of `text`, and no candidate that is a group of `text` has a lower entity ID. It is `None` if and only if no candidate of `intent` is a group of `text`. Argument: `group` makes one pass over the entities of `cache`. The loop invariant states that the best entity so far is a candidate group of `text` with the lowest entity ID of the entities before the index, and that no entity before the index is a candidate group when there is no best entity. `is_candidate` gives `candidate` (P-4.4b-2), and `normalize` gives `normalized` (P-3.1-2).
+- P-18.15-9. Evidence: test.
+
+---
+
+### 18.15b Speaker Group Controls
+
+**Goal:** Act with the music controls on the speakers of a group that play. "Pause the music downstairs" then pauses the group when the group plays, or only the speaker of the group that plays.
+
+- **Implements:** G3, G9. **Depends on:** 18.15.
+- **Files:** modify `intents.toml`, `src/domain/select.rs`, `src/domain/decide.rs`, `src/adapters/onnx.rs`.
+
+**Model.**
+
+- The music controls are the intents of sub-phase 18.8: `music_next`, `music_pause`, `volume_up`, `volume_down` and `volume_set`. In an area, they act on the speaker with the lowest entity ID (sub-phase 18.8). That rule does not change.
+- A speaker of a group can play alone, for example after "play jazz in the kitchen". Then "pause the music downstairs" must pause that speaker, and the group player is not `playing`.
+- `played(group, cache) -> Vec<EntityId>` in `src/domain/select.rs` is a pure function. It gives the target of a control on the group player `group`:
+  1. `group`, when the state of `group` is `playing`.
+  2. Else each member of `group` whose state is `playing`, in the order of `group_members`, when one or more members play. A member is a JSON string of `group_members`. A member with no state does not play.
+  3. Else `group`.
+- In step 3 of `decide` (sub-phase 18.15), a command whose `service` is in the domain `music_assistant` targets the group player. Another command targets `played(group, cache)`. Thus `play_music`, `play_radio` and `queue_music` always play on the whole group.
+- `music_pause` gets the examples "stop the music [downstairs](area)" and "pause the music on the [downstairs speakers](area)". `volume_up` gets the example "turn up the music on the [downstairs speakers](area)". None of them is held out.
+
+**Acceptance criteria.**
+
+- AC-18.15b-1: When the intent is `music_pause` with the area slot "downstairs" and `media_player.downstairs` is `playing`, the call is `media_player.media_pause` with the target `media_player.downstairs`.
+- AC-18.15b-2: When `media_player.downstairs` is `idle`, `media_player.carson_kitchen` is `playing` and `media_player.carson_living_room` is `idle`, the target is `media_player.carson_kitchen`.
+- AC-18.15b-3: When `media_player.downstairs` is `idle` and both of its members are `playing`, the target is `media_player.carson_kitchen` and `media_player.carson_living_room`, in this order.
+- AC-18.15b-4: When no member of `media_player.downstairs` and not the group player is `playing`, the target is `media_player.downstairs`.
+- AC-18.15b-5: When the intent is `volume_set` with the slots `volume = 50` and `area = downstairs`, and only `media_player.carson_kitchen` is `playing`, the call is `media_player.volume_set` with the target `media_player.carson_kitchen` and `volume_level = 0.5`.
+- AC-18.15b-6: When the intent is `play_music` with the area slot "downstairs" and only `media_player.carson_kitchen` is `playing`, the target is `media_player.downstairs`.
+- AC-18.15b-7: When the fixture model gets "stop the music downstairs" and "pause the music on the downstairs speakers", the slots contain `area = downstairs` and `area = downstairs speakers`.
+
+**Proofs.**
+
+- P-18.15b-1 to P-18.15b-4 (AC-18.15b-1 to AC-18.15b-4). Ensures: `played(group, cache)` is `[group]` when the state of `group` is `playing`. Else it is the members of `group` in the order of `group_members` whose state is `playing`, when this sequence is not empty. Else it is `[group]`. Argument: `played` checks the state of `group` first. Then it makes one pass over `group_members`, with the loop invariant that the result is the playing members before the index. It gives `[group]` when the result is empty.
+- P-18.15b-5, P-18.15b-6 (AC-18.15b-5, AC-18.15b-6). Ensures: the call of P-18.15-1 targets the group player when the `service` of the intent is in the domain `music_assistant`, else `played(group, cache)`. Argument: step 3 checks the domain of the `service` before it selects the target.
+- P-18.15b-7. Evidence: test.
+
 ## Field Log
 
 These steps are not tests and gate nothing.
@@ -478,3 +561,4 @@ These steps are not tests and gate nothing.
 4. Say "Put on The Matrix." Make sure that the TV plays the movie. If the Plex libraries have other names, change them in `intents.toml`.
 5. Set `PLEX_TOKEN` in the environment file of the `jarvis` unit. Ask "Are there any new shows?". Compare the answer with the Plex home screen.
 6. Say "Play hip hop", "Play jazz" and "Play Radiohead" in the Office. Make sure that the speaker plays the playlist "Hip Hop", the playlist "jazzy" and the artist "Radiohead", and that Jarvis announces no failure.
+7. Say "Play jazz downstairs." Make sure that all speakers of "Downstairs Speakers" play. Say "Pause the music downstairs." Make sure that they pause.
