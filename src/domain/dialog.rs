@@ -29,6 +29,8 @@ pub enum Pending {
         missing: String,
         /// The values that fill the missing slot. Empty when any answer fills it.
         choices: Vec<String>,
+        /// The transcript of the request that asked.
+        transcript: String,
     },
     /// The answer to a question of System Two.
     Llm {
