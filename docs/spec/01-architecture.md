@@ -615,7 +615,7 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 - `select` is a list of entity filters. A filter has a `domain`, an optional `name` and an optional `device_class`. `name` matches whole words of the entity name or an alias, without case sensitivity (`fan` matches "Office Fan", not "Infant Monitor"). An entity matches when one filter matches. `select` skips an entity that has an entity category, that is hidden or disabled, or that is on a satellite device (a device with an `assist_satellite` entity) and is not a `media_player`.
 - `exclude` is a list of entity IDs that `select` never matches. Use it for a sensor that gives bad values.
 - `plugin` is the tool name of the plugin of a fetch intent, for example `get_weather`.
-- `search = true` makes Jarvis search Music Assistant for the `media_id` of the call and play the best match (sub-phase 18.13b). Only `play_music` has it.
+- `search = true` makes Jarvis search Music Assistant for the `media_id` of the call and play the best match (sub-phase 18.13b). An artist match starts with one track of the artist (sub-phase 18.14). Only `play_music` has it.
 - The area is the area slot. If no slot, it is the satellite area. The area slot matches an area name or alias without case sensitivity.
 - `target = "entities"` uses all matching entities in the area.
 - `target = "entity"` uses `entity`, or the matching entity in the area with the lowest entity ID. Sub-phase 11.6 replaces "lowest entity ID" with "highest habit score". `target` is `entity` when it is absent.
