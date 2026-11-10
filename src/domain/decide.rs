@@ -2046,6 +2046,12 @@ mod tests {
     /// AC-4.5d-1.
     #[test]
     fn ac_4_5d_1_climate_down_sends_number() {
+        let call = thermostat_call("climate_down");
+        assert_eq!(call.data["temperature"], Value::from(70));
+    }
+
+    /// The call of `label` from the Office satellite when the thermostat target is 72.
+    fn thermostat_call(label: &str) -> ServiceCall {
         let mut snapshot = house();
         let thermostat = snapshot
             .states
@@ -2061,8 +2067,8 @@ mod tests {
             now: Timestamp::UNIX_EPOCH,
         };
         let cache = StateCache::load(snapshot);
-        let decision = decided_for(&catalog(), ("climate_down", 0.89), &[], &request, &cache);
-        assert_eq!(data(decision)["temperature"], Value::from(70));
+        let decision = decided_for(&catalog(), (label, 0.89), &[], &request, &cache);
+        called(decision)
     }
 
     /// AC-4.5d-2.
@@ -2948,6 +2954,74 @@ mod tests {
     fn ac_18_12_1_new_shows_fetches_from_the_plugin() {
         let fetch = fetching("get_new_shows", Map::new(), "new_shows");
         assert_eq!(decided_in(&catalog(), "new_shows", None, None), fetch);
+    }
+
+    /// The `homeassistant.turn_off` call for `target`.
+    fn turned_off(target: &[&str]) -> ServiceCall {
+        ServiceCall {
+            domain: "homeassistant".to_owned(),
+            service: "turn_off".to_owned(),
+            target: target.iter().map(|id| (*id).to_owned()).collect(),
+            data: Map::new(),
+            return_response: false,
+        }
+    }
+
+    /// AC-18.16-1.
+    #[test]
+    fn ac_18_16_1_lights_off_turns_off_the_lights_of_the_area() {
+        let call = called(played("lights_off", &[], "kitchen"));
+        assert_eq!(call, turned_off(&KITCHEN));
+    }
+
+    /// AC-18.16-2.
+    #[test]
+    fn ac_18_16_2_fan_off_turns_off_the_fan_of_the_area() {
+        let call = called(played("fan_off", &[], "office"));
+        assert_eq!(call, turned_off(&["fan.office_fan"]));
+        let call = called(played("fan_off", &[], "living_room"));
+        assert_eq!(call, turned_off(&["switch.living_room_fan"]));
+    }
+
+    /// AC-18.16-3.
+    #[test]
+    fn ac_18_16_3_climate_up_sends_two_degrees_more() {
+        let call = thermostat_call("climate_up");
+        let service = (call.domain.as_str(), call.service.as_str());
+        assert_eq!(service, ("climate", "set_temperature"));
+        assert_eq!(call.data["temperature"], Value::from(74));
+    }
+
+    /// The call of `media_player.<service>` on the Kitchen speaker with no data.
+    fn on_speaker(service: &str) -> ServiceCall {
+        ServiceCall {
+            domain: "media_player".to_owned(),
+            service: service.to_owned(),
+            target: vec![KITCHEN_SPEAKER.to_owned()],
+            data: Map::new(),
+            return_response: false,
+        }
+    }
+
+    /// AC-18.16-4.
+    #[test]
+    fn ac_18_16_4_music_resume_plays_on_the_speaker_of_the_area() {
+        let call = called(played("music_resume", &[], "kitchen"));
+        assert_eq!(call, on_speaker("media_play"));
+    }
+
+    /// AC-18.16-5.
+    #[test]
+    fn ac_18_16_5_music_previous_goes_back_on_the_speaker_of_the_area() {
+        let call = called(played("music_previous", &[], "kitchen"));
+        assert_eq!(call, on_speaker("media_previous_track"));
+    }
+
+    /// AC-18.16-6.
+    #[test]
+    fn ac_18_16_6_tv_off_turns_off_the_tv() {
+        let call = called(played("tv_off", &[], "office"));
+        assert_eq!(call, on_tv("turn_off"));
     }
 
     /// AC-7.6-3.
