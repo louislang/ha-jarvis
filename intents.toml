@@ -130,6 +130,7 @@ service = "music_assistant.play_media"
 target = "entity"
 select = [{ domain = "media_player", device_class = "speaker" }]
 data = { media_id = "{{ media }}" }
+search = true
 
 [[intent]]
 name = "play_radio"

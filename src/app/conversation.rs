@@ -26,9 +26,11 @@ use crate::domain::decide;
 use crate::domain::decide::Chosen;
 use crate::domain::decide::Decision;
 use crate::domain::decide::Job;
+use crate::domain::decide::MediaItem;
 use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::decide::Request;
+use crate::domain::decide::SearchResults;
 use crate::domain::intent;
 use crate::domain::model::Prediction;
 use crate::domain::responses;
@@ -212,7 +214,7 @@ impl Conversation {
         let request = satellite
             .map(|satellite| (satellite.to_owned(), self.queues.next_generation(satellite)));
         let (chosen, after) = match decision {
-            Decision::Reply { reply, call } => (reply, call.map(|call| self.after(call, request))),
+            Decision::Reply { reply, call } => self.replied(reply, call, request),
             Decision::Defer {
                 filler,
                 job: Job::Fetch { call, pool },
@@ -234,6 +236,19 @@ impl Conversation {
         Handled { text, after }
     }
 
+    /// `reply` and the work of `call` for `request`, with a search first when the intent of the
+    /// pool of `reply` has `search`.
+    fn replied(
+        &self,
+        reply: Chosen,
+        call: Option<ServiceCall>,
+        request: Option<(String, u64)>,
+    ) -> (Chosen, Option<Work>) {
+        let mut intents = self.catalog.intents.iter();
+        let search = intents.any(|intent| intent.search && intent.name == reply.pool);
+        (reply, call.map(|call| self.after(call, search, request)))
+    }
+
     /// Empty text and `question` in the queue of the satellite of `request` with the generation of
     /// `request`, or the text of `question` with no `request`.
     fn ask(&self, mut question: Chosen, request: Option<(String, u64)>) -> (Chosen, Option<Work>) {
@@ -248,11 +263,13 @@ impl Conversation {
         (question, Some(ask.boxed()))
     }
 
-    /// Makes `call`. When it fails, logs the error, queues a `failure` answer on the satellite
-    /// of `request` with the generation of `request`, and records its use.
-    fn after(&self, call: ServiceCall, request: Option<(String, u64)>) -> Work {
+    /// Makes `call` after `resolve` with `search`. When it fails, logs the error, queues a
+    /// `failure` answer on the satellite of `request` with the generation of `request`, and
+    /// records its use.
+    fn after(&self, call: ServiceCall, search: bool, request: Option<(String, u64)>) -> Work {
         let conversation = self.clone();
         async move {
+            let call = conversation.resolve(call, search).await;
             let Err(error) = conversation.queues.home.call(call).await else {
                 return Ok(());
             };
@@ -265,6 +282,56 @@ impl Conversation {
             queues.announce(&satellite, generation, &text).await
         }
         .boxed()
+    }
+
+    /// With `search`, `call` with the `uri` and the `media_type` of the best Music Assistant match
+    /// of its `media_id` in the config entry of its first target, else `call`. Logs a failed search.
+    async fn resolve(&self, mut call: ServiceCall, search: bool) -> ServiceCall {
+        let name = call.data.get("media_id").and_then(Value::as_str);
+        let entry = {
+            let cache = self.queues.cache.borrow();
+            let mut entities = cache.entities.iter();
+            let found = entities.find(|entity| Some(&entity.entity_id.0) == call.target.first());
+            found.and_then(|entity| entity.config_entry_id.clone())
+        };
+        let (true, Some(name), Some(entry)) = (search, name.map(str::to_owned), entry) else {
+            return call;
+        };
+        match self.search(&name, &entry).await {
+            Ok(Some(item)) => {
+                call.data.insert("media_id".to_owned(), item.uri.into());
+                call.data
+                    .insert("media_type".to_owned(), item.media_type.into());
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!("the music search failed: {error:#}"),
+        }
+        call
+    }
+
+    /// The best match of `name` in the library playlists of the Music Assistant config entry
+    /// `entry`, else in its artists, albums and tracks. An error when a search fails or its
+    /// response does not parse.
+    async fn search(&self, name: &str, entry: &str) -> anyhow::Result<Option<MediaItem>> {
+        let library = serde_json::json!({ "config_entry_id": entry, "name": name,
+            "media_type": ["playlist"], "library_only": true });
+        let all = serde_json::json!({ "config_entry_id": entry, "name": name,
+            "media_type": ["artist", "album", "track"] });
+        for data in [library, all] {
+            let call = ServiceCall {
+                domain: "music_assistant".to_owned(),
+                service: "search".to_owned(),
+                target: Vec::new(),
+                data: serde_json::from_value(data)?,
+                return_response: true,
+            };
+            let response = self.queues.home.call(call).await?.unwrap_or_default();
+            let results: SearchResults = serde_json::from_value(response)?;
+            if let Some(found) = decide::best_match(&results, name) {
+                return Ok(Some(found.clone()));
+            }
+        }
+        Ok(None)
     }
 
     /// Fetches `call` while `request` is the newest of its satellite. Queues its answer of `pool`,
@@ -711,12 +778,14 @@ mod tests {
     use quint_connect::quint_run;
     use quint_connect::switch;
     use serde::Deserialize;
+    use serde_json::json;
     use tokio::runtime::Runtime;
     use tokio::time::Instant;
     use tracing::instrument::WithSubscriber;
 
     use super::*;
     use crate::app::speech::Speech;
+    use crate::domain::model::Slot;
     use crate::domain::responses::Pool;
     use crate::domain::state::ServiceCall;
     use crate::domain::state::State;
@@ -1789,18 +1858,25 @@ mod tests {
         let classifier = classifier(Some(label));
         let (_cache, _changes, mut conversation) =
             still_with(&home, "idle", classifier, Arc::default());
+        with_plugin(&mut conversation, plugin, Ok(result));
+        spoken(conversation, text).await?;
+        Ok(announces(&home))
+    }
+
+    /// The reply after `conversation` with the pools of `responses.toml` handles `text` from the
+    /// kitchen satellite and its work ends.
+    async fn spoken(mut conversation: Conversation, text: &str) -> anyhow::Result<String> {
         let catalog = crate::load_catalog(Path::new("intents.toml"))?;
         let pools = crate::load_pools(Path::new("responses.toml"), &catalog)?;
         conversation.pools = Arc::new(ArcSwap::from_pointee(pools));
-        with_plugin(&mut conversation, plugin, Ok(result));
         let context = Context {
             device_id: Some(KITCHEN.to_owned()),
             satellite_id: Some(SATELLITE.to_owned()),
             ..Context::default()
         };
-        let after = conversation.handle(text, context).await?.after;
+        let Handled { text, after } = conversation.handle(text, context).await?;
         after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
-        Ok(announces(&home))
+        Ok(text)
     }
 
     /// AC-17.4-5.
@@ -1837,6 +1913,132 @@ mod tests {
     async fn ac_18_12_3_no_new_shows_announces_nothing_new() -> anyhow::Result<()> {
         let answer = "Nothing new was added to Plex in the last day.";
         assert_eq!(new_shows(&[], &[]).await?, [answer]);
+        Ok(())
+    }
+
+    /// The speaker of the kitchen satellite.
+    const SPEAKER: &str = "media_player.carson_kitchen";
+
+    /// The config entry of Music Assistant in the tests.
+    const ENTRY: Option<&str> = Some("music_assistant");
+
+    /// The reply and the calls of `home` after a conversation with the catalog of `intents.toml`
+    /// handles "play `media`" from the kitchen satellite, when the classifier gives `label` with
+    /// the slot `media` and [`SPEAKER`] has the config entry `entry`.
+    async fn played(
+        home: &Arc<FakeHome>,
+        label: &str,
+        media: &str,
+        entry: Option<&str>,
+    ) -> anyhow::Result<(String, Vec<ServiceCall>)> {
+        let classifier = Arc::new(FakeClassifier::default());
+        let (name, value) = ("media".to_owned(), media.to_owned());
+        let (ranked, slots) = (vec![(label.to_owned(), 0.9)], vec![Slot { name, value }]);
+        classifier.script(Prediction { ranked, slots });
+        let (cache, _changes, conversation) = still_with(home, "idle", classifier, Arc::default());
+        cache.send_modify(|cache| set_entry(cache, entry));
+        let reply = spoken(conversation, &format!("play {media}")).await?;
+        Ok((reply, home.calls()))
+    }
+
+    /// Sets the config entry of [`SPEAKER`] in `cache` to `entry`.
+    fn set_entry(cache: &mut StateCache, entry: Option<&str>) {
+        let mut entities = Arc::make_mut(&mut cache.entities).iter_mut();
+        let speaker = entities.find(|entity| entity.entity_id.0 == SPEAKER);
+        speaker.expect("the house has it").config_entry_id = entry.map(str::to_owned);
+    }
+
+    /// The `music_assistant` call of `service` on `target` with `data`, with the response data of
+    /// a search.
+    fn music(service: &str, target: &[&str], data: Value) -> ServiceCall {
+        ServiceCall {
+            domain: "music_assistant".to_owned(),
+            service: service.to_owned(),
+            target: target.iter().map(|&entity| entity.to_owned()).collect(),
+            data: serde_json::from_value(data).expect("the data is an object"),
+            return_response: service == "search",
+        }
+    }
+
+    /// The search with `data` and the `play_media` call of [`SPEAKER`] with the `uri` and the
+    /// `media_type` of `item`.
+    fn searched(data: Value, item: &Value) -> [ServiceCall; 2] {
+        let play = json!({ "media_id": item["uri"], "media_type": item["media_type"] });
+        [
+            music("search", &[], data),
+            music("play_media", &[SPEAKER], play),
+        ]
+    }
+
+    /// AC-18.13-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_13_5_play_music_plays_the_library_playlist_of_the_name() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let hip_hop =
+            json!({ "media_type": "playlist", "uri": "library://playlist/82", "name": "Hip Hop" });
+        home.respond_next(json!({ "playlists": [hip_hop] }));
+        let (reply, calls) = played(&home, "play_music", "hip hop", ENTRY).await?;
+        assert_eq!(reply, "Playing hip hop.");
+        let search = json!({ "config_entry_id": "music_assistant", "name": "hip hop",
+            "media_type": ["playlist"], "library_only": true });
+        assert_eq!(calls, searched(search, &hip_hop));
+        Ok(())
+    }
+
+    /// AC-18.13-6.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_13_6_no_playlist_plays_the_artist_of_the_name() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let uri = "spotify--x7LaiKmM://artist/4Z8W4fKeB5YxbusRsdQVPb";
+        let radiohead = json!({ "media_type": "artist", "uri": uri, "name": "Radiohead" });
+        home.respond_next(json!({ "playlists": [] }));
+        home.respond_next(json!({ "artists": [radiohead] }));
+        let (_, calls) = played(&home, "play_music", "radiohead", ENTRY).await?;
+        let search = json!({ "config_entry_id": "music_assistant", "name": "radiohead",
+            "media_type": ["artist", "album", "track"] });
+        assert_eq!(calls[1..], searched(search, &radiohead));
+        Ok(())
+    }
+
+    /// AC-18.13-7.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_13_7_no_match_failed_search_or_no_entry_plays_the_name() -> anyhow::Result<()> {
+        let unmatched = Arc::new(FakeHome::default());
+        let creep = json!({ "media_type": "track", "uri": "library://track/1", "name": "Creep" });
+        unmatched.respond(json!({ "tracks": [creep] }));
+        let (failed, garbled) = (Arc::new(FakeHome::default()), Arc::new(FakeHome::default()));
+        drop(failed.delay());
+        garbled.respond(json!("busy"));
+        let unconfigured = (Arc::new(FakeHome::default()), None);
+        let homes = [
+            (unmatched, ENTRY),
+            (failed, ENTRY),
+            (garbled, ENTRY),
+            unconfigured,
+        ];
+        for (home, entry) in homes {
+            plays_the_name(&home, entry).await?;
+        }
+        Ok(())
+    }
+
+    /// Checks that the last call of `home` after "play radiohead" with `entry` plays the name.
+    async fn plays_the_name(home: &Arc<FakeHome>, entry: Option<&str>) -> anyhow::Result<()> {
+        let play = music("play_media", &[SPEAKER], json!({ "media_id": "radiohead" }));
+        let (_, calls) = played(home, "play_music", "radiohead", entry).await?;
+        assert_eq!(calls.last(), Some(&play), "{entry:?}");
+        Ok(())
+    }
+
+    /// AC-18.13-8.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_13_8_radio_and_queue_make_no_search() -> anyhow::Result<()> {
+        for label in ["play_radio", "queue_music"] {
+            let home = Arc::new(FakeHome::default());
+            let (_, calls) = played(&home, label, "radiohead", ENTRY).await?;
+            let services: Vec<&str> = calls.iter().map(|call| call.service.as_str()).collect();
+            assert_eq!(services, ["play_media"], "{label}");
+        }
         Ok(())
     }
 
