@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use serde_json::Map;
 use serde_json::Value;
 
+use crate::app::conversation::Queues;
 use crate::domain::catalog;
 use crate::domain::intent;
 use crate::domain::responses;
@@ -18,6 +19,7 @@ use crate::domain::speech::Audio;
 use crate::domain::speech::CommitPolicy;
 use crate::domain::training;
 use crate::ports::Classifier;
+use crate::ports::Clock;
 use crate::ports::Listening;
 use crate::ports::Partial;
 use crate::ports::Reasoner;
@@ -33,7 +35,8 @@ const SAMPLES_PER_MS: u64 = 16;
 const NAME_SLOTS: [&str; 3] = ["media", "movie", "show"];
 
 /// Starts listen sessions that warm System Two, predict on each changed first-pass partial,
-/// commit by the policy and give the second-pass transcript.
+/// commit by the policy, early for an answer to an open dialog, and give the second-pass
+/// transcript.
 pub struct Listener {
     /// The two passes of each session.
     stt: Arc<dyn SpeechToText>,
@@ -45,11 +48,16 @@ pub struct Listener {
     policy: CommitPolicy,
     /// The lowest top probability of a confident partial: `model.commit_threshold`.
     threshold: f32,
+    /// The open dialogs, whose answers commit early.
+    queues: Arc<Queues>,
+    /// The time that decides which dialogs are open.
+    clock: Arc<dyn Clock>,
 }
 
 impl Listener {
     /// Listens with `stt` and `classifier`, warms `reasoner`, and commits by `policy` and
-    /// `threshold`.
+    /// `threshold`, or early for an answer to a dialog of `queues` that is open at the time of
+    /// `clock`.
     #[must_use]
     pub fn new(
         stt: Arc<dyn SpeechToText>,
@@ -57,6 +65,8 @@ impl Listener {
         reasoner: Arc<dyn Reasoner>,
         policy: CommitPolicy,
         threshold: f32,
+        queues: Arc<Queues>,
+        clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
             stt,
@@ -64,6 +74,8 @@ impl Listener {
             reasoner,
             policy,
             threshold,
+            queues,
+            clock,
         }
     }
 
@@ -87,6 +99,8 @@ impl Listener {
             classifier: Arc::clone(&self.classifier),
             policy: self.policy.clone(),
             threshold: self.threshold,
+            queues: Arc::clone(&self.queues),
+            clock: Arc::clone(&self.clock),
             text: String::new(),
             confident: false,
             samples: Vec::new(),
@@ -106,9 +120,13 @@ struct Session {
     policy: CommitPolicy,
     /// The lowest top probability of a confident partial.
     threshold: f32,
+    /// The open dialogs, whose answers commit early.
+    queues: Arc<Queues>,
+    /// The time that decides which dialogs are open.
+    clock: Arc<dyn Clock>,
     /// The text of the last changed, non-empty partial.
     text: String,
-    /// True when the prediction of `text` is a confident command.
+    /// True when `text` answers an open dialog or its prediction is a confident command.
     confident: bool,
     /// The pushed samples.
     samples: Vec<i16>,
@@ -118,9 +136,16 @@ impl Session {
     /// Keeps `text` and its confidence when it is a changed, non-empty text.
     async fn update(&mut self, text: &str) {
         if text != self.text && !text.is_empty() {
-            self.confident = confident(&*self.classifier, self.threshold, text).await;
+            self.confident = self.is_confident(text).await;
             text.clone_into(&mut self.text);
         }
+    }
+
+    /// True when `text` answers an open dialog, with no prediction, or when its prediction is a
+    /// confident command.
+    async fn is_confident(&self, text: &str) -> bool {
+        self.queues.is_answer(text, self.clock.now())
+            || confident(&*self.classifier, self.threshold, text).await
     }
 
     /// True when `partial` ends the utterance by the policy.
@@ -293,12 +318,22 @@ mod tests {
 
     use tracing::instrument::WithSubscriber;
 
+    use jiff::Timestamp;
+    use std::time::Duration;
+    use tokio::sync::watch;
+
     use super::*;
+    use crate::DialogConfig;
+    use crate::domain::dialog::Key;
+    use crate::domain::dialog::Pending;
     use crate::domain::model::Prediction;
     use crate::domain::model::Slot;
     use crate::domain::responses::Pool;
     use crate::domain::responses::Response;
+    use crate::domain::state_cache::StateCache;
     use crate::testing::fakes::FakeClassifier;
+    use crate::testing::fakes::FakeClock;
+    use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStt;
     use crate::testing::fakes::FakeTts;
@@ -331,19 +366,61 @@ mod tests {
         }
     }
 
-    /// A listener on `stt` and `classifier` that warms `reasoner`.
+    /// Queues with the cancel phrase "never mind" and a dialog timeout of 15 s, with a dialog for
+    /// each of `open` on its own key, asked at `asked`.
+    fn dialogs(open: Vec<Pending>, asked: Timestamp) -> Arc<Queues> {
+        let dialog = DialogConfig {
+            max_turns: 3,
+            timeout_s: 15,
+            choice_similarity: 0.85,
+            cancel: vec!["never mind".to_owned()],
+        };
+        let (home, cache) = (
+            Arc::new(FakeHome::default()),
+            watch::channel(StateCache::default()),
+        );
+        let queues = Queues::new(home, cache.1, Duration::ZERO, Duration::ZERO, dialog);
+        for (index, pending) in open.into_iter().enumerate() {
+            queues.open(Key(index.to_string()), pending, asked);
+        }
+        Arc::new(queues)
+    }
+
+    /// A listener on `stt`, `classifier` and the dialogs of `queues` at the Unix epoch, that warms
+    /// `reasoner`.
     fn listener(
         stt: FakeStt,
         classifier: &Arc<FakeClassifier>,
         reasoner: &Arc<FakeReasoner>,
+        queues: Arc<Queues>,
     ) -> Listener {
         let classifier = Arc::clone(classifier) as Arc<dyn Classifier>;
         let reasoner = Arc::clone(reasoner) as Arc<dyn Reasoner>;
-        Listener::new(Arc::new(stt), classifier, reasoner, POLICY, 0.9)
+        let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
+        Listener::new(
+            Arc::new(stt),
+            classifier,
+            reasoner,
+            POLICY,
+            0.9,
+            queues,
+            clock,
+        )
     }
 
-    /// A session on `stt`, with a classifier that gives `predictions`, and that classifier.
+    /// A session on `stt` with no dialogs, with a classifier that gives `predictions`, and that
+    /// classifier.
     fn session(
+        stt: FakeStt,
+        predictions: Vec<Prediction>,
+    ) -> anyhow::Result<(Box<dyn Listening>, Arc<FakeClassifier>)> {
+        session_in(dialogs(Vec::new(), Timestamp::UNIX_EPOCH), stt, predictions)
+    }
+
+    /// A session on `stt` and the dialogs of `queues`, with a classifier that gives
+    /// `predictions`, and that classifier.
+    fn session_in(
+        queues: Arc<Queues>,
         stt: FakeStt,
         predictions: Vec<Prediction>,
     ) -> anyhow::Result<(Box<dyn Listening>, Arc<FakeClassifier>)> {
@@ -351,7 +428,7 @@ mod tests {
         for prediction in predictions {
             classifier.script(prediction);
         }
-        let listener = listener(stt, &classifier, &Arc::default());
+        let listener = listener(stt, &classifier, &Arc::default(), queues);
         Ok((listener.listen()?, classifier))
     }
 
@@ -359,16 +436,32 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_7_1_4_listen_warms_the_reasoner_once() -> anyhow::Result<()> {
         let reasoner = Arc::new(FakeReasoner::default());
-        let listener = listener(FakeStt::default(), &Arc::default(), &reasoner);
+        let queues = dialogs(Vec::new(), Timestamp::UNIX_EPOCH);
+        let listener = listener(FakeStt::default(), &Arc::default(), &reasoner, queues);
         let _session = listener.listen()?;
         tokio::task::yield_now().await;
         assert_eq!(reasoner.warms(), 1);
         Ok(())
     }
 
-    /// The result of each push of a 20 ms chunk, one push for each of `partials`, and the
-    /// classifier.
+    /// The result of each push of a 20 ms chunk with no dialogs, one push for each of
+    /// `partials`, and the classifier.
     async fn pushes(
+        partials: Vec<Partial>,
+        predictions: Vec<Prediction>,
+    ) -> anyhow::Result<(Vec<Option<String>>, Arc<FakeClassifier>)> {
+        pushes_in(
+            dialogs(Vec::new(), Timestamp::UNIX_EPOCH),
+            partials,
+            predictions,
+        )
+        .await
+    }
+
+    /// The result of each push of a 20 ms chunk with the dialogs of `queues`, one push for each
+    /// of `partials`, and the classifier.
+    async fn pushes_in(
+        queues: Arc<Queues>,
         partials: Vec<Partial>,
         predictions: Vec<Prediction>,
     ) -> anyhow::Result<(Vec<Option<String>>, Arc<FakeClassifier>)> {
@@ -377,7 +470,7 @@ mod tests {
             partials,
             ..FakeStt::default()
         };
-        let (mut session, classifier) = session(stt, predictions)?;
+        let (mut session, classifier) = session_in(queues, stt, predictions)?;
         let mut results = Vec::new();
         for _ in 0..count {
             results.push(session.push(vec![0; 320]).await?);
@@ -603,6 +696,85 @@ mod tests {
         let text = "turn on the lights in the kitchen";
         let results = slot_pushes(text, "lights_on", "area", "kitchen", &[0, 199, 200]).await?;
         assert_eq!(results, commit_after(2, text));
+        Ok(())
+    }
+
+    /// A `Slot` dialog for the area of `lights_on` with the choices "kitchen" and "living room".
+    fn which_room() -> Pending {
+        Pending::Slot {
+            intent: "lights_on".to_owned(),
+            slots: Vec::new(),
+            missing: "area".to_owned(),
+            choices: vec!["kitchen".to_owned(), "living room".to_owned()],
+            transcript: "turn on the lights".to_owned(),
+        }
+    }
+
+    /// A System Two dialog.
+    fn system_two() -> Pending {
+        Pending::Llm {
+            response_id: "response".to_owned(),
+            call_id: "call".to_owned(),
+        }
+    }
+
+    /// The result of each push of `text` with each of `silences` ms after its last voiced
+    /// sample, when the classifier gives `unknown` and the dialogs of `open` were asked at
+    /// `asked`.
+    async fn answer_pushes(
+        open: Vec<Pending>,
+        asked: Timestamp,
+        text: &str,
+        silences: &[u64],
+    ) -> anyhow::Result<Vec<Option<String>>> {
+        let partials: Vec<Partial> = silences
+            .iter()
+            .map(|silence| partial(text, Some(500), 500 + silence))
+            .collect();
+        let queues = dialogs(open, asked);
+        let (results, _) = pushes_in(queues, partials, vec![prediction("unknown", 0.95)]).await?;
+        Ok(results)
+    }
+
+    /// AC-10.7-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_7_1_slot_answer_commits_at_early_commit_ms() -> anyhow::Result<()> {
+        let epoch = Timestamp::UNIX_EPOCH;
+        let results = answer_pushes(vec![which_room()], epoch, "kitchen", &[0, 199, 200]).await?;
+        assert_eq!(results, commit_after(2, "kitchen"));
+        Ok(())
+    }
+
+    /// AC-10.7-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_7_2_no_open_dialog_commits_at_endpoint_ms() -> anyhow::Result<()> {
+        let silences = [0, 200, 599, 600];
+        let none = answer_pushes(Vec::new(), Timestamp::UNIX_EPOCH, "kitchen", &silences).await?;
+        assert_eq!(none, commit_after(3, "kitchen"));
+        let asked = Timestamp::from_second(-15)?;
+        let late = answer_pushes(vec![which_room()], asked, "kitchen", &silences).await?;
+        assert_eq!(late, commit_after(3, "kitchen"), "a timed-out dialog");
+        Ok(())
+    }
+
+    /// AC-10.7-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_7_3_cancel_commits_at_early_commit_ms() -> anyhow::Result<()> {
+        for open in [which_room(), system_two()] {
+            let epoch = Timestamp::UNIX_EPOCH;
+            let silences = [0, 199, 200];
+            let results = answer_pushes(vec![open.clone()], epoch, "never mind", &silences).await?;
+            assert_eq!(results, commit_after(2, "never mind"), "{open:?}");
+        }
+        Ok(())
+    }
+
+    /// AC-10.7-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_7_5_system_two_answer_commits_at_endpoint_ms() -> anyhow::Result<()> {
+        let (epoch, silences) = (Timestamp::UNIX_EPOCH, [0, 200, 599, 600]);
+        let results = answer_pushes(vec![system_two()], epoch, "fifteen", &silences).await?;
+        assert_eq!(results, commit_after(3, "fifteen"));
         Ok(())
     }
 

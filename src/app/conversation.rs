@@ -182,7 +182,7 @@ impl Conversation {
         };
         let handled = self.reply(decision, area, satellite, key.clone()).await;
         if let (Some(key), Some(pending)) = (key, pending) {
-            self.queues.dialogs().open(key, pending, request.now);
+            self.queues.open(key, pending, request.now);
         }
         let (top, reply) = (prediction.ranked.first(), handled.text.as_str());
         let transcript = request.transcript.as_str();
@@ -945,6 +945,29 @@ impl Queues {
     /// The open dialogs.
     fn dialogs(&self) -> MutexGuard<'_, Dialogs> {
         self.dialogs.lock().expect("no lock holder panics")
+    }
+
+    /// Opens a dialog on `key` that waits for `pending`, asked at `now`.
+    pub fn open(&self, key: Key, pending: Pending, now: Timestamp) {
+        self.dialogs().open(key, pending, now);
+    }
+
+    /// True when `text` is a cancel phrase and a dialog is open at `now`, or when `text` fills an
+    /// open `Slot` dialog. An answer to System Two is free text, so it fills nothing here.
+    pub fn is_answer(&self, text: &str, now: Timestamp) -> bool {
+        let (mut dialogs, rules) = (self.dialogs().clone(), &self.dialog);
+        let keys: Vec<Key> = dialogs.dialogs.keys().cloned().collect();
+        let open: Vec<Dialog> = keys
+            .iter()
+            .filter_map(|key| dialogs.take(key, now, rules.timeout_s))
+            .collect();
+        let fills = |dialog: &Dialog| match &dialog.pending {
+            Pending::Slot { choices, .. } => {
+                dialog::fill(text, choices, rules.choice_similarity).is_some()
+            }
+            Pending::Llm { .. } => false,
+        };
+        (!open.is_empty() && dialog::is_cancel(text, &rules.cancel)) || open.iter().any(fills)
     }
 
     /// The generation of the dialog key of `satellite`.
@@ -2003,7 +2026,6 @@ mod tests {
         let key = Key(SATELLITE.to_owned());
         conversation
             .queues
-            .dialogs()
             .open(key, pending, Timestamp::UNIX_EPOCH);
     }
 

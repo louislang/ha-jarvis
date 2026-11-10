@@ -565,6 +565,47 @@ mod tests {
         within(&["play bluey on the tv"], "tv_show", "kitchen", 400).await
     }
 
+    /// Sends `REQUEST` from the kitchen satellite with no device, so it has no area and opens the
+    /// dialog of "Which room?".
+    ///
+    /// # Errors
+    ///
+    /// The connection fails, or the reply is not a question.
+    async fn ask_room(pipeline: &Pipeline) -> anyhow::Result<()> {
+        let mut client = FakeWyomingClient::connect(pipeline.address).await?;
+        let context = json!({ "satellite_id": KITCHEN_SATELLITE });
+        let data = json!({ "text": REQUEST, "context": context });
+        client.send("transcript", &data).await?;
+        let reply = text_of(&next(&mut client, "handled").await?)?;
+        anyhow::ensure!(
+            reply.is_empty(),
+            "{REQUEST:?} gives {reply:?}, not a question"
+        );
+        Ok(())
+    }
+
+    /// AC-10.7-4.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "GPU host"]
+    async fn ac_10_7_4_room_answer_response_latency_p95_is_300_ms_or_less() -> anyhow::Result<()> {
+        let (pipeline, answer) = (Pipeline::start(Device::Cuda).await?, "the kitchen");
+        let (replies, speech) = (
+            responses("lights_on", "kitchen")?,
+            fakes::speech(answer).await?,
+        );
+        let mut runs = Vec::new();
+        for _ in 0..=RUNS {
+            ask_room(&pipeline).await?;
+            let run = pipeline.run(&speech.samples).await?;
+            let reply = &run.reply;
+            anyhow::ensure!(replies.contains(reply), "{answer:?} gives {reply:?}");
+            runs.push(run);
+        }
+        let (p95, limit) = (report(answer, &runs[1..])?, Duration::from_millis(300));
+        assert!(p95 <= limit, "p95 {p95:?}, limit {limit:?}");
+        Ok(())
+    }
+
     /// Asserts that each of `texts` in `area` on CUDA, with a reply of `pool`, has a p95 latency
     /// of `limit_ms` or less.
     async fn within(texts: &[&str], pool: &str, area: &str, limit_ms: u64) -> anyhow::Result<()> {
