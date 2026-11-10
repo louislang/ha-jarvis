@@ -558,7 +558,7 @@ Speaker groups were one sub-phase. With the controls, its tests and its Verus pr
 **Goal:** Add the local opposites of the existing commands: lights off, fan off, heat up, resume, previous track and TV off. Without them, the System One model gives the opposite intent, and "turn off the lights" turns the lights on.
 
 - **Implements:** G3, G9. **Depends on:** 18.14.
-- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/catalog.rs`, `src/domain/decide.rs`, `src/adapters/onnx.rs`.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/catalog.rs`, `src/domain/decide.rs`, `src/adapters/onnx.rs`, `README.md` (the new requests and the known defect, `CLAUDE.md` workflow item 15).
 
 **Model.**
 
