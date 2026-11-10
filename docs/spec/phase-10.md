@@ -229,11 +229,39 @@ A choice is a closed set, so step 2 comes before step 3. The answer to System Tw
 
 ---
 
+### 10.5c Dialog Fill Context
+
+**Goal:** Keep the transcript of the request that asks for the area. When a filled request falls back to System Two, System Two then gets the original command and the filled area, not only the answer. `validate_pools` also requires the pool `cancelled`.
+
+- **Implements:** G13. **Depends on:** 10.5b.
+- **Files:** modify `src/domain/dialog.rs`, `src/domain/decide.rs`, `src/domain/responses.rs`, `src/app/conversation.rs`.
+- **Quint:** `dialog.qnt` (unchanged: the model has no text, and `fill` already continues the `request` of the dialog).
+
+**Model.**
+
+- `Pending::Slot` gets `transcript`: the transcript of the request that asked. `ask` copies `request.transcript` into it.
+- Routing step 2 (sub-phase 10.5) runs `decide` with a request whose transcript is `<transcript> in <value>`: the `transcript` of the dialog, a space, "in", a space, and the value that `fill` returns. When the filled decision is a System Two job, `Job::Llm` thus has the original command and the filled area. For example, the request "turn on the fan" and the answer "kitchen" give "turn on the fan in Kitchen".
+- `validate_pools` checks that the pool `cancelled` exists, as it checks `ask_area` (sub-phase 10.4). Thus a `responses.toml` without `cancelled` fails at startup, not at the first cancel.
+
+**Acceptance criteria.**
+
+- AC-10.5c-1: When `decide` returns `Ask` for the transcript "turn on the lights", its `Pending::Slot` has the transcript "turn on the lights".
+- AC-10.5c-2: When the user answers "kitchen" to "Which room?" for "turn on the fan" and the kitchen has no fan, `FakeReasoner` receives "turn on the fan in Kitchen".
+- AC-10.5c-3: When the pool `cancelled` is missing, `validate_pools` returns an error that names it.
+
+**Proofs.**
+
+- P-10.5c-1. Ensures: when the decision is `Ask`, its `Pending::Slot` has `transcript == request.transcript`. Argument: `situation` gives its request to `ask`, and `ask` copies `request.transcript`. `asked` (P-10.4-1) gets the request and states the transcript, so `placed` and `situation` also state it.
+- P-10.5c-2. Argument: routing step 2 builds the request with the transcript `<transcript> in <value>`, and each System Two job of `decide` has the transcript of its request (`deferred`, sub-phase 4.5).
+- P-10.5c-3. Ensures: when `validate_pools` returns `Ok`, the pool `cancelled` exists. Argument: `validate_pools` calls `require` for `cancelled` after `ask_area`, and `valid_pools` names `cancelled`.
+
+---
+
 ### 10.6 System Two Questions
 
 **Goal:** Add the `ask_user` tool and `Step::Ask`, so System Two can ask the user for missing data. The next turn sends the answer as the output of the `ask_user` call, with `previous_response_id`.
 
-- **Implements:** G7, G13. **Depends on:** 10.5b.
+- **Implements:** G7, G13. **Depends on:** 10.5c.
 - **Files:** modify `src/ports.rs`, `src/adapters/openai.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`.
 
 **Model.** `Step::Ask { question, response_id, call_id }`. The consumer increases the generation of the key and ends the job (sub-phase 10.5b). It puts the question in the announce queue (sub-phase 4.9b) with the new generation, so it asks when the satellite is idle after the filler. It opens a dialog with `Pending::Llm { response_id, call_id }`. An answer to that dialog sends a `Question` with `previous_response_id` and one `function_call_output` item with `call_id` and the answer text. Each request sets `parallel_tool_calls = false`, so one response has at most one open tool call. When the dialog times out or is cancelled, Jarvis sends nothing for the open call.
