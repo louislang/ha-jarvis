@@ -2,8 +2,10 @@
 
 use std::collections::BTreeMap;
 use std::mem;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -13,12 +15,14 @@ use arc_swap::ArcSwap;
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::BoxFuture;
+use jiff::Timestamp;
 use rand::rngs::StdRng;
 use serde_json::Map;
 use serde_json::Value;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::DialogConfig;
 use crate::app::background::Backfill;
 use crate::app::plugins::Plugins;
 use crate::domain::catalog::Catalog;
@@ -31,8 +35,14 @@ use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::decide::Request;
 use crate::domain::decide::SearchResults;
+use crate::domain::dialog;
+use crate::domain::dialog::Dialog;
+use crate::domain::dialog::Dialogs;
+use crate::domain::dialog::Key;
+use crate::domain::dialog::Pending;
 use crate::domain::intent;
 use crate::domain::model::Prediction;
+use crate::domain::model::Slot;
 use crate::domain::responses;
 use crate::domain::responses::Pools;
 use crate::domain::responses::Response;
@@ -120,38 +130,176 @@ impl Conversation {
         }
     }
 
-    /// The reply to the transcript `text` in `context` and its work: the System One prediction
-    /// of the normalized text in the area name of the satellite device, its decision and its
-    /// dispatch, or the answer of a deferred job when `context` has no satellite.
+    /// The reply to the transcript `text` in `context` and its work. An answer to the open dialog
+    /// of the satellite, else of the conversation, can cancel it, fill it or ask again. Else the
+    /// System One prediction of the normalized text in the area name of the satellite device, its
+    /// decision and its dispatch, or the answer of a deferred job when `context` has no
+    /// satellite. A question opens a dialog.
     ///
     /// # Errors
     ///
     /// The prediction fails. The error text is a `failure` answer.
     pub async fn handle(&self, text: &str, context: Context) -> anyhow::Result<Handled> {
         let (area, name) = self.area(context.device_id.as_deref());
-        let model_context = training::context_text(name.as_deref(), &[]);
-        let prediction = self
-            .classifier
-            .predict(&model_context, &intent::normalize(text))
-            .await
-            .map_err(|error| {
-                tracing::warn!("the prediction failed: {error:#}");
-                anyhow::anyhow!(self.pick("failure"))
-            })?;
+        let now = self.two.clock.now();
+        let key = context.satellite_id.clone().or(context.conversation_id);
+        let (satellite, timeout) = (
+            context.satellite_id.as_deref(),
+            self.queues.dialog.timeout_s,
+        );
+        let take = |key: Key| Some((self.queues.dialogs().take(&key, now, timeout)?, key));
+        let open = key.clone().map(Key).and_then(take);
+        let prediction = match self
+            .route(text, open, name.as_deref(), satellite, now)
+            .await?
+        {
+            ControlFlow::Continue(prediction) => prediction,
+            ControlFlow::Break(handled) => return Ok(handled),
+        };
         let request = Request {
             transcript: text.to_owned(),
             area,
-            now: self.two.clock.now(),
+            now,
         };
-        let decision = self.decide(&prediction, &request);
+        Ok(self
+            .act(&prediction, &request, key.map(Key), satellite)
+            .await)
+    }
+
+    /// The dispatch of the decision for `prediction` of `request` on `satellite`. A question opens
+    /// a dialog for `key`. Logs the request.
+    async fn act(
+        &self,
+        prediction: &Prediction,
+        request: &Request,
+        key: Option<Key>,
+        satellite: Option<&str>,
+    ) -> Handled {
+        let decision = self.decide(prediction, request);
         let (kind, area) = (kind(&decision), request.area.as_ref());
-        let handled = self
-            .reply(decision, area, context.satellite_id.as_deref())
+        let pending = match &decision {
+            Decision::Ask { pending, .. } => Some(pending.clone()),
+            _ => None,
+        };
+        let handled = self.reply(decision, area, satellite).await;
+        if let (Some(key), Some(pending)) = (key, pending) {
+            self.queues.dialogs().open(key, pending, request.now);
+        }
+        let (top, reply) = (prediction.ranked.first(), handled.text.as_str());
+        let transcript = request.transcript.as_str();
+        tracing::info!(transcript, ?top, kind, reply, "handled");
+        handled
+    }
+
+    /// The reply to `text` as an answer to the `open` dialog and its key on `satellite` at `now`: a
+    /// `cancelled` reply that closes it, or a question again. Else the prediction to decide: the
+    /// filled intent of a `Slot` dialog, or the System One prediction of `text` in the area
+    /// `name`.
+    ///
+    /// # Errors
+    ///
+    /// The prediction fails.
+    async fn route(
+        &self,
+        text: &str,
+        open: Option<(Dialog, Key)>,
+        name: Option<&str>,
+        satellite: Option<&str>,
+        now: Timestamp,
+    ) -> anyhow::Result<ControlFlow<Handled, Prediction>> {
+        let Some((dialog, key)) = open else {
+            return Ok(ControlFlow::Continue(self.predict(name, text).await?));
+        };
+        if dialog::is_cancel(text, &self.queues.dialog.cancel) {
+            return Ok(ControlFlow::Break(self.cancel(key)));
+        }
+        if let Some(prediction) = self.filled(&dialog, text) {
+            return Ok(ControlFlow::Continue(prediction));
+        }
+        let prediction = self.predict(name, text).await?;
+        if self.is_clear(&prediction) || matches!(dialog.pending, Pending::Llm { .. }) {
+            return Ok(ControlFlow::Continue(prediction));
+        }
+        let asked = self.ask_again(dialog, key, satellite, now);
+        Ok(ControlFlow::Break(asked))
+    }
+
+    /// A `cancelled` reply. Closes the dialog of `key`.
+    fn cancel(&self, key: Key) -> Handled {
+        self.queues.dialogs().close(key);
+        let text = self.pick("cancelled");
+        Handled { text, after: None }
+    }
+
+    /// The System One prediction of the normalized `text` in the area `name`.
+    ///
+    /// # Errors
+    ///
+    /// The prediction fails. The error text is a `failure` answer.
+    async fn predict(&self, name: Option<&str>, text: &str) -> anyhow::Result<Prediction> {
+        let model_context = training::context_text(name, &[]);
+        let prediction = self
+            .classifier
+            .predict(&model_context, &intent::normalize(text))
             .await;
+        prediction.map_err(|error| {
+            tracing::warn!("the prediction failed: {error:#}");
+            anyhow::anyhow!(self.pick("failure"))
+        })
+    }
+
+    /// True when the top label of `prediction` is not `unknown` and has at least the threshold.
+    fn is_clear(&self, prediction: &Prediction) -> bool {
         let top = prediction.ranked.first();
-        let reply = handled.text.as_str();
-        tracing::info!(transcript = text, ?top, kind, reply, "handled");
-        Ok(handled)
+        top.is_some_and(|(label, probability)| label != "unknown" && *probability >= self.threshold)
+    }
+
+    /// The intent of the `Slot` dialog `dialog` with probability 1 and the value that `text` fills
+    /// in place of the missing slot, or `None` when the dialog has no choices or no choice fits.
+    fn filled(&self, dialog: &Dialog, text: &str) -> Option<Prediction> {
+        let Pending::Slot {
+            intent,
+            slots,
+            missing,
+            choices,
+        } = &dialog.pending
+        else {
+            return None;
+        };
+        let similarity = self.queues.dialog.choice_similarity;
+        let value = dialog::fill(text, choices, similarity).filter(|_| !choices.is_empty())?;
+        let kept = slots.iter().filter(|slot| &slot.name != missing).cloned();
+        let filled = Slot {
+            name: missing.clone(),
+            value,
+        };
+        Some(Prediction {
+            ranked: vec![(intent.clone(), 1.0)],
+            slots: kept.chain([filled]).collect(),
+        })
+    }
+
+    /// `dialog` of `key` with one more question from `ask_area` on `satellite` at `now`, in its
+    /// queue with the current generation, or a `failure` answer at the turn limit.
+    fn ask_again(
+        &self,
+        dialog: Dialog,
+        key: Key,
+        satellite: Option<&str>,
+        now: Timestamp,
+    ) -> Handled {
+        let Some(next) = dialog::next_turn(dialog, self.queues.dialog.max_turns, now) else {
+            let text = self.pick("failure");
+            return Handled { text, after: None };
+        };
+        self.queues.dialogs().dialogs.insert(key, next);
+        let request =
+            satellite.map(|satellite| (satellite.to_owned(), self.queues.generation(satellite)));
+        let (question, after) = self.ask(self.chosen("ask_area"), request);
+        Handled {
+            text: question.text,
+            after,
+        }
     }
 
     /// The ID and the name of the area of the device `device` in the hot cache.
@@ -566,6 +714,11 @@ impl Conversation {
     /// The text of an answer that `responses::select` picks from the current pool `pool`.
     /// Records its use.
     fn pick(&self, pool: &str) -> String {
+        self.chosen(pool).text
+    }
+
+    /// The answer that `responses::select` picks from the current pool `pool`. Records its use.
+    fn chosen(&self, pool: &str) -> Chosen {
         let (text, index) = {
             let pools = self.pools.load();
             let found = pools.get(pool).expect("valid pools have each answer pool");
@@ -574,7 +727,8 @@ impl Conversation {
             (found.responses[index].text.clone(), index)
         };
         self.backfill.record_use(pool.to_owned(), index);
-        text
+        let pool = pool.to_owned();
+        Chosen { text, pool, index }
     }
 }
 
@@ -596,7 +750,7 @@ struct Queue {
     turn: tokio::sync::Mutex<()>,
 }
 
-/// The announce queue of each satellite.
+/// The announce queue of each satellite, the open dialog of each key and the dialog rules.
 pub struct Queues {
     /// The house.
     home: Arc<dyn Home>,
@@ -608,17 +762,22 @@ pub struct Queues {
     idle_wait: Duration,
     /// The queue of each satellite entity.
     satellites: Mutex<BTreeMap<String, Arc<Queue>>>,
+    /// The open dialogs.
+    dialogs: Mutex<Dialogs>,
+    /// The turn limit, the timeout, the choice similarity and the cancel phrases of a dialog.
+    dialog: DialogConfig,
 }
 
 impl Queues {
     /// Queues that announce on `home` `margin` after `cache` shows the satellite idle, and drop
-    /// an item when the satellite is not idle within `idle_wait`.
+    /// an item when the satellite is not idle within `idle_wait`. Their dialogs follow `dialog`.
     #[must_use]
     pub fn new(
         home: Arc<dyn Home>,
         cache: watch::Receiver<StateCache>,
         margin: Duration,
         idle_wait: Duration,
+        dialog: DialogConfig,
     ) -> Self {
         Self {
             home,
@@ -626,6 +785,8 @@ impl Queues {
             margin,
             idle_wait,
             satellites: Mutex::default(),
+            dialogs: Mutex::default(),
+            dialog,
         }
     }
 
@@ -635,9 +796,19 @@ impl Queues {
         Arc::clone(satellites.entry(satellite.to_owned()).or_default())
     }
 
+    /// The open dialogs.
+    fn dialogs(&self) -> MutexGuard<'_, Dialogs> {
+        self.dialogs.lock().expect("no lock holder panics")
+    }
+
+    /// The generation of `satellite`.
+    fn generation(&self, satellite: &str) -> u64 {
+        self.queue(satellite).generation.load(Ordering::SeqCst)
+    }
+
     /// True when the generation of `satellite` is `generation`.
     fn is_current(&self, satellite: &str, generation: u64) -> bool {
-        self.queue(satellite).generation.load(Ordering::SeqCst) == generation
+        self.generation(satellite) == generation
     }
 
     /// Increases the generation of `satellite` and returns it.
@@ -893,6 +1064,7 @@ mod tests {
             ("failure".to_owned(), pool(&[("Failed.", failure)])),
             ("filler".to_owned(), pool(&[("One moment.", 0)])),
             ("ask_area".to_owned(), pool(&[("Which room?", 0)])),
+            ("cancelled".to_owned(), pool(&[("Cancelled.", 0)])),
             (
                 "weather".to_owned(),
                 pool(&[("It is {{ response.sky }}.", 0)]),
@@ -1078,11 +1250,13 @@ mod tests {
     }
 
     /// Queues on `home` and the hot cache of the reference house, with the satellite in the
-    /// state `value`.
+    /// state `value` and the `[dialog]` of `jarvis.toml`.
     fn queues(home: &Arc<FakeHome>, value: &str) -> (watch::Sender<StateCache>, Queues) {
         let (cache, receiver) = watch::channel(StateCache::load(house()));
         set(&cache, value);
-        let queues = Queues::new(Arc::clone(home) as _, receiver, MARGIN, IDLE_WAIT);
+        let config = crate::Config::parse(include_str!("../../jarvis.toml")).expect("valid");
+        let home = Arc::clone(home) as _;
+        let queues = Queues::new(home, receiver, MARGIN, IDLE_WAIT, config.dialog);
         (cache, queues)
     }
 
@@ -1360,8 +1534,13 @@ mod tests {
 
     /// A classifier that gives `label` with 0.9, or fails without `label`.
     fn classifier(label: Option<&str>) -> Arc<FakeClassifier> {
+        scripted(label.as_slice())
+    }
+
+    /// A classifier that gives each of `labels` with 0.9 in order, then fails.
+    fn scripted(labels: &[&str]) -> Arc<FakeClassifier> {
         let classifier = Arc::new(FakeClassifier::default());
-        if let Some(label) = label {
+        for &label in labels {
             let ranked = vec![(label.to_owned(), 0.9)];
             classifier.script(Prediction {
                 ranked,
@@ -1484,12 +1663,18 @@ mod tests {
     ) -> anyhow::Result<(watch::Sender<StateCache>, Handled)> {
         let classifier = classifier(Some("lights_on"));
         let (cache, _changes, conversation) = still_with(home, value, classifier, Arc::default());
-        let context = Context {
+        let handled = conversation
+            .handle("turn on the lights", on_satellite())
+            .await?;
+        Ok((cache, handled))
+    }
+
+    /// The context of the satellite with no device.
+    fn on_satellite() -> Context {
+        Context {
             satellite_id: Some(SATELLITE.to_owned()),
             ..Context::default()
-        };
-        let handled = conversation.handle("turn on the lights", context).await?;
-        Ok((cache, handled))
+        }
     }
 
     /// The questions that `home` asked, in order.
@@ -1536,6 +1721,109 @@ mod tests {
         tokio::join!(after, idle).0?;
         assert_eq!(Instant::now() - start, busy_for + MARGIN);
         assert_eq!(asks(&home), ["Which room?"]);
+        Ok(())
+    }
+
+    /// The replies of a conversation on `home` and `reasoner` to each of `texts` from the satellite
+    /// with no device, when the classifier gives `labels` in order, and the conversation.
+    async fn talk(
+        home: &Arc<FakeHome>,
+        reasoner: Arc<FakeReasoner>,
+        texts: &[&str],
+        labels: &[&str],
+    ) -> anyhow::Result<(Vec<Handled>, Conversation)> {
+        let (_cache, _changes, conversation) = still_with(home, "idle", scripted(labels), reasoner);
+        let mut replies = Vec::new();
+        for text in texts {
+            replies.push(conversation.handle(text, on_satellite()).await?);
+        }
+        Ok((replies, conversation))
+    }
+
+    /// The open dialogs of `conversation`.
+    fn open_dialogs(conversation: &Conversation) -> BTreeMap<Key, Dialog> {
+        conversation.queues.dialogs().dialogs.clone()
+    }
+
+    /// AC-10.5-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_5_1_the_kitchen_fills_the_area() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let texts = ["turn on the lights", "the kitchen"];
+        let (mut replies, conversation) =
+            talk(&home, Arc::default(), &texts, &["lights_on"]).await?;
+        let after = replies.pop().and_then(|handled| handled.after);
+        after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
+        let lights = ["light.kitchen", "light.strawberry_lamp"];
+        let expected = ServiceCall {
+            target: lights.map(str::to_owned).to_vec(),
+            ..service("homeassistant", "turn_on", "")
+        };
+        assert_eq!(home.calls(), [expected]);
+        assert_eq!(open_dialogs(&conversation), BTreeMap::new());
+        Ok(())
+    }
+
+    /// AC-10.5-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_5_3_clear_new_request_replaces_the_dialog() -> anyhow::Result<()> {
+        let texts = ["turn on the lights", "turn on the fan"];
+        let labels = ["lights_on", "fan_on"];
+        let (_, conversation) = talk(&Arc::default(), Arc::default(), &texts, &labels).await?;
+        let dialog = &open_dialogs(&conversation)[&Key(SATELLITE.to_owned())];
+        let fan = matches!(&dialog.pending, Pending::Slot { intent, .. } if intent == "fan_on");
+        assert!(fan && dialog.turns == 1, "{dialog:?}");
+        Ok(())
+    }
+
+    /// AC-10.5-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_5_4_never_mind_cancels() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let texts = ["turn on the lights", "never mind"];
+        let (replies, conversation) = talk(&home, Arc::default(), &texts, &["lights_on"]).await?;
+        assert_eq!(replies[1].text, "Cancelled.");
+        assert!(replies[1].after.is_none(), "the cancel has work");
+        assert_eq!(home.calls(), []);
+        assert_eq!(open_dialogs(&conversation), BTreeMap::new());
+        Ok(())
+    }
+
+    /// AC-10.5-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_5_5_max_turns_of_unclear_answers_fail() -> anyhow::Result<()> {
+        let texts = ["turn on the lights", "zzz", "zzz", "zzz"];
+        let labels = ["lights_on", "unknown", "unknown", "unknown"];
+        let (replies, conversation) =
+            talk(&Arc::default(), Arc::default(), &texts, &labels).await?;
+        let texts: Vec<&str> = replies
+            .iter()
+            .map(|handled| handled.text.as_str())
+            .collect();
+        assert_eq!(texts, ["", "", "", "Failed."]);
+        assert_eq!(open_dialogs(&conversation), BTreeMap::new());
+        Ok(())
+    }
+
+    /// AC-10.5-7.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_5_7_llm_dialog_sends_the_answer_to_system_two() -> anyhow::Result<()> {
+        let reasoner = Arc::new(FakeReasoner::default());
+        let classifier = scripted(&["unknown"]);
+        let (_cache, _changes, conversation) =
+            still_with(&Arc::default(), "idle", classifier, Arc::clone(&reasoner));
+        let pending = Pending::Llm {
+            response_id: "response".to_owned(),
+            call_id: "call".to_owned(),
+        };
+        let key = Key(SATELLITE.to_owned());
+        conversation
+            .queues
+            .dialogs()
+            .open(key, pending, Timestamp::UNIX_EPOCH);
+        let after = conversation.handle("four", on_satellite()).await?.after;
+        after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
+        assert_eq!(reasoner.questions(), ["four"]);
         Ok(())
     }
 

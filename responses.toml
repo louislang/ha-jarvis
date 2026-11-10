@@ -99,3 +99,6 @@ responses = ["Sorry, I could not do that."]
 
 [pools.ask_area]
 responses = ["Which room?", "In which room?"]
+
+[pools.cancelled]
+responses = ["Okay, never mind.", "Cancelled."]
