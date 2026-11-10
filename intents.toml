@@ -161,7 +161,7 @@ select = [{ domain = "media_player", device_class = "speaker" }]
 [[intent]]
 name = "music_pause"
 kind = "command"
-examples = ["pause the music", "stop the music", "pause the music in the [kitchen](area)"]
+examples = ["pause the music", "stop the music", "pause the music in the [kitchen](area)", "stop the music [downstairs](area)", "pause the music on the [downstairs speakers](area)"]
 service = "media_player.media_pause"
 target = "entity"
 select = [{ domain = "media_player", device_class = "speaker" }]
@@ -169,7 +169,7 @@ select = [{ domain = "media_player", device_class = "speaker" }]
 [[intent]]
 name = "volume_up"
 kind = "command"
-examples = ["turn it up", "volume up", "turn up the music", "make the music louder"]
+examples = ["turn it up", "volume up", "turn up the music", "make the music louder", "turn up the music on the [downstairs speakers](area)"]
 service = "media_player.volume_up"
 target = "entity"
 select = [{ domain = "media_player", device_class = "speaker" }]

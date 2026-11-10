@@ -542,13 +542,43 @@ fn place<'a>(
         return Ok(Some(area));
     }
     let decision = match (intent.kind, select::group(intent, name, cache)) {
-        (Kind::Command, Some(group)) => serve(intent, &[group], slots, pools, rng),
+        (Kind::Command, Some(group)) => {
+            serve(intent, &aim(intent, group, cache), slots, pools, rng)
+        }
         _ => None,
     };
     match decision {
         Some(decision) => Err(Box::new(decision)),
         None => Err(ask(intent, prediction, request, cache, pools, rng)),
     }
+}
+
+/// The target of the command `intent` on the group player `group`: the group for a service in the
+/// domain `music_assistant`, else `select::played`.
+#[verus_spec(target =>
+    ensures
+        target@.len() > 0 && aimed_at(*intent, *cache, group, target@),
+)]
+fn aim(intent: &Intent, group: EntityId, cache: &StateCache) -> Vec<EntityId> {
+    let music = match &intent.service {
+        Some(service) => StateCache::in_domain(service.as_str(), "music_assistant"),
+        None => false,
+    };
+    if music {
+        proof_decl! {
+            let ghost wanted = group;
+        }
+        let target = vec![group];
+        proof! {
+            assert(target@ =~= seq![wanted]);
+        }
+        return target;
+    }
+    let target = select::played(&group, cache);
+    proof! {
+        assert(select::texts_of(target@).len() == target@.len());
+    }
+    target
 }
 
 /// The name and then the aliases of each area of `cache`.
@@ -1340,9 +1370,20 @@ pub open spec fn grouped(intent: Intent, cache: StateCache, text: Seq<char>, dec
     decision matches Decision::Reply { call: Some(made), .. }
         && intent.kind is Command
         && (intent.service matches Some(service) && served(service@, made))
-        && entity_ids(made.target@).len() == 1
-        && select::leading(intent, cache, text, entity_ids(made.target@)[0])
+        && made.target@.len() > 0
+        && exists|group: EntityId| #[trigger] select::leading(intent, cache, text, group)
+            && aimed_at(intent, cache, group, entity_ids(made.target@))
         && stringed(intent, made.data)
+}
+
+/// True when `target` is `group` for a service of `intent` in the domain `music_assistant`, else
+/// the target of a control on `group`.
+pub open spec fn aimed_at(intent: Intent, cache: StateCache, group: EntityId, target: Seq<EntityId>) -> bool {
+    if intent.service matches Some(service) && crate::domain::state_cache::in_domain(service@, "music_assistant"@) {
+        target == seq![group]
+    } else {
+        select::texts_of(target) == select::control_target(cache, group.0@)
+    }
 }
 
 /// True when `decision` asks for the area of `intent`, or is not a question and obeys `acted`.
@@ -2713,6 +2754,68 @@ mod tests {
         let slots = [("media", "jazz"), ("area", "downstairs speakers")];
         let decision = played_in("play_music", &slots, "kitchen", &cache);
         assert!(asks_area(&decision), "{decision:?}");
+    }
+
+    /// The other speaker of "Downstairs Speakers".
+    const LIVING_SPEAKER: &str = "media_player.carson_living_room";
+
+    /// The call of `label` with `slots` and the area slot "downstairs" when each of `playing` plays.
+    fn downstairs(label: &str, slots: &[(&str, &str)], playing: &[&str]) -> ServiceCall {
+        let mut snapshot = house();
+        for state in &mut snapshot.states {
+            if playing.contains(&state.entity_id.as_str()) {
+                "playing".clone_into(&mut state.state);
+            }
+        }
+        let mut slots = slots.to_vec();
+        slots.push(("area", "downstairs"));
+        let cache = StateCache::load(snapshot);
+        called(played_in(label, &slots, "kitchen", &cache))
+    }
+
+    /// AC-18.15b-1.
+    #[test]
+    fn ac_18_15b_1_pause_on_the_playing_group() {
+        let call = downstairs("music_pause", &[], &[DOWNSTAIRS]);
+        assert_eq!(call.service, "media_pause");
+        assert_eq!(call.target, [DOWNSTAIRS]);
+    }
+
+    /// AC-18.15b-2.
+    #[test]
+    fn ac_18_15b_2_pause_on_the_one_playing_member() {
+        let call = downstairs("music_pause", &[], &[KITCHEN_SPEAKER]);
+        assert_eq!(call.target, [KITCHEN_SPEAKER]);
+    }
+
+    /// AC-18.15b-3.
+    #[test]
+    fn ac_18_15b_3_pause_on_each_playing_member_in_order() {
+        let call = downstairs("music_pause", &[], &[LIVING_SPEAKER, KITCHEN_SPEAKER]);
+        assert_eq!(call.target, [KITCHEN_SPEAKER, LIVING_SPEAKER]);
+    }
+
+    /// AC-18.15b-4.
+    #[test]
+    fn ac_18_15b_4_pause_on_the_group_when_nothing_plays() {
+        let call = downstairs("music_pause", &[], &[]);
+        assert_eq!(call.target, [DOWNSTAIRS]);
+    }
+
+    /// AC-18.15b-5.
+    #[test]
+    fn ac_18_15b_5_volume_on_the_playing_member() {
+        let call = downstairs("volume_set", &[("volume", "50")], &[KITCHEN_SPEAKER]);
+        assert_eq!(call.service, "volume_set");
+        assert_eq!(call.target, [KITCHEN_SPEAKER]);
+        assert_eq!(call.data["volume_level"], Value::from(0.5));
+    }
+
+    /// AC-18.15b-6.
+    #[test]
+    fn ac_18_15b_6_play_keeps_the_whole_group() {
+        let call = downstairs("play_music", &[("media", "jazz")], &[KITCHEN_SPEAKER]);
+        assert_eq!(call.target, [DOWNSTAIRS]);
     }
 
     /// The `media_content_id` of the `label` call with `slots` from the Office satellite.
