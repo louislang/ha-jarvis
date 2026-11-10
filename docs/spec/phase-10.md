@@ -160,8 +160,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 **Goal:** Process each transcript against the open dialog of its satellite before it is treated as a new request. Answers fill slots, cancel phrases cancel, and a clear new request replaces the dialog.
 
 - **Implements:** G13. **Depends on:** 10.4.
-- **Files:** modify `src/app/conversation.rs`, `responses.toml`.
-- **Quint:** `dialog.qnt` (conformance of the jobs and generations).
+- **Files:** modify `src/app/conversation.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `responses.toml`.
 
 **Model.** For each transcript:
 
@@ -174,7 +173,13 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 
 A choice is a closed set, so step 2 comes before step 3. The answer to System Two is free text, so step 3 comes before step 4. Each `Slot` dialog asks for the area, so it has choices (sub-phase 10.4).
 
-`close` increases the generation of the key, as each new request on a satellite does (sub-phase 4.9c). A deferred job keeps the generation of its key when it starts. Before each announce, question or call, it compares the generation. When the generation changed, the job stops and makes no announce, no question and no further call. A call that already started is not undone. A job that asks increases the generation of its key and ends. The answer continues the request through the dialog.
+- `handle` takes the dialog of the key of the context (`Key`, sub-phase 10.2) before step 1. Steps 2 to 6 thus close it. Step 5 stores the dialog that `next_turn` gives.
+- The filled value replaces each slot with the name of the missing slot, so `decide` reads the filled area (sub-phase 10.4). The intent of the dialog gets the probability 1.
+- Until sub-phase 10.6, step 4 sends the text as a new System Two request.
+- Step 5 asks again from `ask_area` as sub-phase 10.4 asks, with the current generation of the satellite.
+- When `decide` gives `Ask`, `handle` opens a dialog with its `pending` for the key.
+- `start_app` gives the `[dialog]` configuration to the use case. `FakeReasoner` records the text of each question.
+- This sub-phase adds the pool `cancelled`.
 
 **Acceptance criteria.**
 
@@ -183,17 +188,44 @@ A choice is a closed set, so step 2 comes before step 3. The answer to System Tw
 - AC-10.5-4: When the user answers "never mind", Jarvis replies from `cancelled` and `FakeHome` records no call.
 - AC-10.5-5: When the user gives `max_turns` answers that do not fill the slot, Jarvis replies from `failure` and closes the dialog.
 - AC-10.5-7: When an `Llm` dialog is open and the answer has the top label `unknown`, `FakeReasoner` receives the answer.
-- AC-10.5-8: When the user cancels a dialog while its System Two job runs, `FakeHome` records no announce and no `ask` from that job.
-- AC-10.5-9: When `quint-connect` replays 100 traces of `dialog.qnt`, the calls that `FakeHome` records and the generations match the model after each step.
 
 **Proofs.**
 
-- P-10.5-9. Evidence: test. With P-10.1-2, it gives `NoCallAfterCancel` for the Rust code on the replayed traces.
-
 - P-10.5-4. Requires: `NoCallAfterCancel` (P-10.1-2). Argument: step 1 returns before any step that dispatches a call.
 - P-10.5-5. Requires: `TurnLimit`. Argument: step 5 uses `next_turn` (P-10.2-4).
-- P-10.5-8. Requires: P-10.2-6. Argument: the job compares its generation before each announce, question and call, and `close` changed it.
 - P-10.5-1, P-10.5-3, P-10.5-7. Evidence: test.
+
+---
+
+### 10.5b Dialog Generations
+
+**Goal:** Make a closed dialog stop the deferred jobs of its key, and check the jobs and the generations against `dialog.qnt`. A cancel then also stops the System Two job of the dialog.
+
+- **Implements:** G13, G19. **Depends on:** 10.5.
+- **Files:** modify `src/app/conversation.rs`.
+- **Quint:** `dialog.qnt` (conformance of the jobs and generations).
+
+**Model.**
+
+- `close` increases the generation of the key, as each new request on a satellite does (sub-phase 4.9c). A deferred job keeps the generation of its key when it starts. Before each announce, question or call, it compares the generation. When the generation changed, the job stops and makes no announce, no question and no further call. A call that already started is not undone. A job that asks increases the generation of its key and ends. The answer continues the request through the dialog.
+- The announce queues use the generations of `Dialogs` (sub-phase 10.2). A new request on a satellite closes the dialog of its key. Thus each key has one generation.
+- The conformance driver maps the model to `handle` on two satellites:
+  - `open(k)`: a request on `k` whose decision is `Ask`. Until sub-phase 10.6, `ask(r)` is the same request on the key of the job of `r`.
+  - `defer(k)`: a request with a confident label that is not in the catalog, so `decide` gives a System Two job.
+  - `jobAct(r)`: the job of `r` runs, and its answer has one call.
+  - `askAgain(k)`: an answer that fills nothing, with the top label `unknown`. `fill(k)`: the answer "kitchen". `cancel(k)`: the answer "never mind".
+  - `tick`: the clock advances 1 s. `dialog.timeout_s` is 3.
+  - Each call that `FakeHome` records in a step, other than an announce or a question, belongs to the request of that step.
+
+**Acceptance criteria.**
+
+- AC-10.5b-1: When the user cancels a dialog while its System Two job runs, `FakeHome` records no announce and no `ask` from that job.
+- AC-10.5b-2: When `quint-connect` replays 100 traces of `dialog.qnt`, the calls that `FakeHome` records and the generations match the model after each step.
+
+**Proofs.**
+
+- P-10.5b-1. Requires: P-10.2-6. Argument: the job compares its generation before each announce, question and call, and `close` changed it.
+- P-10.5b-2. Evidence: test. With P-10.1-2, it gives `NoCallAfterCancel` for the Rust code on the replayed traces.
 
 ---
 
@@ -201,10 +233,10 @@ A choice is a closed set, so step 2 comes before step 3. The answer to System Tw
 
 **Goal:** Add the `ask_user` tool and `Step::Ask`, so System Two can ask the user for missing data. The next turn sends the answer as the output of the `ask_user` call, with `previous_response_id`.
 
-- **Implements:** G7, G13. **Depends on:** 10.5.
+- **Implements:** G7, G13. **Depends on:** 10.5b.
 - **Files:** modify `src/ports.rs`, `src/adapters/openai.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`.
 
-**Model.** `Step::Ask { question, response_id, call_id }`. The consumer increases the generation of the key and ends the job (sub-phase 10.5). It puts the question in the announce queue (sub-phase 4.9b) with the new generation, so it asks when the satellite is idle after the filler. It opens a dialog with `Pending::Llm { response_id, call_id }`. An answer to that dialog sends a `Question` with `previous_response_id` and one `function_call_output` item with `call_id` and the answer text. Each request sets `parallel_tool_calls = false`, so one response has at most one open tool call. When the dialog times out or is cancelled, Jarvis sends nothing for the open call.
+**Model.** `Step::Ask { question, response_id, call_id }`. The consumer increases the generation of the key and ends the job (sub-phase 10.5b). It puts the question in the announce queue (sub-phase 4.9b) with the new generation, so it asks when the satellite is idle after the filler. It opens a dialog with `Pending::Llm { response_id, call_id }`. An answer to that dialog sends a `Question` with `previous_response_id` and one `function_call_output` item with `call_id` and the answer text. Each request sets `parallel_tool_calls = false`, so one response has at most one open tool call. When the dialog times out or is cancelled, Jarvis sends nothing for the open call.
 
 **Acceptance criteria.**
 
