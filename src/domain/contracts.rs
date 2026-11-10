@@ -39,6 +39,7 @@ use crate::domain::catalog::Filter;
 use crate::domain::catalog::Intent;
 use crate::domain::catalog::Kind;
 use crate::domain::catalog::Target;
+use crate::domain::decide::Artist;
 use crate::domain::decide::MediaItem;
 use crate::domain::decide::SearchResults;
 use crate::domain::dialog::Key;
@@ -181,6 +182,10 @@ pub struct ExSearchResults(SearchResults);
 /// One item of a Music Assistant search response.
 #[verifier::external_type_specification]
 pub struct ExMediaItem(MediaItem);
+
+/// One artist of a track in a Music Assistant search response.
+#[verifier::external_type_specification]
+pub struct ExArtist(Artist);
 
 /// The training set file.
 #[verifier::external_type_specification]

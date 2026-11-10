@@ -470,14 +470,14 @@ impl Conversation {
         (question, Some(ask.boxed()))
     }
 
-    /// Makes `call` after `resolve` with `search`. When it fails, logs the error, queues a
-    /// `failure` answer on the satellite of `request` with the generation of `request`, and
-    /// records its use.
+    /// Makes the calls of `resolve` of `call` with `search` in order. When one fails, makes no
+    /// more calls, logs the error, queues a `failure` answer on the satellite of `request` with
+    /// the generation of `request`, and records its use.
     fn after(&self, call: ServiceCall, search: bool, request: Option<(String, u64)>) -> Work {
         let conversation = self.clone();
         async move {
-            let call = conversation.resolve(call, search).await;
-            let Err(error) = conversation.queues.home.call(call).await else {
+            let calls = conversation.resolve(call, search).await;
+            let Err(error) = conversation.make(calls).await else {
                 return Ok(());
             };
             tracing::warn!("the call failed: {error:#}");
@@ -491,9 +491,17 @@ impl Conversation {
         .boxed()
     }
 
-    /// With `search`, `call` with the `uri` and the `media_type` of the best Music Assistant match
-    /// of its `media_id` in the config entry of its first target, else `call`. Logs a failed search.
-    async fn resolve(&self, mut call: ServiceCall, search: bool) -> ServiceCall {
+    /// Makes `calls` in order, up to the first that fails.
+    async fn make(&self, calls: Vec<ServiceCall>) -> anyhow::Result<()> {
+        for call in calls {
+            self.queues.home.call(call).await?;
+        }
+        Ok(())
+    }
+
+    /// With `search`, the `plays` of `call` for the items of `search` of its `media_id` in the
+    /// config entry of its first target, else `call`. Logs a failed search.
+    async fn resolve(&self, call: ServiceCall, search: bool) -> Vec<ServiceCall> {
         let name = call.data.get("media_id").and_then(Value::as_str);
         let entry = {
             let cache = self.queues.cache.borrow();
@@ -502,24 +510,20 @@ impl Conversation {
             found.and_then(|entity| entity.config_entry_id.clone())
         };
         let (true, Some(name), Some(entry)) = (search, name.map(str::to_owned), entry) else {
-            return call;
+            return vec![call];
         };
-        match self.search(&name, &entry).await {
-            Ok(Some(item)) => {
-                call.data.insert("media_id".to_owned(), item.uri.into());
-                call.data
-                    .insert("media_type".to_owned(), item.media_type.into());
-            }
-            Ok(None) => {}
-            Err(error) => tracing::warn!("the music search failed: {error:#}"),
-        }
-        call
+        let items = self.search(&name, &entry).await.unwrap_or_else(|error| {
+            tracing::warn!("the music search failed: {error:#}");
+            Vec::new()
+        });
+        plays(call, items)
     }
 
-    /// The best match of `name` in the library playlists of the Music Assistant config entry
-    /// `entry`, else in its artists, albums and tracks. An error when a search fails or its
+    /// The items to play for the best match of `name` in the library playlists of the Music
+    /// Assistant config entry `entry`, else in its artists, albums and tracks: the first track of
+    /// an artist match and then the match, or only the match. An error when a search fails or its
     /// response does not parse.
-    async fn search(&self, name: &str, entry: &str) -> anyhow::Result<Option<MediaItem>> {
+    async fn search(&self, name: &str, entry: &str) -> anyhow::Result<Vec<MediaItem>> {
         let library = serde_json::json!({ "config_entry_id": entry, "name": name,
             "media_type": ["playlist"], "library_only": true });
         let all = serde_json::json!({ "config_entry_id": entry, "name": name,
@@ -535,10 +539,10 @@ impl Conversation {
             let response = self.queues.home.call(call).await?.unwrap_or_default();
             let results: SearchResults = serde_json::from_value(response)?;
             if let Some(found) = decide::best_match(&results, name) {
-                return Ok(Some(found.clone()));
+                return Ok(items(&results, found));
             }
         }
-        Ok(None)
+        Ok(Vec::new())
     }
 
     /// Fetches `call` while `request` is the newest of its satellite. Queues its answer of `pool`,
@@ -887,6 +891,35 @@ fn kind(decision: &Decision) -> &'static str {
         Decision::Defer { .. } => "defer",
         Decision::Ask { .. } => "ask",
     }
+}
+
+/// The items to play for the match `found` in `results`: the first track of an artist match,
+/// if any, and then the match.
+fn items(results: &SearchResults, found: &MediaItem) -> Vec<MediaItem> {
+    let artist = found.media_type == "artist";
+    let track = artist.then(|| decide::first_track(results, &found.name));
+    let items = track.flatten().into_iter().chain([found]);
+    items.cloned().collect()
+}
+
+/// `call` for each of `items`, with its `uri` and `media_type`, and `enqueue = "add"` after the
+/// first. `call` when `items` is empty.
+fn plays(call: ServiceCall, items: Vec<MediaItem>) -> Vec<ServiceCall> {
+    if items.is_empty() {
+        return vec![call];
+    }
+    let played = items.into_iter().enumerate().map(|(index, item)| {
+        let mut played = call.clone();
+        played.data.insert("media_id".to_owned(), item.uri.into());
+        played
+            .data
+            .insert("media_type".to_owned(), item.media_type.into());
+        if index > 0 {
+            played.data.insert("enqueue".to_owned(), "add".into());
+        }
+        played
+    });
+    played.collect()
 }
 
 /// The announce queue of one satellite.
@@ -2715,6 +2748,53 @@ mod tests {
             let services: Vec<&str> = calls.iter().map(|call| call.service.as_str()).collect();
             assert_eq!(services, ["play_media"], "{label}");
         }
+        Ok(())
+    }
+
+    /// The calls after the searches of "play `media`", when the second search gives the artist
+    /// `artist` at `uri` and `track`.
+    async fn artist_played(
+        media: &str,
+        artist: &str,
+        uri: &str,
+        track: Value,
+    ) -> anyhow::Result<Vec<ServiceCall>> {
+        let home = Arc::new(FakeHome::default());
+        let artist = json!({ "media_type": "artist", "uri": uri, "name": artist });
+        home.respond_next(json!({ "playlists": [] }));
+        home.respond_next(json!({ "artists": [artist], "tracks": [track] }));
+        let (_, calls) = played(&home, "play_music", media, ENTRY).await?;
+        Ok(calls[2..].to_vec())
+    }
+
+    /// The track `name` at `uri` by the artist `artist`.
+    fn track(name: &str, uri: &str, artist: &str) -> Value {
+        let by = json!({ "media_type": "artist", "uri": "spotify--x7LaiKmM://artist/1", "name": artist });
+        json!({ "media_type": "track", "uri": uri, "name": name, "artists": [by] })
+    }
+
+    /// AC-18.14-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_14_1_artist_plays_its_track_then_queues_the_artist() -> anyhow::Result<()> {
+        let uri = "spotify--x7LaiKmM://track/63OQupATfueTdZMWTxW03A";
+        let karma_police = track("Karma Police", uri, "Radiohead");
+        let calls = artist_played("radiohead", "Radiohead", "library://artist/5", karma_police);
+        let track = json!({ "media_id": uri, "media_type": "track" });
+        let artist =
+            json!({ "media_id": "library://artist/5", "media_type": "artist", "enqueue": "add" });
+        let plays = [track, artist].map(|data| music("play_media", &[SPEAKER], data));
+        assert_eq!(calls.await?, plays);
+        Ok(())
+    }
+
+    /// AC-18.14-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_14_2_artist_without_its_track_plays_the_artist() -> anyhow::Result<()> {
+        let anthem = track("The National Anthem", "library://track/2", "Radiohead");
+        let uri = "library://artist/7";
+        let calls = artist_played("the national", "The National", uri, anthem).await?;
+        let artist = json!({ "media_id": uri, "media_type": "artist" });
+        assert_eq!(calls, [music("play_media", &[SPEAKER], artist)]);
         Ok(())
     }
 
