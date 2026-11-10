@@ -127,6 +127,7 @@ flowchart LR
     crate_app_plugins --> crate_domain_decide
     crate_app_plugins --> crate_domain_state
     crate_app_plugins --> crate_ports
+    crate_app_speech --> crate_app_conversation
     crate_app_speech --> crate_app_speech
     crate_app_speech --> crate_domain_catalog
     crate_app_speech --> crate_domain_intent

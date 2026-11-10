@@ -510,13 +510,14 @@ impl Assistant for App {
     }
 }
 
-/// The listener of `config` on `stt`, which predicts each partial with `classifier` and warms
-/// `reasoner`.
+/// The listener of `config` on `stt`, which predicts each partial with `classifier`, commits early
+/// for an answer to an open dialog of `queues` and warms `reasoner`.
 fn listener(
     config: &Config,
     stt: Arc<dyn SpeechToText>,
     classifier: Arc<dyn Classifier>,
     reasoner: Arc<dyn Reasoner>,
+    queues: &Arc<Queues>,
 ) -> Listener {
     let asr = &config.asr;
     let policy = CommitPolicy {
@@ -525,7 +526,8 @@ fn listener(
         max_utterance_ms: asr.max_utterance_ms,
     };
     let threshold = config.model.commit_threshold;
-    Listener::new(stt, classifier, reasoner, policy, threshold)
+    let (queues, clock) = (Arc::clone(queues), Arc::new(SystemClock));
+    Listener::new(stt, classifier, reasoner, policy, threshold, queues, clock)
 }
 
 /// The System One model of the conversation. A swap affects the next `predict`.
@@ -888,7 +890,8 @@ async fn start_app(
 ) -> anyhow::Result<(App, JoinHandle<()>, JoinHandle<()>)> {
     let task = start_pools(config, pools)?;
     let (cache, queues) = start_sync(home, config);
-    let (classifier, listener, speech) = load_models(config, Arc::clone(&reasoner)).await?;
+    let (classifier, listener, speech) =
+        load_models(config, Arc::clone(&reasoner), &queues).await?;
     let prerender = start_prerender(&speech, &task.pools, cache.clone());
     let catalog = Arc::new(catalog);
     let backfill = backfill(config, &reasoner, task.changes, &speech, &catalog, cache);
@@ -956,8 +959,8 @@ fn system_two(
 }
 
 /// The System One model of `config`, then the listener on the STT models of `config`, which
-/// predicts with that model and warms `reasoner`, and the speech use case on the TTS model of
-/// `config`. The STT and TTS models load on a blocking thread.
+/// predicts with that model, sees the dialogs of `queues` and warms `reasoner`, and the speech use
+/// case on the TTS model of `config`. The STT and TTS models load on a blocking thread.
 ///
 /// # Errors
 ///
@@ -965,6 +968,7 @@ fn system_two(
 async fn load_models(
     config: &Config,
     reasoner: Arc<dyn Reasoner>,
+    queues: &Arc<Queues>,
 ) -> anyhow::Result<(Arc<dyn Classifier>, Listener, Arc<Speech>)> {
     let dir = config.model.dir.join("fixture");
     let model = OnnxLoader.load(&dir, config.device).await?;
@@ -972,7 +976,8 @@ async fn load_models(
     let (asr, tts, device) = (config.asr.clone(), config.tts.clone(), config.device);
     let stt = tokio::task::spawn_blocking(move || SherpaStt::try_new(&asr, device)).await??;
     let tts = tokio::task::spawn_blocking(move || SupertonicTts::try_new(&tts, device)).await??;
-    let listener = listener(config, Arc::new(stt), Arc::clone(&classifier), reasoner);
+    let stt: Arc<dyn SpeechToText> = Arc::new(stt);
+    let listener = listener(config, stt, Arc::clone(&classifier), reasoner, queues);
     Ok((classifier, listener, Arc::new(Speech::new(Arc::new(tts)))))
 }
 
@@ -1667,8 +1672,8 @@ mod tests {
         let config = Config::parse(VALID)?;
         let catalog = load_catalog(&config.intents)?;
         let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
-        let reasoner = Arc::new(FakeReasoner::default());
-        let listener = listener(&config, stt, Arc::clone(&classifier), reasoner);
+        let (reasoner, queues) = (Arc::new(FakeReasoner::default()), queues(&config));
+        let listener = listener(&config, stt, Arc::clone(&classifier), reasoner, &queues);
         Ok(App {
             conversation: conversation(&config, catalog, classifier, &speech)?,
             listener,
