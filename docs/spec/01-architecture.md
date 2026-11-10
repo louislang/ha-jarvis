@@ -249,6 +249,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | File | Layer | Responsibility | Created in |
 |---|---|---|---|
 | `CLAUDE.md` | — | Working rules for code changes. | — |
+| `README.md` | — | Project overview, a table of the current capabilities and a quickstart. Each PR that adds or changes a capability or a setup step updates it. | — |
 | `docs/spec/*.md` | — | This specification. | — |
 | `docs/architecture.md` | — | The full architecture diagram. The pre-commit hook of the PR author writes it (sub-phase 0.11). | 0.9 |
 | `.gitignore` | — | Ignore `target/`, `models/`, `.venv/`, `jarvis.local.toml`, the data files, and the Python caches and coverage data (`__pycache__/`, `train/.coverage`). | 0.1 |
