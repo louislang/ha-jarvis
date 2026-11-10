@@ -623,11 +623,12 @@ impl Conversation {
 
     /// Asks `question` of System Two in `thread` and opens its dialog, which waits for `pending`.
     /// With a request that is still the newest of its satellite, puts it in the queue of the
-    /// satellite with a new generation. Without a request, adds it to `sentences`.
+    /// satellite with a new generation, and announces a `failure` answer with that generation when
+    /// the question fails. Without a request, adds it to `sentences`.
     ///
     /// # Errors
     ///
-    /// The question fails.
+    /// The `failure` announce fails.
     async fn asked(
         &self,
         question: String,
@@ -647,9 +648,12 @@ impl Conversation {
             return Ok(());
         };
         let speak = self.queues.home.ask(satellite, &question);
-        self.queues
-            .queued(satellite, generation, &question, speak)
-            .await
+        let queues = &self.queues;
+        let Err(error) = queues.queued(satellite, generation, &question, speak).await else {
+            return Ok(());
+        };
+        let text = self.or_failure(Err(error));
+        queues.announce(satellite, generation, &text).await
     }
 
     /// Announces `sentence` on the satellite of `request`, or adds it to `sentences` with no
@@ -1976,6 +1980,26 @@ mod tests {
         assert_eq!(asks(&home), ["How many people?"]);
         let dialog = &open_dialogs(&conversation)[&Key(SATELLITE.to_owned())];
         assert!(matches!(dialog.pending, Pending::Llm { .. }), "{dialog:?}");
+        Ok(())
+    }
+
+    /// A System Two question that fails gives a `failure` announce with the new generation.
+    #[tokio::test(start_paused = true)]
+    async fn failed_question_announces_failure() -> anyhow::Result<()> {
+        let (home, reasoner) = (
+            Arc::new(FakeHome::default()),
+            Arc::new(FakeReasoner::default()),
+        );
+        reasoner.script(vec![Scripted::Ask("How many people?")]);
+        let classifier = scripted(&["unknown"]);
+        let (_cache, _changes, conversation) = still_with(&home, "idle", classifier, reasoner);
+        let handled = conversation.handle("plan dinner", on_satellite()).await?;
+        drop(home.delay());
+        handled
+            .after
+            .ok_or_else(|| anyhow::anyhow!("no after"))?
+            .await?;
+        assert_eq!(announces(&home), ["Failed."]);
         Ok(())
     }
 

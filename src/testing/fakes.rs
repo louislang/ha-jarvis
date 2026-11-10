@@ -239,7 +239,7 @@ impl Home for FakeHome {
             data: serde_json::from_value(data)?,
             return_response: false,
         });
-        Ok(())
+        self.wait().await
     }
 }
 
