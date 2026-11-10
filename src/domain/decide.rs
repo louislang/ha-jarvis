@@ -434,7 +434,7 @@ type Situated<'a> = (Option<&'a AreaId>, Map<String, Value>);
         match found {
             Ok((Some(area), _)) => located(*prediction, *request, *cache, *area),
             Ok((None, _)) => unslotted(prediction.slots@) && request.area is None,
-            Err(decision) => deferred(*decision, request.transcript) || asked(*intent, *cache, *decision),
+            Err(decision) => deferred(*decision, request.transcript) || asked(*intent, *request, *cache, *decision),
         },
 )]
 fn situation<'a>(
@@ -451,41 +451,43 @@ fn situation<'a>(
     let area = match area_slot(&prediction.slots) {
         Some(slot) => match cache.area_by_name(prediction.slots[slot].value.as_str()) {
             Some(area) => Some(area),
-            None => return Err(Box::new(ask(intent, prediction, cache, pools, rng))),
+            None => return Err(ask(intent, prediction, request, cache, pools, rng)),
         },
         None => request.area.as_ref(),
     };
     if area.is_none() && matches!((intent.kind, &intent.service), (Kind::Command, Some(_))) {
-        return Err(Box::new(ask(intent, prediction, cache, pools, rng)));
+        return Err(ask(intent, prediction, request, cache, pools, rng));
     }
     Ok((area, context(slots, area, cache)))
 }
 
-/// The question from `ask_area` for the area of `intent`, with the slots of `prediction`, and the
-/// name and the aliases of each area of `cache` as the choices.
+/// The question from `ask_area` for the area of `intent`, with the slots of `prediction`, the name
+/// and the aliases of each area of `cache` as the choices, and the transcript of `request`.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key("ask_area"@)),
         responses::filled(pools@),
     ensures
-        asked(*intent, *cache, decision),
+        asked(*intent, *request, *cache, *decision),
 )]
 fn ask(
     intent: &Intent,
     prediction: &Prediction,
+    request: &Request,
     cache: &StateCache,
     pools: &Pools,
     rng: &mut StdRng,
-) -> Decision {
-    Decision::Ask {
+) -> Box<Decision> {
+    Box::new(Decision::Ask {
         question: choose(pools, "ask_area", rng),
         pending: Pending::Slot {
             intent: intent.name.clone(),
             slots: prediction.slots.clone(),
             missing: "area".to_owned(),
             choices: area_choices(cache),
+            transcript: request.transcript.clone(),
         },
-    }
+    })
 }
 
 /// The name and then the aliases of each area of `cache`.
@@ -1201,15 +1203,15 @@ pub open spec fn acted(intent: Intent, prediction: Prediction, request: Request,
 
 /// True when `decision` asks for the area of `intent`, or is not a question and obeys `acted`.
 pub open spec fn placed(intent: Intent, prediction: Prediction, request: Request, cache: StateCache, decision: Decision) -> bool {
-    if decision is Ask { asked(intent, cache, decision) } else { acted(intent, prediction, request, cache, decision) }
+    if decision is Ask { asked(intent, request, cache, decision) } else { acted(intent, prediction, request, cache, decision) }
 }
 
 /// True when `decision` asks from `ask_area` for the area of `intent`, with the name and the
-/// aliases of each area of `cache` as the choices.
-pub open spec fn asked(intent: Intent, cache: StateCache, decision: Decision) -> bool {
-    decision matches Decision::Ask { question, pending: Pending::Slot { intent: name, missing, choices, .. } }
+/// aliases of each area of `cache` as the choices and the transcript of `request`.
+pub open spec fn asked(intent: Intent, request: Request, cache: StateCache, decision: Decision) -> bool {
+    decision matches Decision::Ask { question, pending: Pending::Slot { intent: name, missing, choices, transcript, .. } }
         && question.pool@ == "ask_area"@ && name@ == intent.name@ && missing@ == "area"@
-        && choices@ == offered(cache.areas@)
+        && choices@ == offered(cache.areas@) && transcript@ == request.transcript@
 }
 
 /// The name and then the aliases of each area of `areas`, in order.
@@ -1733,8 +1735,29 @@ mod tests {
             slots,
             missing: "area".to_owned(),
             choices: names.collect(),
+            transcript: String::new(),
         };
         Decision::Ask { question, pending }
+    }
+
+    /// AC-10.5c-1.
+    #[test]
+    fn ac_10_5c_1_ask_keeps_the_transcript() {
+        let request = Request {
+            transcript: "turn on the lights".to_owned(),
+            area: None,
+            now: Timestamp::UNIX_EPOCH,
+        };
+        let cache = StateCache::load(house());
+        let decision = decided_for(&catalog(), ("lights_on", 0.89), &[], &request, &cache);
+        let Decision::Ask {
+            pending: Pending::Slot { transcript, .. },
+            ..
+        } = decision
+        else {
+            panic!("lights_on without an area asks, got {decision:?}");
+        };
+        assert_eq!(transcript, "turn on the lights");
     }
 
     /// AC-10.4-1.

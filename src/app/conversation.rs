@@ -147,15 +147,15 @@ impl Conversation {
         );
         let take = |key: Key| Some((self.queues.dialogs().take(&key, now, timeout)?, key));
         let open = key.clone().map(Key).and_then(take);
-        let prediction = match self
+        let (prediction, transcript) = match self
             .route(text, open, name.as_deref(), satellite, now)
             .await?
         {
-            ControlFlow::Continue(prediction) => prediction,
+            ControlFlow::Continue(routed) => routed,
             ControlFlow::Break(handled) => return Ok(handled),
         };
         let request = Request {
-            transcript: text.to_owned(),
+            transcript,
             area,
             now,
         };
@@ -190,9 +190,9 @@ impl Conversation {
     }
 
     /// The reply to `text` as an answer to the `open` dialog and its key on `satellite` at `now`: a
-    /// `cancelled` reply that closes it, or a question again. Else the prediction to decide: the
-    /// filled intent of a `Slot` dialog, or the System One prediction of `text` in the area
-    /// `name`.
+    /// `cancelled` reply that closes it, or a question again. Else the prediction to decide and its
+    /// transcript: the filled intent of a `Slot` dialog, or the System One prediction of `text` in
+    /// the area `name`.
     ///
     /// # Errors
     ///
@@ -204,19 +204,22 @@ impl Conversation {
         name: Option<&str>,
         satellite: Option<&str>,
         now: Timestamp,
-    ) -> anyhow::Result<ControlFlow<Handled, Prediction>> {
+    ) -> anyhow::Result<ControlFlow<Handled, (Prediction, String)>> {
         let Some((dialog, key)) = open else {
-            return Ok(ControlFlow::Continue(self.predict(name, text).await?));
+            return Ok(ControlFlow::Continue((
+                self.predict(name, text).await?,
+                text.to_owned(),
+            )));
         };
         if dialog::is_cancel(text, &self.queues.dialog.cancel) {
             return Ok(ControlFlow::Break(self.cancel(key)));
         }
-        if let Some(prediction) = self.filled(&dialog, text) {
-            return Ok(ControlFlow::Continue(prediction));
+        if let Some(filled) = self.filled(&dialog, text) {
+            return Ok(ControlFlow::Continue(filled));
         }
         let prediction = self.predict(name, text).await?;
         if self.is_clear(&prediction) || matches!(dialog.pending, Pending::Llm { .. }) {
-            return Ok(ControlFlow::Continue(prediction));
+            return Ok(ControlFlow::Continue((prediction, text.to_owned())));
         }
         let asked = self.ask_again(dialog, key, satellite, now);
         Ok(ControlFlow::Break(asked))
@@ -253,28 +256,32 @@ impl Conversation {
     }
 
     /// The intent of the `Slot` dialog `dialog` with probability 1 and the value that `text` fills
-    /// in place of the missing slot, or `None` when the dialog has no choices or no choice fits.
-    fn filled(&self, dialog: &Dialog, text: &str) -> Option<Prediction> {
+    /// in place of the missing slot, and the transcript of the dialog with "in" and the value. `None`
+    /// when the dialog has no choices or no choice fits.
+    fn filled(&self, dialog: &Dialog, text: &str) -> Option<(Prediction, String)> {
         let Pending::Slot {
             intent,
             slots,
             missing,
             choices,
+            transcript,
         } = &dialog.pending
         else {
             return None;
         };
         let similarity = self.queues.dialog.choice_similarity;
         let value = dialog::fill(text, choices, similarity).filter(|_| !choices.is_empty())?;
+        let transcript = format!("{transcript} in {value}");
         let kept = slots.iter().filter(|slot| &slot.name != missing).cloned();
         let filled = Slot {
             name: missing.clone(),
             value,
         };
-        Some(Prediction {
+        let prediction = Prediction {
             ranked: vec![(intent.clone(), 1.0)],
             slots: kept.chain([filled]).collect(),
-        })
+        };
+        Some((prediction, transcript))
     }
 
     /// `dialog` of `key` with one more question from `ask_area` on `satellite` at `now`, in its
@@ -1759,6 +1766,19 @@ mod tests {
         };
         assert_eq!(home.calls(), [expected]);
         assert_eq!(open_dialogs(&conversation), BTreeMap::new());
+        Ok(())
+    }
+
+    /// AC-10.5c-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_10_5c_2_filled_system_two_job_has_the_request_and_area() -> anyhow::Result<()> {
+        let reasoner = Arc::new(FakeReasoner::default());
+        let texts = ["turn on the fan", "kitchen"];
+        let (mut replies, _) =
+            talk(&Arc::default(), Arc::clone(&reasoner), &texts, &["fan_on"]).await?;
+        let after = replies.pop().and_then(|handled| handled.after);
+        after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
+        assert_eq!(reasoner.questions(), ["turn on the fan in Kitchen"]);
         Ok(())
     }
 
