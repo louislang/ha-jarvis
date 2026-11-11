@@ -50,6 +50,7 @@ use crate::adapters::sherpa::SherpaStt;
 use crate::adapters::supertonic::SupertonicTts;
 use crate::app::background::Backfill;
 use crate::app::background::Habits;
+use crate::app::background::HabitsTask;
 use crate::app::conversation::Change;
 use crate::app::conversation::Conversation;
 use crate::app::conversation::PoolsTask;
@@ -81,6 +82,7 @@ use crate::ports::ModelLoader;
 use crate::ports::Plugin;
 use crate::ports::Reasoner;
 use crate::ports::SpeechToText;
+use crate::ports::Store;
 
 /// Pure rules.
 pub mod domain {
@@ -241,7 +243,7 @@ impl Config {
     }
 
     /// The name and the value of each timeout and interval.
-    fn durations(&self) -> [(&'static str, u64); 14] {
+    fn durations(&self) -> [(&'static str, u64); 15] {
         let (ha, asr, openai) = (&self.ha, &self.asr, &self.openai);
         [
             ("ha.request_timeout_ms", ha.request_timeout_ms),
@@ -258,6 +260,7 @@ impl Config {
             ("announce.margin_ms", self.announce.margin_ms),
             ("announce.idle_wait_s", self.announce.idle_wait_s),
             ("dialog.timeout_s", self.dialog.timeout_s),
+            ("habits.save_interval_s", self.habits.save_interval_s),
         ]
     }
 
@@ -516,10 +519,14 @@ pub struct DialogConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct HabitsConfig {
+    /// The saved request habit model.
+    pub file: PathBuf,
     /// The days in which a request habit score halves.
     pub half_life_days: f64,
     /// The lowest decayed score of a usual time.
     pub min_score: f64,
+    /// The time between two saves of the model.
+    pub save_interval_s: u64,
 }
 
 /// The `[train]` section.
@@ -831,32 +838,36 @@ where
     let home = start_home(&config.ha, &secrets.ha_token, startup.connector)?;
     let mut shutdown = pin::pin!(startup.shutdown);
     // The models can load for a long time, so a shutdown stops the start too.
-    let (app, pools_task, _) = tokio::select! {
+    let (app, stores, _) = tokio::select! {
         started = start_live_app(&config, &secrets, catalog, pools, home) => started?,
         () = &mut shutdown => return Ok(()),
     };
-    serve_until(config.listen, app, pools_task, shutdown).await
+    serve_until(config.listen, app, stores, shutdown).await
 }
 
 /// Serves `app` on `listen` until `shutdown` completes. Then waits up to [`SHUTDOWN_WAIT`] for
-/// the connection tasks, the work after their replies and `pools_task`.
+/// the connection tasks, the work after their replies, the pools task and the last save of the
+/// habit task of `stores`.
 ///
 /// # Errors
 ///
-/// The server cannot bind or accept, or the pools task panicked.
+/// The server cannot bind or accept, or the pools task or the habit task panicked.
 async fn serve_until(
     listen: SocketAddr,
     app: App,
-    pools_task: JoinHandle<()>,
+    stores: (JoinHandle<()>, HabitsTask),
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     let (listener, tracker) = (TcpListener::bind(listen).await?, TaskTracker::new());
     adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await?;
     tracker.close();
+    let (pools_task, habits) = stores;
     // The pools task saves each change. It ends when the tracked tasks drop the last sender.
     let saved = async {
         tracker.wait().await;
-        pools_task.await
+        drop(habits.stop);
+        let habits_ended = habits.task.await;
+        pools_task.await.and(habits_ended)
     };
     let Ok(ended) = tokio::time::timeout(SHUTDOWN_WAIT, saved).await else {
         tracing::warn!("tasks still run after {SHUTDOWN_WAIT:?}");
@@ -898,22 +909,26 @@ where
 
 /// The app of `config`, `catalog` and the source pools `pools` on `home`, the plugin registry of
 /// `config` and the reasoner of `config` with the tools of that registry and the `OpenAI` API key
-/// of `secrets`. Gives the app, its pools task and its pre-render task.
+/// of `secrets`. Gives the app, its pools task and habit task, and its pre-render task.
 ///
 /// # Errors
 ///
-/// An HTTP client cannot be built, or the saved pools or a model cannot load.
+/// An HTTP client cannot be built, or the saved pools, the habits or a model cannot load.
 async fn start_live_app(
     config: &Config,
     secrets: &Secrets,
     catalog: Catalog,
     pools: Pools,
     home: Arc<dyn Home>,
-) -> anyhow::Result<(App, JoinHandle<()>, JoinHandle<()>)> {
+) -> anyhow::Result<(App, (JoinHandle<()>, HabitsTask), JoinHandle<()>)> {
     let plugins = registry(config, plugins(config, secrets)?);
     let tools = plugins.tools();
-    let reasoner = OpenAiReasoner::try_new(&config.openai, &secrets.openai_key, tools)?;
-    start_app(config, catalog, pools, home, Arc::new(reasoner), plugins).await
+    let reasoner = Arc::new(OpenAiReasoner::try_new(
+        &config.openai,
+        &secrets.openai_key,
+        tools,
+    )?);
+    start_app(config, Arc::new(catalog), pools, home, reasoner, plugins).await
 }
 
 /// The plugins of `config`: the Open-Meteo weather plugin, and the Plex plugin with the token of
@@ -941,28 +956,26 @@ fn registry(config: &Config, plugins: Vec<Arc<dyn Plugin>>) -> Arc<Plugins> {
 }
 
 /// The app of `config`, `catalog` and the source pools `pools` on `home`, `reasoner` and the
-/// plugin registry `plugins`, its pools task and its pre-render task. Starts the pools task and
-/// the sync, and loads the System One model, then the STT and TTS models. Then starts the
-/// pre-render.
+/// plugin registry `plugins`, its pools task and habit task, and its pre-render task. Starts the
+/// sync, the pools task and the habit task, and loads the System One model, then the STT and TTS
+/// models. Then starts the pre-render.
 ///
 /// # Errors
 ///
-/// The saved pools or a model cannot load.
+/// The saved pools, the habits or a model cannot load.
 async fn start_app(
     config: &Config,
-    catalog: Catalog,
+    catalog: Arc<Catalog>,
     pools: Pools,
     home: Arc<dyn Home>,
     reasoner: Arc<dyn Reasoner>,
     plugins: Arc<Plugins>,
-) -> anyhow::Result<(App, JoinHandle<()>, JoinHandle<()>)> {
-    let task = start_pools(config, pools)?;
+) -> anyhow::Result<(App, (JoinHandle<()>, HabitsTask), JoinHandle<()>)> {
     let (cache, queues) = start_sync(home, config);
+    let (task, habits) = start_stores(config, pools, &cache)?;
     let (classifier, listener, speech) =
         load_models(config, Arc::clone(&reasoner), &queues).await?;
     let prerender = start_prerender(&speech, &task.pools, &cache);
-    let catalog = Arc::new(catalog);
-    let habits = habits(config, &cache);
     let backfill = backfill(config, &reasoner, task.changes, &speech, &catalog, cache);
     let app = App {
         conversation: Conversation::new(
@@ -973,32 +986,36 @@ async fn start_app(
             catalog,
             config.model.threshold,
             system_two(config, reasoner, plugins),
-            habits,
+            Arc::clone(&habits.habits),
         ),
         listener,
         speech,
     };
-    Ok((app, task.task, prerender))
+    Ok((app, (task.task, habits), prerender))
 }
 
-/// Starts the pools task of the source pools `pools` and the saved pools of `config`.
+/// Starts the pools task of the source pools `pools` and the saved pools of `config`, and the
+/// habit task of the saved habits of `config`, or of empty habits without the habit file, in the
+/// HA time zone of `cache` with the system time.
 ///
 /// # Errors
 ///
-/// The saved pools cannot load.
-fn start_pools(config: &Config, pools: Pools) -> anyhow::Result<PoolsTask> {
-    let store = Arc::new(FileStore::try_new(config.pools.clone())?);
-    app::conversation::start_pools(pools, store)
-}
-
-/// Empty request habits with the half-life of `config`, in the HA time zone of `cache`.
-fn habits(config: &Config, cache: &watch::Receiver<StateCache>) -> Arc<Habits> {
+/// The saved pools or the habit file cannot load.
+fn start_stores(
+    config: &Config,
+    pools: Pools,
+    cache: &watch::Receiver<StateCache>,
+) -> anyhow::Result<(PoolsTask, HabitsTask)> {
+    let pools_store = Arc::new(FileStore::try_new(config.pools.clone())?);
+    let task = app::conversation::start_pools(pools, pools_store)?;
+    let store = Arc::new(FileStore::try_new(config.habits.file.clone())?);
+    let saved: Option<RequestHabits> = store.load()?;
     let half_life_days = config.habits.half_life_days;
-    Arc::new(Habits::new(
-        RequestHabits::default(),
-        half_life_days,
-        cache.clone(),
-    ))
+    let habits = Habits::new(saved.unwrap_or_default(), half_life_days, cache.clone());
+    let interval = Duration::from_secs(config.habits.save_interval_s);
+    let clock = Arc::new(SystemClock);
+    let habits = app::background::start_habits(Arc::new(habits), store, clock, interval);
+    Ok((task, habits))
 }
 
 /// The backfill of `config` with `reasoner`, the pools task of `changes`, the pre-render of
@@ -1187,6 +1204,8 @@ mod tests {
 
     use crate::adapters::onnx::OnnxLoader;
     use crate::app::conversation::Queues;
+    use crate::domain::habits::Bucket;
+    use crate::domain::habits::DayType;
     use crate::domain::responses::Pool;
     use crate::domain::responses::Pools;
     use crate::domain::responses::Response;
@@ -1312,6 +1331,16 @@ mod tests {
         }
     }
 
+    /// The `[habits]` section of `jarvis.toml`.
+    fn expected_habits() -> HabitsConfig {
+        HabitsConfig {
+            file: PathBuf::from("habits.json"),
+            half_life_days: 14.0,
+            min_score: 2.0,
+            save_interval_s: 300,
+        }
+    }
+
     /// AC-1.1-1.
     #[test]
     fn ac_1_1_1_parse_returns_each_value() -> anyhow::Result<()> {
@@ -1352,10 +1381,7 @@ mod tests {
                 idle_wait_s: 30,
             },
             dialog: expected_dialog(),
-            habits: HabitsConfig {
-                half_life_days: 14.0,
-                min_score: 2.0,
-            },
+            habits: expected_habits(),
             train: TrainConfig {
                 base_model: "sentence-transformers/all-MiniLM-L12-v2".to_owned(),
                 epochs: 8,
@@ -1451,6 +1477,7 @@ mod tests {
             ("announce.margin_ms", 300),
             ("announce.idle_wait_s", 30),
             ("habits.half_life_days", 14),
+            ("habits.save_interval_s", 300),
             ("train.epochs", 8),
             ("train.batch_size", 8),
         ];
@@ -1776,7 +1803,7 @@ mod tests {
     ) -> anyhow::Result<Conversation> {
         let task = app::conversation::start_pools(pools(&catalog), Arc::new(FakeStore::new(None)))?;
         let (catalog, cache) = (Arc::new(catalog), watch::channel(StateCache::default()).1);
-        let habits = habits(config, &cache);
+        let habits = Habits::new(RequestHabits::default(), 14.0, cache.clone());
         let reasoner: Arc<dyn Reasoner> = Arc::new(FakeReasoner::default());
         let backfill = backfill(config, &reasoner, task.changes, speech, &catalog, cache);
         let (queues, threshold) = (queues(config), config.model.threshold);
@@ -1788,7 +1815,7 @@ mod tests {
             catalog,
             threshold,
             two(config),
-            habits,
+            Arc::new(habits),
         ))
     }
 
@@ -1955,10 +1982,42 @@ mod tests {
         Ok(format!("{error:#}"))
     }
 
-    /// `VALID` with the file `pools.json` in `folder`.
-    fn with_pools_in(folder: &Path) -> String {
-        let pools = folder.join("pools.json");
-        VALID.replace("\"pools.json\"", &format!("\"{}\"", pools.display()))
+    /// `VALID` with the files `pools.json` and `habits.json` in `folder`.
+    fn with_stores_in(folder: &Path) -> String {
+        let in_folder = |file: &str| format!("\"{}\"", folder.join(file).display());
+        let text = VALID.replace("\"pools.json\"", &in_folder("pools.json"));
+        text.replace("\"habits.json\"", &in_folder("habits.json"))
+    }
+
+    /// A model with `get_traffic` at 08:10 on Monday, Tuesday and Wednesday in the HA time zone of
+    /// the reference house, and the date of that Wednesday.
+    fn three_mornings() -> (RequestHabits, jiff::civil::Date) {
+        let zone = jiff::tz::TimeZone::get("America/Chicago").expect("a time zone");
+        let monday: Timestamp = "2026-01-05T08:10:00-06:00".parse().expect("a time");
+        let days = [0, 1, 2].map(|day| monday + jiff::SignedDuration::from_hours(24 * day));
+        let mut model = RequestHabits::default();
+        for time in days {
+            model = model.observe("get_traffic".to_owned(), time, &zone, 14.0);
+        }
+        (model, zone.to_datetime(days[2]).date())
+    }
+
+    /// AC-11.4b-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_11_4b_3_stored_model_gives_its_usual_times() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let config = Config::parse(&with_stores_in(folder.path()))?;
+        let (model, wednesday) = three_mornings();
+        FileStore::try_new(config.habits.file.clone())?.save(&model)?;
+        let cache = watch::channel(StateCache::default()).1;
+        let (_, task) = start_stores(&config, Pools::new(), &cache)?;
+        let usual = |saved: RequestHabits| saved.usual_times("get_traffic", wednesday, 14.0, 2.0);
+        let bucket = Bucket {
+            day: DayType::Weekdays,
+            hour: 8,
+        };
+        assert_eq!(task.habits.current().map(usual), Some(vec![bucket]));
+        Ok(())
     }
 
     /// AC-5.4-1.
@@ -1980,7 +2039,7 @@ mod tests {
     async fn ac_5_4_3_missing_model_folder_is_named() -> anyhow::Result<()> {
         let folder = tempfile::tempdir()?;
         let models = folder.path().join("models");
-        let text = with_pools_in(folder.path()).replace("\"cuda\"", "\"cpu\"");
+        let text = with_stores_in(folder.path()).replace("\"cuda\"", "\"cpu\"");
         let text = text.replace("models/system-one", &models.display().to_string());
         let error = run_error(&text).await?;
         let fixture = models.join("fixture").display().to_string();
@@ -2039,7 +2098,7 @@ mod tests {
         fs::write(&responses, text)?;
         let path = format!("\"{}\"", responses.display());
         let error =
-            run_error(&with_pools_in(folder.path()).replace("\"responses.toml\"", &path)).await?;
+            run_error(&with_stores_in(folder.path()).replace("\"responses.toml\"", &path)).await?;
         assert!(error.contains("lights_on"), "no pool: {error}");
         Ok(())
     }
@@ -2064,7 +2123,7 @@ mod tests {
     /// address. It names the int8 files and no second pass, as on a CPU machine.
     fn listening_config(folder: &Path) -> anyhow::Result<(PathBuf, SocketAddr)> {
         let address = free_address();
-        let text = with_pools_in(folder).replace("\"cuda\"", "\"cpu\"");
+        let text = with_stores_in(folder).replace("\"cuda\"", "\"cpu\"");
         let text = text.replace(".fp16.", ".int8.");
         let text = text.replace("second_pass_dir =", "# second_pass_dir =");
         let text = text.replace("0.0.0.0:10700", &address.to_string());

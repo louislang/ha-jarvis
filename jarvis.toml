@@ -76,8 +76,10 @@ choice_similarity = 0.85
 cancel = ["never mind", "cancel", "forget it", "stop"]
 
 [habits]
+file = "habits.json"
 half_life_days = 14
 min_score = 2.0 # three days within 14 days (decision 10)
+save_interval_s = 300
 
 [train]
 base_model = "sentence-transformers/all-MiniLM-L12-v2"
