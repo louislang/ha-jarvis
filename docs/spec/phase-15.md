@@ -8,7 +8,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Goal:** Find each person's trackers and each satellite's presence sensors from the HA registries, with optional overrides in `jarvis.toml`. Speaker identification needs no manual entity list.
 
-- **Implements:** G12. **Depends on:** 14.11.
+- **Implements:** G12. **Depends on:** 14.13.
 - **Files:** create `src/domain/speaker.rs`. Modify `src/domain/state.rs`, `src/domain/state_cache.rs`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.**

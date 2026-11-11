@@ -58,6 +58,7 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 - Use pure functions where possible. All domain functions are pure.
 - Each port has exactly one production adapter. The only exceptions are `Trainer` (local process and RunPod fallback) and `Plugin` (one adapter for each remote API). Port fakes are in `src/testing/fakes.rs` only. A fake server that only one adapter's tests use (for example `FakeHaServer`) is in the test block of that adapter.
 - The same code runs on the GPU and the CPU. `device` in `jarvis.toml` selects it. No separate GPU and CPU code paths.
+- A new plugin uses a free data source without an API key when one exists. Use a source with a key only after the user agrees. The PR then names the environment variable and the sign-up page. Each new fetch intent sets `fresh_min`.
 
 ## Comments and Text
 
