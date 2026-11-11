@@ -235,58 +235,22 @@ fn byte_offset(text: &str, count: usize) -> usize {
     byte
 }
 
-/// Segment A of the model input: the area and the habit lines, or `none` for each that is absent.
+/// Segment A of the model input: the area, or `none` when it is absent.
 #[verus_spec(context =>
     ensures
-        context@ == context_spec(shown(area), habit_lines@),
+        context@ == context_spec(shown(area)),
 )]
 #[must_use]
-pub fn context_text(area: Option<&str>, habit_lines: &[String]) -> String {
+pub fn context_text(area: Option<&str>) -> String {
     let mut context = "area: ".to_owned();
     match area {
         Some(area) => context.push_str(area),
         None => context.push_str("none"),
     }
-    context.push_str(" | habits: ");
-    if habit_lines.is_empty() {
-        context.push_str("none");
-    } else {
-        context.push_str(join(habit_lines).as_str());
-    }
     context
 }
 
-/// The texts of `lines` joined by `; `.
-#[verus_spec(text =>
-    ensures
-        text@ == joined(lines@),
-)]
-fn join(lines: &[String]) -> String {
-    let mut text = String::new();
-    let mut index = 0;
-    #[cfg_attr(verus_only, verus_spec(
-        invariant
-            index <= lines.len(),
-            text@ == joined(lines@.take(index as int)),
-        decreases lines.len() - index,
-    ))]
-    while index < lines.len() {
-        proof! {
-            assert(lines@.take(index + 1).drop_last() =~= lines@.take(index as int));
-        }
-        if index > 0 {
-            text.push_str("; ");
-        }
-        text.push_str(lines[index].as_str());
-        index += 1;
-    }
-    proof! {
-        assert(lines@.take(index as int) =~= lines@);
-    }
-    text
-}
-
-/// The context of an area that `rng` picks from `areas`, with no habit lines.
+/// The context of an area that `rng` picks from `areas`.
 #[verus_spec(context =>
     ensures
         context@ == sampled(areas@, crate::domain::contracts::next(&*old(rng))),
@@ -295,10 +259,10 @@ fn join(lines: &[String]) -> String {
 pub fn sample_context(areas: &[String], rng: &mut StdRng) -> String {
     let random = rng.next_u32() as usize;
     if areas.is_empty() {
-        return context_text(None, &[]);
+        return context_text(None);
     }
     let area = &areas[random % areas.len()];
-    context_text(Some(area.as_str()), &[])
+    context_text(Some(area.as_str()))
 }
 
 /// The training set of the seed examples of `catalog`, each with a context that `rng` samples
@@ -526,27 +490,15 @@ pub open spec fn shown(area: Option<&str>) -> Seq<char> {
     }
 }
 
-/// `context_text` of the shown `area` and `habit_lines`.
-pub open spec fn context_spec(area: Seq<char>, habit_lines: Seq<String>) -> Seq<char> {
-    let habits = if habit_lines.len() == 0 { "none"@ } else { joined(habit_lines) };
-    "area: "@ + area + " | habits: "@ + habits
-}
-
-/// The texts of `lines` joined by `; `.
-pub open spec fn joined(lines: Seq<String>) -> Seq<char>
-    decreases lines.len(),
-{
-    if lines.len() <= 1 {
-        if lines.len() == 0 { Seq::empty() } else { lines[0]@ }
-    } else {
-        joined(lines.drop_last()) + "; "@ + lines.last()@
-    }
+/// `context_text` of the shown `area`.
+pub open spec fn context_spec(area: Seq<char>) -> Seq<char> {
+    "area: "@ + area
 }
 
 /// The context of the area of `areas` at `random` modulo its length, or of no area.
 pub open spec fn sampled(areas: Seq<String>, random: u32) -> Seq<char> {
     let area = if areas.len() == 0 { "none"@ } else { areas[random as int % areas.len() as int]@ };
-    context_spec(area, Seq::empty())
+    context_spec(area)
 }
 
 /// The number of seed examples of `intents`.
@@ -603,20 +555,11 @@ mod tests {
         (catalog, set)
     }
 
-    /// AC-3.3-1.
+    /// AC-11.5-1.
     #[test]
-    fn ac_3_3_1_context_text_of_area_without_habits() {
-        assert_eq!(
-            context_text(Some("kitchen"), &[]),
-            "area: kitchen | habits: none"
-        );
-    }
-
-    /// AC-3.3-2.
-    #[test]
-    fn ac_3_3_2_context_text_of_habits_without_area() {
-        let lines = ["a".to_owned(), "b".to_owned()];
-        assert_eq!(context_text(None, &lines), "area: none | habits: a; b");
+    fn ac_11_5_1_context_text_is_the_area_or_none() {
+        assert_eq!(context_text(Some("kitchen")), "area: kitchen");
+        assert_eq!(context_text(None), "area: none");
     }
 
     /// AC-3.3-3.
@@ -648,7 +591,7 @@ mod tests {
     fn ac_3_3b_3_json_round_trip_is_equal() {
         let (_, mut set) = training_set();
         set.examples.push(Example {
-            context: context_text(Some("office"), &[]),
+            context: context_text(Some("office")),
             text: "turn on the tv".to_owned(),
             label: Label::Not("tv_on".to_owned()),
             spans: None,
@@ -663,7 +606,7 @@ mod tests {
     fn ac_3_3c_1_json_spans_are_character_offsets() {
         let markup = intent::parse_example("set the [café](area) lights").expect("valid markup");
         let example = Example {
-            context: context_text(None, &[]),
+            context: context_text(None),
             text: markup.text,
             label: Label::Intent("lights_on".to_owned()),
             spans: Some(markup.spans),

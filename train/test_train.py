@@ -65,11 +65,11 @@ LIVING_ROOM: list[Span] = [{"slot": "area", "start": 12, "end": 23}]
 
 INPUTS = ["input_ids", "attention_mask", "token_type_ids"]
 
-OFFICE = "area: office | habits: none"
+OFFICE = "area: office"
 
 LIGHTS: list[Example] = [
     {
-        "context": f"area: {area} | habits: none",
+        "context": f"area: {area}",
         "text": f"turn on the {area} lights",
         "intent": "lights_on",
         "spans": [{"slot": "area", "start": 12, "end": 12 + len(area)}],
@@ -195,13 +195,13 @@ def test_ac_3_6_1_load_set_returns_valid_set(tmp_path: Path) -> None:
     """A valid file gives its training set."""
     examples: list[Example] = [
         {
-            "context": "area: kitchen | habits: none",
+            "context": "area: kitchen",
             "text": "turn on the kitchen lights",
             "intent": "lights_on",
             "spans": [{"slot": "area", "start": 12, "end": 19}],
         },
         {
-            "context": "area: office | habits: none",
+            "context": "area: office",
             "text": "hi",
             "not": "lights_on",
             "spans": None,
@@ -313,7 +313,7 @@ def test_ac_3_8_2_onnx_matches_torch(
     model, tokenizer, out = exported
     # A pair longer than the export sample also checks the dynamic sequence axis.
     encoding = tokenizer(
-        ["area: kitchen | habits: none"] * 2,
+        ["area: kitchen"] * 2,
         ["turn on the kitchen lights now", "hi"],
         padding=True,
         return_tensors="np",

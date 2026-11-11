@@ -1680,7 +1680,7 @@ mod tests {
         let expected: Vec<String> = fakes::house()
             .areas
             .iter()
-            .map(|area| training::context_text(Some(area.name.as_str()), &[]))
+            .map(|area| training::context_text(Some(area.name.as_str())))
             .collect();
         for context in contexts(&HOUSE)? {
             assert!(
@@ -1691,13 +1691,16 @@ mod tests {
         Ok(())
     }
 
-    /// AC-3.4-3.
+    /// AC-11.5-2.
     #[test]
-    fn ac_3_4_3_without_house_each_context_is_none() -> anyhow::Result<()> {
-        let contexts = contexts(&[])?;
-        assert!(!contexts.is_empty(), "the training set has no examples");
-        for context in contexts {
-            assert_eq!(context, "area: none | habits: none");
+    fn ac_11_5_2_contexts_have_no_habits() -> anyhow::Result<()> {
+        let empty = contexts(&[])?;
+        assert!(!empty.is_empty(), "the training set has no examples");
+        for context in empty {
+            assert_eq!(context, "area: none");
+        }
+        for context in contexts(&HOUSE)? {
+            assert!(!context.contains("habits"), "{context} has habits");
         }
         Ok(())
     }
@@ -2242,7 +2245,7 @@ mod tests {
         tts: &SupertonicTts,
     ) -> anyhow::Result<()> {
         classifier
-            .predict("area: kitchen | habits: none", "turn on the lights")
+            .predict("area: kitchen", "turn on the lights")
             .await?;
         let audio = tts.synth("Hello").await?;
         anyhow::ensure!(!audio.samples.is_empty(), "the audio has no samples");
