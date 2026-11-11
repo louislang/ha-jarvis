@@ -1,4 +1,5 @@
-//! Request habits: the time bucket of a request and decayed day scores.
+//! Request habits: the time bucket of a request, decayed day scores, usual times and the habit
+//! file.
 
 use std::collections::BTreeMap;
 
@@ -6,6 +7,8 @@ use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::civil::Weekday;
 use jiff::tz::TimeZone;
+use serde::Deserialize;
+use serde::Serialize;
 use vstd::prelude::*;
 
 #[cfg(verus_only)]
@@ -24,8 +27,8 @@ use crate::domain::contracts::weekday;
 use crate::domain::contracts::whole_hours;
 
 /// The day type of a bucket.
-#[verus_verify]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DayType {
     /// Monday to Friday.
     Weekdays,
@@ -53,12 +56,65 @@ pub struct Strength {
     pub last: Date,
 }
 
-/// The request habit model: the strength of each request key and bucket.
-#[verus_verify]
-#[derive(Clone, Debug, Default, PartialEq)]
+/// The request habit model: the strength of each request key and bucket. `habits.json` keeps it
+/// as a list of entries, because a JSON map key must be a string.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(from = "Vec<Entry>", into = "Vec<Entry>")]
 pub struct RequestHabits {
     /// The strength of each request key and bucket.
     pub strengths: BTreeMap<(String, Bucket), Strength>,
+}
+
+/// One strength of `habits.json`.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Entry {
+    /// The request key.
+    pub key: String,
+    /// The day type of the bucket.
+    pub day: DayType,
+    /// The hour of the bucket.
+    pub hour: i8,
+    /// The score on the day `last`.
+    pub score: f64,
+    /// The local date of the last day that counted.
+    pub last: Date,
+}
+
+#[verus_verify]
+impl From<Vec<Entry>> for RequestHabits {
+    fn from(entries: Vec<Entry>) -> Self {
+        let mut strengths = BTreeMap::new();
+        for entry in entries {
+            let bucket = Bucket {
+                day: entry.day,
+                hour: entry.hour,
+            };
+            let strength = Strength {
+                score: entry.score,
+                last: entry.last,
+            };
+            strengths.insert((entry.key, bucket), strength);
+        }
+        Self { strengths }
+    }
+}
+
+#[verus_verify]
+impl From<RequestHabits> for Vec<Entry> {
+    fn from(habits: RequestHabits) -> Self {
+        let mut entries = Vec::new();
+        let strengths = habits.strengths.iter();
+        for (entry, strength) in strengths {
+            entries.push(Entry {
+                key: entry.0.clone(),
+                day: entry.1.day,
+                hour: entry.1.hour,
+                score: strength.score,
+                last: strength.last,
+            });
+        }
+        entries
+    }
 }
 
 #[verus_verify]
@@ -96,6 +152,83 @@ impl RequestHabits {
         };
         self.strengths.insert(entry, strength);
         self
+    }
+
+    /// The buckets of `key` whose score decayed to `today` is `min_score` or more, in bucket order.
+    #[verus_spec(times =>
+        ensures
+            all_usual(self.strengths@, key@, times@, today, half_life_days, min_score),
+            forall|entry: (String, Bucket)| #[trigger] self.strengths@.contains_key(entry) && entry.0@ == key@ && !times@.contains(entry.1)
+                ==> scored(self.strengths@[entry], today, half_life_days, min_score, false),
+    )]
+    #[must_use]
+    pub fn usual_times(
+        &self,
+        key: &str,
+        today: Date,
+        half_life_days: f64,
+        min_score: f64,
+    ) -> Vec<Bucket> {
+        let mut times = Vec::new();
+        let entries = self.strengths.iter();
+        proof_decl! {
+            let ghost all = vstd::std_specs::iter::IteratorSpec::remaining(&entries);
+        }
+        #[cfg_attr(verus_only, verus_spec(entry_iter =>
+            invariant
+                entry_iter.seq() == all,
+                lists(self.strengths@, all),
+                all_usual(self.strengths@, key@, times@, today, half_life_days, min_score),
+                usual_checked(all, entry_iter.index(), key@, times@, today, half_life_days, min_score),
+        ))]
+        for (entry, strength) in entries {
+            let usual = decayed(strength.score, strength.last, today, half_life_days) >= min_score;
+            proof! {
+                assert(self.strengths@.contains_key(*all[entry_iter.index() as int].0));
+                assert(scored(*strength, today, half_life_days, min_score, usual));
+            }
+            if entry.0.as_str() == key && usual {
+                proof! {
+                    lemma_pushed(times@, entry.1);
+                }
+                times.push(entry.1);
+            }
+        }
+        times
+    }
+
+    /// The model without each strength whose score decayed to `today` is less than 0.01.
+    #[verus_spec(pruned =>
+        ensures
+            kept_from(self.strengths@, pruned.strengths@, today, half_life_days),
+            forall|entry: (String, Bucket)| #[trigger] self.strengths@.contains_key(entry) && !pruned.strengths@.contains_key(entry)
+                ==> scored(self.strengths@[entry], today, half_life_days, 0.01f64, false),
+    )]
+    #[must_use]
+    pub fn prune(self, today: Date, half_life_days: f64) -> Self {
+        let mut strengths = BTreeMap::new();
+        let entries = self.strengths.iter();
+        proof_decl! {
+            let ghost all = vstd::std_specs::iter::IteratorSpec::remaining(&entries);
+        }
+        #[cfg_attr(verus_only, verus_spec(entry_iter =>
+            invariant
+                entry_iter.seq() == all,
+                lists(self.strengths@, all),
+                kept_from(self.strengths@, strengths@, today, half_life_days),
+                prune_checked(all, entry_iter.index(), strengths@, today, half_life_days),
+        ))]
+        for (entry, strength) in entries {
+            let kept = decayed(strength.score, strength.last, today, half_life_days) >= 0.01;
+            proof! {
+                assert(self.strengths@.contains_key(*all[entry_iter.index() as int].0));
+                assert(scored(*strength, today, half_life_days, 0.01f64, kept));
+            }
+            if kept {
+                strengths.insert((entry.0.clone(), entry.1), *strength);
+            }
+        }
+        Self { strengths }
     }
 }
 
@@ -182,6 +315,93 @@ pub open spec fn decays(score: f64, last: Date, today: Date, half_life_days: f64
     exists|hours: f64, days: f64, exponent: f64| #[trigger] decay_steps(score, last, today, half_life_days, hours, days, exponent, found)
 }
 
+/// True when the score of `strength` decayed to `today` compares to `min_score` with the result
+/// `kept` of `>=`.
+pub open spec fn scored(strength: Strength, today: Date, half_life_days: f64, min_score: f64, kept: bool) -> bool {
+    exists|found: f64| #[trigger] decays(strength.score, strength.last, today, half_life_days, found)
+        && vstd::std_specs::cmp::ge_ensures::<f64>(found, min_score, kept)
+}
+
+/// True when `strengths` has a strength of the key with the text `key` in `bucket` whose score
+/// decayed to `today` is `min_score` or more.
+pub open spec fn usual(strengths: Map<(String, Bucket), Strength>, key: Seq<char>, bucket: Bucket, today: Date, half_life_days: f64, min_score: f64) -> bool {
+    exists|entry: (String, Bucket)| #[trigger] strengths.contains_key(entry) && entry.0@ == key && entry.1 == bucket
+        && scored(strengths[entry], today, half_life_days, min_score, true)
+}
+
+/// True when `all` lists each entry of `strengths` with its strength.
+pub open spec fn lists(strengths: Map<(String, Bucket), Strength>, all: Seq<(&(String, Bucket), &Strength)>) -> bool {
+    &&& forall|index: int| 0 <= index < all.len()
+        ==> #[trigger] strengths.contains_key(*all[index].0) && strengths[*all[index].0] == *all[index].1
+    &&& forall|entry: (String, Bucket)| #[trigger] strengths.contains_key(entry) ==> all.contains((&entry, &strengths[entry]))
+}
+
+/// True when each bucket of `times` is a usual time of `key`.
+pub open spec fn all_usual(strengths: Map<(String, Bucket), Strength>, key: Seq<char>, times: Seq<Bucket>, today: Date, half_life_days: f64, min_score: f64) -> bool {
+    forall|index: int| 0 <= index < times.len() ==> #[trigger] usual(strengths, key, times[index], today, half_life_days, min_score)
+}
+
+/// True when each of the first `count` entries of `all` with the key `key` has its bucket in
+/// `times`, or a decayed score less than `min_score`.
+pub open spec fn usual_checked(all: Seq<(&(String, Bucket), &Strength)>, count: int, key: Seq<char>, times: Seq<Bucket>, today: Date, half_life_days: f64, min_score: f64) -> bool {
+    forall|seen: int| 0 <= seen < count && (*all[seen].0).0@ == key
+        ==> times.contains((*all[seen].0).1) || scored(*all[seen].1, today, half_life_days, min_score, false)
+}
+
+/// True when each strength of `kept` is the strength of `strengths` with a decayed score of 0.01 or
+/// more.
+pub open spec fn kept_from(strengths: Map<(String, Bucket), Strength>, kept: Map<(String, Bucket), Strength>, today: Date, half_life_days: f64) -> bool {
+    forall|entry: (String, Bucket)| #[trigger] kept.contains_key(entry) ==> {
+        &&& strengths.contains_key(entry)
+        &&& kept[entry] == strengths[entry]
+        &&& scored(strengths[entry], today, half_life_days, 0.01f64, true)
+    }
+}
+
+/// True when each of the first `count` entries of `all` is in `kept`, or has a decayed score less
+/// than 0.01.
+pub open spec fn prune_checked(all: Seq<(&(String, Bucket), &Strength)>, count: int, kept: Map<(String, Bucket), Strength>, today: Date, half_life_days: f64) -> bool {
+    forall|seen: int| 0 <= seen < count
+        ==> kept.contains_key(*all[seen].0) || scored(*all[seen].1, today, half_life_days, 0.01f64, false)
+}
+
+/// `times` with `bucket` pushed contains `bucket` and each bucket of `times`.
+pub proof fn lemma_pushed(times: Seq<Bucket>, bucket: Bucket)
+    ensures
+        times.push(bucket).contains(bucket),
+        forall|other: Bucket| times.contains(other) ==> #[trigger] times.push(bucket).contains(other),
+{
+    assert(times.push(bucket)[times.len() as int] == bucket);
+    assert forall|other: Bucket| times.contains(other) implies #[trigger] times.push(bucket).contains(other) by {
+        let index = choose|index: int| 0 <= index < times.len() && times[index] == other;
+        assert(times.push(bucket)[index] == other);
+    }
+}
+
+/// The conversion from a list of entries has no spec function. Only Verus has this trait.
+#[cfg(verus_only)]
+impl vstd::std_specs::convert::FromSpecImpl<Vec<Entry>> for RequestHabits {
+    open spec fn obeys_from_spec() -> bool {
+        false
+    }
+
+    open spec fn from_spec(entries: Vec<Entry>) -> Self {
+        arbitrary()
+    }
+}
+
+/// The conversion to a list of entries has no spec function. Only Verus has this trait.
+#[cfg(verus_only)]
+impl vstd::std_specs::convert::FromSpecImpl<RequestHabits> for Vec<Entry> {
+    open spec fn obeys_from_spec() -> bool {
+        false
+    }
+
+    open spec fn from_spec(habits: RequestHabits) -> Self {
+        arbitrary()
+    }
+}
+
 } // verus!
 
 /// Tests of buckets and request habit scores.
@@ -192,6 +412,13 @@ mod tests {
 
     /// The default half-life in days.
     const HALF_LIFE_DAYS: f64 = 14.0;
+    /// The default lowest score of a usual time.
+    const MIN_SCORE: f64 = 2.0;
+    /// Weekdays from 08:00 to 09:00.
+    const WEEKDAY_8: Bucket = Bucket {
+        day: DayType::Weekdays,
+        hour: 8,
+    };
 
     /// The time zone of the reference house.
     fn zone() -> TimeZone {
@@ -217,6 +444,11 @@ mod tests {
             habits = habits.observe(key.to_owned(), at(date, time), &zone, HALF_LIFE_DAYS);
         }
         habits
+    }
+
+    /// The usual times of `get_traffic` in `habits` on `date`.
+    fn traffic_times(habits: &RequestHabits, date: &str) -> Vec<Bucket> {
+        habits.usual_times("get_traffic", day(date), HALF_LIFE_DAYS, MIN_SCORE)
     }
 
     /// AC-11.1b-1.
@@ -273,5 +505,51 @@ mod tests {
             "{strengths:?}"
         );
         assert!(!strengths.contains_key(&(key, weekday)), "{strengths:?}");
+    }
+
+    /// AC-11.3b-1.
+    #[test]
+    fn ac_11_3b_1_three_weekday_mornings_are_a_usual_time() {
+        let dates = ["2026-11-09", "2026-11-10", "2026-11-11"];
+        let habits = observed("get_traffic", &dates, "08:10");
+        assert_eq!(traffic_times(&habits, "2026-11-11"), [WEEKDAY_8]);
+    }
+
+    /// AC-11.3b-2.
+    #[test]
+    fn ac_11_3b_2_two_days_of_requests_are_no_usual_time() {
+        let dates = ["2026-11-09"; 5]
+            .into_iter()
+            .chain(["2026-11-10"; 5])
+            .collect::<Vec<&str>>();
+        let habits = observed("get_traffic", &dates, "08:10");
+        assert_eq!(traffic_times(&habits, "2026-11-10"), []);
+    }
+
+    /// AC-11.3b-3.
+    #[test]
+    fn ac_11_3b_3_three_days_within_one_half_life_are_a_usual_time() {
+        let dates = ["2026-10-28", "2026-11-04", "2026-11-11"];
+        let habits = observed("get_traffic", &dates, "08:10");
+        assert_eq!(traffic_times(&habits, "2026-11-11"), [WEEKDAY_8]);
+    }
+
+    /// AC-11.3b-4.
+    #[test]
+    fn ac_11_3b_4_usual_time_fades_after_eight_days() {
+        let dates = ["2026-11-09", "2026-11-10", "2026-11-11"];
+        let habits = observed("get_traffic", &dates, "08:10");
+        assert_eq!(traffic_times(&habits, "2026-11-18"), [WEEKDAY_8]);
+        assert_eq!(traffic_times(&habits, "2026-11-19"), []);
+    }
+
+    /// AC-11.3b-5.
+    #[test]
+    fn ac_11_3b_5_prune_removes_only_faded_strengths() {
+        let old = observed("get_weather", &["2026-08-01"], "09:30");
+        let new = observed("get_traffic", &["2026-11-09"], "08:10");
+        let mut both = old;
+        both.strengths.extend(new.strengths.clone());
+        assert_eq!(both.prune(day("2026-11-09"), HALF_LIFE_DAYS), new);
     }
 }
