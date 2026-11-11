@@ -846,8 +846,8 @@ where
 }
 
 /// Serves `app` on `listen` until `shutdown` completes. Then waits up to [`SHUTDOWN_WAIT`] for
-/// the connection tasks, the work after their replies, the pools task and the last save of the
-/// habit task of `stores`.
+/// the connection tasks, the work after their replies and the pools task of `stores`, and then
+/// for the last save of its habit task.
 ///
 /// # Errors
 ///
@@ -863,17 +863,19 @@ async fn serve_until(
     tracker.close();
     let (pools_task, habits) = stores;
     // The pools task saves each change. It ends when the tracked tasks drop the last sender.
-    let saved = async {
+    let drained = async {
         tracker.wait().await;
-        drop(habits.stop);
-        let habits_ended = habits.task.await;
-        pools_task.await.and(habits_ended)
+        pools_task.await
     };
-    let Ok(ended) = tokio::time::timeout(SHUTDOWN_WAIT, saved).await else {
+    let ended = tokio::time::timeout(SHUTDOWN_WAIT, drained).await;
+    // The habits save also when a connection still runs (sub-phase 5.4c).
+    drop(habits.stop);
+    let saved = habits.task.await;
+    let Ok(ended) = ended else {
         tracing::warn!("tasks still run after {SHUTDOWN_WAIT:?}");
-        return Ok(());
+        return Ok(saved?);
     };
-    Ok(ended?)
+    Ok(ended.and(saved)?)
 }
 
 /// Starts `HaHome` with `token` and `connector` on the host and the port of `ha.url`.
@@ -2182,7 +2184,7 @@ mod tests {
         Ok(())
     }
     /// Holds a connection to the Wyoming server at `address` and stops `run` with `stop`. Then
-    /// checks that a new connection fails and advances virtual time by 5 s.
+    /// checks that a new connection fails and advances virtual time by 5 s, then 1 ms.
     async fn stop_while_connected(
         address: SocketAddr,
         stop: oneshot::Sender<()>,
@@ -2196,6 +2198,9 @@ mod tests {
         let connected = TcpStream::connect(address).await;
         anyhow::ensure!(connected.is_err(), "the server accepts after the stop");
         tokio::time::advance(Duration::from_secs(5)).await;
+        // The last saves run on blocking threads, which stop the paused clock, so `run` returns
+        // before this sleep ends.
+        tokio::time::sleep(Duration::from_millis(1)).await;
         Ok(())
     }
 
@@ -2226,6 +2231,8 @@ mod tests {
             Duration::from_secs(5),
             "run waits up to 5 s for the open connection"
         );
+        let habits = folder.path().join("habits.json");
+        assert!(habits.exists(), "run did not save {}", habits.display());
         Ok(())
     }
 
