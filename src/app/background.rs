@@ -1,4 +1,4 @@
-//! Hot cache sync and response backfill.
+//! Hot cache sync, response backfill and the request habit model.
 
 use std::collections::BTreeSet;
 use std::collections::HashSet;
@@ -10,12 +10,15 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use tokio::sync::watch;
 
 use crate::BackfillConfig;
 use crate::app::conversation::Change;
 use crate::app::speech::Speech;
 use crate::domain::catalog::Catalog;
+use crate::domain::habits::RequestHabits;
 use crate::domain::responses;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Pools;
@@ -234,6 +237,65 @@ pub fn area_names(cache: &StateCache) -> Vec<String> {
 fn texts(pool: &Pool) -> Vec<String> {
     let texts = pool.responses.iter().map(|response| response.text.clone());
     texts.collect()
+}
+
+/// The request habit model, which `handle` records into.
+pub struct Habits {
+    /// The model. No code holds the lock across an `await`.
+    model: Mutex<RequestHabits>,
+    /// The days in which a score halves.
+    half_life_days: f64,
+    /// The hot cache, which has the HA time zone.
+    cache: watch::Receiver<StateCache>,
+}
+
+impl Habits {
+    /// The habits of `model`, whose scores halve each `half_life_days`, in the HA time zone of
+    /// `cache`.
+    #[must_use]
+    pub fn new(
+        model: RequestHabits,
+        half_life_days: f64,
+        cache: watch::Receiver<StateCache>,
+    ) -> Self {
+        Self {
+            model: Mutex::new(model),
+            half_life_days,
+            cache,
+        }
+    }
+
+    /// Records one request of `key` at `time`. Without the HA time zone, or with a poisoned lock,
+    /// the request does not count.
+    pub fn observe(&self, key: String, time: Timestamp) {
+        let Some(zone) = self.zone() else {
+            return;
+        };
+        if let Some(mut model) = self.lock() {
+            *model = mem::take(&mut *model).observe(key, time, &zone, self.half_life_days);
+        }
+    }
+
+    /// A copy of the model, or `None` when the lock is poisoned.
+    #[must_use]
+    pub fn current(&self) -> Option<RequestHabits> {
+        self.lock().map(|model| model.clone())
+    }
+
+    /// The HA time zone of the hot cache.
+    fn zone(&self) -> Option<TimeZone> {
+        let cache = self.cache.borrow();
+        TimeZone::get(&cache.config.as_ref()?.time_zone).ok()
+    }
+
+    /// The model, or `None` after a `warn` event when a holder of the lock panicked.
+    fn lock(&self) -> Option<MutexGuard<'_, RequestHabits>> {
+        let locked = self.model.lock();
+        if locked.is_err() {
+            tracing::warn!("the habit model is poisoned");
+        }
+        locked.ok()
+    }
 }
 
 /// Tests of the sync and backfill use cases and their conformance to `cache_sync.qnt` and

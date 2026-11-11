@@ -49,6 +49,7 @@ use crate::adapters::plex::Plex;
 use crate::adapters::sherpa::SherpaStt;
 use crate::adapters::supertonic::SupertonicTts;
 use crate::app::background::Backfill;
+use crate::app::background::Habits;
 use crate::app::conversation::Change;
 use crate::app::conversation::Conversation;
 use crate::app::conversation::PoolsTask;
@@ -58,6 +59,7 @@ use crate::app::plugins::Plugins;
 use crate::app::speech::Listener;
 use crate::app::speech::Speech;
 use crate::domain::catalog::Catalog;
+use crate::domain::habits::RequestHabits;
 use crate::domain::model::Prediction;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Pools;
@@ -958,10 +960,10 @@ async fn start_app(
     let (cache, queues) = start_sync(home, config);
     let (classifier, listener, speech) =
         load_models(config, Arc::clone(&reasoner), &queues).await?;
-    let prerender = start_prerender(&speech, &task.pools, cache.clone());
+    let prerender = start_prerender(&speech, &task.pools, &cache);
     let catalog = Arc::new(catalog);
+    let habits = habits(config, &cache);
     let backfill = backfill(config, &reasoner, task.changes, &speech, &catalog, cache);
-    let two = system_two(config, reasoner, plugins, Arc::new(SystemClock));
     let app = App {
         conversation: Conversation::new(
             task.pools,
@@ -970,7 +972,8 @@ async fn start_app(
             classifier,
             catalog,
             config.model.threshold,
-            two,
+            system_two(config, reasoner, plugins),
+            habits,
         ),
         listener,
         speech,
@@ -986,6 +989,16 @@ async fn start_app(
 fn start_pools(config: &Config, pools: Pools) -> anyhow::Result<PoolsTask> {
     let store = Arc::new(FileStore::try_new(config.pools.clone())?);
     app::conversation::start_pools(pools, store)
+}
+
+/// Empty request habits with the half-life of `config`, in the HA time zone of `cache`.
+fn habits(config: &Config, cache: &watch::Receiver<StateCache>) -> Arc<Habits> {
+    let half_life_days = config.habits.half_life_days;
+    Arc::new(Habits::new(
+        RequestHabits::default(),
+        half_life_days,
+        cache.clone(),
+    ))
 }
 
 /// The backfill of `config` with `reasoner`, the pools task of `changes`, the pre-render of
@@ -1005,19 +1018,14 @@ fn backfill(
     ))
 }
 
-/// System Two on `reasoner`, the plugin registry `plugins` and `clock` with the timeout and the
-/// call rules of `config.openai`.
-fn system_two(
-    config: &Config,
-    reasoner: Arc<dyn Reasoner>,
-    plugins: Arc<Plugins>,
-    clock: Arc<dyn Clock>,
-) -> SystemTwo {
+/// System Two on `reasoner`, the plugin registry `plugins` and the system time with the timeout
+/// and the call rules of `config.openai`.
+fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins>) -> SystemTwo {
     let openai = &config.openai;
     SystemTwo {
         reasoner,
         plugins,
-        clock,
+        clock: Arc::new(SystemClock),
         timeout: Duration::from_millis(openai.timeout_ms),
         allowed_domains: openai.allowed_domains.clone(),
         read_services: openai.read_services.clone(),
@@ -1065,9 +1073,9 @@ fn start_sync(home: Arc<dyn Home>, config: &Config) -> (watch::Receiver<StateCac
 fn start_prerender(
     speech: &Arc<Speech>,
     pools: &Arc<ArcSwap<Pools>>,
-    mut cache: watch::Receiver<StateCache>,
+    cache: &watch::Receiver<StateCache>,
 ) -> JoinHandle<()> {
-    let (speech, pools) = (Arc::clone(speech), Arc::clone(pools));
+    let (speech, pools, mut cache) = (Arc::clone(speech), Arc::clone(pools), cache.clone());
     tokio::spawn(async move {
         if cache.changed().await.is_err() {
             return;
@@ -1722,7 +1730,8 @@ mod tests {
     fn two(config: &Config) -> SystemTwo {
         let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
         let reasoner = Arc::new(FakeReasoner::default());
-        system_two(config, reasoner, registry(config, Vec::new()), clock)
+        let two = system_two(config, reasoner, registry(config, Vec::new()));
+        SystemTwo { clock, ..two }
     }
 
     /// The tool names of the registry of the configuration `text` with every variable set.
@@ -1767,6 +1776,7 @@ mod tests {
     ) -> anyhow::Result<Conversation> {
         let task = app::conversation::start_pools(pools(&catalog), Arc::new(FakeStore::new(None)))?;
         let (catalog, cache) = (Arc::new(catalog), watch::channel(StateCache::default()).1);
+        let habits = habits(config, &cache);
         let reasoner: Arc<dyn Reasoner> = Arc::new(FakeReasoner::default());
         let backfill = backfill(config, &reasoner, task.changes, speech, &catalog, cache);
         let (queues, threshold) = (queues(config), config.model.threshold);
@@ -1778,6 +1788,7 @@ mod tests {
             catalog,
             threshold,
             two(config),
+            habits,
         ))
     }
 
