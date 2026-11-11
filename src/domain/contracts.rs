@@ -108,7 +108,6 @@ pub struct ExStateCache(StateCache);
 
 /// The cause of a state change.
 #[verifier::external_type_specification]
-#[verifier::external_body]
 pub struct ExContext(Context);
 
 /// An area registry entry.
@@ -576,6 +575,15 @@ pub fn ex_map_get<'map, Key>(map: &'map Map<String, Value>, key: &Key) -> (value
         },
 {
     map.get(key)
+}
+
+/// True when `left` and `right` are equal. `Value` is `Eq`, so a value equals itself. <https://docs.rs/serde_json/1/serde_json/enum.Value.html#impl-Eq-for-Value>
+#[verifier::external_fn_specification]
+pub fn ex_value_eq(left: &Value, right: &Value) -> (equal: bool)
+    ensures
+        *left == *right ==> equal,
+{
+    <Value as PartialEq>::eq(left, right)
 }
 
 /// Makes an empty JSON object. <https://docs.rs/serde_json/1/serde_json/struct.Map.html#method.new>
