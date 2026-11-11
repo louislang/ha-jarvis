@@ -29,7 +29,7 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 
 ## Required Checks
 
-`just check` runs these in the pre-commit hook. CI runs each as a separate job. `bench` runs in the hook on Linux only. `gpu-test` runs in the hook on the GPU host only. `pr-size` and `diagram` run in CI only, because they need the PR base.
+`just check` runs these in the pre-commit hook. CI runs each as a separate job. `bench` runs in the hook on Linux only. `gpu-test` runs in the hook on the GPU host only. CI skips `gpu-test` for a docs-only PR, which changes only files under `docs/`, `README.md`, `CLAUDE.md` and `.github/pull_request_template.md`. `just merge` accepts a skipped `gpu-test` only for such a PR. `pr-size` and `diagram` run in CI only, because they need the PR base.
 
 | Check | What fails it |
 |---|---|

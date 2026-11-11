@@ -176,7 +176,7 @@ Every test gives the same result on every run with the same code.
    - One check box for each required check, and the boxes "Started in a fresh context", "Codex review threads resolved" and "`[GPU host]` criteria pass in `gpu-test`".
 7. The Codex GitHub app reviews each PR. Resolve every review thread before merge.
 8. A PR changes at most 400 lines (added plus deleted). These files do not count: `Cargo.lock`, `docs/architecture.md`, `src/testing/house.json`. If a sub-phase cannot fit, first split it in a spec PR. The first part keeps its number. Each later part adds a letter: `4.5b`, `4.5c`. No other sub-phase changes its number.
-9. Merge only with `just merge <pr>` (sub-phases 0.15 and 0.16). It merges a PR whose base is `main` (the bottom layer of a stack, a spec PR or a fix PR) by squash when every required check passed, every review thread is resolved, every check box is checked, and the title, the branch and the summary follow rules 1, 4 and 6. The squash commit is the inspected head commit, with the PR title and summary as its message. GitHub then rebases the rest of the stack.
+9. Merge only with `just merge <pr>` (sub-phases 0.15 and 0.16). It merges a PR whose base is `main` (the bottom layer of a stack, a spec PR or a fix PR) by squash when every required check passed (a skipped `gpu-test` passes only for a docs-only PR, section 7.3), every review thread is resolved, every check box is checked, and the title, the branch and the summary follow rules 1, 4 and 6. The squash commit is the inspected head commit, with the PR title and summary as its message. GitHub then rebases the rest of the stack.
 10. Bootstrap: a rule applies from the sub-phase that adds its gate. Until then, check the rule by hand. Before sub-phase 0.5, the PR description has a summary and short bullet points. Before sub-phase 0.6, count the PR size with `git diff --numstat`. Do not push to `main`. Merge layers 0.2 to 0.15 with `gh pr merge --squash --subject "<PR title>" --body "<PR summary>"` when every CI job passed, every review thread is resolved and every check box is checked. Sub-phase 0.16 merges itself with its own `just merge`.
 11. After a change to a lower layer, run `gh stack rebase` and `gh stack push`.
 
@@ -205,8 +205,10 @@ CI runs each check as a separate job. "Push" is a push to `main`. `just merge` r
 | `quint` | `just quint` | Push, PR | Yes |
 | `verus` | `just verus` (`cargo verus verify -p jarvis`) | Push, PR | Yes |
 | `workflow-lint` | `just workflow-lint` (`actionlint`) | Push, PR | Yes |
-| `gpu-test` | `just gpu-test` on the self-hosted GPU runner | Push, PR | On the GPU host only (`JARVIS_DEVICE=cuda`) |
+| `gpu-test` | `just gpu-test` on the self-hosted GPU runner | Push, PR (skipped for a docs-only PR) | On the GPU host only (`JARVIS_DEVICE=cuda`) |
 | `pr-size` | `xtask pr-size --base origin/<base branch> --limit 400` | PR | No (needs the PR base) |
 | `diagram` | `xtask diagram --base origin/<base branch>`, posted on the PR | PR | No (needs the PR base) |
+
+A docs-only PR changes only files under `docs/`, `README.md`, `CLAUDE.md` and `.github/pull_request_template.md`. Such a PR changes no code that `gpu-test` tests, so CI skips `gpu-test` for it, and live Jarvis on the GPU host does not stop (sub-phase 0.13). `just merge` accepts a skipped `gpu-test` only for a docs-only PR (sub-phase 0.15). The PR still checks the boxes of `gpu-test` and of the `[GPU host]` criteria.
 
 `check` also runs `just diagram`, which writes `docs/architecture.md`. A structure test in `rust-test` fails when the committed file is stale (sub-phase 0.11).

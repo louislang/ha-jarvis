@@ -427,16 +427,24 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 
 **Model.** `gpu-test` runs `cargo test --workspace --release -- --ignored` with `JARVIS_DEVICE=cuda`. The GPU host also runs the live Jarvis as the systemd unit `jarvis` (`01-architecture.md` section 10). Thus the `gpu-test` job stops the `jarvis` service before the tests and starts it again after them, also when they fail, so the tests get the whole GPU and the latency is not noisy. Live Jarvis is down while the job runs: a push of a stack with N layers stops it N times. The CI job `gpu-test` runs on `[self-hosted, linux, gpu]` for `push` and `pull_request`. On the GPU host, `check` also runs `gpu-test` when `JARVIS_DEVICE=cuda` is set, so the hook gates it there. `actionlint` knows only the GitHub-hosted labels and the standard self-hosted labels. `.github/actionlint.yaml` declares the label `gpu`. The repository is public, so the job runs only on a push or on a pull request from a branch of this repository. A pull request from a fork cannot run code on the GPU host.
 
+The job takes about 15 minutes on one shared runner, and live Jarvis is down for that time. A docs-only PR (`02-rules.md` section 7.3) changes no code that the job tests, so the job does not run for it:
+
+- The job `fixture-model`, which `gpu-test` needs, checks out with `fetch-depth: 2`. On `pull_request`, its step `changes` lists the files of `git diff --name-only --no-renames HEAD^1 HEAD`. The checkout is the PR merge commit, so `HEAD^1` is the base. `--no-renames` lists the old path of a renamed file too. The step writes `docs-only=true` to `GITHUB_OUTPUT` when each file is under `docs/` or is `README.md`, `CLAUDE.md` or `.github/pull_request_template.md`. Else, also for an empty list, it writes `docs-only=false`. When `git diff` fails, the step fails. The job has the output `docs-only` of this step.
+- The `if` of `gpu-test` also requires `needs.fixture-model.outputs.docs-only != 'true'`. On a push, the step does not run and the output is empty, so `gpu-test` runs.
+- A job that its `if` skips still reports the check `gpu-test`, with the conclusion `skipped`. The required status checks of the repository ruleset count a skipped check as passed. `just merge` accepts it only for a docs-only PR (sub-phase 0.15).
+
 **Acceptance criteria.**
 
-- AC-0.13-1: When `ci.yml` is parsed, the job `gpu-test` runs on `[self-hosted, linux, gpu]` and runs `just gpu-test`. Its `if` is `github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository`.
+- AC-0.13-1: When `ci.yml` is parsed, the job `gpu-test` runs on `[self-hosted, linux, gpu]` and runs `just gpu-test`. Its `if` is `needs.fixture-model.outputs.docs-only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)`.
 - AC-0.13-2: When the `justfile` is dumped, `gpu-test` sets `JARVIS_DEVICE=cuda` and passes `--ignored`, and `check` runs `gpu-test` only when `JARVIS_DEVICE=cuda` is set.
 - AC-0.13-3: When there are no ignored tests, `just gpu-test` exits with code 0.
 - AC-0.13-4: When `ci.yml` is parsed, the job `gpu-test` stops the `jarvis` service before `just gpu-test` and has a step with `if: always()` that starts it again.
+- AC-0.13-5: When the step `changes` runs in a temporary repository after a commit that adds only `docs/spec/phase-00.md`, `README.md`, `CLAUDE.md` and `.github/pull_request_template.md`, it writes `docs-only=true`. When the commit also adds `src/main.rs`, or only renames `src/lib.rs` to `docs/lib.md`, it writes `docs-only=false`.
+- AC-0.13-6: When `ci.yml` is parsed, the job `fixture-model` checks out with `fetch-depth: 2`, runs the step `changes` only on `pull_request`, and has the output `docs-only` of that step.
 
 **Proofs.**
 
-- P-0.13-1 to P-0.13-4. Evidence: test.
+- P-0.13-1 to P-0.13-6. Evidence: test.
 
 **Field log.** On the GPU host, install the NVIDIA driver, CUDA 12 and cuDNN 9. Register the GitHub Actions runner with the labels `self-hosted`, `linux` and `gpu`. Create the systemd unit `jarvis` and its environment file (`01-architecture.md` section 10). Until sub-phase 5.4, `jarvis` prints its usage and exits, so `stop` and `start` succeed. Let the runner user run `systemctl stop jarvis` and `systemctl start jarvis` without a password. Record that the `gpu-test` job runs on the runner.
 
@@ -480,7 +488,8 @@ Each build makes `jarvis-<tag>-<target>.tar.gz` with the binary and its shared l
 
 **Model.** `merge_allowed(pr, required) -> Result<(), Vec<Reason>>`. `pr` has the title, the branch, the base, the changed files, the description, the check results, the review threads, and the logins of the reviews, comments and reactions. The conditions:
 
-- Each required check (the job names in `ci.yml` that run on `pull_request`) has conclusion `success`.
+- Each required check (the job names in `ci.yml` that run on `pull_request`) has conclusion `success`. The conclusion of a check over its runs: a run without success outranks a success, and a success outranks a skipped run.
+- Exception: `gpu-test` with the conclusion `skipped` passes when the PR is docs-only, that is, each changed file is under `docs/` or is `README.md`, `CLAUDE.md` or `.github/pull_request_template.md` (sub-phase 0.13). A run of `gpu-test` that did not skip still counts: a failure is a reason. `gh pr view` gives only the new path of a renamed file, but CI runs `gpu-test` for a PR that renames a code file into `docs/`, so the result of that run counts.
 - A Codex review exists: a review, a comment or a reaction by the login `CODEX_LOGIN`. Every review thread is resolved. `CODEX_LOGIN` is a constant: the login that the field log of sub-phase 0.5 records.
 - Every check box in the description is checked.
 - The base is `main`.
@@ -503,10 +512,11 @@ Each build makes `jarvis-<tag>-<target>.tar.gz` with the binary and its shared l
 - AC-0.15-10: When the description has a `Co-Authored-By` line, `merge_allowed` returns a reason.
 - AC-0.15-11: When the title and the branch are `4.5b Title` and `4.5b-title`, `Spec: Title` and `spec-title`, or `Fix: Title` and `fix-title`, `merge_allowed` returns no reason for them.
 - AC-0.15-12: When a spec PR changes a file outside `docs/spec/` and `CLAUDE.md`, `merge_allowed` returns a reason that names the file.
+- AC-0.15-13: When the only run of `gpu-test` has the conclusion `skipped`, `merge_allowed` returns no reason for it if each changed file is `docs/spec/phase-00.md`, `README.md`, `CLAUDE.md` or `.github/pull_request_template.md`. It returns `gpu-test` as a reason if a changed file is `src/lib.rs`, or if the PR is docs-only and `gpu-test` is missing or has a run with conclusion `failure`. When a check has one skipped run and one successful run, its conclusion is `success`.
 
 **Proofs.**
 
-- P-0.15-1 to P-0.15-12. Requires: the PR data and the required set. Ensures: `Ok` if and only if all conditions hold, and otherwise the result lists each failed condition. Argument: `merge_allowed` evaluates each condition, collects a reason for each failure, and returns `Ok` only when the list is empty. The title rule is one match over the three kinds of PR.
+- P-0.15-1 to P-0.15-13. Requires: the PR data and the required set. Ensures: `Ok` if and only if all conditions hold, and otherwise the result lists each failed condition. Argument: `merge_allowed` evaluates each condition, collects a reason for each failure, and returns `Ok` only when the list is empty. The title rule is one match over the three kinds of PR.
 
 ---
 
