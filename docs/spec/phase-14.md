@@ -1,6 +1,6 @@
 # Phase 14: Learned Intents
 
-This phase makes System Two teach System One. Jarvis clusters frequent requests that System Two answers, System Two proposes a new intent for each cluster, and the next training run adds it to the model. Then System One handles these requests. Fetch and prefetch intents with a usual time (phase 11) get their answers before it, and Jarvis refreshes the answers while the window of the usual time is open. When a cluster needs remote data that no plugin gives, Jarvis asks Claude for a new plugin through one GitHub issue (decision 32).
+This phase makes System Two teach System One. Jarvis clusters frequent requests that System Two answers, System Two proposes a new intent for each cluster, and the next training run adds it to the model. Then System One handles these requests. Fetch and prefetch intents with a usual time (phase 11) get their answers before it, and Jarvis refreshes the answers while the window of the usual time is open. When a cluster needs remote data that no plugin gives, Jarvis asks Claude for a new plugin through one plugin request file in a local folder (decision 32).
 
 ---
 
@@ -73,7 +73,7 @@ This phase makes System Two teach System One. Jarvis clusters frequent requests 
 
 ### 14.3 Learned Intent Quint Model
 
-**Goal:** Add `quint/learned.qnt`, the model of the proposal lifecycle. Prove that no intent with a service becomes active without approval, that a cluster is proposed only once, that each activation counts as exactly one change, and that a plugin request opens at most one issue.
+**Goal:** Add `quint/learned.qnt`, the model of the proposal lifecycle. Prove that no intent with a service becomes active without approval, that a cluster is proposed only once, that each activation counts as exactly one change, and that a cluster gets at most one plugin request.
 
 - **Implements:** G14, G16, G19. **Depends on:** 14.2.
 - **Files:** create `quint/learned.qnt`.
@@ -82,18 +82,18 @@ This phase makes System Two teach System One. Jarvis clusters frequent requests 
 **Model.**
 
 - Constants: `CLUSTERS = Set("c1", "c2")`, `HAS_SERVICE: CLUSTER -> bool`, `NEEDS_PLUGIN: CLUSTER -> bool`.
-- State: `status: CLUSTER -> Absent | Pending | Active | Rejected | None | Requested`, `approved: Set[CLUSTER]`, `proposals: int`, `changes: int`, `issues: CLUSTER -> int`.
+- State: `status: CLUSTER -> Absent | Pending | Active | Rejected | None | Requested`, `approved: Set[CLUSTER]`, `proposals: int`, `changes: int`, `requests: CLUSTER -> int`.
 - Actions:
   - `propose(c)` (only when `Absent`): `proposals += 1`. With `NEEDS_PLUGIN`: `Requested`. Else with a service: `Pending`. Else: `Active` and `changes += 1`. Unsuitable: `None`.
   - `approve(c)` (only when `Pending`): add to `approved`, `Active`, `changes += 1`.
   - `reject(c)` (only when `Pending`): `Rejected`.
-  - `openIssue(c)` (only when `Requested` and `issues[c] = 0`): `issues[c] += 1`.
-  - `failIssue(c)` (only when `Requested` and `issues[c] = 0`): nothing changes.
+  - `writeRequest(c)` (only when `Requested` and `requests[c] = 0`): `requests[c] += 1`.
+  - `failRequest(c)` (only when `Requested` and `requests[c] = 0`): nothing changes.
 - Invariants:
   - `ServiceNeedsApproval`: `status[c] = Active and HAS_SERVICE[c]` implies `c` in `approved`.
   - `NoReproposal`: `proposals` equals the number of clusters whose status is not `Absent`.
   - `ActivationCountsOnce`: `changes` equals the number of `Active` clusters.
-  - `OneIssuePerCluster`: `issues[c] <= 1`, and `issues[c] = 1` implies `status[c] = Requested`.
+  - `OneRequestPerCluster`: `requests[c] <= 1`, and `requests[c] = 1` implies `status[c] = Requested`.
 
 **Acceptance criteria.**
 
@@ -102,7 +102,7 @@ This phase makes System Two teach System One. Jarvis clusters frequent requests 
 
 **Proofs.**
 
-- P-14.3-2. `ServiceNeedsApproval`: `propose` makes a cluster with a service `Pending`, never `Active`. The only other path to `Active` is `approve`, which adds the cluster to `approved` in the same step. `NoReproposal`: `propose` is enabled only from `Absent` and moves the cluster out of `Absent`. No action moves a cluster back to `Absent`. So each cluster is proposed at most once. `ActivationCountsOnce`: each transition into `Active` adds 1 to `changes`, and no action leaves `Active`. `Requested` adds no change. `OneIssuePerCluster`: `openIssue` is the only action that writes `issues`, and its guard needs `Requested` and `issues[c] = 0`. No action leaves `Requested`.
+- P-14.3-2. `ServiceNeedsApproval`: `propose` makes a cluster with a service `Pending`, never `Active`. The only other path to `Active` is `approve`, which adds the cluster to `approved` in the same step. `NoReproposal`: `propose` is enabled only from `Absent` and moves the cluster out of `Absent`. No action moves a cluster back to `Absent`. So each cluster is proposed at most once. `ActivationCountsOnce`: each transition into `Active` adds 1 to `changes`, and no action leaves `Active`. `Requested` adds no change. `OneRequestPerCluster`: `writeRequest` is the only action that writes `requests`, and its guard needs `Requested` and `requests[c] = 0`. No action leaves `Requested`.
 - P-14.3-1. Evidence: model check.
 
 ---
@@ -152,7 +152,7 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 - AC-14.5-6: When `quint-connect` replays 100 traces of `learned.qnt`, the statuses in `learned.toml` match the model after each step.
 - AC-14.5-7: When a cluster that the entry `family_calendar` covers has requests at 07:10 on Monday, Tuesday and Wednesday, `usual_times` of `family_calendar` returns `[(weekdays, 7)]` after the check.
 - AC-14.5-8: When the next check finds the same cluster with the same times, the habit model does not change.
-- AC-14.5-9: When the proposal is a valid `new_plugin`, `learned.toml` has a `requested` entry with `needs` and no `issue`.
+- AC-14.5-9: When the proposal is a valid `new_plugin`, `learned.toml` has a `requested` entry with `needs` and no `request_file`.
 
 **Proofs.**
 
@@ -385,28 +385,28 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 
 ---
 
-### 14.12 Issues Port and GitHub Adapter
+### 14.12 Plugin Request Port and File Adapter
 
-**Goal:** Add the `Issues` port and `GitHubIssues`, which opens an issue in the Jarvis repository through the GitHub REST API. Jarvis can then ask Claude for a code change.
+**Goal:** Add the `PluginRequests` port and `RequestFiles`, which writes one Markdown file into a local folder. Jarvis can then ask Claude for a code change without a remote service.
 
 - **Implements:** G14. **Depends on:** 14.11.
-- **Files:** create `src/adapters/github.rs`. Modify `src/ports.rs`, `src/domain/learn.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
+- **Files:** modify `src/ports.rs`, `src/adapters/files.rs`, `src/domain/learn.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`, `.gitignore`.
 
 **Model.**
 
-- `Issue { title, body }` is in `src/domain/learn.rs`, because sub-phase 14.13 builds it in the domain.
-- `Issues::open(issue) -> Result<String>` opens the issue and gives its web URL.
-- `GitHubIssues` implements `Issues` with one `reqwest` client and the `[github]` settings. `open` sends `POST <url>/repos/<repo>/issues` with the headers `Authorization: Bearer <token>`, `Accept: application/vnd.github+json`, `X-GitHub-Api-Version: 2022-11-28` and `User-Agent: jarvis`, and the body `{ title, body, labels: [label], assignees: [assignee] }`. Status 201 gives the `html_url` of the reply. Another status gives an error with the status and the reply text. A request longer than `timeout_ms` gives a timeout error.
-- `FakeIssues` records each issue and gives a script of results.
-- This sub-phase adds the optional `[github]` section (`url`, `repo`, `token_env`, `label`, `assignee`, `timeout_ms`) and resolves `token_env` (sub-phase 1.2). The token is a fine-grained token with read and write access to the issues of `repo` only. Without the section, `run` makes no `Issues` adapter.
+- `PluginRequest { name, text }` is in `src/domain/learn.rs`, because sub-phase 14.13 builds it in the domain. `name` is the name of the learned entry. `text` is the Markdown text.
+- `PluginRequests::write(request) -> Result<PathBuf>` writes the request and gives the path of its file.
+- `RequestFiles` implements `PluginRequests` in `src/adapters/files.rs`, because it writes local files as the file store does. It has the folder `learn.plugin_requests`. `write` makes the folder when it does not exist. Then it writes `text` to `<folder>/<name>.md` with an atomic write: a `tempfile` in the same folder, then a rename. Thus a reader never sees a part of a file, and a second write of the same name replaces the file. The name is snake case (sub-phase 14.2), so it is a safe file name. An I/O error gives an error with the path.
+- `FakePluginRequests` records each request and gives a script of results.
+- This sub-phase adds the optional key `learn.plugin_requests`: the folder. The key turns plugin requests on. Without it, `run` makes no `PluginRequests` adapter, and Jarvis writes no plugin requests. `jarvis.toml` sets it to `plugin-requests`, and `.gitignore` ignores that folder.
 
 **Acceptance criteria.**
 
-- AC-14.12-1: When `open` runs, the mock receives one `POST /repos/louislang/ha-jarvis/issues` with the bearer token, the four headers, the title, the body, the label and the assignee.
-- AC-14.12-2: When the mock returns 201 with an `html_url`, `open` returns that URL.
-- AC-14.12-3: When the mock returns 422, `open` returns an error that contains 422 and the reply text.
-- AC-14.12-4: When the mock gives no reply within `timeout_ms`, `open` returns a timeout error.
-- AC-14.12-5: When `jarvis.toml` has no `[github]` section, `run` starts with no `Issues` adapter.
+- AC-14.12-1: When `write` runs for the name `get_traffic`, the file `<folder>/get_traffic.md` has the text of the request, and `write` returns its path.
+- AC-14.12-2: When the folder does not exist, `write` makes it and writes the file.
+- AC-14.12-3: When `write` runs two times for the same name with different texts, the folder has one file, with the second text.
+- AC-14.12-4: When the folder path is a file, `write` returns an error that contains the path.
+- AC-14.12-5: When `jarvis.toml` has no `learn.plugin_requests`, `run` starts with no `PluginRequests` adapter.
 
 **Proofs.**
 
@@ -416,7 +416,7 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 
 ### 14.13 Plugin Requests
 
-**Goal:** When System Two finds that a cluster needs remote data that no plugin gives, open one GitHub issue that asks Claude for the plugin and its fetch intent. The request then becomes a normal code PR, and after the next release it gets System One speed.
+**Goal:** When System Two finds that a cluster needs remote data that no plugin gives, write one plugin request file that asks Claude for the plugin and its fetch intent. The request then becomes a normal code PR, and after the next release it gets System One speed.
 
 - **Implements:** G11, G14, G19. **Depends on:** 14.12.
 - **Files:** modify `src/domain/learn.rs`, `src/app/background.rs`, `src/lib.rs`.
@@ -424,33 +424,34 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 
 **Model.**
 
-- Sub-phase 14.5 saves a valid `new_plugin` proposal with `status = requested` and no `issue`. The request habits of the cluster have the entry name as their key (sub-phase 14.5).
-- After each check and at startup, for each `requested` entry without `issue`, the use case builds `plugin_issue(entry, usual)` with the usual times of the entry name, calls `Issues::open`, and saves `issue := url` in the entry. An error logs one `warn` event, and the next check tries again. Without an `Issues` adapter, the entries wait.
-- `plugin_issue(entry, usual) -> Issue` is a pure function:
-  - The title is `Plugin request: <name>`.
-  - The body has four parts: `## Requests` with each cluster text on its own line, `## Usual times` with one line `<weekdays|weekends> <HH:00>` for each bucket of `usual`, or `none`, `## Data needed` with `needs`, and `## Task`.
-  - `## Task` says: write a plugin for this data in the pattern of phase 17 (one `Plugin` adapter, the change map row "Add a plugin" of `01-architecture.md` section 12), the fetch intent `<name>` with `plugin` and `fresh_min` in `intents.toml`, its pool in `responses.toml`, and tests with a local mock server. Use a free data source without an API key when one exists. Use a source with a key only after the owner agrees in this issue. Then the PR names the environment variable and the sign-up page. Open a normal PR.
-- One issue for each cluster: the entry is saved before the call, `covering` names it at each later check (`NoReproposal`), and an entry with `issue` opens no other issue. A crash after `open` and before the save of `issue` can open a second issue at the next start. The GitHub REST API has no idempotency key that prevents this.
+- Sub-phase 14.5 saves a valid `new_plugin` proposal with `status = requested` and no `request_file`. The request habits of the cluster have the entry name as their key (sub-phase 14.5).
+- After each check and at startup, for each `requested` entry without `request_file`, the use case builds `plugin_request(entry, usual)` with the usual times of the entry name, calls `PluginRequests::write`, and saves `request_file := path` in the entry. An error logs one `warn` event, and the next check tries again. Without a `PluginRequests` adapter, the entries wait. When you set `learn.plugin_requests` later, the next start writes them.
+- `plugin_request(entry, usual) -> PluginRequest` is a pure function:
+  - `name` is the entry name.
+  - `text` starts with the title line `# Plugin request: <name>`. Then it has four parts: `## Requests` with each cluster text on its own line, `## Usual times` with one line `<weekdays|weekends> <HH:00>` for each bucket of `usual`, or `none`, `## Data needed` with `needs`, and `## Task`.
+  - `## Task` says: write a plugin for this data in the pattern of phase 17 (one `Plugin` adapter, the change map row "Add a plugin" of `01-architecture.md` section 12), the fetch intent `<name>` with `plugin` and `fresh_min` in `intents.toml`, its pool in `responses.toml`, and tests with a local mock server. Use a free data source without an API key when one exists. Use a source with a key only after the owner agrees, so ask first. Then the PR names the environment variable and the sign-up page. Open a normal PR.
+- One request for each cluster: the entry is saved before the write, `covering` names it at each later check (`NoReproposal`), and an entry with `request_file` writes no other request. A crash after `write` and before the save of `request_file` writes the request again at the next start. The file name is the entry name, so the second write replaces the first file (AC-14.12-3). A second file occurs only when the first file was moved or deleted before the restart.
+- Jarvis only writes files to the folder. It does not read, move or delete them.
 - The PR of Claude adds the intent `<name>` to `intents.toml`. After the release, System One acts on the requests under the same key, and sub-phase 14.10b prefetches the intent at its usual times. The `requested` entry stays, so `covering` still skips the cluster.
 
 **Acceptance criteria.**
 
-- AC-14.13-1: When the proposal for a cluster is `new_plugin` with the name `get_traffic`, `learned.toml` has a `requested` entry, and `FakeIssues` records one issue with the title `Plugin request: get_traffic`.
-- AC-14.13-2: When `plugin_issue` runs for an entry with two texts, the usual time `(weekdays, 8)` and `needs = "current road traffic from home to work"`, the body has both texts, the line `weekdays 08:00`, the `needs` text, and the task text with the rule for API keys.
-- AC-14.13-3: When the issue is open, the entry has its URL, and the next check and the next start open no issue.
-- AC-14.13-4: When `FakeIssues` returns an error, the entry has no `issue`, and the next check records a new `open` call for it.
-- AC-14.13-5: When Jarvis has no `Issues` adapter, the entry stays `requested` without `issue`.
+- AC-14.13-1: When the proposal for a cluster is `new_plugin` with the name `get_traffic`, `learned.toml` has a `requested` entry, and `FakePluginRequests` records one request with the name `get_traffic` and the title line `# Plugin request: get_traffic`.
+- AC-14.13-2: When `plugin_request` runs for an entry with two texts, the usual time `(weekdays, 8)` and `needs = "current road traffic from home to work"`, the text has the title line, both texts, the line `weekdays 08:00`, the `needs` text, and the task text with the rule for API keys.
+- AC-14.13-3: When the write succeeds, the entry has the path in `request_file`, and the next check and the next start write no request.
+- AC-14.13-4: When `FakePluginRequests` returns an error, the entry has no `request_file`, and the next check records a new `write` call for it.
+- AC-14.13-5: When Jarvis has no `PluginRequests` adapter, the entry stays `requested` without `request_file`.
 - AC-14.13-6: When `usual` is empty, the `## Usual times` part has the line `none`.
-- AC-14.13-7: When `quint-connect` replays 100 traces of `learned.qnt`, the statuses and the issues in `learned.toml` and `FakeIssues` match the model after each step.
+- AC-14.13-7: When `quint-connect` replays 100 traces of `learned.qnt`, the statuses and the requests in `learned.toml` and `FakePluginRequests` match the model after each step.
 
 **Proofs.**
 
-- P-14.13-2, P-14.13-6. Ensures: the body is the four parts in order, with the texts of the entry, one line for each bucket of `usual` or `none`, and the `needs` text. Argument: `plugin_issue` joins the parts with one `format!` for each line, and the empty case of `usual` has its own arm.
-- P-14.13-3. Requires: `OneIssuePerCluster`, `NoReproposal`. Argument: the use case opens an issue only for a `requested` entry with `issue = None`, and it saves the URL after `Ok`.
-- P-14.13-4. Argument: the `Err` arm logs and does not save `issue`.
+- P-14.13-2, P-14.13-6. Ensures: the text is the title line and the four parts in order, with the texts of the entry, one line for each bucket of `usual` or `none`, and the `needs` text. Argument: `plugin_request` joins the parts with one `format!` for each line, and the empty case of `usual` has its own arm.
+- P-14.13-3. Requires: `OneRequestPerCluster`, `NoReproposal`. Argument: the use case writes a request only for a `requested` entry with `request_file = None`, and it saves the path after `Ok`.
+- P-14.13-4. Argument: the `Err` arm logs and does not save `request_file`.
 - P-14.13-1, P-14.13-5, P-14.13-7. Evidence: test.
 
 **Field log.**
 
-1. Make a fine-grained GitHub token with read and write access to the issues of `louislang/ha-jarvis` only. Put it in the environment file of the `jarvis` unit as `JARVIS_GITHUB_TOKEN`. Set `[github]`.
-2. Install the Claude GitHub app or the Claude Code GitHub Action on the repository. Set its trigger to an issue with the label `github.label` or the assignee `github.assignee`. Record the trigger that you chose, and record that a test issue starts Claude.
+1. In the `jarvis.toml` of the GPU host, set `learn.plugin_requests` to a folder that the `jarvis` unit can write and Claude can read. To turn plugin requests off, remove the key.
+2. Set up Claude Code to watch the folder, for example with a scheduled routine that reads each new file and does its `## Task`. Record the method that you chose, and record that a test file starts Claude.

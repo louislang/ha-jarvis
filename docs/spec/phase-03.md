@@ -144,14 +144,14 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Model.**
 
 - `context_text(area, habit_lines) -> String`: `"area: <area or none> | habits: <lines joined by '; ' or none>"`.
-- `sample_context(areas, rng) -> String`: `context_text` of a random area and no habit lines. No sub-phase adds habit lines (`01-architecture.md` decision 9).
+- `sample_context(areas, rng) -> String`: `context_text` of a random area and no habit lines. No sub-phase adds habit lines (`01-architecture.md` decision 9). Sub-phase 11.5 removes the `habits` part and the parameter `habit_lines`.
 - `held_out(text, holdout) -> bool = xxh3(normalize(text)) mod 10000 < holdout * 10000`. This sub-phase adds `train.holdout`.
 - This sub-phase adds `rand` and `xxhash-rust` (`01-architecture.md` section 7).
 
 **Acceptance criteria.**
 
 - AC-3.3-1: When `context_text("kitchen", [])` runs, it returns `"area: kitchen | habits: none"`.
-- AC-3.3-2: When `context_text(None, ["a", "b"])` runs, it returns `"area: none | habits: a; b"`.
+- AC-3.3-2: When `context_text(None, ["a", "b"])` runs, it returns `"area: none | habits: a; b"`. AC-11.5-1 replaces AC-3.3-1 and this criterion.
 - AC-3.3-3: When `sample_context` gets the same seed, it returns the same context.
 - AC-3.3-8: When `held_out` runs two times for the same text, it returns the same value.
 - AC-3.3-9: When `held_out` runs for 1,000 different texts with `holdout = 0.1`, between 70 and 130 are held out.
@@ -224,7 +224,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 - AC-3.4-1: When `jarvis dataset jarvis.toml out.json --house src/testing/house.json` runs, `out.json` is a valid training set.
 - AC-3.4-2: When it runs with `--house`, each context names an area of the reference house.
-- AC-3.4-3: When it runs without `--house`, each context is `"area: none | habits: none"`.
+- AC-3.4-3: When it runs without `--house`, each context is `"area: none | habits: none"`. AC-11.5-2 replaces this criterion.
 - AC-3.4-4: When the command runs two times with the same inputs, the two files are equal.
 - AC-3.4-5: When the command runs, the file has no example for which `held_out` is true.
 

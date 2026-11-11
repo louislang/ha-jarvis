@@ -69,7 +69,7 @@ This phase adds the driving port and the Wyoming adapter. HA can use Jarvis as i
 **Acceptance criteria.**
 
 - AC-5.3-1: When `handle` gets "turn on the lights" with a Kitchen `device_id` and `FakeClassifier` gives `lights_on` 0.9, it returns a `lights_on` response.
-- AC-5.3-2: When `handle` runs with a Kitchen `device_id`, `FakeClassifier` records the context `"area: Kitchen | habits: none"`.
+- AC-5.3-2: When `handle` runs with a Kitchen `device_id`, `FakeClassifier` records the context `"area: Kitchen | habits: none"`. AC-11.5-3 replaces this criterion.
 - AC-5.3-3: When the context has no `device_id`, the recorded context has `area: none`.
 - AC-5.3-4: When the decision is `Defer`, `handle` returns a filler text.
 - AC-5.3-5: When `predict` returns an error, `handle` returns `Err` with a `failure` text.
