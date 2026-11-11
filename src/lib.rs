@@ -87,6 +87,7 @@ pub mod domain {
     pub mod contracts;
     pub mod decide;
     pub mod dialog;
+    pub mod habits;
     pub mod intent;
     pub mod model;
     pub mod responses;
