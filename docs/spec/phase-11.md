@@ -4,9 +4,9 @@ This phase learns the habits of the house. Habits go into the model context, hel
 
 ---
 
-### 11.1 Source, Action and Bucket
+### 11.1 Source and Action
 
-**Goal:** Add the pure functions that classify a state change: who caused it, what action it was, and which time bucket it falls in. Habits can then ignore automations and count only real use.
+**Goal:** Add the pure functions that classify a state change: who caused it and what action it was. Habits can then ignore automations and count only real use.
 
 - **Implements:** G11. **Depends on:** 10.7.
 - **Files:** create `src/domain/habits.rs`. Modify `src/lib.rs`.
@@ -15,7 +15,6 @@ This phase learns the habits of the house. Habits go into the model context, hel
 
 - `source(context, jarvis_user_id) -> Source` (decision 10). `jarvis_user_id` is `Snapshot.user_id` (sub-phase 2.3).
 - `action(domain, old, new) -> Option<(action, value)>`: `on`/`off` from the state, `play` with `media_series_title` when present (the show), else `media_title`, `set_temperature` with the new `temperature`. Other attribute changes give `None`.
-- `bucket(time, zone) -> (DayType, hour)`. `DayType` is `weekdays` or `weekends`. `zone` is `Snapshot.config.time_zone`.
 
 **Acceptance criteria.**
 
@@ -27,13 +26,32 @@ This phase learns the habits of the house. Habits go into the model context, hel
 - AC-11.1-6: When a media player changes to `playing` with `media_title = Bluey`, `action` returns `play` with `Bluey`. With `media_series_title = Bluey` and `media_title = Sleepytime`, it returns `play` with `Bluey`.
 - AC-11.1-7: When the climate `temperature` changes from 72 to 70, `action` returns `set_temperature` with `70`.
 - AC-11.1-8: When only an untracked attribute changes, `action` returns none.
-- AC-11.1-9: When the time is Saturday 20:15 in the HA time zone, `bucket` returns `(weekends, 20)`.
 
 **Proofs.**
 
 - P-11.1-1 to P-11.1-4. Ensures: `source` is a total function with this precedence: Jarvis user, then `parent_id`, then other `user_id`, then none. Argument: `source` is one ordered `match` on `(user_id, parent_id)` with these four arms.
 - P-11.1-5 to P-11.1-8. Ensures: `action` gives `on` or `off` for a change of state, `play` with the show or the title, `set_temperature` with the new temperature, and `None` for a change in no tracked field. Argument: `action` matches on the domain and compares the tracked fields of `old` and `new`. A change in no tracked field reaches the `None` arm.
-- P-11.1-9. Evidence: test (time zone data).
+
+---
+
+### 11.1b Bucket
+
+**Goal:** Add the pure function that gives the time bucket of a state change. Habits can then count use by day type and hour.
+
+- **Implements:** G11. **Depends on:** 11.1.
+- **Files:** modify `src/domain/habits.rs`.
+
+**Model.**
+
+- `bucket(time, zone) -> (DayType, hour)`. `DayType` is `weekdays` or `weekends`. `zone` is `Snapshot.config.time_zone`.
+
+**Acceptance criteria.**
+
+- AC-11.1b-1: When the time is Saturday 20:15 in the HA time zone, `bucket` returns `(weekends, 20)`.
+
+**Proofs.**
+
+- P-11.1b-1. Evidence: test (time zone data).
 
 ---
 
@@ -41,7 +59,7 @@ This phase learns the habits of the house. Habits go into the model context, hel
 
 **Goal:** Add the habit model with decayed counts, scores with neighbor hours, the plain-text summary and the established habit set. Jarvis can now say what the house tends to do at a given time.
 
-- **Implements:** G11, G16. **Depends on:** 11.1.
+- **Implements:** G11, G16. **Depends on:** 11.1b.
 - **Files:** modify `src/domain/habits.rs`, `src/lib.rs`, `jarvis.toml`, `benches/domain.rs`.
 
 **Model.**
