@@ -159,7 +159,7 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 - P-14.5-2, P-14.5-3, P-14.5-9. Requires: `ServiceNeedsApproval`. Argument: the status is `requested` for `new_plugin`, else `if needs_approval { pending } else { active }` (P-14.2-4).
 - P-14.5-4. Requires: `NoReproposal`. Argument: the saved entry has the cluster centroid, so `covering` names it at the next check (P-14.1-3).
 - P-14.5-5. Requires: `NoReproposal`. Argument: the `Err` branch of `validate_proposal` saves the `none` entry with the centroid, so `covering` names it at the next check.
-- P-14.5-8. Argument: each time of the cluster has a date on or before the `last` of its key and bucket, so each `observe` returns the model unchanged (P-11.3-6).
+- P-14.5-8. Argument: each time of the cluster has a date on or before the `last` of its key and bucket, so each `observe` returns the model unchanged (P-11.3-2).
 - P-14.5-1, P-14.5-6, P-14.5-7. Evidence: test.
 
 ---
@@ -257,7 +257,7 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 
 **Model.**
 
-- The usual times of an intent are `usual_times` of the request habits with the intent name as the key (sub-phase 11.3).
+- The usual times of an intent are `usual_times` of the request habits with the intent name as the key (sub-phase 11.3b).
 - `in_window(usual, now, zone, lead) -> bool`: `usual` contains `bucket(now, zone)` or `bucket(now + lead, zone)`. Thus the window of a usual time starts `lead` before the hour and ends at the end of the hour: for weekdays 08:00 and a lead of 5 min, it is 07:55 to 09:00 on a weekday. The bucket of the shifted time gives the day type, so a window that starts before midnight works. A time change of the HA time zone moves the window with the local hour.
 - `refresh_due(usual, attempt, now, zone, lead, fresh_min) -> bool`: `in_window(usual, now, zone, lead)`, and `attempt` is none or `now - attempt >= fresh_min`. `attempt` is the time of the last prefetch of the intent, with or without success. Thus the first prefetch is at the window start, a refresh follows each `fresh_min`, and a failed prefetch waits `fresh_min` before it tries again.
 - `fresh(answer_time, now, fresh_min) = now - answer_time <= fresh_min`.
