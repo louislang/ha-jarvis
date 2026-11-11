@@ -86,7 +86,7 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
 
 ### 11.3 Request Habit Scores
 
-**Goal:** Add the request habit model: a decayed score for each request and bucket, in which each day counts once, and the usual times of a request. Jarvis can now tell when the house usually asks for something.
+**Goal:** Add the request habit model: a decayed score for each request and bucket, in which each day counts once. Jarvis can now count the requests of the house by time of the week.
 
 - **Implements:** G11. **Depends on:** 11.2.
 - **Files:** modify `src/domain/habits.rs`, `src/lib.rs`, `jarvis.toml`.
@@ -94,36 +94,54 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
 **Model.**
 
 - A request key is a name: the intent name of a request that System One acts on. Sub-phase 14.5 adds the name of a learned entry for a cluster of System Two requests.
-- `RequestHabits` keeps a `Strength { score, last }` for each key and bucket. `last` is the local date of the last day that counted. `Bucket` and `DayType` derive `Eq` and `Ord` for the map key: weekdays before weekends, then the hour.
+- `RequestHabits` maps each pair of key and bucket to a `Strength { score, last }`. `last` is the local date of the last day that counted. `Bucket` and `DayType` derive `Eq` and `Ord` for the map key: weekdays before weekends, then the hour.
 - `decayed(score, last, today, half_life_days) = score * 0.5^(days(last, today) / half_life_days)`. `days` is the number of calendar days from `last` to `today`.
-- `observe(self, key, time, zone, settings) -> Self`. `b = bucket(time, zone)`, and `d` is the local date of `time` in `zone`:
+- `observe(self, key, time, zone, half_life_days) -> Self`. `b = bucket(time, zone)`, and `d` is the local date of `time` in `zone`:
   - Without a `Strength` for `(key, b)`, it adds `{ score: 1, last: d }`.
   - When `d <= last`, it returns `self` unchanged. Thus a day counts once for each key and bucket, and an older request changes nothing.
   - Else the `Strength` becomes `{ score: decayed(score, last, d) + 1, last: d }`.
-- `usual_times(key, today, settings) -> Vec<Bucket>`: the buckets of `key` with `decayed(score, last, today) >= min_score`, in bucket order.
-- `prune(today, settings) -> Self` removes each `Strength` with a decayed score less than 0.01, and each key without a `Strength`. Thus the model does not grow with old requests.
-- The defaults are `half_life_days = 14` and `min_score = 2.0`. When a request occurs in one bucket on three days within 14 days, the score on the day of the third request is more than `1 + 0.5 + 0.5 = 2.0`, so the bucket is a usual time. Requests on two days give at most `1 + 0.5^(1/14)`, which is less than 2.0. A usual time fades when no new request comes: a habit of three days in a row ends 8 days after the last request.
-- `habits.json` keeps a list of `{ key, day, hour, score, last }` objects, because a JSON map key must be a string.
-- This sub-phase adds `[habits]` (`half_life_days`, `min_score`). `validate` checks that both are more than 0 (sub-phase 2.2).
+- This sub-phase adds `[habits]` (`half_life_days`, `min_score`). The defaults are `half_life_days = 14` and `min_score = 2.0` (sub-phase 11.3b). `validate` checks that both are more than 0 (sub-phase 2.2).
 
 **Acceptance criteria.**
 
 - AC-11.3-1: When `today` is 14 days after `last`, `decayed(4.0, last, today, 14)` returns 2.0.
-- AC-11.3-2: When `get_traffic` is observed on Monday, Tuesday and Wednesday at 08:10 in the HA time zone, `usual_times` on that Wednesday returns `[(weekdays, 8)]`.
-- AC-11.3-3: When `get_traffic` is observed five times on Monday and five times on Tuesday at 08:10, `usual_times` on that Tuesday returns no bucket.
-- AC-11.3-4: When `get_traffic` is observed at 08:10 on three weekdays, the first one 14 days before the third, `usual_times` on the day of the third returns `[(weekdays, 8)]`.
-- AC-11.3-5: When the model of AC-11.3-2 gets no new request, `usual_times` returns `[(weekdays, 8)]` 7 days after that Wednesday, and no bucket 8 days after it.
-- AC-11.3-6: When `observe` gets a time on the date of `last` or before it, for the same key and bucket, the model does not change.
-- AC-11.3-7: When `get_weather` is observed on Saturday at 09:30, the model has a `Strength` for `(weekends, 9)` and none for `(weekdays, 9)`.
-- AC-11.3-8: When the decayed score of a `Strength` is less than 0.01, `prune` removes it, and the other entries do not change.
+- AC-11.3-2: When `observe` gets a time on the date of `last` or before it, for the same key and bucket, the model does not change.
+- AC-11.3-3: When `get_weather` is observed on Saturday at 09:30, the model has a `Strength` for `(weekends, 9)` and none for `(weekdays, 9)`.
 
 **Proofs.**
 
 - P-11.3-1. Ensures: `decayed(s, l, t, h) = s * 0.5^(days(l, t) / h)`. Argument: `decayed` is that expression. The test checks the value (`02-rules.md` section 5.1, rule 9).
-- P-11.3-2 to P-11.3-5. Ensures: `usual_times(k, t)` has `b` if and only if `(k, b)` has a `Strength` with `decayed(score, last, t) >= min_score`. Argument: `usual_times` filters the entries of `k` with that predicate. The tests check the values.
-- P-11.3-6. Ensures: when `(k, b)` has a `Strength` and `d <= last`, `observe` returns the model unchanged. Argument: `observe` returns `self` in the arm with the guard `d <= last`.
-- P-11.3-7. Ensures: `observe` changes only the entry of `(key, bucket(time, zone))`. Argument: `observe` reads and writes only that map entry, and P-11.1b-1 gives the bucket.
-- P-11.3-8. Ensures: `prune` keeps a `Strength` if and only if its decayed score is 0.01 or more. Argument: `prune` is a filter with that predicate, then a filter that removes the empty keys.
+- P-11.3-2. Ensures: when `(k, b)` has a `Strength` and `d <= last`, `observe` returns the model unchanged. Argument: `observe` returns `self` in the arm with the guard `d <= last`.
+- P-11.3-3. Ensures: `observe` changes only the entry of `(key, bucket(time, zone))`. Argument: `observe` reads and writes only that map entry, and P-11.1b-1 gives the bucket.
+
+---
+
+### 11.3b Usual Times and Habit File
+
+**Goal:** Add the usual times of a request, the removal of faded scores and the file format of the model. Jarvis can now tell when the house usually asks for something.
+
+- **Implements:** G11. **Depends on:** 11.3.
+- **Files:** modify `src/domain/habits.rs`.
+
+**Model.**
+
+- `usual_times(key, today, half_life_days, min_score) -> Vec<Bucket>`: the buckets of `key` with `decayed(score, last, today) >= min_score`, in bucket order.
+- `prune(today, half_life_days) -> Self` removes each `Strength` with a decayed score less than 0.01. Thus the model does not grow with old requests.
+- With the defaults of sub-phase 11.3, a request in one bucket on three days within 14 days has a score of more than `1 + 0.5 + 0.5 = 2.0` on the day of the third request, so the bucket is a usual time. Requests on two days give at most `1 + 0.5^(1/14)`, which is less than 2.0. A usual time fades when no new request comes: a habit of three days in a row ends 8 days after the last request.
+- `habits.json` keeps a list of `{ key, day, hour, score, last }` objects, because a JSON map key must be a string.
+
+**Acceptance criteria.**
+
+- AC-11.3b-1: When `get_traffic` is observed on Monday, Tuesday and Wednesday at 08:10 in the HA time zone, `usual_times` on that Wednesday returns `[(weekdays, 8)]`.
+- AC-11.3b-2: When `get_traffic` is observed five times on Monday and five times on Tuesday at 08:10, `usual_times` on that Tuesday returns no bucket.
+- AC-11.3b-3: When `get_traffic` is observed at 08:10 on three weekdays, the first one 14 days before the third, `usual_times` on the day of the third returns `[(weekdays, 8)]`.
+- AC-11.3b-4: When the model of AC-11.3b-1 gets no new request, `usual_times` returns `[(weekdays, 8)]` 7 days after that Wednesday, and no bucket 8 days after it.
+- AC-11.3b-5: When the decayed score of a `Strength` is less than 0.01, `prune` removes it, and the other entries do not change.
+
+**Proofs.**
+
+- P-11.3b-1 to P-11.3b-4. Ensures: `usual_times(k, t)` has `b` if and only if `(k, b)` has a `Strength` with `decayed(score, last, t) >= min_score`. Argument: `usual_times` filters the entries of `k` with that predicate. The tests check the values.
+- P-11.3b-5. Ensures: `prune` keeps a `Strength` if and only if its decayed score is 0.01 or more. Argument: `prune` is a filter with that predicate.
 
 ---
 
@@ -131,7 +149,7 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
 
 **Goal:** Record each spoken request that System One acts on in the request habit model, and save the model on an interval and at shutdown. Request habits now build up from normal use of the house.
 
-- **Implements:** G11. **Depends on:** 11.3.
+- **Implements:** G11. **Depends on:** 11.3b.
 - **Files:** modify `src/app/conversation.rs`, `src/app/background.rs`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.**
