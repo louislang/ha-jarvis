@@ -145,12 +145,12 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
 
 ---
 
-### 11.4 Request Recording and Store
+### 11.4 Request Recording
 
-**Goal:** Record each spoken request that System One acts on in the request habit model, and save the model on an interval and at shutdown. Request habits now build up from normal use of the house.
+**Goal:** Record each spoken request that System One acts on in the request habit model. Request habits now build up from normal use of the house.
 
 - **Implements:** G11. **Depends on:** 11.3b.
-- **Files:** modify `src/app/conversation.rs`, `src/app/background.rs`, `src/lib.rs`, `src/testing/e2e.rs`, `jarvis.toml`.
+- **Files:** modify `src/app/conversation.rs`, `src/app/background.rs`, `src/lib.rs`.
 
 **Model.**
 
@@ -160,10 +160,8 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
   - The decision is not `Defer` with `Job::Llm`. Sub-phase 14.5 counts the requests that System Two answers.
 - A request that asks for the area counts once, with its intent. The answer that fills the area does not count.
 - An HA state change or an automation never reaches `handle`, so it never counts.
-- `handle` and the habit task share the model behind one `std::sync::Mutex`. No code holds the lock across an `await`. A poisoned lock logs one `warn` event, and the request does not count.
-- At startup, `run` loads the model from a `Store<RequestHabits>` at `habits.file`, or starts with an empty model. The habit task in `src/app/background.rs` saves `prune(today)` of the model each `save_interval_s` and at shutdown.
-- This sub-phase adds `habits.file` and `habits.save_interval_s`. `validate` checks that `save_interval_s` is more than 0.
-- The pipeline harness of `src/testing/e2e.rs` keeps `habits.json` in its temporary folder, as it keeps `pools.json`. Thus a test does not read or write the habit file of the repository folder.
+- `src/app/background.rs` keeps the model behind one `std::sync::Mutex`, which `handle` and the habit task (sub-phase 11.4b) share. No code holds the lock across an `await`. A poisoned lock logs one `warn` event, and the request does not count.
+- Until sub-phase 11.4b, `start_app` gives `handle` an empty model, and Jarvis does not save it.
 
 **Acceptance criteria.**
 
@@ -171,15 +169,37 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
 - AC-11.4-2: When the context has no `satellite_id`, the model does not change.
 - AC-11.4-3: When the decision is `Defer` with `Job::Llm`, the model does not change.
 - AC-11.4-4: When "turn on the lights" asks for the area and the answer "the kitchen" fills it, the model has one observation of `lights_on`, from the request.
-- AC-11.4-5: When `save_interval_s` passes, the habit store has the new observations.
-- AC-11.4-6: When Jarvis stops, the habit store receives a save.
-- AC-11.4-7: When the habit store has a model at startup, `usual_times` of its keys gives the stored usual times.
 
 **Proofs.**
 
 - P-11.4-2, P-11.4-3. Argument: `handle` calls `observe` only inside the guard `satellite_id.is_some() && !is_llm(decision)`.
 - P-11.4-4. Argument: the routing arms of an answer (steps 1, 2, 4 and 5) do not call `observe`. Only the arm of a new request does.
-- P-11.4-1, P-11.4-5 to P-11.4-7. Evidence: test.
+- P-11.4-1. Evidence: test.
+
+---
+
+### 11.4b Habit Store
+
+**Goal:** Save the request habit model on an interval and at shutdown, and load it at startup. Request habits now survive a restart.
+
+- **Implements:** G11. **Depends on:** 11.4.
+- **Files:** modify `src/app/background.rs`, `src/lib.rs`, `src/testing/e2e.rs`, `jarvis.toml`.
+
+**Model.**
+
+- At startup, `run` loads the model from a `Store<RequestHabits>` at `habits.file`, or starts with an empty model. The habit task in `src/app/background.rs` saves `prune(today)` of the model each `save_interval_s` and at shutdown.
+- This sub-phase adds `habits.file` and `habits.save_interval_s`. `validate` checks that `save_interval_s` is more than 0.
+- The pipeline harness of `src/testing/e2e.rs` keeps `habits.json` in its temporary folder, as it keeps `pools.json`. Thus a test does not read or write the habit file of the repository folder.
+
+**Acceptance criteria.**
+
+- AC-11.4b-1: When `save_interval_s` passes, the habit store has the new observations.
+- AC-11.4b-2: When Jarvis stops, the habit store receives a save.
+- AC-11.4b-3: When the habit store has a model at startup, `usual_times` of its keys gives the stored usual times.
+
+**Proofs.**
+
+- P-11.4b-1 to P-11.4b-3. Evidence: test.
 
 ---
 
@@ -187,7 +207,7 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
 
 **Goal:** Remove the `habits` part from the context of the System One model. Request habits are not a model input (`01-architecture.md` decision 9), so the part is always `none` and gives the model no information.
 
-- **Implements:** G3, G11. **Depends on:** 11.4.
+- **Implements:** G3, G11. **Depends on:** 11.4b.
 - **Files:** modify `src/domain/training.rs`, `src/app/conversation.rs`, `src/app/speech.rs`, `src/lib.rs`, `src/adapters/onnx.rs`, `train/test_train.py`.
 
 **Model.**
