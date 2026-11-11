@@ -289,7 +289,7 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 - **Files:** modify `src/app/background.rs`, `src/app/conversation.rs`, `src/app/speech.rs`, `src/app/plugins.rs`, `src/lib.rs`, `jarvis.toml`.
 - **Quint:** `prefetch.qnt` (conformance).
 
-**Model.** Each minute, for each active prefetch intent with `refresh_due`, set its attempt time and call `answer` with the intent `question`. The question has the area of the most recent interaction of the intent, so System Two gets its entities. A `Call` step with a service in `learn.prefetch_services` runs, and its result goes back to System Two. Any other `Call` step discards the prefetch and makes no call. A `Plugin` step runs through the plugin registry, because a plugin only reads data (decision 30). It uses `Plugins::refresh(call, home)`: `fetch` of sub-phase 17.1 without the cache read. `refresh` always calls the plugin, and its result replaces the cache entry. Thus a prefetched answer never has plugin data older than the prefetch, also when `plugins.cache_s` is longer than `fresh_min`. Only a stream that ends with `Done` and no error forms the answer, which is pre-rendered, stored with its time, and replaces the old answer. A failed prefetch keeps the old answer. Prefetch intents have no slots (sub-phase 14.2), so the intent is the full cache key. When the intent is predicted, a fresh answer is the reply. Else the request goes to System Two. This sub-phase adds `learn.prefetch_services`.
+**Model.** Each minute, for each active prefetch intent with `refresh_due`, set its attempt time and call `answer` with the intent `question`. The question has the area of the most recent interaction of the intent, so System Two gets its entities. A `Call` step with a service in `learn.prefetch_services` runs, and its result goes back to System Two. Any other `Call` step discards the prefetch and makes no call. A `Plugin` step runs through the plugin registry, because a plugin only reads data (decision 30). It uses `Plugins::refresh(call, home)`: `fetch` of sub-phase 17.1 without the cache read. `refresh` always calls the plugin, and its result replaces the cache entry. Thus a prefetched answer never has plugin data older than the prefetch, also when `plugins.cache_s` is longer than `fresh_min`. Only a stream that ends with `Done` and no error forms the answer, which is pre-rendered, stored with its time, and replaces the old answer. A failed prefetch keeps the old answer. Prefetch intents have no slots (sub-phase 14.2), so the intent and the area of the question are the full cache key. When the intent is predicted, a fresh answer with the area of the request is the reply. Else the request goes to System Two. This sub-phase adds `learn.prefetch_services`.
 
 **Acceptance criteria.**
 
@@ -305,10 +305,11 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 - AC-14.10-10: When `FakeReasoner` gives a `Plugin` step during a prefetch, `FakePlugin` records the fetch, `FakeHome` records no call, and the prefetch continues.
 - AC-14.10-11: When the window of weekdays 08:00 is open with `fresh_min = 30`, `FakeReasoner` records `answer` calls at 07:55, 08:25 and 08:55, and no call at 09:00 or later.
 - AC-14.10-12: When the registry cache has a result of the call from less than `cache_s` ago, a `Plugin` step during a prefetch still makes `FakePlugin` record a new fetch, and the next `fetch` of the call returns the new result.
+- AC-14.10-13: When the fresh answer has the area Kitchen and the request comes from the Office, `handle` returns a filler and the request goes to System Two.
 
 **Proofs.**
 
-- P-14.10-3, P-14.10-4. Requires: `ServedAnswerIsFresh`. Argument: the reply branch is guarded by `fresh` (P-14.9-4).
+- P-14.10-3, P-14.10-4, P-14.10-13. Requires: `ServedAnswerIsFresh`. Argument: the reply branch is guarded by `fresh` (P-14.9-4) and by the equality of the stored area and the area of the request.
 - P-14.10-5. Requires: `NoCallFromPrefetch`. Argument: the `Call` arm of the prefetch consumer checks the service against `prefetch_services` before it calls `Home`. Any other service returns a discard.
 - P-14.10-9. Argument: only the `Done` arm without an error replaces the stored answer.
 - P-14.10-10. Argument: the `Plugin` arm of the prefetch consumer calls only `Plugins::refresh` and has no discard.
@@ -330,8 +331,8 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 - The prefetch use case of sub-phase 14.10 also runs, each minute, each fetch intent of the live catalog with `refresh_due`. It sets the attempt time of the intent first.
 - It renders the `data` of the intent with no slots, as in step 2 of sub-phase 17.4. A data value that needs a slot gives no prefetch for that intent.
 - It runs `Plugins::refresh` (sub-phase 14.10) with the rendered call and the `HomeConfig` of the hot cache. A plugin only reads data (decision 30), so the prefetch acts on nothing.
-- On success, it selects and renders one response of the intent pool with the result as `response` and the area of the most recent interaction of the intent, pre-renders it, and stores `{ call, text, time }` for the intent. It replaces the old answer. An error keeps the old answer.
-- When `decide` gives `Defer` with a filler and `Job::Fetch { call, pool }`, and the stored answer of `pool` is fresh and has the same `call`, `handle` replies with the stored text instead. It speaks no filler and fetches nothing. Else the fetch runs as in sub-phase 17.4.
+- On success, it selects and renders one response of the intent pool with the result as `response` and the area of the most recent interaction of the intent, pre-renders it, and stores `{ call, area, text, time }` for the intent. `area` is the area of the render, or none. It replaces the old answer. An error keeps the old answer.
+- When `decide` gives `Defer` with a filler and `Job::Fetch { call, pool }`, and the stored answer of `pool` is fresh, has the same `call` and has the same area as the request, `handle` replies with the stored text instead. A pool can use `area`, so a text rendered for one area never answers a request in another area. It speaks no filler and fetches nothing. Else the fetch runs as in sub-phase 17.4.
 - `refresh` skips the registry cache, so each refresh gets new plugin data, also when `plugins.cache_s` is longer than `fresh_min`.
 
 **Acceptance criteria.**
@@ -340,7 +341,7 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 - AC-14.10b-2: When the user asks "what is the weather like" at Saturday 09:10, `handle` returns the prefetched text, and `FakePlugin` records no new fetch.
 - AC-14.10b-3: When the window stays open, `FakePlugin` records the next fetch at 09:25:23, and no fetch at 10:00:00 or later.
 - AC-14.10b-4: When the stored answer is older than `fresh_min`, `handle` returns a filler and the fetch runs as in sub-phase 17.4.
-- AC-14.10b-5: When the stored call has other arguments than the call of the request, `handle` returns a filler and the fetch runs.
+- AC-14.10b-5: When the stored call has other arguments than the call of the request, or the stored area is the Kitchen and the request comes from the Office, `handle` returns a filler and the fetch runs.
 - AC-14.10b-6: When the `data` of a fetch intent uses a slot, the intent gets no prefetch.
 - AC-14.10b-7: When `FakePlugin` returns an error during a refresh, the old answer stays, and the next fetch is `fresh_min` later.
 - AC-14.10b-8 [GPU host]: A fresh fetch intent answer has a response latency p95 of 300 ms or less in the Phase 9 harness.
@@ -348,7 +349,7 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 
 **Proofs.**
 
-- P-14.10b-2, P-14.10b-4, P-14.10b-5. Requires: `ServedAnswerIsFresh`. Argument: the reply branch is guarded by `fresh` (P-14.9-4) and by the equality of the stored call and the call of the request.
+- P-14.10b-2, P-14.10b-4, P-14.10b-5. Requires: `ServedAnswerIsFresh`. Argument: the reply branch is guarded by `fresh` (P-14.9-4) and by the equality of the stored call and area and those of the request.
 - P-14.10b-3. Requires: `PrefetchOnlyInWindow`, `NoEarlyRefresh`. Argument: the fetch starts only under `refresh_due` (P-14.9-3).
 - P-14.10b-6. Argument: a render error of the data returns before `Plugins::refresh`.
 - P-14.10b-7. Argument: only the `Ok` arm replaces the stored answer, and the attempt time is set before the fetch.
