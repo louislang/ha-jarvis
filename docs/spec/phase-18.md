@@ -609,6 +609,8 @@ Speaker groups were one sub-phase. With the controls, its tests and its Verus pr
   | "unpause the music" | `music_resume` | `volume_down` |
   | "turn off the tv" | `tv_off` | `volume_down` |
 
+  AC-11.5-4 replaces this criterion.
+
 - AC-18.16-8: When the fixture model gets each phrase of the table of AC-18.16-7, the top label is not the old wrong intent of the phrase.
 
 **Proofs.**

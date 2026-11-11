@@ -79,8 +79,8 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
 **Proofs.**
 
 - P-11.2-1. Evidence: test (the `serde` derive).
-- P-11.2-2. Ensures: the allowed set of `check_slots` is the tagged slots and the built-ins. Argument: `check_slots` inserts only these names before it checks the templates.
-- P-11.2-3. Ensures: `variables` gives the slots of the intent and the built-ins of its kind and target. Argument: `variables` inserts only these names.
+- P-11.2-2. Evidence: test. Argument: `check_slots` inserts only the tagged slots and the built-ins into its set of allowed names before it checks the templates. Verus cannot state the claim, because the set is local to `check_slots`, and the `ensures` of `parse_example` does not state the slot names (P-3.2b).
+- P-11.2-3. Evidence: test. Argument: `variables` inserts only the slots of the intent and the built-ins of its kind and target. Verus cannot state the claim, because the `ensures` of `parse_example` does not state the slot names (P-3.2b, P-4.2-6).
 
 ---
 
@@ -161,3 +161,39 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
 - P-11.4-2, P-11.4-3. Argument: `handle` calls `observe` only inside the guard `satellite_id.is_some() && !is_llm(decision)`.
 - P-11.4-4. Argument: the routing arms of an answer (steps 1, 2, 4 and 5) do not call `observe`. Only the arm of a new request does.
 - P-11.4-1, P-11.4-5 to P-11.4-7. Evidence: test.
+
+---
+
+### 11.5 Remove Habits From the Model Context
+
+**Goal:** Remove the `habits` part from the context of the System One model. Request habits are not a model input (`01-architecture.md` decision 9), so the part is always `none` and gives the model no information.
+
+- **Implements:** G3, G11. **Depends on:** 11.4.
+- **Files:** modify `src/domain/training.rs`, `src/app/conversation.rs`, `src/app/speech.rs`, `src/lib.rs`, `src/adapters/onnx.rs`, `train/test_train.py`.
+
+**Model.**
+
+- `context_text(area) -> String`: `"area: <area or none>"`. The parameter `habit_lines`, the helper `join`, the spec function `joined` and the test of AC-3.3-2 go away. The spec function `context_spec` loses its `habit_lines` parameter.
+- `sample_context` (sub-phase 3.3), `handle` (sub-phase 5.3), the speculative prediction (sub-phase 6.8) and the test of AC-3.4-2 call `context_text` with the area only. Thus the training set file of the `dataset` command, the fixture model and the training sets of sub-phase 13.1 get the new context.
+- `train/train.py` gives the context to the tokenizer as one text segment, and it does not parse it. Thus it does not change. The fixtures of `train/test_train.py` use the new context, as the training set file does.
+- The tests that give a context directly use the new context: the adapter tests of `src/adapters/onnx.rs`, and the tests of AC-5.3-3, AC-5.4c-1 and AC-6.8-11.
+- The training set file changes, so `just fixture-model` and the CI job `fixture-model` train the fixture model again (sub-phase 3.9). Every criterion that uses the fixture model must pass with the new model. When one fails, change the specification first.
+- The live Jarvis on the GPU host serves the fixture model (sub-phase 5.4) that it trained with the old context. Thus the model must train again after the release (field log).
+
+**Acceptance criteria.**
+
+- AC-11.5-1: When `context_text(Some("kitchen"))` runs, it returns `"area: kitchen"`. When `context_text(None)` runs, it returns `"area: none"`. This replaces AC-3.3-1 and AC-3.3-2.
+- AC-11.5-2: When `jarvis dataset` runs without `--house`, each context is `"area: none"`. With `--house`, no context contains `habits`. This replaces AC-3.4-3.
+- AC-11.5-3: When `handle` runs with a Kitchen `device_id`, `FakeClassifier` records the context `"area: Kitchen"`. This replaces AC-5.3-2.
+- AC-11.5-4: When the fixture model gets each phrase of the table of AC-18.16-7 with the context `area: none`, the top label is the new intent, with a probability of `model.commit_threshold` or more. This replaces AC-18.16-7.
+
+**Proofs.**
+
+- P-11.5-1. Ensures: the result is `area: <area or none>`. Argument: `context_text` is a `format!` with one branch for no area.
+- P-11.5-2. Argument: the contexts come from `sample_context`, which calls `context_text` with an area of the list, or with no area when the list is empty (P-11.5-1).
+- P-11.5-3. Argument: `handle` gives the classifier `context_text` of the area of the device (P-11.5-1).
+- P-11.5-4. Evidence: test (the fixture model).
+
+**Field log.**
+
+1. After the release with this sub-phase, stop the `jarvis` unit on the GPU host, run `just fixture-model` in its checkout, and start the unit again. Record that "turn on the lights" from the Office satellite turns on the Office lights.

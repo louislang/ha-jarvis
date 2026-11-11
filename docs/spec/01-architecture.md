@@ -50,7 +50,7 @@ Dependency rules:
                                    │   │ decide responses state │ │   Plugin ─────────▶ adapters/open_meteo.rs ─▶ Open-Meteo
                                    │   │ dialog habits feedback │ │                     adapters/plex.rs ─▶ Plex
                                    │   │ learn speaker speech   │ │   Models ─────────▶ LiveModels (lib.rs)
-                                   │   └────────────────────────┘ │   Issues ─────────▶ adapters/github.rs ─▶ GitHub
+                                   │   └────────────────────────┘ │   PluginRequests ─▶ adapters/files.rs
                                    └──────────────────────────────┘
 ```
 
@@ -76,7 +76,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | `Store<T>` | Driven | `load`, `save` | `adapters/files.rs` (TOML or JSON from the file extension) |
 | `Clock` | Driven | `now` | `SystemClock` in `src/lib.rs` |
 | `Models` | Driven | `release`, `restore` | `LiveModels` in `src/lib.rs` |
-| `Issues` | Driven | `open` | `adapters/github.rs` |
+| `PluginRequests` | Driven | `write` | `adapters/files.rs` |
 
 Tests in the application layer use the fakes in `src/testing/fakes.rs`. Adapter tests use local servers (`wiremock`, a fake HA WebSocket server), in-memory object stores or real models.
 
@@ -86,12 +86,12 @@ The System One model is one ONNX model with two heads: intent classification and
 
 Input: two text segments.
 
-- Segment A is the context. `context_text` makes it from the satellite area. No sub-phase gives habit lines, so the `habits` part is always `none` (decision 9).
+- Segment A is the context: `area: <area or none>`. `context_text` makes it from the satellite area. Request habits are not a model input (decision 9), so sub-phase 11.5 removes the old `habits` part.
 - Segment B is the normalized transcript (sub-phase 3.1).
 
 ```
 User: "Turn on the lights"
-Context: "area: living room | habits: none"
+Context: "area: living room"
 ```
 
 Output:
@@ -163,7 +163,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 29. **Blocking work off the async workers.** STT decoding, the second pass, `predict`, TTS synthesis, voice embedding and SQLite calls run in `tokio::task::spawn_blocking`. The async workers only move bytes and wait. Thus a decode for one satellite does not delay `handle` for another.
 30. **Remote data through plugins.** Data from a remote server, for example a weather forecast, reaches Jarvis only through a `Plugin` adapter. Jarvis code builds the request and parses the reply into a typed result. Thus the result is the same for the same reply, and no model sees a raw API call. System Two gets each plugin as its own tool, for example `get_weather(when)`. A System One fetch intent names a plugin. The plugin registry keeps each result for `plugins.cache_s`. A plugin only reads data, so it has no `allowed_domains` check. System Two still calls HA services directly, within `openai.allowed_domains` (sub-phase 7.5). The weather plugin uses Open-Meteo, which needs no API key, with the location of the HA configuration. The Plex plugin reads the recently added items and the On Deck list of the Plex server with a token (phase 18). A new plugin uses a free data source without an API key when one exists. A source with a key needs your approval first, and the PR of the plugin then names the environment variable and the sign-up page.
 31. **Fixed TTS input lengths.** ONNX Runtime keeps the cuDNN state of a `Conv` node only for its last input shape, so each new reply length added about 230 ms to the TTS on the GPU host. Jarvis runs the four Supertonic-3 graphs itself through `ort`, with the fp32 vector estimator and vocoder. It adds zeros and masks to each input up to one of two lengths: 64 text ids and 64 latent frames, or 160 text ids and 192 latent frames. Each length has its own set of sessions, so a change of length builds no new plans. A longer input keeps its length (sub-phases 9.3 and 9.3b).
-32. **Plugin requests through GitHub.** When System Two finds that a cluster needs remote data that no plugin gives, Jarvis does not guess an answer source. It opens one GitHub issue for the cluster through the `Issues` port: the example requests, the usual times and the data needed (sub-phase 14.13). Claude writes a normal code PR with the plugin, the fetch intent and its `fresh_min`, and the tests. CI, the Codex review and your review gate it as any other PR, and the next release puts it on the GPU host. The issue has the label `github.label` and the assignee `github.assignee`. The app that starts Claude on such an issue is a setting of the repository (field log of sub-phase 14.13).
+32. **Plugin requests through a local folder.** When System Two finds that a cluster needs remote data that no plugin gives, Jarvis does not guess an answer source. It writes one Markdown file for the cluster into the folder `learn.plugin_requests` through the `PluginRequests` port: the example requests, the usual times, the data needed and the task (sub-phase 14.13). The file name is the name of the future fetch intent. Claude watches the folder and writes a normal code PR with the plugin, the fetch intent and its `fresh_min`, and the tests. CI, the Codex review and your review gate it as any other PR, and the next release puts it on the GPU host. How Claude watches the folder is outside Jarvis (field log of sub-phase 14.13). Without `learn.plugin_requests`, Jarvis writes no plugin requests. Thus Jarvis needs no remote service and no token for this.
 
 ## 6. Latency Budget (System One)
 
@@ -209,14 +209,14 @@ With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan c
 | `ort` (features `load-dynamic`, `cuda`), `tokenizers` | Adapter | System One model prediction and the Supertonic-3 TTS graphs with ONNX Runtime (CUDA or CPU execution provider). Tokenizer from `tokenizer.json`. |
 | `rand_distr` | Adapter | Seeded normal noise of the Supertonic-3 latent (`StandardNormal`). |
 | `unicode-normalization` | Adapter | NFKD of the TTS text before the Supertonic-3 indexer. |
-| `reqwest` | Adapter | RunPod serverless REST API. Open-Meteo forecast API (features `json`, `query`). Plex server API. GitHub REST API. |
+| `reqwest` | Adapter | RunPod serverless REST API. Open-Meteo forecast API (features `json`, `query`). Plex server API. |
 | `object_store` (feature `aws`) | Adapter | RunPod network volume through its S3-compatible API. |
 | `async-openai` | Adapter | OpenAI Responses API: streaming, tools, structured output, `previous_response_id`. |
 | `rusqlite` (feature `bundled`) | Adapter | Interaction log database. |
 | `axum` | Adapter | Review web page and API. |
 | `hound` | Adapter | WAV encode for audio playback. |
 | `toml`, `tempfile` | Adapter, root | File stores with atomic write. Configuration. |
-| `wiremock` (dev) | Adapter tests | Mock OpenAI, RunPod, Open-Meteo, Plex and GitHub servers. |
+| `wiremock` (dev) | Adapter tests | Mock OpenAI, RunPod, Open-Meteo and Plex servers. |
 | `rubato` (dev) | Test | Resample TTS audio from 44.1 kHz to 16 kHz in `speech(text)`. |
 | `cargo-llvm-cov` (tool) | — | Coverage gate. |
 | `rust-code-analysis-cli` (tool) | — | Cyclomatic complexity, Halstead and Python function length metrics. `xtask complexity` reads its JSON output. |
@@ -290,7 +290,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `quint/dialog.qnt` | Model | Dialogs. | 10.1 |
 | `quint/feedback.qnt` | Model | Marks and blocked decisions. | 12.2 |
 | `quint/training.qnt` | Model | Training trigger, run, pause, accept and fallback. | 13.4 |
-| `quint/learned.qnt` | Model | Learned intent lifecycle, approval and plugin request issues. | 14.3 |
+| `quint/learned.qnt` | Model | Learned intent lifecycle, approval and plugin requests. | 14.3 |
 | `quint/prefetch.qnt` | Model | Prefetch window, refresh, freshness and side effects. | 14.8 |
 | `quint/speaker.qnt` | Model | Speaker identification and enrollment. | 15.5 |
 | `quint/jarvis.qnt` | Model | The system model. It composes the other models. | 16.1 |
@@ -321,7 +321,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/app/plugins.rs` | Application | Plugin registry: lookup by tool name, result cache and deadline. | 17.1 |
 | `src/adapters/ha.rs` | Adapter | `Home` over the HA WebSocket API. | 2.2 |
 | `src/adapters/onnx.rs` | Adapter | `Classifier` and `ModelLoader` with ONNX Runtime. | 3.12 |
-| `src/adapters/files.rs` | Adapter | `Store<T>` with TOML or JSON files and atomic write. | 4.3 |
+| `src/adapters/files.rs` | Adapter | `Store<T>` with TOML or JSON files and atomic write. `PluginRequests` with Markdown files in a folder (sub-phase 14.12). | 4.3 |
 | `src/adapters/wyoming.rs` | Driving adapter | Wyoming TCP server. It calls `Assistant`. | 5.1 |
 | `src/adapters/sherpa.rs` | Adapter | `SpeechToText` (first and second pass), `VoiceEmbedder`, `VoiceProfiles` with sherpa-onnx. | 6.2 |
 | `src/adapters/supertonic.rs` | Adapter | `TextToSpeech` with the Supertonic-3 graphs in ONNX Runtime and fixed input lengths. | 9.3 |
@@ -333,12 +333,11 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/adapters/runpod.rs` | Adapter | `Trainer` with the RunPod REST API and network volume (fallback). | 13.8b |
 | `src/adapters/open_meteo.rs` | Adapter | `Plugin` `get_weather` with the Open-Meteo forecast API. | 17.3 |
 | `src/adapters/plex.rs` | Adapter | `Plugin` `get_new_shows` with the Plex server API. | 18.11 |
-| `src/adapters/github.rs` | Adapter | `Issues` with the GitHub REST API. | 14.12 |
 | `src/testing/house.json` | Test | The reference house snapshot (section 11). | 2.1 |
 | `src/testing/fakes.rs` | Test | `#[cfg(test)]` only. A fake for each port, `FakeWyomingClient`, `speech(text)`. | 2.9 |
 | `src/testing/e2e.rs` | Test | `#[cfg(test)]` only. Pipeline harness and end-to-end latency tests. | 9.1 |
 
-Jarvis also writes these data files: `habits.json`, `voices.json`, `jarvis.db`, `generated.json`, `training.json`, `pools.json` (use counts and generated responses), `learned.toml` (learned intents) and the model folders in `models/system-one/`. They are not source files, and Git ignores them. Edit `learned.toml` only while Jarvis is stopped. `jarvis.local.toml` is the configuration of a machine other than the GPU host (section 9). Git ignores it too.
+Jarvis also writes these data files: `habits.json`, `voices.json`, `jarvis.db`, `generated.json`, `training.json`, `pools.json` (use counts and generated responses), `learned.toml` (learned intents), the plugin request files in the folder `learn.plugin_requests` and the model folders in `models/system-one/`. They are not source files, and Git ignores them. Edit `learned.toml` only while Jarvis is stopped. `jarvis.local.toml` is the configuration of a machine other than the GPU host (section 9). Git ignores it too.
 
 Unit tests are in a `#[cfg(test)] mod tests` block at the end of each source file. The conformance driver for a Quint model is in the test block of the module that it checks. Shared test code is in `src/testing/` only. The fake HA WebSocket server is in the test block of `src/adapters/ha.rs`. `src/testing/house.json` is a data file: tests embed it with `include_str!`, and the `dataset` command reads it from its `--house` path.
 
@@ -471,15 +470,8 @@ check_interval_s = 3600
 responses = 10
 prefetch_lead_min = 5
 prefetch_services = ["calendar.get_events"]
-
-# Optional. Without this section, Jarvis opens no plugin requests (sub-phase 14.13).
-[github]
-url = "https://api.github.com"
-repo = "louislang/ha-jarvis"
-token_env = "JARVIS_GITHUB_TOKEN" # fine-grained, issues of `repo` only
-label = "claude"
-assignee = "louislang" # the login that the Claude trigger watches (field log of sub-phase 14.13)
-timeout_ms = 10000
+# Optional. Without it, Jarvis writes no plugin requests (sub-phase 14.13).
+plugin_requests = "plugin-requests"
 
 [log]
 database = "jarvis.db"
@@ -686,9 +678,9 @@ Training set file (the contract between Jarvis and `train/train.py`):
   "labels": ["unknown", "lights_on", "fan_on"],
   "tags": ["O", "B-area", "I-area", "B-show", "I-show"],
   "examples": [
-    { "context": "area: kitchen | habits: none", "text": "turn on the kitchen lights", "intent": "lights_on",
+    { "context": "area: kitchen", "text": "turn on the kitchen lights", "intent": "lights_on",
       "spans": [{ "slot": "area", "start": 12, "end": 19 }] },
-    { "context": "area: office | habits: none", "text": "turn on the tv", "not": "tv_on", "spans": null }
+    { "context": "area: office", "text": "turn on the tv", "not": "tv_on", "spans": null }
   ]
 }
 ```
@@ -787,7 +779,7 @@ Each model has state variables, actions and named invariants. `02-rules.md` sect
 | `dialog.qnt` | Dialogs and deferred jobs | `domain/dialog.rs`, `app/conversation.rs` | `TurnLimit`, `NoCallAfterCancel` |
 | `feedback.qnt` | Marks | `domain/feedback.rs` | `DecideAvoidsBlocked` |
 | `training.qnt` | Training | `domain/training.rs`, `app/training.rs` | `OneRun`, `SwapNeverWorse`, `CountResetsAfterRun`, `FailureKeepsModel`, `FallbackOnce`, `PauseOnlyLocal` |
-| `learned.qnt` | Learned intents | `domain/learn.rs`, `app/background.rs` | `ServiceNeedsApproval`, `NoReproposal`, `ActivationCountsOnce`, `OneIssuePerCluster` |
+| `learned.qnt` | Learned intents | `domain/learn.rs`, `app/background.rs` | `ServiceNeedsApproval`, `NoReproposal`, `ActivationCountsOnce`, `OneRequestPerCluster` |
 | `prefetch.qnt` | Prefetch | `domain/learn.rs`, `app/background.rs` | `NoCallFromPrefetch`, `ServedAnswerIsFresh`, `PrefetchOnlyInWindow`, `NoEarlyRefresh` |
 | `speaker.qnt` | Speaker identification | `domain/speaker.rs` | `SpeakerIsCandidate`, `NoVoiceOnlyEnrollment` |
 | `jarvis.qnt` | System | All use cases | `OneHandledPerRequest`, `ReplyBeforeCall`, `FillerBeforeAnswer`, `ModelSwapAtomic`, `NoTalkOver` |

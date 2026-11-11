@@ -1,6 +1,6 @@
 # Phase 17: Plugins
 
-This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a remote server reaches Jarvis only through a plugin: System Two gets each plugin as a tool, and a System One fetch intent names a plugin. The first plugin is the weather forecast from Open-Meteo. Sub-phase 14.2 adds `fresh_min` to each fetch intent, and sub-phase 14.10b prefetches a fetch intent at its usual times. Sub-phase 14.13 asks Claude for each new plugin through a GitHub issue. A new plugin follows the pattern of this phase and uses a free data source without an API key when one exists (decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 9 and before phase 10.
+This phase adds the plugin layer (`01-architecture.md` decision 30). Data from a remote server reaches Jarvis only through a plugin: System Two gets each plugin as a tool, and a System One fetch intent names a plugin. The first plugin is the weather forecast from Open-Meteo. Sub-phase 14.2 adds `fresh_min` to each fetch intent, and sub-phase 14.10b prefetches a fetch intent at its usual times. Sub-phase 14.13 asks Claude for each new plugin through a plugin request file in a local folder. A new plugin follows the pattern of this phase and uses a free data source without an API key when one exists (decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 9 and before phase 10.
 
 ---
 
