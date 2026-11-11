@@ -95,12 +95,12 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 - This sub-phase adds `minijinja` (`01-architecture.md` section 7). Sub-phase 4.2 uses the same crate.
 - `validate_catalog` adds these checks:
-  4. Each variable of a template (the `entity` field and the `data` values) that is not a built-in (`area`, `entity`, `person`, `response`) and not a `habit_defaults` key is tagged in one or more examples of the intent. The check gets the variables from `minijinja` `undeclared_variables` and collects them into a `BTreeSet`. A template that does not parse gives an error.
+  4. Each variable of a template (the `entity` field and the `data` values) that is not a built-in (`area`, `entity`, `person`, `response`) and not a `habit_defaults` key is tagged in one or more examples of the intent. Sub-phase 11.2 removes `habit_defaults`. The check gets the variables from `minijinja` `undeclared_variables` and collects them into a `BTreeSet`. A template that does not parse gives an error.
   5. The text of each example (after the markup) equals its `normalize` result.
 
 **Acceptance criteria.**
 
-- AC-3.2b-1: When a template uses a slot that no example of the intent tags, `validate_catalog` returns an error that contains the slot name. A `habit_defaults` key and a built-in variable give no error.
+- AC-3.2b-1: When a template uses a slot that no example of the intent tags, `validate_catalog` returns an error that contains the slot name. A `habit_defaults` key and a built-in variable give no error. AC-11.2-2 replaces this criterion.
 - AC-3.2b-2: When the text of an example is not normalized (for example it has a capital letter or a comma), `validate_catalog` returns an error that contains the example.
 - AC-3.2b-3: When a template does not parse, `validate_catalog` returns an error that contains the intent name.
 
@@ -144,7 +144,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Model.**
 
 - `context_text(area, habit_lines) -> String`: `"area: <area or none> | habits: <lines joined by '; ' or none>"`.
-- `sample_context(areas, rng) -> String`: `context_text` of a random area and no habit lines. Sub-phase 13.1 adds habit lines.
+- `sample_context(areas, rng) -> String`: `context_text` of a random area and no habit lines. No sub-phase adds habit lines (`01-architecture.md` decision 9).
 - `held_out(text, holdout) -> bool = xxh3(normalize(text)) mod 10000 < holdout * 10000`. This sub-phase adds `train.holdout`.
 - This sub-phase adds `rand` and `xxhash-rust` (`01-architecture.md` section 7).
 

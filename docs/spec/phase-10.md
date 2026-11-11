@@ -150,7 +150,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 
 - P-10.4-1, P-10.4-2. Ensures: a missing area, or an area slot that matches no area, gives `Ask` from `ask_area` with the area names and aliases as choices. Argument: the two `Defer` returns of sub-phase 4.5b become `Ask { ask_area, choices }`. No other branch changes.
 - P-10.4-4, P-10.4-5. Argument: `handle` matches `(Ask, ctx.satellite_id)` with two arms.
-- P-10.4-7. Ensures: a missing template slot that is not `optional`, not `area` and has no habit value gives `Defer` with `Job::Llm`. Argument: `decide` checks each template slot of the intent against the prediction, `optional` and `habit_defaults` before it renders, and the only `Ask` is from `ask_area`.
+- P-10.4-7. Ensures: a missing template slot that is not `optional`, not `area` and has no habit value gives `Defer` with `Job::Llm`. Argument: `decide` checks each template slot of the intent against the prediction, `optional` and `habit_defaults` before it renders, and the only `Ask` is from `ask_area`. Sub-phase 11.2 removes `habit_defaults`.
 - P-10.4-8. Requires: `AnnounceWhenIdle` (P-4.7-2). Argument: the question is an item of the announce queue, which waits for `idle` (P-4.9c-1).
 - P-10.4-9. Ensures: a filled alias gives the area of the alias. Argument: the choices contain the aliases, and `decide` resolves the filled value with `area_by_name` (P-2.8b-1).
 - P-10.4-3, P-10.4-6. Evidence: test.

@@ -45,7 +45,7 @@ This phase selects responses, selects entities and decides the action from a pre
 
 - `render(template, context) -> Result<String>`. Undefined variables are errors. The environment uses `UndefinedBehavior::Strict` and debug mode, because `minijinja` names the undefined variable only in debug mode. `Cargo.toml` turns on the `serde` feature of `minijinja`, so the context is a `serde_json` value.
 - `validate_pools(pools, catalog) -> Result<()>`: each intent has a pool, the `filler` and `failure` pools exist, each pool has one or more responses, every template parses, and every template uses only the variables of its pool (`minijinja` `undeclared_variables`).
-- Template variables of an intent pool: `area` (the area name in lowercase), the slots and the `habit_defaults` keys of its intent, `entity` when the intent has `target = "entity"`, `response` when it has `kind = "fetch"`, and `person` when it has `needs_speaker` (sub-phase 15.7). A pool that is not an intent pool uses no variable. Thus a template that validates also renders. The slots of an intent come from the same function that check 4 of `validate_catalog` uses (sub-phase 3.2b), so `catalog.rs` makes it public.
+- Template variables of an intent pool: `area` (the area name in lowercase), the slots and the `habit_defaults` keys of its intent (sub-phase 11.2 removes `habit_defaults`), `entity` when the intent has `target = "entity"`, `response` when it has `kind = "fetch"`, and `person` when it has `needs_speaker` (sub-phase 15.7). A pool that is not an intent pool uses no variable. Thus a template that validates also renders. The slots of an intent come from the same function that check 4 of `validate_catalog` uses (sub-phase 3.2b), so `catalog.rs` makes it public.
 
 **Acceptance criteria.**
 
@@ -54,7 +54,7 @@ This phase selects responses, selects entities and decides the action from a pre
 - AC-4.2-3: When an intent has no pool, `validate_pools` returns an error that contains the intent name.
 - AC-4.2-4: When a template has a syntax error, `validate_pools` returns an error that contains the pool name.
 - AC-4.2-5: When `filler` or `failure` is missing, `validate_pools` returns an error that names it.
-- AC-4.2-6: When a template of an intent pool uses a variable that is not a built-in, a slot or a `habit_defaults` key of the intent, `validate_pools` returns an error with the pool and the variable.
+- AC-4.2-6: When a template of an intent pool uses a variable that is not a built-in, a slot or a `habit_defaults` key of the intent, `validate_pools` returns an error with the pool and the variable. AC-11.2-3 replaces this criterion.
 - AC-4.2-7: When a pool has no responses, `validate_pools` returns an error that names the pool.
 - AC-4.2-8: When a pool of a `target = "entities"` intent uses `entity`, a pool of an intent that is not `fetch` uses `response`, or a pool that is not an intent pool uses a variable, `validate_pools` returns an error with the pool and the variable.
 
@@ -162,7 +162,7 @@ This phase selects responses, selects entities and decides the action from a pre
 
 **Model.**
 
-- `target = "entity"`: the `entity` of the intent, else the matching entity in the area with the lowest entity ID (sub-phase 11.6 uses the highest habit score).
+- `target = "entity"`: the `entity` of the intent, else the matching entity in the area with the lowest entity ID.
 - `entity` is a template, for example `{{ person.calendar }}`. `select` returns the `entity` text unrendered. `decide` (sub-phase 4.5d) renders it with its context before it uses the result.
 - If the area has no match and the house has exactly one match, the result is that entity.
 

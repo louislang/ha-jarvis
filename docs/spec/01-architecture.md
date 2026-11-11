@@ -62,7 +62,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 |---|---|---|---|
 | `Assistant` | Driving | `info`, `listen` (gives a `Listening` session: `push`, `finish`), `handle`, `speak` | Implemented by `App` in `src/lib.rs`. Called by `adapters/wyoming.rs`. |
 | `Review` | Driving | `list`, `audio`, `mark`, `intents`, `proposals`, `resolve` | Implemented by `app/review.rs`. Called by `adapters/web.rs`. |
-| `Home` | Driven | `snapshot`, `events`, `call`, `announce`, `ask`, `history` | `adapters/ha.rs` |
+| `Home` | Driven | `snapshot`, `events`, `call`, `announce`, `ask` | `adapters/ha.rs` |
 | `SpeechToText` | Driven | `stream` (first pass: gives `accept`, `partial`, `reset`), `transcribe` (second pass) | `adapters/sherpa.rs` |
 | `TextToSpeech` | Driven | `synth` | `adapters/supertonic.rs` |
 | `VoiceEmbedder` | Driven | `embed` | `adapters/sherpa.rs` |
@@ -85,12 +85,12 @@ The System One model is one ONNX model with two heads: intent classification and
 
 Input: two text segments.
 
-- Segment A is the context. `context_text` makes it from the satellite area and the habit summary.
+- Segment A is the context. `context_text` makes it from the satellite area. No sub-phase gives habit lines, so the `habits` part is always `none` (decision 9).
 - Segment B is the normalized transcript (sub-phase 3.1).
 
 ```
 User: "Turn on the lights"
-Context: "area: living room | habits: living room lamp on 18:00 weekdays 4.2; tv play bluey 18:00 weekdays 3.1"
+Context: "area: living room | habits: none"
 ```
 
 Output:
@@ -139,8 +139,8 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 6. **Area from context.** HA sends `device_id` and `satellite_id` in the `Transcript` context. Jarvis finds the area of the device in the hot cache. (Source: `homeassistant/components/wyoming/conversation.py`.)
 7. **One templating engine.** `minijinja` renders the response text and the service call data. All pools and intents use the same syntax.
 8. **Time is an input.** Domain functions receive the current time as an argument. The application gets the time from the `Clock` port. Tests use `FakeClock`.
-9. **Habits are a model input.** The application learns habits from the same event stream as the hot cache. The habit summary for the satellite area and the current time is part of the model context. Habits also rank entities and fill missing slots in `decide`.
-10. **Source from the HA context.** Each `state_changed` event has a context. A `user_id` that is not the Jarvis user means `manual`. A `parent_id` means `automation`. No `user_id` and no `parent_id` means a physical device change, which is `manual`. The Jarvis user means `voice`.
+9. **Request habits, not device habits.** Jarvis learns when people ask for what. Each spoken request counts in its bucket: the day type and the hour (phase 11). HA state changes and automations do not count, because native HA automations handle device schedules. Thus habits are not a model input, and they do not select entities or slot values. Request habits move work from System Two (slow and expensive) to System One (fast and cheap): before a usual time, Jarvis prepares the answer of the request (phase 14).
+10. **A habit fades.** Each day counts once for each request and bucket. The score halves each `habits.half_life_days`. A bucket is a usual time while its score is `habits.min_score` or more. With 14 and 2.0, a request on three days within 14 days is a habit on the day of the third request. Requests on two days are never a habit.
 11. **One joint model.** One model gives the intent probabilities and the slot tags. Thus one CPU pass per transcript gives all System One data. Clusters of the requests that System Two answers use OpenAI embeddings (sub-phase 14.1). These do not change when System One retrains, and the context does not change them.
 12. **Train locally first, with the full GPU.** The process adapter runs `train/train.py` on the GPU of the GPU host. A local run and live Jarvis never share the GPU. Jarvis does not announce a run. Before a local run, Jarvis mutes the microphones of the satellites that are not muted, stops answering and releases its model sessions. After the run, with success or an error, Jarvis loads them again, unmutes only the microphones that it muted, and answers again. Then it measures the new model (decision 13). When the local run fails (for example, CUDA out of memory), the training use case sends the same training set to the RunPod adapter. A RunPod run does not pause Jarvis or mute the satellites. Jarvis predicts with the ONNX model through `ort`. The Python script and the inline script of the review page are the only non-Rust code. The training set file is the contract between them.
 13. **Accept only an equal or better model.** Jarvis assigns each example to the held-out set by a stable hash of its text. Jarvis measures the old model and the new model on the same held-out set. Jarvis keeps the new model only when its intent accuracy and its slot accuracy are both equal or higher.
@@ -307,11 +307,11 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/domain/decide.rs` | Domain | `decide`: prediction and context to `Decision`. | 4.5 |
 | `src/domain/speech.rs` | Domain | Audio type, commit policy, audio chunks, sentence split, audio correlation. | 6.2 |
 | `src/domain/dialog.rs` | Domain | Dialog state, answer fill, cancel, turn limit. | 10.2 |
-| `src/domain/habits.rs` | Domain | Habit model: source, buckets, decay, scores, summary. | 11.1 |
+| `src/domain/habits.rs` | Domain | Request habits: buckets, decayed day scores, usual times. | 11.1 |
 | `src/domain/feedback.rs` | Domain | Marks, corrections, feedback rules. | 12.3 |
 | `src/domain/learn.rs` | Domain | Clusters, proposal validation, approval rule, prefetch schedule and freshness. | 14.1 |
 | `src/domain/speaker.rs` | Domain | Discovery, presence, proximity and identification. | 15.1 |
-| `src/app/background.rs` | Application | Hot cache sync, habit learning, backfill, learned intents, prefetch. | 2.9 |
+| `src/app/background.rs` | Application | Hot cache sync, request habit store, backfill, learned intents, prefetch. | 2.9 |
 | `src/app/conversation.rs` | Application | `handle` use case, dispatch, deferred jobs, dialog map. | 4.8 |
 | `src/app/speech.rs` | Application | `listen` and `speak` use cases, audio cache, pre-render. | 6.3b |
 | `src/app/review.rs` | Application | `Review` use case. | 12.7 |
@@ -364,7 +364,6 @@ dir = "models/system-one"
 threshold = 0.6
 commit_threshold = 0.9
 next_threshold = 0.2
-habits = 5
 
 [asr]
 model_dir = "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25"
@@ -428,11 +427,9 @@ cancel = ["never mind", "cancel", "forget it", "stop"]
 
 [habits]
 file = "habits.json"
-domains = ["light", "fan", "switch", "media_player", "climate"]
 half_life_days = 14
-bootstrap_days = 30
+min_score = 2.0 # three days within 14 days (decision 10)
 save_interval_s = 300
-min_score = 3.0
 
 [train]
 state = "training.json"
@@ -576,16 +573,6 @@ plugin = "get_weather"
 data = { when = "today" }
 
 [[intent]]
-name = "tv_on"
-kind = "command"
-examples = ["turn on the tv", "switch the tv on", "tv on"]
-service = "media_player.play_media"
-target = "entity"
-select = [{ domain = "media_player", name = "tv" }]
-habit_defaults = { show = "play" }
-data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "shuffle": 1}' }
-
-[[intent]]
 name = "calendar_add"
 kind = "command"
 needs_speaker = true
@@ -619,16 +606,15 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 - `search = true` makes Jarvis search Music Assistant for the `media_id` of the call and play the best match (sub-phase 18.13b). An artist match starts with one track of the artist (sub-phase 18.14). Only `play_music` has it.
 - The area is the area slot. If no slot, it is the satellite area. The area slot matches an area name or alias without case sensitivity. For a command, an area slot that matches no area can name a Music Assistant speaker group (sub-phase 18.15).
 - `target = "entities"` uses all matching entities in the area.
-- `target = "entity"` uses `entity`, or the matching entity in the area with the lowest entity ID. Sub-phase 11.6 replaces "lowest entity ID" with "highest habit score". `target` is `entity` when it is absent.
+- `target = "entity"` uses `entity`, or the matching entity in the area with the lowest entity ID. `target` is `entity` when it is absent.
 - `target = "house"` uses all matching entities of the house, in any area. A query with it needs no area.
 - A list query is a query with `target = "entities"` or `target = "house"`. `state` is the state that it keeps, for example `on`. Its pool gets `entities`: the state, the attributes and the name of each selected entity with that state. An empty selection gives `Defer`. An empty `entities` list does not (sub-phase 18.1).
 - When System One knows the intent but cannot act, the result is `Defer`: Jarvis speaks a filler, makes no call, and System Two answers the request (sub-phase 4.5). Examples: an empty selection, a missing slot, a missing `person`, or a template that does not render.
 - When the area has no matching entity and the house has exactly one, Jarvis uses that entity. Example: one thermostat for the house.
-- `habit_defaults` maps a slot to a habit action. When the slot is empty, Jarvis uses the most frequent value of that action now.
 - `needs_speaker = true` makes the `person` variable available. Jarvis waits up to `speaker.wait_ms` for it.
 - `next_date(day, plus_days)` returns the ISO date of the next `day` plus `plus_days`. An empty `day` means today. A `day` that is not a day name, `today` or `tomorrow` gives an error.
-- Template variables are the built-ins `area` (the area name in lowercase), `entity`, `person` and `response`, the slots of the intent, and the keys of `habit_defaults`.
-- A slot that the prediction does not have is missing, unless the intent lists it in `optional`. A missing optional slot is an empty string. A missing `habit_defaults` key uses the habit value. Another missing slot gives `Defer`. Phase 10 makes Jarvis ask for a missing `area`. Before Phase 10, a missing `area` gives `Defer`.
+- Template variables are the built-ins `area` (the area name in lowercase), `entity`, `person` and `response`, and the slots of the intent.
+- A slot that the prediction does not have is missing, unless the intent lists it in `optional`. A missing optional slot is an empty string. Another missing slot gives `Defer`. Phase 10 makes Jarvis ask for a missing `area`. Before Phase 10, a missing `area` gives `Defer`.
 - A data value that is one `{{ expression }}` keeps the type of the expression result. One `{{ expression }}` starts with `{{`, ends with `}}`, and has no other `}}`. Other data values render as strings.
 
 `responses.toml` (example entries):

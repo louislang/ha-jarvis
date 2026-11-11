@@ -22,8 +22,8 @@ This phase improves the System One model. Jarvis builds the training set, trains
   - An interaction without an action mark gives no example.
   - A mark example uses the normalized transcript and the logged model context.
   - A mark on a dialog answer (an interaction with `link`) gives the example with the normalized transcript and the context of the first interaction of the dialog, and `spans = None`. The answer alone ("the kitchen") is not a request.
-- `sample_context(areas, habits, rng)` now adds the habit summary of the sampled area at a random time.
-- `training_set(catalog, generated, marked, areas, habits, rng, settings) -> TrainingSet`. When two examples have the same normalized text and different labels, the newest mark wins, then a seed, then a generated example.
+- Request habits are not a model input (`01-architecture.md` decision 9), so `sample_context` (sub-phase 3.3) does not change.
+- `training_set(catalog, generated, marked, areas, rng, settings) -> TrainingSet`. When two examples have the same normalized text and different labels, the newest mark wins, then a seed, then a generated example.
 
 **Acceptance criteria.**
 
@@ -31,17 +31,15 @@ This phase improves the System One model. Jarvis builds the training set, trains
 - AC-13.1-2: When an interaction has a bad action mark with the correction `tv_show`, `mark_examples` returns a `tv_show` example with `spans = None`.
 - AC-13.1-3: When an interaction has a bad action mark without a correction, `mark_examples` returns a `Not` example for the selected intent.
 - AC-13.1-4: When an interaction has no action mark, `mark_examples` returns no example.
-- AC-13.1-5: When `sample_context` gets a habit model, the context has the habit summary of the sampled area and time.
-- AC-13.1-6: When a mark and a seed have the same normalized text and different labels, the training set has only the mark example.
-- AC-13.1-7: When a bad action mark has the correction `unknown`, or a good action mark is on a System Two interaction, `mark_examples` returns an `Intent(unknown)` example.
-- AC-13.1-8: When a good action mark is on a dialog answer, the example has the text and the context of the first interaction and `spans = None`.
+- AC-13.1-5: When a mark and a seed have the same normalized text and different labels, the training set has only the mark example.
+- AC-13.1-6: When a bad action mark has the correction `unknown`, or a good action mark is on a System Two interaction, `mark_examples` returns an `Intent(unknown)` example.
+- AC-13.1-7: When a good action mark is on a dialog answer, the example has the text and the context of the first interaction and `spans = None`.
 
 **Proofs.**
 
-- P-13.1-1 to P-13.1-4, P-13.1-7. Ensures: `mark_examples` is a total function of the action mark and the decision. Argument: it is a `filter_map` over the interactions with a `match` on `(value, correction, decision)`. The arms are `(Good, _, System Two)`, `(Good, _, _)`, `(Bad, Some(unknown), _)`, `(Bad, Some(k), _)`, `(Bad, None, _)` and no mark. They cover every case once.
-- P-13.1-5 (AC-13.1-5). Ensures: the context is `context_text(area, summary(area, time, n))` for the sampled area and time. Argument: `sample_context` draws an area and a time from `rng`, then calls `context_text` with the summary (P-3.3-2).
-- P-13.1-6 (AC-13.1-6). Ensures: of the examples with the same normalized text and different labels, the set keeps only the one with the highest precedence: the newest mark, then a seed, then a generated example. Argument: the builder groups the examples by normalized text and keeps the maximum of each group by the key `(source rank, mark time)`.
-- P-13.1-8. Ensures: an example from a dialog answer has the text and the context of the first interaction and no spans. Argument: before the `match`, the builder replaces the text and the context with those of the interaction that `link` names, and sets `spans = None`.
+- P-13.1-1 to P-13.1-4, P-13.1-6. Ensures: `mark_examples` is a total function of the action mark and the decision. Argument: it is a `filter_map` over the interactions with a `match` on `(value, correction, decision)`. The arms are `(Good, _, System Two)`, `(Good, _, _)`, `(Bad, Some(unknown), _)`, `(Bad, Some(k), _)`, `(Bad, None, _)` and no mark. They cover every case once.
+- P-13.1-5 (AC-13.1-5). Ensures: of the examples with the same normalized text and different labels, the set keeps only the one with the highest precedence: the newest mark, then a seed, then a generated example. Argument: the builder groups the examples by normalized text and keeps the maximum of each group by the key `(source rank, mark time)`.
+- P-13.1-7. Ensures: an example from a dialog answer has the text and the context of the first interaction and no spans. Argument: before the `match`, the builder replaces the text and the context with those of the interaction that `link` names, and sets `spans = None`.
 
 ---
 
@@ -75,24 +73,23 @@ This phase improves the System One model. Jarvis builds the training set, trains
 
 ### 13.3 Change Count
 
-**Goal:** Add the training state and the change count: new action marks and new established habits since the last run. Jarvis knows when enough has changed to train. Sub-phase 14.11 adds the new active learned intents.
+**Goal:** Add the training state and the change count: new action marks since the last run. Jarvis knows when enough has changed to train. Sub-phase 14.11 adds the new active learned intents.
 
 - **Implements:** G16. **Depends on:** 13.2.
 - **Files:** modify `src/domain/training.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `TrainingState { current: Option<run_id>, last_time, habit_keys: BTreeSet<HabitKey> }`. `changes(state, marked, established) = |action marks with a mark time after last_time| + |established \ state.habit_keys|`. Only action marks count, because a response mark gives no training example. `should_train(count, min_changes) = count >= min_changes`. This sub-phase adds `train.state` and `train.min_changes`.
+**Model.** `TrainingState { current: Option<run_id>, last_time }`. `changes(state, marked) = |action marks with a mark time after last_time|`. Only action marks count, because a response mark gives no training example. Request habits are not training data (`01-architecture.md` decision 9), so they do not count. `should_train(count, min_changes) = count >= min_changes`. This sub-phase adds `train.state` and `train.min_changes`.
 
 **Acceptance criteria.**
 
-- AC-13.3-1: When 12 action marks and 8 new established habits occur after the last run, `changes` returns 20.
-- AC-13.3-2: When an established habit was in `habit_keys`, it does not count.
-- AC-13.3-3: When the count is `min_changes - 1`, `should_train` returns false. At `min_changes`, it returns true.
-- AC-13.3-4: When a response mark occurs after the last run, `changes` does not count it.
+- AC-13.3-1: When 20 action marks occur after the last run and 3 before it, `changes` returns 20.
+- AC-13.3-2: When the count is `min_changes - 1`, `should_train` returns false. At `min_changes`, it returns true.
+- AC-13.3-3: When a response mark occurs after the last run, `changes` does not count it.
 
 **Proofs.**
 
-- P-13.3-1, P-13.3-2, P-13.3-4. Ensures: `changes` is the number of action marks after `last_time` plus the number of established keys that are not in `habit_keys`. Argument: `changes` is the sum of two set sizes. The first filters the marks by target and time. The second is a set difference, so keys in `habit_keys` are excluded.
-- P-13.3-3. Ensures: `should_train(c, m)` is true if and only if `c >= m`. Argument: `should_train` is `>=`.
+- P-13.3-1, P-13.3-3. Ensures: `changes` is the number of action marks after `last_time`. Argument: `changes` is the size of the marks filtered by target and time.
+- P-13.3-2. Ensures: `should_train(c, m)` is true if and only if `c >= m`. Argument: `should_train` is `>=`.
 
 ---
 
@@ -274,14 +271,14 @@ This phase improves the System One model. Jarvis builds the training set, trains
 
 **Model.** Each `check_interval_s`, if `should_train` and no run is active, start a run:
 
-0. Keep `started := now` and the established habit keys at this time.
+0. Keep `started := now`.
 1. `refresh` the generated examples.
 2. Build the training set. Upload only the examples that are not held out. When the held-out set is empty, stop with an error before training.
 3. `train` of the local `Trainer`. Sub-phase 13.10 mutes the satellites and pauses Jarvis for this call.
 4. `ModelLoader::load` the new folder.
 5. Predict the held-out set with the old and the new classifier.
 6. If `accept`, swap the classifier, write `current` in the training state, and delete the model folders other than the current and the previous one. Else delete the new folder.
-7. Log both measures. Set `last_time := started` and `habit_keys :=` the keys of step 0. Thus a change during the run counts for the next run.
+7. Log both measures. Set `last_time := started`. Thus a change during the run counts for the next run.
 
 On a final error, the old model stays and the training state does not change. The next automatic run waits `train.failure_backoff_s`. A voice trigger does not wait. `run` now loads `<model.dir>/<current>` from the training state when it exists (sub-phase 5.4 loads the fixture). This sub-phase adds `train.check_interval_s` and `train.failure_backoff_s`.
 
