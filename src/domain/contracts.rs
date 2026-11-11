@@ -15,6 +15,8 @@ use std::time::Duration;
 use jiff::SignedDuration;
 use jiff::Timestamp;
 use jiff::civil::DateTime;
+use jiff::civil::Weekday;
+use jiff::tz::TimeZone;
 use minijinja::Environment;
 use minijinja::Error;
 use minijinja::ErrorKind;
@@ -428,6 +430,52 @@ pub fn ex_timestamp_as_nanosecond(timestamp: Timestamp) -> (result: i128)
         result == nanosecond(timestamp),
 {
     Timestamp::as_nanosecond(timestamp)
+}
+
+/// A time zone. <https://docs.rs/jiff/0.2/jiff/tz/struct.TimeZone.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExTimeZone(TimeZone);
+
+/// A day of the week. <https://docs.rs/jiff/0.2/jiff/civil/enum.Weekday.html>
+#[verifier::external_type_specification]
+pub struct ExWeekday(Weekday);
+
+/// The civil date and time of `timestamp` in `zone`.
+pub uninterp spec fn local(zone: TimeZone, timestamp: Timestamp) -> DateTime;
+
+/// Gives the civil date and time of `timestamp` in `zone`. <https://docs.rs/jiff/0.2/jiff/tz/struct.TimeZone.html#method.to_datetime>
+#[verifier::external_fn_specification]
+pub fn ex_time_zone_to_datetime(zone: &TimeZone, timestamp: Timestamp) -> (datetime: DateTime)
+    ensures
+        datetime == local(*zone, timestamp),
+{
+    zone.to_datetime(timestamp)
+}
+
+/// The day of the week of `datetime`.
+pub uninterp spec fn weekday(datetime: DateTime) -> Weekday;
+
+/// Gives the day of the week. <https://docs.rs/jiff/0.2/jiff/civil/struct.DateTime.html#method.weekday>
+#[verifier::external_fn_specification]
+pub fn ex_datetime_weekday(datetime: DateTime) -> (day: Weekday)
+    ensures
+        day == weekday(datetime),
+{
+    datetime.weekday()
+}
+
+/// The hour of `datetime`.
+pub uninterp spec fn hour(datetime: DateTime) -> i8;
+
+/// Gives the hour, in the range `0..=23`. <https://docs.rs/jiff/0.2/jiff/civil/struct.DateTime.html#method.hour>
+#[verifier::external_fn_specification]
+pub fn ex_datetime_hour(datetime: DateTime) -> (result: i8)
+    ensures
+        result == hour(datetime),
+        0 <= result <= 23,
+{
+    datetime.hour()
 }
 
 /// A `jiff` error. <https://docs.rs/jiff/0.2/jiff/struct.Error.html>
