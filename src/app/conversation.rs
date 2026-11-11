@@ -22,6 +22,7 @@ use tokio::task::JoinHandle;
 
 use crate::DialogConfig;
 use crate::app::background::Backfill;
+use crate::app::background::Habits;
 use crate::app::plugins::Plugins;
 use crate::domain::catalog::Catalog;
 use crate::domain::decide;
@@ -99,13 +100,20 @@ pub struct Conversation {
     threshold: f32,
     /// System Two.
     two: SystemTwo,
+    /// The request habit model, in which each new spoken request counts.
+    habits: Arc<Habits>,
 }
 
 impl Conversation {
     /// Decides with `classifier`, `catalog` and `threshold`, and asks `two`. Dispatches to
     /// `queues`, their house and `backfill`, which records the uses of `pools`. Selects the
-    /// responses with a random source seeded from the time of `two`.
+    /// responses with a random source seeded from the time of `two`. Records the requests in
+    /// `habits`.
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the use case connects each part of a request"
+    )]
     pub fn new(
         pools: Arc<ArcSwap<Pools>>,
         backfill: Arc<Backfill>,
@@ -114,6 +122,7 @@ impl Conversation {
         catalog: Arc<Catalog>,
         threshold: f32,
         two: SystemTwo,
+        habits: Arc<Habits>,
     ) -> Self {
         use rand::SeedableRng;
         let seed = two.clock.now().as_millisecond().unsigned_abs();
@@ -126,6 +135,7 @@ impl Conversation {
             catalog,
             threshold,
             two,
+            habits,
         }
     }
 
@@ -133,7 +143,7 @@ impl Conversation {
     /// of the satellite, else of the conversation, can cancel it, fill it or ask again. Else the
     /// System One prediction of the normalized text in the area name of the satellite device, its
     /// decision and its dispatch, or the answer of a deferred job when `context` has no
-    /// satellite. A question opens a dialog.
+    /// satellite. A question opens a dialog. A new request from a satellite counts in the habits.
     ///
     /// # Errors
     ///
@@ -142,13 +152,9 @@ impl Conversation {
         let (area, name) = self.area(context.device_id.as_deref());
         let now = self.two.clock.now();
         let key = context.satellite_id.clone().or(context.conversation_id);
-        let (satellite, timeout) = (
-            context.satellite_id.as_deref(),
-            self.queues.dialog.timeout_s,
-        );
-        let take = |key: Key| Some((self.queues.dialogs().take(&key, now, timeout)?, key));
-        let open = key.clone().map(Key).and_then(take);
-        let (prediction, transcript) = match self
+        let satellite = context.satellite_id.as_deref();
+        let open = self.take_dialog(key.clone(), now);
+        let (prediction, transcript, new) = match self
             .route(text, open, name.as_deref(), satellite, now)
             .await?
         {
@@ -161,20 +167,36 @@ impl Conversation {
             now,
         };
         Ok(self
-            .act(&prediction, &request, key.map(Key), satellite)
+            .act(&prediction, &request, key.map(Key), satellite, new)
             .await)
     }
 
+    /// The open dialog of `key` at `now` and its key. The dialog map no longer has it.
+    fn take_dialog(&self, key: Option<String>, now: Timestamp) -> Option<(Dialog, Key)> {
+        let key = Key(key?);
+        let timeout = self.queues.dialog.timeout_s;
+        let dialog = self.queues.dialogs().take(&key, now, timeout)?;
+        Some((dialog, key))
+    }
+
     /// The dispatch of the decision for `prediction` of `request` on `satellite`. A question opens
-    /// a dialog for `key`. Logs the request.
+    /// a dialog for `key`. A `new` request from `satellite` counts in the habits. Logs the request.
     async fn act(
         &self,
         prediction: &Prediction,
         request: &Request,
         key: Option<Key>,
         satellite: Option<&str>,
+        new: bool,
     ) -> Handled {
         let decision = self.decide(prediction, request);
+        // Only a spoken request counts. Text from the HA UI has no satellite.
+        self.record(
+            prediction,
+            &decision,
+            request.now,
+            new && satellite.is_some(),
+        );
         let (kind, area) = (kind(&decision), request.area.as_ref());
         let pending = match &decision {
             Decision::Ask { pending, .. } => Some(pending.clone()),
@@ -190,10 +212,22 @@ impl Conversation {
         handled
     }
 
+    /// Records the top intent of `prediction` at `now` in the habits when the request is `spoken`
+    /// and `decision` does not defer to System Two.
+    fn record(&self, prediction: &Prediction, decision: &Decision, now: Timestamp, spoken: bool) {
+        let top = prediction
+            .ranked
+            .first()
+            .filter(|_| spoken && !is_llm(decision));
+        if let Some((intent, _)) = top {
+            self.habits.observe(intent.clone(), now);
+        }
+    }
+
     /// The reply to `text` as an answer to the `open` dialog and its key on `satellite` at `now`: a
     /// `cancelled` reply that closes it, or a question again. Else the prediction to decide and its
     /// transcript: the filled intent of a `Slot` dialog, or the System One prediction of `text` in
-    /// the area `name`.
+    /// the area `name`, with true for a new request.
     ///
     /// # Errors
     ///
@@ -205,22 +239,23 @@ impl Conversation {
         name: Option<&str>,
         satellite: Option<&str>,
         now: Timestamp,
-    ) -> anyhow::Result<ControlFlow<Handled, (Prediction, String)>> {
+    ) -> anyhow::Result<ControlFlow<Handled, (Prediction, String, bool)>> {
         let Some((dialog, key)) = open else {
             return Ok(ControlFlow::Continue((
                 self.predict(name, text).await?,
                 text.to_owned(),
+                true,
             )));
         };
         if dialog::is_cancel(text, &self.queues.dialog.cancel) {
             return Ok(ControlFlow::Break(self.cancel(key)));
         }
-        if let Some(filled) = self.filled(&dialog, text) {
-            return Ok(ControlFlow::Continue(filled));
+        if let Some((prediction, transcript)) = self.filled(&dialog, text) {
+            return Ok(ControlFlow::Continue((prediction, transcript, false)));
         }
         let prediction = self.predict(name, text).await?;
         if self.is_clear(&prediction) {
-            return Ok(ControlFlow::Continue((prediction, text.to_owned())));
+            return Ok(ControlFlow::Continue((prediction, text.to_owned(), true)));
         }
         Ok(ControlFlow::Break(
             self.unclear(text, dialog, key, satellite, now).await,
@@ -893,6 +928,17 @@ fn kind(decision: &Decision) -> &'static str {
     }
 }
 
+/// True when `decision` defers to System Two.
+fn is_llm(decision: &Decision) -> bool {
+    matches!(
+        decision,
+        Decision::Defer {
+            job: Job::Llm(_),
+            ..
+        }
+    )
+}
+
 /// The items to play for the match `found` in `results`: the first track of an artist match,
 /// if any, and then the match.
 fn items(results: &SearchResults, found: &MediaItem) -> Vec<MediaItem> {
@@ -1174,6 +1220,9 @@ mod tests {
 
     use super::*;
     use crate::app::speech::Speech;
+    use crate::domain::habits::Bucket;
+    use crate::domain::habits::DayType;
+    use crate::domain::habits::RequestHabits;
     use crate::domain::model::Slot;
     use crate::domain::responses::Pool;
     use crate::domain::state::ServiceCall;
@@ -1245,6 +1294,7 @@ mod tests {
         let catalog = toml::from_str(include_str!("../../intents.toml")).expect("it is a catalog");
         let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
         let backfill = backfill(changes, Arc::clone(&reasoner), &queues, max_pool);
+        let habits = Habits::new(RequestHabits::default(), 14.0, queues.cache.clone());
         let (queues, timeout) = (Arc::new(queues), TIMEOUT);
         Conversation::new(
             pools,
@@ -1261,6 +1311,7 @@ mod tests {
                 allowed_domains: ALLOWED.map(str::to_owned).to_vec(),
                 read_services: vec!["calendar.get_events".to_owned()],
             },
+            Arc::new(habits),
         )
     }
 
@@ -2048,6 +2099,87 @@ mod tests {
         let after = conversation.handle("four", on_satellite()).await?.after;
         after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
         assert_eq!(reasoner.questions(), ["four"]);
+        Ok(())
+    }
+
+    /// A conversation from `still_with` whose classifier gives each of `labels` in order, and its
+    /// clock at `time`.
+    fn at(time: &str, labels: &[&str]) -> (Arc<SetClock>, Conversation) {
+        let (_cache, _changes, mut conversation) =
+            still_with(&Arc::default(), "idle", scripted(labels), Arc::default());
+        let clock = Arc::new(SetClock(Mutex::new(time.parse().expect("a time"))));
+        conversation.two.clock = Arc::clone(&clock) as _;
+        (clock, conversation)
+    }
+
+    /// Monday 08:10 in the HA time zone of the reference house.
+    const MONDAY: &str = "2026-01-05T08:10:00-06:00";
+
+    /// The keys and buckets of the habits of `conversation`.
+    fn observed(conversation: &Conversation) -> Vec<(String, Bucket)> {
+        let habits = conversation.habits.current().unwrap_or_default();
+        habits.strengths.into_keys().collect()
+    }
+
+    /// The key `intent` in the weekday bucket of `hour`.
+    fn weekday(intent: &str, hour: i8) -> (String, Bucket) {
+        let day = DayType::Weekdays;
+        (intent.to_owned(), Bucket { day, hour })
+    }
+
+    /// The context of the kitchen satellite and its device.
+    fn in_kitchen() -> Context {
+        Context {
+            device_id: Some(KITCHEN.to_owned()),
+            ..on_satellite()
+        }
+    }
+
+    /// AC-11.4-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_11_4_1_spoken_request_counts_in_its_bucket() -> anyhow::Result<()> {
+        let (_clock, conversation) = at(MONDAY, &["lights_on"]);
+        let _ = conversation
+            .handle("turn on the lights", in_kitchen())
+            .await?;
+        assert_eq!(observed(&conversation), [weekday("lights_on", 8)]);
+        Ok(())
+    }
+
+    /// AC-11.4-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_11_4_2_request_without_a_satellite_does_not_count() -> anyhow::Result<()> {
+        let (_clock, conversation) = at(MONDAY, &["lights_on"]);
+        let context = Context {
+            satellite_id: None,
+            ..in_kitchen()
+        };
+        let _ = conversation.handle("turn on the lights", context).await?;
+        assert_eq!(observed(&conversation), []);
+        Ok(())
+    }
+
+    /// AC-11.4-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_11_4_3_system_two_request_does_not_count() -> anyhow::Result<()> {
+        let (_clock, conversation) = at(MONDAY, &["unknown"]);
+        let handled = conversation.handle("plan dinner", in_kitchen()).await?;
+        assert_eq!(handled.text, "One moment.");
+        assert_eq!(observed(&conversation), []);
+        Ok(())
+    }
+
+    /// AC-11.4-4. The answer comes in the next hour, so a count of it would add a bucket.
+    #[tokio::test(start_paused = true)]
+    async fn ac_11_4_4_area_answer_does_not_count() -> anyhow::Result<()> {
+        let (clock, conversation) = at("2026-01-05T08:59:55-06:00", &["lights_on"]);
+        let _ = conversation
+            .handle("turn on the lights", on_satellite())
+            .await?;
+        *clock.0.lock().expect("no lock holder panics") = "2026-01-05T09:00:05-06:00".parse()?;
+        let _ = conversation.handle("the kitchen", on_satellite()).await?;
+        assert_eq!(open_dialogs(&conversation), BTreeMap::new());
+        assert_eq!(observed(&conversation), [weekday("lights_on", 8)]);
         Ok(())
     }
 
