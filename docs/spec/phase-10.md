@@ -67,7 +67,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 - `Dialog { pending, turns, asked }`. `asked` is the time of the last question. `Dialogs: Map<Key, Dialog>` and a generation number for each key. `Key` is the `satellite_id`, else the `conversation_id`. The generations of sub-phase 4.9b now use `Key`, so a conversation without a satellite also has one.
 - `open(key, pending, now)`, `take(key, now) -> Option<Dialog>` (removes it; `None` when `now - asked >= timeout_s`), `next_turn(dialog, max_turns, now) -> Option<Dialog>` (`turns + 1` and `asked := now`), `close(key)` (removes the dialog and increases the generation of the key).
 - `turns` counts the questions of one dialog: System Two questions also count.
-- This sub-phase adds `[dialog]` (`max_turns`, `timeout_s`).
+- This sub-phase adds `[dialog]` (`max_turns`, `timeout_s`). `validate` checks that each is more than 0 (sub-phase 2.2). With `max_turns = 0`, Jarvis never asks again. With `timeout_s = 0`, `take` drops every answer.
 
 **Acceptance criteria.**
 
@@ -77,6 +77,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 - AC-10.2-4: When the dialog has `max_turns` turns, `next_turn` returns none.
 - AC-10.2-5: When `quint-connect` replays 100 traces of `dialog.qnt`, `Dialogs` matches the open dialogs of the model (`turns`, `asked`, `request`) after each step.
 - AC-10.2-6: When `close` runs for a key, the generation of that key increases by 1 and other keys do not change.
+- AC-10.2-7: When `dialog.max_turns` or `dialog.timeout_s` is 0, `parse` returns an error that contains the field name and the range.
 
 **Proofs.**
 
@@ -85,6 +86,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 - P-10.2-6. Ensures: `close(k)` increases the generation of `k` by 1, and the generations of other keys do not change. Argument: `close` does one increment on one key.
 - P-10.2-4. Requires: `TurnLimit` (P-10.1-2). Ensures: `next_turn` returns `None` when `turns >= max_turns`, else the dialog with `turns + 1`. Argument: `next_turn` is this one comparison.
 - P-10.2-5. Evidence: test.
+- P-10.2-7. Ensures: `max_turns = 0` or `timeout_s = 0` gives `Err` with the field name and the range. Argument: `validate` compares each of the two fields with 0 (P-2.2-6).
 
 ---
 
@@ -93,7 +95,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 **Goal:** Add `is_cancel` and `fill`, which match a spoken answer to a cancel phrase or to a list of choices with fuzzy matching. "The kitchen" and a slightly misheard "kitchn" both fill the area.
 
 - **Implements:** G13. **Depends on:** 10.2.
-- **Files:** modify `src/domain/dialog.rs`, `src/lib.rs`, `jarvis.toml`.
+- **Files:** modify `src/domain/dialog.rs`, `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
 
 **Model.** `is_cancel(text, cancel) -> bool`: the normalized text equals a cancel phrase. `fill(answer, choices, similarity) -> Option<String>`: with no choices, the normalized answer. Else, when the words of one or more choices are whole words of the normalized answer, return the longest such choice. Else, remove a leading "the", and return the choice with the highest Jaro-Winkler similarity if it is at least `similarity`. This sub-phase adds `dialog.choice_similarity` and `dialog.cancel`.
 
