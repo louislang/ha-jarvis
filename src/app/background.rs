@@ -1,4 +1,4 @@
-//! Hot cache sync, response backfill and the request habit model.
+//! Hot cache sync, response backfill and the request habit store.
 
 use std::collections::BTreeSet;
 use std::collections::HashSet;
@@ -12,7 +12,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use crate::BackfillConfig;
 use crate::app::conversation::Change;
@@ -24,8 +26,10 @@ use crate::domain::responses::Pool;
 use crate::domain::responses::Pools;
 use crate::domain::state::Event;
 use crate::domain::state_cache::StateCache;
+use crate::ports::Clock;
 use crate::ports::Home;
 use crate::ports::Reasoner;
+use crate::ports::Store;
 
 /// The wait before the first retry of a failed snapshot.
 const FIRST_RETRY: Duration = Duration::from_secs(1);
@@ -239,7 +243,7 @@ fn texts(pool: &Pool) -> Vec<String> {
     texts.collect()
 }
 
-/// The request habit model, which `handle` records into.
+/// The request habit model, which `handle` records into and the habit task saves.
 pub struct Habits {
     /// The model. No code holds the lock across an `await`.
     model: Mutex<RequestHabits>,
@@ -282,6 +286,16 @@ impl Habits {
         self.lock().map(|model| model.clone())
     }
 
+    /// The model without the scores that faded by the local date of `time`, or the whole model
+    /// without the HA time zone. `None` when the lock is poisoned.
+    fn pruned(&self, time: Timestamp) -> Option<RequestHabits> {
+        let model = self.current()?;
+        Some(match self.zone() {
+            Some(zone) => model.prune(zone.to_datetime(time).date(), self.half_life_days),
+            None => model,
+        })
+    }
+
     /// The HA time zone of the hot cache.
     fn zone(&self) -> Option<TimeZone> {
         let cache = self.cache.borrow();
@@ -298,7 +312,47 @@ impl Habits {
     }
 }
 
-/// Tests of the sync and backfill use cases and their conformance to `cache_sync.qnt` and
+/// The habit task, its habits and its stop.
+pub struct HabitsTask {
+    /// The habits that the task saves.
+    pub habits: Arc<Habits>,
+    /// Stops the task after one more save when it sends or drops.
+    pub stop: oneshot::Sender<()>,
+    /// The task.
+    pub task: JoinHandle<()>,
+}
+
+/// Starts the habit task. Each `interval`, and once more when its stop sends or drops, it saves
+/// to `store` the model of `habits` without the scores that faded by the `clock` time.
+#[must_use]
+pub fn start_habits(
+    habits: Arc<Habits>,
+    store: Arc<dyn Store<RequestHabits>>,
+    clock: Arc<dyn Clock>,
+    interval: Duration,
+) -> HabitsTask {
+    let (stop, mut stopped) = oneshot::channel();
+    let saved = Arc::clone(&habits);
+    let task = tokio::spawn(async move {
+        loop {
+            let stopping = tokio::select! {
+                () = tokio::time::sleep(interval) => false,
+                _ = &mut stopped => true,
+            };
+            if let Some(model) = saved.pruned(clock.now()) {
+                let store = Arc::clone(&store);
+                // A failed save keeps the last saved file. The next save writes the whole model.
+                let _ = tokio::task::spawn_blocking(move || store.save(&model)).await;
+            }
+            if stopping {
+                return;
+            }
+        }
+    });
+    HabitsTask { habits, stop, task }
+}
+
+/// Tests of the sync, backfill and habit use cases and the conformance to `cache_sync.qnt` and
 /// `backfill.qnt`.
 #[cfg(test)]
 mod tests {
@@ -322,8 +376,11 @@ mod tests {
     use super::*;
     use crate::Config;
     use crate::app::conversation;
+    use crate::domain::habits::Bucket;
+    use crate::domain::habits::DayType;
     use crate::domain::state::Snapshot;
     use crate::domain::state::State;
+    use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
@@ -449,6 +506,52 @@ mod tests {
     async fn ac_2_9_7_failed_start_loads_after_one_second() {
         let cache = assert_retries(1, &[1]).await;
         assert_eq!(*cache.borrow(), StateCache::load(house()));
+    }
+
+    /// The `habits.save_interval_s` of the tests.
+    const SAVE_INTERVAL: Duration = Duration::from_secs(300);
+
+    /// Monday 08:10 in the HA time zone of the reference house.
+    fn monday() -> Timestamp {
+        "2026-01-05T08:10:00-06:00".parse().expect("a time")
+    }
+
+    /// The task of empty habits of the reference house with `FakeStore` and the clock at
+    /// `monday()`, and that store.
+    fn habit_task() -> (HabitsTask, Arc<FakeStore<RequestHabits>>) {
+        let cache = watch::channel(StateCache::load(house())).1;
+        let habits = Arc::new(Habits::new(RequestHabits::default(), 14.0, cache));
+        let (store, clock) = (Arc::new(FakeStore::new(None)), FakeClock(monday()));
+        let saving = Arc::clone(&store) as _;
+        let task = start_habits(habits, saving, Arc::new(clock), SAVE_INTERVAL);
+        (task, store)
+    }
+
+    /// AC-11.4b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_11_4b_1_interval_saves_the_new_observations() {
+        let (task, store) = habit_task();
+        task.habits.observe("get_traffic".to_owned(), monday());
+        tokio::time::sleep(SAVE_INTERVAL + Duration::from_secs(1)).await;
+        let saved = store
+            .saves()
+            .pop()
+            .map(|model| model.strengths.into_keys().collect());
+        let bucket = Bucket {
+            day: DayType::Weekdays,
+            hour: 8,
+        };
+        assert_eq!(saved, Some(vec![("get_traffic".to_owned(), bucket)]));
+    }
+
+    /// AC-11.4b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_11_4b_2_stop_saves() -> anyhow::Result<()> {
+        let (task, store) = habit_task();
+        drop(task.stop);
+        task.task.await?;
+        assert_eq!(store.saves().len(), 1);
+        Ok(())
     }
 
     /// AC-8.4-1.

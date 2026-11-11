@@ -224,6 +224,7 @@ async fn serve(
     let catalog = crate::load_catalog(&config.intents)?;
     let pools = crate::load_pools(&config.responses, &catalog)?;
     let plugins = crate::registry(config, vec![Arc::new(FakePlugin::new("get_weather"))]);
+    let catalog = Arc::new(catalog);
     let (app, _, prerender) =
         crate::start_app(config, catalog, pools, home, reasoner, plugins).await?;
     prerender.await?;
@@ -278,8 +279,9 @@ async fn stream_audio(
     }
 }
 
-/// The configuration of `device` (`01-architecture.md` section 9) with `pools.json` in `folder`:
-/// `jarvis.toml` on CUDA, the configuration of a CPU machine on the CPU.
+/// The configuration of `device` (`01-architecture.md` section 9) with `pools.json` and
+/// `habits.json` in `folder`: `jarvis.toml` on CUDA, the configuration of a CPU machine on the
+/// CPU.
 ///
 /// # Errors
 ///
@@ -287,6 +289,7 @@ async fn stream_audio(
 fn config(device: Device, folder: &Path) -> anyhow::Result<Config> {
     let mut config = Config::parse(include_str!("../../jarvis.toml"))?;
     config.pools = folder.join("pools.json");
+    config.habits.file = folder.join("habits.json");
     if device == Device::Cuda {
         return Ok(config);
     }
