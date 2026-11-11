@@ -9,6 +9,7 @@ This file uses the technical names in `00-overview.md` section 0.3. All sub-phas
 3. Use a crate or a tool when one gives the function. Do not write your own version.
 4. Each struct, function and file has one responsibility.
 5. A change in the change map (`01-architecture.md` section 12) touches only the listed files.
+6. A new plugin uses a free data source without an API key when one exists. Use a source with a key only after the user agrees. The PR of such a plugin names the environment variable and the sign-up page (`01-architecture.md` decision 30).
 
 ## 2. Rust Code Rules
 

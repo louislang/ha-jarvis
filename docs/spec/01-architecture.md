@@ -50,7 +50,7 @@ Dependency rules:
                                    │   │ decide responses state │ │   Plugin ─────────▶ adapters/open_meteo.rs ─▶ Open-Meteo
                                    │   │ dialog habits feedback │ │                     adapters/plex.rs ─▶ Plex
                                    │   │ learn speaker speech   │ │   Models ─────────▶ LiveModels (lib.rs)
-                                   │   └────────────────────────┘ │
+                                   │   └────────────────────────┘ │   Issues ─────────▶ adapters/github.rs ─▶ GitHub
                                    └──────────────────────────────┘
 ```
 
@@ -76,6 +76,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | `Store<T>` | Driven | `load`, `save` | `adapters/files.rs` (TOML or JSON from the file extension) |
 | `Clock` | Driven | `now` | `SystemClock` in `src/lib.rs` |
 | `Models` | Driven | `release`, `restore` | `LiveModels` in `src/lib.rs` |
+| `Issues` | Driven | `open` | `adapters/github.rs` |
 
 Tests in the application layer use the fakes in `src/testing/fakes.rs`. Adapter tests use local servers (`wiremock`, a fake HA WebSocket server), in-memory object stores or real models.
 
@@ -160,8 +161,9 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 27. **One ONNX Runtime, GPU or CPU.** `sherpa-onnx` (feature `shared`) and `ort` (feature `load-dynamic`) load the same ONNX Runtime 1.28.2 shared library from sherpa-onnx 2.0.1. On the GPU host, it is the CUDA 12 and cuDNN 9 build from the sherpa-onnx `linux-x64-gpu` release. On other machines, it is the CPU build. Thus the two crates cannot conflict, and `device` selects the CUDA or the CPU execution provider for all models.
 28. **Two-pass STT.** The first pass streams, so Jarvis knows the words while the user speaks. It uses NVIDIA Nemotron Speech Streaming EN 0.6B with 160 ms chunks on the GPU host. The first pass gives the last word only after the VAD ends the segment and flushes the model (sub-phase 6.6c). The VAD ends the segment `vad_min_silence_ms` after the voice end, and an early commit comes `early_commit_ms` after the voice end (sub-phase 9.1b). `vad_min_silence_ms < early_commit_ms` (sub-phase 2.2), so the flush comes before an early commit. At commit, the second pass decodes the whole utterance with NVIDIA Parakeet Unified EN 0.6B in offline mode. The second pass has full context, so it is more accurate. The second pass adds zeros to each utterance up to 4 s, or up to `max_utterance_ms` for a longer utterance, so each decode has one of two input lengths (sub-phase 6.7). On the Open ASR Leaderboard sets, the average word error rate goes from 7.67% to 5.91%, and on LibriSpeech test-clean from 2.56% to 1.63%. HA receives the second-pass text on the GPU host. Both models are official sherpa-onnx exports. The GPU host runs fp16 conversions of them (sub-phase 6.6c). Cloud streaming APIs take about 250 ms to 300 ms to give the final text, so they cannot meet G1. CPU machines use the same first pass and have no second pass.
 29. **Blocking work off the async workers.** STT decoding, the second pass, `predict`, TTS synthesis, voice embedding and SQLite calls run in `tokio::task::spawn_blocking`. The async workers only move bytes and wait. Thus a decode for one satellite does not delay `handle` for another.
-30. **Remote data through plugins.** Data from a remote server, for example a weather forecast, reaches Jarvis only through a `Plugin` adapter. Jarvis code builds the request and parses the reply into a typed result. Thus the result is the same for the same reply, and no model sees a raw API call. System Two gets each plugin as its own tool, for example `get_weather(when)`. A System One fetch intent names a plugin. The plugin registry keeps each result for `plugins.cache_s`. A plugin only reads data, so it has no `allowed_domains` check. System Two still calls HA services directly, within `openai.allowed_domains` (sub-phase 7.5). The weather plugin uses Open-Meteo, which needs no API key, with the location of the HA configuration. The Plex plugin reads the recently added items and the On Deck list of the Plex server with a token (phase 18).
+30. **Remote data through plugins.** Data from a remote server, for example a weather forecast, reaches Jarvis only through a `Plugin` adapter. Jarvis code builds the request and parses the reply into a typed result. Thus the result is the same for the same reply, and no model sees a raw API call. System Two gets each plugin as its own tool, for example `get_weather(when)`. A System One fetch intent names a plugin. The plugin registry keeps each result for `plugins.cache_s`. A plugin only reads data, so it has no `allowed_domains` check. System Two still calls HA services directly, within `openai.allowed_domains` (sub-phase 7.5). The weather plugin uses Open-Meteo, which needs no API key, with the location of the HA configuration. The Plex plugin reads the recently added items and the On Deck list of the Plex server with a token (phase 18). A new plugin uses a free data source without an API key when one exists. A source with a key needs your approval first, and the PR of the plugin then names the environment variable and the sign-up page.
 31. **Fixed TTS input lengths.** ONNX Runtime keeps the cuDNN state of a `Conv` node only for its last input shape, so each new reply length added about 230 ms to the TTS on the GPU host. Jarvis runs the four Supertonic-3 graphs itself through `ort`, with the fp32 vector estimator and vocoder. It adds zeros and masks to each input up to one of two lengths: 64 text ids and 64 latent frames, or 160 text ids and 192 latent frames. Each length has its own set of sessions, so a change of length builds no new plans. A longer input keeps its length (sub-phases 9.3 and 9.3b).
+32. **Plugin requests through GitHub.** When System Two finds that a cluster needs remote data that no plugin gives, Jarvis does not guess an answer source. It opens one GitHub issue for the cluster through the `Issues` port: the example requests, the usual times and the data needed (sub-phase 14.13). Claude writes a normal code PR with the plugin, the fetch intent and its `fresh_min`, and the tests. CI, the Codex review and your review gate it as any other PR, and the next release puts it on the GPU host. The issue has the label `github.label` and the assignee `github.assignee`. The app that starts Claude on such an issue is a setting of the repository (field log of sub-phase 14.13).
 
 ## 6. Latency Budget (System One)
 
@@ -207,14 +209,14 @@ With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan c
 | `ort` (features `load-dynamic`, `cuda`), `tokenizers` | Adapter | System One model prediction and the Supertonic-3 TTS graphs with ONNX Runtime (CUDA or CPU execution provider). Tokenizer from `tokenizer.json`. |
 | `rand_distr` | Adapter | Seeded normal noise of the Supertonic-3 latent (`StandardNormal`). |
 | `unicode-normalization` | Adapter | NFKD of the TTS text before the Supertonic-3 indexer. |
-| `reqwest` | Adapter | RunPod serverless REST API. Open-Meteo forecast API (features `json`, `query`). Plex server API. |
+| `reqwest` | Adapter | RunPod serverless REST API. Open-Meteo forecast API (features `json`, `query`). Plex server API. GitHub REST API. |
 | `object_store` (feature `aws`) | Adapter | RunPod network volume through its S3-compatible API. |
 | `async-openai` | Adapter | OpenAI Responses API: streaming, tools, structured output, `previous_response_id`. |
 | `rusqlite` (feature `bundled`) | Adapter | Interaction log database. |
 | `axum` | Adapter | Review web page and API. |
 | `hound` | Adapter | WAV encode for audio playback. |
 | `toml`, `tempfile` | Adapter, root | File stores with atomic write. Configuration. |
-| `wiremock` (dev) | Adapter tests | Mock OpenAI, RunPod, Open-Meteo and Plex servers. |
+| `wiremock` (dev) | Adapter tests | Mock OpenAI, RunPod, Open-Meteo, Plex and GitHub servers. |
 | `rubato` (dev) | Test | Resample TTS audio from 44.1 kHz to 16 kHz in `speech(text)`. |
 | `cargo-llvm-cov` (tool) | — | Coverage gate. |
 | `rust-code-analysis-cli` (tool) | — | Cyclomatic complexity, Halstead and Python function length metrics. `xtask complexity` reads its JSON output. |
@@ -288,8 +290,8 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `quint/dialog.qnt` | Model | Dialogs. | 10.1 |
 | `quint/feedback.qnt` | Model | Marks and blocked decisions. | 12.2 |
 | `quint/training.qnt` | Model | Training trigger, run, pause, accept and fallback. | 13.4 |
-| `quint/learned.qnt` | Model | Learned intent lifecycle and approval. | 14.3 |
-| `quint/prefetch.qnt` | Model | Prefetch freshness and side effects. | 14.8 |
+| `quint/learned.qnt` | Model | Learned intent lifecycle, approval and plugin request issues. | 14.3 |
+| `quint/prefetch.qnt` | Model | Prefetch window, refresh, freshness and side effects. | 14.8 |
 | `quint/speaker.qnt` | Model | Speaker identification and enrollment. | 15.5 |
 | `quint/jarvis.qnt` | Model | The system model. It composes the other models. | 16.1 |
 | `src/lib.rs` | Root | Module tree, `Config`, `SystemClock`, `LiveModels`, `App` (implements `Assistant` by delegation), `run`, the `dataset` command, `main`. | 0.1 |
@@ -331,6 +333,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/adapters/runpod.rs` | Adapter | `Trainer` with the RunPod REST API and network volume (fallback). | 13.8b |
 | `src/adapters/open_meteo.rs` | Adapter | `Plugin` `get_weather` with the Open-Meteo forecast API. | 17.3 |
 | `src/adapters/plex.rs` | Adapter | `Plugin` `get_new_shows` with the Plex server API. | 18.11 |
+| `src/adapters/github.rs` | Adapter | `Issues` with the GitHub REST API. | 14.12 |
 | `src/testing/house.json` | Test | The reference house snapshot (section 11). | 2.1 |
 | `src/testing/fakes.rs` | Test | `#[cfg(test)]` only. A fake for each port, `FakeWyomingClient`, `speech(text)`. | 2.9 |
 | `src/testing/e2e.rs` | Test | `#[cfg(test)]` only. Pipeline harness and end-to-end latency tests. | 9.1 |
@@ -467,8 +470,16 @@ cluster_distance = 0.3
 check_interval_s = 3600
 responses = 10
 prefetch_lead_min = 5
-prefetch_ttl_min = 60
 prefetch_services = ["calendar.get_events"]
+
+# Optional. Without this section, Jarvis opens no plugin requests (sub-phase 14.13).
+[github]
+url = "https://api.github.com"
+repo = "louislang/ha-jarvis"
+token_env = "JARVIS_GITHUB_TOKEN" # fine-grained, issues of `repo` only
+label = "claude"
+assignee = "louislang" # the login that the Claude trigger watches (field log of sub-phase 14.13)
+timeout_ms = 10000
 
 [log]
 database = "jarvis.db"
@@ -571,6 +582,7 @@ kind = "fetch"
 examples = ["what is the weather like", "will it rain today", "what is the forecast"]
 plugin = "get_weather"
 data = { when = "today" }
+fresh_min = 30
 
 [[intent]]
 name = "calendar_add"
@@ -597,12 +609,13 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 - `unknown_examples` are seed examples for the `unknown` label.
 - `kind = "command"`: Jarvis replies from the pool and calls the service in the background. A command with no `service` only replies. Static intents use this form.
 - `kind = "query"`: Jarvis replies with data from the hot cache. No remote call.
-- `kind = "fetch"`: Jarvis replies with a filler. Then it fetches the result of the `plugin` of the intent, with the rendered `data` as the arguments, and announces the answer (decision 30). A fetch needs no area.
+- `kind = "fetch"`: Jarvis replies with a filler. Then it fetches the result of the `plugin` of the intent, with the rendered `data` as the arguments, and announces the answer (decision 30). A fetch needs no area. When a fresh prefetched answer has the same call, Jarvis replies with it at once (sub-phase 14.10b).
 - `kind = "prefetch"`: Jarvis replies with the prefetched answer when it is fresh. Else Jarvis treats the request as System Two. Only learned intents use this kind.
 - `kind = "train"`: Jarvis replies from the pool and starts a training run (sub-phase 13.11).
 - `select` is a list of entity filters. A filter has a `domain`, an optional `name` and an optional `device_class`. `name` matches whole words of the entity name or an alias, without case sensitivity (`fan` matches "Office Fan", not "Infant Monitor"). An entity matches when one filter matches. `select` skips an entity that has an entity category, that is hidden or disabled, or that is on a satellite device (a device with an `assist_satellite` entity) and is not a `media_player`.
 - `exclude` is a list of entity IDs that `select` never matches. Use it for a sensor that gives bad values.
 - `plugin` is the tool name of the plugin of a fetch intent, for example `get_weather`.
+- `fresh_min` is how long the answer of a fetch or prefetch intent stays fresh, in minutes, for example 5 for traffic and 30 for the weather. Each fetch and prefetch intent has it, and no other kind has it. Before a usual time of the intent (phase 11), Jarvis prefetches the answer. Then it refreshes the answer each `fresh_min` until the window ends (sub-phases 14.9 to 14.10b).
 - `search = true` makes Jarvis search Music Assistant for the `media_id` of the call and play the best match (sub-phase 18.13b). An artist match starts with one track of the artist (sub-phase 18.14). Only `play_music` has it.
 - The area is the area slot. If no slot, it is the satellite area. The area slot matches an area name or alias without case sensitivity. For a command, an area slot that matches no area can name a Music Assistant speaker group (sub-phase 18.15).
 - `target = "entities"` uses all matching entities in the area.
@@ -774,7 +787,7 @@ Each model has state variables, actions and named invariants. `02-rules.md` sect
 | `dialog.qnt` | Dialogs and deferred jobs | `domain/dialog.rs`, `app/conversation.rs` | `TurnLimit`, `NoCallAfterCancel` |
 | `feedback.qnt` | Marks | `domain/feedback.rs` | `DecideAvoidsBlocked` |
 | `training.qnt` | Training | `domain/training.rs`, `app/training.rs` | `OneRun`, `SwapNeverWorse`, `CountResetsAfterRun`, `FailureKeepsModel`, `FallbackOnce`, `PauseOnlyLocal` |
-| `learned.qnt` | Learned intents | `domain/learn.rs`, `app/background.rs` | `ServiceNeedsApproval`, `NoReproposal`, `ActivationCountsOnce` |
-| `prefetch.qnt` | Prefetch | `domain/learn.rs`, `app/background.rs` | `NoCallFromPrefetch`, `ServedAnswerIsFresh` |
+| `learned.qnt` | Learned intents | `domain/learn.rs`, `app/background.rs` | `ServiceNeedsApproval`, `NoReproposal`, `ActivationCountsOnce`, `OneIssuePerCluster` |
+| `prefetch.qnt` | Prefetch | `domain/learn.rs`, `app/background.rs` | `NoCallFromPrefetch`, `ServedAnswerIsFresh`, `PrefetchOnlyInWindow`, `NoEarlyRefresh` |
 | `speaker.qnt` | Speaker identification | `domain/speaker.rs` | `SpeakerIsCandidate`, `NoVoiceOnlyEnrollment` |
 | `jarvis.qnt` | System | All use cases | `OneHandledPerRequest`, `ReplyBeforeCall`, `FillerBeforeAnswer`, `ModelSwapAtomic`, `NoTalkOver` |
