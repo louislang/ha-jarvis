@@ -47,6 +47,9 @@ use crate::domain::decide::MediaItem;
 use crate::domain::decide::SearchResults;
 use crate::domain::dialog::Key;
 use crate::domain::habits::Bucket;
+use crate::domain::habits::DayType;
+use crate::domain::habits::Entry;
+use crate::domain::habits::RequestHabits;
 use crate::domain::intent::Span;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Response;
@@ -158,6 +161,18 @@ pub struct ExIntent(Intent);
 /// The responses of one intent or one filler type.
 #[verifier::external_type_specification]
 pub struct ExPool(Pool);
+
+/// The day type of a habit bucket.
+#[verifier::external_type_specification]
+pub struct ExDayType(DayType);
+
+/// The request habit model.
+#[verifier::external_type_specification]
+pub struct ExRequestHabits(RequestHabits);
+
+/// One strength of `habits.json`.
+#[verifier::external_type_specification]
+pub struct ExEntry(Entry);
 
 /// One response template and its use count.
 #[verifier::external_type_specification]
