@@ -214,24 +214,13 @@ impl Config {
         self.validate_relations()
     }
 
-    /// Checks that each `ha`, `asr` and `dialog` timeout, interval and count is more than 0.
+    /// Checks that each timeout, interval, count and limit is more than 0.
     ///
     /// # Errors
     ///
     /// A field is 0. The error names the field and the range.
     fn validate_positive(&self) -> anyhow::Result<()> {
-        let asr = &self.asr;
-        let positive = [
-            ("ha.request_timeout_ms", self.ha.request_timeout_ms),
-            ("ha.announce_timeout_s", self.ha.announce_timeout_s),
-            ("ha.ping_interval_s", self.ha.ping_interval_s),
-            ("asr.vad_min_silence_ms", asr.vad_min_silence_ms),
-            ("asr.early_commit_ms", asr.early_commit_ms),
-            ("asr.endpoint_ms", asr.endpoint_ms),
-            ("asr.max_utterance_ms", asr.max_utterance_ms),
-            ("dialog.max_turns", u64::from(self.dialog.max_turns)),
-            ("dialog.timeout_s", self.dialog.timeout_s),
-        ];
+        let positive = self.durations().into_iter().chain(self.counts());
         for (name, value) in positive {
             anyhow::ensure!(
                 value > 0,
@@ -239,6 +228,51 @@ impl Config {
             );
         }
         Ok(())
+    }
+
+    /// The name and the value of each timeout and interval.
+    fn durations(&self) -> [(&'static str, u64); 14] {
+        let (ha, asr, openai) = (&self.ha, &self.asr, &self.openai);
+        [
+            ("ha.request_timeout_ms", ha.request_timeout_ms),
+            ("ha.announce_timeout_s", ha.announce_timeout_s),
+            ("ha.ping_interval_s", ha.ping_interval_s),
+            ("asr.vad_min_silence_ms", asr.vad_min_silence_ms),
+            ("asr.early_commit_ms", asr.early_commit_ms),
+            ("asr.endpoint_ms", asr.endpoint_ms),
+            ("asr.max_utterance_ms", asr.max_utterance_ms),
+            ("openai.timeout_ms", openai.timeout_ms),
+            ("openai.warm_idle_s", openai.warm_idle_s),
+            ("plugins.cache_s", self.plugins.cache_s),
+            ("plugins.timeout_ms", self.plugins.timeout_ms),
+            ("announce.margin_ms", self.announce.margin_ms),
+            ("announce.idle_wait_s", self.announce.idle_wait_s),
+            ("dialog.timeout_s", self.dialog.timeout_s),
+        ]
+    }
+
+    /// The name and the value of each count and limit.
+    fn counts(&self) -> [(&'static str, u64); 11] {
+        let (openai, backfill, train) = (&self.openai, &self.backfill, &self.train);
+        [
+            ("tts.num_steps", u64::from(self.tts.num_steps)),
+            (
+                "openai.max_output_tokens",
+                u64::from(openai.max_output_tokens),
+            ),
+            (
+                "openai.bulk_max_output_tokens",
+                u64::from(openai.bulk_max_output_tokens),
+            ),
+            ("openai.max_tool_calls", u64::from(openai.max_tool_calls)),
+            ("backfill.min_fresh", backfill.min_fresh as u64),
+            ("backfill.batch", backfill.batch as u64),
+            ("backfill.max_chars", backfill.max_chars as u64),
+            ("backfill.max_pool", backfill.max_pool as u64),
+            ("dialog.max_turns", u64::from(self.dialog.max_turns)),
+            ("train.epochs", train.epochs as u64),
+            ("train.batch_size", train.batch_size as u64),
+        ]
     }
 
     /// Checks the relation of each pair of fields.
@@ -371,7 +405,7 @@ pub struct TtsConfig {
     /// The speaker ID of the voice style.
     pub voice: i32,
     /// The number of denoising steps.
-    pub num_steps: i32,
+    pub num_steps: u32,
 }
 
 /// The `[openai]` section.
@@ -1363,6 +1397,38 @@ mod tests {
             assert!(
                 error.contains(name) && error.contains("more than 0"),
                 "error for {broken} has no field or range: {error}"
+            );
+        }
+    }
+
+    /// AC-2.2-7.
+    #[test]
+    fn ac_2_2_7_zero_field_names_field_and_range() {
+        let fields = [
+            ("tts.num_steps", 4),
+            ("openai.timeout_ms", 8000),
+            ("openai.warm_idle_s", 60),
+            ("openai.max_output_tokens", 150),
+            ("openai.bulk_max_output_tokens", 8000),
+            ("openai.max_tool_calls", 5),
+            ("plugins.cache_s", 300),
+            ("plugins.timeout_ms", 5000),
+            ("backfill.min_fresh", 3),
+            ("backfill.batch", 5),
+            ("backfill.max_chars", 80),
+            ("backfill.max_pool", 30),
+            ("announce.margin_ms", 300),
+            ("announce.idle_wait_s", 30),
+            ("train.epochs", 8),
+            ("train.batch_size", 8),
+        ];
+        for (name, value) in fields {
+            let (_, key) = name.split_once('.').expect("the name has a section");
+            let text = VALID.replace(&format!("{key} = {value}"), &format!("{key} = 0"));
+            let error = parse_error(&text);
+            assert!(
+                error.contains(name) && error.contains("more than 0"),
+                "error for {name} = 0 has no field or range: {error}"
             );
         }
     }
