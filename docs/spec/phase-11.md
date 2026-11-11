@@ -1,6 +1,6 @@
-# Phase 11: Habit Learning
+# Phase 11: Request Habits
 
-This phase learns the habits of the house. Habits go into the model context, help select the entity and missing slot values, and go into the System Two prompt.
+This phase learns the request habits of the house: which spoken request people make at which time of the week. A request habit is not a device habit. Native HA automations switch devices at set times, so Jarvis does not learn or act on HA state changes. Phase 14 uses the request habits to prepare an answer before its usual time, so a slow System Two request gets System One speed (decision 9).
 
 ---
 
@@ -8,12 +8,14 @@ This phase learns the habits of the house. Habits go into the model context, hel
 
 **Goal:** Add the pure functions that classify a state change: who caused it and what action it was. Habits can then ignore automations and count only real use.
 
+This sub-phase is merged. Request habits do not use HA state changes, so sub-phase 11.2 removes its code.
+
 - **Implements:** G11. **Depends on:** 10.7.
 - **Files:** create `src/domain/habits.rs`. Modify `src/lib.rs`.
 
 **Model.**
 
-- `source(context, jarvis_user_id) -> Source` (decision 10). `jarvis_user_id` is `Snapshot.user_id` (sub-phase 2.3).
+- `source(context, jarvis_user_id) -> Source`. `jarvis_user_id` is `Snapshot.user_id` (sub-phase 2.3).
 - `action(domain, old, new) -> Option<(action, value)>`: `on`/`off` from the state, `play` with `media_series_title` when present (the show), else `media_title`, `set_temperature` with the new `temperature`. Other attribute changes give `None`.
 
 **Acceptance criteria.**
@@ -36,7 +38,7 @@ This phase learns the habits of the house. Habits go into the model context, hel
 
 ### 11.1b Bucket
 
-**Goal:** Add the pure function that gives the time bucket of a state change. Habits can then count use by day type and hour.
+**Goal:** Add the pure function that gives the time bucket of a state change. Habits can then count use by day type and hour. Request habits use the same bucket for the time of a request.
 
 - **Implements:** G11. **Depends on:** 11.1.
 - **Files:** modify `src/domain/habits.rs`.
@@ -55,157 +57,107 @@ This phase learns the habits of the house. Habits go into the model context, hel
 
 ---
 
-### 11.2 Scores and Summary
+### 11.2 Remove Device Habits
 
-**Goal:** Add the habit model with decayed counts, scores with neighbor hours, the plain-text summary and the established habit set. Jarvis can now say what the house tends to do at a given time.
+**Goal:** Remove the merged code that only device habits need: `source`, `action` and the `habit_defaults` field of an intent. Request habits keep only `bucket`.
 
-- **Implements:** G11, G16. **Depends on:** 11.1b.
-- **Files:** modify `src/domain/habits.rs`, `src/lib.rs`, `jarvis.toml`, `benches/domain.rs`.
+- **Implements:** G11. **Depends on:** 11.1b.
+- **Files:** modify `src/domain/habits.rs`, `src/domain/catalog.rs`, `src/domain/responses.rs`.
 
 **Model.**
 
-- `decayed(count, last, now, half_life) = count * 0.5^((now - last) / half_life)`.
-- `observe(self, entity, action, value, source, time) -> Self` adds 1 to the decayed count of `(entity, action, value, source, bucket)`. An observation older than the last update of its key is ignored.
-- `score(entity, action, time) = c(bucket(time)) + 0.5 * (c(bucket(time - 1 h)) + c(bucket(time + 1 h)))`, without `automation` counts. Thus the neighbors cross midnight with the day type of that hour.
-- `summary(area, time, n) -> Vec<String>`: the top `n` habits for the area at that time. Each line is `<entity name> <action> [<value>] <HH:00> <weekdays|weekends> <score with one decimal>`, in lowercase.
-- `HabitKey` is `(entity, action)`. `score` adds the counts of all values and of all sources except `automation`.
-- `established(min_score) -> BTreeSet<HabitKey>`: the keys with a score of `min_score` or more in one or more buckets.
-- `prune(now) -> Self` removes each key whose decayed count is less than 0.01 in every bucket. Thus the model does not grow with old shows and old entities.
-- This sub-phase adds `[habits]` (`domains`, `half_life_days`, `min_score`).
+- `src/domain/habits.rs` loses `Source`, `Action`, `source`, `action`, their helpers, their spec functions and the tests of AC-11.1-1 to AC-11.1-8. `DayType`, `Bucket`, `bucket`, `day_of` and the test of AC-11.1b-1 stay.
+- `src/domain/contracts.rs` loses each contract and axiom that only the removed code uses.
+- `Intent` loses `habit_defaults`. `Intent` has `deny_unknown_fields`, so an intent with `habit_defaults` no longer loads. A template variable must now be a built-in or a tagged slot (`check_slots`, sub-phase 3.2b). An intent pool variable must be a built-in or a slot (`variables`, sub-phase 4.2). No intent of `intents.toml` has `habit_defaults`.
 
 **Acceptance criteria.**
 
-- AC-11.2-1: When the time is one half-life after the last update, `decayed(4.0, ...)` returns 2.0.
-- AC-11.2-2: When the house turns on a light at 18:00 on 10 weekdays, `score` at 18:00 on a weekday is higher than at 09:00.
-- AC-11.2-3: When all observations come from `automation`, `score` returns 0.
-- AC-11.2-4: When `summary` runs at 18:00 on a weekday, its first line has the form `living room lamp on 18:00 weekdays 4.2`.
-- AC-11.2-5: When a habit has a score of `min_score` in one bucket, `established` contains it.
-- AC-11.2-6 [Bench]: `score` with 500 habit keys uses 200,000 instructions or fewer.
-- AC-11.2-7: When `score` runs at Monday 00:30, it adds half of the count of the Sunday 23:00 (`weekends`) bucket.
-- AC-11.2-8: When `observe` gets a time older than the last update of the key, the count does not change.
-- AC-11.2-9: When every decayed count of a key is less than 0.01, `prune` removes the key, and the other keys do not change.
+- AC-11.2-1: When an intent of the catalog text has `habit_defaults`, the catalog does not load, and the error names `habit_defaults`.
+- AC-11.2-2: When a template of an intent uses a variable that is not a built-in or a tagged slot, `validate_catalog` returns an error that contains the variable. This replaces AC-3.2b-1.
+- AC-11.2-3: When a template of an intent pool uses a variable that is not a built-in or a slot of the intent, `validate_pools` returns an error with the pool and the variable. This replaces AC-4.2-6.
 
 **Proofs.**
 
-- P-11.2-1. Ensures: `decayed(4.0, last, last + half_life, half_life) = 2.0`. Argument: `0.5^1 = 0.5`, and `4.0 * 0.5 = 2.0`.
-- P-11.2-2 (AC-11.2-2). Ensures: `score` at 18:00 on a weekday is more than `score` at 09:00, which is 0. Argument: the 18:00 bucket has 10 observations, so `c(18) > 0`. The 09:00 bucket and its neighbors have none, so `score(09:00) = 0`. Decay keeps positive counts positive.
-- P-11.2-3. Ensures: `score = 0` when every count comes from `automation`. Argument: `score` sums only non-`automation` counts, which are all 0.
-- P-11.2-4 (AC-11.2-4). Ensures: each summary line has the format of the model in lowercase, and the first line has the highest score. Argument: `summary` sorts the keys of the area by score, highest first, takes `n`, and formats each with one `format!` and `to_lowercase`.
-- P-11.2-5. Ensures: `established = { k | max over buckets of score(k) >= min_score }`. Argument: `established` filters keys by `max over buckets of score >= min_score`.
-- P-11.2-7 (AC-11.2-7). Ensures: `score` at Monday 00:30 adds `0.5 * c(weekends, 23)`. Argument: `bucket(time - 1 h)` is the bucket of Sunday 23:30, and `bucket` takes the day type of the shifted time.
-- P-11.2-8 (AC-11.2-8). Ensures: an observation older than the last update of its key does not change the model. Argument: `observe` returns `self` unchanged when `time` is less than the last update of the key.
-- P-11.2-9 (AC-11.2-9). Ensures: `prune` keeps a key if and only if one of its decayed counts is 0.01 or more. Argument: `prune` is a filter over the keys with that predicate.
-- P-11.2-6. Evidence: benchmark.
+- P-11.2-1. Evidence: test (the `serde` derive).
+- P-11.2-2. Ensures: the allowed set of `check_slots` is the tagged slots and the built-ins. Argument: `check_slots` inserts only these names before it checks the templates.
+- P-11.2-3. Ensures: `variables` gives the slots of the intent and the built-ins of its kind and target. Argument: `variables` inserts only these names.
 
 ---
 
-### 11.3 Habit Learning and Store
+### 11.3 Request Habit Scores
 
-**Goal:** Feed each live state change into the habit model and save the model on an interval and at shutdown. Habits now build up from normal use of the house.
+**Goal:** Add the request habit model: a decayed score for each request and bucket, in which each day counts once, and the usual times of a request. Jarvis can now tell when the house usually asks for something.
 
 - **Implements:** G11. **Depends on:** 11.2.
-- **Files:** modify `src/app/background.rs`, `src/lib.rs`, `jarvis.toml`.
+- **Files:** modify `src/domain/habits.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** The sync use case gives each `StateChanged` event to the cache and, for a domain in `habits.domains`, to `observe`. A `Store<Habits>` saves `prune(now)` of the model to `habits.file` each `save_interval_s` and at shutdown. This sub-phase adds `habits.file` and `habits.save_interval_s`.
+**Model.**
+
+- A request key is a name: the intent name of a request that System One acts on. Sub-phase 14.5 adds the name of a learned entry for a cluster of System Two requests.
+- `RequestHabits` keeps a `Strength { score, last }` for each key and bucket. `last` is the local date of the last day that counted. `Bucket` and `DayType` derive `Eq` and `Ord` for the map key: weekdays before weekends, then the hour.
+- `decayed(score, last, today, half_life_days) = score * 0.5^(days(last, today) / half_life_days)`. `days` is the number of calendar days from `last` to `today`.
+- `observe(self, key, time, zone, settings) -> Self`. `b = bucket(time, zone)`, and `d` is the local date of `time` in `zone`:
+  - Without a `Strength` for `(key, b)`, it adds `{ score: 1, last: d }`.
+  - When `d <= last`, it returns `self` unchanged. Thus a day counts once for each key and bucket, and an older request changes nothing.
+  - Else the `Strength` becomes `{ score: decayed(score, last, d) + 1, last: d }`.
+- `usual_times(key, today, settings) -> Vec<Bucket>`: the buckets of `key` with `decayed(score, last, today) >= min_score`, in bucket order.
+- `prune(today, settings) -> Self` removes each `Strength` with a decayed score less than 0.01, and each key without a `Strength`. Thus the model does not grow with old requests.
+- The defaults are `half_life_days = 14` and `min_score = 2.0`. When a request occurs in one bucket on three days within 14 days, the score on the day of the third request is more than `1 + 0.5 + 0.5 = 2.0`, so the bucket is a usual time. Requests on two days give at most `1 + 0.5^(1/14)`, which is less than 2.0. A usual time fades when no new request comes: a habit of three days in a row ends 8 days after the last request.
+- `habits.json` keeps a list of `{ key, day, hour, score, last }` objects, because a JSON map key must be a string.
+- This sub-phase adds `[habits]` (`half_life_days`, `min_score`). `validate` checks that both are more than 0 (sub-phase 2.2).
 
 **Acceptance criteria.**
 
-- AC-11.3-1: When `FakeHome` sends `StateChanged` for a tracked domain, the habit model has the observation before virtual time advances.
-- AC-11.3-2: When the event is for a domain not in `habits.domains`, the model does not change.
-- AC-11.3-3: When `save_interval_s` passes, the habit store has the new observations.
-- AC-11.3-4: When Jarvis stops, the habit store receives a save.
+- AC-11.3-1: When `today` is 14 days after `last`, `decayed(4.0, last, today, 14)` returns 2.0.
+- AC-11.3-2: When `get_traffic` is observed on Monday, Tuesday and Wednesday at 08:10 in the HA time zone, `usual_times` on that Wednesday returns `[(weekdays, 8)]`.
+- AC-11.3-3: When `get_traffic` is observed five times on Monday and five times on Tuesday at 08:10, `usual_times` on that Tuesday returns no bucket.
+- AC-11.3-4: When `get_traffic` is observed at 08:10 on three weekdays, the first one 14 days before the third, `usual_times` on the day of the third returns `[(weekdays, 8)]`.
+- AC-11.3-5: When the model of AC-11.3-2 gets no new request, `usual_times` returns `[(weekdays, 8)]` 7 days after that Wednesday, and no bucket 8 days after it.
+- AC-11.3-6: When `observe` gets a time on the date of `last` or before it, for the same key and bucket, the model does not change.
+- AC-11.3-7: When `get_weather` is observed on Saturday at 09:30, the model has a `Strength` for `(weekends, 9)` and none for `(weekdays, 9)`.
+- AC-11.3-8: When the decayed score of a `Strength` is less than 0.01, `prune` removes it, and the other entries do not change.
 
 **Proofs.**
 
-- P-11.3-2. Argument: `observe` is called inside `if domains.contains(domain)`.
-- P-11.3-1, P-11.3-3, P-11.3-4. Evidence: test.
+- P-11.3-1. Ensures: `decayed(s, l, t, h) = s * 0.5^(days(l, t) / h)`. Argument: `decayed` is that expression. The test checks the value (`02-rules.md` section 5.1, rule 9).
+- P-11.3-2 to P-11.3-5. Ensures: `usual_times(k, t)` has `b` if and only if `(k, b)` has a `Strength` with `decayed(score, last, t) >= min_score`. Argument: `usual_times` filters the entries of `k` with that predicate. The tests check the values.
+- P-11.3-6. Ensures: when `(k, b)` has a `Strength` and `d <= last`, `observe` returns the model unchanged. Argument: `observe` returns `self` in the arm with the guard `d <= last`.
+- P-11.3-7. Ensures: `observe` changes only the entry of `(key, bucket(time, zone))`. Argument: `observe` reads and writes only that map entry, and P-11.1b-1 gives the bucket.
+- P-11.3-8. Ensures: `prune` keeps a `Strength` if and only if its decayed score is 0.01 or more. Argument: `prune` is a filter with that predicate, then a filter that removes the empty keys.
 
 ---
 
-### 11.4 History Bootstrap
+### 11.4 Request Recording and Store
 
-**Goal:** Add `Home::history` and load `bootstrap_days` of HA history when no habit data exists. Jarvis has useful habits on its first day.
+**Goal:** Record each spoken request that System One acts on in the request habit model, and save the model on an interval and at shutdown. Request habits now build up from normal use of the house.
 
 - **Implements:** G11. **Depends on:** 11.3.
-- **Files:** modify `src/ports.rs`, `src/adapters/ha.rs`, `src/app/background.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
+- **Files:** modify `src/app/conversation.rs`, `src/app/background.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `Home::history(start, end, entities) -> Result<Vec<StateChange>>` uses `history/history_during_period`. When the habit store has no data, the use case loads the history and observes each change with source `unknown`. The history ends at the time of the first live subscription, so history and live events do not overlap. The first state of each entity in the history is a start state, not a change, so it gives no observation. This sub-phase adds `habits.bootstrap_days`.
+**Model.**
 
-**Acceptance criteria.**
-
-- AC-11.4-1: When the habit store has no data, the use case calls `history` for `bootstrap_days`, and all bootstrap observations have source `unknown`.
-- AC-11.4-2: When `HaHome::history` runs, `FakeHaServer` receives `history/history_during_period` with the start and end times.
-- AC-11.4-3: When the habit store has data, the use case does not call `history`.
-- AC-11.4-4: When the history has three states for one entity, the use case observes two changes, and the history request ends at the subscription time.
-
-**Proofs.**
-
-- P-11.4-1, P-11.4-3. Argument: the bootstrap runs inside `if store.load()? == None`, and it passes the constant source `unknown`.
-- P-11.4-2, P-11.4-4. Evidence: test.
-
----
-
-### 11.5 Habits in the Model Context
-
-**Goal:** Put the habit summary for the satellite area and the current time into the System One model context. The model can now prefer what the house usually does at this time.
-
-- **Implements:** G3, G11. **Depends on:** 11.4.
-- **Files:** modify `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`.
-
-**Model.** `handle` builds `context_text(area, summary(area, now, model.habits))`. The speech use case still predicts partials with no habit lines, because the audio stream has no satellite. This sub-phase adds `model.habits`.
+- After `decide`, `handle` observes the intent of the decision at the `Clock` time when all of these are true:
+  - The context has a `satellite_id`. Thus only a spoken request counts. Text from the HA UI does not.
+  - Routing processes the text as a new request (steps 3 and 6 of sub-phase 10.5). An answer to a dialog is not a request.
+  - The decision is not `Defer` with `Job::Llm`. Sub-phase 14.5 counts the requests that System Two answers.
+- A request that asks for the area counts once, with its intent. The answer that fills the area does not count.
+- An HA state change or an automation never reaches `handle`, so it never counts.
+- `handle` and the habit task share the model behind one `std::sync::Mutex`. No code holds the lock across an `await`. A poisoned lock logs one `warn` event, and the request does not count.
+- At startup, `run` loads the model from a `Store<RequestHabits>` at `habits.file`, or starts with an empty model. The habit task in `src/app/background.rs` saves `prune(today)` of the model each `save_interval_s` and at shutdown.
+- This sub-phase adds `habits.file` and `habits.save_interval_s`. `validate` checks that `save_interval_s` is more than 0.
 
 **Acceptance criteria.**
 
-- AC-11.5-1: When `handle` runs at 18:00 on a weekday in the Living Room, `FakeClassifier` records a context with the top `model.habits` habit lines for that area and time.
-- AC-11.5-2: When the speech use case predicts a partial text, the context has `habits: none`.
-- AC-11.5-3 [GPU host]: With 500 habit keys, all Phase 9.2 latency tests pass.
+- AC-11.4-1: When `handle` gets a request with a `satellite_id` on Monday at 08:10 and `FakeClassifier` gives `lights_on` 0.9, the model has a `Strength` for `lights_on` in `(weekdays, 8)` when `handle` returns.
+- AC-11.4-2: When the context has no `satellite_id`, the model does not change.
+- AC-11.4-3: When the decision is `Defer` with `Job::Llm`, the model does not change.
+- AC-11.4-4: When "turn on the lights" asks for the area and the answer "the kitchen" fills it, the model has one observation of `lights_on`, from the request.
+- AC-11.4-5: When `save_interval_s` passes, the habit store has the new observations.
+- AC-11.4-6: When Jarvis stops, the habit store receives a save.
+- AC-11.4-7: When the habit store has a model at startup, `usual_times` of its keys gives the stored usual times.
 
 **Proofs.**
 
-- P-11.5-1. Argument: `handle` passes `summary(area, now, n)` to `context_text` (P-3.3-2).
-- P-11.5-2. Argument: the speech use case passes an empty list.
-- P-11.5-3. Evidence: test.
-
----
-
-### 11.6 Habits in Entity and Slot Selection
-
-**Goal:** Use habit scores to choose between entities and to fill a missing slot. "Turn on the TV" picks the usual TV and the usual show for this time.
-
-- **Implements:** G11. **Depends on:** 11.5.
-- **Files:** modify `src/domain/select.rs`, `src/domain/decide.rs`, `intents.toml`.
-
-**Model.** The habit action of an intent comes from its service: `turn_on` gives `on`, `turn_off` gives `off`, `media_player.play_media` gives `play`, and `climate.set_temperature` gives `set_temperature`. Another service scores 0. `target = "entity"` picks the matching entity with the highest score of that action now. Equal scores pick the lowest entity ID. `habit_defaults` maps a slot to a habit action. An empty slot takes the value of that action with the highest score now, for the selected entity. No such habit gives `Defer` with `Job::Llm` (sub-phase 4.5d).
-
-**Acceptance criteria.**
-
-- AC-11.6-1: When an area has two media players, `select` returns the one with the higher score now.
-- AC-11.6-2: When two entities have equal scores, `select` returns the one with the lowest entity ID.
-- AC-11.6-3: When `tv_on` has no `show` slot and the top `play` value at 20:00 is `Bluey`, the call data `media_content_id` has `"show_name": "Bluey"`.
-- AC-11.6-4: When no habit exists for an empty `habit_defaults` slot, `decide` returns `Defer` with `Job::Llm`.
-
-**Proofs.**
-
-- P-11.6-1, P-11.6-2. Ensures: `select` gives the candidate with the highest score, and of equal scores the lowest entity ID. Argument: `select` sorts the candidates by entity ID, then uses a `max_by` on the score that keeps the first of equal elements.
-- P-11.6-3, P-11.6-4. Ensures: an empty `habit_defaults` slot takes the value with the highest score now, and no such value gives `Defer` with `Job::Llm`. Argument: the slot value is `slot.or(top_value(habits, action, now))`. `None` from both gives `Defer`.
-
----
-
-### 11.7 Habits in the System Two Prompt
-
-**Goal:** Add the habit summary to the System Two question. OpenAI answers with the same knowledge of the house that System One has.
-
-- **Implements:** G7, G11. **Depends on:** 11.6.
-- **Files:** modify `src/ports.rs`, `src/adapters/openai.rs`, `src/app/conversation.rs`.
-
-**Model.** `Question` gets `habits: Vec<String>`. The user message lists them. The system message does not change.
-
-**Acceptance criteria.**
-
-- AC-11.7-1: When the prompt builder runs, the user message contains the habit summary for the area.
-- AC-11.7-2: When the prompt builder runs, the system message equals the system message of sub-phase 7.2 byte for byte.
-
-**Proofs.**
-
-- P-11.7-1. Argument: the user message builder iterates `question.habits`.
-- P-11.7-2. Argument: `system_prompt` is still a constant (P-7.2-1).
+- P-11.4-2, P-11.4-3. Argument: `handle` calls `observe` only inside the guard `satellite_id.is_some() && !is_llm(decision)`.
+- P-11.4-4. Argument: the routing arms of an answer (steps 1, 2, 4 and 5) do not call `observe`. Only the arm of a new request does.
+- P-11.4-1, P-11.4-5 to P-11.4-7. Evidence: test.

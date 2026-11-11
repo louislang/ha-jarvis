@@ -62,7 +62,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | Second pass | The offline STT model. At commit, it decodes the whole utterance again and gives the final transcript. |
 | Early commit | Jarvis sends the final transcript before HA stops the audio stream. |
 | System One | The local, fast path. The System One model classifies the request. Jarvis acts without a remote call. |
-| System One model | A pre-trained text encoder that Jarvis fine-tunes. It gets the transcript, the satellite area and the habits. It gives a probability for each intent and for `unknown`. It also tags the slots. |
+| System One model | A pre-trained text encoder that Jarvis fine-tunes. It gets the transcript and the satellite area. It gives a probability for each intent and for `unknown`. It also tags the slots. |
 | System Two | The OpenAI path. It handles requests that System One cannot classify or cannot act on. |
 | Intent | One action that Jarvis can take, for example `lights_on`. Each intent is one label of the System One model. |
 | Unknown | The reserved label for a request that matches no intent. |
@@ -76,10 +76,9 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | Ask | The HA service `assist_satellite.start_conversation`. It speaks a question on one satellite, then listens without the wake word. |
 | Dialog | The state of one open conversation on one satellite. |
 | Response latency | The time that Jarvis adds to a request: from the voice end that the VAD detects to the `transcript` event, from `transcript` to `handled`, and from `synthesize` to the first audio chunk. The time that HA takes between these events is not part of it. |
-| Habit | A learned pattern: an entity action that occurs at a specified time of the week. |
-| Bucket | One time slot for habits: the day type (weekday or weekend) and the hour. |
-| Established habit | A habit with a score of `habits.min_score` or more in one or more buckets. |
-| Source | The cause of a state change: `manual`, `automation`, `voice` or `unknown`. |
+| Request habit | A spoken request that people make in the same time slot on several days, for example "what's the traffic like today?" on weekdays at 08:00. Its key is the intent name, or the name of the learned entry of a cluster of System Two requests. HA state changes and automations are not request habits. |
+| Bucket | One time slot for request habits: the day type (weekday or weekend) and the hour. |
+| Usual time | A bucket in which the decayed score of a request is `habits.min_score` or more. |
 | Speaker | The person who speaks the request. |
 | Voice profile | The stored voice embeddings of one person. |
 | Learned intent | An intent that Jarvis adds itself from a cluster of requests that System Two answered. |
@@ -93,7 +92,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | Training set | All labeled examples for the System One model. |
 | Held-out set | The examples that Jarvis uses only to measure accuracy. Training never uses them. |
 | Training run | One fine-tune of the System One model, on the GPU host or on RunPod. |
-| Change | One event that counts toward the next automatic training run: a new action mark, a new active learned intent or a new established habit. |
+| Change | One event that counts toward the next automatic training run: a new action mark or a new active learned intent. |
 | Fixture model | A System One model that `just fixture-model` trains on the CPU from the seed examples. |
 | RunPod | The GPU cloud that runs a training run when local training fails. |
 | ONNX | The model file format. ONNX Runtime runs the models. |
@@ -119,7 +118,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 |---|---|
 | G1 | The response latency for System One requests is 300 ms or less (p95) on the GPU host. A System One request here has a top intent at or above `model.commit_threshold` and a response in the audio cache. An intent with `needs_speaker` can wait `speaker.wait_ms` more (AC-15.7-9). The light commands of AC-9.2-5 have a target of 400 ms. |
 | G2 | STT starts when the first audio chunk arrives. STT has two passes: a streaming first pass and an offline second pass at commit. On the GPU host, the first pass is NVIDIA Nemotron Speech Streaming EN 0.6B and the second pass is NVIDIA Parakeet Unified EN 0.6B. |
-| G3 | The System One model classifies common requests locally. It gets the transcript, the satellite area and the habits. It gives a probability for each intent and for `unknown`, and tags the slots. The response path does not call a remote service. |
+| G3 | The System One model classifies common requests locally. It gets the transcript and the satellite area. It gives a probability for each intent and for `unknown`, and tags the slots. The response path does not call a remote service. |
 | G4 | Each intent has a pool of responses. Jarvis selects with variety and does not repeat the last response. |
 | G5 | Jarvis adds new responses to a pool when the pool has too few unused responses. |
 | G6 | For a request that needs external data, Jarvis speaks a filler immediately. Then Jarvis announces the real answer. |
@@ -127,12 +126,12 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | G8 | Jarvis keeps a hot cache of HA entity states. The hot cache stays in sync with HA. |
 | G9 | Jarvis knows the area of the satellite. "Turn on the lights" controls the lights in that area. |
 | G10 | The code uses hexagonal architecture. It is modular: each change in the change map (`01-architecture.md` section 12) touches only the listed files. It obeys all rules in `02-rules.md`. |
-| G11 | Jarvis learns the habits of the house from HA state changes. The habits are an input of the System One model. They also help Jarvis select the entity and missing slot values. |
+| G11 | Jarvis learns the request habits of the house: which spoken request people make at which time of the week. Only spoken requests count, never HA state changes or automations. Before the usual time of a request whose answer needs current data, Jarvis prepares the answer. Thus the request moves from System Two speed to System One speed. |
 | G12 | Jarvis identifies the speaker from who is home, phone or watch proximity to the satellite (through Bluetooth), the satellite presence sensor, and voice. Jarvis discovers these entities from HA. Person-specific intents act for that speaker. |
 | G13 | When Jarvis does not understand, or needs more data, it asks the user. It continues to ask until the request is clear, the user cancels, or the turn limit occurs. |
 | G14 | Jarvis clusters frequent requests that System Two answers, not only `unknown` requests. For each cluster, System Two writes a new intent, so System One handles these requests after the next training run. Jarvis adds it automatically, except an intent that calls an HA service. That intent waits for your approval. |
 | G15 | Jarvis logs each request with its audio (for the last `audio_days` days), the action and the response. You can mark the action and the response as good or bad, with an optional correction. Jarvis uses the marks in future decisions. |
-| G16 | Marks, learned intents and established habits become training data. Jarvis starts a training run after `train.min_changes` changes, or when you ask by voice. The run uses the GPU host first and RunPod when local training fails. During a local run, Jarvis mutes the satellites and pauses: it does not answer, and the run gets the full GPU. The new model replaces the old model only when its held-out accuracy is equal or better. |
+| G16 | Marks and learned intents become training data. Jarvis starts a training run after `train.min_changes` changes, or when you ask by voice. The run uses the GPU host first and RunPod when local training fails. During a local run, Jarvis mutes the satellites and pauses: it does not answer, and the run gets the full GPU. The new model replaces the old model only when its held-out accuracy is equal or better. |
 | G17 | The repository is on GitHub. The pre-commit hook and CI run the required checks. `just merge` merges a PR only when they all pass. A `v*` tag publishes release binaries for Linux x86-64 and macOS x86-64 (Intel), and the training image. |
 | G18 | On the GPU host, STT, the System One model, TTS and voice identification run on the GPU. Other machines run the same code on the CPU. |
 | G19 | Each stateful part of Jarvis with concurrency or a life cycle (the parts in `01-architecture.md` section 13) has a Quint model with named invariants. CI checks each model, and conformance tests replay its traces against the Rust code. A system model composes the parts of the request life cycle. Simple stores (use counts, the correlation buffer, interaction updates, voice profiles, habit storage) have unit tests instead. A model check to a step bound is bounded evidence, not a proof for all executions. |
@@ -153,11 +152,12 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 
 - Add dentist to my calendar for Monday. Jarvis adds the event to the calendar of the speaker.
 
-### 1.3 Example Habits
+### 1.3 Example Request Habits
 
-- The living room lights turn on at about 18:00 on weekdays.
-- The house watches TV in the living room at about 20:00.
-- A person adjusts the thermostat manually in the evening.
+- On weekdays between 08:00 and 09:00, you ask "What's the traffic like today?". System Two answers slowly, or it cannot answer without a data source. After a few mornings, Jarvis notices the repeated request. When no plugin gives the data, Jarvis asks Claude for a new plugin (phase 14). When the new plugin is released, Jarvis knows the usual time: weekdays at 08:00. At about 07:55, Jarvis gets the traffic data and prepares the reply. It refreshes the reply until 09:00. At 08:10, the request gets System One speed.
+- On weekends, the house asks "What is the weather like?" at about 09:00. At 08:55, Jarvis gets the forecast and prepares the reply.
+- You ask for the traffic on two mornings only. That is not a request habit, so Jarvis prepares nothing.
+- The living room lights turn on at 18:00. That is a device schedule, not a request habit. A native HA automation does it.
 
 ### 1.4 Example Dialogs
 
@@ -169,11 +169,11 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 - Users often say "Tell me a joke". The model gives `unknown`, so System Two answers. Jarvis clusters these requests. System Two proposes `tell_joke`, a static intent with 10 jokes. It has no service, so Jarvis adds it automatically. After the next training run, "Tell me a joke" gets System One speed.
 - Users often ask "What is playing on the living room TV?". System One guesses a wrong intent and cannot act, so System Two answers. Jarvis clusters these requests, and System Two proposes a new intent. After the next training run, System One answers it.
 - Users often say "Good night". System Two proposes `good_night` with the service `scene.turn_on`. It calls an HA service, so it waits for your approval on the review page.
-- A user says "How is traffic to work?" at about 08:00 on weekdays. System Two proposes a prefetch intent. At 07:55 Jarvis gets the answer. At 08:00 the answer is ready.
+- Users often ask "What is on the family calendar today?" at about 07:00 on weekdays. System Two answers with `calendar.get_events` and proposes a prefetch intent. At 06:55 Jarvis gets the answer. At 07:00 the answer is ready.
 
 ### 1.6 Example Training Triggers
 
-- You mark the action of 12 interactions, Jarvis adds 2 learned intents and the house gets 6 new established habits. That is 20 changes. With `train.min_changes = 20`, Jarvis starts a training run.
+- You mark the action of 18 interactions, and Jarvis adds 2 learned intents. That is 20 changes. With `train.min_changes = 20`, Jarvis starts a training run.
 - You say "Start training." Jarvis starts a training run now, with any number of changes.
 
 ### 1.7 Non-Goals
@@ -203,7 +203,7 @@ Each line is one PR. The work order follows the rows of this table, not the phas
 | [17 Plugins](phase-17.md) | 17.1 Plugin port and cache · 17.2 Plugin tools in System Two · 17.3 Open-Meteo weather plugin · 17.3b One plugin registry · 17.4 Weather intent through the plugin |
 | [18 Queries and Media](phase-18.md) | 18.1 List queries · 18.2 Light queries · 18.3 Door, window and lock queries · 18.4 Climate and fan queries · 18.5 Presence and alarm queries · 18.6 Now playing query · 18.7 Music playback · 18.8 Music controls · 18.9 Plex playback · 18.10 TV controls · 18.11 Plex plugin · 18.12 New shows intent · 18.13 Music search data · 18.13b Music search playback · 18.14 Fast artist start · 18.15 Speaker groups · 18.15b Speaker group controls · 18.16 Opposite commands |
 | [10 Multi-Turn Dialogs](phase-10.md) | 10.1 Dialog Quint model · 10.2 Dialog state · 10.3 Answer fill and cancel · 10.4 Ask decision and HA ask · 10.5 Dialog routing · 10.5b Dialog generations · 10.5c Dialog fill context · 10.6 System Two questions · 10.6b System Two answers · 10.7 Early commit for answers |
-| [11 Habit Learning](phase-11.md) | 11.1 Source and action · 11.1b Bucket · 11.2 Scores and summary · 11.3 Habit learning and store · 11.4 History bootstrap · 11.5 Habits in the model context · 11.6 Habits in entity and slot selection · 11.7 Habits in the System Two prompt |
+| [11 Request Habits](phase-11.md) | 11.1 Source and action · 11.1b Bucket · 11.2 Remove device habits · 11.3 Request habit scores · 11.4 Request recording and store |
 | [12 Interaction Log and Feedback](phase-12.md) | 12.1 Audio correlation · 12.2 Feedback Quint model · 12.3 Feedback rules · 12.4 Interaction log port and SQLite storage · 12.5 Marks, deferred requests and pruning · 12.6 Record interactions · 12.7 Review port and use case · 12.8 Review web API · 12.9 Review page · 12.10 Feedback in decide · 12.11 Feedback in responses and System Two |
 | [13 Training](phase-13.md) | 13.1 Mark examples and training set · 13.2 Held-out split and acceptance · 13.3 Change count · 13.4 Training Quint model · 13.5 Paraphrase generation · 13.6 Generated example store · 13.7 Trainer port and process adapter · 13.8 RunPod handler · 13.8b RunPod adapter · 13.9 Training run · 13.10 Training pause and fallback · 13.11 Voice trigger |
 | [14 Learned Intents](phase-14.md) | 14.1 Clusters · 14.2 Proposal rules · 14.3 Learned intent Quint model · 14.4 Proposal generation · 14.5 Learned intent lifecycle · 14.6 Proposal review · 14.7 Activation · 14.8 Prefetch Quint model · 14.9 Prefetch rules · 14.10 Prefetch use case · 14.11 Learned intents in training |

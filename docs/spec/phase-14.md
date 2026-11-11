@@ -11,18 +11,20 @@ This phase makes System Two teach System One. Jarvis clusters frequent requests 
 - **Implements:** G14. **Depends on:** 13.11.
 - **Files:** create `src/domain/learn.rs`. Modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
 
-**Model.** The embeddings come from `Reasoner::embed` (sub-phase 14.4) on the transcripts. They do not change when System One retrains, and the context does not change them. `clusters(points, distance, min_points) -> Vec<Cluster { texts, centroid }>`: DBSCAN with `linfa-clustering` on the L2-normalized embeddings. Noise points are dropped. `covered(cluster, learned, distance) -> bool`: the cluster centroid is within `distance` of the stored centroid of one learned entry, at any status. Thus new wordings of a rejected topic stay covered when the window moves. This sub-phase adds `[learn]` (`window_days`, `min_cluster`, `cluster_distance`).
+**Model.** The embeddings come from `Reasoner::embed` (sub-phase 14.4) on the transcripts. They do not change when System One retrains, and the context does not change them. A point has the text, the time, the `spoken` flag (sub-phase 12.5) and the embedding of one request. `clusters(points, distance, min_points) -> Vec<Cluster { texts, times, centroid }>`: DBSCAN with `linfa-clustering` on the L2-normalized embeddings. Noise points are dropped. `times` are the times of the spoken points of the cluster, because only spoken requests are request habits (sub-phase 11.4). `covering(cluster, learned, distance) -> Option<name>`: the name of the first learned entry, at any status, whose stored centroid is within `distance` of the cluster centroid. Thus new wordings of a rejected topic stay covered when the window moves. This sub-phase adds `[learn]` (`window_days`, `min_cluster`, `cluster_distance`).
 
 **Acceptance criteria.**
 
 - AC-14.1-1: When six embeddings are close and one is far, `clusters` with `min_points = 5` returns one cluster of six.
 - AC-14.1-2: When four embeddings are close, `clusters` with `min_points = 5` returns no cluster.
-- AC-14.1-3: When a learned entry has a centroid within `cluster_distance` of the cluster centroid, `covered` returns true, also when the texts differ.
-- AC-14.1-4: When no learned entry has a centroid within `cluster_distance`, `covered` returns false.
+- AC-14.1-3: When a learned entry has a centroid within `cluster_distance` of the cluster centroid, `covering` returns its name, also when the texts differ.
+- AC-14.1-4: When no learned entry has a centroid within `cluster_distance`, `covering` returns none.
+- AC-14.1-5: When six close points have six request times and one of them is not spoken, the cluster has the five times of the spoken points.
 
 **Proofs.**
 
-- P-14.1-3, P-14.1-4. Ensures: `covered` is true if and only if one learned entry has a centroid within `distance` of the cluster centroid. Argument: `covered` is `any(entry: dist(cluster.centroid, entry.centroid) <= distance)`.
+- P-14.1-3, P-14.1-4. Ensures: `covering` gives `Some(name)` if and only if a learned entry has a centroid within `distance` of the cluster centroid, and `name` is the first such entry. Argument: `covering` is `find(entry: dist(cluster.centroid, entry.centroid) <= distance)` over the entries in file order, mapped to the name.
+- P-14.1-5. Ensures: `times` of a cluster are the times of its points with `spoken`. Argument: the cluster builder filters its points by `spoken` before it collects the times.
 - P-14.1-1, P-14.1-2. Evidence: test (the DBSCAN crate).
 
 ---
@@ -124,7 +126,9 @@ This phase makes System Two teach System One. Jarvis clusters frequent requests 
 - **Files:** modify `src/app/background.rs`, `src/lib.rs`, `jarvis.toml`.
 - **Quint:** `learned.qnt` (conformance).
 
-**Model.** Each `learn.check_interval_s`: read `deferred(now - window_days)` (sub-phase 12.5), `embed` their texts, compute `clusters`, skip `covered` clusters, call `propose`, then `validate_proposal`. A valid proposal is saved with `status = pending` if `needs_approval`, else `active`. `kind = none` is saved with `status = none`. An invalid proposal is logged and saved with `status = none`, so the next check does not ask again. Each entry has the cluster `texts` and `centroid`. The pools task (sub-phase 4.8) owns `learned.toml` writes too. This sub-phase adds `learn.file` and `learn.check_interval_s`.
+**Model.** Each `learn.check_interval_s`: read `deferred(now - window_days)` (sub-phase 12.5), `embed` their texts, compute `clusters`, skip the clusters that `covering` names, call `propose`, then `validate_proposal`. A valid proposal is saved with `status = pending` if `needs_approval`, else `active`. `kind = none` is saved with `status = none`. An invalid proposal is logged and saved with `status = none`, so the next check does not ask again. Each entry has the cluster `texts` and `centroid`. The pools task (sub-phase 4.8) owns `learned.toml` writes too. This sub-phase adds `learn.file` and `learn.check_interval_s`.
+
+The check also records the request habits of System Two requests (sub-phase 11.4 counts only the requests that System One acts on). The request key of a cluster is the name of its covering entry, or the name of the entry that this check saves for it. When that entry is `pending` or `active`, the check observes each time of the cluster under that key, in time order (sub-phase 11.3). A `none` or `rejected` entry records nothing, because its name can be invalid or never become an intent. Each day counts once for each key and bucket, so the next check, which sees the same times again, changes nothing. When the entry later becomes an intent with the same name, the requests that System One acts on continue the same key.
 
 **Acceptance criteria.**
 
@@ -134,13 +138,16 @@ This phase makes System Two teach System One. Jarvis clusters frequent requests 
 - AC-14.5-4: When the proposal is `none`, `learned.toml` has a `none` entry, and the next check does not propose that cluster.
 - AC-14.5-5: When the proposal is not valid, Jarvis logs the error and saves a `none` entry, and the next check does not propose that cluster.
 - AC-14.5-6: When `quint-connect` replays 100 traces of `learned.qnt`, the statuses in `learned.toml` match the model after each step.
+- AC-14.5-7: When a cluster that the entry `family_calendar` covers has requests at 07:10 on Monday, Tuesday and Wednesday, `usual_times` of `family_calendar` returns `[(weekdays, 7)]` after the check.
+- AC-14.5-8: When the next check finds the same cluster with the same times, the habit model does not change.
 
 **Proofs.**
 
 - P-14.5-2, P-14.5-3. Requires: `ServiceNeedsApproval`. Argument: the status is `if needs_approval { pending } else { active }` (P-14.2-4).
-- P-14.5-4. Requires: `NoReproposal`. Argument: the saved entry has the cluster centroid, so the next check finds the cluster `covered` (P-14.1-3).
-- P-14.5-5. Requires: `NoReproposal`. Argument: the `Err` branch of `validate_proposal` saves the `none` entry with the centroid, so the next check finds the cluster `covered`.
-- P-14.5-1, P-14.5-6. Evidence: test.
+- P-14.5-4. Requires: `NoReproposal`. Argument: the saved entry has the cluster centroid, so `covering` names it at the next check (P-14.1-3).
+- P-14.5-5. Requires: `NoReproposal`. Argument: the `Err` branch of `validate_proposal` saves the `none` entry with the centroid, so `covering` names it at the next check.
+- P-14.5-8. Argument: each time of the cluster has a date on or before the `last` of its key and bucket, so each `observe` returns the model unchanged (P-11.3-6).
+- P-14.5-1, P-14.5-6, P-14.5-7. Evidence: test.
 
 ---
 
@@ -171,28 +178,25 @@ This phase makes System Two teach System One. Jarvis clusters frequent requests 
 
 ### 14.7 Activation
 
-**Goal:** When a learned intent becomes active, add its pool and audio, count one change, seed its habit times and add it to the next training set. After the next training run, the request gets System One speed.
+**Goal:** When a learned intent becomes active, add its pool and audio, count one change and add it to the next training set. After the next training run, the request gets System One speed.
 
 - **Implements:** G1, G14, G16. **Depends on:** 14.6.
-- **Files:** modify `src/app/background.rs`, `src/app/speech.rs`, `src/app/training.rs`, `src/domain/habits.rs`.
+- **Files:** modify `src/app/background.rs`, `src/app/speech.rs`, `src/app/training.rs`.
 
-**Model.** On activation, in this order: save the pool through the pools task, pre-render it, add the intent to the live catalog (an `ArcSwap<Catalog>` of `intents.toml` and the active learned intents), set and save `activated := now` (so `changes` counts it once, sub-phase 14.11), then observe one `jarvis.intent` habit for each cluster interaction time. Each step before `activated` is idempotent. At startup, each `active` entry without `activated` runs activation again. A crash after `activated` loses only the seed habits, which normal use replaces, and never adds a duplicate. `Review::intents` now also returns the active learned intent names. The habit model also records each voice request as entity `jarvis.intent`, action = the intent name, source `voice`. `jarvis.intent` has no area and is not a device habit, so `summary` and `established` leave it out.
+**Model.** On activation, in this order: save the pool through the pools task, pre-render it, add the intent to the live catalog (an `ArcSwap<Catalog>` of `intents.toml` and the active learned intents), then set and save `activated := now` (so `changes` counts it once, sub-phase 14.11). Each step before `activated` is idempotent. At startup, each `active` entry without `activated` runs activation again. Thus a crash never adds a duplicate. `Review::intents` now also returns the active learned intent names. The request habits of the entry already have its name as their key (sub-phase 14.5), so activation does not change them.
 
 **Acceptance criteria.**
 
 - AC-14.7-1: When an entry becomes `active`, the saved pools have its pool and the audio cache has its responses.
-- AC-14.7-2: When an entry becomes `active`, the habit model has one `jarvis.intent` observation for each cluster interaction.
-- AC-14.7-3: When `FakeClassifier` gives `tell_joke` 0.9 after a training run, `handle` replies from the `tell_joke` pool.
-- AC-14.7-4: When a static intent pool has fewer than `min_fresh` unused responses, the Phase 8 backfill adds responses.
-- AC-14.7-5 [GPU host]: In the Phase 9 harness with `FakeClassifier` that gives `tell_joke`, the response latency p95 is 300 ms or less.
-- AC-14.7-6: When Jarvis restarts with an `active` entry without `activated`, the pool exists once and `activated` is set.
-- AC-14.7-7: When an entry becomes `active`, `intents` returns its name.
-- AC-14.7-8: When the habit model has `jarvis.intent` keys, `summary` and `established` do not contain them.
+- AC-14.7-2: When `FakeClassifier` gives `tell_joke` 0.9 after a training run, `handle` replies from the `tell_joke` pool.
+- AC-14.7-3: When a static intent pool has fewer than `min_fresh` unused responses, the Phase 8 backfill adds responses.
+- AC-14.7-4 [GPU host]: In the Phase 9 harness with `FakeClassifier` that gives `tell_joke`, the response latency p95 is 300 ms or less.
+- AC-14.7-5: When Jarvis restarts with an `active` entry without `activated`, the pool exists once and `activated` is set.
+- AC-14.7-6: When an entry becomes `active`, `intents` returns its name.
 
 **Proofs.**
 
-- P-14.7-8. Ensures: no line of `summary` and no key of `established` has the entity `jarvis.intent`. Argument: both functions filter out that entity before they score.
-- P-14.7-1 to P-14.7-7. Evidence: test.
+- P-14.7-1 to P-14.7-6. Evidence: test.
 
 ---
 
@@ -232,19 +236,17 @@ This phase makes System Two teach System One. Jarvis clusters frequent requests 
 - **Implements:** G14. **Depends on:** 14.8.
 - **Files:** modify `src/domain/learn.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `usual_times(habits, intent, min_score) -> Vec<Bucket>`: the buckets where the `jarvis.intent` score of the intent is at least `min_score`. `prefetch_due(usual, last_check, now, lead) -> bool`: a usual bucket starts at `s` in the local time of HA, and `last_check < s - lead <= now`. Thus a check at 07:55:23 finds the 08:00 bucket, and the next check does not find it again. After a restart, `last_check` is the start time, so Jarvis does not prefetch a missed window. A bucket start that does not exist on a day with a time change is skipped. `fresh(answer_time, now, ttl) = now - answer_time <= ttl`. This sub-phase adds `learn.prefetch_lead_min` and `learn.prefetch_ttl_min`.
+**Model.** The usual times of an intent are `usual_times` of the request habits with the intent name as the key (sub-phase 11.3). `prefetch_due(usual, last_check, now, lead) -> bool`: a usual bucket starts at `s` in the local time of HA, and `last_check < s - lead <= now`. Thus a check at 07:55:23 finds the 08:00 bucket, and the next check does not find it again. After a restart, `last_check` is the start time, so Jarvis does not prefetch a missed window. A bucket start that does not exist on a day with a time change is skipped. `fresh(answer_time, now, ttl) = now - answer_time <= ttl`. This sub-phase adds `learn.prefetch_lead_min` and `learn.prefetch_ttl_min`.
 
 **Acceptance criteria.**
 
 - AC-14.9-1: When the usual time is weekdays 08:00 and the lead is 5 min, `prefetch_due` with `last_check` 07:54:23 is true at 07:55:23 on a weekday and false at 07:55:23 on Saturday. With `last_check` 07:55:23, it is false at 07:56:23.
 - AC-14.9-2: When the answer is older than `prefetch_ttl_min`, `fresh` returns false. At exactly `prefetch_ttl_min`, it returns true.
-- AC-14.9-3: When the score drops below `min_score`, `usual_times` no longer has the bucket.
 
 **Proofs.**
 
 - P-14.9-1. Ensures: `prefetch_due` is true if and only if a usual bucket start `s` has `last_check < s - lead <= now`. Argument: `s - lead = 07:55:00` is in `(07:54:23, 07:55:23]` only on a weekday, where `(weekday, 8)` is in `usual`. It is not in `(07:55:23, 07:56:23]`.
 - P-14.9-2. Ensures: `fresh(a, now, ttl)` is true if and only if `now - a <= ttl`. Argument: `fresh` is `<=`.
-- P-14.9-3. Ensures: `usual_times` has a bucket if and only if the score of the intent there is `min_score` or more. Argument: `usual_times` filters by `score >= min_score`.
 
 ---
 
