@@ -176,29 +176,15 @@ impl Config {
         Ok(config)
     }
 
-    /// Checks the range of each field, then [`Config::validate_relations`].
+    /// Checks [`Config::validate_positive`], the range of each other field, then
+    /// [`Config::validate_relations`].
     ///
     /// # Errors
     ///
     /// A field is out of its range, or a pair of fields breaks its relation. The error names the
     /// field and the range, or both fields.
     fn validate(&self) -> anyhow::Result<()> {
-        let asr = &self.asr;
-        let positive = [
-            ("ha.request_timeout_ms", self.ha.request_timeout_ms),
-            ("ha.announce_timeout_s", self.ha.announce_timeout_s),
-            ("ha.ping_interval_s", self.ha.ping_interval_s),
-            ("asr.vad_min_silence_ms", asr.vad_min_silence_ms),
-            ("asr.early_commit_ms", asr.early_commit_ms),
-            ("asr.endpoint_ms", asr.endpoint_ms),
-            ("asr.max_utterance_ms", asr.max_utterance_ms),
-        ];
-        for (name, value) in positive {
-            anyhow::ensure!(
-                value > 0,
-                "{name} = {value} is out of range: it must be more than 0"
-            );
-        }
+        self.validate_positive()?;
         let probabilities = [
             ("model.threshold", self.model.threshold),
             ("model.commit_threshold", self.model.commit_threshold),
@@ -209,7 +195,7 @@ impl Config {
                 "{name} = {value} is out of range: it must be in [0, 1]"
             );
         }
-        let vad_threshold = asr.vad_threshold;
+        let vad_threshold = self.asr.vad_threshold;
         anyhow::ensure!(
             vad_threshold > 0.0,
             "asr.vad_threshold = {vad_threshold} is out of range: it must be more than 0"
@@ -225,6 +211,33 @@ impl Config {
             );
         }
         self.validate_relations()
+    }
+
+    /// Checks that each `ha`, `asr` and `dialog` timeout, interval and count is more than 0.
+    ///
+    /// # Errors
+    ///
+    /// A field is 0. The error names the field and the range.
+    fn validate_positive(&self) -> anyhow::Result<()> {
+        let asr = &self.asr;
+        let positive = [
+            ("ha.request_timeout_ms", self.ha.request_timeout_ms),
+            ("ha.announce_timeout_s", self.ha.announce_timeout_s),
+            ("ha.ping_interval_s", self.ha.ping_interval_s),
+            ("asr.vad_min_silence_ms", asr.vad_min_silence_ms),
+            ("asr.early_commit_ms", asr.early_commit_ms),
+            ("asr.endpoint_ms", asr.endpoint_ms),
+            ("asr.max_utterance_ms", asr.max_utterance_ms),
+            ("dialog.max_turns", u64::from(self.dialog.max_turns)),
+            ("dialog.timeout_s", self.dialog.timeout_s),
+        ];
+        for (name, value) in positive {
+            anyhow::ensure!(
+                value > 0,
+                "{name} = {value} is out of range: it must be more than 0"
+            );
+        }
+        Ok(())
     }
 
     /// Checks the relation of each pair of fields.
@@ -1349,6 +1362,19 @@ mod tests {
             assert!(
                 error.contains(name) && error.contains("more than 0"),
                 "error for {broken} has no field or range: {error}"
+            );
+        }
+    }
+
+    /// AC-10.2-7.
+    #[test]
+    fn ac_10_2_7_zero_dialog_limit_names_field_and_range() {
+        for (field, value) in [("max_turns", 3), ("timeout_s", 15)] {
+            let text = VALID.replace(&format!("{field} = {value}"), &format!("{field} = 0"));
+            let error = parse_error(&text);
+            assert!(
+                error.contains(&format!("dialog.{field}")) && error.contains("more than 0"),
+                "error for dialog.{field} = 0 has no field or range: {error}"
             );
         }
     }
