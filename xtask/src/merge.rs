@@ -15,6 +15,9 @@ const CI: &str = include_str!("../../.github/workflows/ci.yml");
 /// The fields that `gh pr view` reads.
 const VIEW_FIELDS: &str = "title,headRefName,baseRefName,files,body,statusCheckRollup,headRefOid";
 
+/// The documentation files outside `docs/`. A PR that changes only these and files in `docs/` is docs-only.
+const DOCS_FILES: [&str; 3] = ["README.md", "CLAUDE.md", ".github/pull_request_template.md"];
+
 /// The connections of a PR with the logins of the reviews, comments and reactions, each read as `author { login }`.
 const LOGIN_CONNECTIONS: [(&str, &str); 3] = [
     ("reviews", "author { login }"),
@@ -86,11 +89,19 @@ pub fn merge_allowed(pr: &PullRequest, required: &[&str]) -> Result<(), Vec<Reas
     }
 }
 
-/// A reason for each required check without a `SUCCESS` conclusion.
+/// A reason for each required check without a `SUCCESS` conclusion. A skipped `gpu-test` passes for a docs-only PR.
 fn failed_checks(pr: &PullRequest, required: &[&str]) -> Vec<Reason> {
+    let docs_only = pr
+        .files
+        .iter()
+        .all(|file| file.starts_with("docs/") || DOCS_FILES.contains(&file.as_str()));
     required
         .iter()
-        .filter(|name| pr.checks.get(**name).map(String::as_str) != Some("SUCCESS"))
+        .filter(|name| {
+            let conclusion = pr.checks.get(**name).map(String::as_str);
+            conclusion != Some("SUCCESS")
+                && !(docs_only && **name == "gpu-test" && conclusion == Some("SKIPPED"))
+        })
         .map(|name| Reason::Check((*name).to_owned()))
         .collect()
 }
@@ -313,18 +324,16 @@ fn nodes(path: &OsStr, number: &str, connection: &str, fields: &str) -> Result<V
     Ok(nodes.cloned().collect())
 }
 
-/// The conclusion of each check over its runs. A skipped run does not count. A run without success outranks a success.
+/// The conclusion of each check over its runs. A run without success outranks a success, and a success outranks a
+/// skipped run.
 fn conclusions(runs: &[Value]) -> BTreeMap<String, String> {
     let mut checks = BTreeMap::new();
     for run in runs {
         let conclusion = text(run, "/conclusion");
-        if conclusion == "SKIPPED" {
-            continue;
-        }
         let current = checks
             .entry(text(run, "/name"))
             .or_insert_with(|| conclusion.clone());
-        if *current == "SUCCESS" {
+        if *current == "SKIPPED" || (*current == "SUCCESS" && conclusion != "SKIPPED") {
             *current = conclusion;
         }
     }
@@ -598,6 +607,40 @@ mod tests {
             merge_allowed(&pr, &REQUIRED),
             Err(vec![Reason::SpecFile("xtask/src/merge.rs".to_owned())])
         );
+    }
+
+    /// The files of a docs-only PR.
+    const DOCS: [&str; 4] = [
+        "docs/spec/phase-00.md",
+        "README.md",
+        "CLAUDE.md",
+        ".github/pull_request_template.md",
+    ];
+
+    /// `merge_allowed` with only the required check `gpu-test`, for a PR with `files` and `gpu-test` runs with `runs`.
+    fn gpu_test_result(files: &[&str], runs: &[&str]) -> Result<(), Vec<Reason>> {
+        let runs: Vec<Value> = runs
+            .iter()
+            .map(|conclusion| json!({"name": "gpu-test", "conclusion": conclusion}))
+            .collect();
+        let pr = PullRequest {
+            files: files.iter().map(ToString::to_string).collect(),
+            checks: conclusions(&runs),
+            ..allowed()
+        };
+        merge_allowed(&pr, &["gpu-test"])
+    }
+
+    /// A skipped `gpu-test` passes only for a docs-only PR. A success outranks a skipped run.
+    #[test]
+    fn ac_0_15_13_skipped_gpu_test() {
+        let gpu_test = Err(vec![Reason::Check("gpu-test".to_owned())]);
+        let code = [DOCS[0], "src/lib.rs"];
+        assert_eq!(gpu_test_result(&DOCS, &["SKIPPED"]), Ok(()));
+        assert_eq!(gpu_test_result(&code, &["SKIPPED"]), gpu_test);
+        assert_eq!(gpu_test_result(&DOCS, &[]), gpu_test);
+        assert_eq!(gpu_test_result(&DOCS, &["SKIPPED", "FAILURE"]), gpu_test);
+        assert_eq!(gpu_test_result(&code, &["SKIPPED", "SUCCESS"]), Ok(()));
     }
 
     /// The `gh pr view` output of a PR that meets every rule, with a push run of each check and a skipped one.

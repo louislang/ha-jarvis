@@ -850,6 +850,20 @@ fn ac_0_5_3_setup_installs_gh_stack() {
 /// The shell line that reads the PR base. In a native stack, `github.base_ref` is the trunk.
 const READ_BASE: &str = "base=$(gh pr view \"$PR\" --json baseRefName --jq .baseRefName)";
 
+/// The checkout step of the CI job `job`.
+fn checkout(job: &serde_yaml::Value) -> &serde_yaml::Value {
+    job["steps"]
+        .as_sequence()
+        .expect("the job has steps")
+        .iter()
+        .find(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|uses| uses.starts_with("actions/checkout@"))
+        })
+        .expect("the job checks out")
+}
+
 /// Checks that the CI job `job` runs only on PRs, with the full history, reads the PR base, and
 /// that a command has `command`. Returns the job.
 fn assert_pull_request_job<'workflow>(
@@ -863,17 +877,7 @@ fn assert_pull_request_job<'workflow>(
         Some("github.event_name == 'pull_request'"),
         "{job} runs only on pull_request"
     );
-    let checkout = steps["steps"]
-        .as_sequence()
-        .expect("the job has steps")
-        .iter()
-        .find(|step| {
-            step["uses"]
-                .as_str()
-                .is_some_and(|uses| uses.starts_with("actions/checkout@"))
-        })
-        .expect("the job checks out");
-    assert_eq!(checkout["with"]["fetch-depth"].as_u64(), Some(0));
+    assert_eq!(checkout(steps)["with"]["fetch-depth"].as_u64(), Some(0));
     let commands = runs(ci, job);
     assert!(
         commands.iter().any(|run| run.contains(READ_BASE)),
@@ -1054,7 +1058,7 @@ fn ac_0_12_5_check_and_ci_run_quint_gate() {
     );
 }
 
-/// CI runs `gpu-test` on the self-hosted GPU runner, but not for a fork pull request.
+/// CI runs `gpu-test` on the self-hosted GPU runner, but not for a docs-only or a fork pull request.
 #[test]
 fn ac_0_13_1_ci_runs_gpu_test_on_gpu_runner() {
     let ci = yaml(".github/workflows/ci.yml");
@@ -1071,10 +1075,11 @@ fn ac_0_13_1_ci_runs_gpu_test_on_gpu_runner() {
     assert_eq!(
         ci["jobs"]["gpu-test"]["if"].as_str(),
         Some(
-            "github.event_name != 'pull_request' || \
-             github.event.pull_request.head.repo.full_name == github.repository"
+            "needs.fixture-model.outputs.docs-only != 'true' && \
+             (github.event_name != 'pull_request' || \
+             github.event.pull_request.head.repo.full_name == github.repository)"
         ),
-        "gpu-test skips fork pull requests"
+        "gpu-test skips docs-only and fork pull requests"
     );
 }
 
@@ -1123,6 +1128,86 @@ fn ac_0_13_4_gpu_test_job_pauses_jarvis() {
         matches!(order, [Some(stop), Some(test), Some(start)]
             if stop < test && test < start && steps[start]["if"].as_str() == Some("always()")),
         "gpu-test stops jarvis, runs the tests, then always starts jarvis: {order:?}"
+    );
+}
+
+/// The step `changes` of the job `fixture-model`.
+fn changes_step(ci: &serde_yaml::Value) -> &serde_yaml::Value {
+    let steps = ci["jobs"]["fixture-model"]["steps"]
+        .as_sequence()
+        .expect("the job exists");
+    steps
+        .iter()
+        .find(|step| step["id"].as_str() == Some("changes"))
+        .expect("the job has the step changes")
+}
+
+/// Commits all files of `repository` with the message `message`.
+fn commit_all(repository: &Path, message: &str) {
+    assert_passes(&git(repository, &["add", "--all"]));
+    assert_passes(&git(repository, &["commit", "--quiet", "-m", message]));
+}
+
+/// Runs `script` with `bash -e`, as a CI step does, in `folder`.
+fn bash(folder: &Path, script: &str) -> Output {
+    run(Command::new("bash")
+        .args(["-e", "-c", script])
+        .current_dir(folder))
+}
+
+/// The output of the step `changes` after a commit of the shell command `change` on a repository with `src/lib.rs`.
+fn docs_only_output(change: &str) -> String {
+    let repository = TempDir::new().expect("a temporary folder");
+    let path = repository.path();
+    assert_passes(&git(path, &["init", "--quiet"]));
+    fs::create_dir(path.join("src")).expect("src is created");
+    fs::write(path.join("src/lib.rs"), "pub fn one() -> u32 { 1 }\n").expect("lib.rs is written");
+    commit_all(path, "Base");
+    assert_passes(&bash(path, change));
+    commit_all(path, "Change");
+    let ci = yaml(".github/workflows/ci.yml");
+    let script = changes_step(&ci)["run"]
+        .as_str()
+        .expect("the step runs a script");
+    assert_passes(&bash(path, &format!("GITHUB_OUTPUT=.git/output\n{script}")));
+    fs::read_to_string(path.join(".git/output")).expect("the step writes its output")
+}
+
+/// The step `changes` finds a commit that changes only documentation, also with the old path of a rename.
+#[test]
+fn ac_0_13_5_changes_step_finds_docs_only() {
+    let docs = "mkdir -p docs/spec .github && touch docs/spec/phase-00.md README.md CLAUDE.md .github/pull_request_template.md";
+    let cases = [
+        (docs.to_owned(), "true"),
+        (format!("{docs} src/main.rs"), "false"),
+        (
+            "mkdir docs && git mv src/lib.rs docs/lib.md".to_owned(),
+            "false",
+        ),
+    ];
+    for (change, docs_only) in cases {
+        assert_eq!(
+            docs_only_output(&change),
+            format!("docs-only={docs_only}\n"),
+            "after {change}"
+        );
+    }
+}
+
+/// `fixture-model` reads the base of the PR merge commit and gives `gpu-test` the output `docs-only` on PRs.
+#[test]
+fn ac_0_13_6_fixture_model_outputs_docs_only() {
+    let ci = yaml(".github/workflows/ci.yml");
+    let job = &ci["jobs"]["fixture-model"];
+    assert_eq!(checkout(job)["with"]["fetch-depth"].as_u64(), Some(2));
+    assert_eq!(
+        changes_step(&ci)["if"].as_str(),
+        Some("github.event_name == 'pull_request'"),
+        "changes runs only on pull_request"
+    );
+    assert_eq!(
+        job["outputs"]["docs-only"].as_str(),
+        Some("${{ steps.changes.outputs.docs-only }}")
     );
 }
 
