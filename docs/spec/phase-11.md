@@ -150,7 +150,7 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
 **Goal:** Record each spoken request that System One acts on in the request habit model, and save the model on an interval and at shutdown. Request habits now build up from normal use of the house.
 
 - **Implements:** G11. **Depends on:** 11.3b.
-- **Files:** modify `src/app/conversation.rs`, `src/app/background.rs`, `src/lib.rs`, `jarvis.toml`.
+- **Files:** modify `src/app/conversation.rs`, `src/app/background.rs`, `src/lib.rs`, `src/testing/e2e.rs`, `jarvis.toml`.
 
 **Model.**
 
@@ -163,6 +163,7 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
 - `handle` and the habit task share the model behind one `std::sync::Mutex`. No code holds the lock across an `await`. A poisoned lock logs one `warn` event, and the request does not count.
 - At startup, `run` loads the model from a `Store<RequestHabits>` at `habits.file`, or starts with an empty model. The habit task in `src/app/background.rs` saves `prune(today)` of the model each `save_interval_s` and at shutdown.
 - This sub-phase adds `habits.file` and `habits.save_interval_s`. `validate` checks that `save_interval_s` is more than 0.
+- The pipeline harness of `src/testing/e2e.rs` keeps `habits.json` in its temporary folder, as it keeps `pools.json`. Thus a test does not read or write the habit file of the repository folder.
 
 **Acceptance criteria.**
 
