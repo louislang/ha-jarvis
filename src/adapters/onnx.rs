@@ -263,10 +263,10 @@ mod tests {
     const FIXTURE: &str = "models/system-one/fixture";
 
     /// A context that gives 32 tokens with `TEXT`.
-    const CONTEXT: &str = "area: kitchen | habits: none";
+    const CONTEXT: &str = "area: kitchen";
 
     /// A text that gives 32 tokens with `CONTEXT`.
-    const TEXT: &str = "turn on the lights in the kitchen and the living room and set the brightness to fifty percent in the office now";
+    const TEXT: &str = "turn on the lights in the kitchen and the living room and set the brightness to fifty percent in the office and the bedroom right now";
 
     /// Serializes the latency tests, so that one test does not slow the other.
     static LATENCY: Mutex<()> = Mutex::new(());
@@ -450,7 +450,7 @@ mod tests {
         .await
     }
 
-    /// The phrases of AC-18.16-7 with their new intent and their old wrong intent.
+    /// The phrases of AC-11.5-4 with their new intent and their old wrong intent.
     const OPPOSITES: [(&str, &str, &str); 10] = [
         ("turn off the lights", "lights_off", "lights_on"),
         ("turn the lights off", "lights_off", "lights_on"),
@@ -470,17 +470,15 @@ mod tests {
         let classifier = OnnxLoader.load(Path::new(FIXTURE), Device::Cpu).await?;
         let mut tops = Vec::new();
         for (text, _, _) in OPPOSITES {
-            let prediction = classifier
-                .predict("area: none | habits: none", text)
-                .await?;
+            let prediction = classifier.predict("area: none", text).await?;
             tops.push(prediction.ranked[0].clone());
         }
         Ok(tops)
     }
 
-    /// AC-18.16-7.
+    /// AC-11.5-4.
     #[tokio::test]
-    async fn ac_18_16_7_opposite_phrases_give_the_new_intent_with_confidence() -> anyhow::Result<()>
+    async fn ac_11_5_4_opposite_phrases_give_the_new_intent_with_confidence() -> anyhow::Result<()>
     {
         let threshold = crate::Config::load(Path::new("jarvis.toml"))?
             .model
@@ -511,9 +509,7 @@ mod tests {
     async fn ac_3_12_11_long_text_is_truncated() -> anyhow::Result<()> {
         let classifier = OnnxLoader.load(Path::new(FIXTURE), Device::Cpu).await?;
         let text = "turn on the lights ".repeat(300);
-        classifier
-            .predict("area: none | habits: none", text.trim_end())
-            .await?;
+        classifier.predict("area: none", text.trim_end()).await?;
         Ok(())
     }
 

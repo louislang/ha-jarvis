@@ -314,7 +314,7 @@ impl Conversation {
     ///
     /// The prediction fails. The error text is a `failure` answer.
     async fn predict(&self, name: Option<&str>, text: &str) -> anyhow::Result<Prediction> {
-        let model_context = training::context_text(name, &[]);
+        let model_context = training::context_text(name);
         let prediction = self
             .classifier
             .predict(&model_context, &intent::normalize(text))
@@ -1854,18 +1854,18 @@ mod tests {
         Ok(())
     }
 
-    /// AC-5.3-2.
+    /// AC-11.5-3.
     #[tokio::test(start_paused = true)]
-    async fn ac_5_3_2_kitchen_device_gives_the_kitchen_context() {
+    async fn ac_11_5_3_kitchen_device_gives_the_kitchen_context() {
         let (_, calls) = handled(Some("lights_on"), "turn on the lights", Some(KITCHEN)).await;
-        assert_eq!(calls[0].0, "area: Kitchen | habits: none");
+        assert_eq!(calls[0].0, "area: Kitchen");
     }
 
     /// AC-5.3-3.
     #[tokio::test(start_paused = true)]
     async fn ac_5_3_3_no_device_gives_no_area() {
         let (_, calls) = handled(Some("lights_on"), "turn on the lights", None).await;
-        assert_eq!(calls[0].0, "area: none | habits: none");
+        assert_eq!(calls[0].0, "area: none");
     }
 
     /// AC-5.3-4.

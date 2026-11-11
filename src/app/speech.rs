@@ -207,7 +207,7 @@ fn accept(stream: &Mutex<Box<dyn SttStream>>, samples: &[i16]) -> anyhow::Result
 /// `unknown` and its probability is `threshold` or more, and no value of a `NAME_SLOTS` slot ends
 /// the normalized text. False when the prediction fails.
 async fn confident(classifier: &dyn Classifier, threshold: f32, text: &str) -> bool {
-    let context = training::context_text(None, &[]);
+    let context = training::context_text(None);
     let text = intent::normalize(text);
     match classifier.predict(&context, &text).await {
         Ok(prediction) => {
@@ -637,7 +637,7 @@ mod tests {
     async fn ac_6_8_11_predicts_the_normalized_partial() -> anyhow::Result<()> {
         let partials = vec![partial("Turn on the", Some(20), 20)];
         let (_results, classifier) = pushes(partials, vec![prediction("lights_on", 0.5)]).await?;
-        let context = training::context_text(None, &[]);
+        let context = training::context_text(None);
         assert_eq!(classifier.calls(), [(context, "turn on the".to_owned())]);
         Ok(())
     }
