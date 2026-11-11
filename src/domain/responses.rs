@@ -323,9 +323,6 @@ fn variables(name: &str, catalog: &Catalog) -> BTreeSet<String> {
         return variables;
     };
     catalog::insert_slots(intent, &mut variables);
-    for key in intent.habit_defaults.keys() {
-        variables.insert(key.clone());
-    }
     variables.insert("area".to_owned());
     if intent.target == Target::Entity {
         variables.insert("entity".to_owned());
@@ -868,20 +865,16 @@ mod tests {
         }
     }
 
-    /// AC-4.2-6.
+    /// AC-11.2-3.
     #[test]
-    fn ac_4_2_6_unknown_variable_names_pool_and_variable() {
+    fn ac_11_2_3_unknown_variable_names_pool_and_variable() {
         let result = validate(|pools, _| set(pools, "tv_show", &["{{ show }} in {{ season }}."]));
         assert_eq!(result, unknown("tv_show", "season"));
+        let result = validate(|pools, _| set(pools, "fan_on", &["{{ speed }}"]));
+        assert_eq!(result, unknown("fan_on", "speed"));
         let result = validate(|pools, catalog| {
-            let speed = ("speed".to_owned(), "fan.set_percentage".to_owned());
-            catalog.intents[1].habit_defaults.extend([speed]);
             catalog.intents[1].needs_speaker = true;
-            set(
-                pools,
-                "fan_on",
-                &["{{ speed }} {{ area }} {{ entity }} {{ person }}"],
-            );
+            set(pools, "fan_on", &["{{ area }} {{ entity }} {{ person }}"]);
         });
         assert_eq!(result, Ok(()));
     }

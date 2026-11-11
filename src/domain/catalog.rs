@@ -59,9 +59,6 @@ pub struct Intent {
     /// The service data templates, or the plugin argument templates of a fetch.
     #[serde(default)]
     pub data: BTreeMap<String, String>,
-    /// The habit action of each slot that has a habit default.
-    #[serde(default)]
-    pub habit_defaults: BTreeMap<String, String>,
     /// True when Jarvis plays the best Music Assistant match of the `media_id` of the call.
     #[serde(default)]
     pub search: bool,
@@ -128,7 +125,7 @@ pub enum CatalogError {
     Unknown,
     /// A template of the intent with this name does not parse.
     Template(String),
-    /// A template variable that is not a built-in, a habit default or a tagged slot.
+    /// A template variable that is not a built-in or a tagged slot.
     Untagged(String),
     /// An example whose text is not normalized.
     NotNormal(String),
@@ -231,7 +228,7 @@ fn check_name(catalog: &Catalog, index: usize) -> Result<(), CatalogError> {
 }
 
 /// Checks that each example text of `intent` is normalized and each template variable is a
-/// built-in, a habit default or a tagged slot.
+/// built-in or a tagged slot.
 #[verus_verify]
 fn check_slots(intent: &Intent) -> Result<(), CatalogError> {
     check_normal(intent)?;
@@ -239,9 +236,6 @@ fn check_slots(intent: &Intent) -> Result<(), CatalogError> {
     insert_slots(intent, &mut allowed);
     for name in &["area", "entity", "person", "response"] {
         allowed.insert((*name).to_owned());
-    }
-    for key in intent.habit_defaults.keys() {
-        allowed.insert(key.clone());
     }
     if let Some(entity) = &intent.entity {
         check_template(intent, entity.as_str(), &allowed)?;
@@ -588,19 +582,26 @@ mod tests {
         assert_eq!(result, Err(CatalogError::Unknown));
     }
 
-    /// AC-3.2b-1.
+    /// AC-11.2-1.
     #[test]
-    fn ac_3_2b_1_untagged_template_slot_names_slot() {
+    fn ac_11_2_1_habit_defaults_does_not_load() {
+        let text = format!("{INTENTS}\n[intent.habit_defaults]\nspeed = \"fan.set_percentage\"\n");
+        let error = toml::from_str::<Catalog>(&text).expect_err("habit_defaults is unknown");
+        let error = error.to_string();
+        assert!(error.contains("habit_defaults"), "{error}");
+    }
+
+    /// AC-11.2-2.
+    #[test]
+    fn ac_11_2_2_untagged_template_variable_names_variable() {
         let result = validate(|intents| {
             let season = "{{ season }}".to_owned();
             intents[3].data.insert("season".to_owned(), season);
         });
         assert_eq!(result, Err(CatalogError::Untagged("season".to_owned())));
         let result = validate(|intents| {
-            let speed = "{{ speed }} {{ area }} {{ person }} {{ response }}".to_owned();
-            intents[1].data.insert("percentage".to_owned(), speed);
-            let action = "fan.set_percentage".to_owned();
-            intents[1].habit_defaults.insert("speed".to_owned(), action);
+            let built_ins = "{{ area }} {{ person }} {{ response }}".to_owned();
+            intents[1].data.insert("percentage".to_owned(), built_ins);
             intents[1].entity = Some("{{ entity }}".to_owned());
         });
         assert_eq!(result, Ok(()));
