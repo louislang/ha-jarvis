@@ -141,6 +141,7 @@ flowchart LR
     crate_domain_contracts --> crate_domain_catalog
     crate_domain_contracts --> crate_domain_decide
     crate_domain_contracts --> crate_domain_dialog
+    crate_domain_contracts --> crate_domain_habits
     crate_domain_contracts --> crate_domain_intent
     crate_domain_contracts --> crate_domain_responses
     crate_domain_contracts --> crate_domain_state
@@ -161,6 +162,7 @@ flowchart LR
     crate_domain_dialog --> crate_domain_model
     crate_domain_dialog --> crate_domain_select
     crate_domain_habits --> crate_domain_contracts
+    crate_domain_habits --> crate_domain_habits
     crate_domain_intent --> crate_domain_contracts
     crate_domain_intent --> crate_domain_intent
     crate_domain_model --> crate_domain_contracts

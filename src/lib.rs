@@ -160,6 +160,8 @@ pub struct Config {
     pub announce: AnnounceConfig,
     /// Dialogs.
     pub dialog: DialogConfig,
+    /// Request habits.
+    pub habits: HabitsConfig,
     /// Training.
     pub train: TrainConfig,
 }
@@ -196,11 +198,17 @@ impl Config {
                 "{name} = {value} is out of range: it must be in [0, 1]"
             );
         }
-        let vad_threshold = self.asr.vad_threshold;
-        anyhow::ensure!(
-            vad_threshold > 0.0,
-            "asr.vad_threshold = {vad_threshold} is out of range: it must be more than 0"
-        );
+        let positive = [
+            ("asr.vad_threshold", f64::from(self.asr.vad_threshold)),
+            ("habits.half_life_days", self.habits.half_life_days),
+            ("habits.min_score", self.habits.min_score),
+        ];
+        for (name, value) in positive {
+            anyhow::ensure!(
+                value > 0.0,
+                "{name} = {value} is out of range: it must be more than 0"
+            );
+        }
         let fractions = [
             ("train.holdout", self.train.holdout),
             ("dialog.choice_similarity", self.dialog.choice_similarity),
@@ -500,6 +508,16 @@ pub struct DialogConfig {
     pub choice_similarity: f64,
     /// The normalized phrases that cancel a dialog.
     pub cancel: Vec<String>,
+}
+
+/// The `[habits]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct HabitsConfig {
+    /// The days in which a request habit score halves.
+    pub half_life_days: f64,
+    /// The lowest decayed score of a usual time.
+    pub min_score: f64,
 }
 
 /// The `[train]` section.
@@ -1326,6 +1344,10 @@ mod tests {
                 idle_wait_s: 30,
             },
             dialog: expected_dialog(),
+            habits: HabitsConfig {
+                half_life_days: 14.0,
+                min_score: 2.0,
+            },
             train: TrainConfig {
                 base_model: "sentence-transformers/all-MiniLM-L12-v2".to_owned(),
                 epochs: 8,
@@ -1391,6 +1413,7 @@ mod tests {
                 "vad_threshold = 0.0",
                 "asr.vad_threshold",
             ),
+            ("min_score = 2.0", "min_score = 0.0", "habits.min_score"),
         ];
         for (field, broken, name) in cases {
             let error = parse_error(&VALID.replace(field, broken));
@@ -1419,6 +1442,7 @@ mod tests {
             ("backfill.max_pool", 30),
             ("announce.margin_ms", 300),
             ("announce.idle_wait_s", 30),
+            ("habits.half_life_days", 14),
             ("train.epochs", 8),
             ("train.batch_size", 8),
         ];

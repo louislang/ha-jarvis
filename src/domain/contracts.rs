@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use jiff::SignedDuration;
 use jiff::Timestamp;
+use jiff::civil::Date;
 use jiff::civil::DateTime;
 use jiff::civil::Weekday;
 use jiff::tz::TimeZone;
@@ -45,6 +46,7 @@ use crate::domain::decide::Artist;
 use crate::domain::decide::MediaItem;
 use crate::domain::decide::SearchResults;
 use crate::domain::dialog::Key;
+use crate::domain::habits::Bucket;
 use crate::domain::intent::Span;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Response;
@@ -479,6 +481,59 @@ pub fn ex_datetime_hour(datetime: DateTime) -> (result: i8)
     datetime.hour()
 }
 
+/// A date without a time zone. <https://docs.rs/jiff/0.2/jiff/civil/struct.Date.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExDate(Date);
+
+/// The date of `datetime`.
+pub uninterp spec fn date_of(datetime: DateTime) -> Date;
+
+/// Gives the date of `datetime`. <https://docs.rs/jiff/0.2/jiff/civil/struct.DateTime.html#method.date>
+#[verifier::external_fn_specification]
+pub fn ex_datetime_date(datetime: DateTime) -> (date: Date)
+    ensures
+        date == date_of(datetime),
+{
+    datetime.date()
+}
+
+/// The duration from `date` to `other`, with each day 24 hours.
+pub uninterp spec fn date_until(date: Date, other: Date) -> SignedDuration;
+
+/// Gives the duration from `date` to `other`, with each day 24 hours. <https://docs.rs/jiff/0.2/jiff/civil/struct.Date.html#method.duration_until>
+#[verifier::external_fn_specification]
+pub fn ex_date_duration_until(date: Date, other: Date) -> (duration: SignedDuration)
+    ensures
+        duration == date_until(date, other),
+{
+    date.duration_until(other)
+}
+
+/// The whole hours of `duration`.
+pub uninterp spec fn whole_hours(duration: SignedDuration) -> i64;
+
+/// Gives the whole hours of `duration`. <https://docs.rs/jiff/0.2/jiff/struct.SignedDuration.html#method.as_hours>
+#[verifier::external_fn_specification]
+pub fn ex_signed_duration_as_hours(duration: &SignedDuration) -> (hours: i64)
+    ensures
+        hours == whole_hours(*duration),
+{
+    duration.as_hours()
+}
+
+/// `base` raised to the power `exponent`.
+pub uninterp spec fn power(base: f64, exponent: f64) -> f64;
+
+/// Raises `base` to the power `exponent`. <https://doc.rust-lang.org/std/primitive.f64.html#method.powf>
+#[verifier::external_fn_specification]
+pub fn ex_f64_powf(base: f64, exponent: f64) -> (result: f64)
+    ensures
+        result == power(base, exponent),
+{
+    base.powf(exponent)
+}
+
 /// A `jiff` error. <https://docs.rs/jiff/0.2/jiff/struct.Error.html>
 #[verifier::external_type_specification]
 #[verifier::external_body]
@@ -576,6 +631,12 @@ pub broadcast axiom fn axiom_string_obeys_cmp()
 pub broadcast axiom fn axiom_key_obeys_cmp()
     ensures
         #[trigger] vstd::laws_cmp::obeys_cmp::<Key>(),
+;
+
+/// `Bucket` derives `Ord`, so it compares by its day type, then its hour. <https://doc.rust-lang.org/std/cmp/trait.Ord.html#derivable>
+pub broadcast axiom fn axiom_bucket_obeys_cmp()
+    ensures
+        #[trigger] vstd::laws_cmp::obeys_cmp::<Bucket>(),
 ;
 
 /// The `String` key with the text `text`.
