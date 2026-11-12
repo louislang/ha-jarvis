@@ -1,11 +1,15 @@
-//! The `listen` and `speak` use cases, the audio cache and the pre-render of the pool responses.
+//! The `listen` and `speak` use cases, the committed utterances, the audio cache and the
+//! pre-render of the pool responses.
 
 use std::collections::BTreeSet;
+use std::mem;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use jiff::Timestamp;
 use serde_json::Map;
 use serde_json::Value;
 
@@ -17,6 +21,7 @@ use crate::domain::responses::Pools;
 use crate::domain::speech;
 use crate::domain::speech::Audio;
 use crate::domain::speech::CommitPolicy;
+use crate::domain::speech::Utterance;
 use crate::domain::training;
 use crate::ports::Classifier;
 use crate::ports::Clock;
@@ -34,9 +39,66 @@ const SAMPLES_PER_MS: u64 = 16;
 /// one commits only at `endpoint_ms`.
 const NAME_SLOTS: [&str; 3] = ["media", "movie", "show"];
 
+/// The committed utterances of the last `log.correlate_s`, which a request finds by its text.
+pub struct Utterances {
+    /// The utterances in commit order.
+    kept: Mutex<Vec<Utterance>>,
+    /// The time of each append and correlate.
+    clock: Arc<dyn Clock>,
+    /// The time that an utterance stays: `log.correlate_s`.
+    window_s: u64,
+}
+
+impl Utterances {
+    /// No utterances, each kept for `window_s` by the time of `clock`.
+    #[must_use]
+    pub fn new(clock: Arc<dyn Clock>, window_s: u64) -> Self {
+        Self {
+            kept: Mutex::new(Vec::new()),
+            clock,
+            window_s,
+        }
+    }
+
+    /// Drops the expired utterances, then keeps `text`, `audio` and `voice_end` at the time now.
+    fn append(&self, text: String, audio: Audio, voice_end: Option<Timestamp>) {
+        self.change(|kept, time| {
+            let mut kept = speech::expire(kept, time, self.window_s);
+            kept.push(Utterance {
+                text,
+                audio,
+                time,
+                voice_end,
+            });
+            (kept, ())
+        });
+    }
+
+    /// Drops the expired utterances, then removes and gives the one with the normalized text of
+    /// `text`. `None` when none or more than one has it.
+    #[must_use]
+    pub fn correlate(&self, text: &str) -> Option<Utterance> {
+        self.change(|kept, now| speech::correlate(kept, text, now, self.window_s))
+            .flatten()
+    }
+
+    /// Replaces the utterances with the first result of `change` of the utterances and the time
+    /// now, and gives the second. `None` when an earlier change panicked.
+    fn change<T>(
+        &self,
+        change: impl FnOnce(Vec<Utterance>, Timestamp) -> (Vec<Utterance>, T),
+    ) -> Option<T> {
+        let now = self.clock.now();
+        let mut kept = self.kept.lock().ok()?;
+        let (rest, result) = change(mem::take(&mut *kept), now);
+        *kept = rest;
+        Some(result)
+    }
+}
+
 /// Starts listen sessions that warm System Two, predict on each changed first-pass partial,
 /// commit by the policy, early for an answer to an open dialog, and give the second-pass
-/// transcript.
+/// transcript, which it keeps with its audio.
 pub struct Listener {
     /// The two passes of each session.
     stt: Arc<dyn SpeechToText>,
@@ -52,13 +114,19 @@ pub struct Listener {
     queues: Arc<Queues>,
     /// The time that decides which dialogs are open.
     clock: Arc<dyn Clock>,
+    /// The committed utterances.
+    utterances: Arc<Utterances>,
 }
 
 impl Listener {
     /// Listens with `stt` and `classifier`, warms `reasoner`, and commits by `policy` and
     /// `threshold`, or early for an answer to a dialog of `queues` that is open at the time of
-    /// `clock`.
+    /// `clock`. Keeps each transcript in `utterances`.
     #[must_use]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the session connects both passes, the prediction, the dialogs and the utterances"
+    )]
     pub fn new(
         stt: Arc<dyn SpeechToText>,
         classifier: Arc<dyn Classifier>,
@@ -67,6 +135,7 @@ impl Listener {
         threshold: f32,
         queues: Arc<Queues>,
         clock: Arc<dyn Clock>,
+        utterances: Arc<Utterances>,
     ) -> Self {
         Self {
             stt,
@@ -76,7 +145,14 @@ impl Listener {
             threshold,
             queues,
             clock,
+            utterances,
         }
+    }
+
+    /// The committed utterances.
+    #[must_use]
+    pub fn utterances(&self) -> &Utterances {
+        &self.utterances
     }
 
     /// A session on a new first-pass stream, with no text. Starts a warm of System Two in the
@@ -101,9 +177,11 @@ impl Listener {
             threshold: self.threshold,
             queues: Arc::clone(&self.queues),
             clock: Arc::clone(&self.clock),
+            utterances: Arc::clone(&self.utterances),
             text: String::new(),
             confident: false,
             samples: Vec::new(),
+            voice_end_ms: None,
         }))
     }
 }
@@ -124,12 +202,16 @@ struct Session {
     queues: Arc<Queues>,
     /// The time that decides which dialogs are open.
     clock: Arc<dyn Clock>,
+    /// The committed utterances, which keep the transcript.
+    utterances: Arc<Utterances>,
     /// The text of the last changed, non-empty partial.
     text: String,
     /// True when `text` answers an open dialog or its prediction is a confident command.
     confident: bool,
     /// The pushed samples.
     samples: Vec<i16>,
+    /// The audio position of the last voiced sample of the last partial.
+    voice_end_ms: Option<u64>,
 }
 
 impl Session {
@@ -163,13 +245,22 @@ impl Session {
         self.samples.len() as u64 / SAMPLES_PER_MS
     }
 
+    /// The time of the last voiced sample when the last pushed sample is at `now`, or `None`
+    /// before any speech.
+    fn voice_end(&self, now: Timestamp) -> Option<Timestamp> {
+        let silence_ms = self.audio_ms().saturating_sub(self.voice_end_ms?);
+        now.checked_sub(Duration::from_millis(silence_ms)).ok()
+    }
+
     /// The second-pass text of the pushed samples, else the first-pass text. A second-pass error
-    /// gives the first-pass text. Logs the text, its pass and the audio length.
+    /// gives the first-pass text. Logs the text, its pass and the audio length, and keeps the text
+    /// with the samples in the utterances.
     ///
     /// # Errors
     ///
     /// The second pass panicked.
     async fn transcript(&self) -> anyhow::Result<String> {
+        let voice_end = self.voice_end(self.clock.now());
         let (stt, samples) = (Arc::clone(&self.stt), self.samples.clone());
         let (text, pass) =
             match tokio::task::spawn_blocking(move || stt.transcribe(&samples)).await? {
@@ -186,6 +277,11 @@ impl Session {
             audio_ms = self.audio_ms(),
             "transcript"
         );
+        let audio = Audio {
+            samples: self.samples.clone(),
+            rate: 16_000,
+        };
+        self.utterances.append(text.clone(), audio, voice_end);
         Ok(text)
     }
 }
@@ -232,6 +328,7 @@ impl Listening for Session {
         self.samples.extend_from_slice(&samples);
         let stream = Arc::clone(&self.stream);
         let partial = tokio::task::spawn_blocking(move || accept(&stream, &samples)).await??;
+        self.voice_end_ms = partial.voice_end_ms;
         self.update(&partial.text).await;
         if !self.commits(&partial) {
             return Ok(None);
@@ -337,6 +434,7 @@ mod tests {
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStt;
     use crate::testing::fakes::FakeTts;
+    use crate::testing::fakes::SetClock;
     use crate::testing::fakes::log_dispatch;
 
     /// Commits 200 ms after confident text, 600 ms after other text and at 10 s of audio.
@@ -397,6 +495,7 @@ mod tests {
         let classifier = Arc::clone(classifier) as Arc<dyn Classifier>;
         let reasoner = Arc::clone(reasoner) as Arc<dyn Reasoner>;
         let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
+        let utterances = Arc::new(Utterances::new(clock.clone(), 10));
         Listener::new(
             Arc::new(stt),
             classifier,
@@ -405,7 +504,43 @@ mod tests {
             0.9,
             queues,
             clock,
+            utterances,
         )
+    }
+
+    /// The texts of the utterances of `utterances`, in order.
+    fn texts(utterances: &Utterances) -> Vec<String> {
+        let kept = utterances.kept.lock().expect("no panic with the lock");
+        kept.iter()
+            .map(|utterance| utterance.text.clone())
+            .collect()
+    }
+
+    /// AC-12.1b-1.
+    #[test]
+    fn ac_12_1b_1_append_and_correlate_drop_expired_utterances() -> anyhow::Result<()> {
+        let clock = Arc::new(SetClock(Mutex::new(Timestamp::UNIX_EPOCH)));
+        let utterances = Utterances::new(clock.clone(), 10);
+        let set = |second: i64| -> anyhow::Result<()> {
+            *clock.0.lock().expect("no panic with the lock") = Timestamp::from_second(second)?;
+            Ok(())
+        };
+        let audio = Audio {
+            samples: vec![1],
+            rate: 16_000,
+        };
+        utterances.append("turn on the lights".to_owned(), audio.clone(), None);
+        set(11)?;
+        utterances.append("turn off the fan".to_owned(), audio, None);
+        assert_eq!(texts(&utterances), ["turn off the fan"], "after an append");
+        set(22)?;
+        assert_eq!(utterances.correlate("pause the music"), None);
+        assert_eq!(
+            texts(&utterances),
+            Vec::<String>::new(),
+            "after a correlate"
+        );
+        Ok(())
     }
 
     /// A session on `stt` with no dialogs, with a classifier that gives `predictions`, and that
