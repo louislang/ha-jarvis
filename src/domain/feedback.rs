@@ -1,5 +1,7 @@
 //! Feedback: marks on interactions and the decisions that they block.
 
+use std::collections::BTreeSet;
+
 use jiff::Timestamp;
 use vstd::prelude::*;
 
@@ -52,6 +54,18 @@ pub struct Action {
     pub targets: Vec<String>,
 }
 
+/// One response of an interaction.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Spoken {
+    /// The spoken text.
+    pub text: String,
+    /// The pool name.
+    pub pool: String,
+    /// The response template.
+    pub template: String,
+}
+
 /// The parts of one interaction that its marks rate.
 #[verus_verify]
 #[derive(Clone, Debug, PartialEq)]
@@ -62,6 +76,8 @@ pub struct Rated {
     pub link: Option<String>,
     /// The action.
     pub action: Action,
+    /// The responses, in the order of the interaction.
+    pub responses: Vec<Spoken>,
 }
 
 /// One mark with the interaction that it rates.
@@ -123,6 +139,160 @@ impl Feedback {
         let bad = count(&self.marks, &normal, intent, targets, Value::Bad);
         bad > count(&self.marks, &normal, intent, targets, Value::Good)
     }
+
+    /// The pool and the template of each response with a bad mark.
+    #[verus_spec(found =>
+        ensures
+            forall|pair: (String, String)| found@.contains(pair) <==> bad_listed(self.marks@, self.marks@.len() as int, pair),
+    )]
+    #[must_use]
+    pub fn bad_responses(&self) -> BTreeSet<(String, String)> {
+        let mut found = BTreeSet::new();
+        let mut index = 0;
+        #[cfg_attr(verus_only, verus_spec(
+            invariant
+                index <= self.marks@.len(),
+                forall|pair: (String, String)| found@.contains(pair) <==> bad_listed(self.marks@, index as int, pair),
+            decreases self.marks@.len() - index,
+        ))]
+        while index < self.marks.len() {
+            proof! {
+                lemma_listed_step(self.marks@, index as int);
+            }
+            if let Some(pair) = bad_pair(&self.marks[index]) {
+                found.insert(pair);
+            }
+            index += 1;
+        }
+        found
+    }
+
+    /// One line in plain words for each of the first `n` bad action marks for the normalized
+    /// `text`.
+    #[verus_spec(lines =>
+        ensures
+            lines@.len() == vstd::math::min(n as int, self.marks@.filter(wrong(intent::normalized(text@))).len() as int),
+    )]
+    #[must_use]
+    pub fn corrections(&self, text: &str, n: usize) -> Vec<String> {
+        let normal = intent::normalize(text);
+        let (mut lines, mut index) = (Vec::new(), 0);
+        #[cfg_attr(verus_only, verus_spec(
+            invariant
+                normal@ == intent::normalized(text@),
+                index <= self.marks@.len(),
+                lines@.len() == vstd::math::min(n as int, self.marks@.take(index as int).filter(wrong(normal@)).len() as int),
+            decreases self.marks@.len() - index,
+        ))]
+        while index < self.marks.len() {
+            proof! {
+                lemma_filter_step(self.marks@, index as int, wrong(normal@));
+            }
+            if lines.len() < n && is_wrong(&self.marks[index], &normal) {
+                lines.push(line(&self.marks[index]));
+            }
+            index += 1;
+        }
+        proof! {
+            assert(self.marks@.take(self.marks@.len() as int) =~= self.marks@);
+        }
+        lines
+    }
+
+    /// The texts of up to `n` good and up to `n` bad marked responses of `pool`.
+    #[must_use]
+    pub fn examples(&self, pool: &str, n: usize) -> (Vec<String>, Vec<String>) {
+        let (mut good, mut bad, mut index) = (Vec::new(), Vec::new(), 0);
+        #[cfg_attr(verus_only, verus_spec(
+            invariant
+                index <= self.marks@.len(),
+            decreases self.marks@.len() - index,
+        ))]
+        while index < self.marks.len() {
+            let marked = &self.marks[index];
+            if let Some(text) = text_in(marked, pool) {
+                match marked.mark.value {
+                    Some(Value::Good) if good.len() < n => good.push(text),
+                    Some(Value::Bad) if bad.len() < n => bad.push(text),
+                    _ => {}
+                }
+            }
+            index += 1;
+        }
+        (good, bad)
+    }
+}
+
+/// The text of the response that `marked` marks, when the response is from `pool`.
+#[verus_verify]
+fn text_in(marked: &Marked, pool: &str) -> Option<String> {
+    let responses = &marked.rated.responses;
+    match marked.mark.target {
+        Target::Response(index)
+            if index < responses.len() && responses[index].pool.as_str() == pool =>
+        {
+            Some(responses[index].text.clone())
+        }
+        _ => None,
+    }
+}
+
+/// The pool and the template of the response that `marked` marks bad, if any.
+#[verus_spec(pair =>
+    ensures
+        pair == bad_of(*marked),
+)]
+fn bad_pair(marked: &Marked) -> Option<(String, String)> {
+    let responses = &marked.rated.responses;
+    match marked.mark.target {
+        Target::Response(index) if index < responses.len() => match marked.mark.value {
+            Some(Value::Bad) => Some((
+                responses[index].pool.clone(),
+                responses[index].template.clone(),
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// True when `marked` is a bad action mark for the normalized text `normal`.
+#[verus_spec(found =>
+    ensures
+        found == wrong(normal@)(*marked),
+)]
+fn is_wrong(marked: &Marked, normal: &str) -> bool {
+    matches!(marked.mark.target, Target::Action)
+        && matches!(marked.mark.value, Some(Value::Bad))
+        && marked.text.as_str() == normal
+}
+
+/// The bad action of `marked` in plain words, for example
+/// `tv_on on media_player.office was wrong, the right intent is tv_show`.
+#[verus_verify]
+fn line(marked: &Marked) -> String {
+    let action = &marked.rated.action;
+    let mut line = action.intent.clone();
+    line.push_str(" on ");
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= action.targets@.len(),
+        decreases action.targets@.len() - index,
+    ))]
+    while index < action.targets.len() {
+        if index > 0 {
+            line.push_str(", ");
+        }
+        line.push_str(action.targets[index].as_str());
+        index += 1;
+    }
+    line.push_str(" was wrong");
+    if let Some(correction) = &marked.mark.correction {
+        line.push_str(", the right intent is ");
+        line.push_str(correction.as_str());
+    }
+    line
 }
 
 /// The number of action marks of `marks` with `value` for the normalized text `normal`, `intent`
@@ -211,6 +381,8 @@ fn is_for(marked: &Marked, normal: &str, intent: &str, targets: &[String]) -> bo
 
 verus! {
 
+broadcast use {crate::domain::contracts::axiom_string_obeys_cmp, vstd::laws_cmp::group_laws_cmp};
+
 /// The text that the marks of `rated` count for: the transcript of the first interaction of a
 /// dialog, else the transcript.
 pub open spec fn asked(rated: Rated) -> Seq<char> {
@@ -242,6 +414,47 @@ pub open spec fn counts(key: (Seq<char>, Seq<char>, Seq<Seq<char>>), value: Valu
 /// set `targets`.
 pub open spec fn counted(marks: Seq<Marked>, text: Seq<char>, intent: Seq<char>, targets: Seq<String>, value: Value) -> nat {
     marks.filter(counts((intent::normalized(text), intent, select::views(targets)), value)).len()
+}
+
+/// The pool and the template of the response that `marked` marks bad, if any.
+pub open spec fn bad_of(marked: Marked) -> Option<(String, String)> {
+    let responses = marked.rated.responses@;
+    match marked.mark.target {
+        Target::Response(index) => if index < responses.len() && marked.mark.value == Some(Value::Bad) {
+            Some((responses[index as int].pool, responses[index as int].template))
+        } else {
+            None
+        },
+        Target::Action => None,
+    }
+}
+
+/// True when one of the first `count` marks of `marks` marks bad the response with `pair`.
+pub open spec fn bad_listed(marks: Seq<Marked>, count: int, pair: (String, String)) -> bool {
+    exists|index: int| 0 <= index < count && #[trigger] bad_of(marks[index]) == Some(pair)
+}
+
+/// The predicate of the bad action marks for the normalized text `text`.
+pub open spec fn wrong(text: Seq<char>) -> spec_fn(Marked) -> bool {
+    |marked: Marked| marked.mark.target == Target::Action && marked.mark.value == Some(Value::Bad) && marked.text@ == text
+}
+
+/// A pair is in the first `index + 1` marks when it is in the first `index`, or the mark at
+/// `index` marks it bad.
+proof fn lemma_listed_step(marks: Seq<Marked>, index: int)
+    requires
+        0 <= index < marks.len(),
+    ensures
+        forall|pair: (String, String)| bad_listed(marks, index + 1, pair)
+            <==> bad_listed(marks, index, pair) || bad_of(marks[index]) == Some(pair),
+{
+    assert forall|pair: (String, String)| bad_listed(marks, index + 1, pair)
+        implies bad_listed(marks, index, pair) || bad_of(marks[index]) == Some(pair) by {
+        let found = choose|found: int| 0 <= found < index + 1 && #[trigger] bad_of(marks[found]) == Some(pair);
+        if found < index {
+            assert(bad_listed(marks, index, pair));
+        }
+    }
 }
 
 /// The filter of the first `index + 1` items is the filter of the first `index`, with the item at
@@ -291,6 +504,7 @@ mod tests {
             transcript: transcript.to_owned(),
             link: None,
             action: Action { intent, targets },
+            responses: Vec::new(),
         }
     }
 
@@ -367,6 +581,41 @@ mod tests {
         };
         let feedback = Feedback::default().apply(answer, mark(2, Some(Value::Bad)));
         assert!(blocked(&feedback, TV), "the first text is not blocked");
+    }
+
+    /// AC-12.3c-1.
+    #[test]
+    fn ac_12_3c_1_bad_responses_has_only_the_bad_response() {
+        let spoken = |pool: &str| Spoken {
+            text: format!("The {pool} text."),
+            pool: pool.to_owned(),
+            template: format!("The {pool} template."),
+        };
+        let responses = ["filler", "tv_on", "failure"].map(spoken).to_vec();
+        let rated = Rated {
+            responses,
+            ..rated(TV, office())
+        };
+        let response = Mark {
+            target: Target::Response(1),
+            ..mark(1, Some(Value::Bad))
+        };
+        let feedback = Feedback::default().apply(rated, response);
+        let pair = ("tv_on".to_owned(), "The tv_on template.".to_owned());
+        assert_eq!(feedback.bad_responses(), BTreeSet::from([pair]));
+    }
+
+    /// AC-12.3c-2.
+    #[test]
+    fn ac_12_3c_2_correction_names_intent_targets_and_correction() {
+        let correction = Some("tv_show".to_owned());
+        let wrong = Mark {
+            correction,
+            ..mark(1, Some(Value::Bad))
+        };
+        let feedback = Feedback::default().apply(rated(TV, office()), wrong);
+        let expected = "tv_on on media_player.office was wrong, the right intent is tv_show";
+        assert_eq!(feedback.corrections(TV, 3), [expected]);
     }
 
     /// The targets of the model decision `d`: the Office or the Living Room media player.
