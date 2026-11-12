@@ -49,7 +49,7 @@ This phase sends `unknown` and low-probability requests to OpenAI. Jarvis speaks
 - AC-7.2-2: When the prompt builder runs for the Kitchen, the user message has only Kitchen entities.
 - AC-7.2-3: When the question has no area, the user message has no entities.
 - AC-7.2-4: When `now` is Monday 2026-10-26 08:00 in `America/Chicago`, the user message has "Monday 2026-10-26 08:00" and the HA location name.
-- AC-7.2-5: When the system prompt is read, it asks for plain text to speak, with no Markdown, lists or emoji.
+- AC-7.2-5: When the system prompt is read, it asks for plain text to speak, with no Markdown, lists or emoji. Sub-phase 10.6b adds two rules to it (AC-10.6b-6).
 
 **Proofs.**
 
