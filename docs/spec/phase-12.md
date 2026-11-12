@@ -213,7 +213,7 @@ This phase logs each request with its audio, action and response. You mark the a
 - **Implements:** G14, G15. **Depends on:** 12.4b.
 - **Files:** modify `src/ports.rs`, `src/adapters/sqlite.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `Interaction` gets `marks`. `mark(mark)` (stores the mark with its time), `marked() -> Vec<Interaction>`, `deferred(since) -> Vec<Deferred { id, text, time, spoken }>` (interactions after `since` whose decision is `Defer` with `Job::Llm`, without a bad action mark and without a `link`; `spoken` is true when the interaction has a `satellite`; `Deferred` is in `src/domain/feedback.rs`), `prune(now)`: delete audio older than `audio_days` and unmarked records older than `record_days`. Thus `deferred` gives each request that System Two answered: a top label `unknown`, a top probability less than `model.threshold`, a label that is not in the catalog, a blocked decision (sub-phase 12.10), or an intent that System One cannot act on (sub-phase 4.5). A dialog answer is not a request, so `deferred` leaves it out. The marks are migration step 2 of the schema (sub-phase 12.4). This sub-phase adds `log.audio_days` and `log.record_days`.
+**Model.** `Interaction` gets `marks`. `mark(mark)` (stores the mark with its time), `marked() -> Vec<Interaction>`, `deferred(since) -> Vec<Deferred { id, text, time, spoken }>` (interactions after `since` whose decision is `Defer` with `Job::Llm`, without a bad action mark and without a `link`; `spoken` is true when the interaction has a `satellite`; `Deferred` is in `src/domain/feedback.rs`), `prune(now)`: delete audio older than `audio_days` and unmarked records older than `record_days`. `prune` keeps a record that a marked record links to, so `get` of the `link` of a marked dialog answer still makes its `Rated` (sub-phase 12.7). Thus `deferred` gives each request that System Two answered: a top label `unknown`, a top probability less than `model.threshold`, a label that is not in the catalog, a blocked decision (sub-phase 12.10), or an intent that System One cannot act on (sub-phase 4.5). A dialog answer is not a request, so `deferred` leaves it out. The marks are migration step 2 of the schema (sub-phase 12.4). This sub-phase adds `log.audio_days` and `log.record_days`.
 
 **Acceptance criteria.**
 
@@ -223,12 +223,13 @@ This phase logs each request with its audio, action and response. You mark the a
 - AC-12.5-4: When `prune` runs, it deletes audio older than `audio_days` and unmarked records older than `record_days`.
 - AC-12.5-5: When `prune` runs, it keeps every marked record, at any age.
 - AC-12.5-6: When the database has schema version 1 with records, the adapter migrates it to version 2 and keeps every record.
+- AC-12.5-7: When `prune` runs, it keeps an unmarked first interaction of a dialog, at any age, when a marked answer of the dialog links to it.
 
 **Proofs.**
 
 - P-12.5-3. Argument: the query has the four conditions in its `WHERE` clause.
 - P-12.5-6. Evidence: test.
-- P-12.5-4, P-12.5-5. Argument: the record delete has `marks IS NULL AND time < now - record_days`. A marked record fails the first condition.
+- P-12.5-4, P-12.5-5, P-12.5-7. Argument: the record delete has `marks IS NULL AND time < now - record_days AND id NOT IN (SELECT link FROM interactions WHERE marks IS NOT NULL AND link IS NOT NULL)`. A marked record fails the first condition. A first interaction that a marked record links to fails the third condition. The delete never removes a marked record, so the link stays.
 - P-12.5-1, P-12.5-2. Evidence: test.
 
 ---
