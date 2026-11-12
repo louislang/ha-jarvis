@@ -140,6 +140,20 @@ pub struct Interaction {
     pub marks: Vec<Mark>,
 }
 
+/// A request that System Two answered.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Deferred {
+    /// The ID of the interaction.
+    pub id: u64,
+    /// The transcript.
+    pub text: String,
+    /// The time of the request.
+    pub time: Timestamp,
+    /// True when the request came from a satellite.
+    pub spoken: bool,
+}
+
 /// One mark with the interaction that it rates.
 #[verus_verify]
 #[derive(Clone, Debug, PartialEq)]

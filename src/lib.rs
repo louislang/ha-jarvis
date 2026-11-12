@@ -554,6 +554,10 @@ pub struct TrainConfig {
 pub struct LogConfig {
     /// The interaction log database file.
     pub database: PathBuf,
+    /// The age in days after which `prune` deletes the audio.
+    pub audio_days: u64,
+    /// The age in days after which `prune` deletes an unmarked record.
+    pub record_days: u64,
     /// The time that a committed utterance waits for its request.
     pub correlate_s: u64,
 }
@@ -1374,6 +1378,8 @@ mod tests {
     fn expected_log() -> LogConfig {
         LogConfig {
             database: PathBuf::from("jarvis.db"),
+            audio_days: 30,
+            record_days: 90,
             correlate_s: 10,
         }
     }
