@@ -86,6 +86,30 @@ pub struct Feedback {
 
 #[verus_verify]
 impl Feedback {
+    /// The feedback with `mark` on `rated` instead of the earlier mark of its interaction and
+    /// target. A mark on a dialog answer counts for the text of the first interaction.
+    #[verus_spec(applied =>
+        ensures
+            mark.value is None ==> applied.marks@ == self.marks@.filter(other(mark.interaction, mark.target)),
+            mark.value is Some ==> {
+                &&& applied.marks@.drop_last() == self.marks@.filter(other(mark.interaction, mark.target))
+                &&& applied.marks@.last().mark == mark && applied.marks@.last().rated == rated
+                &&& applied.marks@.last().text@ == intent::normalized(asked(rated))
+            },
+    )]
+    #[must_use]
+    pub fn apply(self, rated: Rated, mark: Mark) -> Self {
+        let mut marks = without(self.marks, mark.interaction, mark.target);
+        if mark.value.is_some() {
+            let text = match &rated.link {
+                Some(first) => intent::normalize(first),
+                None => intent::normalize(&rated.transcript),
+            };
+            marks.push(Marked { mark, text, rated });
+        }
+        Self { marks }
+    }
+
     /// True when the bad action marks for the normalized `text`, `intent` and the set `targets`
     /// are more than the good ones.
     #[verus_spec(found =>
@@ -134,6 +158,42 @@ fn count(marks: &[Marked], normal: &str, intent: &str, targets: &[String], value
     found
 }
 
+/// `marks` without the mark on `target` of `interaction`.
+#[verus_spec(kept =>
+    ensures
+        kept@ == marks@.filter(other(interaction, target)),
+)]
+fn without(marks: Vec<Marked>, interaction: u64, target: Target) -> Vec<Marked> {
+    let mut kept = Vec::new();
+    let all = marks.into_iter();
+    proof_decl! {
+        let ghost seen = vstd::std_specs::iter::IteratorSpec::remaining(&all);
+    }
+    #[cfg_attr(verus_only, verus_spec(marked_iter =>
+        invariant
+            marked_iter.seq() == seen,
+            seen == marks@,
+            kept@ == seen.take(marked_iter.index() as int).filter(other(interaction, target)),
+    ))]
+    for marked in all {
+        proof! {
+            lemma_filter_step(seen, marked_iter.index() as int, other(interaction, target));
+        }
+        let same = match (marked.mark.target, target) {
+            (Target::Action, Target::Action) => true,
+            (Target::Response(left), Target::Response(right)) => left == right,
+            _ => false,
+        };
+        if marked.mark.interaction != interaction || !same {
+            kept.push(marked);
+        }
+    }
+    proof! {
+        assert(seen.take(seen.len() as int) =~= seen);
+    }
+    kept
+}
+
 /// True when `marked` is an action mark for the normalized text `normal`, `intent` and the set
 /// `targets`.
 #[verus_spec(found =>
@@ -150,6 +210,20 @@ fn is_for(marked: &Marked, normal: &str, intent: &str, targets: &[String]) -> bo
 }
 
 verus! {
+
+/// The text that the marks of `rated` count for: the transcript of the first interaction of a
+/// dialog, else the transcript.
+pub open spec fn asked(rated: Rated) -> Seq<char> {
+    match rated.link {
+        Some(first) => first@,
+        None => rated.transcript@,
+    }
+}
+
+/// The predicate of the marks that are not on `target` of `interaction`.
+pub open spec fn other(interaction: u64, target: Target) -> spec_fn(Marked) -> bool {
+    |marked: Marked| marked.mark.interaction != interaction || marked.mark.target != target
+}
 
 /// True when `mark` is an action mark on `action` for the key: a normalized text, an intent and a
 /// set of targets.
@@ -190,6 +264,16 @@ proof fn lemma_filter_step<T>(items: Seq<T>, index: int, keep: spec_fn(T) -> boo
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::mem;
+
+    use quint_connect::Driver;
+    use quint_connect::State as ModelState;
+    use quint_connect::Step;
+    use quint_connect::quint_run;
+    use quint_connect::switch;
+    use serde::Deserialize;
+
     use super::*;
 
     /// The request of the tests.
@@ -214,18 +298,23 @@ mod tests {
     /// media player.
     fn marked(values: &[Value]) -> Feedback {
         let marks = values.iter().zip(1..).map(|(&value, interaction)| Marked {
-            mark: Mark {
-                interaction,
-                target: Target::Action,
-                value: Some(value),
-                correction: None,
-                time: Timestamp::UNIX_EPOCH,
-            },
+            mark: mark(interaction, Some(value)),
             text: "turn on the tv".to_owned(),
             rated: rated(TV, office()),
         });
         Feedback {
             marks: marks.collect(),
+        }
+    }
+
+    /// The mark `value` on the action of `interaction`.
+    fn mark(interaction: u64, value: Option<Value>) -> Mark {
+        Mark {
+            interaction,
+            target: Target::Action,
+            value,
+            correction: None,
+            time: Timestamp::UNIX_EPOCH,
         }
     }
 
@@ -256,5 +345,132 @@ mod tests {
             !blocked(&feedback, "turn on the lights"),
             "the lights are blocked"
         );
+    }
+
+    /// AC-12.3b-1.
+    #[test]
+    fn ac_12_3b_1_removed_mark_restores_blocked() {
+        let feedback = marked(&[Value::Bad, Value::Good]);
+        let removed = feedback.apply(rated(TV, office()), mark(2, None));
+        assert!(blocked(&removed, TV), "not blocked without the good mark");
+        let removed = removed.apply(rated(TV, office()), mark(1, None));
+        assert!(!blocked(&removed, TV), "blocked without marks");
+    }
+
+    /// AC-12.3b-3.
+    #[test]
+    fn ac_12_3b_3_dialog_answer_counts_for_the_first_text() {
+        let link = Some(TV.to_owned());
+        let answer = Rated {
+            link,
+            ..rated("the office", office())
+        };
+        let feedback = Feedback::default().apply(answer, mark(2, Some(Value::Bad)));
+        assert!(blocked(&feedback, TV), "the first text is not blocked");
+    }
+
+    /// The targets of the model decision `d`: the Office or the Living Room media player.
+    fn targets(d: &str) -> Vec<String> {
+        let room = if d == "d1" { "office" } else { "living_room" };
+        vec![format!("media_player.{room}")]
+    }
+
+    /// A mark value of `feedback.qnt`.
+    #[derive(Deserialize)]
+    struct Pick {
+        /// `Good` or `Bad`.
+        tag: String,
+    }
+
+    /// The good and bad marks of `feedback.qnt` for each text and decision.
+    #[derive(Deserialize)]
+    struct Model {
+        /// The good marks.
+        good: BTreeMap<(String, String), i64>,
+        /// The bad marks.
+        bad: BTreeMap<(String, String), i64>,
+    }
+
+    /// `blocked` for each text and decision.
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(from = "Model")]
+    struct Blocked(BTreeMap<(String, String), bool>);
+
+    impl From<Model> for Blocked {
+        /// Bad marks more than good marks.
+        fn from(model: Model) -> Self {
+            let blocked = model.bad.into_iter().map(|(key, bad)| {
+                let good = model.good[&key];
+                (key, bad > good)
+            });
+            Self(blocked.collect())
+        }
+    }
+
+    impl ModelState<FeedbackDriver> for Blocked {
+        /// `blocked` for "turn on the tv" with each decision.
+        fn from_driver(driver: &FeedbackDriver) -> anyhow::Result<Self> {
+            let blocked = ["d1", "d2"].map(|d| {
+                let found = driver.feedback.blocked(TV, "tv_on", &targets(d));
+                (("t".to_owned(), d.to_owned()), found)
+            });
+            Ok(Self(blocked.into()))
+        }
+    }
+
+    /// Replays `feedback.qnt` against `Feedback`. The text `t` is "turn on the tv", and each mark
+    /// is on a new interaction.
+    #[derive(Default)]
+    struct FeedbackDriver {
+        /// The feedback.
+        feedback: Feedback,
+        /// The interaction, decision and value of each mark that is not removed.
+        marks: Vec<(u64, String, Value)>,
+        /// The number of marks so far, which is the ID of the last marked interaction.
+        count: u64,
+    }
+
+    impl FeedbackDriver {
+        /// Applies `mark` on the action of decision `d`.
+        fn apply(&mut self, d: &str, mark: Mark) {
+            let rated = rated(TV, targets(d));
+            self.feedback = mem::take(&mut self.feedback).apply(rated, mark);
+        }
+
+        /// Marks decision `d` with `value` on a new interaction.
+        fn mark(&mut self, d: String, value: Value) {
+            self.count += 1;
+            self.apply(&d, mark(self.count, Some(value)));
+            self.marks.push((self.count, d, value));
+        }
+
+        /// Removes a mark with `value` on decision `d`.
+        fn unmark(&mut self, d: &str, value: Value) {
+            let found = self.marks.iter().position(|m| m.1 == d && m.2 == value);
+            let (interaction, ..) = self.marks.remove(found.expect("a mark to remove"));
+            self.apply(d, mark(interaction, None));
+        }
+    }
+
+    impl Driver for FeedbackDriver {
+        type State = Blocked;
+
+        fn step(&mut self, step: &Step) -> anyhow::Result<()> {
+            switch!(step {
+                init => *self = Self::default(),
+                markGood(d: String) => self.mark(d, Value::Good),
+                markBad(d: String) => self.mark(d, Value::Bad),
+                unmark(d: String, value: Pick) => {
+                    self.unmark(&d, if value.tag == "Bad" { Value::Bad } else { Value::Good });
+                },
+                decide => {},
+            })
+        }
+    }
+
+    /// AC-12.3b-2. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/feedback.qnt", max_steps = 30, seed = "1")]
+    fn ac_12_3b_2_conformance() -> impl Driver {
+        FeedbackDriver::default()
     }
 }
