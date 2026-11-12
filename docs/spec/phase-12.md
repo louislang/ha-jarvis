@@ -585,7 +585,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 **Goal:** Restart Jarvis after a save, so that the new settings take effect. When the start with the new file fails or crashes, put the last good file back and start again, and show the rollback in the status.
 
 - **Implements:** G24. **Depends on:** 12.9e.
-- **Files:** modify `src/lib.rs`, `src/adapters/settings.rs`, `src/adapters/review.html`, `.gitignore`.
+- **Files:** modify `src/ports.rs`, `src/lib.rs`, `src/adapters/settings.rs`, `src/adapters/web.rs`, `src/adapters/review.html`, `.gitignore`.
 
 **Model.**
 
@@ -593,7 +593,9 @@ A cancel phrase is not logged, because it has no prediction and no action.
   - `<config>.bak`: the last good text, from a save until the next start is ready.
   - `<config>.trying`: the marker of the trial start, the first start after a save. It holds the error text of a failed trial start, or nothing.
   - `<config>.rollback`: the reason of the last rollback.
-- After the check of sub-phase 12.9e, `save` writes the old text to `<config>.bak`, writes the new text, and removes `<config>.rollback`. Then it sets the status to `Restarting` and notifies the shutdown.
+- `Activity { Idle, Restarting }` is in `src/ports.rs`. The root keeps one `Arc<Mutex<Activity>>`. Each change of it locks the mutex, checks the old value and sets the new value in one critical section. Sub-phase 13.10b adds `Training`.
+- `save` first changes the activity from `Idle` to `Restarting`. With another value, it returns `Refusal::Busy` and reads and writes nothing. When the check of sub-phase 12.9e fails, `save` sets `Idle` again. Else the activity stays `Restarting` until the process ends, so a second save cannot replace `<config>.bak` with an untested file. `POST api/settings` maps `Busy` to 409 with `{ "error": "Jarvis is busy" }`.
+- After the check, `save` writes the old text to `<config>.bak`, writes the new text, and removes `<config>.rollback`. Then it sets the status to `Restarting` and notifies the shutdown.
 - The shutdown future of `serve` completes on SIGINT, SIGTERM or this notification. `run` returns `Ended::Restart` after the notification and `Ended::Stop` after a signal. At `Restart`, `run` keeps the status `Restarting`, so the entity shows `restarting` while Jarvis is down (sub-phase 12.9c). At `Stop`, it sets `Offline`.
 - `run` calls `settings::begin(config)` first, before it loads the configuration:
   - When `<config>.trying` exists, the trial start failed or crashed. `begin` renames `<config>.bak` to `<config>` and `<config>.trying` to `<config>.rollback`. An empty reason becomes `start after save crashed`. Jarvis logs one `error` event and starts with the old file.
@@ -621,6 +623,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 - AC-12.9f-5: When `begin` runs while `<config>.trying` has an error text, `<config>` has the text of the backup, `<config>.rollback` has the error text, and neither `<config>.bak` nor `<config>.trying` exists. When `<config>.trying` is empty, `<config>.rollback` has `start after save crashed`.
 - AC-12.9f-6: When a save, a failed trial start and a failed start after the rollback occur in sequence, the exit codes are 75, 75 and 1, and `<config>` has the old text. When `panic_code` runs without `<config>.trying`, it returns 101.
 - AC-12.9f-7: When `<config>.rollback` exists at the start, `GET api/status` gives the message `settings rolled back: <reason>`. After the next save, `<config>.rollback` does not exist.
+- AC-12.9f-8: When two saves run at the same time, one succeeds and the other returns `Busy`, and `<config>.bak` has the text from before both saves. When a save fails the check, the next valid save succeeds. When `FakeControl` returns `Busy`, `POST api/settings` returns 409.
 
 **Proofs.**
 
@@ -628,6 +631,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 - P-12.9f-2, P-12.9f-4. Argument: `start` matches on the result of `serve` and on the existence of `<config>.trying`. `panic_code` checks the same file.
 - P-12.9f-3, P-12.9f-5. Argument: `begin` checks `<config>.trying` first and `<config>.bak` second. `run` calls `confirm` before `serve_until`, and the web server starts in `serve_until`.
 - P-12.9f-6. Argument: an exit code of 75 needs `Ended::Restart`, which only a save gives, or `<config>.trying`, which only `begin` makes at the start after a save. The start after a failed trial start removes `<config>.trying` and `<config>.bak` in `begin`, and only a new save writes `<config>.bak` again. Thus that start exits with 1 or 101.
+- P-12.9f-8. Argument: only the change from `Idle` to `Restarting` lets `save` read the file, and it runs in one critical section, so one save at a time gets it. Only a failed check sets `Idle` again, before any write.
 - P-12.9f-7. Evidence: test.
 
 **Field log.** Add `RestartForceExitStatus=75` to the unit `jarvis` and run `systemctl daemon-reload`. In the Jarvis tab, change `dialog.timeout_s` and save. Record that the status shows `restarting`, then `online`, and that the new value is in `jarvis.toml`. Then set `tts.voice` to a voice that the TTS model does not have and save. Record that the status and the attribute `message` of `sensor.jarvis_status` show `settings rolled back` with the error, and that `jarvis.toml` has the old value.
