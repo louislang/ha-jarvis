@@ -109,18 +109,19 @@ pub enum Write {
 }
 
 /// Starts the log writer task, which runs each message of its sender on `log` in order and logs a
-/// failed write. The task ends when every sender drops.
+/// failed write. Gives the sender and the task, which ends after the last message when every
+/// sender drops.
 #[must_use]
-pub fn start_writer(log: Arc<dyn InteractionLog>) -> UnboundedSender<Write> {
+pub fn start_writer(log: Arc<dyn InteractionLog>) -> (UnboundedSender<Write>, JoinHandle<()>) {
     let (writer, mut messages) = tokio::sync::mpsc::unbounded_channel();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         while let Some(Write::Append(interaction, audio)) = messages.recv().await {
             if let Err(error) = log.append(*interaction, audio).await {
                 tracing::warn!("the log write failed: {error:#}");
             }
         }
     });
-    writer
+    (writer, task)
 }
 
 /// Decides requests with System One and dispatches the decisions to the home, System Two, the
@@ -275,10 +276,8 @@ impl Conversation {
             marks: Vec::new(),
         };
         // A send fails only after the writer ended, at shutdown.
-        let _ = self
-            .recorder
-            .writer
-            .send(Write::Append(Box::new(interaction), audio));
+        let write = Write::Append(Box::new(interaction), audio);
+        let _ = self.recorder.writer.send(write);
     }
 
     /// The open dialog of `key` at `now` and its key. The dialog map no longer has it.
@@ -1050,9 +1049,7 @@ fn route(decision: &Decision) -> Route {
             job: Job::Fetch { .. },
             ..
         } => Route::Fetch,
-        Decision::Defer {
-            job: Job::Llm(_), ..
-        } => Route::Llm,
+        Decision::Defer { .. } => Route::Llm,
         Decision::Ask { .. } => Route::Ask,
     }
 }
@@ -2320,33 +2317,26 @@ mod tests {
             delay,
             ..FakeLog::default()
         });
-        conversation.recorder.writer = start_writer(Arc::clone(&log) as _);
+        conversation.recorder.writer = start_writer(Arc::clone(&log) as _).0;
         (log, conversation)
     }
 
-    /// The audio of the utterances of the tests.
-    fn audio() -> Audio {
-        Audio {
-            samples: vec![1, 2, 3],
-            rate: 16_000,
-        }
-    }
-
     /// Keeps an utterance of `LIGHTS` in `conversation`, whose voice ended 200 ms before the time
-    /// of the tests.
-    fn hear(conversation: &Conversation) {
+    /// of the tests. Gives its audio.
+    fn hear(conversation: &Conversation) -> Audio {
         let voice_end = Timestamp::UNIX_EPOCH - Duration::from_millis(200);
+        let (samples, rate) = (vec![1, 2, 3], 16_000);
+        let audio = Audio { samples, rate };
         let utterances = &conversation.recorder.utterances;
-        utterances.append(LIGHTS.to_owned(), audio(), Some(voice_end));
+        utterances.append(LIGHTS.to_owned(), audio.clone(), Some(voice_end));
+        audio
     }
 
     /// The interactions of `log` with their audio after the writer runs.
     async fn written(log: &FakeLog) -> Vec<(Interaction, Option<Audio>)> {
         tokio::time::sleep(Duration::from_millis(1)).await;
-        log.interactions
-            .lock()
-            .expect("no lock holder panics")
-            .clone()
+        let interactions = log.interactions.lock();
+        interactions.expect("no lock holder panics").clone()
     }
 
     /// The record of `LIGHTS` from the satellite.
@@ -2377,9 +2367,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_12_6_1_voice_request_is_logged_with_its_audio() -> anyhow::Result<()> {
         let (log, conversation) = logging(&Arc::default(), Duration::ZERO);
-        hear(&conversation);
+        let audio = hear(&conversation);
         let _ = conversation.handle(LIGHTS, on_satellite()).await?;
-        assert_eq!(written(&log).await, [(lights_record(), Some(audio()))]);
+        assert_eq!(written(&log).await, [(lights_record(), Some(audio))]);
         Ok(())
     }
 
@@ -2389,9 +2379,7 @@ mod tests {
         let (log, conversation) = logging(&Arc::default(), Duration::ZERO);
         hear(&conversation);
         let _ = conversation.handle(LIGHTS, Context::default()).await?;
-        let logged = written(&log).await;
-        let audio: Vec<&Option<Audio>> = logged.iter().map(|(_, audio)| audio).collect();
-        assert_eq!(audio, [&None]);
+        assert_eq!(written(&log).await[0].1, None);
         Ok(())
     }
 
@@ -2407,14 +2395,15 @@ mod tests {
         Ok(())
     }
 
-    /// AC-12.1b-2.
+    /// The writer task ends only after it runs its queued messages, so a shutdown loses none.
     #[tokio::test(start_paused = true)]
-    async fn ac_12_1b_2_handle_without_satellite_does_not_correlate() -> anyhow::Result<()> {
-        let (_log, conversation) = logging(&Arc::default(), Duration::ZERO);
-        hear(&conversation);
-        let _ = conversation.handle(LIGHTS, Context::default()).await?;
-        let found = conversation.recorder.utterances.correlate(LIGHTS);
-        assert!(found.is_some(), "handle without a satellite_id correlated");
+    async fn writer_ends_after_its_queued_messages() -> anyhow::Result<()> {
+        let log = Arc::new(FakeLog::default());
+        let (writer, task) = start_writer(Arc::clone(&log) as _);
+        writer.send(Write::Append(Box::new(lights_record()), None))?;
+        drop(writer);
+        task.await?;
+        assert_eq!(written(&log).await.len(), 1);
         Ok(())
     }
 

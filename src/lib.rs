@@ -828,8 +828,12 @@ fn area_names(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(snapshot.areas.into_iter().map(|area| area.name).collect())
 }
 
-/// A started app, its pools task and habit task, and its pre-render task.
-type Started = (App, (JoinHandle<()>, HabitsTask), JoinHandle<()>);
+/// A started app, its pools task, habit task and log writer task, and its pre-render task.
+type Started = (
+    App,
+    (JoinHandle<()>, HabitsTask, JoinHandle<()>),
+    JoinHandle<()>,
+);
 
 /// The longest wait of [`run`] for the running tasks and the saves after the shutdown future
 /// completes.
@@ -880,26 +884,26 @@ where
 }
 
 /// Serves `app` on `listen` until `shutdown` completes. Then waits up to [`SHUTDOWN_WAIT`] for
-/// the connection tasks, the work after their replies and the pools task of `stores`, and then
-/// for the last save of its habit task.
+/// the connection tasks, the work after their replies, and the pools task and the log writer
+/// task of `stores`, and then for the last save of its habit task.
 ///
 /// # Errors
 ///
-/// The server cannot bind or accept, or the pools task or the habit task panicked.
+/// The server cannot bind or accept, or a task of `stores` panicked.
 async fn serve_until(
     listen: SocketAddr,
     app: App,
-    stores: (JoinHandle<()>, HabitsTask),
+    stores: (JoinHandle<()>, HabitsTask, JoinHandle<()>),
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     let (listener, tracker) = (TcpListener::bind(listen).await?, TaskTracker::new());
     adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await?;
     tracker.close();
-    let (pools_task, habits) = stores;
-    // The pools task saves each change. It ends when the tracked tasks drop the last sender.
+    let (pools_task, habits, writer) = stores;
+    // Both tasks run each message. They end when the tracked tasks drop the last sender.
     let drained = async {
         tracker.wait().await;
-        pools_task.await
+        pools_task.await.and(writer.await)
     };
     let ended = tokio::time::timeout(SHUTDOWN_WAIT, drained).await;
     // The habits save also when a connection still runs (sub-phase 5.4c).
@@ -1009,9 +1013,9 @@ async fn start_app(
 ) -> anyhow::Result<Started> {
     let (cache, queues) = start_sync(home, config);
     let (task, habits) = start_stores(config, pools, &cache)?;
-    let (classifier, listener, speech) =
-        load_models(config, Arc::clone(&reasoner), &queues).await?;
+    let (classifier, listener, speech) = load_models(config, reasoner.clone(), &queues).await?;
     let prerender = start_prerender(&speech, &task.pools, &cache);
+    let (recorder, writer) = recorder(config, &listener)?;
     let app = App {
         conversation: Conversation::new(
             task.pools,
@@ -1021,28 +1025,30 @@ async fn start_app(
             catalog,
             config.model.threshold,
             system_two(config, reasoner, plugins),
-            Arc::clone(&habits.habits),
-            recorder(config, &listener)?,
+            habits.habits.clone(),
+            recorder,
         ),
         listener,
         speech,
     };
-    Ok((app, (task.task, habits), prerender))
+    Ok((app, (task.task, habits, writer), prerender))
 }
 
-/// The recorder of the utterances of `listener` and of the log of `config`, on a new log writer
-/// task.
+/// The recorder of the utterances of `listener` and of the log of `config`, and its new log
+/// writer task.
 ///
 /// # Errors
 ///
 /// The log cannot open.
-fn recorder(config: &Config, listener: &Listener) -> anyhow::Result<Recorder> {
+fn recorder(config: &Config, listener: &Listener) -> anyhow::Result<(Recorder, JoinHandle<()>)> {
     let log = SqliteLog::open(&config.log)?;
-    Ok(Recorder {
+    let (writer, task) = app::conversation::start_writer(Arc::new(log));
+    let recorder = Recorder {
         utterances: Arc::clone(listener.utterances()),
-        writer: app::conversation::start_writer(Arc::new(log)),
+        writer,
         model: MODEL.to_owned(),
-    })
+    };
+    Ok((recorder, task))
 }
 
 /// Starts the pools task of the source pools `pools` and the saved pools of `config`, and the
@@ -1263,6 +1269,7 @@ mod tests {
     use crate::domain::state_cache::StateCache;
     use crate::domain::training;
     use crate::ports::ModelLoader;
+    use crate::ports::Partial;
     use crate::ports::TextToSpeech;
     use crate::testing::fakes;
     use crate::testing::fakes::FakeClassifier;
@@ -1859,12 +1866,13 @@ mod tests {
     }
 
     /// The conversation of `config` with `classifier`, `queues(config)`, `two(config)`, the pools
-    /// of `catalog` and a backfill on `FakeReasoner` and `speech`.
+    /// of `catalog`, a backfill on `FakeReasoner` and `speech`, and `utterances`.
     fn conversation(
         config: &Config,
         catalog: Catalog,
         classifier: Arc<dyn Classifier>,
         speech: &Arc<Speech>,
+        utterances: Arc<Utterances>,
     ) -> anyhow::Result<Conversation> {
         let task = app::conversation::start_pools(pools(&catalog), Arc::new(FakeStore::new(None)))?;
         let (catalog, cache) = (Arc::new(catalog), watch::channel(StateCache::default()).1);
@@ -1881,17 +1889,12 @@ mod tests {
             threshold,
             two(config),
             Arc::new(habits),
-            recorder(),
+            Recorder {
+                utterances,
+                writer: tokio::sync::mpsc::unbounded_channel().0,
+                model: MODEL.to_owned(),
+            },
         ))
-    }
-
-    /// A recorder with no utterances and a log writer that has ended.
-    fn recorder() -> Recorder {
-        Recorder {
-            utterances: Arc::new(Utterances::new(Arc::new(SystemClock), 10)),
-            writer: tokio::sync::mpsc::unbounded_channel().0,
-            model: MODEL.to_owned(),
-        }
     }
 
     /// The app of `VALID` with `classifier`, `stt`, the reference house and `pools`.
@@ -1904,8 +1907,9 @@ mod tests {
         let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
         let (reasoner, queues) = (Arc::new(FakeReasoner::default()), queues(&config));
         let listener = listener(&config, stt, Arc::clone(&classifier), reasoner, &queues);
+        let utterances = Arc::clone(listener.utterances());
         Ok(App {
-            conversation: conversation(&config, catalog, classifier, &speech)?,
+            conversation: conversation(&config, catalog, classifier, &speech, utterances)?,
             listener,
             speech,
         })
@@ -2134,6 +2138,29 @@ mod tests {
         current.0.store(Arc::new(new.clone() as _));
         let _ = handle().await;
         assert_eq!((old.calls().len(), new.calls().len()), (1, 1));
+        Ok(())
+    }
+
+    /// AC-12.1b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_1b_2_handle_without_satellite_does_not_correlate() -> anyhow::Result<()> {
+        let text = "turn on the lights";
+        let partial = Partial {
+            text: text.to_owned(),
+            voice_end_ms: None,
+            vad_ms: 20,
+        };
+        let stt = FakeStt {
+            partials: vec![partial],
+            ..FakeStt::default()
+        };
+        let app = app_with(Arc::new(FakeClassifier::default()), Arc::new(stt))?;
+        let mut session = app.listen()?;
+        session.push(vec![0; 320]).await?;
+        session.finish().await?;
+        let _ = app.handle(text, ports::Context::default()).await;
+        let found = app.listener.utterances().correlate(text);
+        assert!(found.is_some(), "handle without a satellite_id correlated");
         Ok(())
     }
 
