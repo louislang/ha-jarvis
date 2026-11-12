@@ -17,6 +17,7 @@ use crate::Device;
 use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::feedback::Interaction;
+use crate::domain::feedback::Spoken;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
@@ -263,6 +264,13 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> Timestamp;
 }
 
+/// A change to a logged interaction.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Change {
+    /// Adds a later announce or question to the responses.
+    Response(Spoken),
+}
+
 /// The interactions that `list` keeps.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Filter {
@@ -285,9 +293,15 @@ pub trait InteractionLog: Send + Sync {
     /// Stores `interaction` with its 16 kHz `audio`.
     async fn append(&self, interaction: Interaction, audio: Option<Audio>) -> anyhow::Result<()>;
 
+    /// Applies `change` to the interaction `id`.
+    async fn update(&self, id: u64, change: Change) -> anyhow::Result<()>;
+
     /// The interactions of `page` that `filter` keeps, newest first.
     async fn list(&self, filter: Filter, page: Page) -> anyhow::Result<Vec<Interaction>>;
 
     /// The interaction `id`, or `None` when it does not exist.
     async fn get(&self, id: u64) -> anyhow::Result<Option<Interaction>>;
+
+    /// The audio of the interaction `id`, or `None` when it has none.
+    async fn audio(&self, id: u64) -> anyhow::Result<Option<Audio>>;
 }
