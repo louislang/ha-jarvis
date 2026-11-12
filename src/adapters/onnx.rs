@@ -423,6 +423,32 @@ mod tests {
         .await
     }
 
+    /// AC-18.7-8.
+    #[tokio::test]
+    async fn ac_18_7_8_genre_music_phrase_tags_media_and_group() -> anyhow::Result<()> {
+        let threshold = crate::Config::load(Path::new("jarvis.toml"))?
+            .model
+            .threshold;
+        let classifier = OnnxLoader.load(Path::new(FIXTURE), Device::Cpu).await?;
+        let text = "play christmas music downstairs";
+        let expected =
+            [("media", "christmas music"), ("area", "downstairs")].map(|(name, value)| Slot {
+                name: name.to_owned(),
+                value: value.to_owned(),
+            });
+        for context in ["area: Office", "area: Kitchen", "area: none"] {
+            let prediction = classifier.predict(context, text).await?;
+            let (top, probability) = &prediction.ranked[0];
+            assert_eq!(top, "play_music", "top label with {context}");
+            assert!(
+                *probability >= threshold,
+                "{context} gives {probability}, under {threshold}"
+            );
+            assert_eq!(prediction.slots, expected, "slots with {context}");
+        }
+        Ok(())
+    }
+
     /// AC-18.15-9.
     #[tokio::test]
     async fn ac_18_15_9_slots_contain_the_group_name() -> anyhow::Result<()> {
