@@ -61,7 +61,7 @@ impl Utterances {
     }
 
     /// Drops the expired utterances, then keeps `text`, `audio` and `voice_end` at the time now.
-    fn append(&self, text: String, audio: Audio, voice_end: Option<Timestamp>) {
+    pub fn append(&self, text: String, audio: Audio, voice_end: Option<Timestamp>) {
         self.change(|kept, time| {
             let mut kept = speech::expire(kept, time, self.window_s);
             kept.push(Utterance {
@@ -151,7 +151,7 @@ impl Listener {
 
     /// The committed utterances.
     #[must_use]
-    pub fn utterances(&self) -> &Utterances {
+    pub fn utterances(&self) -> &Arc<Utterances> {
         &self.utterances
     }
 

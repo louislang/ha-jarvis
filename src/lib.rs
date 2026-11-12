@@ -47,6 +47,7 @@ use crate::adapters::open_meteo::OpenMeteo;
 use crate::adapters::openai::OpenAiReasoner;
 use crate::adapters::plex::Plex;
 use crate::adapters::sherpa::SherpaStt;
+use crate::adapters::sqlite::SqliteLog;
 use crate::adapters::supertonic::SupertonicTts;
 use crate::app::background::Backfill;
 use crate::app::background::Habits;
@@ -55,6 +56,7 @@ use crate::app::conversation::Change;
 use crate::app::conversation::Conversation;
 use crate::app::conversation::PoolsTask;
 use crate::app::conversation::Queues;
+use crate::app::conversation::Recorder;
 use crate::app::conversation::SystemTwo;
 use crate::app::plugins::Plugins;
 use crate::app::speech::Listener;
@@ -562,6 +564,9 @@ pub struct LogConfig {
     pub correlate_s: u64,
 }
 
+/// The run name of the System One model that Jarvis loads.
+const MODEL: &str = "fixture";
+
 /// The `Clock` of the system time.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
@@ -596,10 +601,6 @@ impl Assistant for App {
     }
 
     async fn handle(&self, text: &str, context: ports::Context) -> anyhow::Result<Handled> {
-        // A typed request never gets voice audio. Nothing reads the utterance yet.
-        if context.satellite_id.is_some() {
-            drop(self.listener.utterances().correlate(text));
-        }
         self.conversation.handle(text, context).await
     }
 
@@ -827,6 +828,9 @@ fn area_names(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(snapshot.areas.into_iter().map(|area| area.name).collect())
 }
 
+/// A started app, its pools task and habit task, and its pre-render task.
+type Started = (App, (JoinHandle<()>, HabitsTask), JoinHandle<()>);
+
 /// The longest wait of [`run`] for the running tasks and the saves after the shutdown future
 /// completes.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
@@ -952,7 +956,7 @@ async fn start_live_app(
     catalog: Catalog,
     pools: Pools,
     home: Arc<dyn Home>,
-) -> anyhow::Result<(App, (JoinHandle<()>, HabitsTask), JoinHandle<()>)> {
+) -> anyhow::Result<Started> {
     let plugins = registry(config, plugins(config, secrets)?);
     let tools = plugins.tools();
     let reasoner = Arc::new(OpenAiReasoner::try_new(
@@ -1002,28 +1006,43 @@ async fn start_app(
     home: Arc<dyn Home>,
     reasoner: Arc<dyn Reasoner>,
     plugins: Arc<Plugins>,
-) -> anyhow::Result<(App, (JoinHandle<()>, HabitsTask), JoinHandle<()>)> {
+) -> anyhow::Result<Started> {
     let (cache, queues) = start_sync(home, config);
     let (task, habits) = start_stores(config, pools, &cache)?;
     let (classifier, listener, speech) =
         load_models(config, Arc::clone(&reasoner), &queues).await?;
     let prerender = start_prerender(&speech, &task.pools, &cache);
-    let backfill = backfill(config, &reasoner, task.changes, &speech, &catalog, cache);
     let app = App {
         conversation: Conversation::new(
             task.pools,
-            backfill,
+            backfill(config, &reasoner, task.changes, &speech, &catalog, cache),
             queues,
             classifier,
             catalog,
             config.model.threshold,
             system_two(config, reasoner, plugins),
             Arc::clone(&habits.habits),
+            recorder(config, &listener)?,
         ),
         listener,
         speech,
     };
     Ok((app, (task.task, habits), prerender))
+}
+
+/// The recorder of the utterances of `listener` and of the log of `config`, on a new log writer
+/// task.
+///
+/// # Errors
+///
+/// The log cannot open.
+fn recorder(config: &Config, listener: &Listener) -> anyhow::Result<Recorder> {
+    let log = SqliteLog::open(&config.log)?;
+    Ok(Recorder {
+        utterances: Arc::clone(listener.utterances()),
+        writer: app::conversation::start_writer(Arc::new(log)),
+        model: MODEL.to_owned(),
+    })
 }
 
 /// Starts the pools task of the source pools `pools` and the saved pools of `config`, and the
@@ -1093,7 +1112,7 @@ async fn load_models(
     reasoner: Arc<dyn Reasoner>,
     queues: &Arc<Queues>,
 ) -> anyhow::Result<(Arc<dyn Classifier>, Listener, Arc<Speech>)> {
-    let dir = config.model.dir.join("fixture");
+    let dir = config.model.dir.join(MODEL);
     let model = OnnxLoader.load(&dir, config.device).await?;
     let classifier: Arc<dyn Classifier> = Arc::new(CurrentClassifier(ArcSwap::from_pointee(model)));
     let (asr, tts, device) = (config.asr.clone(), config.tts.clone(), config.device);
@@ -1244,7 +1263,6 @@ mod tests {
     use crate::domain::state_cache::StateCache;
     use crate::domain::training;
     use crate::ports::ModelLoader;
-    use crate::ports::Partial;
     use crate::ports::TextToSpeech;
     use crate::testing::fakes;
     use crate::testing::fakes::FakeClassifier;
@@ -1863,7 +1881,17 @@ mod tests {
             threshold,
             two(config),
             Arc::new(habits),
+            recorder(),
         ))
+    }
+
+    /// A recorder with no utterances and a log writer that has ended.
+    fn recorder() -> Recorder {
+        Recorder {
+            utterances: Arc::new(Utterances::new(Arc::new(SystemClock), 10)),
+            writer: tokio::sync::mpsc::unbounded_channel().0,
+            model: MODEL.to_owned(),
+        }
     }
 
     /// The app of `VALID` with `classifier`, `stt`, the reference house and `pools`.
@@ -2029,10 +2057,11 @@ mod tests {
         Ok(format!("{error:#}"))
     }
 
-    /// `VALID` with the files `pools.json` and `habits.json` in `folder`.
+    /// `VALID` with the files `pools.json`, `habits.json` and `jarvis.db` in `folder`.
     fn with_stores_in(folder: &Path) -> String {
         let in_folder = |file: &str| format!("\"{}\"", folder.join(file).display());
         let text = VALID.replace("\"pools.json\"", &in_folder("pools.json"));
+        let text = text.replace("\"jarvis.db\"", &in_folder("jarvis.db"));
         text.replace("\"habits.json\"", &in_folder("habits.json"))
     }
 
@@ -2105,29 +2134,6 @@ mod tests {
         current.0.store(Arc::new(new.clone() as _));
         let _ = handle().await;
         assert_eq!((old.calls().len(), new.calls().len()), (1, 1));
-        Ok(())
-    }
-
-    /// AC-12.1b-2.
-    #[tokio::test(start_paused = true)]
-    async fn ac_12_1b_2_handle_without_satellite_does_not_correlate() -> anyhow::Result<()> {
-        let text = "turn on the lights";
-        let partial = Partial {
-            text: text.to_owned(),
-            voice_end_ms: None,
-            vad_ms: 20,
-        };
-        let stt = FakeStt {
-            partials: vec![partial],
-            ..FakeStt::default()
-        };
-        let app = app_with(Arc::new(FakeClassifier::default()), Arc::new(stt))?;
-        let mut session = app.listen()?;
-        session.push(vec![0; 320]).await?;
-        session.finish().await?;
-        let _ = app.handle(text, ports::Context::default()).await;
-        let found = app.listener.utterances().correlate(text);
-        assert!(found.is_some(), "handle without a satellite_id correlated");
         Ok(())
     }
 

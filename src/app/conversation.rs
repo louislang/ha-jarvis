@@ -1,4 +1,5 @@
-//! The `handle` use case, dispatch of decisions, the announce queues and the pools task.
+//! The `handle` use case, dispatch of decisions, the announce queues, the pools task and the log
+//! writer task.
 
 use std::collections::BTreeMap;
 use std::mem;
@@ -6,6 +7,8 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -17,6 +20,7 @@ use jiff::Timestamp;
 use rand::rngs::StdRng;
 use serde_json::Map;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
@@ -24,6 +28,7 @@ use crate::DialogConfig;
 use crate::app::background::Backfill;
 use crate::app::background::Habits;
 use crate::app::plugins::Plugins;
+use crate::app::speech::Utterances;
 use crate::domain::catalog::Catalog;
 use crate::domain::decide;
 use crate::domain::decide::AskCall;
@@ -40,12 +45,17 @@ use crate::domain::dialog::Dialog;
 use crate::domain::dialog::Dialogs;
 use crate::domain::dialog::Key;
 use crate::domain::dialog::Pending;
+use crate::domain::feedback::Action;
+use crate::domain::feedback::Interaction;
+use crate::domain::feedback::Route;
 use crate::domain::intent;
 use crate::domain::model::Prediction;
 use crate::domain::model::Slot;
 use crate::domain::responses;
 use crate::domain::responses::Pools;
 use crate::domain::responses::Response;
+use crate::domain::speech::Audio;
+use crate::domain::speech::Utterance;
 use crate::domain::state::AreaId;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
@@ -55,6 +65,7 @@ use crate::ports::Clock;
 use crate::ports::Context;
 use crate::ports::Handled;
 use crate::ports::Home;
+use crate::ports::InteractionLog;
 use crate::ports::Reasoner;
 use crate::ports::Step;
 use crate::ports::Store;
@@ -80,6 +91,38 @@ pub struct SystemTwo {
     pub read_services: Vec<String>,
 }
 
+/// The parts of the log of the requests.
+#[derive(Clone)]
+pub struct Recorder {
+    /// The committed utterances, which give the audio of a voice request.
+    pub utterances: Arc<Utterances>,
+    /// The sender to the log writer task.
+    pub writer: UnboundedSender<Write>,
+    /// The run name of the System One model.
+    pub model: String,
+}
+
+/// One message to the log writer task.
+pub enum Write {
+    /// Stores the interaction with its audio.
+    Append(Box<Interaction>, Option<Audio>),
+}
+
+/// Starts the log writer task, which runs each message of its sender on `log` in order and logs a
+/// failed write. The task ends when every sender drops.
+#[must_use]
+pub fn start_writer(log: Arc<dyn InteractionLog>) -> UnboundedSender<Write> {
+    let (writer, mut messages) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(Write::Append(interaction, audio)) = messages.recv().await {
+            if let Err(error) = log.append(*interaction, audio).await {
+                tracing::warn!("the log write failed: {error:#}");
+            }
+        }
+    });
+    writer
+}
+
 /// Decides requests with System One and dispatches the decisions to the home, System Two, the
 /// announce queues and the pools task.
 #[derive(Clone)]
@@ -102,13 +145,17 @@ pub struct Conversation {
     two: SystemTwo,
     /// The request habit model, in which each new spoken request counts.
     habits: Arc<Habits>,
+    /// The log of the requests.
+    recorder: Recorder,
+    /// The ID of the next interaction.
+    next_id: Arc<AtomicU64>,
 }
 
 impl Conversation {
     /// Decides with `classifier`, `catalog` and `threshold`, and asks `two`. Dispatches to
     /// `queues`, their house and `backfill`, which records the uses of `pools`. Selects the
     /// responses with a random source seeded from the time of `two`. Records the requests in
-    /// `habits`.
+    /// `habits` and in `recorder`, with IDs from the time of `two` in microseconds.
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
@@ -123,9 +170,12 @@ impl Conversation {
         threshold: f32,
         two: SystemTwo,
         habits: Arc<Habits>,
+        recorder: Recorder,
     ) -> Self {
         use rand::SeedableRng;
-        let seed = two.clock.now().as_millisecond().unsigned_abs();
+        let now = two.clock.now();
+        let seed = now.as_millisecond().unsigned_abs();
+        let next_id = Arc::new(AtomicU64::new(now.as_microsecond().unsigned_abs()));
         Self {
             pools,
             backfill,
@@ -136,6 +186,8 @@ impl Conversation {
             threshold,
             two,
             habits,
+            recorder,
+            next_id,
         }
     }
 
@@ -144,6 +196,7 @@ impl Conversation {
     /// System One prediction of the normalized text in the area name of the satellite device, its
     /// decision and its dispatch, or the answer of a deferred job when `context` has no
     /// satellite. A question opens a dialog. A new request from a satellite counts in the habits.
+    /// Sends the record of a decided request to the log writer.
     ///
     /// # Errors
     ///
@@ -151,6 +204,7 @@ impl Conversation {
     pub async fn handle(&self, text: &str, context: Context) -> anyhow::Result<Handled> {
         let (area, name) = self.area(context.device_id.as_deref());
         let now = self.two.clock.now();
+        let heard = self.hear(text, &context, name.as_deref(), now);
         let key = context.satellite_id.clone().or(context.conversation_id);
         let satellite = context.satellite_id.as_deref();
         let open = self.take_dialog(key.clone(), now);
@@ -166,9 +220,65 @@ impl Conversation {
             area,
             now,
         };
-        Ok(self
+        let (handled, route) = self
             .act(&prediction, &request, key.map(Key), satellite, new)
-            .await)
+            .await;
+        self.append(heard, &prediction, route);
+        Ok(handled)
+    }
+
+    /// `text` in `context` from the area `name` at `now`, with a new interaction ID and, from a
+    /// satellite, the utterance of `text`.
+    fn hear(&self, text: &str, context: &Context, name: Option<&str>, now: Timestamp) -> Heard {
+        let satellite = context.satellite_id.clone();
+        // A typed request never gets voice audio.
+        let utterance = satellite
+            .as_ref()
+            .and_then(|_| self.recorder.utterances.correlate(text));
+        Heard {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            time: now,
+            satellite,
+            transcript: text.to_owned(),
+            model_context: training::context_text(name),
+            utterance,
+        }
+    }
+
+    /// Sends the record of `heard` with `prediction` and the decision of kind `route` to the log
+    /// writer, with the audio of its utterance.
+    fn append(&self, heard: Heard, prediction: &Prediction, route: Route) {
+        let (audio, voice_end) = heard.utterance.map_or((None, None), |utterance| {
+            (Some(utterance.audio), utterance.voice_end)
+        });
+        let end = self.two.clock.now();
+        let latency = voice_end.map(|start| end.duration_since(start).as_millis());
+        let top = prediction.ranked.first().map(|(label, _)| label.clone());
+        let interaction = Interaction {
+            id: heard.id,
+            time: heard.time,
+            satellite: heard.satellite,
+            transcript: heard.transcript,
+            model_context: heard.model_context,
+            model: self.recorder.model.clone(),
+            top_labels: prediction.ranked.iter().take(3).cloned().collect(),
+            slots: Vec::new(),
+            action: Action {
+                intent: top.unwrap_or_default(),
+                targets: Vec::new(),
+            },
+            decision: route,
+            service_calls: Vec::new(),
+            responses: Vec::new(),
+            latency_ms: latency.and_then(|latency| u64::try_from(latency).ok()),
+            link: None,
+            marks: Vec::new(),
+        };
+        // A send fails only after the writer ended, at shutdown.
+        let _ = self
+            .recorder
+            .writer
+            .send(Write::Append(Box::new(interaction), audio));
     }
 
     /// The open dialog of `key` at `now` and its key. The dialog map no longer has it.
@@ -181,6 +291,7 @@ impl Conversation {
 
     /// The dispatch of the decision for `prediction` of `request` on `satellite`. A question opens
     /// a dialog for `key`. A `new` request from `satellite` counts in the habits. Logs the request.
+    /// Also the kind of the decision.
     async fn act(
         &self,
         prediction: &Prediction,
@@ -188,16 +299,12 @@ impl Conversation {
         key: Option<Key>,
         satellite: Option<&str>,
         new: bool,
-    ) -> Handled {
+    ) -> (Handled, Route) {
         let decision = self.decide(prediction, request);
+        let route = route(&decision);
         // Only a spoken request counts. Text from the HA UI has no satellite.
-        self.record(
-            prediction,
-            &decision,
-            request.now,
-            new && satellite.is_some(),
-        );
-        let (kind, area) = (kind(&decision), request.area.as_ref());
+        self.record(prediction, route, request.now, new && satellite.is_some());
+        let area = request.area.as_ref();
         let pending = match &decision {
             Decision::Ask { pending, .. } => Some(pending.clone()),
             _ => None,
@@ -208,17 +315,17 @@ impl Conversation {
         }
         let (top, reply) = (prediction.ranked.first(), handled.text.as_str());
         let transcript = request.transcript.as_str();
-        tracing::info!(transcript, ?top, kind, reply, "handled");
-        handled
+        tracing::info!(transcript, ?top, ?route, reply, "handled");
+        (handled, route)
     }
 
     /// Records the top intent of `prediction` at `now` in the habits when the request is `spoken`
-    /// and `decision` does not defer to System Two.
-    fn record(&self, prediction: &Prediction, decision: &Decision, now: Timestamp, spoken: bool) {
+    /// and the decision of kind `route` does not defer to System Two.
+    fn record(&self, prediction: &Prediction, route: Route, now: Timestamp, spoken: bool) {
         let top = prediction
             .ranked
             .first()
-            .filter(|_| spoken && !is_llm(decision));
+            .filter(|_| spoken && !matches!(route, Route::Llm));
         if let Some((intent, _)) = top {
             self.habits.observe(intent.clone(), now);
         }
@@ -919,24 +1026,35 @@ struct Thread {
     answers: Option<AskCall>,
 }
 
-/// The name of the kind of `decision`.
-fn kind(decision: &Decision) -> &'static str {
-    match decision {
-        Decision::Reply { .. } => "reply",
-        Decision::Defer { .. } => "defer",
-        Decision::Ask { .. } => "ask",
-    }
+/// A request as `handle` hears it, before its decision.
+struct Heard {
+    /// The interaction ID.
+    id: u64,
+    /// The time of the request.
+    time: Timestamp,
+    /// The satellite entity, or `None` for a typed request.
+    satellite: Option<String>,
+    /// The transcript.
+    transcript: String,
+    /// Segment A of the model input.
+    model_context: String,
+    /// The utterance of a voice request.
+    utterance: Option<Utterance>,
 }
 
-/// True when `decision` defers to System Two.
-fn is_llm(decision: &Decision) -> bool {
-    matches!(
-        decision,
+/// The kind of `decision`.
+fn route(decision: &Decision) -> Route {
+    match decision {
+        Decision::Reply { .. } => Route::Reply,
         Decision::Defer {
-            job: Job::Llm(_),
+            job: Job::Fetch { .. },
             ..
-        }
-    )
+        } => Route::Fetch,
+        Decision::Defer {
+            job: Job::Llm(_), ..
+        } => Route::Llm,
+        Decision::Ask { .. } => Route::Ask,
+    }
 }
 
 /// The items to play for the match `found` in `results`: the first track of an artist match,
@@ -1231,6 +1349,7 @@ mod tests {
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
+    use crate::testing::fakes::FakeLog;
     use crate::testing::fakes::FakePlugin;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
@@ -1312,6 +1431,7 @@ mod tests {
                 read_services: vec!["calendar.get_events".to_owned()],
             },
             Arc::new(habits),
+            recorder(),
         )
     }
 
@@ -2166,6 +2286,135 @@ mod tests {
         let handled = conversation.handle("plan dinner", in_kitchen()).await?;
         assert_eq!(handled.text, "One moment.");
         assert_eq!(observed(&conversation), []);
+        Ok(())
+    }
+
+    /// The text of the logged requests of the tests.
+    const LIGHTS: &str = "turn on the kitchen lights";
+
+    /// A recorder with no utterances, the model `fixture` and a writer that has ended.
+    fn recorder() -> Recorder {
+        let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
+        Recorder {
+            utterances: Arc::new(Utterances::new(clock, 10)),
+            writer: tokio::sync::mpsc::unbounded_channel().0,
+            model: "fixture".to_owned(),
+        }
+    }
+
+    /// A conversation on `home` whose classifier gives `lights_on` with 0.9 and the area slot
+    /// `kitchen`, which logs to a `FakeLog` that waits `delay` for each call, and the log.
+    fn logging(home: &Arc<FakeHome>, delay: Duration) -> (Arc<FakeLog>, Conversation) {
+        let classifier = Arc::new(FakeClassifier::default());
+        let slot = Slot {
+            name: "area".to_owned(),
+            value: "kitchen".to_owned(),
+        };
+        classifier.script(Prediction {
+            ranked: vec![("lights_on".to_owned(), 0.9)],
+            slots: vec![slot],
+        });
+        let (_cache, _changes, mut conversation) =
+            still_with(home, "idle", classifier, Arc::default());
+        let log = Arc::new(FakeLog {
+            delay,
+            ..FakeLog::default()
+        });
+        conversation.recorder.writer = start_writer(Arc::clone(&log) as _);
+        (log, conversation)
+    }
+
+    /// The audio of the utterances of the tests.
+    fn audio() -> Audio {
+        Audio {
+            samples: vec![1, 2, 3],
+            rate: 16_000,
+        }
+    }
+
+    /// Keeps an utterance of `LIGHTS` in `conversation`, whose voice ended 200 ms before the time
+    /// of the tests.
+    fn hear(conversation: &Conversation) {
+        let voice_end = Timestamp::UNIX_EPOCH - Duration::from_millis(200);
+        let utterances = &conversation.recorder.utterances;
+        utterances.append(LIGHTS.to_owned(), audio(), Some(voice_end));
+    }
+
+    /// The interactions of `log` with their audio after the writer runs.
+    async fn written(log: &FakeLog) -> Vec<(Interaction, Option<Audio>)> {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        log.interactions
+            .lock()
+            .expect("no lock holder panics")
+            .clone()
+    }
+
+    /// The record of `LIGHTS` from the satellite.
+    fn lights_record() -> Interaction {
+        Interaction {
+            id: 0,
+            time: Timestamp::UNIX_EPOCH,
+            satellite: Some(SATELLITE.to_owned()),
+            transcript: LIGHTS.to_owned(),
+            model_context: training::context_text(None),
+            model: "fixture".to_owned(),
+            top_labels: vec![("lights_on".to_owned(), 0.9)],
+            slots: Vec::new(),
+            action: Action {
+                intent: "lights_on".to_owned(),
+                targets: Vec::new(),
+            },
+            decision: Route::Reply,
+            service_calls: Vec::new(),
+            responses: Vec::new(),
+            latency_ms: Some(200),
+            link: None,
+            marks: Vec::new(),
+        }
+    }
+
+    /// AC-12.6-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_6_1_voice_request_is_logged_with_its_audio() -> anyhow::Result<()> {
+        let (log, conversation) = logging(&Arc::default(), Duration::ZERO);
+        hear(&conversation);
+        let _ = conversation.handle(LIGHTS, on_satellite()).await?;
+        assert_eq!(written(&log).await, [(lights_record(), Some(audio()))]);
+        Ok(())
+    }
+
+    /// AC-12.6-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_6_2_typed_request_has_no_audio() -> anyhow::Result<()> {
+        let (log, conversation) = logging(&Arc::default(), Duration::ZERO);
+        hear(&conversation);
+        let _ = conversation.handle(LIGHTS, Context::default()).await?;
+        let logged = written(&log).await;
+        let audio: Vec<&Option<Audio>> = logged.iter().map(|(_, audio)| audio).collect();
+        assert_eq!(audio, [&None]);
+        Ok(())
+    }
+
+    /// AC-12.6-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_6_3_slow_log_does_not_delay_handle() -> anyhow::Result<()> {
+        let (log, conversation) = logging(&Arc::default(), Duration::from_millis(500));
+        let start = Instant::now();
+        let _ = conversation.handle(LIGHTS, on_satellite()).await?;
+        assert_eq!(Instant::now(), start, "handle waited for the log");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(written(&log).await.len(), 1);
+        Ok(())
+    }
+
+    /// AC-12.1b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_1b_2_handle_without_satellite_does_not_correlate() -> anyhow::Result<()> {
+        let (_log, conversation) = logging(&Arc::default(), Duration::ZERO);
+        hear(&conversation);
+        let _ = conversation.handle(LIGHTS, Context::default()).await?;
+        let found = conversation.recorder.utterances.correlate(LIGHTS);
+        assert!(found.is_some(), "handle without a satellite_id correlated");
         Ok(())
     }
 
