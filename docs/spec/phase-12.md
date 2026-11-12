@@ -582,42 +582,53 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 ### 12.9f Restart and Rollback
 
-**Goal:** Restart Jarvis after a save, so that the new settings take effect. When the start with the new file fails, put the last good file back and start again, and show the rollback in the status.
+**Goal:** Restart Jarvis after a save, so that the new settings take effect. When the start with the new file fails or crashes, put the last good file back and start again, and show the rollback in the status.
 
 - **Implements:** G24. **Depends on:** 12.9e.
 - **Files:** modify `src/lib.rs`, `src/adapters/settings.rs`, `src/adapters/review.html`, `.gitignore`.
 
 **Model.**
 
-- Two files are next to the configuration file `<config>`. `<config>.bak` holds the last good text from a save until the next start is ready. `<config>.rollback` holds the reason of the last rollback.
+- Three files can be next to the configuration file `<config>`:
+  - `<config>.bak`: the last good text, from a save until the next start is ready.
+  - `<config>.trying`: the marker of the trial start, the first start after a save. It holds the error text of a failed trial start, or nothing.
+  - `<config>.rollback`: the reason of the last rollback.
 - After the check of sub-phase 12.9e, `save` writes the old text to `<config>.bak`, writes the new text, and removes `<config>.rollback`. Then it sets the status to `Restarting` and notifies the shutdown.
 - The shutdown future of `serve` completes on SIGINT, SIGTERM or this notification. `run` returns `Ended::Restart` after the notification and `Ended::Stop` after a signal. At `Restart`, `run` keeps the status `Restarting`, so the entity shows `restarting` while Jarvis is down (sub-phase 12.9c). At `Stop`, it sets `Offline`.
-- `run` calls `settings::confirm(config)` when the start is ready: after the models load and before `serve_until`. `confirm` removes `<config>.bak`.
+- `run` calls `settings::begin(config)` first, before it loads the configuration:
+  - When `<config>.trying` exists, the trial start failed or crashed. `begin` renames `<config>.bak` to `<config>` and `<config>.trying` to `<config>.rollback`. An empty reason becomes `start after save crashed`. Jarvis logs one `error` event and starts with the old file.
+  - Else, when `<config>.bak` exists, this start is the trial start. `begin` makes an empty `<config>.trying`.
+- `run` calls `settings::confirm(config)` when the start is ready: after the models load and before `serve_until`. `confirm` removes `<config>.trying` and `<config>.bak`.
 - `start` gives the exit code from the result of `serve`:
   - `Ok(Restart)`: 75.
   - `Ok(Stop)`: 0.
-  - `Err(error)` while `<config>.bak` exists: the start failed before it was ready, after a save. `settings::roll_back(config, error)` renames `<config>.bak` to `<config>` and writes the error text to `<config>.rollback`. Jarvis logs one `error` event. The exit code is 75.
-  - `Err(error)` without `<config>.bak`: 1, as before.
-- The unit `jarvis` has `RestartForceExitStatus=75` (`01-architecture.md` section 10). Thus systemd starts Jarvis again after exit code 75 only. A start that fails after a rollback has no `<config>.bak`, so it exits with 1, and the restarts do not loop. A panic exits with 101 and does not roll back. Then `<config>.bak` stays, and the next start that fails rolls back.
+  - `Err(error)` while `<config>.trying` exists: the trial start failed. `start` writes the error text to `<config>.trying`. The exit code is 75.
+  - `Err(error)` without `<config>.trying`: 1, as before.
+- A panic in a `tokio` task is an error of `serve`. For a panic of the main thread, `serve` sets a panic hook with `panic::set_hook`. The hook calls the default hook, and then exits with `settings::panic_code(config)`: 75 when `<config>.trying` exists, else 101. Thus a crash of the trial start gives 75, and the next start rolls back with the reason `start after save crashed`.
+- The unit `jarvis` has `RestartForceExitStatus=75` (`01-architecture.md` section 10). systemd starts Jarvis again after the exit code 75 only.
+- The restarts do not loop. Jarvis exits with 75 only after a save or when the trial start fails. The start after a failed trial start rolls back and removes `<config>.trying` and `<config>.bak`, so it is not a trial start. When it fails, it exits with 1 or 101, and systemd does not start it again. Thus one save gives at most two automatic restarts.
+- When the trial start dies from a signal (for example `SIGSEGV` in native code), systemd does not start Jarvis again. `<config>.trying` stays, so the next start, by hand or at boot, rolls back.
 - When `<config>.rollback` exists at the start, the status starts with the message `settings rolled back: <reason>`. The message stays until the next save removes the file.
 - After a save gives 204, the page shows `restarting` in `#status` until `api/status` gives `online`. Then it reads `api/settings` again, so a rollback shows the old values.
-- `.gitignore` ignores `/jarvis.toml.bak` and `/jarvis.toml.rollback`.
+- `.gitignore` ignores `/jarvis.toml.bak`, `/jarvis.toml.trying` and `/jarvis.toml.rollback`.
 
 **Acceptance criteria.**
 
 - AC-12.9f-1: When `save` succeeds, `<config>.bak` has the old text, `<config>` has the new text, the status is `restarting`, and `run` returns `Ended::Restart`.
 - AC-12.9f-2: When `serve` returns `Ended::Restart`, the exit code is 75. When it returns `Ended::Stop`, the exit code is 0.
-- AC-12.9f-3: When `serve` returns an error while `<config>.bak` exists, `<config>` has the text of the backup, `<config>.rollback` has the error text, `<config>.bak` does not exist, and the exit code is 75.
-- AC-12.9f-4: When `serve` returns an error and `<config>.bak` does not exist, `<config>` does not change, and the exit code is 1.
-- AC-12.9f-5: When the start is ready, `<config>.bak` does not exist.
-- AC-12.9f-6: When `<config>.rollback` exists at the start, `GET api/status` gives the message `settings rolled back: <reason>`. After the next save, `<config>.rollback` does not exist.
+- AC-12.9f-3: When `begin` runs while `<config>.bak` exists and `<config>.trying` does not exist, `<config>.trying` exists after it. When the start is ready, neither `<config>.bak` nor `<config>.trying` exists.
+- AC-12.9f-4: When `serve` returns an error while `<config>.trying` exists, `<config>.trying` has the error text, and the exit code is 75. When `panic_code` runs while `<config>.trying` exists, it returns 75.
+- AC-12.9f-5: When `begin` runs while `<config>.trying` has an error text, `<config>` has the text of the backup, `<config>.rollback` has the error text, and neither `<config>.bak` nor `<config>.trying` exists. When `<config>.trying` is empty, `<config>.rollback` has `start after save crashed`.
+- AC-12.9f-6: When a save, a failed trial start and a failed start after the rollback occur in sequence, the exit codes are 75, 75 and 1, and `<config>` has the old text. When `panic_code` runs without `<config>.trying`, it returns 101.
+- AC-12.9f-7: When `<config>.rollback` exists at the start, `GET api/status` gives the message `settings rolled back: <reason>`. After the next save, `<config>.rollback` does not exist.
 
 **Proofs.**
 
 - P-12.9f-1. Argument: `save` writes the backup before the new text, and both after the check (P-12.9e-2). The notification comes after the writes.
-- P-12.9f-2 to P-12.9f-4. Argument: `start` matches on the result of `serve` and on the existence of `<config>.bak`. Only the error arm with the backup calls `roll_back`.
-- P-12.9f-5. Argument: `run` calls `confirm` before `serve_until`, and the web server starts in `serve_until`.
-- P-12.9f-6. Evidence: test.
+- P-12.9f-2, P-12.9f-4. Argument: `start` matches on the result of `serve` and on the existence of `<config>.trying`. `panic_code` checks the same file.
+- P-12.9f-3, P-12.9f-5. Argument: `begin` checks `<config>.trying` first and `<config>.bak` second. `run` calls `confirm` before `serve_until`, and the web server starts in `serve_until`.
+- P-12.9f-6. Argument: an exit code of 75 needs `Ended::Restart`, which only a save gives, or `<config>.trying`, which only `begin` makes at the start after a save. The start after a failed trial start removes `<config>.trying` and `<config>.bak` in `begin`, and only a new save writes `<config>.bak` again. Thus that start exits with 1 or 101.
+- P-12.9f-7. Evidence: test.
 
 **Field log.** Add `RestartForceExitStatus=75` to the unit `jarvis` and run `systemctl daemon-reload`. In the Jarvis tab, change `dialog.timeout_s` and save. Record that the status shows `restarting`, then `online`, and that the new value is in `jarvis.toml`. Then set `tts.voice` to a voice that the TTS model does not have and save. Record that the status and the attribute `message` of `sensor.jarvis_status` show `settings rolled back` with the error, and that `jarvis.toml` has the old value.
 
