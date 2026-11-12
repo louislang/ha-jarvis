@@ -8,7 +8,7 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Goal:** Keep each committed utterance with its audio for a short window and find it again by its text. The conversation use case can then attach the audio to the request, although HA sends audio and text on different connections.
 
-- **Implements:** G15. **Depends on:** 11.7.
+- **Implements:** G15. **Depends on:** 11.5.
 - **Files:** modify `src/domain/speech.rs`, `src/app/speech.rs`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.** `Utterance { text, audio, time, voice_end }`. The speech use case appends each committed utterance. Each append and each `correlate` first drops the utterances older than `log.correlate_s`, so expired audio leaves at the next use. `correlate(utterances, text, now, window) -> Option<Utterance>`: the utterance with equal normalized text and `now - time <= window`, when exactly one matches. Two or more matches are ambiguous and give `None`, so wrong audio never drives identity or enrollment. A match removes the utterance. The conversation use case correlates only when the context has a `satellite_id`, so a typed request never gets voice audio. This sub-phase adds `[log]` with `correlate_s`.
