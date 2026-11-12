@@ -72,7 +72,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | `Trainer` | Driven | `train` (gives a model folder for a training set) | `adapters/process.rs` (local GPU) and `adapters/runpod.rs` (fallback) |
 | `Reasoner` | Driven | `warm`, `answer` (gives steps: sentence, call, plugin, ask, done), `generate`, `paraphrase`, `embed`, `propose` | `adapters/openai.rs` |
 | `Plugin` | Driven | `tool`, `fetch` | One adapter for each remote API: `adapters/open_meteo.rs` (weather), `adapters/plex.rs` (new shows) |
-| `InteractionLog` | Driven | `append`, `update`, `list`, `audio`, `mark`, `marked`, `deferred`, `prune` | `adapters/sqlite.rs` |
+| `InteractionLog` | Driven | `append`, `update`, `list`, `get`, `audio`, `mark`, `marked`, `deferred`, `prune` | `adapters/sqlite.rs` |
 | `Store<T>` | Driven | `load`, `save` | `adapters/files.rs` (TOML or JSON from the file extension) |
 | `Clock` | Driven | `now` | `SystemClock` in `src/lib.rs` |
 | `Models` | Driven | `release`, `restore` | `LiveModels` in `src/lib.rs` |
