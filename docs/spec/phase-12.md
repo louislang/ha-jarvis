@@ -255,7 +255,7 @@ This phase logs each request with its audio, action and response. You mark the a
 **Goal:** Record every request in the log after the reply is sent, and prune once a day. The log is complete without adding latency.
 
 - **Implements:** G15. **Depends on:** 12.5b.
-- **Files:** modify `src/app/conversation.rs`, `src/app/speech.rs`, `src/app/background.rs`, `src/lib.rs`, `src/testing/fakes.rs`.
+- **Files:** modify `src/app/conversation.rs`, `src/app/speech.rs`, `src/app/background.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `src/testing/e2e.rs`.
 
 **Model.** `handle` makes the interaction ID before dispatch. The first ID is the clock time in microseconds at the start, and each request adds one, so the IDs stay unique after a restart. When the context has a `satellite_id`, `handle` correlates the audio once. This call moves from `src/lib.rs` (sub-phase 12.1b) into the conversation use case. A match removes the utterance, so `handle` is the only caller: it sends the utterance with the append, and sub-phase 15.6 uses the same utterance for the speaker. Before it returns, it sends the append to the log writer task on an unbounded channel. The writer runs the messages in the order it receives them. The record has these values:
 
@@ -264,7 +264,7 @@ This phase logs each request with its audio, action and response. You mark the a
 - A slot gets the byte offsets of the first match of its value in the normalized transcript. A slot without a match is left out.
 - `responses` has the text that `handle` returns, with its pool and template: the reply, the filler or the question of the decision, or the deferred answer for a request without a satellite. A System Two text has an empty pool and template.
 
-Sub-phase 12.6b adds later announces and dialog answers. `FakeLog` gets `delay`: each `append` and `update` waits it. The background use case calls `prune` once a day, the first time one day after the start.
+Sub-phase 12.6b adds later announces and dialog answers. `FakeLog` gets `delay`: each `append` and `update` waits it. The background use case calls `prune` once a day, the first time one day after the start. The end-to-end harness (sub-phase 9.1) keeps the log database in its temporary folder.
 
 **Acceptance criteria.**
 
