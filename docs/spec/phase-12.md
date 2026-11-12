@@ -1,6 +1,6 @@
 # Phase 12: Interaction Log and Feedback
 
-This phase logs each request with its audio, action and response. You mark the action and the response as good or bad, with an optional correction. Marks change decisions at once, and Phase 13 trains on them.
+This phase logs each request with its audio, action and response. You mark the action and the response as good or bad, with an optional correction, in the Jarvis tab of the HA sidebar. The tab also shows the status of Jarvis and a form of chosen settings, and an HA entity shows the status. Marks change decisions at once, and Phase 13 trains on them.
 
 ---
 
@@ -168,7 +168,7 @@ This phase logs each request with its audio, action and response. You mark the a
 
 - `Interaction` (in `src/domain/feedback.rs`, because the training domain reads it): `id`, `time`, `satellite`, `transcript`, `model_context`, `model` (the run name of the classifier), `top labels` (three labels with probabilities), `slots` (name, value, byte offsets in the normalized transcript), `action` (the `Action` of sub-phase 12.3: the intent of the decision and its targets), `decision` (the kind of the decision: `Reply`, `Fetch` for `Defer` with `Job::Fetch`, `Llm` for `Defer` with `Job::Llm`, or `Ask`), `service calls`, `responses` (text, pool, template), `latency_ms` (from the `voice_end` of the correlated utterance to the end of `handle`; none without audio), `link` (the ID of the first interaction of a dialog). The intent of `action` can be a next intent (sub-phase 12.10), so it is not always the top label. Sub-phase 12.5 adds `marks`.
 - The audio is a BLOB of 16-bit mono PCM at 16 kHz.
-- `append(interaction, audio)`, `list(filter, page) -> Vec<Interaction>` (newest first, `review.page_size`), `get(id) -> Option<Interaction>`. `get` gives the interaction that a mark or a `link` names, so the caller can make its `Rated` (sub-phase 12.3).
+- `append(interaction, audio)`, `list(filter, page) -> Vec<Interaction>` (newest first, `web.page_size`), `get(id) -> Option<Interaction>`. `get` gives the interaction that a mark or a `link` names, so the caller can make its `Rated` (sub-phase 12.3).
 - The adapter creates the schema when the database file does not exist. It stores the schema version in `PRAGMA user_version`. The version starts at 1. A later sub-phase that changes the schema adds one migration step and increases the version. On start, the adapter runs the steps from the stored version to the current version in one transaction, so marks survive an update. A version newer than the code is an error with both versions.
 - This sub-phase adds `log.database`.
 
@@ -372,56 +372,290 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 ---
 
-### 12.8 Review Web API
+### 12.8 Web API
 
-**Goal:** Add the review web server with token authentication and the JSON and WAV endpoints. You can now read and mark interactions over HTTP.
+**Goal:** Add the web server of the Jarvis tab with token authentication and the review endpoints. You can now read and mark interactions over HTTP, and the Jarvis add-on (sub-phase 12.9g) can put the server into the HA sidebar.
 
-- **Implements:** G15. **Depends on:** 12.7.
+- **Implements:** G15, G24. **Depends on:** 12.7.
 - **Files:** create `src/adapters/web.rs`. Modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
 
 **Model.**
 
-- `GET /api/interactions?filter=&page=`, `GET /api/interactions/{id}/audio` (WAV), `GET /api/intents`, `POST /api/interactions/{id}/mark` with `{ "target": "action" | "response", "index": <n> | null, "value": "good" | "bad" | null, "correction": "<intent>" | null }`. `index` is the position of the response in the interaction (sub-phase 12.3). It is required for `response`.
-- `GET /` returns the page without a token. The page has no data. Each `/api/` request needs `Authorization: Bearer <token>`.
-- A browser cannot send this header when it opens a page or loads an `<audio>` source. Thus the page asks for the token, keeps it in `sessionStorage`, sends it with each `fetch`, and plays audio from a blob URL that an authenticated `fetch` makes.
-- This sub-phase adds `[review]` (`listen`, `token_env`, `page_size`) and resolves the token in `Secrets`.
+- `GET api/interactions?filter=&page=`, `GET api/interactions/{id}/audio` (WAV), `GET api/intents`, `POST api/interactions/{id}/mark` with `{ "target": "action" | "response", "index": <n> | null, "value": "good" | "bad" | null, "correction": "<intent>" | null }`. `index` is the position of the response in the interaction (sub-phase 12.3). It is required for `response`.
+- HA ingress serves the Jarvis tab under a path prefix (`/api/hassio_ingress/<session>/`). The add-on removes the prefix before it sends a request to Jarvis. Thus the routes of the server are the same with and without the add-on.
+- Each request under `api/` needs `Authorization: Bearer <token>`. The add-on adds this header to each request that it sends to Jarvis (sub-phase 12.9g). Thus the page has no token prompt and keeps no token. A request from another machine on the LAN needs the header too.
+- `run` serves the web server on `web.listen` next to the Wyoming server. The shutdown future of `run` stops both (sub-phase 5.4c).
+- This sub-phase adds `[web]` (`listen`, `token_env`, `page_size`) and resolves the token in `Secrets`. `web.page_size` is the page size of `list` (sub-phase 12.4).
 
 **Acceptance criteria.**
 
-- AC-12.8-1: When an `/api/` request has no token or a wrong token, the adapter returns 401.
-- AC-12.8-2: When a request has the correct token, `GET /api/interactions` returns the page from `FakeReview`.
-- AC-12.8-3: When `GET /api/interactions/{id}/audio` runs, the result is a valid WAV file with the stored samples.
+- AC-12.8-1: When a request under `api/` has no token or a wrong token, the adapter returns 401.
+- AC-12.8-2: When a request has the correct token, `GET api/interactions` returns the page from `FakeReview`.
+- AC-12.8-3: When `GET api/interactions/{id}/audio` runs, the result is a valid WAV file with the stored samples.
 - AC-12.8-4: When the interaction has no audio, the audio endpoint returns 404.
-- AC-12.8-5: When `POST /mark` has a correction that is not an intent name, the adapter returns 400.
-- AC-12.8-6: When `GET /` has no token, the adapter returns the page.
-- AC-12.8-7: When `POST /mark` has `"target": "response"` and `"index": 2`, `FakeReview` receives a mark with `Response(2)`. Without `index`, the adapter returns 400.
+- AC-12.8-5: When `POST api/interactions/{id}/mark` has a correction that is not an intent name, the adapter returns 400.
+- AC-12.8-6: When `run` starts, the web server answers on `web.listen`. When the shutdown future completes, the web server stops.
+- AC-12.8-7: When the mark request has `"target": "response"` and `"index": 2`, `FakeReview` receives a mark with `Response(2)`. Without `index`, the adapter returns 400.
 
 **Proofs.**
 
-- P-12.8-1, P-12.8-6. Argument: one middleware layer wraps every `/api/` route and compares the token before the handler runs. `GET /` is outside that layer.
+- P-12.8-1. Argument: one middleware layer wraps every route under `api/` and compares the token before the handler runs.
 - P-12.8-4, P-12.8-5. Argument: the handlers map `None` to 404 and the `Review::mark` error to 400.
 - P-12.8-7. Argument: the handler maps `("response", Some(n))` to `Response(n)` and `("response", None)` to 400.
-- P-12.8-2, P-12.8-3. Evidence: test.
+- P-12.8-2, P-12.8-3, P-12.8-6. Evidence: test.
 
 ---
 
 ### 12.9 Review Page
 
-**Goal:** Add the review page that plays each request's audio and lets you mark the action and the response, with an optional correction. Marking takes one click per interaction.
+**Goal:** Add the page of the Jarvis tab with the review section. It plays the audio of each request and lets you mark the action and the response, with an optional correction. Marking takes one click per interaction, and the page works under the path prefix of HA ingress.
 
-- **Implements:** G15. **Depends on:** 12.8.
+- **Implements:** G15, G24. **Depends on:** 12.8.
 - **Files:** create `src/adapters/review.html`. Modify `src/adapters/web.rs`.
 
-**Model.** `GET /` returns `review.html` (embedded with `include_str!`). The page script is inline JavaScript in `review.html` (`CLAUDE.md` permits it) with the token flow of sub-phase 12.8. For each interaction, the page shows the time, satellite, transcript, an audio player, the action and the response, good and bad buttons for each, and a list of intents for the correction after a bad action mark. It has a filter for bad and unmarked interactions.
+**Model.**
+
+- `GET /` returns `review.html` (embedded with `include_str!`) without a token. The page has no data. The page script is inline JavaScript in `review.html` (`CLAUDE.md` permits it).
+- Every URL in the page is relative, for example `api/interactions`, not `/api/interactions`. HA ingress serves the page under a path prefix, so an absolute URL misses the add-on.
+- The page sends no `Authorization` header, because the add-on adds it. Thus the `audio` element can load `api/interactions/{id}/audio` directly.
+- For each interaction, the page shows the time, satellite, transcript, an audio player, the action and the response, good and bad buttons for each, and a list of intents for the correction after a bad action mark. It has a filter for bad and unmarked interactions.
 
 **Acceptance criteria.**
 
-- AC-12.9-1: When `GET /` runs, the result is HTML that contains the elements `#interactions`, `#filter`, `template#interaction`, an `audio` element in the template, and the buttons `.mark-good`, `.mark-bad` and the `select.correction` list.
+- AC-12.9-1: When `GET /` runs without a token, the result is HTML that contains the elements `#interactions`, `#filter`, `template#interaction`, an `audio` element in the template, and the buttons `.mark-good`, `.mark-bad` and the `select.correction` list.
 - AC-12.9-2: When the inline script of `review.html` is extracted, `node --check` exits with code 0.
+- AC-12.9-3: When `review.html` is checked, no `src`, `href` or `action` attribute and no string in the script starts with `/`, `http:` or `https:`, and the script does not contain `Authorization`.
 
 **Proofs.**
 
-- P-12.9-1, P-12.9-2. Evidence: test.
+- P-12.9-1 to P-12.9-3. Evidence: test.
+
+---
+
+### 12.9b Status
+
+**Goal:** Add the status of Jarvis to the API and to the page. You see in the Jarvis tab that Jarvis is online. Later sub-phases add training, restarting and the rollback message.
+
+- **Implements:** G24. **Depends on:** 12.9.
+- **Files:** modify `src/ports.rs`, `src/lib.rs`, `src/adapters/web.rs`, `src/adapters/review.html`, `src/testing/fakes.rs`.
+
+**Model.**
+
+- `Status { state: State, message: Option<String> }` and `State { Online, Training, Restarting, Offline }` are in `src/ports.rs`. The JSON form is `{ "state": "online", "message": null }`, with the state in lowercase.
+- The composition root keeps the status in a `tokio::sync::watch` channel. The channel starts with `Online` and no message. The web server starts only when the start is ready (sub-phase 12.8), so the API never gives a status before that. Sub-phases 12.9c, 12.9f and 13.10b read or change the status.
+- The new driving port `Control` has `status() -> Status`. `src/lib.rs` implements it with the receiver of the channel. `adapters/web.rs` calls it. `FakeControl` in `src/testing/fakes.rs` gives a set status.
+- `GET api/status` returns the status.
+- The page has a status section `#status` with `.state` and `.message`. The page reads `api/status` at load and each 5 s. When the request fails, for example when the add-on returns its down page (sub-phase 12.9g), the section shows `offline`.
+
+**Acceptance criteria.**
+
+- AC-12.9b-1: When `run` has started, `GET api/status` returns `{ "state": "online", "message": null }`.
+- AC-12.9b-2: When `FakeControl` gives `training` with the message `run 7`, `GET api/status` returns both.
+- AC-12.9b-3: When `GET /` runs, the HTML contains `#status` with the elements `.state` and `.message`.
+
+**Proofs.**
+
+- P-12.9b-1. Argument: the channel starts with `Online` and no message, and nothing changes it in this sub-phase.
+- P-12.9b-2, P-12.9b-3. Evidence: test.
+
+---
+
+### 12.9c Status Entity
+
+**Goal:** Publish the status of Jarvis as the HA entity `sensor.jarvis_status` through MQTT discovery, with a retained state and a last will. Dashboards and automations see `online`, `training`, `restarting` and `offline`, also when Jarvis dies, and the entity stays after an HA restart.
+
+- **Implements:** G24. **Depends on:** 12.9b.
+- **Files:** create `src/adapters/mqtt.rs`. Modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
+
+**Model.**
+
+- This sub-phase adds the optional section `[mqtt]`: `url` (for example `mqtt://homeassistant.local:1883`), `username_env` and `password_env`. `Secrets` resolves the user name and the password. Without the section, Jarvis publishes no status.
+- `adapters/mqtt.rs` connects to the broker with `rumqttc`, with the client ID `jarvis` and a keep-alive of 30 s. It reads the status from a receiver of the status channel. No use case calls it, so it has no port (`01-architecture.md` section 1).
+- The last will is the payload `{ "state": "offline", "message": null }` on the topic `jarvis/status`, with QoS 1 and retain. The broker publishes it when the connection ends without `DISCONNECT`, at the latest 1.5 keep-alive intervals (45 s) after the last packet.
+- At each `ConnAck`, the first connection and each reconnection, the adapter publishes these two messages with QoS 1 and retain:
+  - On `homeassistant/sensor/jarvis/status/config`: `{ "name": "Status", "unique_id": "jarvis_status", "device": { "identifiers": ["jarvis"], "name": "Jarvis" }, "device_class": "enum", "options": ["online", "training", "restarting", "offline"], "state_topic": "jarvis/status", "value_template": "{{ value_json.state }}", "json_attributes_topic": "jarvis/status" }`. HA makes the entity ID `sensor.jarvis_status` from the device name and the entity name. The field `message` of the status becomes an attribute of the entity.
+  - On `jarvis/status`: the current status.
+- Each change of the status publishes `jarvis/status` again, with retain.
+- The broker keeps both messages. The entity has a `unique_id`, so HA makes it again from the retained discovery message after an HA restart, with the retained state.
+- After a connection error, the adapter waits 5 s, and its next poll connects again.
+- When the sender of the status channel closes, the adapter publishes the last status, sends `DISCONNECT` and ends. After `DISCONNECT` the broker does not publish the will. At the end of `run`, the root sets `Offline` and then drops the sender. Thus a stop gives `offline`.
+- `run` starts the adapter when the start is ready. Thus the entity shows `online` only when Jarvis answers. Before that, the entity keeps the retained state of the earlier process.
+- The tests use an in-process `rumqttd` broker on a local port and a `rumqttc` client that subscribes. They do not pause the clock, and they do not sleep: each test waits for the messages that it expects.
+
+**Acceptance criteria.**
+
+- AC-12.9c-1: When the adapter connects, a client that subscribes after it gets the retained discovery message with `unique_id` `jarvis_status`, `state_topic` `jarvis/status` and the four options, and the retained state `{ "state": "online", "message": null }`.
+- AC-12.9c-2: When the status changes to `training`, the client gets `{ "state": "training", "message": null }` with retain.
+- AC-12.9c-3: When the adapter task is aborted, so that the connection ends without `DISCONNECT`, the client gets `{ "state": "offline", "message": null }`.
+- AC-12.9c-4: When the status is `restarting` and the sender of the channel closes, the adapter ends, and a client that subscribes after the end gets `restarting`.
+- AC-12.9c-5: When the shutdown future of `run` completes, the last status in the channel is `offline`.
+- AC-12.9c-6: When `[mqtt]` is not set, `run` starts and opens no MQTT connection.
+
+**Proofs.**
+
+- P-12.9c-1. Argument: the `ConnAck` arm of the poll loop publishes both messages, so each connection publishes them again.
+- P-12.9c-5. Argument: `run` sends `Offline` after the servers stop and before it drops the sender.
+- P-12.9c-2 to P-12.9c-4, P-12.9c-6. Evidence: test.
+
+**Field log.** In the MQTT broker on the HA host, make the user of Jarvis (for the Mosquitto add-on, an HA user or the `logins` option). Add `MQTT_USERNAME` and `MQTT_PASSWORD` to `jarvis.env`, and set `mqtt.url` to the broker. Restart Jarvis. Record that `sensor.jarvis_status` is `online` and belongs to the device Jarvis. Stop the unit `jarvis` and record `offline`. Restart HA and record that the entity keeps its state.
+
+---
+
+### 12.9d Settings Fields
+
+**Goal:** Add the fields of the settings form and the pure functions that read them from the text of `jarvis.toml` and change them in it. A change keeps the comments and the order of the file, and no secret or path is a field.
+
+- **Implements:** G24. **Depends on:** 12.9c.
+- **Files:** create `src/adapters/settings.rs`. Modify `src/lib.rs`, `Cargo.toml`.
+
+**Model.**
+
+- `FIELDS` is the fixed list of the form fields, in groups, in this order:
+
+  | Group | Fields |
+  |---|---|
+  | Speech | `asr.vad_threshold`, `asr.vad_min_silence_ms`, `asr.early_commit_ms`, `asr.endpoint_ms`, `asr.max_utterance_ms` |
+  | Voice | `tts.voice`, `tts.num_steps` |
+  | System One | `model.threshold`, `model.commit_threshold` |
+  | System Two | `openai.model`, `openai.timeout_ms`, `openai.max_output_tokens`, `openai.max_tool_calls` |
+  | Dialogs | `dialog.max_turns`, `dialog.timeout_s`, `dialog.cancel` |
+  | Announce | `announce.margin_ms`, `announce.idle_wait_s` |
+  | Habits | `habits.half_life_days`, `habits.min_score` |
+  | Log | `log.audio_days`, `log.record_days` |
+
+- The form does not have these fields:
+  - `listen` and `web.listen`: a wrong value cuts off the Jarvis tab itself.
+  - `device`, each file and folder, `ha.url`, the plugin URLs, `mqtt.url` and `[train.runpod]`: a wrong value stops the start.
+  - Each `*_env` field: it names a secret.
+  - `openai.allowed_domains`, `openai.read_services` and `learn.prefetch_services`: they decide which HA services OpenAI and a prefetch can call.
+  - `train.max_vram_gb` and `train.python`: they protect the GPU host.
+  - `[[people]]` and `[[satellites]]`: lists of tables.
+  - The backfill values, `plugins.cache_s`, `plugins.timeout_ms` and the HA time limits: internal values.
+  - Each field that a later sub-phase adds to `jarvis.toml`. A field joins the form only when you ask.
+- `Setting { group, name, value }`. `value` is a JSON number, a JSON string or a JSON list of strings.
+- `read(text) -> Result<Vec<Setting>>` gives each field of `FIELDS` with its value in `text`, in the order of `FIELDS`.
+- `edit(text, changes: BTreeMap<String, serde_json::Value>) -> Result<String, String>` sets each changed field in `text` with `toml_edit`. All other text stays the same, also the comments. A name that is not in `FIELDS` is an error that names it. A new value keeps the TOML type of the old value: integer, float, string or array of strings. A JSON number for a float field becomes a float. A JSON value of another kind is an error that names the field and the type. `edit` does not check ranges: sub-phase 12.9e checks the result with `Config::parse`.
+
+**Acceptance criteria.**
+
+- AC-12.9d-1: When `read` gets the `jarvis.toml` of the repository, it returns exactly the fields of `FIELDS`, in order, with the values of the file, and no name ends with `_env`.
+- AC-12.9d-2: When `edit` changes `asr.endpoint_ms` to 700, the result differs from the input only in that line, and the comment of the line stays.
+- AC-12.9d-3: When `edit` gets `ha.url` or `ha.token_env`, it returns an error that names the field, for each.
+- AC-12.9d-4: When `edit` gets a string for `asr.endpoint_ms`, it returns an error that names the field. When it gets the JSON number 3 for `habits.min_score`, the result has `min_score = 3.0`.
+
+**Proofs.**
+
+- P-12.9d-3. Argument: `edit` looks up each name in `FIELDS` before it changes the document, and returns the error on the first name that is not there.
+- P-12.9d-4. Argument: `edit` matches on the pair of the old TOML type and the JSON kind. Only the matching pairs and the pair of a float and a JSON number give a value.
+- P-12.9d-1, P-12.9d-2. Evidence: test.
+
+---
+
+### 12.9e Settings Form
+
+**Goal:** Show the settings fields in the Jarvis tab and save a change with the same checks as at the start. Jarvis refuses a bad value with a message and does not change the file.
+
+- **Implements:** G24. **Depends on:** 12.9d.
+- **Files:** modify `src/ports.rs`, `src/lib.rs`, `src/adapters/web.rs`, `src/adapters/review.html`, `src/testing/fakes.rs`.
+
+**Model.**
+
+- `Control` gets `settings() -> Result<Vec<Setting>>` and `save(changes) -> Result<(), Refusal>`. `Refusal::Invalid(message)`. `Setting` moves to `src/ports.rs`.
+- In `src/lib.rs`, `settings` reads the configuration file that `run` got and calls `read`. `save` reads the file, calls `edit`, and checks the new text with `Config::parse`. Thus the rules of the start apply (sub-phase 1.1 and later). Only when the check passes, `save` writes the new text with an atomic write (`tempfile`). Else it returns `Invalid` with the message of `edit` or `Config::parse`. The new values take effect at the next start. Sub-phase 12.9f restarts Jarvis.
+- `GET api/settings` returns the fields. `POST api/settings` with `{ "<name>": <value>, ... }` returns 204 on success, and 400 with `{ "error": "<message>" }` for `Invalid`.
+- The page has `form#settings` with one `fieldset` for each group and one input for each field: a number input for a number, a text input for a string, and a `textarea` with one line for each string of a list. `button#save` sends only the changed fields. `#settings-error` shows the message of a 400.
+
+**Acceptance criteria.**
+
+- AC-12.9e-1: When `save` sets `asr.endpoint_ms` to 700 in a temporary copy of `jarvis.toml`, the file has the new value, and `settings` returns it.
+- AC-12.9e-2: When `save` sets `asr.early_commit_ms` to 700 while `asr.endpoint_ms` is 600, it returns `Invalid` with the message of `Config::parse`, and the file does not change.
+- AC-12.9e-3: When `save` gets `ha.token_env`, it returns `Invalid`, and the file does not change.
+- AC-12.9e-4: When `FakeControl` refuses a save with a message, `POST api/settings` returns 400 with that message. When it accepts, the result is 204.
+- AC-12.9e-5: When `GET /` runs, the HTML contains `form#settings`, `button#save` and `#settings-error`.
+
+**Proofs.**
+
+- P-12.9e-2, P-12.9e-3. Argument: `save` calls `edit` and `Config::parse` before the write, and returns on the first error.
+- P-12.9e-1, P-12.9e-4, P-12.9e-5. Evidence: test.
+
+---
+
+### 12.9f Restart and Rollback
+
+**Goal:** Restart Jarvis after a save, so that the new settings take effect. When the start with the new file fails, put the last good file back and start again, and show the rollback in the status.
+
+- **Implements:** G24. **Depends on:** 12.9e.
+- **Files:** modify `src/lib.rs`, `src/adapters/settings.rs`, `src/adapters/review.html`, `.gitignore`.
+
+**Model.**
+
+- Two files are next to the configuration file `<config>`. `<config>.bak` holds the last good text from a save until the next start is ready. `<config>.rollback` holds the reason of the last rollback.
+- After the check of sub-phase 12.9e, `save` writes the old text to `<config>.bak`, writes the new text, and removes `<config>.rollback`. Then it sets the status to `Restarting` and notifies the shutdown.
+- The shutdown future of `serve` completes on SIGINT, SIGTERM or this notification. `run` returns `Ended::Restart` after the notification and `Ended::Stop` after a signal. At `Restart`, `run` keeps the status `Restarting`, so the entity shows `restarting` while Jarvis is down (sub-phase 12.9c). At `Stop`, it sets `Offline`.
+- `run` calls `settings::confirm(config)` when the start is ready: after the models load and before `serve_until`. `confirm` removes `<config>.bak`.
+- `start` gives the exit code from the result of `serve`:
+  - `Ok(Restart)`: 75.
+  - `Ok(Stop)`: 0.
+  - `Err(error)` while `<config>.bak` exists: the start failed before it was ready, after a save. `settings::roll_back(config, error)` renames `<config>.bak` to `<config>` and writes the error text to `<config>.rollback`. Jarvis logs one `error` event. The exit code is 75.
+  - `Err(error)` without `<config>.bak`: 1, as before.
+- The unit `jarvis` has `RestartForceExitStatus=75` (`01-architecture.md` section 10). Thus systemd starts Jarvis again after exit code 75 only. A start that fails after a rollback has no `<config>.bak`, so it exits with 1, and the restarts do not loop. A panic exits with 101 and does not roll back. Then `<config>.bak` stays, and the next start that fails rolls back.
+- When `<config>.rollback` exists at the start, the status starts with the message `settings rolled back: <reason>`. The message stays until the next save removes the file.
+- After a save gives 204, the page shows `restarting` in `#status` until `api/status` gives `online`. Then it reads `api/settings` again, so a rollback shows the old values.
+- `.gitignore` ignores `/jarvis.toml.bak` and `/jarvis.toml.rollback`.
+
+**Acceptance criteria.**
+
+- AC-12.9f-1: When `save` succeeds, `<config>.bak` has the old text, `<config>` has the new text, the status is `restarting`, and `run` returns `Ended::Restart`.
+- AC-12.9f-2: When `serve` returns `Ended::Restart`, the exit code is 75. When it returns `Ended::Stop`, the exit code is 0.
+- AC-12.9f-3: When `serve` returns an error while `<config>.bak` exists, `<config>` has the text of the backup, `<config>.rollback` has the error text, `<config>.bak` does not exist, and the exit code is 75.
+- AC-12.9f-4: When `serve` returns an error and `<config>.bak` does not exist, `<config>` does not change, and the exit code is 1.
+- AC-12.9f-5: When the start is ready, `<config>.bak` does not exist.
+- AC-12.9f-6: When `<config>.rollback` exists at the start, `GET api/status` gives the message `settings rolled back: <reason>`. After the next save, `<config>.rollback` does not exist.
+
+**Proofs.**
+
+- P-12.9f-1. Argument: `save` writes the backup before the new text, and both after the check (P-12.9e-2). The notification comes after the writes.
+- P-12.9f-2 to P-12.9f-4. Argument: `start` matches on the result of `serve` and on the existence of `<config>.bak`. Only the error arm with the backup calls `roll_back`.
+- P-12.9f-5. Argument: `run` calls `confirm` before `serve_until`, and the web server starts in `serve_until`.
+- P-12.9f-6. Evidence: test.
+
+**Field log.** Add `RestartForceExitStatus=75` to the unit `jarvis` and run `systemctl daemon-reload`. In the Jarvis tab, change `dialog.timeout_s` and save. Record that the status shows `restarting`, then `online`, and that the new value is in `jarvis.toml`. Then set `tts.voice` to a voice that the TTS model does not have and save. Record that the status and the attribute `message` of `sensor.jarvis_status` show `settings rolled back` with the error, and that `jarvis.toml` has the old value.
+
+---
+
+### 12.9g Home Assistant Add-on
+
+**Goal:** Add the Jarvis add-on, which puts the Jarvis tab into the HA sidebar through HA ingress. It is a reverse proxy to the web server of Jarvis on the GPU host, and it shows a down page when Jarvis does not answer.
+
+- **Implements:** G24. **Depends on:** 12.9f.
+- **Files:** create `repository.yaml`, `addon/config.yaml`, `addon/build.yaml`, `addon/Dockerfile`, `addon/run.sh`, `addon/nginx.conf`, `addon/down.html`. Modify `xtask/src/gates.rs`.
+
+**Model.**
+
+- The repository is an HA add-on repository. `repository.yaml` names it, and the folder `addon/` holds the one add-on. The Supervisor builds the image on the HA host from `addon/Dockerfile`.
+- `addon/config.yaml`: `name: Jarvis`, `slug: jarvis`, a `version`, `arch: [amd64, aarch64]`, `init: false`, `ingress: true`, `ingress_port: 8099`, `panel_title: Jarvis`, `panel_icon: mdi:robot`, the options `url` (default `http://192.168.1.65:10701`) and `token`, and the schema `url: url` and `token: password`. Each change of a file in `addon/` increases `version`, so HA offers the update.
+- `addon/build.yaml` names the base image of each architecture: `ghcr.io/home-assistant/<arch>-base` with a fixed version tag. The base image has `bashio` and the s6 init.
+- `addon/Dockerfile` starts with `ARG BUILD_FROM` and `FROM $BUILD_FROM`, installs `nginx` with `apk`, copies `nginx.conf` to `/etc/nginx/nginx.conf`, `down.html` to `/www/down.html` and `run.sh` to `/run.sh`, and runs `/run.sh`.
+- `addon/run.sh` has at most 10 lines. It reads the options `url` and `token` with `bashio::config`, puts them in place of `@URL@` and `@TOKEN@` in `/etc/nginx/nginx.conf` with `sed`, and runs `exec nginx -g 'daemon off;'`.
+- `addon/nginx.conf` listens on port 8099. It accepts only `172.30.32.2`, the ingress gateway of the Supervisor, and denies all other clients. It sends each request to `@URL@` with `proxy_set_header Authorization "Bearer @TOKEN@"` and a connect time limit of 5 s. `error_page 502 503 504 /down.html` serves `/www/down.html` when Jarvis does not answer. The status code stays 502, 503 or 504, so the page script sees the failure (sub-phase 12.9b).
+- `addon/down.html` is a static page with the text "Jarvis is down" and `<meta http-equiv="refresh" content="10">`. It has no script, so `src/adapters/review.html` stays the only JavaScript. The refresh loads the same relative URL again, so the tab shows Jarvis again when it answers.
+- The add-on does not publish the status entity. Jarvis publishes it through MQTT (sub-phase 12.9c), so the entity does not depend on the add-on.
+- CI has no Supervisor. Structure tests in `xtask/src/gates.rs` check the files with `serde_yaml` and text checks. The field log checks the add-on in HA.
+
+**Acceptance criteria.**
+
+- AC-12.9g-1: When `repository.yaml` is parsed, it has a `name` and the `url` `https://github.com/louislang/ha-jarvis`.
+- AC-12.9g-2: When `addon/config.yaml` is parsed, it has `slug: jarvis`, `ingress: true`, `ingress_port: 8099`, `panel_title`, `panel_icon`, `init: false`, the architectures `amd64` and `aarch64`, a `version` of the form `x.y.z`, the options `url` and `token`, and the schema `url: url` and `token: password`.
+- AC-12.9g-3: When `addon/build.yaml` is parsed, `build_from` names `ghcr.io/home-assistant/<arch>-base` for `amd64` and `aarch64`, each with a version tag and not `latest`.
+- AC-12.9g-4: When `addon/nginx.conf` is checked, it listens on the `ingress_port` of `addon/config.yaml`, has `allow 172.30.32.2;` before `deny all;`, `proxy_pass @URL@;`, `proxy_set_header Authorization "Bearer @TOKEN@";` and `error_page 502 503 504 /down.html;`.
+- AC-12.9g-5: When `addon/run.sh` and `addon/Dockerfile` are checked, `run.sh` has at most 10 lines, reads the options `url` and `token`, replaces `@URL@` and `@TOKEN@`, and ends with `exec nginx`. The `Dockerfile` copies `nginx.conf`, `down.html` and `run.sh` to the paths that `run.sh` and `nginx.conf` use.
+- AC-12.9g-6: When `addon/down.html` is checked, it has the text "Jarvis is down", a `meta` refresh, no `<script` and no URL that starts with `/`, `http:` or `https:`.
+
+**Proofs.**
+
+- P-12.9g-1 to P-12.9g-6. Evidence: test.
+
+**Field log.** Add `JARVIS_WEB_TOKEN` to `jarvis.env` with a value from `openssl rand -hex 32` (the token goes through `sed`, so use only hex characters), and restart Jarvis. In HA, open Settings, Add-ons, Add-on Store, Repositories, and add `https://github.com/louislang/ha-jarvis`. Install the add-on Jarvis. Set `url` to `http://192.168.1.65:10701` and `token` to the same value. Start the add-on and turn on "Show in sidebar". Record that the Jarvis tab shows the interactions, the status and the settings, also in the HA app outside the house. Stop the unit `jarvis` and record that the tab shows "Jarvis is down". Start the unit and record that the tab shows Jarvis again.
 
 ---
 
@@ -429,7 +663,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 **Goal:** Make `decide` skip blocked decisions. After a bad mark, the same request goes to the next entity, then the next likely intent, then System Two with the correction.
 
-- **Implements:** G15, G19. **Depends on:** 12.9.
+- **Implements:** G15, G19. **Depends on:** 12.9g.
 - **Files:** modify `src/domain/decide.rs`, `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`.
 - **Quint:** `feedback.qnt` (`DecideAvoidsBlocked`).
 
@@ -482,4 +716,5 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 These steps are not tests and gate nothing.
 
-1. In a browser, open the review page, play the audio of an interaction, and send a mark with a correction.
+1. In the Jarvis tab of HA, play the audio of an interaction, and send a mark with a correction.
+2. Do the field logs of sub-phases 12.9c, 12.9f and 12.9g.

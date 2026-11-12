@@ -166,16 +166,16 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 
 ### 14.6 Proposal Review
 
-**Goal:** Add the pending proposals to the `Review` port, the web API and the review page, with approve and reject. You decide which device-control intents Jarvis may learn.
+**Goal:** Add the pending proposals to the `Review` port, the web API and the page of the Jarvis tab, with approve and reject. You decide which device-control intents Jarvis may learn.
 
 - **Implements:** G14. **Depends on:** 14.5.
 - **Files:** modify `src/ports.rs`, `src/app/review.rs`, `src/adapters/web.rs`, `src/adapters/review.html`, `src/testing/fakes.rs`.
 
-**Model.** `Review::proposals() -> Vec<LearnedIntent>` (status `pending`). `Review::resolve(name, approve)`: `pending` to `active` or `rejected`. Any other status gives an error. API: `GET /api/proposals`, `POST /api/proposals/{name}` with `{ "approve": true | false }`.
+**Model.** `Review::proposals() -> Vec<LearnedIntent>` (status `pending`). `Review::resolve(name, approve)`: `pending` to `active` or `rejected`. Any other status gives an error. API: `GET api/proposals`, `POST api/proposals/{name}` with `{ "approve": true | false }`.
 
 **Acceptance criteria.**
 
-- AC-14.6-1: When `GET /api/proposals` runs, it returns only `pending` entries.
+- AC-14.6-1: When `GET api/proposals` runs, it returns only `pending` entries.
 - AC-14.6-2: When you approve a `pending` entry, it becomes `active`.
 - AC-14.6-3: When you reject a `pending` entry, it becomes `rejected`, and the next check does not propose that cluster.
 - AC-14.6-4: When you resolve an entry that is not `pending`, the API returns 409 and nothing changes.

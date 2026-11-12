@@ -15,7 +15,7 @@ This file uses the technical names in `00-overview.md` section 0.3. All sub-phas
 
 | # | Rule | Enforced by |
 |---|---|---|
-| R1 | Rust stable, edition 2024. Python is permitted only in `train/`. | Review |
+| R1 | Rust stable, edition 2024. Python is permitted only in `train/`. The other non-Rust code is the inline JavaScript of `src/adapters/review.html` and the Jarvis add-on: `repository.yaml` and the files of `addon/` that `01-architecture.md` section 8 lists (YAML, `Dockerfile`, `nginx` configuration, a start script of at most 10 lines and a static page with no script). | Review, structure tests of sub-phase 12.9g |
 | R2 | `cargo fmt --check` passes. | `rust-format` |
 | R3 | `cargo clippy --all-targets -- -D clippy::pedantic -D warnings` passes. | `rust-lint` |
 | R4 | A function has a maximum of 50 lines. | `rust-lint` (`too_many_lines`, `clippy.toml`) |
