@@ -1,0 +1,250 @@
+//! `InteractionLog` with SQLite.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::Mutex;
+
+use async_trait::async_trait;
+use rusqlite::Connection;
+use rusqlite::OptionalExtension;
+use rusqlite::params;
+
+use crate::domain::feedback::Interaction;
+use crate::domain::speech::Audio;
+use crate::ports::Filter;
+use crate::ports::InteractionLog;
+use crate::ports::Page;
+
+/// The migration steps of the schema. The step at index `n` moves the schema from version `n` to
+/// version `n + 1`.
+const STEPS: [&str; 1] = [
+    "CREATE TABLE interactions (id INTEGER PRIMARY KEY, time INTEGER NOT NULL, record TEXT NOT NULL, audio BLOB)",
+];
+
+/// The interaction log in one SQLite database file. Each interaction is a JSON record.
+pub struct SqliteLog {
+    /// The open database.
+    connection: Arc<Mutex<Connection>>,
+}
+
+impl SqliteLog {
+    /// Opens the database at `path`, which it creates when it does not exist, and migrates its
+    /// schema to the current version in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// The database cannot open, a migration step fails, or the schema version of the database is
+    /// newer than the code.
+    pub fn open(path: &Path) -> anyhow::Result<Self> {
+        let mut connection = Connection::open(path)?;
+        let stored: usize =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        let current = STEPS.len();
+        anyhow::ensure!(
+            stored <= current,
+            "the schema version {stored} of the database is newer than the version {current} of Jarvis"
+        );
+        let transaction = connection.transaction()?;
+        for step in &STEPS[stored..] {
+            transaction.execute_batch(step)?;
+        }
+        transaction.pragma_update(None, "user_version", current)?;
+        transaction.commit()?;
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+        })
+    }
+
+    /// The result of `work` on the database, in a blocking thread.
+    async fn run<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&Connection) -> rusqlite::Result<T> + Send + 'static,
+    ) -> anyhow::Result<T> {
+        let connection = Arc::clone(&self.connection);
+        tokio::task::spawn_blocking(move || {
+            let connection = connection
+                .lock()
+                .map_err(|_| anyhow::anyhow!("an earlier database call panicked"))?;
+            Ok(work(&connection)?)
+        })
+        .await?
+    }
+}
+
+#[async_trait]
+impl InteractionLog for SqliteLog {
+    async fn append(&self, interaction: Interaction, audio: Option<Audio>) -> anyhow::Result<()> {
+        let record = serde_json::to_string(&interaction)?;
+        let bytes: Option<Vec<u8>> = audio.map(|audio| {
+            audio
+                .samples
+                .iter()
+                .flat_map(|sample| sample.to_le_bytes())
+                .collect()
+        });
+        let (id, time) = (interaction.id, interaction.time.as_millisecond());
+        self.run(move |connection| {
+            let insert =
+                "INSERT INTO interactions (id, time, record, audio) VALUES (?1, ?2, ?3, ?4)";
+            connection.execute(insert, params![id, time, record, bytes])
+        })
+        .await?;
+        Ok(())
+    }
+
+    async fn list(&self, Filter::All: Filter, page: Page) -> anyhow::Result<Vec<Interaction>> {
+        let records = self
+            .run(move |connection| {
+                let query = "SELECT record FROM interactions ORDER BY time DESC, id DESC LIMIT ?1 OFFSET ?2";
+                let mut statement = connection.prepare(query)?;
+                let offset = page.number.saturating_mul(page.size);
+                let rows = statement.query_map(params![page.size, offset], |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .await?;
+        let interactions = records.iter().map(|record| serde_json::from_str(record));
+        Ok(interactions.collect::<Result<_, _>>()?)
+    }
+
+    async fn get(&self, id: u64) -> anyhow::Result<Option<Interaction>> {
+        let record: Option<String> = self
+            .run(move |connection| {
+                let query = "SELECT record FROM interactions WHERE id = ?1";
+                connection
+                    .query_row(query, [id], |row| row.get(0))
+                    .optional()
+            })
+            .await?;
+        Ok(record
+            .map(|record| serde_json::from_str(&record))
+            .transpose()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use jiff::Timestamp;
+    use serde_json::Map;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::domain::feedback::Action;
+    use crate::domain::feedback::Route;
+    use crate::domain::feedback::Spoken;
+    use crate::domain::feedback::Tagged;
+    use crate::domain::state::ServiceCall;
+
+    /// The first page of 50 interactions.
+    const PAGE: Page = Page {
+        number: 0,
+        size: 50,
+    };
+
+    /// A log in a new temporary folder, and the folder.
+    fn log() -> (SqliteLog, TempDir) {
+        let folder = tempfile::tempdir().expect("a temporary folder");
+        let log = SqliteLog::open(&folder.path().join("jarvis.db")).expect("the log opens");
+        (log, folder)
+    }
+
+    /// The response `text` from the pool `pool`.
+    fn spoken(pool: &str, text: &str) -> Spoken {
+        let (pool, text) = (pool.to_owned(), text.to_owned());
+        Spoken {
+            template: text.clone(),
+            text,
+            pool,
+        }
+    }
+
+    /// The interaction `id` at second `id`, with a value in every field.
+    fn interaction(id: u64) -> Interaction {
+        let office = "media_player.office".to_owned();
+        let call = ServiceCall {
+            domain: "media_player".to_owned(),
+            service: "turn_on".to_owned(),
+            target: vec![office.clone()],
+            data: Map::from_iter([("volume".to_owned(), 0.5.into())]),
+            return_response: false,
+        };
+        let slot = Tagged {
+            name: "area".to_owned(),
+            value: "office".to_owned(),
+            start: 16,
+            end: 22,
+        };
+        Interaction {
+            id,
+            time: Timestamp::from_second(id.cast_signed()).expect("a valid second"),
+            satellite: Some("assist_satellite.office".to_owned()),
+            transcript: "Turn on the TV in the office.".to_owned(),
+            model_context: "area: office".to_owned(),
+            model: "fixture".to_owned(),
+            top_labels: vec![("tv_on".to_owned(), 0.75), ("unknown".to_owned(), 0.25)],
+            slots: vec![slot],
+            action: Action {
+                intent: "tv_on".to_owned(),
+                targets: vec![office],
+            },
+            decision: Route::Reply,
+            service_calls: vec![call],
+            responses: vec![spoken("tv_on", "Turning on the TV.")],
+            latency_ms: Some(120),
+            link: Some(1),
+        }
+    }
+
+    /// AC-12.4-1.
+    #[tokio::test]
+    async fn ac_12_4_1_list_and_get_return_every_field() -> anyhow::Result<()> {
+        let (log, _folder) = log();
+        log.append(interaction(7), None).await?;
+        assert_eq!(log.list(Filter::All, PAGE).await?, [interaction(7)]);
+        assert_eq!(log.get(7).await?, Some(interaction(7)));
+        Ok(())
+    }
+
+    /// AC-12.4-2.
+    #[tokio::test]
+    async fn ac_12_4_2_list_gives_one_page_newest_first() -> anyhow::Result<()> {
+        let (log, _folder) = log();
+        for id in 1..=60 {
+            log.append(interaction(id), None).await?;
+        }
+        let ids: Vec<u64> = log
+            .list(Filter::All, PAGE)
+            .await?
+            .iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(ids, (11..=60).rev().collect::<Vec<u64>>());
+        Ok(())
+    }
+
+    /// AC-12.4-3.
+    #[test]
+    fn ac_12_4_3_open_creates_the_database() -> anyhow::Result<()> {
+        let (_log, folder) = log();
+        let connection = Connection::open(folder.path().join("jarvis.db"))?;
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 1);
+        let count: u32 =
+            connection.query_row("SELECT count(*) FROM interactions", [], |row| row.get(0))?;
+        assert_eq!(count, 0);
+        Ok(())
+    }
+
+    /// AC-12.4-4.
+    #[test]
+    fn ac_12_4_4_newer_schema_is_an_error() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("jarvis.db");
+        Connection::open(&path)?.pragma_update(None, "user_version", 2)?;
+        let Err(error) = SqliteLog::open(&path) else {
+            panic!("a newer schema opens");
+        };
+        let expected = "the schema version 2 of the database is newer than the version 1 of Jarvis";
+        assert_eq!(error.to_string(), expected);
+        Ok(())
+    }
+}
