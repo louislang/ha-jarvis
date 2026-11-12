@@ -79,42 +79,81 @@ This phase logs each request with its audio, action and response. You mark the a
 
 ---
 
-### 12.3 Feedback Rules
+### 12.3 Blocked Decisions
 
-**Goal:** Add the pure feedback model that implements `feedback.qnt`: marks, blocked decisions, bad responses, corrections and examples. Every later use of feedback reads from this one model.
+**Goal:** Add the pure feedback model that implements `feedback.qnt`, with its types and `blocked`: a decision with more bad marks than good marks for a text. Every later use of feedback reads from this one model.
 
 - **Implements:** G15, G19. **Depends on:** 12.2.
 - **Files:** create `src/domain/feedback.rs`. Modify `src/lib.rs`.
-- **Quint:** `feedback.qnt` (conformance).
 
 **Model.**
 
-- `Mark { interaction, target: Action | Response(index), value: Good | Bad | None, correction: Option<intent>, time }`. `index` is the position of the response in the interaction (filler, reply, announce or question). A correction is an intent name or `unknown`. `unknown` means "send this to System Two".
-- `Feedback::apply(self, mark) -> Self`. A `None` value removes the earlier mark of that interaction and target.
-- A dialog answer (an interaction with `link`) is not a request of its own. A mark on it counts for the text of the first interaction of the dialog.
+- `Mark { interaction, target: Action | Response(index), value: Good | Bad | None, correction: Option<intent>, time }`. `interaction` is the ID of the marked interaction. `index` is the position of the response in the interaction (filler, reply, announce or question). A correction is an intent name or `unknown`. `unknown` means "send this to System Two".
+- `Rated { transcript, link, action }`: the parts of the marked interaction that the feedback model reads. `link` is the transcript of the first interaction of the dialog, for a dialog answer. `action` is the intent and the targets. The caller makes `Rated` from the interaction (sub-phase 12.4).
+- `Feedback` keeps each mark with its `Rated` and the normalized text that the mark counts for.
 - `blocked(text, intent, targets) -> bool`: bad action marks are more than good action marks for that normalized text, intent and targets. `targets` is the sorted set of entity IDs.
-- `bad_responses() -> Set<(pool, template)>`, from the pool and the template of each marked response (sub-phase 12.4).
-- `corrections(text, n) -> Vec<String>`: the bad actions and corrections for this text, in plain words.
-- `examples(pool, n) -> (good, bad)`: response texts with their marks.
 
 **Acceptance criteria.**
 
 - AC-12.3-1: When the action for "turn on the tv" with `media_player.office` is marked bad, `blocked` returns true for that text, intent and target.
 - AC-12.3-2: When the same action is marked bad once and good twice, `blocked` returns false.
 - AC-12.3-3: When the action is marked bad for "turn on the tv", `blocked` returns false for "turn on the lights".
-- AC-12.3-4: When a mark is removed, `blocked` returns the value from before the mark.
-- AC-12.3-5: When the response at index 1 of an interaction is marked bad, `bad_responses` contains the pool and the template of that response, and no other response of the interaction.
-- AC-12.3-6: When a text has one bad action with the correction `tv_show`, `corrections` returns one line that names the intent, the targets and `tv_show`.
-- AC-12.3-7: When `quint-connect` replays 100 traces of `feedback.qnt`, `blocked` equals the model `blocked` after each step.
-- AC-12.3-8: When the action of a dialog answer is marked bad, `blocked` returns true for the text of the first interaction, with the intent and the targets of the answer.
 
 **Proofs.**
 
 - P-12.3-1 to P-12.3-3. Ensures: `blocked(t, i, g)` is true if and only if the bad action marks for the key `(normalize(t), i, g)` are more than the good ones. Argument: `blocked` is the `blocked` definition of `feedback.qnt`. It compares the two counts for the key `(normalize(text), intent, targets)`. Another text is another key.
-- P-12.3-4 (AC-12.3-4). Ensures: `apply` of a `None` mark gives the counts from before the removed mark. Argument: each interaction has at most one mark for each target. `apply` first subtracts the old mark from the counts and then adds the new one. A removal adds nothing, so the counts return to their earlier values.
-- P-12.3-5, P-12.3-6. Ensures: `bad_responses` has exactly the pool and template of each response with a bad mark, and `corrections` has one line for each bad action of the text. Argument: both functions are filters over the marks.
-- P-12.3-8. Ensures: a mark on a dialog answer counts for the key of the text of the first interaction. Argument: `apply` takes the text of the interaction that `link` names when `link` is set.
-- P-12.3-7. Evidence: test.
+
+---
+
+### 12.3b Apply Marks
+
+**Goal:** Add `Feedback::apply`, which adds, replaces and removes marks, and replay `feedback.qnt` against it. A mark changes `blocked` at once.
+
+- **Implements:** G15, G19. **Depends on:** 12.3.
+- **Files:** modify `src/domain/feedback.rs`.
+- **Quint:** `feedback.qnt` (conformance).
+
+**Model.**
+
+- `Feedback::apply(self, rated, mark) -> Self`. The mark replaces the earlier mark of that interaction and target. A `None` value removes the earlier mark.
+- A dialog answer (an interaction with `link`) is not a request of its own. A mark on it counts for the text of the first interaction of the dialog.
+
+**Acceptance criteria.**
+
+- AC-12.3b-1: When a mark is removed, `blocked` returns the value from before the mark.
+- AC-12.3b-2: When `quint-connect` replays 100 traces of `feedback.qnt`, `blocked` equals the model `blocked` after each step.
+- AC-12.3b-3: When the action of a dialog answer is marked bad, `blocked` returns true for the text of the first interaction, with the intent and the targets of the answer.
+
+**Proofs.**
+
+- P-12.3b-1 (AC-12.3b-1). Ensures: `apply` of a `None` mark gives the marks from before the removed mark. Argument: each interaction has at most one mark for each target. `apply` first removes the old mark and then adds the new one. A removal adds nothing, so the marks and their counts return to their earlier values.
+- P-12.3b-3. Ensures: a mark on a dialog answer counts for the key of the text of the first interaction. Argument: `apply` takes the text that `link` holds when `link` is set.
+- P-12.3b-2. Evidence: test.
+
+---
+
+### 12.3c Bad Responses and Corrections
+
+**Goal:** Add the feedback rules for responses and System Two: bad responses, corrections and examples. Sub-phases 12.10 and 12.11 read them.
+
+- **Implements:** G15. **Depends on:** 12.3b.
+- **Files:** modify `src/domain/feedback.rs`.
+
+**Model.**
+
+- `Rated` gets `responses`: the text, the pool and the template of each response, in the order of the interaction (sub-phase 12.4).
+- `bad_responses() -> Set<(pool, template)>`, from the pool and the template of each marked response.
+- `corrections(text, n) -> Vec<String>`: the bad actions and corrections for this text, in plain words.
+- `examples(pool, n) -> (good, bad)`: response texts with their marks.
+
+**Acceptance criteria.**
+
+- AC-12.3c-1: When the response at index 1 of an interaction is marked bad, `bad_responses` contains the pool and the template of that response, and no other response of the interaction.
+- AC-12.3c-2: When a text has one bad action with the correction `tv_show`, `corrections` returns one line that names the intent, the targets and `tv_show`.
+
+**Proofs.**
+
+- P-12.3c-1, P-12.3c-2. Ensures: `bad_responses` has exactly the pool and template of each response with a bad mark, and `corrections` has one line for each bad action of the text. Argument: both functions are filters over the marks.
 
 ---
 
@@ -122,7 +161,7 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Goal:** Add the `InteractionLog` port and its SQLite adapter with `append`, `update`, `list` and `audio`. Each request can now be stored with its audio and found again.
 
-- **Implements:** G15. **Depends on:** 12.3.
+- **Implements:** G15. **Depends on:** 12.3c.
 - **Files:** create `src/adapters/sqlite.rs`. Modify `src/ports.rs`, `src/domain/feedback.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `jarvis.toml`, `Cargo.toml`.
 
 **Model.**
@@ -223,7 +262,7 @@ This phase logs each request with its audio, action and response. You mark the a
 **Proofs.**
 
 - P-12.7-3. Argument: the name check runs before both writes and returns on failure.
-- P-12.7-2. Argument: `Feedback::apply` with `None` (P-12.3-4).
+- P-12.7-2. Argument: `Feedback::apply` with `None` (P-12.3b-1).
 - P-12.7-1, P-12.7-4. Evidence: test.
 
 ---
