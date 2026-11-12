@@ -110,6 +110,8 @@ pub struct Recorder {
 pub enum Write {
     /// Stores the interaction with its audio.
     Append(Box<Interaction>, Option<Audio>),
+    /// Applies the change to the interaction with the ID.
+    Update(u64, crate::ports::Change),
 }
 
 /// Starts the log writer task, which runs each message of its sender on `log` in order and logs a
@@ -119,8 +121,12 @@ pub enum Write {
 pub fn start_writer(log: Arc<dyn InteractionLog>) -> (UnboundedSender<Write>, JoinHandle<()>) {
     let (writer, mut messages) = tokio::sync::mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
-        while let Some(Write::Append(interaction, audio)) = messages.recv().await {
-            if let Err(error) = log.append(*interaction, audio).await {
+        while let Some(write) = messages.recv().await {
+            let written = match write {
+                Write::Append(interaction, audio) => log.append(*interaction, audio).await,
+                Write::Update(id, change) => log.update(id, change).await,
+            };
+            if let Err(error) = written {
                 tracing::warn!("the log write failed: {error:#}");
             }
         }
@@ -213,13 +219,10 @@ impl Conversation {
         let (area, name) = self.area(context.device_id.as_deref());
         let now = self.two.clock.now();
         let heard = self.hear(text, &context, name.as_deref(), now);
-        let key = context.satellite_id.clone().or(context.conversation_id);
-        let satellite = context.satellite_id.as_deref();
+        let key = context.satellite_id.or(context.conversation_id).map(Key);
         let open = self.take_dialog(key.clone(), now);
-        let (prediction, transcript, new) = match self
-            .route(text, open, name.as_deref(), satellite, now)
-            .await?
-        {
+        let routed = self.route(text, open, name.as_deref(), &heard, now).await?;
+        let (prediction, transcript, new) = match routed {
             ControlFlow::Continue(routed) => routed,
             ControlFlow::Break(handled) => return Ok(handled),
         };
@@ -228,9 +231,7 @@ impl Conversation {
             area,
             now,
         };
-        let (handled, decided) = self
-            .act(&prediction, &request, key.map(Key), satellite, new)
-            .await;
+        let (handled, decided) = self.act(&prediction, &request, key, &heard, new).await;
         self.append(heard, &prediction, decided);
         Ok(handled)
     }
@@ -287,31 +288,36 @@ impl Conversation {
     }
 
     /// The open dialog of `key` at `now` and its key. The dialog map no longer has it.
-    fn take_dialog(&self, key: Option<String>, now: Timestamp) -> Option<(Dialog, Key)> {
-        let key = Key(key?);
+    fn take_dialog(&self, key: Option<Key>, now: Timestamp) -> Option<(Dialog, Key)> {
+        let key = key?;
         let timeout = self.queues.dialog.timeout_s;
         let dialog = self.queues.dialogs().take(&key, now, timeout)?;
         Some((dialog, key))
     }
 
-    /// The dispatch of the decision for `prediction` of `request` on `satellite`. A question opens
-    /// a dialog for `key`. A `new` request from `satellite` counts in the habits. Logs the request.
-    /// Also the parts of its record that the decision gives.
+    /// The dispatch of the decision for `prediction` of `request` on the satellite of `heard`. A
+    /// question opens a dialog for `key`. A `new` request from a satellite counts in the habits.
+    /// Logs the request. Also the parts of its record that the decision gives.
     async fn act(
         &self,
         prediction: &Prediction,
         request: &Request,
         key: Option<Key>,
-        satellite: Option<&str>,
+        heard: &Heard,
         new: bool,
     ) -> (Handled, Decided) {
         let decision = self.decide(prediction, request);
         let (mut decided, pending) = self.parts(&decision);
         let route = decided.route;
         // Only a spoken request counts. Text from the HA UI has no satellite.
-        self.record(prediction, route, request.now, new && satellite.is_some());
+        self.record(
+            prediction,
+            route,
+            request.now,
+            new && heard.satellite.is_some(),
+        );
         let area = request.area.as_ref();
-        let (handled, answer) = self.reply(decision, area, satellite, key.clone()).await;
+        let (handled, answer) = self.reply(decision, area, heard, key.clone()).await;
         if let (Some(key), Some(pending)) = (key, pending) {
             self.queues.open(key, pending, request.now);
         }
@@ -360,10 +366,10 @@ impl Conversation {
         }
     }
 
-    /// The reply to `text` as an answer to the `open` dialog and its key on `satellite` at `now`: a
-    /// `cancelled` reply that closes it, or a question again. Else the prediction to decide and its
-    /// transcript: the filled intent of a `Slot` dialog, or the System One prediction of `text` in
-    /// the area `name`, with true for a new request.
+    /// The reply to `text` as an answer to the `open` dialog and its key on the satellite of
+    /// `heard` at `now`: a `cancelled` reply that closes it, or a question again. Else the
+    /// prediction to decide and its transcript: the filled intent of a `Slot` dialog, or the System
+    /// One prediction of `text` in the area `name`, with true for a new request.
     ///
     /// # Errors
     ///
@@ -373,7 +379,7 @@ impl Conversation {
         text: &str,
         open: Option<(Dialog, Key)>,
         name: Option<&str>,
-        satellite: Option<&str>,
+        heard: &Heard,
         now: Timestamp,
     ) -> anyhow::Result<ControlFlow<Handled, (Prediction, String, bool)>> {
         let Some((dialog, key)) = open else {
@@ -394,19 +400,19 @@ impl Conversation {
             return Ok(ControlFlow::Continue((prediction, text.to_owned(), true)));
         }
         Ok(ControlFlow::Break(
-            self.unclear(text, dialog, key, satellite, now).await,
+            self.unclear(text, dialog, key, heard, now).await,
         ))
     }
 
-    /// The reply to the unclear answer `text` to `dialog` of `key` on `satellite` at `now`: for an
+    /// The reply to the unclear answer `text` of `heard` to `dialog` of `key` at `now`: for an
     /// `Llm` dialog, a filler and the System Two answer to the call of the dialog, or the answer
-    /// itself without `satellite`. Else a question again.
+    /// itself without a satellite. Else a question again.
     async fn unclear(
         &self,
         text: &str,
         dialog: Dialog,
         key: Key,
-        satellite: Option<&str>,
+        heard: &Heard,
         now: Timestamp,
     ) -> Handled {
         let Pending::Llm {
@@ -414,11 +420,10 @@ impl Conversation {
             call_id,
         } = dialog.pending
         else {
-            return self.ask_again(dialog, key, satellite, now);
+            return self.ask_again(dialog, key, heard, now);
         };
         let thread = Thread {
-            request: satellite
-                .map(|satellite| (satellite.to_owned(), self.queues.next_generation(satellite))),
+            request: self.origin(heard.satellite.as_deref(), heard.id),
             key: Some(key),
             turns: dialog.turns,
             answers: Some(AskCall {
@@ -497,22 +502,19 @@ impl Conversation {
         Some((prediction, transcript))
     }
 
-    /// `dialog` of `key` with one more question from `ask_area` on `satellite` at `now`, in its
-    /// queue with the current generation, or a `failure` answer at the turn limit.
-    fn ask_again(
-        &self,
-        dialog: Dialog,
-        key: Key,
-        satellite: Option<&str>,
-        now: Timestamp,
-    ) -> Handled {
+    /// `dialog` of `key` with one more question from `ask_area` on the satellite of `heard` at
+    /// `now`, in its queue with the current generation, or a `failure` answer at the turn limit.
+    fn ask_again(&self, dialog: Dialog, key: Key, heard: &Heard, now: Timestamp) -> Handled {
         let Some(next) = dialog::next_turn(dialog, self.queues.dialog.max_turns, now) else {
             let text = self.pick("failure");
             return Handled { text, after: None };
         };
         self.queues.dialogs().dialogs.insert(key, next);
-        let request =
-            satellite.map(|satellite| (satellite.to_owned(), self.queues.generation(satellite)));
+        let request = heard.satellite.as_ref().map(|satellite| Origin {
+            satellite: satellite.clone(),
+            generation: self.queues.generation(satellite),
+            id: heard.id,
+        });
         let (question, after) = self.ask(self.chosen("ask_area"), request);
         Handled {
             text: question.text,
@@ -546,17 +548,17 @@ impl Conversation {
         )
     }
 
-    /// The dispatch of `decision` from `area` on `satellite`. Without `satellite`, the answer of a
-    /// deferred job, whose question opens a dialog for `key`, or a `failure` answer when the job
-    /// fails, and that answer as a response.
+    /// The dispatch of `decision` of `heard` from `area` on its satellite. Without a satellite, the
+    /// answer of a deferred job, whose question opens a dialog for `key`, or a `failure` answer
+    /// when the job fails, and that answer as a response.
     async fn reply(
         &self,
         decision: Decision,
         area: Option<&AreaId>,
-        satellite: Option<&str>,
+        heard: &Heard,
         key: Option<Key>,
     ) -> (Handled, Option<Spoken>) {
-        let answer = match (decision, satellite) {
+        let answer = match (decision, heard.satellite.as_deref()) {
             (Decision::Defer { job, .. }, None) => match job {
                 Job::Fetch { call, pool } => self.fetched(&call, &pool).await,
                 Job::Llm(text) => {
@@ -568,7 +570,9 @@ impl Conversation {
                     answer.map(|all| unpooled(all.join(" ")))
                 }
             },
-            (decision, satellite) => return (self.dispatch(decision, area, satellite), None),
+            (decision, satellite) => {
+                return (self.dispatch(decision, area, satellite, heard.id), None);
+            }
         };
         let spoken = self.or_failure(answer);
         let text = spoken.text.clone();
@@ -577,15 +581,16 @@ impl Conversation {
 
     /// The reply, filler or question of `decision` and its service call from `area` as background
     /// work, and its fetch, answer or question only with `satellite`. Records the use of the reply.
-    /// Increases the generation of `satellite`, the satellite entity of the request.
+    /// Increases the generation of `satellite`, the satellite entity of the request. Later
+    /// announces go to the record `id`.
     pub fn dispatch(
         &self,
         decision: Decision,
         area: Option<&AreaId>,
         satellite: Option<&str>,
+        id: u64,
     ) -> Handled {
-        let request = satellite
-            .map(|satellite| (satellite.to_owned(), self.queues.next_generation(satellite)));
+        let request = self.origin(satellite, id);
         let (chosen, after) = match decision {
             Decision::Reply { reply, call } => self.replied(reply, call, request),
             Decision::Defer {
@@ -616,13 +621,22 @@ impl Conversation {
         Handled { text, after }
     }
 
+    /// The origin of the request `id` on `satellite`, with the next generation of the satellite.
+    fn origin(&self, satellite: Option<&str>, id: u64) -> Option<Origin> {
+        satellite.map(|satellite| Origin {
+            satellite: satellite.to_owned(),
+            generation: self.queues.next_generation(satellite),
+            id,
+        })
+    }
+
     /// `reply` and the work of `call` for `request`, with a search first when the intent of the
     /// pool of `reply` has `search`.
     fn replied(
         &self,
         reply: Chosen,
         call: Option<ServiceCall>,
-        request: Option<(String, u64)>,
+        request: Option<Origin>,
     ) -> (Chosen, Option<Work>) {
         let mut intents = self.catalog.intents.iter();
         let search = intents.any(|intent| intent.search && intent.name == reply.pool);
@@ -631,8 +645,13 @@ impl Conversation {
 
     /// Empty text and `question` in the queue of the satellite of `request` with the generation of
     /// `request`, or the text of `question` with no `request`.
-    fn ask(&self, mut question: Chosen, request: Option<(String, u64)>) -> (Chosen, Option<Work>) {
-        let Some((satellite, generation)) = request else {
+    fn ask(&self, mut question: Chosen, request: Option<Origin>) -> (Chosen, Option<Work>) {
+        let Some(Origin {
+            satellite,
+            generation,
+            ..
+        }) = request
+        else {
             return (question, None);
         };
         let (queues, text) = (Arc::clone(&self.queues), mem::take(&mut question.text));
@@ -646,7 +665,7 @@ impl Conversation {
     /// Makes the calls of `resolve` of `call` with `search` in order. When one fails, makes no
     /// more calls, logs the error, queues a `failure` answer on the satellite of `request` with
     /// the generation of `request`, and records its use.
-    fn after(&self, call: ServiceCall, search: bool, request: Option<(String, u64)>) -> Work {
+    fn after(&self, call: ServiceCall, search: bool, request: Option<Origin>) -> Work {
         let conversation = self.clone();
         async move {
             let calls = conversation.resolve(call, search).await;
@@ -654,12 +673,10 @@ impl Conversation {
                 return Ok(());
             };
             tracing::warn!("the call failed: {error:#}");
-            let Some((satellite, generation)) = request else {
+            let Some(origin) = request else {
                 return Ok(());
             };
-            let text = conversation.pick("failure");
-            let queues = &conversation.queues;
-            queues.announce(&satellite, generation, &text).await
+            conversation.announce(&origin, conversation.failure()).await
         }
         .boxed()
     }
@@ -720,17 +737,18 @@ impl Conversation {
 
     /// Fetches `call` while `request` is the newest of its satellite. Queues its answer of `pool`,
     /// or a `failure` answer when it fails, with the generation of `request`.
-    fn fetch(&self, call: PluginCall, pool: String, request: (String, u64)) -> Work {
+    fn fetch(&self, call: PluginCall, pool: String, origin: Origin) -> Work {
         let conversation = self.clone();
         async move {
-            let (satellite, generation) = request;
-            if !conversation.queues.is_current(&satellite, generation) {
+            if !conversation
+                .queues
+                .is_current(&origin.satellite, origin.generation)
+            {
                 return Ok(());
             }
             let answer = conversation.fetched(&call, &pool).await;
-            let text = conversation.or_failure(answer).text;
-            let queues = &conversation.queues;
-            queues.announce(&satellite, generation, &text).await
+            let spoken = conversation.or_failure(answer);
+            conversation.announce(&origin, spoken).await
         }
         .boxed()
     }
@@ -741,12 +759,11 @@ impl Conversation {
         let conversation = self.clone();
         async move {
             let answer = conversation.answer(&text, area.as_ref(), &thread).await;
-            let (Err(error), Some((satellite, generation))) = (answer, &thread.request) else {
+            let (Err(error), Some(origin)) = (answer, &thread.request) else {
                 return Ok(());
             };
-            let text = conversation.or_failure(Err(error)).text;
-            let queues = &conversation.queues;
-            queues.announce(satellite, *generation, &text).await
+            let failure = conversation.or_failure(Err(error));
+            conversation.announce(origin, failure).await
         }
         .boxed()
     }
@@ -873,42 +890,82 @@ impl Conversation {
         };
         let next = dialog::next_turn(dialog, self.queues.dialog.max_turns, now);
         let question = next.is_some().then_some(question);
-        let Some((satellite, generation)) = &thread.request else {
+        let Some(origin) = &thread.request else {
             if let (Some(key), Some(next)) = (thread.key.clone(), next) {
                 self.queues.dialogs().dialogs.insert(key, next);
             }
             sentences.push(question.unwrap_or_else(|| self.pick("failure")));
             return Ok(());
         };
-        match self.queues.reopen(satellite, *generation, next) {
-            Some(generation) => self.ask_or_fail(satellite, generation, question).await,
+        match self
+            .queues
+            .reopen(&origin.satellite, origin.generation, next)
+        {
+            Some(generation) => self.ask_or_fail(origin, generation, question).await,
             None => Ok(()),
         }
     }
 
-    /// Asks `question` on `satellite` with `generation` in its queue, or announces a `failure`
-    /// answer with `generation` without `question` or when the question fails.
+    /// Asks `question` on the satellite of `origin` in its queue with `generation`, or announces a
+    /// `failure` answer without `question` or when the question fails.
     ///
     /// # Errors
     ///
     /// The `failure` announce fails.
     async fn ask_or_fail(
         &self,
-        satellite: &str,
+        origin: &Origin,
         generation: u64,
         question: Option<String>,
     ) -> anyhow::Result<()> {
-        let Some(question) = question else {
-            let text = self.pick("failure");
-            return self.queues.announce(satellite, generation, &text).await;
+        let origin = &Origin {
+            generation,
+            ..origin.clone()
         };
-        let speak = self.queues.home.ask(satellite, &question);
-        let queues = &self.queues;
-        let Err(error) = queues.queued(satellite, generation, &question, speak).await else {
+        let Some(question) = question else {
+            return self.announce(origin, self.failure()).await;
+        };
+        let speak = self.queues.home.ask(&origin.satellite, &question);
+        let asked = self.queued(origin, unpooled(question.clone()), speak).await;
+        let Err(error) = asked else {
             return Ok(());
         };
-        let text = self.or_failure(Err(error)).text;
-        queues.announce(satellite, generation, &text).await
+        self.announce(origin, self.or_failure(Err(error))).await
+    }
+
+    /// Announces `spoken` on the satellite of `origin` as `Queues::announce` describes.
+    ///
+    /// # Errors
+    ///
+    /// The announce fails.
+    async fn announce(&self, origin: &Origin, spoken: Spoken) -> anyhow::Result<()> {
+        let speak = self.queues.home.announce(&origin.satellite, &spoken.text);
+        self.queued(origin, spoken.clone(), speak).await
+    }
+
+    /// Runs `speak`, which speaks `spoken` on the satellite of `origin`, as `Queues::queued` does
+    /// with the generation of `origin`. After it speaks, adds `spoken` to the record of `origin`.
+    ///
+    /// # Errors
+    ///
+    /// `speak` fails.
+    async fn queued(
+        &self,
+        origin: &Origin,
+        spoken: Spoken,
+        speak: BoxFuture<'_, anyhow::Result<()>>,
+    ) -> anyhow::Result<()> {
+        let (writer, id, text) = (self.recorder.writer.clone(), origin.id, spoken.text.clone());
+        let logged = async move {
+            speak.await?;
+            // A send fails only after the writer ended, at shutdown.
+            let _ = writer.send(Write::Update(id, crate::ports::Change::Response(spoken)));
+            Ok(())
+        };
+        let (satellite, generation) = (&origin.satellite, origin.generation);
+        self.queues
+            .queued(satellite, generation, &text, logged.boxed())
+            .await
     }
 
     /// Announces `sentence` on the satellite of `request`, or adds it to `sentences` with no
@@ -920,16 +977,14 @@ impl Conversation {
     async fn say(
         &self,
         sentence: String,
-        request: Option<&(String, u64)>,
+        request: Option<&Origin>,
         sentences: &mut Vec<String>,
     ) -> anyhow::Result<()> {
-        let Some((satellite, generation)) = request else {
+        let Some(origin) = request else {
             sentences.push(sentence);
             return Ok(());
         };
-        self.queues
-            .announce(satellite, *generation, &sentence)
-            .await
+        self.announce(origin, unpooled(sentence)).await
     }
 
     /// Makes `call` and sends its result on `reply` while `request` is the newest of its
@@ -938,10 +993,10 @@ impl Conversation {
         &self,
         call: ServiceCall,
         reply: oneshot::Sender<anyhow::Result<Option<Value>>>,
-        request: Option<&(String, u64)>,
+        request: Option<&Origin>,
     ) -> bool {
         let current = request
-            .is_none_or(|(satellite, generation)| self.queues.is_current(satellite, *generation));
+            .is_none_or(|origin| self.queues.is_current(&origin.satellite, origin.generation));
         if current {
             // The send fails only when the answer has ended, so the result is not needed.
             let _ = reply.send(self.tool(call).await);
@@ -1024,8 +1079,13 @@ impl Conversation {
     fn or_failure(&self, answer: anyhow::Result<Spoken>) -> Spoken {
         answer.unwrap_or_else(|error| {
             tracing::warn!("the answer failed: {error:#}");
-            self.spoken(self.chosen("failure"))
+            self.failure()
         })
+    }
+
+    /// A `failure` answer. Records its use.
+    fn failure(&self) -> Spoken {
+        self.spoken(self.chosen("failure"))
     }
 
     /// `chosen` with the template of its response in the current pools.
@@ -1066,8 +1126,9 @@ impl Conversation {
 /// Where a System Two answer goes, and the dialog that it continues.
 #[derive(Default)]
 struct Thread {
-    /// The satellite and the generation of the request, or `None` without a satellite.
-    request: Option<(String, u64)>,
+    /// The satellite, the generation and the record of the request, or `None` without a
+    /// satellite.
+    request: Option<Origin>,
     /// The key of the dialog that a question opens without a satellite.
     key: Option<Key>,
     /// The questions of the dialog so far.
@@ -1090,6 +1151,17 @@ struct Heard {
     model_context: String,
     /// The utterance of a voice request.
     utterance: Option<Utterance>,
+}
+
+/// The satellite of a request, the generation of the request on it and the ID of its record.
+#[derive(Clone)]
+struct Origin {
+    /// The satellite entity.
+    satellite: String,
+    /// The generation of the request on the satellite.
+    generation: u64,
+    /// The interaction ID.
+    id: u64,
 }
 
 /// The parts of the record of a request that its decision gives.
@@ -1615,7 +1687,7 @@ mod tests {
         });
         let (_task, _store, conversation) = start(&home)?;
         let start = Instant::now();
-        let handled = conversation.dispatch(reply(Some(call())), None, None);
+        let handled = conversation.dispatch(reply(Some(call())), None, None, 0);
         assert_eq!(Instant::now(), start, "dispatch waited for the call");
         assert!(handled.after.is_some(), "the call is not in after");
         Ok(())
@@ -1626,7 +1698,9 @@ mod tests {
     async fn ac_4_8_2_call_only_after_start() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
         let (_task, _store, conversation) = start(&home)?;
-        let after = conversation.dispatch(reply(Some(call())), None, None).after;
+        let after = conversation
+            .dispatch(reply(Some(call())), None, None, 0)
+            .after;
         assert_eq!(home.calls(), [], "a call came before the start");
         after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
         assert_eq!(home.calls(), [call()]);
@@ -1637,7 +1711,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_4_8_3_store_receives_new_use_count() -> anyhow::Result<()> {
         let started = start(&Arc::new(FakeHome::default()))?;
-        let _ = started.2.dispatch(reply(Some(call())), None, None);
+        let _ = started.2.dispatch(reply(Some(call())), None, None, 0);
         let expected = responses::record_use(unused(), "lights_on", 1);
         assert_eq!(last_save(started).await?, expected);
         Ok(())
@@ -1648,7 +1722,7 @@ mod tests {
     async fn ac_4_8_4_reply_without_call_makes_no_call() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
         let (_task, _store, conversation) = start(&home)?;
-        let handled = conversation.dispatch(reply(None), None, None);
+        let handled = conversation.dispatch(reply(None), None, None, 0);
         assert!(handled.after.is_none(), "a reply with no call has work");
         assert_eq!(home.calls(), []);
         Ok(())
@@ -1660,7 +1734,7 @@ mod tests {
         let started = start(&Arc::new(FakeHome::default()))?;
         thread::scope(|scope| {
             for _ in 0..100 {
-                scope.spawn(|| started.2.dispatch(reply(None), None, None));
+                scope.spawn(|| started.2.dispatch(reply(None), None, None, 0));
             }
         });
         let saved = last_save(started).await?;
@@ -1830,7 +1904,7 @@ mod tests {
         decision: Decision,
         satellite: Option<&str>,
     ) -> anyhow::Result<Work> {
-        let handled = conversation.dispatch(decision, None, satellite);
+        let handled = conversation.dispatch(decision, None, satellite, 0);
         handled.after.ok_or_else(|| anyhow::anyhow!("no after"))
     }
 
@@ -1876,7 +1950,7 @@ mod tests {
         let home = Arc::new(FakeHome::default());
         let (_cache, _changes, conversation) = still(&home, "idle");
         let first = failed(&home, &conversation)?;
-        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE));
+        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE), 0);
         first.await?;
         assert_eq!(announces(&home), [] as [&str; 0]);
         Ok(())
@@ -1906,7 +1980,7 @@ mod tests {
         let classifier = Arc::<FakeClassifier>::default();
         let (_cache, changes, conversation) =
             still_with(&home, "idle", classifier, Arc::clone(&reasoner));
-        let _ = conversation.dispatch(reply(None), None, None);
+        let _ = conversation.dispatch(reply(None), None, None, 0);
         let _ = changes
             .try_iter()
             .fold(unused(), |pools, change| change(pools));
@@ -2400,8 +2474,18 @@ mod tests {
             ranked: vec![("lights_on".to_owned(), 0.9)],
             slots: vec![slot],
         });
-        let (_cache, _changes, mut conversation) =
-            still_with(home, "idle", classifier, Arc::default());
+        logging_with(home, classifier, Arc::default(), delay)
+    }
+
+    /// A conversation on `home`, `classifier` and `reasoner`, which logs to a `FakeLog` that waits
+    /// `delay` for each call, and the log.
+    fn logging_with(
+        home: &Arc<FakeHome>,
+        classifier: Arc<FakeClassifier>,
+        reasoner: Arc<FakeReasoner>,
+        delay: Duration,
+    ) -> (Arc<FakeLog>, Conversation) {
+        let (_cache, _changes, mut conversation) = still_with(home, "idle", classifier, reasoner);
         let log = Arc::new(FakeLog {
             delay,
             ..FakeLog::default()
@@ -2566,6 +2650,59 @@ mod tests {
         assert_eq!(Instant::now(), start, "handle waited for the log");
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(written(&log).await.len(), 1);
+        Ok(())
+    }
+
+    /// The log and the work of "plan dinner" on the satellite, when System Two answers "Dinner is
+    /// planned." and the log waits `delay` for each call.
+    async fn planned(delay: Duration) -> anyhow::Result<(Arc<FakeLog>, Work)> {
+        let reasoner = Arc::new(FakeReasoner::default());
+        reasoner.script(vec![Scripted::Sentence("Dinner is planned.")]);
+        let classifier = scripted(&["unknown"]);
+        let (log, conversation) = logging_with(&Arc::default(), classifier, reasoner, delay);
+        let after = conversation
+            .handle("plan dinner", on_satellite())
+            .await?
+            .after;
+        Ok((log, after.ok_or_else(|| anyhow::anyhow!("no after"))?))
+    }
+
+    /// The response texts of each record of `log` after the writer runs.
+    async fn response_texts(log: &FakeLog) -> Vec<Vec<String>> {
+        let logged = written(log).await;
+        let texts =
+            |record: &Interaction| record.responses.iter().map(|s| s.text.clone()).collect();
+        logged.iter().map(|(record, _)| texts(record)).collect()
+    }
+
+    /// AC-12.6c-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_6c_1_announce_reaches_the_same_record() -> anyhow::Result<()> {
+        let (log, after) = planned(Duration::ZERO).await?;
+        after.await?;
+        assert_eq!(
+            response_texts(&log).await,
+            [["One moment.", "Dinner is planned."]]
+        );
+        Ok(())
+    }
+
+    /// AC-12.6c-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_6c_2_update_before_append_still_lands() -> anyhow::Result<()> {
+        let (log, after) = planned(Duration::from_millis(500)).await?;
+        after.await?;
+        let appended = log
+            .interactions
+            .lock()
+            .expect("no lock holder panics")
+            .len();
+        assert_eq!(appended, 0, "the append ran before the announce");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(
+            response_texts(&log).await,
+            [["One moment.", "Dinner is planned."]]
+        );
         Ok(())
     }
 
@@ -2957,7 +3094,7 @@ mod tests {
             Decision::Defer { filler, job },
             Some(SATELLITE),
         )?;
-        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE));
+        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE), 0);
         old.await?;
         assert_eq!(home.calls(), []);
         Ok(())
