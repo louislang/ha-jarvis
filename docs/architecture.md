@@ -26,6 +26,7 @@ flowchart LR
         crate_domain_contracts[contracts]
         crate_domain_decide[decide]
         crate_domain_dialog[dialog]
+        crate_domain_feedback[feedback]
         crate_domain_habits[habits]
         crate_domain_intent[intent]
         crate_domain_model[model]
@@ -163,6 +164,9 @@ flowchart LR
     crate_domain_dialog --> crate_domain_intent
     crate_domain_dialog --> crate_domain_model
     crate_domain_dialog --> crate_domain_select
+    crate_domain_feedback --> crate_domain_feedback
+    crate_domain_feedback --> crate_domain_intent
+    crate_domain_feedback --> crate_domain_select
     crate_domain_habits --> crate_domain_contracts
     crate_domain_habits --> crate_domain_habits
     crate_domain_intent --> crate_domain_contracts
