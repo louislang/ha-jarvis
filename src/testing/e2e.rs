@@ -290,6 +290,7 @@ fn config(device: Device, folder: &Path) -> anyhow::Result<Config> {
     let mut config = Config::parse(include_str!("../../jarvis.toml"))?;
     config.pools = folder.join("pools.json");
     config.habits.file = folder.join("habits.json");
+    config.log.database = folder.join("jarvis.db");
     if device == Device::Cuda {
         return Ok(config);
     }

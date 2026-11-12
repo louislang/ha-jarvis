@@ -47,6 +47,7 @@ use crate::adapters::open_meteo::OpenMeteo;
 use crate::adapters::openai::OpenAiReasoner;
 use crate::adapters::plex::Plex;
 use crate::adapters::sherpa::SherpaStt;
+use crate::adapters::sqlite::SqliteLog;
 use crate::adapters::supertonic::SupertonicTts;
 use crate::app::background::Backfill;
 use crate::app::background::Habits;
@@ -55,6 +56,7 @@ use crate::app::conversation::Change;
 use crate::app::conversation::Conversation;
 use crate::app::conversation::PoolsTask;
 use crate::app::conversation::Queues;
+use crate::app::conversation::Recorder;
 use crate::app::conversation::SystemTwo;
 use crate::app::plugins::Plugins;
 use crate::app::speech::Listener;
@@ -562,6 +564,9 @@ pub struct LogConfig {
     pub correlate_s: u64,
 }
 
+/// The run name of the System One model that Jarvis loads.
+const MODEL: &str = "fixture";
+
 /// The `Clock` of the system time.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
@@ -596,10 +601,6 @@ impl Assistant for App {
     }
 
     async fn handle(&self, text: &str, context: ports::Context) -> anyhow::Result<Handled> {
-        // A typed request never gets voice audio. Nothing reads the utterance yet.
-        if context.satellite_id.is_some() {
-            drop(self.listener.utterances().correlate(text));
-        }
         self.conversation.handle(text, context).await
     }
 
@@ -827,6 +828,13 @@ fn area_names(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(snapshot.areas.into_iter().map(|area| area.name).collect())
 }
 
+/// A started app, its pools task, habit task and log writer task, and its pre-render task.
+type Started = (
+    App,
+    (JoinHandle<()>, HabitsTask, JoinHandle<()>),
+    JoinHandle<()>,
+);
+
 /// The longest wait of [`run`] for the running tasks and the saves after the shutdown future
 /// completes.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
@@ -876,26 +884,26 @@ where
 }
 
 /// Serves `app` on `listen` until `shutdown` completes. Then waits up to [`SHUTDOWN_WAIT`] for
-/// the connection tasks, the work after their replies and the pools task of `stores`, and then
-/// for the last save of its habit task.
+/// the connection tasks, the work after their replies, and the pools task and the log writer
+/// task of `stores`, and then for the last save of its habit task.
 ///
 /// # Errors
 ///
-/// The server cannot bind or accept, or the pools task or the habit task panicked.
+/// The server cannot bind or accept, or a task of `stores` panicked.
 async fn serve_until(
     listen: SocketAddr,
     app: App,
-    stores: (JoinHandle<()>, HabitsTask),
+    stores: (JoinHandle<()>, HabitsTask, JoinHandle<()>),
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     let (listener, tracker) = (TcpListener::bind(listen).await?, TaskTracker::new());
     adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await?;
     tracker.close();
-    let (pools_task, habits) = stores;
-    // The pools task saves each change. It ends when the tracked tasks drop the last sender.
+    let (pools_task, habits, writer) = stores;
+    // Both tasks run each message. They end when the tracked tasks drop the last sender.
     let drained = async {
         tracker.wait().await;
-        pools_task.await
+        pools_task.await.and(writer.await)
     };
     let ended = tokio::time::timeout(SHUTDOWN_WAIT, drained).await;
     // The habits save also when a connection still runs (sub-phase 5.4c).
@@ -952,7 +960,7 @@ async fn start_live_app(
     catalog: Catalog,
     pools: Pools,
     home: Arc<dyn Home>,
-) -> anyhow::Result<(App, (JoinHandle<()>, HabitsTask), JoinHandle<()>)> {
+) -> anyhow::Result<Started> {
     let plugins = registry(config, plugins(config, secrets)?);
     let tools = plugins.tools();
     let reasoner = Arc::new(OpenAiReasoner::try_new(
@@ -1002,28 +1010,45 @@ async fn start_app(
     home: Arc<dyn Home>,
     reasoner: Arc<dyn Reasoner>,
     plugins: Arc<Plugins>,
-) -> anyhow::Result<(App, (JoinHandle<()>, HabitsTask), JoinHandle<()>)> {
+) -> anyhow::Result<Started> {
     let (cache, queues) = start_sync(home, config);
     let (task, habits) = start_stores(config, pools, &cache)?;
-    let (classifier, listener, speech) =
-        load_models(config, Arc::clone(&reasoner), &queues).await?;
+    let (classifier, listener, speech) = load_models(config, reasoner.clone(), &queues).await?;
     let prerender = start_prerender(&speech, &task.pools, &cache);
-    let backfill = backfill(config, &reasoner, task.changes, &speech, &catalog, cache);
+    let (recorder, writer) = recorder(config, &listener)?;
     let app = App {
         conversation: Conversation::new(
             task.pools,
-            backfill,
+            backfill(config, &reasoner, task.changes, &speech, &catalog, cache),
             queues,
             classifier,
             catalog,
             config.model.threshold,
             system_two(config, reasoner, plugins),
-            Arc::clone(&habits.habits),
+            habits.habits.clone(),
+            recorder,
         ),
         listener,
         speech,
     };
-    Ok((app, (task.task, habits), prerender))
+    Ok((app, (task.task, habits, writer), prerender))
+}
+
+/// The recorder of the utterances of `listener` and of the log of `config`, and its new log
+/// writer task.
+///
+/// # Errors
+///
+/// The log cannot open.
+fn recorder(config: &Config, listener: &Listener) -> anyhow::Result<(Recorder, JoinHandle<()>)> {
+    let log = SqliteLog::open(&config.log)?;
+    let (writer, task) = app::conversation::start_writer(Arc::new(log));
+    let recorder = Recorder {
+        utterances: Arc::clone(listener.utterances()),
+        writer,
+        model: MODEL.to_owned(),
+    };
+    Ok((recorder, task))
 }
 
 /// Starts the pools task of the source pools `pools` and the saved pools of `config`, and the
@@ -1093,7 +1118,7 @@ async fn load_models(
     reasoner: Arc<dyn Reasoner>,
     queues: &Arc<Queues>,
 ) -> anyhow::Result<(Arc<dyn Classifier>, Listener, Arc<Speech>)> {
-    let dir = config.model.dir.join("fixture");
+    let dir = config.model.dir.join(MODEL);
     let model = OnnxLoader.load(&dir, config.device).await?;
     let classifier: Arc<dyn Classifier> = Arc::new(CurrentClassifier(ArcSwap::from_pointee(model)));
     let (asr, tts, device) = (config.asr.clone(), config.tts.clone(), config.device);
@@ -1841,12 +1866,13 @@ mod tests {
     }
 
     /// The conversation of `config` with `classifier`, `queues(config)`, `two(config)`, the pools
-    /// of `catalog` and a backfill on `FakeReasoner` and `speech`.
+    /// of `catalog`, a backfill on `FakeReasoner` and `speech`, and `utterances`.
     fn conversation(
         config: &Config,
         catalog: Catalog,
         classifier: Arc<dyn Classifier>,
         speech: &Arc<Speech>,
+        utterances: Arc<Utterances>,
     ) -> anyhow::Result<Conversation> {
         let task = app::conversation::start_pools(pools(&catalog), Arc::new(FakeStore::new(None)))?;
         let (catalog, cache) = (Arc::new(catalog), watch::channel(StateCache::default()).1);
@@ -1863,6 +1889,11 @@ mod tests {
             threshold,
             two(config),
             Arc::new(habits),
+            Recorder {
+                utterances,
+                writer: tokio::sync::mpsc::unbounded_channel().0,
+                model: MODEL.to_owned(),
+            },
         ))
     }
 
@@ -1876,8 +1907,9 @@ mod tests {
         let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
         let (reasoner, queues) = (Arc::new(FakeReasoner::default()), queues(&config));
         let listener = listener(&config, stt, Arc::clone(&classifier), reasoner, &queues);
+        let utterances = Arc::clone(listener.utterances());
         Ok(App {
-            conversation: conversation(&config, catalog, classifier, &speech)?,
+            conversation: conversation(&config, catalog, classifier, &speech, utterances)?,
             listener,
             speech,
         })
@@ -2029,10 +2061,11 @@ mod tests {
         Ok(format!("{error:#}"))
     }
 
-    /// `VALID` with the files `pools.json` and `habits.json` in `folder`.
+    /// `VALID` with the files `pools.json`, `habits.json` and `jarvis.db` in `folder`.
     fn with_stores_in(folder: &Path) -> String {
         let in_folder = |file: &str| format!("\"{}\"", folder.join(file).display());
         let text = VALID.replace("\"pools.json\"", &in_folder("pools.json"));
+        let text = text.replace("\"jarvis.db\"", &in_folder("jarvis.db"));
         text.replace("\"habits.json\"", &in_folder("habits.json"))
     }
 

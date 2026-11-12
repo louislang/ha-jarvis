@@ -685,6 +685,8 @@ pub struct FakeLog {
     pub interactions: Mutex<Vec<(Interaction, Option<Audio>)>>,
     /// The time of each `prune` call, in order.
     pub prunes: Mutex<Vec<Timestamp>>,
+    /// The wait of each `append` and `update`.
+    pub delay: Duration,
 }
 
 impl FakeLog {
@@ -729,11 +731,13 @@ fn has_bad(interaction: &Interaction, on: impl Fn(feedback::Target) -> bool) -> 
 #[async_trait]
 impl InteractionLog for FakeLog {
     async fn append(&self, interaction: Interaction, audio: Option<Audio>) -> anyhow::Result<()> {
+        tokio::time::sleep(self.delay).await;
         lock(&self.interactions).push((interaction, audio));
         Ok(())
     }
 
     async fn update(&self, id: u64, change: Change) -> anyhow::Result<()> {
+        tokio::time::sleep(self.delay).await;
         let Change::Response(spoken) = change;
         self.change(id, |interaction| interaction.responses.push(spoken));
         Ok(())

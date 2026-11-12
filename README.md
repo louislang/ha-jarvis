@@ -23,6 +23,7 @@ The design is in [`docs/spec/`](docs/spec/00-overview.md).
 | Everything else | Any other request, for example "Plan dinner for tonight" | OpenAI, with HA tools and plugins. OpenAI can ask you a question and use your answer. |
 | Speech | Streaming speech-to-text, then a second pass at the end of speech. Text-to-speech with a cache of rendered responses. A short answer like "Kitchen" ends listening after 100 ms. | Local |
 | Responses | Each intent has a pool of replies with variety. Jarvis adds new replies when a pool runs low. A slow request gets a filler reply, then an announcement of the answer. | Local, OpenAI for new replies |
+| Interaction log | Jarvis records each request with its audio, transcript, prediction, decision and latency in the SQLite file `log.database` (`jarvis.db`). | Local |
 
 Not built yet: habit learning, the review page and feedback, automatic training, learned intents, speaker identification and timers (phases 11 to 16 in [`docs/spec/00-overview.md`](docs/spec/00-overview.md)).
 
