@@ -305,6 +305,7 @@ A choice is a closed set, so step 2 comes before step 3. The answer to System Tw
 - Routing step 4 (sub-phase 10.5) sends the answer to an `Llm` dialog as a new request on the satellite: a filler, and a System Two job whose `Question` has the call of the dialog. Without a `satellite_id`, `handle` waits for the answer and returns its text (sub-phase 7.5c).
 - The job keeps the turns of the dialog. Each question of the job goes through `next_turn`. At the turn limit, the job announces from `failure`, and the dialog stays closed.
 - When the dialog times out or is cancelled, Jarvis sends nothing for the open call.
+- Jarvis speaks each sentence of the text with `announce`, which does not listen. Only an `ask_user` call asks with `Home::ask`. In the field test on 2026-11-12, System Two asked "Which downstairs speaker should I play it in?" in the text. The satellite did not listen after it, so Jarvis did not get the answer. The user heard the question two times, and HA recorded four `announce` calls and no `start_conversation`. The answer probably had two rounds around a tool call, and the second round said the text of the first again. Thus the system prompt (sub-phase 7.2) gets two rules after its first two sentences: "Ask the user a question only with the ask_user tool, never in the text. Do not say again text that you already said in this answer." The fix PR `Fix: System Two Questions` changes `system_prompt()` in `src/adapters/openai.rs` and its tests.
 - `FakeReasoner` records the call ID that each question answers.
 
 **Acceptance criteria.**
@@ -314,12 +315,13 @@ A choice is a closed set, so step 2 comes before step 3. The answer to System Tw
 - AC-10.6b-3: When the user answers, `handle` returns a filler before `FakeReasoner` completes.
 - AC-10.6b-4: When `FakeReasoner` asks three questions and then answers, `FakeHome` records three `ask` calls, then the announce.
 - AC-10.6b-5: When `FakeReasoner` asks more than `max_turns` questions, `FakeHome` records an announce from `failure` and the dialog closes.
+- AC-10.6b-6: When the system prompt is read, it says to ask a question only with the `ask_user` tool and not to say again text that the answer already said.
 
 **Proofs.**
 
 - P-10.6b-2. Argument: the request builder has two branches. With a previous ID, it sends only the tool output for the call ID.
 - P-10.6b-5. Requires: `TurnLimit`. Argument: each `Ask` step goes through `next_turn`.
-- P-10.6b-1, P-10.6b-3, P-10.6b-4. Evidence: test.
+- P-10.6b-1, P-10.6b-3, P-10.6b-4, P-10.6b-6. Evidence: test.
 
 ---
 
