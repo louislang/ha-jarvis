@@ -34,6 +34,8 @@ pub struct PullRequest {
     pub branch: String,
     /// The base branch.
     pub base: String,
+    /// The number of commits of `main` that the head does not contain.
+    pub behind: usize,
     /// The paths of the changed files.
     pub files: Vec<String>,
     /// The PR description.
@@ -60,6 +62,8 @@ pub enum Reason {
     Unchecked(String),
     /// A base branch other than `main`.
     Base(String),
+    /// The number of commits of `main` that the head does not contain, when it is not 0.
+    Behind(usize),
     /// The title and the branch follow no kind of PR.
     Kind,
     /// A file outside `docs/spec/` and `CLAUDE.md` in a spec PR.
@@ -119,6 +123,7 @@ fn pr_reasons(pr: &PullRequest) -> Vec<Reason> {
         (threads > 0).then_some(Reason::UnresolvedThreads(threads)),
         (!pr.logins.iter().any(|login| is_codex(login))).then_some(Reason::NoCodexReview),
         (pr.base != "main").then(|| Reason::Base(pr.base.clone())),
+        (pr.behind > 0).then_some(Reason::Behind(pr.behind)),
         (!follows_kind(&pr.title, &pr.branch)).then_some(Reason::Kind),
     ];
     single.into_iter().flatten().chain(spec_files).collect()
@@ -266,11 +271,14 @@ fn merge(number: &str, path: &OsStr) -> Result<(), Vec<String>> {
 /// The PR data and the head commit of PR `number`.
 fn read(number: &str, path: &OsStr) -> Result<(PullRequest, String), String> {
     let view = json(&gh(path, &["pr", "view", number, "--json", VIEW_FIELDS])?)?;
+    let head = text(&view, "/headRefOid");
+    let behind = behind(path, &head)?;
     let threads = nodes(path, number, "reviewThreads", "isResolved")?;
     let pr = PullRequest {
         title: text(&view, "/title"),
         branch: text(&view, "/headRefName"),
         base: text(&view, "/baseRefName"),
+        behind,
         files: list(&view, "/files")
             .iter()
             .map(|file| text(file, "/path"))
@@ -283,7 +291,17 @@ fn read(number: &str, path: &OsStr) -> Result<(PullRequest, String), String> {
             .count(),
         logins: logins(path, number)?,
     };
-    Ok((pr, text(&view, "/headRefOid")))
+    Ok((pr, head))
+}
+
+/// The number of commits of `main` that the commit `head` does not contain.
+fn behind(path: &OsStr, head: &str) -> Result<usize, String> {
+    let compare = format!("repos/{{owner}}/{{repo}}/compare/main...{head}");
+    let behind = gh(path, &["api", &compare, "--jq", ".behind_by"])?;
+    behind
+        .trim()
+        .parse()
+        .map_err(|error| format!("behind_by {behind:?}: {error}"))
 }
 
 /// The logins of the reviews, comments and reactions of PR `number`.
@@ -409,6 +427,7 @@ mod tests {
             title: "0.15 Merge Rules".to_owned(),
             branch: "0.15-merge-rules".to_owned(),
             base: "main".to_owned(),
+            behind: 0,
             files: vec!["docs/spec/phase-00.md".to_owned()],
             body: BODY.to_owned(),
             checks: BTreeMap::from(REQUIRED.map(|name| (name.to_owned(), "SUCCESS".to_owned()))),
@@ -643,6 +662,17 @@ mod tests {
         assert_eq!(gpu_test_result(&code, &["SKIPPED", "SUCCESS"]), Ok(()));
     }
 
+    /// A head that does not contain 2 commits of `main` is a reason with the number 2.
+    #[test]
+    fn ac_0_15_14_behind_main() {
+        let pr = PullRequest {
+            behind: 2,
+            ..allowed()
+        };
+        assert_eq!(merge_allowed(&pr, &REQUIRED), Err(vec![Reason::Behind(2)]));
+        assert_eq!(merge_allowed(&allowed(), &REQUIRED), Ok(()));
+    }
+
     /// The `gh pr view` output of a PR that meets every rule, with a push run of each check and a skipped one.
     fn view() -> Value {
         let mut runs: Vec<Value> = jobs(CI)
@@ -670,13 +700,13 @@ mod tests {
         format!("printf '%s' '{}'", Value::from(pages))
     }
 
-    /// A folder with a fake `gh` that records each call in `gh.calls`, prints `view()` and a Codex login, and runs
-    /// `threads` for the review thread query.
-    fn fake_gh(threads: &str) -> TempDir {
+    /// A folder with a fake `gh` that records each call in `gh.calls`, prints `view()`, a Codex login and `behind` for
+    /// the compare call, and runs `threads` for the review thread query.
+    fn fake_gh(threads: &str, behind: u32) -> TempDir {
         let folder = TempDir::new().expect("a temporary folder");
         let logins = print_pages(&[json!([{"author": {"login": "chatgpt-codex-connector"}}])]);
         let script = format!(
-            "#!/bin/sh\nprintf '[%s]' \"$@\" >> \"$0.calls\"\necho >> \"$0.calls\"\ncase \"$*\" in\n\"pr view\"*) printf '%s' '{}' ;;\n*reviewThreads*) {threads} ;;\n*graphql*) {logins} ;;\nesac\n",
+            "#!/bin/sh\nprintf '[%s]' \"$@\" >> \"$0.calls\"\necho >> \"$0.calls\"\ncase \"$*\" in\n\"pr view\"*) printf '%s' '{}' ;;\n*compare*) echo {behind} ;;\n*reviewThreads*) {threads} ;;\n*graphql*) {logins} ;;\nesac\n",
             view()
         );
         let gh = folder.path().join("gh");
@@ -694,7 +724,7 @@ mod tests {
     /// The merge has the head commit, the title and the summary that were read.
     #[test]
     fn ac_0_16_1_merge_at_read_head() {
-        let gh = fake_gh(&print_pages(&[json!([{"isResolved": true}])]));
+        let gh = fake_gh(&print_pages(&[json!([{"isResolved": true}])]), 0);
         assert_eq!(merge("16", gh.path().as_os_str()), Ok(()));
         let merge_call = "[pr][merge][16][--squash][--match-head-commit][0123abc][--subject][0.16 Merge Command][--body][Adds the merge rules. They decide whether a PR can merge.]\n";
         assert!(
@@ -707,10 +737,13 @@ mod tests {
     /// An unresolved thread on the second page refuses the merge.
     #[test]
     fn ac_0_16_2_threads_on_two_pages() {
-        let gh = fake_gh(&print_pages(&[
-            json!([{"isResolved": true}]),
-            json!([{"isResolved": false}]),
-        ]));
+        let gh = fake_gh(
+            &print_pages(&[
+                json!([{"isResolved": true}]),
+                json!([{"isResolved": false}]),
+            ]),
+            0,
+        );
         assert_eq!(
             merge("16", gh.path().as_os_str()),
             Err(vec!["UnresolvedThreads(1)".to_owned()])
@@ -721,12 +754,29 @@ mod tests {
     /// A failed `gh` call exits with code 1, gives its error and runs no merge.
     #[test]
     fn ac_0_16_3_failed_gh_call() {
-        let gh = fake_gh("echo 'HTTP 502: Bad Gateway' >&2; exit 1");
+        let gh = fake_gh("echo 'HTTP 502: Bad Gateway' >&2; exit 1", 0);
         assert_eq!(
             merge("16", gh.path().as_os_str()),
             Err(vec!["HTTP 502: Bad Gateway".to_owned()])
         );
         assert_eq!(run("16", gh.path().as_os_str()), ExitCode::FAILURE);
+        assert!(!calls(&gh).contains("[merge]"), "no merge: {}", calls(&gh));
+    }
+
+    /// A compare call that gives 1 for the head that was read refuses the merge.
+    #[test]
+    fn ac_0_16_5_compare_behind_refuses_merge() {
+        let gh = fake_gh(&print_pages(&[json!([{"isResolved": true}])]), 1);
+        assert_eq!(
+            merge("16", gh.path().as_os_str()),
+            Err(vec!["Behind(1)".to_owned()])
+        );
+        let compare = "[api][repos/{owner}/{repo}/compare/main...0123abc][--jq][.behind_by]\n";
+        assert!(
+            calls(&gh).contains(compare),
+            "compare at the head: {}",
+            calls(&gh)
+        );
         assert!(!calls(&gh).contains("[merge]"), "no merge: {}", calls(&gh));
     }
 

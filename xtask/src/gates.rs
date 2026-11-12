@@ -1058,7 +1058,7 @@ fn ac_0_12_5_check_and_ci_run_quint_gate() {
     );
 }
 
-/// CI runs `gpu-test` on the self-hosted GPU runner, but not for a docs-only or a fork pull request.
+/// CI runs `gpu-test` on the self-hosted GPU runner, but not on `main`, or for a docs-only or a fork pull request.
 #[test]
 fn ac_0_13_1_ci_runs_gpu_test_on_gpu_runner() {
     let ci = yaml(".github/workflows/ci.yml");
@@ -1075,11 +1075,36 @@ fn ac_0_13_1_ci_runs_gpu_test_on_gpu_runner() {
     assert_eq!(
         ci["jobs"]["gpu-test"]["if"].as_str(),
         Some(
-            "needs.fixture-model.outputs.docs-only != 'true' && \
+            "github.ref != 'refs/heads/main' && \
+             needs.fixture-model.outputs.docs-only != 'true' && \
              (github.event_name != 'pull_request' || \
              github.event.pull_request.head.repo.full_name == github.repository)"
         ),
-        "gpu-test skips docs-only and fork pull requests"
+        "gpu-test skips main, docs-only and fork pull requests"
+    );
+}
+
+/// Only the push to `main` has the ref `refs/heads/main`: the call from `release.yml` has the tag.
+#[test]
+fn ac_0_13_7_gpu_test_skips_only_push_to_main() {
+    let ci = yaml(".github/workflows/ci.yml");
+    let release = yaml(".github/workflows/release.yml");
+    let main: serde_yaml::Value =
+        serde_yaml::from_str("{branches: [main]}").expect("the expected push trigger is YAML");
+    let tags: serde_yaml::Value =
+        serde_yaml::from_str("{push: {tags: ['v*']}}").expect("the expected trigger is YAML");
+    assert_eq!(ci["on"]["push"], main, "CI runs on push only for main");
+    assert_eq!(release["on"], tags, "the release runs only on tags");
+    assert_eq!(
+        release["jobs"]["ci"]["uses"].as_str(),
+        Some("./.github/workflows/ci.yml")
+    );
+    assert!(
+        ci["jobs"]["gpu-test"]["if"]
+            .as_str()
+            .is_some_and(|condition| condition.starts_with("github.ref != 'refs/heads/main' && ")),
+        "the first condition of gpu-test skips main: {:?}",
+        ci["jobs"]["gpu-test"]["if"]
     );
 }
 

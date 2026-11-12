@@ -229,7 +229,8 @@ jobs:
   gpu-test:
     # The repository is public: a fork pull request must not run code on the GPU host.
     # A docs-only PR changes no code that the job tests, and the job stops live Jarvis for about 15 minutes.
-    if: needs.fixture-model.outputs.docs-only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    # `just merge` merges only a PR that contains `main`, so the PR already tested the tree of a push to `main`.
+    if: github.ref != 'refs/heads/main' && needs.fixture-model.outputs.docs-only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     # The fixture model comes from the cache that `fixture-model` writes.
     needs: fixture-model
     runs-on: [self-hosted, linux, gpu]
