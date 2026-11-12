@@ -1,6 +1,6 @@
 # Phase 12: Interaction Log and Feedback
 
-This phase logs each request with its audio, action and response. You mark the action and the response as good or bad, with an optional correction. Marks change decisions at once, and Phase 13 trains on them.
+This phase logs each request with its audio, action and response. You mark the action and the response as good or bad, with an optional correction, in the Jarvis tab of the HA sidebar. The tab also shows the status of Jarvis, and an HA entity shows the status. Marks change decisions at once, and Phase 13 trains on them.
 
 ---
 
@@ -168,7 +168,7 @@ This phase logs each request with its audio, action and response. You mark the a
 
 - `Interaction` (in `src/domain/feedback.rs`, because the training domain reads it): `id`, `time`, `satellite`, `transcript`, `model_context`, `model` (the run name of the classifier), `top labels` (three labels with probabilities), `slots` (name, value, byte offsets in the normalized transcript), `action` (the `Action` of sub-phase 12.3: the intent of the decision and its targets), `decision` (the kind of the decision: `Reply`, `Fetch` for `Defer` with `Job::Fetch`, `Llm` for `Defer` with `Job::Llm`, or `Ask`), `service calls`, `responses` (text, pool, template), `latency_ms` (from the `voice_end` of the correlated utterance to the end of `handle`; none without audio), `link` (the ID of the first interaction of a dialog). The intent of `action` can be a next intent (sub-phase 12.10), so it is not always the top label. Sub-phase 12.5 adds `marks`.
 - The audio is a BLOB of 16-bit mono PCM at 16 kHz.
-- `append(interaction, audio)`, `list(filter, page) -> Vec<Interaction>` (newest first, `review.page_size`), `get(id) -> Option<Interaction>`. `get` gives the interaction that a mark or a `link` names, so the caller can make its `Rated` (sub-phase 12.3).
+- `append(interaction, audio)`, `list(filter, page) -> Vec<Interaction>` (newest first, `web.page_size`), `get(id) -> Option<Interaction>`. `get` gives the interaction that a mark or a `link` names, so the caller can make its `Rated` (sub-phase 12.3).
 - The adapter creates the schema when the database file does not exist. It stores the schema version in `PRAGMA user_version`. The version starts at 1. A later sub-phase that changes the schema adds one migration step and increases the version. On start, the adapter runs the steps from the stored version to the current version in one transaction, so marks survive an update. A version newer than the code is an error with both versions.
 - This sub-phase adds `log.database`.
 
@@ -372,56 +372,132 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 ---
 
-### 12.8 Review Web API
+### 12.8 Web API
 
-**Goal:** Add the review web server with token authentication and the JSON and WAV endpoints. You can now read and mark interactions over HTTP.
+**Goal:** Add the web server of the Jarvis tab with token authentication and the review endpoints. You can now read and mark interactions over HTTP, and the Jarvis add-on (`01-architecture.md` decision 33) can put the server into the HA sidebar.
 
-- **Implements:** G15. **Depends on:** 12.7.
+- **Implements:** G15, G24. **Depends on:** 12.7.
 - **Files:** create `src/adapters/web.rs`. Modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
 
 **Model.**
 
-- `GET /api/interactions?filter=&page=`, `GET /api/interactions/{id}/audio` (WAV), `GET /api/intents`, `POST /api/interactions/{id}/mark` with `{ "target": "action" | "response", "index": <n> | null, "value": "good" | "bad" | null, "correction": "<intent>" | null }`. `index` is the position of the response in the interaction (sub-phase 12.3). It is required for `response`.
-- `GET /` returns the page without a token. The page has no data. Each `/api/` request needs `Authorization: Bearer <token>`.
-- A browser cannot send this header when it opens a page or loads an `<audio>` source. Thus the page asks for the token, keeps it in `sessionStorage`, sends it with each `fetch`, and plays audio from a blob URL that an authenticated `fetch` makes.
-- This sub-phase adds `[review]` (`listen`, `token_env`, `page_size`) and resolves the token in `Secrets`.
+- `GET api/interactions?filter=&page=`, `GET api/interactions/{id}/audio` (WAV), `GET api/intents`, `POST api/interactions/{id}/mark` with `{ "target": "action" | "response", "index": <n> | null, "value": "good" | "bad" | null, "correction": "<intent>" | null }`. `index` is the position of the response in the interaction (sub-phase 12.3). It is required for `response`.
+- HA ingress serves the Jarvis tab under a path prefix (`/api/hassio_ingress/<session>/`). The add-on removes the prefix before it sends a request to Jarvis. Thus the routes of the server are the same with and without the add-on.
+- Each request under `api/` needs `Authorization: Bearer <token>`. The add-on adds this header to each request that it sends to Jarvis. Thus the page has no token prompt and keeps no token. A request from another machine on the LAN needs the header too.
+- `run` serves the web server on `web.listen` next to the Wyoming server. The shutdown future of `run` stops both (sub-phase 5.4c).
+- This sub-phase adds `[web]` (`listen`, `token_env`, `page_size`) and resolves the token in `Secrets`. `web.page_size` is the page size of `list` (sub-phase 12.4).
 
 **Acceptance criteria.**
 
-- AC-12.8-1: When an `/api/` request has no token or a wrong token, the adapter returns 401.
-- AC-12.8-2: When a request has the correct token, `GET /api/interactions` returns the page from `FakeReview`.
-- AC-12.8-3: When `GET /api/interactions/{id}/audio` runs, the result is a valid WAV file with the stored samples.
+- AC-12.8-1: When a request under `api/` has no token or a wrong token, the adapter returns 401.
+- AC-12.8-2: When a request has the correct token, `GET api/interactions` returns the page from `FakeReview`.
+- AC-12.8-3: When `GET api/interactions/{id}/audio` runs, the result is a valid WAV file with the stored samples.
 - AC-12.8-4: When the interaction has no audio, the audio endpoint returns 404.
-- AC-12.8-5: When `POST /mark` has a correction that is not an intent name, the adapter returns 400.
-- AC-12.8-6: When `GET /` has no token, the adapter returns the page.
-- AC-12.8-7: When `POST /mark` has `"target": "response"` and `"index": 2`, `FakeReview` receives a mark with `Response(2)`. Without `index`, the adapter returns 400.
+- AC-12.8-5: When `POST api/interactions/{id}/mark` has a correction that is not an intent name, the adapter returns 400.
+- AC-12.8-6: When `run` starts, the web server answers on `web.listen`. When the shutdown future completes, the web server stops.
+- AC-12.8-7: When the mark request has `"target": "response"` and `"index": 2`, `FakeReview` receives a mark with `Response(2)`. Without `index`, the adapter returns 400.
 
 **Proofs.**
 
-- P-12.8-1, P-12.8-6. Argument: one middleware layer wraps every `/api/` route and compares the token before the handler runs. `GET /` is outside that layer.
+- P-12.8-1. Argument: one middleware layer wraps every route under `api/` and compares the token before the handler runs.
 - P-12.8-4, P-12.8-5. Argument: the handlers map `None` to 404 and the `Review::mark` error to 400.
 - P-12.8-7. Argument: the handler maps `("response", Some(n))` to `Response(n)` and `("response", None)` to 400.
-- P-12.8-2, P-12.8-3. Evidence: test.
+- P-12.8-2, P-12.8-3, P-12.8-6. Evidence: test.
 
 ---
 
 ### 12.9 Review Page
 
-**Goal:** Add the review page that plays each request's audio and lets you mark the action and the response, with an optional correction. Marking takes one click per interaction.
+**Goal:** Add the page of the Jarvis tab with the review section. It plays the audio of each request and lets you mark the action and the response, with an optional correction. Marking takes one click per interaction, and the page works under the path prefix of HA ingress.
 
-- **Implements:** G15. **Depends on:** 12.8.
+- **Implements:** G15, G24. **Depends on:** 12.8.
 - **Files:** create `src/adapters/review.html`. Modify `src/adapters/web.rs`.
 
-**Model.** `GET /` returns `review.html` (embedded with `include_str!`). The page script is inline JavaScript in `review.html` (`CLAUDE.md` permits it) with the token flow of sub-phase 12.8. For each interaction, the page shows the time, satellite, transcript, an audio player, the action and the response, good and bad buttons for each, and a list of intents for the correction after a bad action mark. It has a filter for bad and unmarked interactions.
+**Model.**
+
+- `GET /` returns `review.html` (embedded with `include_str!`) without a token. The page has no data. The page script is inline JavaScript in `review.html` (`CLAUDE.md` permits it).
+- Every URL in the page is relative, for example `api/interactions`, not `/api/interactions`. HA ingress serves the page under a path prefix, so an absolute URL misses the add-on.
+- The page sends no `Authorization` header, because the add-on adds it. Thus the `audio` element can load `api/interactions/{id}/audio` directly.
+- For each interaction, the page shows the time, satellite, transcript, an audio player, the action and the response, good and bad buttons for each, and a list of intents for the correction after a bad action mark. It has a filter for bad and unmarked interactions.
 
 **Acceptance criteria.**
 
-- AC-12.9-1: When `GET /` runs, the result is HTML that contains the elements `#interactions`, `#filter`, `template#interaction`, an `audio` element in the template, and the buttons `.mark-good`, `.mark-bad` and the `select.correction` list.
+- AC-12.9-1: When `GET /` runs without a token, the result is HTML that contains the elements `#interactions`, `#filter`, `template#interaction`, an `audio` element in the template, and the buttons `.mark-good`, `.mark-bad` and the `select.correction` list.
 - AC-12.9-2: When the inline script of `review.html` is extracted, `node --check` exits with code 0.
+- AC-12.9-3: When `review.html` is checked, no `src`, `href` or `action` attribute and no string in the script starts with `/`, `http:` or `https:`, and the script does not contain `Authorization`.
 
 **Proofs.**
 
-- P-12.9-1, P-12.9-2. Evidence: test.
+- P-12.9-1 to P-12.9-3. Evidence: test.
+
+---
+
+### 12.9b Status
+
+**Goal:** Add the status of Jarvis to the API and to the page. You see in the Jarvis tab that Jarvis is online. Later sub-phases add training, restarting and the rollback message.
+
+- **Implements:** G24. **Depends on:** 12.9.
+- **Files:** modify `src/ports.rs`, `src/lib.rs`, `src/adapters/web.rs`, `src/adapters/review.html`, `src/testing/fakes.rs`.
+
+**Model.**
+
+- `Status { state: State, message: Option<String> }` and `State { Online, Training, Restarting, Offline }` are in `src/ports.rs`. The JSON form is `{ "state": "online", "message": null }`, with the state in lowercase.
+- The composition root keeps the status in a `tokio::sync::watch` channel. The channel starts with `Online` and no message. The web server starts only when the start is ready (sub-phase 12.8), so the API never gives a status before that. Sub-phase 12.9c and later sub-phases read or change the status.
+- The new driving port `Control` has `status() -> Status`. `src/lib.rs` implements it with the receiver of the channel. `adapters/web.rs` calls it. `FakeControl` in `src/testing/fakes.rs` gives a set status.
+- `GET api/status` returns the status.
+- The page has a status section `#status` with `.state` and `.message`. The page reads `api/status` at load and each 5 s. When the request fails, for example when the add-on returns its down page (decision 33), the section shows `offline`.
+
+**Acceptance criteria.**
+
+- AC-12.9b-1: When `run` has started, `GET api/status` returns `{ "state": "online", "message": null }`.
+- AC-12.9b-2: When `FakeControl` gives `training` with the message `run 7`, `GET api/status` returns both.
+- AC-12.9b-3: When `GET /` runs, the HTML contains `#status` with the elements `.state` and `.message`.
+
+**Proofs.**
+
+- P-12.9b-1. Argument: the channel starts with `Online` and no message, and nothing changes it in this sub-phase.
+- P-12.9b-2, P-12.9b-3. Evidence: test.
+
+---
+
+### 12.9c Status Entity
+
+**Goal:** Publish the status of Jarvis as the HA entity `sensor.jarvis_status` through MQTT discovery, with a retained state and a last will. Dashboards and automations see `online`, `training`, `restarting` and `offline`, also when Jarvis dies, and the entity stays after an HA restart.
+
+- **Implements:** G24. **Depends on:** 12.9b.
+- **Files:** create `src/adapters/mqtt.rs`. Modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
+
+**Model.**
+
+- This sub-phase adds the optional section `[mqtt]`: `url` (for example `mqtt://homeassistant.local:1883`), `username_env` and `password_env`. `Secrets` resolves the user name and the password. Without the section, Jarvis publishes no status.
+- `adapters/mqtt.rs` connects to the broker with `rumqttc`, with the client ID `jarvis` and a keep-alive of 30 s. It reads the status from a receiver of the status channel. No use case calls it, so it has no port (`01-architecture.md` section 1).
+- The last will is the payload `{ "state": "offline", "message": null }` on the topic `jarvis/status`, with QoS 1 and retain. The broker publishes it when the connection ends without `DISCONNECT`, at the latest 1.5 keep-alive intervals (45 s) after the last packet.
+- At each `ConnAck`, the first connection and each reconnection, the adapter publishes these two messages with QoS 1 and retain:
+  - On `homeassistant/sensor/jarvis/status/config`: `{ "name": "Status", "unique_id": "jarvis_status", "device": { "identifiers": ["jarvis"], "name": "Jarvis" }, "device_class": "enum", "options": ["online", "training", "restarting", "offline"], "state_topic": "jarvis/status", "value_template": "{{ value_json.state }}", "json_attributes_topic": "jarvis/status" }`. HA makes the entity ID `sensor.jarvis_status` from the device name and the entity name. The field `message` of the status becomes an attribute of the entity.
+  - On `jarvis/status`: the current status.
+- Each change of the status publishes `jarvis/status` again, with retain.
+- The broker keeps both messages. The entity has a `unique_id`, so HA makes it again from the retained discovery message after an HA restart, with the retained state.
+- After a connection error, the adapter waits 5 s, and its next poll connects again.
+- When the sender of the status channel closes, the adapter publishes the last status, sends `DISCONNECT` and ends. After `DISCONNECT` the broker does not publish the will. At the end of `run`, the root sets `Offline` and then drops the sender. Thus a stop gives `offline`.
+- `run` starts the adapter when the start is ready. Thus the entity shows `online` only when Jarvis answers. Before that, the entity keeps the retained state of the earlier process.
+- The tests use an in-process `rumqttd` broker on a local port and a `rumqttc` client that subscribes. They do not pause the clock, and they do not sleep: each test waits for the messages that it expects.
+
+**Acceptance criteria.**
+
+- AC-12.9c-1: When the adapter connects, a client that subscribes after it gets the retained discovery message with `unique_id` `jarvis_status`, `state_topic` `jarvis/status` and the four options, and the retained state `{ "state": "online", "message": null }`.
+- AC-12.9c-2: When the status changes to `training`, the client gets `{ "state": "training", "message": null }` with retain.
+- AC-12.9c-3: When the adapter task is aborted, so that the connection ends without `DISCONNECT`, the client gets `{ "state": "offline", "message": null }`.
+- AC-12.9c-4: When the status is `restarting` and the sender of the channel closes, the adapter ends, and a client that subscribes after the end gets `restarting`.
+- AC-12.9c-5: When the shutdown future of `run` completes, the last status in the channel is `offline`.
+- AC-12.9c-6: When `[mqtt]` is not set, `run` starts and opens no MQTT connection.
+
+**Proofs.**
+
+- P-12.9c-1. Argument: the `ConnAck` arm of the poll loop publishes both messages, so each connection publishes them again.
+- P-12.9c-5. Argument: `run` sends `Offline` after the servers stop and before it drops the sender.
+- P-12.9c-2 to P-12.9c-4, P-12.9c-6. Evidence: test.
+
+**Field log.** In the MQTT broker on the HA host, make the user of Jarvis (for the Mosquitto add-on, an HA user or the `logins` option). Add `MQTT_USERNAME` and `MQTT_PASSWORD` to `jarvis.env`, and set `mqtt.url` to the broker. Restart Jarvis. Record that `sensor.jarvis_status` is `online` and belongs to the device Jarvis. Stop the unit `jarvis` and record `offline`. Restart HA and record that the entity keeps its state.
 
 ---
 
@@ -429,7 +505,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 **Goal:** Make `decide` skip blocked decisions. After a bad mark, the same request goes to the next entity, then the next likely intent, then System Two with the correction.
 
-- **Implements:** G15, G19. **Depends on:** 12.9.
+- **Implements:** G15, G19. **Depends on:** 12.9c.
 - **Files:** modify `src/domain/decide.rs`, `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`.
 - **Quint:** `feedback.qnt` (`DecideAvoidsBlocked`).
 
@@ -482,4 +558,5 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 These steps are not tests and gate nothing.
 
-1. In a browser, open the review page, play the audio of an interaction, and send a mark with a correction.
+1. In the Jarvis tab of HA, play the audio of an interaction, and send a mark with a correction.
+2. Do the field log of sub-phase 12.9c.

@@ -89,6 +89,9 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | Proposal | A learned intent that System Two writes for one cluster. |
 | Plugin request | One Markdown file in a local folder in which Jarvis asks Claude for a new plugin and its fetch intent, for a cluster that needs remote data that no plugin gives. |
 | Approval | Your decision to accept or reject a proposal that calls an HA service. |
+| Jarvis tab | The Jarvis panel in the HA sidebar. It has the review of interactions and proposals and the status of Jarvis. |
+| Jarvis add-on | The HA add-on in `addon/`. It puts the web server of Jarvis into the HA sidebar through HA ingress, and shows a down page when Jarvis does not answer. |
+| Status entity | The HA entity `sensor.jarvis_status`: `online`, `training`, `restarting` or `offline`. Jarvis publishes it through MQTT discovery. |
 | Interaction | One record of one request: audio, transcript, model context, prediction, decision, service calls, responses, latency and marks. |
 | Mark | Your rating of an interaction: `good` or `bad`, for the action and for the response. |
 | Correction | The intent that Jarvis should have selected. You give it with a bad action mark. |
@@ -142,6 +145,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | G21 | Each PR has one concern, starts in a fresh context, is one layer of the phase's stack of PRs, has at most 400 changed lines, a two- or three-sentence summary written after the code, short bullet points and a check box for each required check, and gets a Codex code review with all threads resolved. |
 | G22 | Every test is deterministic. Every check is a gated check in the pre-commit hook and in CI, not only a rule in `CLAUDE.md`. |
 | G23 | Each proof about a domain function is a Verus proof, written in the same PR as the function. Verus also proves that no domain function overflows an integer, indexes out of bounds or fails an `expect`. The only trusted code is the contracts in `src/domain/contracts.rs`. |
+| G24 | Jarvis has a tab in the HA sidebar: the review of interactions and proposals and the status of Jarvis (online, training or restarting). The status entity shows the status to dashboards and automations, also when Jarvis is down, and it stays after an HA restart. |
 
 ### 1.1 Example System One Requests
 
@@ -171,7 +175,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 
 - Users often say "Tell me a joke". The model gives `unknown`, so System Two answers. Jarvis clusters these requests. System Two proposes `tell_joke`, a static intent with 10 jokes. It has no service, so Jarvis adds it automatically. After the next training run, "Tell me a joke" gets System One speed.
 - Users often ask "What is playing on the living room TV?". System One guesses a wrong intent and cannot act, so System Two answers. Jarvis clusters these requests, and System Two proposes a new intent. After the next training run, System One answers it.
-- Users often say "Good night". System Two proposes `good_night` with the service `scene.turn_on`. It calls an HA service, so it waits for your approval on the review page.
+- Users often say "Good night". System Two proposes `good_night` with the service `scene.turn_on`. It calls an HA service, so it waits for your approval in the Jarvis tab.
 - Users often ask "What is on the family calendar today?" at about 07:00 on weekdays. System Two answers with `calendar.get_events` and proposes a prefetch intent. At 06:55 Jarvis gets the answer. At 07:00 the answer is ready.
 
 ### 1.6 Example Training Triggers
@@ -207,7 +211,7 @@ Each line is one PR. The work order follows the rows of this table, not the phas
 | [18 Queries and Media](phase-18.md) | 18.1 List queries · 18.2 Light queries · 18.3 Door, window and lock queries · 18.4 Climate and fan queries · 18.5 Presence and alarm queries · 18.6 Now playing query · 18.7 Music playback · 18.8 Music controls · 18.9 Plex playback · 18.10 TV controls · 18.11 Plex plugin · 18.12 New shows intent · 18.13 Music search data · 18.13b Music search playback · 18.14 Fast artist start · 18.15 Speaker groups · 18.15b Speaker group controls · 18.16 Opposite commands |
 | [10 Multi-Turn Dialogs](phase-10.md) | 10.1 Dialog Quint model · 10.2 Dialog state · 10.3 Answer fill and cancel · 10.4 Ask decision and HA ask · 10.5 Dialog routing · 10.5b Dialog generations · 10.5c Dialog fill context · 10.6 System Two questions · 10.6b System Two answers · 10.7 Early commit for answers |
 | [11 Request Habits](phase-11.md) | 11.1 Source and action · 11.1b Bucket · 11.2 Remove device habits · 11.3 Request habit scores · 11.3b Usual times and habit file · 11.4 Request recording · 11.4b Habit store · 11.5 Remove habits from the model context |
-| [12 Interaction Log and Feedback](phase-12.md) | 12.1 Audio correlation · 12.1b Utterance buffer · 12.2 Feedback Quint model · 12.3 Blocked decisions · 12.3b Apply marks · 12.3c Bad responses and corrections · 12.4 Interaction log port and SQLite storage · 12.4b Interaction updates and audio · 12.5 Marks · 12.5b Deferred requests and pruning · 12.6 Record interactions · 12.6b Record decisions and daily prune · 12.6c Interaction updates · 12.6d Dialog links · 12.7 Review port and use case · 12.8 Review web API · 12.9 Review page · 12.10 Feedback in decide · 12.11 Feedback in responses and System Two |
+| [12 Interaction Log and Feedback](phase-12.md) | 12.1 Audio correlation · 12.1b Utterance buffer · 12.2 Feedback Quint model · 12.3 Blocked decisions · 12.3b Apply marks · 12.3c Bad responses and corrections · 12.4 Interaction log port and SQLite storage · 12.4b Interaction updates and audio · 12.5 Marks · 12.5b Deferred requests and pruning · 12.6 Record interactions · 12.6b Record decisions and daily prune · 12.6c Interaction updates · 12.6d Dialog links · 12.7 Review port and use case · 12.8 Web API · 12.9 Review page · 12.9b Status · 12.9c Status entity · 12.10 Feedback in decide · 12.11 Feedback in responses and System Two |
 | [13 Training](phase-13.md) | 13.1 Mark examples and training set · 13.2 Held-out split and acceptance · 13.3 Change count · 13.4 Training Quint model · 13.5 Paraphrase generation · 13.6 Generated example store · 13.7 Trainer port and process adapter · 13.8 RunPod handler · 13.8b RunPod adapter · 13.9 Training run · 13.10 Training pause and fallback · 13.11 Voice trigger |
 | [14 Learned Intents](phase-14.md) | 14.1 Clusters · 14.2 Proposal rules · 14.3 Learned intent Quint model · 14.4 Proposal generation · 14.5 Learned intent lifecycle · 14.6 Proposal review · 14.7 Activation · 14.8 Prefetch Quint model · 14.9 Prefetch rules · 14.10 Prefetch use case · 14.10b Fetch intent prefetch · 14.11 Learned intents in training · 14.12 Plugin request port and file adapter · 14.13 Plugin requests |
 | [15 Speaker Identification](phase-15.md) | 15.1 Discovery · 15.2 Presence and proximity signals · 15.3 Voice ports and adapters · 15.4 Voice embedding at commit · 15.5 Speaker Quint model · 15.6 Identification and enrollment · 15.7 Person-specific intents |

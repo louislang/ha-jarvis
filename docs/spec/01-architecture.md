@@ -21,6 +21,8 @@ The composition root (`src/lib.rs`) is the only code that knows all layers. The 
 
 `xtask/` is a separate crate in the same Cargo workspace. It holds the developer tools: the complexity gate, the PR size gate, the module graph, the layer rules and the diagram. Jarvis does not depend on it.
 
+`adapters/mqtt.rs` publishes the status entity. The composition root starts it with a receiver of the status channel. No use case calls it, so it has no port.
+
 The training script (`train/`) is outside the layers. It is the only Python code. It reads a training set file and writes ONNX model files. Rust code does not import it. The process adapter starts it as a process on the GPU host. The RunPod adapter starts it on RunPod. `just fixture-model` starts it on the CPU.
 
 Dependency rules:
@@ -37,8 +39,8 @@ Dependency rules:
  HA Assist ──Wyoming──▶ adapters/  │  Assistant port              │
  pipeline              wyoming.rs ─┼─▶ (listen, handle, speak)    │   Home port ──────▶ adapters/ha.rs ─────▶ HA API
                                    │        │                     │   SpeechToText ───▶ adapters/sherpa.rs
- Browser ──HTTP──────▶ adapters/   │  Review port                 │   TextToSpeech ───▶ adapters/supertonic.rs
-                       web.rs ─────┼─▶ (list, mark, proposals)    │   VoiceEmbedder ──▶ adapters/sherpa.rs
+ Jarvis add-on ─HTTP─▶ adapters/   │  Review, Control ports       │   TextToSpeech ───▶ adapters/supertonic.rs
+ (HA ingress)          web.rs ─────┼─▶ (review, status, settings) │   VoiceEmbedder ──▶ adapters/sherpa.rs
                                    │        │                     │   VoiceProfiles ──▶ adapters/sherpa.rs
                                    │   ┌────▼──── app/ ─────────┐ │   Classifier ─────▶ adapters/onnx.rs
                                    │   │ conversation  speech   │─┼─▶ ModelLoader ────▶ adapters/onnx.rs
@@ -51,6 +53,7 @@ Dependency rules:
                                    │   │ dialog habits feedback │ │                     adapters/plex.rs ─▶ Plex
                                    │   │ learn speaker speech   │ │   Models ─────────▶ LiveModels (lib.rs)
                                    │   └────────────────────────┘ │   PluginRequests ─▶ adapters/files.rs
+                                   │                              │   Status ─────────▶ adapters/mqtt.rs (no port) ─▶ MQTT broker
                                    └──────────────────────────────┘
 ```
 
@@ -62,6 +65,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 |---|---|---|---|
 | `Assistant` | Driving | `info`, `listen` (gives a `Listening` session: `push`, `finish`), `handle`, `speak` | Implemented by `App` in `src/lib.rs`. Called by `adapters/wyoming.rs`. |
 | `Review` | Driving | `list`, `audio`, `mark`, `intents`, `proposals`, `resolve` | Implemented by `app/review.rs`. Called by `adapters/web.rs`. |
+| `Control` | Driving | `status`, `settings`, `save` | Implemented in `src/lib.rs`. Called by `adapters/web.rs`. |
 | `Home` | Driven | `snapshot`, `events`, `call`, `announce`, `ask` | `adapters/ha.rs` |
 | `SpeechToText` | Driven | `stream` (first pass: gives `accept`, `partial`, `reset`), `transcribe` (second pass) | `adapters/sherpa.rs` |
 | `TextToSpeech` | Driven | `synth` | `adapters/supertonic.rs` |
@@ -143,7 +147,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 9. **Request habits, not device habits.** Jarvis learns when people ask for what. Each spoken request counts in its bucket: the day type and the hour (phase 11). HA state changes and automations do not count, because native HA automations handle device schedules. Thus habits are not a model input, and they do not select entities or slot values. Request habits move work from System Two (slow and expensive) to System One (fast and cheap): before a usual time, Jarvis prepares the answer of the request (phase 14).
 10. **A habit fades.** Each day counts once for each request and bucket. The score halves each `habits.half_life_days`. A bucket is a usual time while its score is `habits.min_score` or more. With 14 and 2.0, a request on three days within 14 days is a habit on the day of the third request. Requests on two days are never a habit.
 11. **One joint model.** One model gives the intent probabilities and the slot tags. Thus one CPU pass per transcript gives all System One data. Clusters of the requests that System Two answers use OpenAI embeddings (sub-phase 14.1). These do not change when System One retrains, and the context does not change them.
-12. **Train locally first, with the full GPU.** The process adapter runs `train/train.py` on the GPU of the GPU host. A local run and live Jarvis never share the GPU. Jarvis does not announce a run. Before a local run, Jarvis mutes the microphones of the satellites that are not muted, stops answering and releases its model sessions. After the run, with success or an error, Jarvis loads them again, unmutes only the microphones that it muted, and answers again. Then it measures the new model (decision 13). When the local run fails (for example, CUDA out of memory), the training use case sends the same training set to the RunPod adapter. A RunPod run does not pause Jarvis or mute the satellites. Jarvis predicts with the ONNX model through `ort`. The Python script and the inline script of the review page are the only non-Rust code. The training set file is the contract between them.
+12. **Train locally first, with the full GPU.** The process adapter runs `train/train.py` on the GPU of the GPU host. A local run and live Jarvis never share the GPU. Jarvis does not announce a run. Before a local run, Jarvis mutes the microphones of the satellites that are not muted, stops answering and releases its model sessions. After the run, with success or an error, Jarvis loads them again, unmutes only the microphones that it muted, and answers again. Then it measures the new model (decision 13). When the local run fails (for example, CUDA out of memory), the training use case sends the same training set to the RunPod adapter. A RunPod run does not pause Jarvis or mute the satellites. Jarvis predicts with the ONNX model through `ort`. The Python script and the inline script of the page of the Jarvis tab are the only non-Rust code. The training set file is the contract between them.
 13. **Accept only an equal or better model.** Jarvis assigns each example to the held-out set by a stable hash of its text. Jarvis measures the old model and the new model on the same held-out set. Jarvis keeps the new model only when its intent accuracy and its slot accuracy are both equal or higher.
 14. **Training trigger.** Jarvis counts changes since the last training run. At `train.min_changes`, Jarvis starts a run. A voice request starts a run at any count. Only one run occurs at a time. After each run, accepted or rejected, the count starts again from 0.
 15. **Speaker identification is not on the critical path.** Jarvis calculates the voice embedding in the background after commit. Only intents with `needs_speaker = true` wait for the result.
@@ -152,7 +156,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 18. **Dialogs by satellite.** `start_conversation` starts a new pipeline run with a new `conversation_id`. Thus Jarvis keys each dialog by `satellite_id`. When the context has no `satellite_id` (for example, text from the HA UI), Jarvis keys the dialog by `conversation_id` and puts the question in `Handled`. A dialog closes on completion, on cancel, after `dialog.max_turns` questions, or `dialog.timeout_s` after the last question.
 19. **System Two asks with a tool.** The OpenAI request has an `ask_user` tool. When the model calls it, Jarvis asks the question and keeps the dialog open. The next turn sends the answer as the `function_call_output` of that call, with `previous_response_id`.
 20. **System Two teaches System One.** Jarvis clusters the OpenAI embeddings of recent requests that System Two answered: `unknown` requests, requests under `model.threshold` and requests that System One cannot act on. For each large cluster, System Two writes a proposal for a new intent: name, kind, examples, responses and an optional service. Jarvis validates it and saves it to `learned.toml`. The next training run adds it to the model, so System One handles these requests.
-21. **Device control needs approval.** A proposal with a `service` waits for your approval on the review page. Other proposals become active immediately.
+21. **Device control needs approval.** A proposal with a `service` waits for your approval in the Jarvis tab. Other proposals become active immediately.
 22. **Prefetch has no side effects.** A prefetch answer must not change the house. A `Call` step during a prefetch runs only when its service is in `learn.prefetch_services` (read-only services such as `calendar.get_events`). Any other `Call` discards that prefetch. A `Plugin` step always runs, because a plugin only reads data (decision 30). A `States` step also always runs, because it only reads the hot cache (sub-phase 7.6).
 23. **Discovery from HA.** Jarvis reads the HA registries in the hot cache. Each `person` entity lists its `device_trackers`. The sensors on the same device as a tracker give its area and distance (for example from Bermuda with the satellites as Bluetooth proxies). The `binary_sensor` entities with device class `occupancy`, `presence` or `motion` on the satellite device are its presence sensors. Configuration can override discovery. In the reference house (section 11) the presence sensors have no device class. Set their device class to `occupancy` in HA, or list them in `[[satellites]]`.
 24. **Audio correlation.** HA sends the audio (`asr`) and the transcript (`handle`) on different connections with no shared ID. The speech use case keeps each committed utterance (text, audio, time) for `log.correlate_s`. For a voice request (a context with a `satellite_id`), the conversation use case finds the one utterance with the same normalized text and removes it. An ambiguous match gives no audio. Speaker identification uses the same correlation.
@@ -164,6 +168,8 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 30. **Remote data through plugins.** Data from a remote server, for example a weather forecast, reaches Jarvis only through a `Plugin` adapter. Jarvis code builds the request and parses the reply into a typed result. Thus the result is the same for the same reply, and no model sees a raw API call. System Two gets each plugin as its own tool, for example `get_weather(when)`. A System One fetch intent names a plugin. The plugin registry keeps each result for `plugins.cache_s`. A plugin only reads data, so it has no `allowed_domains` check. System Two still calls HA services directly, within `openai.allowed_domains` (sub-phase 7.5). The weather plugin uses Open-Meteo, which needs no API key, with the location of the HA configuration. The Plex plugin reads the recently added items and the On Deck list of the Plex server with a token (phase 18). A new plugin uses a free data source without an API key when one exists. A source with a key needs your approval first, and the PR of the plugin then names the environment variable and the sign-up page.
 31. **Fixed TTS input lengths.** ONNX Runtime keeps the cuDNN state of a `Conv` node only for its last input shape, so each new reply length added about 230 ms to the TTS on the GPU host. Jarvis runs the four Supertonic-3 graphs itself through `ort`, with the fp32 vector estimator and vocoder. It adds zeros and masks to each input up to one of two lengths: 64 text ids and 64 latent frames, or 160 text ids and 192 latent frames. Each length has its own set of sessions, so a change of length builds no new plans. A longer input keeps its length (sub-phases 9.3 and 9.3b).
 32. **Plugin requests through a local folder.** When System Two finds that a cluster needs remote data that no plugin gives, Jarvis does not guess an answer source. It writes one Markdown file for the cluster into the folder `learn.plugin_requests` through the `PluginRequests` port: the example requests, the usual times, the data needed and the task (sub-phase 14.13). The file name is the name of the future fetch intent. Claude watches the folder and writes a normal code PR with the plugin, the fetch intent and its `fresh_min`, and the tests. CI, the Codex review and your review gate it as any other PR, and the next release puts it on the GPU host. How Claude watches the folder is outside Jarvis (field log of sub-phase 14.13). Without `learn.plugin_requests`, Jarvis writes no plugin requests. Thus Jarvis needs no remote service and no token for this.
+
+33. **A tab in Home Assistant.** You use Jarvis through HA, so the review page and the status are one tab in the HA sidebar, as Music Assistant has. HA runs the Supervisor on the HA host, and Jarvis runs on the GPU host. The Jarvis add-on is an `nginx` reverse proxy on the HA host. HA ingress gives the sidebar entry, the HA login and remote access, and serves the tab under a path prefix. Thus the page uses only relative URLs. The add-on adds the bearer token of `web.token_env` to each request, so the page has no token prompt. When Jarvis does not answer, the add-on shows its own down page. The status entity does not depend on the add-on: Jarvis publishes it through MQTT discovery with a `unique_id`, a retained state and a last will `offline`. Thus the broker marks Jarvis offline when the process dies, and the entity stays after an HA restart. (sub-phases 12.8 to 12.9c).
 
 ## 6. Latency Budget (System One)
 
@@ -213,7 +219,9 @@ With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan c
 | `object_store` (feature `aws`) | Adapter | RunPod network volume through its S3-compatible API. |
 | `async-openai` | Adapter | OpenAI Responses API: streaming, tools, structured output, `previous_response_id`. |
 | `rusqlite` (feature `bundled`) | Adapter | Interaction log database. |
-| `axum` | Adapter | Review web page and API. |
+| `axum` | Adapter | Web page and API of the Jarvis tab. |
+| `rumqttc` | Adapter | MQTT client of the status entity: discovery, retained state and last will. |
+| `rumqttd` (dev) | Adapter tests | In-process MQTT broker for the tests of `adapters/mqtt.rs`. |
 | `hound` | Adapter | WAV encode for audio playback. |
 | `toml`, `tempfile` | Adapter, root | File stores with atomic write. Configuration. |
 | `wiremock` (dev) | Adapter tests | Mock OpenAI, RunPod, Open-Meteo and Plex servers. |
@@ -327,8 +335,9 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/adapters/supertonic.rs` | Adapter | `TextToSpeech` with the Supertonic-3 graphs in ONNX Runtime and fixed input lengths. | 9.3 |
 | `src/adapters/openai.rs` | Adapter | `Reasoner` with OpenAI. Prompt builders. | 7.1 |
 | `src/adapters/sqlite.rs` | Adapter | `InteractionLog` with SQLite. | 12.4 |
-| `src/adapters/web.rs` | Driving adapter | Review web server with token auth. It calls `Review`. | 12.8 |
-| `src/adapters/review.html` | Driving adapter | The review page. `web.rs` embeds it with `include_str!`. | 12.9 |
+| `src/adapters/web.rs` | Driving adapter | Web server of the Jarvis tab with token auth. It calls `Review` and `Control`. | 12.8 |
+| `src/adapters/review.html` | Driving adapter | The page of the Jarvis tab: review, status and settings. `web.rs` embeds it with `include_str!`. | 12.9 |
+| `src/adapters/mqtt.rs` | Adapter | The status entity through MQTT discovery, a retained state and a last will. No port (section 1). | 12.9c |
 | `src/adapters/process.rs` | Adapter | `Trainer` that runs `train/train.py` as a local process. | 13.7 |
 | `src/adapters/runpod.rs` | Adapter | `Trainer` with the RunPod REST API and network volume (fallback). | 13.8b |
 | `src/adapters/open_meteo.rs` | Adapter | `Plugin` `get_weather` with the Open-Meteo forecast API. | 17.3 |
@@ -479,10 +488,16 @@ audio_days = 30
 record_days = 90
 correlate_s = 10
 
-[review]
+[web]
 listen = "0.0.0.0:10701"
-token_env = "JARVIS_REVIEW_TOKEN"
+token_env = "JARVIS_WEB_TOKEN"
 page_size = 50
+
+# Optional. Without this section, Jarvis publishes no status entity.
+[mqtt]
+url = "mqtt://homeassistant.local:1883"
+username_env = "MQTT_USERNAME"
+password_env = "MQTT_PASSWORD"
 
 [speaker]
 model = "models/wespeaker_en_voxceleb_CAM++.onnx"
@@ -696,8 +711,9 @@ Training set file (the contract between Jarvis and `train/train.py`):
 | Test machine | macOS x86-64 (Intel MacBook Pro) | `cpu` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, int8. No second pass. | Development. Runs the pre-commit hook (without `bench` and `gpu-test`). |
 | CI | `ubuntu-latest` | `cpu` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, int8. No second pass. | `just check`. |
 | RunPod | RunPod serverless | GPU | — | Training fallback. |
+| HA host | Home Assistant OS with the Supervisor | — | — | Runs HA, the Jarvis add-on and the MQTT broker (Mosquitto add-on). |
 
-The GPU host runs Jarvis as the systemd unit `jarvis`: `jarvis serve jarvis.toml` in a checkout of the release tag. An environment file of the unit holds the secrets, `ORT_DYLIB_PATH`, which points to the `libonnxruntime` in the release folder, and `LD_LIBRARY_PATH`, which points to the release folder (sub-phase 6.1). Port 10700 (Wyoming) has no authentication, so the host firewall accepts it only from the HA host.
+The GPU host runs Jarvis as the systemd unit `jarvis`: `jarvis serve jarvis.toml` in a checkout of the release tag. An environment file of the unit holds the secrets, `ORT_DYLIB_PATH`, which points to the `libonnxruntime` in the release folder, and `LD_LIBRARY_PATH`, which points to the release folder (sub-phase 6.1). Port 10700 (Wyoming) has no authentication, so the host firewall accepts it only from the HA host. Port 10701 (web) needs the token of `web.token_env`.
 
 VRAM budget of live Jarvis on the GPU host (6 GB). A local training run does not share the GPU with live Jarvis, so it has no row.
 
