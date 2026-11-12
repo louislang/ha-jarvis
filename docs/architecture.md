@@ -97,6 +97,7 @@ flowchart LR
     crate_adapters_sherpa --> crate
     crate_adapters_sherpa --> crate_adapters_sherpa
     crate_adapters_sherpa --> crate_ports
+    crate_adapters_sqlite --> crate
     crate_adapters_sqlite --> crate_adapters_sqlite
     crate_adapters_sqlite --> crate_domain_feedback
     crate_adapters_sqlite --> crate_domain_speech

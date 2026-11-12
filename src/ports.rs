@@ -16,6 +16,7 @@ use serde_json::Value;
 use crate::Device;
 use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
+use crate::domain::feedback::Deferred;
 use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
 use crate::domain::feedback::Spoken;
@@ -314,4 +315,12 @@ pub trait InteractionLog: Send + Sync {
 
     /// The interactions with a mark, oldest first.
     async fn marked(&self) -> anyhow::Result<Vec<Interaction>>;
+
+    /// The System Two requests after `since` without a bad action mark, oldest first. A dialog
+    /// answer is not a request.
+    async fn deferred(&self, since: Timestamp) -> anyhow::Result<Vec<Deferred>>;
+
+    /// Deletes the audio older than `log.audio_days`, and the unmarked records older than
+    /// `log.record_days` that no marked record links to.
+    async fn prune(&self, now: Timestamp) -> anyhow::Result<()>;
 }

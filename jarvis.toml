@@ -89,4 +89,6 @@ holdout = 0.1
 
 [log]
 database = "jarvis.db"
+audio_days = 30
+record_days = 90
 correlate_s = 10

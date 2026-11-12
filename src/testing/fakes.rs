@@ -46,8 +46,10 @@ use crate::adapters::supertonic::SupertonicTts;
 use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::feedback;
+use crate::domain::feedback::Deferred;
 use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
+use crate::domain::feedback::Route;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
@@ -681,6 +683,8 @@ impl<T: Clone + Send> Store<T> for FakeStore<T> {
 pub struct FakeLog {
     /// Each appended interaction with its audio, in order.
     pub interactions: Mutex<Vec<(Interaction, Option<Audio>)>>,
+    /// The time of each `prune` call, in order.
+    pub prunes: Mutex<Vec<Timestamp>>,
 }
 
 impl FakeLog {
@@ -715,10 +719,11 @@ impl FakeLog {
     }
 }
 
-/// True when `interaction` has a bad mark.
-fn has_bad(interaction: &Interaction) -> bool {
-    let bad = |mark: &Mark| matches!(mark.value, Some(feedback::Value::Bad));
-    interaction.marks.iter().any(bad)
+/// True when `interaction` has a bad mark on a target that `on` keeps.
+fn has_bad(interaction: &Interaction, on: impl Fn(feedback::Target) -> bool) -> bool {
+    let marks = &interaction.marks;
+    let bad = |mark: &Mark| matches!(mark.value, Some(feedback::Value::Bad)) && on(mark.target);
+    marks.iter().any(bad)
 }
 
 #[async_trait]
@@ -737,7 +742,7 @@ impl InteractionLog for FakeLog {
     async fn list(&self, filter: Filter, page: Page) -> anyhow::Result<Vec<Interaction>> {
         let mut interactions = self.kept(|interaction| match filter {
             Filter::All => true,
-            Filter::Bad => has_bad(interaction),
+            Filter::Bad => has_bad(interaction, |_| true),
         });
         interactions.reverse();
         let skipped = interactions.into_iter().skip(page.number * page.size);
@@ -766,6 +771,27 @@ impl InteractionLog for FakeLog {
 
     async fn marked(&self) -> anyhow::Result<Vec<Interaction>> {
         Ok(self.kept(|interaction| !interaction.marks.is_empty()))
+    }
+
+    async fn deferred(&self, since: Timestamp) -> anyhow::Result<Vec<Deferred>> {
+        let found = self.kept(|interaction| {
+            interaction.time > since
+                && interaction.decision == Route::Llm
+                && interaction.link.is_none()
+                && !has_bad(interaction, |target| target == feedback::Target::Action)
+        });
+        let deferred = found.into_iter().map(|interaction| Deferred {
+            id: interaction.id,
+            text: interaction.transcript,
+            time: interaction.time,
+            spoken: interaction.satellite.is_some(),
+        });
+        Ok(deferred.collect())
+    }
+
+    async fn prune(&self, now: Timestamp) -> anyhow::Result<()> {
+        lock(&self.prunes).push(now);
+        Ok(())
     }
 }
 
