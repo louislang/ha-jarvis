@@ -1,6 +1,6 @@
 # Phase 18: Queries and Media
 
-This phase adds System One query intents about the house, Music Assistant playback and Plex playback. The queries read only the hot cache and make no service call. The music intents call `music_assistant.play_media` and the `media_player` services on the speaker of the area, or on a Music Assistant speaker group. The Plex intents call `media_player.play_media` with a `plex://` content ID on the TV. The list of new Plex shows comes from the Plex server, so it is a plugin (`01-architecture.md` decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 17 and before phase 10.
+This phase adds System One query intents about the house, Music Assistant playback and Plex playback. The queries read only the hot cache and make no service call. The music intents call `music_assistant.play_media` and the `media_player` services on the speaker of the area, or on a Music Assistant speaker group. The Plex intents call `media_player.play_media` with a `plex://` content ID on the TV. The list of new Plex shows comes from the Plex server, so it is a plugin (`01-architecture.md` decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 17 and before phase 10. Sub-phases 18.17 to 18.18b bias the second pass toward the names of the house and of the music library, because the field tests misheard them.
 
 Each sub-phase that adds an intent adds its seed examples to `intents.toml` and its pool to `responses.toml` (`01-architecture.md` section 12). The training set then changes, so `just fixture-model` trains the fixture model again (sub-phase 3.9), and CI trains it again because the cache key is the hash of the training set. AC-3.12-1 to AC-3.12-4 then check the new seed examples. When the fixture model does not learn a new example, the PR changes the examples, not the tests. Jarvis serves the fixture model until sub-phase 13.9, and the training runs of phase 13 use the same seed examples. The tests of the intent sub-phases decide with the catalog of `intents.toml`, the pools of `responses.toml` and the reference house. A test that needs an entity that the reference house does not have adds it to the snapshot before it loads the cache. The tests of AC-3.2-1 and AC-3.2c-2 in `src/domain/catalog.rs` list the intent names in the order of `intents.toml`, so each such sub-phase adds its names there. The fixture model gives each seed example a context by its position, so a new intent can move the contexts of the examples after it. The order of the new intents can change to keep the existing tests passing.
 
@@ -618,6 +618,129 @@ Speaker groups were one sub-phase. With the controls, its tests and its Verus pr
 - P-18.16-1 to P-18.16-6. Evidence: test. The rules are P-4.5c-1, P-4.4c-4 and P-4.5d-1.
 - P-18.16-7, P-18.16-8. Evidence: test. The probabilities come from the model file (`02-rules.md` section 5, rule 5).
 
+---
+
+### 18.17 Second-Pass Hotwords
+
+**Goal:** Let the second pass prefer a list of phrases, the hotwords, with modified beam search. "Play Radiohead" then gives "Radiohead", not "Radio Head", when the list has the name.
+
+- **Implements:** G2. **Depends on:** 18.16.
+- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`, `justfile`, `xtask/src/gates.rs`.
+
+**Model.**
+
+- In the field tests of 2026-11-12, the second pass misheard names. "Play Radiohead" gave "Play Radio Hat", and Music Assistant played the track "Radio" by Hot Water Music. "Resume music" gave "Presume music".
+- sherpa-onnx 2.0.1 biases a NeMo transducer only with `decoding_method = "modified_beam_search"`. Greedy search ignores hotwords. sherpa-onnx splits each hotword into the tokens of the model, so the hotwords also need `modeling_unit = "bpe"` and a `bpe_vocab` file.
+- Measurements on the GPU host with the CPU provider, the `sherpa-onnx-offline` program of v2.0.1, the second-pass model and synthetic speech of five phrases:
+  - With the hotword "Radiohead", "Play Radio Head." became "Play Radiohead.".
+  - With a list of 210 HA names (lights, switches, media players, scenes, scripts, fans, climate, covers, locks and automations), "Play hot water music." became "Play Hot Water Music.", and "Activate movie time." became "Activate Movie Time.". "Resume the music." and "Turn on the desk lamp." did not change.
+  - Hotwords in capital letters broke the decode at the score 3.0: the text had only hotwords. Hotwords as the names are written ("Radiohead", "Desk Lamp") gave the correct text at 1.5 and at 3.0.
+  - The five files with the model load took 2.78 s with greedy search and 2.95 s with beam search and 210 hotwords.
+  - The synthetic speech did not give "Radio Hat" or "Presume". The field log checks these errors.
+- `OfflineRecognizer::create_stream_with_hotwords(text)` gives hotwords for one stream. `/` separates the phrases of `text`. Jarvis sets no `hotwords_file`. Thus the list changes without a model reload. Each such stream encodes the list again and builds its context graph. AC-18.17-7 measures this time.
+- When one token of one phrase is not in `tokens.txt`, sherpa-onnx skips all phrases of the stream. The tokens of the second-pass model have all ASCII letters, digits and the apostrophe, but not "é". `create_stream_with_hotwords` panics on a NUL character. Thus `hotword_text(phrases) -> String`, a pure function in `src/adapters/sherpa.rs`, makes the text:
+  1. Each phrase gets NFKD (`unicode-normalization`), and each character that is not ASCII is removed. "Beyoncé" becomes "Beyonce".
+  2. Each character that is not an ASCII letter, a digit or an apostrophe becomes a space. Thus no `/` and no `:` reach sherpa-onnx, where `/` separates phrases and `:` starts a score. "AC/DC" becomes "AC DC".
+  3. Each run of spaces becomes one space, and the spaces at the two ends are removed. An empty phrase is removed.
+  4. `/` joins the phrases. The case does not change.
+- The model folder has no BPE vocabulary. `bpe_vocab(tokens) -> String`, a pure function in `src/adapters/sherpa.rs`, makes it from the text of `tokens.txt`: one line for each token, with the token, a tab and the score -100 for `<unk>`, else -1. This vocabulary gave the measured results. `SherpaStt::try_new` writes it to a temporary file (`tempfile`) and gives its path as `bpe_vocab`. sherpa-onnx reads the file only during the load.
+- This sub-phase adds `asr.hotwords` (on or off) and `asr.hotwords_score` (more than 0, sub-phase 2.2). When `hotwords` is true, the second pass loads with `modified_beam_search`, the sherpa-onnx default of 4 active paths, `hotwords_score`, `modeling_unit = "bpe"` and the vocabulary. When `hotwords` is false, the second pass loads with greedy search, as before. `jarvis.toml` sets `hotwords = true` and `hotwords_score = 1.5`, the lower of the two correct measured scores. A higher score with a long list can change more words that are not names.
+- `SpeechToText::set_hotwords(phrases: &[String])` keeps `hotword_text(phrases)` for the next `transcribe` calls. `SherpaStt` keeps the text in an `ArcSwap`, so a `transcribe` on another thread does not wait. When `hotwords` is true and the text is not empty, `transcribe` uses `create_stream_with_hotwords`. Else it uses `create_stream`. `FakeStt` records each list.
+- The first pass stays greedy, with no hotwords. sherpa-onnx can also bias an online stream with beam search. But on the GPU host, the first-pass text only gives the speculative prediction, and the time of beam search on each 160 ms chunk and on the flush (sub-phase 6.6c) is not measured.
+- CI and the test machine run no second pass. The adapter tests of this sub-phase decode `speech(text)` (sub-phase 6.6) with the int8 files of the second-pass model. They run on the CPU, as the measurements did. Thus `just models` also downloads the int8 second-pass model (`parakeet_sums`). `gpu-models` keeps its download, because it copies the fp16 files into that folder. If `speech("play radiohead")` does not give "play radio head" without hotwords, a spec PR changes the phrase of AC-18.17-4 and AC-18.17-5 before the code.
+
+**Acceptance criteria.**
+
+- AC-18.17-1: After `just models`, the int8 second-pass folder is in `models/`, and each file of `parakeet_sums` has its SHA-256.
+- AC-18.17-2: `hotword_text` of "Beyoncé", "AC/DC", " Guns N' Roses ", "Night: Day", "" and "Desk Lamp" gives "Beyonce/AC DC/Guns N' Roses/Night Day/Desk Lamp".
+- AC-18.17-3: `bpe_vocab` of "<unk> 0\n▁the 1\ns 2\n" gives "<unk>\t-100\n▁the\t-1\ns\t-1\n".
+- AC-18.17-4: With `hotwords = false`, the normalized second-pass text of `speech("play radiohead")` is "play radio head".
+- AC-18.17-5: With `hotwords = true` and `set_hotwords(["Radiohead"])`, the normalized second-pass text of `speech("play radiohead")` is "play radiohead".
+- AC-18.17-6: With `hotwords = true` and the names and aliases of the areas and entities of the reference house as hotwords, the normalized second-pass text of `speech("add dentist to my calendar for monday")` is "add dentist to my calendar for monday".
+- AC-18.17-7 [GPU host]: With `hotwords = true` and 2000 hotwords (the names of the reference house, then "Name 1", "Name 2" and more), `transcribe` of a 3 s utterance has a p95 of less than 40 ms, the budget of AC-6.7-4.
+- AC-18.17-8: A configuration with `asr.hotwords_score = 0` fails with an error that names the field and the range.
+
+**Proofs.**
+
+- P-18.17-2. Argument: steps 1 to 3 change one phrase at a time, and step 4 joins only the phrases that are not empty.
+- P-18.17-3. Argument: `bpe_vocab` keeps the first field of each line, and only `<unk>` gets -100.
+- P-18.17-8. Argument: `validate` checks `asr.hotwords_score` with the other values that must be more than 0.
+- P-18.17-1, P-18.17-4 to P-18.17-7. Evidence: test.
+
+---
+
+### 18.18 Hotword List
+
+**Goal:** Build the hotwords from the names of the house, the command verbs of the intent catalog and the music library. The second pass then prefers the names and the commands that people say in their requests.
+
+- **Implements:** G2, G9. **Depends on:** 18.17.
+- **Files:** modify `src/domain/speech.rs`, `src/domain/catalog.rs`, `intents.toml`.
+
+**Model.**
+
+- `HOTWORD_DOMAINS` in `src/domain/speech.rs` holds the domains of the measured list: `automation`, `climate`, `cover`, `fan`, `light`, `lock`, `media_player`, `scene`, `script` and `switch`.
+- `Intent.verbs: Vec<String>`, default empty, holds the command verbs of the intent. You write them in `intents.toml` from the examples of the intent. A verb starts a request, and the second pass writes the first word of a sentence with a capital letter ("Resume the music."). A hotword matches only with the same case, so each verb has a capital first letter.
+- `intents.toml` gets these verbs. `lights_on` and `fan_on`: "Turn on". `lights_off`, `fan_off` and `tv_off`: "Turn off". `volume_up`: "Turn up". `volume_down`: "Turn down". `music_pause` and `tv_pause`: "Pause". `music_resume`: "Resume" and "Unpause". `queue_music`: "Queue". `tv_skip`: "Fast forward". `continue_show`: "Continue" and "Keep watching".
+- The verbs "Play", "Stop", "Start", "Set", "Put" and "Make" are not hotwords. These short words are in most requests and in many names, so a boost on them can change other words. The verbs of the list are distinct words or verb phrases of two words. A hotword gets its score only when the whole phrase matches, so a verb phrase does not change one of its words alone.
+- `hotwords(cache, catalog, music) -> Vec<String>` is a pure function. It gives, in this order:
+  1. The name and then the aliases of each area, in the order of `cache.areas`.
+  2. The name and then the aliases of each entity of `cache.entities` that is in a domain of `HOTWORD_DOMAINS` and is not skipped (`is_skipped`, sub-phase 4.4b), in the order of `cache.entities`.
+  3. The verbs of each intent of `catalog.intents`, in the order of the catalog.
+  4. The names of `music`, in their order.
+- `hotwords` does not change a name or a verb. `hotword_text` makes the text for sherpa-onnx (sub-phase 18.17). A phrase can occur more than one time.
+- The measurements tested only names. The field log checks the effect of the verbs on "Resume the music".
+- `music_entry(cache) -> Option<&str>` is a pure function. It gives the `config_entry_id` of the first entity of `cache.entities` that has a `config_entry_id` and whose state has the attribute `mass_player_type`. Each Music Assistant player has this attribute (sub-phase 18.15), and its config entry is the config entry of Music Assistant (sub-phase 18.13).
+
+**Acceptance criteria.**
+
+- AC-18.18-1: When `hotwords` gets the reference house, a catalog with only `music_resume` and the verbs "Resume" and "Unpause", and the music names "Jazzy" and "Radiohead", the list is the seven area names in the order of the house, then the names and aliases of the entities of `HOTWORD_DOMAINS`, then "Resume", "Unpause", "Jazzy" and "Radiohead". It contains "Bedtime" (a scene), "Porch Light" (an alias of "Front Porch Light") and "the TV". It does not contain "Kitchen Presence" (a binary sensor).
+- AC-18.18-2: When the test gives "Office Fan" an entity category, hides it or disables it, the list does not contain "Office Fan".
+- AC-18.18-3: When the state of `media_player.carson_kitchen` has `mass_player_type = "player"` and its registry entry has `config_entry_id = "music_assistant"`, `music_entry` gives "music_assistant". When no entity has both, it gives `None`.
+- AC-18.18-4: The catalog of `intents.toml` gives `music_resume` the verbs "Resume" and "Unpause" and `lights_on` the verb "Turn on". No intent has the verb "Play", "Stop", "Start", "Set", "Put" or "Make".
+
+**Proofs.**
+
+- P-18.18-1, P-18.18-2 (AC-18.18-1, AC-18.18-2). Ensures: `hotwords(cache, catalog, music) = area_words(cache.areas) + entity_words(cache, cache.entities) + verb_words(catalog.intents) + music`. `area_words(areas)` is the concatenation of `[area.name] + area.aliases` for each area in order. `entity_words(cache, entities)` is the concatenation of `[entity.name] + entity.aliases` for each entity in order whose domain is in `HOTWORD_DOMAINS` and that is not `skipped(cache, entity)`. `verb_words(intents)` is the concatenation of `intent.verbs` for each intent in order. Argument: `hotwords` makes one pass over the areas, one over the entities and one over the intents. The loop invariant of each pass states that the result is the spec function of the items before the index. Then it appends `music`. `is_skipped` gives `skipped` (P-4.4b-6).
+- P-18.18-4. Evidence: test.
+- P-18.18-3 (AC-18.18-3). Ensures: `music_entry(cache)` is the `config_entry_id` of the first entity of `cache.entities` with a `config_entry_id` and a state with `mass_player_type`, and `None` when no entity has both. Argument: one pass over the entities, with the loop invariant that no entity before the index has both.
+
+---
+
+### 18.18b Hotword Refresh
+
+**Goal:** Give the hotword list to the second pass at the start and each hour. A new entity, a renamed scene or a new artist in the library then reaches the second pass without a restart.
+
+- **Implements:** G2, G9. **Depends on:** 18.18.
+- **Files:** modify `src/app/background.rs`, `src/lib.rs`, `src/testing/fakes.rs`.
+
+Sub-phases 18.18 and 18.18b were one sub-phase. With the Verus proofs and the tests of the task, it changes about 450 lines, which is more than the limit of 400 (`02-rules.md` section 7.1, rule 8).
+
+**Model.**
+
+- `refresh_hotwords(home, cache, catalog, stt)` in `src/app/background.rs`:
+  1. When `music_entry` of the hot cache gives a config entry, it calls `music_assistant.get_library` with no target, `return_response: true` and the data `{ config_entry_id, media_type, limit: 500, order_by: "play_count_desc" }`, for each `media_type` of `playlist`, `artist` and `album`, in this order. The names are the `name` of each item of `items` in the response.
+  2. A failed call, or a response that does not parse, is logged. The list then has no names of that media type.
+  3. It calls `stt.set_hotwords(hotwords(cache, catalog, names))` with the hot cache after the calls and the catalog of `intents.toml`. It logs one `info` event with the number of hotwords.
+- `music_assistant.get_library` gives the library of Music Assistant, not the catalog of a streaming provider. The limit of the action is 500 items, so each media type has one call and at most the 500 most played items. Thus the list has at most 1500 music names, the names of the house and the verbs. AC-18.17-7 measures 2000 hotwords.
+- Track names are not hotwords. A library has many more tracks than artists, and many track names are common words, for example "Jazz" or "Home". "Play" with a track name still goes to the search of sub-phase 18.13b.
+- `start_hotwords(home, cache, catalog, stt)` starts a task. The task waits until the hot cache has its first snapshot (`config` is not `None`). Then it runs `refresh_hotwords` at once and again each `HOTWORDS_REFRESH` (one hour, a constant). Thus a change of a name reaches the second pass in one hour or less. The task stops with the runtime and saves nothing.
+- `run` starts the task only when `asr.hotwords` is true and `asr.second_pass_dir` is set.
+- `FakeHome` can give a response for each `get_library` call by its `media_type`.
+
+**Acceptance criteria.**
+
+- AC-18.18b-1: When the hot cache has `media_player.carson_kitchen` with `mass_player_type = "player"` and `config_entry_id = "music_assistant"`, `FakeHome` records three `music_assistant.get_library` calls with no target, `return_response: true` and the data `{ config_entry_id: "music_assistant", media_type, limit: 500, order_by: "play_count_desc" }`, with the `media_type` `playlist`, `artist` and `album`, in this order.
+- AC-18.18b-2: When the three calls give "Jazzy", "Radiohead" and "OK Computer", `FakeStt` records the list of `hotwords` with the music names "Jazzy", "Radiohead" and "OK Computer".
+- AC-18.18b-3: When the `artist` call fails, `FakeStt` records the list with "Jazzy" and "OK Computer" only.
+- AC-18.18b-4: When no entity has `mass_player_type`, `FakeHome` records no `get_library` call, and `FakeStt` records the list of the house names and the verbs.
+- AC-18.18b-5: Before the first snapshot loads, `FakeStt` records no list. After one hour of virtual time, `FakeStt` records a second list, with the name of an entity that the test renamed in the hot cache.
+
+**Proofs.**
+
+- P-18.18b-1 to P-18.18b-3. Argument: `refresh_hotwords` makes the three calls in order. Each failure gives no names for its media type, and the list comes from `hotwords` (P-18.18-1).
+- P-18.18b-4. Argument: `refresh_hotwords` makes the calls only when `music_entry` gives `Some` (P-18.18-3).
+- P-18.18b-5. Evidence: test.
+
 ## Field Log
 
 These steps are not tests and gate nothing.
@@ -629,3 +752,6 @@ These steps are not tests and gate nothing.
 5. Set `PLEX_TOKEN` in the environment file of the `jarvis` unit. Ask "Are there any new shows?". Compare the answer with the Plex home screen.
 6. Say "Play hip hop", "Play jazz" and "Play Radiohead" in the Office. Make sure that the speaker plays the playlist "Hip Hop", the playlist "jazzy" and the artist "Radiohead", and that Jarvis announces no failure.
 7. Say "Play jazz downstairs." Make sure that all speakers of "Downstairs Speakers" play. Say "Pause the music downstairs." Make sure that they pause.
+8. After a release with sub-phase 18.18b, find the `info` event with the number of hotwords in the log of the `jarvis` unit. Compare the number with the names in HA and the library of Music Assistant.
+9. In the Office, say "Play Radiohead" and "Resume the music". Make sure that the transcripts in the log are "Play Radiohead." and "Resume the music.", and that the speaker plays the artist "Radiohead". If "Presume" stays, record it and the score of the verbs (sub-phase 18.18).
+10. In the Office, say "Turn on the office lights" five times. Make sure that the response latency in the log has no new delay (Phase 9 field log).

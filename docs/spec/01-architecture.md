@@ -69,7 +69,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | `Review` | Driving | `list`, `audio`, `mark`, `intents`, `proposals`, `resolve` | Implemented by `app/review.rs`. Called by `adapters/web.rs`. |
 | `Control` | Driving | `status`, `settings`, `save` | Implemented in `src/lib.rs`. Called by `adapters/web.rs`. |
 | `Home` | Driven | `snapshot`, `events`, `call`, `announce`, `ask` | `adapters/ha.rs` |
-| `SpeechToText` | Driven | `stream` (first pass: gives `accept`, `partial`, `reset`), `transcribe` (second pass) | `adapters/sherpa.rs` |
+| `SpeechToText` | Driven | `stream` (first pass: gives `accept`, `partial`, `reset`), `transcribe` (second pass), `set_hotwords` | `adapters/sherpa.rs` |
 | `TextToSpeech` | Driven | `synth` | `adapters/supertonic.rs` |
 | `VoiceEmbedder` | Driven | `embed` | `adapters/sherpa.rs` |
 | `VoiceProfiles` | Driven | `enroll`, `similarities` | `adapters/sherpa.rs` |
@@ -170,6 +170,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 30. **Remote data through plugins.** Data from a remote server, for example a weather forecast, reaches Jarvis only through a `Plugin` adapter. Jarvis code builds the request and parses the reply into a typed result. Thus the result is the same for the same reply, and no model sees a raw API call. System Two gets each plugin as its own tool, for example `get_weather(when)`. A System One fetch intent names a plugin. The plugin registry keeps each result for `plugins.cache_s`. A plugin only reads data, so it has no `allowed_domains` check. System Two still calls HA services directly, within `openai.allowed_domains` (sub-phase 7.5). The weather plugin uses Open-Meteo, which needs no API key, with the location of the HA configuration. The Plex plugin reads the recently added items and the On Deck list of the Plex server with a token (phase 18). A new plugin uses a free data source without an API key when one exists. A source with a key needs your approval first, and the PR of the plugin then names the environment variable and the sign-up page.
 31. **Fixed TTS input lengths.** ONNX Runtime keeps the cuDNN state of a `Conv` node only for its last input shape, so each new reply length added about 230 ms to the TTS on the GPU host. Jarvis runs the four Supertonic-3 graphs itself through `ort`, with the fp32 vector estimator and vocoder. It adds zeros and masks to each input up to one of two lengths: 64 text ids and 64 latent frames, or 160 text ids and 192 latent frames. Each length has its own set of sessions, so a change of length builds no new plans. A longer input keeps its length (sub-phases 9.3 and 9.3b).
 32. **Plugin requests through a local folder.** When System Two finds that a cluster needs remote data that no plugin gives, Jarvis does not guess an answer source. It writes one Markdown file for the cluster into the folder `learn.plugin_requests` through the `PluginRequests` port: the example requests, the usual times, the data needed and the task (sub-phase 14.13). The file name is the name of the future fetch intent. Claude watches the folder and writes a normal code PR with the plugin, the fetch intent and its `fresh_min`, and the tests. CI, the Codex review and your review gate it as any other PR, and the next release puts it on the GPU host. How Claude watches the folder is outside Jarvis (field log of sub-phase 14.13). Without `learn.plugin_requests`, Jarvis writes no plugin requests. Thus Jarvis needs no remote service and no token for this.
+33. **Speech biasing.** The second pass decodes with modified beam search and a list of hotwords: the names and aliases of the areas, of the entities that people control (lights, switches, fans, climate, covers, locks, media players, scenes, scripts and automations), the command verbs of the intent catalog (`verbs`, for example "Resume" and "Turn on"), and the playlists, artists and albums of the Music Assistant library. A phrase of the list that the audio matches gets `asr.hotwords_score` for each token. Each stream gets the list (`create_stream_with_hotwords`), so the list changes without a model reload. Jarvis builds the list at the start and each hour (sub-phases 18.17 to 18.18b). On the GPU host with the CPU provider, "Play Radio Head." became "Play Radiohead." and "Activate movie time." became "Activate Movie Time.". Hotwords keep the case of the names: hotwords in capital letters broke the decode. A verb has a capital first letter, because it starts the sentence. The first pass stays greedy, because on the GPU host its text only gives the speculative prediction.
 
 33. **A tab in Home Assistant.** You use Jarvis through HA, so the review page, the status and the settings form are one tab in the HA sidebar, as Music Assistant has. HA runs the Supervisor on the HA host, and Jarvis runs on the GPU host. The Jarvis add-on is an `nginx` reverse proxy on the HA host. HA ingress gives the sidebar entry, the HA login and remote access, and serves the tab under a path prefix. Thus the page uses only relative URLs. The add-on adds the bearer token of `web.token_env` to each request, so the page has no token prompt. When Jarvis does not answer, the add-on shows its own down page. The status entity does not depend on the add-on: Jarvis publishes it through MQTT discovery with a `unique_id`, a retained state and a last will `offline`. Thus the broker marks Jarvis offline when the process dies, and the entity stays after an HA restart. The settings form shows a fixed list of fields and no secret. A save checks the new file with the checks of the start, keeps the old file, and restarts Jarvis with exit code 75, which the unit restarts. When the next start fails or crashes before it is ready, Jarvis puts the old file back and starts again, and the status shows the reason. One save gives at most two automatic restarts (sub-phases 12.8 to 12.9g).
 
@@ -205,18 +206,18 @@ With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan c
 | `vstd` | Domain | Verus: `#[verus_spec]`, `#[verus_verify]`, `verus!`, spec types and the `vstd` specifications of `std`. A normal build erases the proof code. |
 | `serde`, `serde_json` | All | Data types and messages. |
 | `tokio` | Application, adapters | Async runtime, TCP, timers, channels. |
-| `arc-swap` | Application, root | Atomic swap of the System One model. |
+| `arc-swap` | Application, adapter, root | Atomic swap of the System One model and of the hotword text of the second pass. |
 | `tokio-util` | Adapter, root | `TaskTracker`: the connection tasks and the `after` work that a shutdown waits for. |
 | `anyhow` | All except domain | Error propagation. Domain functions return typed errors. |
 | `tracing`, `tracing-subscriber` | Application, adapters, root | Logs and latency spans. |
 | `futures` | Ports, application, adapters | `Stream` for events, partial transcripts and sentences. |
 | `async-trait` | Ports, application, adapters, root | Async methods on port traits behind `Arc<dyn Port>`. |
 | `tokio-tungstenite`, `futures-util` | Adapter | HA WebSocket API. |
-| `sherpa-onnx` (`=2.0.1`, feature `shared`) | Adapter | Streaming STT (`OnlineRecognizer`), voice identification (`SpeakerEmbeddingExtractor`, `SpeakerEmbeddingManager`). CUDA or CPU provider. |
+| `sherpa-onnx` (`=2.0.1`, feature `shared`) | Adapter | Streaming STT (`OnlineRecognizer`), second pass with hotwords (`OfflineRecognizer`), voice identification (`SpeakerEmbeddingExtractor`, `SpeakerEmbeddingManager`). CUDA or CPU provider. |
 | `text-processing-rs` | Adapter | Numbers as words in the second-pass text (`tn_normalize_sentence`). |
 | `ort` (features `load-dynamic`, `cuda`), `tokenizers` | Adapter | System One model prediction and the Supertonic-3 TTS graphs with ONNX Runtime (CUDA or CPU execution provider). Tokenizer from `tokenizer.json`. |
 | `rand_distr` | Adapter | Seeded normal noise of the Supertonic-3 latent (`StandardNormal`). |
-| `unicode-normalization` | Adapter | NFKD of the TTS text before the Supertonic-3 indexer. |
+| `unicode-normalization` | Adapter | NFKD of the TTS text before the Supertonic-3 indexer, and of the hotwords. |
 | `reqwest` | Adapter | RunPod serverless REST API. Open-Meteo forecast API (features `json`, `query`). Plex server API. |
 | `object_store` (feature `aws`) | Adapter | RunPod network volume through its S3-compatible API. |
 | `async-openai` | Adapter | OpenAI Responses API: streaming, tools, structured output, `previous_response_id`. |
@@ -226,7 +227,7 @@ With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan c
 | `rumqttc` | Adapter | MQTT client of the status entity: discovery, retained state and last will. |
 | `rumqttd` (dev) | Adapter tests | In-process MQTT broker for the tests of `adapters/mqtt.rs`. |
 | `hound` | Adapter | WAV encode for audio playback. |
-| `toml`, `tempfile` | Adapter, root | File stores with atomic write. Configuration. |
+| `toml`, `tempfile` | Adapter, root | File stores with atomic write. Configuration. The BPE vocabulary file of the second pass. |
 | `wiremock` (dev) | Adapter tests | Mock OpenAI, RunPod, Open-Meteo and Plex servers. |
 | `rubato` (dev) | Test | Resample TTS audio from 44.1 kHz to 16 kHz in `speech(text)`. |
 | `cargo-llvm-cov` (tool) | — | Coverage gate. |
@@ -319,13 +320,13 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/domain/responses.rs` | Domain | Pools: select, render, record use, backfill policy, validation. | 4.1 |
 | `src/domain/select.rs` | Domain | Entity selection for an intent and an area. | 4.4 |
 | `src/domain/decide.rs` | Domain | `decide`: prediction and context to `Decision`. | 4.5 |
-| `src/domain/speech.rs` | Domain | Audio type, commit policy, audio chunks, sentence split, audio correlation. | 6.2 |
+| `src/domain/speech.rs` | Domain | Audio type, commit policy, audio chunks, sentence split, audio correlation, hotword list. | 6.2 |
 | `src/domain/dialog.rs` | Domain | Dialog state, answer fill, cancel, turn limit. | 10.2 |
 | `src/domain/habits.rs` | Domain | Request habits: buckets, decayed day scores, usual times. | 11.1 |
 | `src/domain/feedback.rs` | Domain | Marks, corrections, feedback rules. | 12.3 |
 | `src/domain/learn.rs` | Domain | Clusters, proposal validation, approval rule, prefetch schedule and freshness. | 14.1 |
 | `src/domain/speaker.rs` | Domain | Discovery, presence, proximity and identification. | 15.1 |
-| `src/app/background.rs` | Application | Hot cache sync, request habit store, backfill, learned intents, prefetch. | 2.9 |
+| `src/app/background.rs` | Application | Hot cache sync, request habit store, backfill, learned intents, prefetch, hotword refresh. | 2.9 |
 | `src/app/conversation.rs` | Application | `handle` use case, dispatch, deferred jobs, dialog map. | 4.8 |
 | `src/app/speech.rs` | Application | `listen` and `speak` use cases, audio cache, pre-render. | 6.3b |
 | `src/app/review.rs` | Application | `Review` use case. | 12.7 |
@@ -402,6 +403,8 @@ vad_min_silence_ms = 60
 early_commit_ms = 100
 endpoint_ms = 600
 max_utterance_ms = 8000
+hotwords = true     # second pass: beam search with the names of the house (decision 33)
+hotwords_score = 1.5
 
 [tts]
 model_dir = "models/sherpa-onnx-supertonic-3-tts-int8-2026-05-11"
@@ -634,6 +637,7 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 - `select` is a list of entity filters. A filter has a `domain`, an optional `name` and an optional `device_class`. `name` matches whole words of the entity name or an alias, without case sensitivity (`fan` matches "Office Fan", not "Infant Monitor"). An entity matches when one filter matches. `select` skips an entity that has an entity category, that is hidden or disabled, or that is on a satellite device (a device with an `assist_satellite` entity) and is not a `media_player`.
 - `exclude` is a list of entity IDs that `select` never matches. Use it for a sensor that gives bad values.
 - `plugin` is the tool name of the plugin of a fetch intent, for example `get_weather`.
+- `verbs` are the command verbs of the intent, with a capital first letter, for example "Resume". The second pass prefers them (decision 33). Short verbs that are in most requests, for example "Play" and "Stop", are not verbs of the list.
 - `fresh_min` is how long the answer of a fetch or prefetch intent stays fresh, in minutes, for example 5 for traffic and 30 for the weather. Each fetch and prefetch intent has it, and no other kind has it. Before a usual time of the intent (phase 11), Jarvis prefetches the answer. Then it refreshes the answer each `fresh_min` until the window ends (sub-phases 14.9 to 14.10b).
 - `search = true` makes Jarvis search Music Assistant for the `media_id` of the call and play the best match (sub-phase 18.13b). An artist match starts with one track of the artist (sub-phase 18.14). Only `play_music` has it.
 - The area is the area slot. If no slot, it is the satellite area. The area slot matches an area name or alias without case sensitivity. For a command, an area slot that matches no area can name a Music Assistant speaker group (sub-phase 18.15).
