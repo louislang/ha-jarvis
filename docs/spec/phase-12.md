@@ -257,7 +257,7 @@ This phase logs each request with its audio, action and response. You mark the a
 - **Implements:** G15. **Depends on:** 12.5b.
 - **Files:** modify `src/app/conversation.rs`, `src/app/speech.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `src/testing/e2e.rs`.
 
-**Model.** `handle` makes the interaction ID before dispatch. The first ID is the clock time in microseconds at the start, and each request adds one, so the IDs stay unique after a restart. When the context has a `satellite_id`, `handle` correlates the audio once. This call moves from `src/lib.rs` (sub-phase 12.1b) into the conversation use case. A match removes the utterance, so `handle` is the only caller: it sends the utterance with the append, and sub-phase 15.6 uses the same utterance for the speaker. Before it returns, it sends the append to the log writer task on an unbounded channel. The writer runs the messages in the order it receives them. The record has the ID, the time, the satellite, the transcript, the model context, the model `fixture` (the model folder that Jarvis loads), the three top labels, the decision and the latency. Its action is the top label with no targets. Sub-phase 12.6b adds the targets, the slots, the service calls and the responses. `FakeLog` gets `delay`: each `append` and `update` waits it. The end-to-end harness (sub-phase 9.1) keeps the log database in its temporary folder.
+**Model.** `handle` makes the interaction ID before dispatch. The first ID is the clock time in microseconds at the start, and each request adds one. Sub-phase 12.6b also starts above the stored IDs. When the context has a `satellite_id`, `handle` correlates the audio once. This call moves from `src/lib.rs` (sub-phase 12.1b) into the conversation use case. A match removes the utterance, so `handle` is the only caller: it sends the utterance with the append, and sub-phase 15.6 uses the same utterance for the speaker. Before it returns, it sends the append to the log writer task on an unbounded channel. The writer runs the messages in the order it receives them. The record has the ID, the time, the satellite, the transcript, the model context, the model `fixture` (the model folder that Jarvis loads), the three top labels, the decision and the latency. Its action is the top label with no targets. Sub-phase 12.6b adds the targets, the slots, the service calls and the responses. `FakeLog` gets `delay`: each `append` and `update` waits it. The end-to-end harness (sub-phase 9.1) keeps the log database in its temporary folder.
 
 **Acceptance criteria.**
 
@@ -275,10 +275,10 @@ This phase logs each request with its audio, action and response. You mark the a
 
 ### 12.6b Record Decisions and Daily Prune
 
-**Goal:** Add the parts of the decision to each record, and prune the log once a day. A mark can then rate the action and each response.
+**Goal:** Add the parts of the decision to each record, keep new IDs above the stored IDs, and prune the log once a day. A mark can then rate the action and each response.
 
 - **Implements:** G15. **Depends on:** 12.6.
-- **Files:** modify `src/app/conversation.rs`, `src/app/background.rs`, `src/lib.rs`.
+- **Files:** modify `src/app/conversation.rs`, `src/app/background.rs`, `src/adapters/sqlite.rs`, `src/lib.rs`.
 
 **Model.** The record gets these values:
 
@@ -286,15 +286,17 @@ This phase logs each request with its audio, action and response. You mark the a
 - A slot gets the byte offsets of the first match of its value in the normalized transcript. A slot without a match is left out.
 - `responses` has the text that `handle` returns, with its pool and template: the reply, the filler or the question of the decision, or the deferred answer for a request without a satellite. A System Two text has an empty pool and template.
 
-The background use case calls `prune` once a day, the first time one day after the start.
+The first interaction ID is the larger of the clock time in microseconds at the start and the largest stored ID plus one. Thus a clock that moved back before a restart does not reuse a stored ID. At the start, before the log writer task starts, `SqliteLog` gives the largest stored ID with `SELECT MAX(id)`. `list` cannot give it, because it orders by time. The background use case calls `prune` once a day, the first time one day after the start.
 
 **Acceptance criteria.**
 
 - AC-12.6b-1: When a voice request with the area slot `kitchen` completes, the interaction has the slot with its byte offsets, the action with its sorted targets, the service calls, and the response with its pool and template.
 - AC-12.6b-2: When one day passes on `FakeClock`, `FakeLog` records one `prune` call.
+- AC-12.6b-3: When the log has an interaction whose ID is larger than the start time in microseconds, the first new interaction gets that ID plus one.
 
 **Proofs.**
 
+- P-12.6b-3. Argument: the counter starts at the larger of the start time and the largest stored ID plus one, and each request adds one. Thus each new ID is larger than every stored ID.
 - P-12.6b-1, P-12.6b-2. Evidence: test.
 
 ---
