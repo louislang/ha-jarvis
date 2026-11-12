@@ -12,8 +12,7 @@ use crate::domain::select;
 use crate::domain::state::ServiceCall;
 
 /// The part of an interaction that a mark rates.
-#[verus_verify]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum Target {
     /// The action: the intent and its targets.
     Action,
@@ -22,8 +21,7 @@ pub enum Target {
 }
 
 /// A rating.
-#[verus_verify]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum Value {
     /// The rated part was right.
     Good,
@@ -32,8 +30,7 @@ pub enum Value {
 }
 
 /// A rating of one part of one interaction.
-#[verus_verify]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Mark {
     /// The ID of the interaction.
     pub interaction: u64,
@@ -139,6 +136,8 @@ pub struct Interaction {
     pub latency_ms: Option<u64>,
     /// The ID of the first interaction of the dialog, for a dialog answer.
     pub link: Option<u64>,
+    /// The marks, at most one for each target.
+    pub marks: Vec<Mark>,
 }
 
 /// One mark with the interaction that it rates.

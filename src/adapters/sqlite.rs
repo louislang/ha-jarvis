@@ -7,10 +7,12 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
+use rusqlite::Params;
 use rusqlite::params;
 use rusqlite::types::FromSql;
 
 use crate::domain::feedback::Interaction;
+use crate::domain::feedback::Mark;
 use crate::domain::speech::Audio;
 use crate::ports::Change;
 use crate::ports::Filter;
@@ -19,9 +21,20 @@ use crate::ports::Page;
 
 /// The migration steps of the schema. The step at index `n` moves the schema from version `n` to
 /// version `n + 1`.
-const STEPS: [&str; 1] = [
+const STEPS: [&str; 2] = [
     "CREATE TABLE interactions (id INTEGER PRIMARY KEY, time INTEGER NOT NULL, record TEXT NOT NULL, audio BLOB)",
+    "CREATE TABLE marks (interaction INTEGER NOT NULL, mark TEXT NOT NULL)",
 ];
+
+/// The JSON record of an interaction with its marks, in the order that they were stored.
+const RECORD: &str = "json_set(record, '$.marks', json((SELECT json_group_array(json(mark) ORDER BY rowid) FROM marks WHERE interaction = interactions.id)))";
+
+/// Adds the mark `?2` to the interaction `?1`.
+const ADD: &str = "INSERT INTO marks (interaction, mark) VALUES (?1, ?2)";
+
+/// The condition of the interactions with a bad mark.
+const BAD: &str =
+    "id IN (SELECT interaction FROM marks WHERE json_extract(mark, '$.value') = 'Bad')";
 
 /// The sample rate of the stored audio.
 const RATE: u32 = 16_000;
@@ -75,6 +88,24 @@ impl SqliteLog {
         .await?
     }
 
+    /// The interactions with their marks that `clauses` select with `values`.
+    async fn records(
+        &self,
+        clauses: String,
+        values: impl Params + Send + 'static,
+    ) -> anyhow::Result<Vec<Interaction>> {
+        let query = format!("SELECT {RECORD} FROM interactions {clauses}");
+        let records = self
+            .run(move |connection| {
+                let mut statement = connection.prepare(&query)?;
+                let rows = statement.query_map(values, |row| row.get(0))?;
+                rows.collect::<rusqlite::Result<Vec<String>>>()
+            })
+            .await?;
+        let interactions = records.iter().map(|record| serde_json::from_str(record));
+        Ok(interactions.collect::<Result<_, _>>()?)
+    }
+
     /// The value of `column` of the interaction `id`, or `None` when the interaction does not
     /// exist.
     async fn column<T: FromSql + Send + 'static>(
@@ -103,14 +134,23 @@ impl InteractionLog for SqliteLog {
                 .flat_map(|sample| sample.to_le_bytes())
                 .collect()
         });
+        let marks: Vec<String> = interaction
+            .marks
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()?;
         let (id, time) = (interaction.id, interaction.time.as_millisecond());
         self.run(move |connection| {
+            let transaction = connection.unchecked_transaction()?;
             let insert =
                 "INSERT INTO interactions (id, time, record, audio) VALUES (?1, ?2, ?3, ?4)";
-            connection.execute(insert, params![id, time, record, bytes])
+            transaction.execute(insert, params![id, time, record, bytes])?;
+            for mark in &marks {
+                transaction.execute(ADD, params![id, mark])?;
+            }
+            transaction.commit()
         })
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn update(&self, id: u64, change: Change) -> anyhow::Result<()> {
@@ -124,25 +164,19 @@ impl InteractionLog for SqliteLog {
         Ok(())
     }
 
-    async fn list(&self, Filter::All: Filter, page: Page) -> anyhow::Result<Vec<Interaction>> {
-        let records = self
-            .run(move |connection| {
-                let query = "SELECT record FROM interactions ORDER BY time DESC, id DESC LIMIT ?1 OFFSET ?2";
-                let mut statement = connection.prepare(query)?;
-                let offset = page.number.saturating_mul(page.size);
-                let rows = statement.query_map(params![page.size, offset], |row| row.get(0))?;
-                rows.collect::<rusqlite::Result<Vec<String>>>()
-            })
-            .await?;
-        let interactions = records.iter().map(|record| serde_json::from_str(record));
-        Ok(interactions.collect::<Result<_, _>>()?)
+    async fn list(&self, filter: Filter, page: Page) -> anyhow::Result<Vec<Interaction>> {
+        let kept = match filter {
+            Filter::All => String::new(),
+            Filter::Bad => format!("WHERE {BAD}"),
+        };
+        let offset = page.number.saturating_mul(page.size);
+        let clauses = format!("{kept} ORDER BY time DESC, id DESC LIMIT ?1 OFFSET ?2");
+        self.records(clauses, (page.size, offset)).await
     }
 
     async fn get(&self, id: u64) -> anyhow::Result<Option<Interaction>> {
-        let record: Option<String> = self.column("record", id).await?;
-        Ok(record
-            .map(|record| serde_json::from_str(&record))
-            .transpose()?)
+        let mut found = self.records("WHERE id = ?1".to_owned(), (id,)).await?;
+        Ok(found.pop())
     }
 
     async fn audio(&self, id: u64) -> anyhow::Result<Option<Audio>> {
@@ -156,6 +190,26 @@ impl InteractionLog for SqliteLog {
             }
         }))
     }
+
+    async fn mark(&self, mark: Mark) -> anyhow::Result<()> {
+        let (id, kept) = (mark.interaction, mark.value.is_some());
+        let record = serde_json::to_string(&mark)?;
+        self.run(move |connection| {
+            let transaction = connection.unchecked_transaction()?;
+            let remove = "DELETE FROM marks WHERE interaction = ?1 AND json_extract(mark, '$.target') = json_extract(?2, '$.target')";
+            transaction.execute(remove, params![id, record])?;
+            if kept {
+                transaction.execute(ADD, params![id, record])?;
+            }
+            transaction.commit()
+        })
+        .await
+    }
+
+    async fn marked(&self) -> anyhow::Result<Vec<Interaction>> {
+        let clauses = "WHERE id IN (SELECT interaction FROM marks) ORDER BY time, id";
+        self.records(clauses.to_owned(), ()).await
+    }
 }
 
 #[cfg(test)]
@@ -166,9 +220,12 @@ mod tests {
 
     use super::*;
     use crate::domain::feedback::Action;
+    use crate::domain::feedback::Mark;
     use crate::domain::feedback::Route;
     use crate::domain::feedback::Spoken;
     use crate::domain::feedback::Tagged;
+    use crate::domain::feedback::Target;
+    use crate::domain::feedback::Value;
     use crate::domain::state::ServiceCall;
 
     /// The first page of 50 interactions.
@@ -182,6 +239,25 @@ mod tests {
         let folder = tempfile::tempdir().expect("a temporary folder");
         let log = SqliteLog::open(&folder.path().join("jarvis.db")).expect("the log opens");
         (log, folder)
+    }
+
+    /// The mark `value` on `target` of the interaction `id`, with the correction `tv_show`.
+    fn mark(id: u64, target: Target, value: Option<Value>) -> Mark {
+        Mark {
+            interaction: id,
+            target,
+            value,
+            correction: Some("tv_show".to_owned()),
+            time: Timestamp::from_second(1).expect("a valid second"),
+        }
+    }
+
+    /// The IDs of `interactions`.
+    fn ids(interactions: &[Interaction]) -> Vec<u64> {
+        interactions
+            .iter()
+            .map(|interaction| interaction.id)
+            .collect()
     }
 
     /// The response `text` from the pool `pool`.
@@ -228,6 +304,7 @@ mod tests {
             responses: vec![spoken("tv_on", "Turning on the TV.")],
             latency_ms: Some(120),
             link: Some(1),
+            marks: Vec::new(),
         }
     }
 
@@ -248,13 +325,8 @@ mod tests {
         for id in 1..=60 {
             log.append(interaction(id), None).await?;
         }
-        let ids: Vec<u64> = log
-            .list(Filter::All, PAGE)
-            .await?
-            .iter()
-            .map(|i| i.id)
-            .collect();
-        assert_eq!(ids, (11..=60).rev().collect::<Vec<u64>>());
+        let listed = log.list(Filter::All, PAGE).await?;
+        assert_eq!(ids(&listed), (11..=60).rev().collect::<Vec<u64>>());
         Ok(())
     }
 
@@ -264,7 +336,7 @@ mod tests {
         let (_log, folder) = log();
         let connection = Connection::open(folder.path().join("jarvis.db"))?;
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         let count: u32 =
             connection.query_row("SELECT count(*) FROM interactions", [], |row| row.get(0))?;
         assert_eq!(count, 0);
@@ -276,11 +348,11 @@ mod tests {
     fn ac_12_4_4_newer_schema_is_an_error() -> anyhow::Result<()> {
         let folder = tempfile::tempdir()?;
         let path = folder.path().join("jarvis.db");
-        Connection::open(&path)?.pragma_update(None, "user_version", 2)?;
+        Connection::open(&path)?.pragma_update(None, "user_version", 3)?;
         let Err(error) = SqliteLog::open(&path) else {
             panic!("a newer schema opens");
         };
-        let expected = "the schema version 2 of the database is newer than the version 1 of Jarvis";
+        let expected = "the schema version 3 of the database is newer than the version 2 of Jarvis";
         assert_eq!(error.to_string(), expected);
         Ok(())
     }
@@ -310,6 +382,84 @@ mod tests {
         log.append(interaction(8), None).await?;
         assert_eq!(log.audio(7).await?, Some(audio));
         assert_eq!(log.audio(8).await?, None);
+        Ok(())
+    }
+
+    /// `append` stores the marks of the interaction.
+    #[tokio::test]
+    async fn append_keeps_the_marks() -> anyhow::Result<()> {
+        let (log, _folder) = log();
+        let mut marked = interaction(7);
+        marked
+            .marks
+            .push(mark(7, Target::Action, Some(Value::Good)));
+        log.append(marked.clone(), None).await?;
+        assert_eq!(log.get(7).await?, Some(marked));
+        Ok(())
+    }
+
+    /// AC-12.5-1.
+    #[tokio::test]
+    async fn ac_12_5_1_marked_gives_the_correction() -> anyhow::Result<()> {
+        let (log, _folder) = log();
+        log.append(interaction(7), None).await?;
+        log.append(interaction(8), None).await?;
+        let bad = mark(7, Target::Action, Some(Value::Bad));
+        log.mark(bad.clone()).await?;
+        let mut expected = interaction(7);
+        expected.marks.push(bad);
+        assert_eq!(log.marked().await?, [expected]);
+        Ok(())
+    }
+
+    /// AC-12.5-2.
+    #[tokio::test]
+    async fn ac_12_5_2_bad_filter_keeps_bad_marks() -> anyhow::Result<()> {
+        let (log, _folder) = log();
+        for id in 1..=5 {
+            log.append(interaction(id), None).await?;
+        }
+        let marks = [
+            mark(1, Target::Action, Some(Value::Good)),
+            mark(2, Target::Response(0), Some(Value::Bad)),
+            mark(4, Target::Action, Some(Value::Bad)),
+            mark(4, Target::Action, None),
+            mark(5, Target::Action, Some(Value::Bad)),
+        ];
+        for marked in marks {
+            log.mark(marked).await?;
+        }
+        assert_eq!(ids(&log.list(Filter::Bad, PAGE).await?), [5, 2]);
+        Ok(())
+    }
+
+    /// Writes a database of schema version 1 at `path` with the record of `interaction` without
+    /// its marks.
+    fn version_one(path: &Path, interaction: &Interaction) -> anyhow::Result<()> {
+        let connection = Connection::open(path)?;
+        connection.execute_batch(STEPS[0])?;
+        connection.pragma_update(None, "user_version", 1)?;
+        let mut record = serde_json::to_value(interaction)?;
+        if let Some(fields) = record.as_object_mut() {
+            fields.remove("marks");
+        }
+        let (id, time) = (interaction.id, interaction.time.as_millisecond());
+        let insert = "INSERT INTO interactions (id, time, record) VALUES (?1, ?2, ?3)";
+        connection.execute(insert, params![id, time, record.to_string()])?;
+        Ok(())
+    }
+
+    /// AC-12.5-3.
+    #[tokio::test]
+    async fn ac_12_5_3_migration_keeps_every_record() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let path = folder.path().join("jarvis.db");
+        version_one(&path, &interaction(7))?;
+        let log = SqliteLog::open(&path)?;
+        assert_eq!(log.get(7).await?, Some(interaction(7)));
+        let connection = Connection::open(&path)?;
+        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        assert_eq!(version, 2);
         Ok(())
     }
 }

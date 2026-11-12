@@ -17,6 +17,7 @@ use crate::Device;
 use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::feedback::Interaction;
+use crate::domain::feedback::Mark;
 use crate::domain::feedback::Spoken;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
@@ -276,6 +277,8 @@ pub enum Change {
 pub enum Filter {
     /// Every interaction.
     All,
+    /// The interactions with a bad mark.
+    Bad,
 }
 
 /// One page of a list.
@@ -304,4 +307,11 @@ pub trait InteractionLog: Send + Sync {
 
     /// The audio of the interaction `id`, or `None` when it has none.
     async fn audio(&self, id: u64) -> anyhow::Result<Option<Audio>>;
+
+    /// Stores `mark` instead of the earlier mark of its interaction and target. A `None` value
+    /// removes the earlier mark.
+    async fn mark(&self, mark: Mark) -> anyhow::Result<()>;
+
+    /// The interactions with a mark, oldest first.
+    async fn marked(&self) -> anyhow::Result<Vec<Interaction>>;
 }

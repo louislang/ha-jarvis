@@ -46,6 +46,7 @@ use crate::domain::decide::Artist;
 use crate::domain::decide::MediaItem;
 use crate::domain::decide::SearchResults;
 use crate::domain::dialog::Key;
+use crate::domain::feedback;
 use crate::domain::feedback::Action;
 use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Route;
@@ -218,6 +219,18 @@ pub struct ExRoute(Route);
 /// One logged request.
 #[verifier::external_type_specification]
 pub struct ExInteraction(Interaction);
+
+/// A rating of one part of one interaction.
+#[verifier::external_type_specification]
+pub struct ExMark(feedback::Mark);
+
+/// The part of an interaction that a mark rates.
+#[verifier::external_type_specification]
+pub struct ExMarkTarget(feedback::Target);
+
+/// A rating.
+#[verifier::external_type_specification]
+pub struct ExMarkValue(feedback::Value);
 
 /// The lists of a Music Assistant search response.
 #[verifier::external_type_specification]
