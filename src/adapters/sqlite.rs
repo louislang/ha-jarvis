@@ -8,9 +8,11 @@ use async_trait::async_trait;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 use rusqlite::params;
+use rusqlite::types::FromSql;
 
 use crate::domain::feedback::Interaction;
 use crate::domain::speech::Audio;
+use crate::ports::Change;
 use crate::ports::Filter;
 use crate::ports::InteractionLog;
 use crate::ports::Page;
@@ -20,6 +22,9 @@ use crate::ports::Page;
 const STEPS: [&str; 1] = [
     "CREATE TABLE interactions (id INTEGER PRIMARY KEY, time INTEGER NOT NULL, record TEXT NOT NULL, audio BLOB)",
 ];
+
+/// The sample rate of the stored audio.
+const RATE: u32 = 16_000;
 
 /// The interaction log in one SQLite database file. Each interaction is a JSON record.
 pub struct SqliteLog {
@@ -69,6 +74,22 @@ impl SqliteLog {
         })
         .await?
     }
+
+    /// The value of `column` of the interaction `id`, or `None` when the interaction does not
+    /// exist.
+    async fn column<T: FromSql + Send + 'static>(
+        &self,
+        column: &str,
+        id: u64,
+    ) -> anyhow::Result<Option<T>> {
+        let query = format!("SELECT {column} FROM interactions WHERE id = ?1");
+        self.run(move |connection| {
+            connection
+                .query_row(&query, [id], |row| row.get(0))
+                .optional()
+        })
+        .await
+    }
 }
 
 #[async_trait]
@@ -92,6 +113,17 @@ impl InteractionLog for SqliteLog {
         Ok(())
     }
 
+    async fn update(&self, id: u64, change: Change) -> anyhow::Result<()> {
+        let Change::Response(spoken) = change;
+        let spoken = serde_json::to_string(&spoken)?;
+        self.run(move |connection| {
+            let add = "UPDATE interactions SET record = json_insert(record, '$.responses[#]', json(?2)) WHERE id = ?1";
+            connection.execute(add, params![id, spoken])
+        })
+        .await?;
+        Ok(())
+    }
+
     async fn list(&self, Filter::All: Filter, page: Page) -> anyhow::Result<Vec<Interaction>> {
         let records = self
             .run(move |connection| {
@@ -107,17 +139,22 @@ impl InteractionLog for SqliteLog {
     }
 
     async fn get(&self, id: u64) -> anyhow::Result<Option<Interaction>> {
-        let record: Option<String> = self
-            .run(move |connection| {
-                let query = "SELECT record FROM interactions WHERE id = ?1";
-                connection
-                    .query_row(query, [id], |row| row.get(0))
-                    .optional()
-            })
-            .await?;
+        let record: Option<String> = self.column("record", id).await?;
         Ok(record
             .map(|record| serde_json::from_str(&record))
             .transpose()?)
+    }
+
+    async fn audio(&self, id: u64) -> anyhow::Result<Option<Audio>> {
+        let bytes: Option<Option<Vec<u8>>> = self.column("audio", id).await?;
+        Ok(bytes.flatten().map(|bytes| {
+            let (pairs, _) = bytes.as_chunks::<2>();
+            let samples = pairs.iter().map(|pair| i16::from_le_bytes(*pair));
+            Audio {
+                samples: samples.collect(),
+                rate: RATE,
+            }
+        }))
     }
 }
 
@@ -245,6 +282,34 @@ mod tests {
         };
         let expected = "the schema version 2 of the database is newer than the version 1 of Jarvis";
         assert_eq!(error.to_string(), expected);
+        Ok(())
+    }
+
+    /// AC-12.4b-1.
+    #[tokio::test]
+    async fn ac_12_4b_1_update_adds_the_announce() -> anyhow::Result<()> {
+        let (log, _folder) = log();
+        log.append(interaction(7), None).await?;
+        let announce = spoken("announce", "The show is on.");
+        log.update(7, Change::Response(announce.clone())).await?;
+        let mut expected = interaction(7);
+        expected.responses.push(announce);
+        assert_eq!(log.list(Filter::All, PAGE).await?, [expected]);
+        Ok(())
+    }
+
+    /// AC-12.4b-2.
+    #[tokio::test]
+    async fn ac_12_4b_2_audio_gives_the_stored_samples() -> anyhow::Result<()> {
+        let (log, _folder) = log();
+        let audio = Audio {
+            samples: vec![0, 1, -1, i16::MAX, i16::MIN, 300],
+            rate: 16_000,
+        };
+        log.append(interaction(7), Some(audio.clone())).await?;
+        log.append(interaction(8), None).await?;
+        assert_eq!(log.audio(7).await?, Some(audio));
+        assert_eq!(log.audio(8).await?, None);
         Ok(())
     }
 }

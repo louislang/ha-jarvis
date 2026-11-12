@@ -1,5 +1,6 @@
 //! A fake for each port.
 
+use std::cmp;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
@@ -45,6 +46,7 @@ use crate::Device;
 use crate::adapters::supertonic::SupertonicTts;
 use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
+use crate::domain::feedback::Interaction;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
@@ -52,14 +54,18 @@ use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
 use crate::ports::Assistant;
+use crate::ports::Change;
 use crate::ports::Classifier;
 use crate::ports::Clock;
 use crate::ports::Context;
+use crate::ports::Filter;
 use crate::ports::Handled;
 use crate::ports::Home;
 use crate::ports::Info;
+use crate::ports::InteractionLog;
 use crate::ports::Listening;
 use crate::ports::ModelLoader;
+use crate::ports::Page;
 use crate::ports::Partial;
 use crate::ports::Plugin;
 use crate::ports::Reasoner;
@@ -666,6 +672,60 @@ impl<T: Clone + Send> Store<T> for FakeStore<T> {
         *lock(&self.value) = Some(value.clone());
         lock(&self.saves).push(value.clone());
         Ok(())
+    }
+}
+
+/// An `InteractionLog` in memory.
+#[derive(Default)]
+pub struct FakeLog {
+    /// Each appended interaction with its audio, in order.
+    pub interactions: Mutex<Vec<(Interaction, Option<Audio>)>>,
+}
+
+impl FakeLog {
+    /// The interaction `id` with its audio.
+    fn find(&self, id: u64) -> Option<(Interaction, Option<Audio>)> {
+        let interactions = lock(&self.interactions);
+        interactions
+            .iter()
+            .find(|(found, _)| found.id == id)
+            .cloned()
+    }
+}
+
+#[async_trait]
+impl InteractionLog for FakeLog {
+    async fn append(&self, interaction: Interaction, audio: Option<Audio>) -> anyhow::Result<()> {
+        lock(&self.interactions).push((interaction, audio));
+        Ok(())
+    }
+
+    async fn update(&self, id: u64, change: Change) -> anyhow::Result<()> {
+        let Change::Response(spoken) = change;
+        let mut interactions = lock(&self.interactions);
+        let found = interactions.iter_mut().find(|(found, _)| found.id == id);
+        if let Some((interaction, _)) = found {
+            interaction.responses.push(spoken);
+        }
+        Ok(())
+    }
+
+    async fn list(&self, Filter::All: Filter, page: Page) -> anyhow::Result<Vec<Interaction>> {
+        let mut interactions: Vec<Interaction> = lock(&self.interactions)
+            .iter()
+            .map(|(interaction, _)| interaction.clone())
+            .collect();
+        interactions.sort_by_key(|interaction| cmp::Reverse(interaction.time));
+        let skipped = interactions.into_iter().skip(page.number * page.size);
+        Ok(skipped.take(page.size).collect())
+    }
+
+    async fn get(&self, id: u64) -> anyhow::Result<Option<Interaction>> {
+        Ok(self.find(id).map(|(interaction, _)| interaction))
+    }
+
+    async fn audio(&self, id: u64) -> anyhow::Result<Option<Audio>> {
+        Ok(self.find(id).and_then(|(_, audio)| audio))
     }
 }
 
