@@ -159,32 +159,50 @@ This phase logs each request with its audio, action and response. You mark the a
 
 ### 12.4 Interaction Log Port and SQLite Storage
 
-**Goal:** Add the `InteractionLog` port and its SQLite adapter with `append`, `update`, `list` and `audio`. Each request can now be stored with its audio and found again.
+**Goal:** Add the `InteractionLog` port and its SQLite adapter with `append`, `list` and `get`. Each request can now be stored with its audio and found again.
 
 - **Implements:** G15. **Depends on:** 12.3c.
-- **Files:** create `src/adapters/sqlite.rs`. Modify `src/ports.rs`, `src/domain/feedback.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `jarvis.toml`, `Cargo.toml`.
+- **Files:** create `src/adapters/sqlite.rs`. Modify `src/ports.rs`, `src/domain/feedback.rs`, `src/domain/state.rs`, `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
 
 **Model.**
 
-- `Interaction` (in `src/domain/feedback.rs`, because the training domain reads it): `id`, `time`, `satellite`, `transcript`, `model_context`, `model` (the run name of the classifier), `top labels` (three labels with probabilities), `slots` (name, value, byte offsets in the normalized transcript), `decision`, `service calls`, `responses` (text, pool, template), `latency_ms` (from the `voice_end` of the correlated utterance to the end of `handle`; none without audio), `link` (the first interaction of a dialog), `marks`.
+- `Interaction` (in `src/domain/feedback.rs`, because the training domain reads it): `id`, `time`, `satellite`, `transcript`, `model_context`, `model` (the run name of the classifier), `top labels` (three labels with probabilities), `slots` (name, value, byte offsets in the normalized transcript), `action` (the `Action` of sub-phase 12.3: the intent of the decision and its targets), `decision` (the kind of the decision: `Reply`, `Fetch` for `Defer` with `Job::Fetch`, `Llm` for `Defer` with `Job::Llm`, or `Ask`), `service calls`, `responses` (text, pool, template), `latency_ms` (from the `voice_end` of the correlated utterance to the end of `handle`; none without audio), `link` (the ID of the first interaction of a dialog). The intent of `action` can be a next intent (sub-phase 12.10), so it is not always the top label. Sub-phase 12.5 adds `marks`.
 - The audio is a BLOB of 16-bit mono PCM at 16 kHz.
-- `append`, `update(id, change)`, `list(filter, page) -> Vec<Interaction>` (newest first, `review.page_size`), `audio(id) -> Option<Audio>`.
+- `append(interaction, audio)`, `list(filter, page) -> Vec<Interaction>` (newest first, `review.page_size`), `get(id) -> Option<Interaction>`. `get` gives the interaction that a mark or a `link` names, so the caller can make its `Rated` (sub-phase 12.3).
 - The adapter creates the schema when the database file does not exist. It stores the schema version in `PRAGMA user_version`. The version starts at 1. A later sub-phase that changes the schema adds one migration step and increases the version. On start, the adapter runs the steps from the stored version to the current version in one transaction, so marks survive an update. A version newer than the code is an error with both versions.
 - This sub-phase adds `log.database`.
 
 **Acceptance criteria.**
 
-- AC-12.4-1: When `append` runs, `list` returns the interaction with every field.
-- AC-12.4-2: When `update` adds an announce text, `list` returns the interaction with that text.
-- AC-12.4-3: When `list` gets a page size of 50 with 60 interactions, it returns 50, newest first.
-- AC-12.4-4: When `audio` runs for an interaction with audio, it returns the same samples that `append` stored.
-- AC-12.4-5: When the database file does not exist, the adapter creates it with the schema.
-- AC-12.4-6: When the database has a schema version newer than the code, the adapter returns an error with both versions.
+- AC-12.4-1: When `append` runs, `list` and `get` return the interaction with every field.
+- AC-12.4-2: When `list` gets a page size of 50 with 60 interactions, it returns 50, newest first.
+- AC-12.4-3: When the database file does not exist, the adapter creates it with the schema.
+- AC-12.4-4: When the database has a schema version newer than the code, the adapter returns an error with both versions.
 
 **Proofs.**
 
-- P-12.4-3. Argument: the query is `ORDER BY time DESC LIMIT page_size OFFSET page * page_size`.
-- P-12.4-1, P-12.4-2, P-12.4-4 to P-12.4-6. Evidence: test.
+- P-12.4-2. Argument: the query is `ORDER BY time DESC LIMIT page_size OFFSET page * page_size`.
+- P-12.4-1, P-12.4-3, P-12.4-4. Evidence: test.
+
+---
+
+### 12.4b Interaction Updates and Audio
+
+**Goal:** Add `update` and `audio` to the log, and `FakeLog`. Later announces and questions reach the stored interaction, and its audio can be played again.
+
+- **Implements:** G15. **Depends on:** 12.4.
+- **Files:** modify `src/ports.rs`, `src/adapters/sqlite.rs`, `src/testing/fakes.rs`.
+
+**Model.** `update(id, change)`: a change adds a later announce or question to `responses`. `audio(id) -> Option<Audio>` gives the stored samples at 16 kHz. `FakeLog` keeps the interactions and their audio in memory, for the application tests of sub-phase 12.6.
+
+**Acceptance criteria.**
+
+- AC-12.4b-1: When `update` adds an announce text, `list` returns the interaction with that text.
+- AC-12.4b-2: When `audio` runs for an interaction with audio, it returns the same samples that `append` stored.
+
+**Proofs.**
+
+- P-12.4b-1, P-12.4b-2. Evidence: test.
 
 ---
 
@@ -192,10 +210,10 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Goal:** Add `mark`, `marked`, `deferred` and `prune` to the log. Marks are stored with corrections, requests that System Two answered can be clustered later, and old audio is deleted while marked records are kept.
 
-- **Implements:** G14, G15. **Depends on:** 12.4.
+- **Implements:** G14, G15. **Depends on:** 12.4b.
 - **Files:** modify `src/ports.rs`, `src/adapters/sqlite.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `mark(mark)` (stores the mark with its time), `marked() -> Vec<Interaction>`, `deferred(since) -> Vec<Deferred { id, text, time, spoken }>` (interactions after `since` whose decision is `Defer` with `Job::Llm`, without a bad action mark and without a `link`; `spoken` is true when the interaction has a `satellite`; `Deferred` is in `src/domain/feedback.rs`), `prune(now)`: delete audio older than `audio_days` and unmarked records older than `record_days`. Thus `deferred` gives each request that System Two answered: a top label `unknown`, a top probability less than `model.threshold`, a label that is not in the catalog, a blocked decision (sub-phase 12.10), or an intent that System One cannot act on (sub-phase 4.5). A dialog answer is not a request, so `deferred` leaves it out. The marks are migration step 2 of the schema (sub-phase 12.4). This sub-phase adds `log.audio_days` and `log.record_days`.
+**Model.** `Interaction` gets `marks`. `mark(mark)` (stores the mark with its time), `marked() -> Vec<Interaction>`, `deferred(since) -> Vec<Deferred { id, text, time, spoken }>` (interactions after `since` whose decision is `Defer` with `Job::Llm`, without a bad action mark and without a `link`; `spoken` is true when the interaction has a `satellite`; `Deferred` is in `src/domain/feedback.rs`), `prune(now)`: delete audio older than `audio_days` and unmarked records older than `record_days`. `prune` keeps a record that a marked record links to, so `get` of the `link` of a marked dialog answer still makes its `Rated` (sub-phase 12.7). Thus `deferred` gives each request that System Two answered: a top label `unknown`, a top probability less than `model.threshold`, a label that is not in the catalog, a blocked decision (sub-phase 12.10), or an intent that System One cannot act on (sub-phase 4.5). A dialog answer is not a request, so `deferred` leaves it out. The marks are migration step 2 of the schema (sub-phase 12.4). This sub-phase adds `log.audio_days` and `log.record_days`.
 
 **Acceptance criteria.**
 
@@ -205,12 +223,13 @@ This phase logs each request with its audio, action and response. You mark the a
 - AC-12.5-4: When `prune` runs, it deletes audio older than `audio_days` and unmarked records older than `record_days`.
 - AC-12.5-5: When `prune` runs, it keeps every marked record, at any age.
 - AC-12.5-6: When the database has schema version 1 with records, the adapter migrates it to version 2 and keeps every record.
+- AC-12.5-7: When `prune` runs, it keeps an unmarked first interaction of a dialog, at any age, when a marked answer of the dialog links to it.
 
 **Proofs.**
 
 - P-12.5-3. Argument: the query has the four conditions in its `WHERE` clause.
 - P-12.5-6. Evidence: test.
-- P-12.5-4, P-12.5-5. Argument: the record delete has `marks IS NULL AND time < now - record_days`. A marked record fails the first condition.
+- P-12.5-4, P-12.5-5, P-12.5-7. Argument: the record delete has `marks IS NULL AND time < now - record_days AND id NOT IN (SELECT link FROM interactions WHERE marks IS NOT NULL AND link IS NOT NULL)`. A marked record fails the first condition. A first interaction that a marked record links to fails the third condition. The delete never removes a marked record, so the link stays.
 - P-12.5-1, P-12.5-2. Evidence: test.
 
 ---
@@ -250,7 +269,7 @@ This phase logs each request with its audio, action and response. You mark the a
 - **Implements:** G15. **Depends on:** 12.6.
 - **Files:** create `src/app/review.rs`. Modify `src/ports.rs`, `src/lib.rs`, `src/testing/fakes.rs`.
 
-**Model.** `Review`: `list(filter, page)`, `audio(id)`, `mark(mark)`, `intents()`. `mark` checks that a correction is an intent name or `unknown`, writes the mark to the log and applies it to the feedback model.
+**Model.** `Review`: `list(filter, page)`, `audio(id)`, `mark(mark)`, `intents()`. `mark` checks that a correction is an intent name or `unknown`, writes the mark to the log and applies it to the feedback model. It makes the `Rated` of the marked interaction with `get`: its transcript, action and responses, and the transcript of the interaction that its `link` names.
 
 **Acceptance criteria.**
 
@@ -353,7 +372,7 @@ This phase logs each request with its audio, action and response. You mark the a
 - **Implements:** G4, G5, G15. **Depends on:** 12.10.
 - **Files:** modify `src/domain/responses.rs`, `src/adapters/openai.rs`, `src/app/background.rs`, `src/lib.rs`.
 
-**Model.** `select` now returns `Option<usize>`. The allowed responses are those that are not bad. If two or more are allowed, `last` is also excluded. With none allowed, `select` returns `None`, and dispatch replies with empty text. No-bad takes precedence over no-repeat. `needs_backfill` counts only responses that are not bad. The `generate` prompt includes `examples(pool, 5)`. At startup, the feedback model is built from `marked()`.
+**Model.** `select` now returns `Option<usize>`. The allowed responses are those that are not bad. If two or more are allowed, `last` is also excluded. With none allowed, `select` returns `None`, and dispatch replies with empty text. No-bad takes precedence over no-repeat. `needs_backfill` counts only responses that are not bad. The `generate` prompt includes `examples(pool, 5)`. At startup, the feedback model is built from `marked()`, with the `Rated` of each interaction as in sub-phase 12.7.
 
 **Acceptance criteria.**
 
