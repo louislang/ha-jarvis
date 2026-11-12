@@ -29,6 +29,9 @@ const STEPS: [&str; 2] = [
 /// The JSON record of an interaction with its marks, in the order that they were stored.
 const RECORD: &str = "json_set(record, '$.marks', json((SELECT json_group_array(json(mark) ORDER BY rowid) FROM marks WHERE interaction = interactions.id)))";
 
+/// Adds the mark `?2` to the interaction `?1`.
+const ADD: &str = "INSERT INTO marks (interaction, mark) VALUES (?1, ?2)";
+
 /// The condition of the interactions with a bad mark.
 const BAD: &str =
     "id IN (SELECT interaction FROM marks WHERE json_extract(mark, '$.value') = 'Bad')";
@@ -131,14 +134,23 @@ impl InteractionLog for SqliteLog {
                 .flat_map(|sample| sample.to_le_bytes())
                 .collect()
         });
+        let marks: Vec<String> = interaction
+            .marks
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<_, _>>()?;
         let (id, time) = (interaction.id, interaction.time.as_millisecond());
         self.run(move |connection| {
+            let transaction = connection.unchecked_transaction()?;
             let insert =
                 "INSERT INTO interactions (id, time, record, audio) VALUES (?1, ?2, ?3, ?4)";
-            connection.execute(insert, params![id, time, record, bytes])
+            transaction.execute(insert, params![id, time, record, bytes])?;
+            for mark in &marks {
+                transaction.execute(ADD, params![id, mark])?;
+            }
+            transaction.commit()
         })
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn update(&self, id: u64, change: Change) -> anyhow::Result<()> {
@@ -183,13 +195,13 @@ impl InteractionLog for SqliteLog {
         let (id, kept) = (mark.interaction, mark.value.is_some());
         let record = serde_json::to_string(&mark)?;
         self.run(move |connection| {
+            let transaction = connection.unchecked_transaction()?;
             let remove = "DELETE FROM marks WHERE interaction = ?1 AND json_extract(mark, '$.target') = json_extract(?2, '$.target')";
-            connection.execute(remove, params![id, record])?;
+            transaction.execute(remove, params![id, record])?;
             if kept {
-                let add = "INSERT INTO marks (interaction, mark) VALUES (?1, ?2)";
-                connection.execute(add, params![id, record])?;
+                transaction.execute(ADD, params![id, record])?;
             }
-            Ok(())
+            transaction.commit()
         })
         .await
     }
@@ -370,6 +382,19 @@ mod tests {
         log.append(interaction(8), None).await?;
         assert_eq!(log.audio(7).await?, Some(audio));
         assert_eq!(log.audio(8).await?, None);
+        Ok(())
+    }
+
+    /// `append` stores the marks of the interaction.
+    #[tokio::test]
+    async fn append_keeps_the_marks() -> anyhow::Result<()> {
+        let (log, _folder) = log();
+        let mut marked = interaction(7);
+        marked
+            .marks
+            .push(mark(7, Target::Action, Some(Value::Good)));
+        log.append(marked.clone(), None).await?;
+        assert_eq!(log.get(7).await?, Some(marked));
         Ok(())
     }
 
