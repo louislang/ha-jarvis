@@ -2,6 +2,7 @@
 
 use jiff::Timestamp;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 
 /// The states, registries and configuration of HA at one time.
@@ -143,7 +144,7 @@ pub enum Event {
 }
 
 /// An HA service call.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ServiceCall {
     /// For example `light`.
     pub domain: String,

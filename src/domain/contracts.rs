@@ -46,6 +46,11 @@ use crate::domain::decide::Artist;
 use crate::domain::decide::MediaItem;
 use crate::domain::decide::SearchResults;
 use crate::domain::dialog::Key;
+use crate::domain::feedback::Action;
+use crate::domain::feedback::Interaction;
+use crate::domain::feedback::Route;
+use crate::domain::feedback::Spoken;
+use crate::domain::feedback::Tagged;
 use crate::domain::habits::Bucket;
 use crate::domain::habits::DayType;
 use crate::domain::habits::Entry;
@@ -193,6 +198,26 @@ pub struct ExFilter(Filter);
 /// One slot value in the text of an example.
 #[verifier::external_type_specification]
 pub struct ExSpan(Span);
+
+/// The intent of an action and the sorted entity IDs of its targets.
+#[verifier::external_type_specification]
+pub struct ExAction(Action);
+
+/// One response of an interaction.
+#[verifier::external_type_specification]
+pub struct ExSpoken(Spoken);
+
+/// A slot value with its byte offsets in the normalized transcript.
+#[verifier::external_type_specification]
+pub struct ExTagged(Tagged);
+
+/// The kind of a decision.
+#[verifier::external_type_specification]
+pub struct ExRoute(Route);
+
+/// One logged request.
+#[verifier::external_type_specification]
+pub struct ExInteraction(Interaction);
 
 /// The lists of a Music Assistant search response.
 #[verifier::external_type_specification]

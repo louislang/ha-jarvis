@@ -12,6 +12,7 @@ flowchart LR
         crate_adapters_openai[openai]
         crate_adapters_plex[plex]
         crate_adapters_sherpa[sherpa]
+        crate_adapters_sqlite[sqlite]
         crate_adapters_supertonic[supertonic]
         crate_adapters_wyoming[wyoming]
     end
@@ -96,6 +97,10 @@ flowchart LR
     crate_adapters_sherpa --> crate
     crate_adapters_sherpa --> crate_adapters_sherpa
     crate_adapters_sherpa --> crate_ports
+    crate_adapters_sqlite --> crate_adapters_sqlite
+    crate_adapters_sqlite --> crate_domain_feedback
+    crate_adapters_sqlite --> crate_domain_speech
+    crate_adapters_sqlite --> crate_ports
     crate_adapters_supertonic --> crate
     crate_adapters_supertonic --> crate_adapters_supertonic
     crate_adapters_supertonic --> crate_domain_speech
@@ -144,6 +149,7 @@ flowchart LR
     crate_domain_contracts --> crate_domain_catalog
     crate_domain_contracts --> crate_domain_decide
     crate_domain_contracts --> crate_domain_dialog
+    crate_domain_contracts --> crate_domain_feedback
     crate_domain_contracts --> crate_domain_habits
     crate_domain_contracts --> crate_domain_intent
     crate_domain_contracts --> crate_domain_responses
@@ -168,6 +174,7 @@ flowchart LR
     crate_domain_feedback --> crate_domain_feedback
     crate_domain_feedback --> crate_domain_intent
     crate_domain_feedback --> crate_domain_select
+    crate_domain_feedback --> crate_domain_state
     crate_domain_habits --> crate_domain_contracts
     crate_domain_habits --> crate_domain_habits
     crate_domain_intent --> crate_domain_contracts
@@ -192,6 +199,7 @@ flowchart LR
     crate_domain_training --> crate_domain_intent
     crate_ports --> crate
     crate_ports --> crate_domain_decide
+    crate_ports --> crate_domain_feedback
     crate_ports --> crate_domain_model
     crate_ports --> crate_domain_speech
     crate_ports --> crate_domain_state

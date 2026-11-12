@@ -123,6 +123,7 @@ pub mod adapters {
     pub mod openai;
     pub mod plex;
     pub mod sherpa;
+    pub mod sqlite;
     pub mod supertonic;
     pub mod wyoming;
 }
@@ -551,6 +552,8 @@ pub struct TrainConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct LogConfig {
+    /// The interaction log database file.
+    pub database: PathBuf,
     /// The time that a committed utterance waits for its request.
     pub correlate_s: u64,
 }
@@ -1367,6 +1370,14 @@ mod tests {
         }
     }
 
+    /// The `[log]` section of `jarvis.toml`.
+    fn expected_log() -> LogConfig {
+        LogConfig {
+            database: PathBuf::from("jarvis.db"),
+            correlate_s: 10,
+        }
+    }
+
     /// AC-1.1-1.
     #[test]
     fn ac_1_1_1_parse_returns_each_value() -> anyhow::Result<()> {
@@ -1414,7 +1425,7 @@ mod tests {
                 batch_size: 8,
                 holdout: 0.1,
             },
-            log: LogConfig { correlate_s: 10 },
+            log: expected_log(),
         };
         assert_eq!(Config::parse(VALID)?, expected);
         Ok(())

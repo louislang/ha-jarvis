@@ -16,6 +16,7 @@ use serde_json::Value;
 use crate::Device;
 use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
+use crate::domain::feedback::Interaction;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
@@ -260,4 +261,33 @@ pub trait Plugin: Send + Sync {
 pub trait Clock: Send + Sync {
     /// The time now.
     fn now(&self) -> Timestamp;
+}
+
+/// The interactions that `list` keeps.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Filter {
+    /// Every interaction.
+    All,
+}
+
+/// One page of a list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Page {
+    /// The page number, from 0.
+    pub number: usize,
+    /// The number of items on a page.
+    pub size: usize,
+}
+
+/// The log of the requests with their audio.
+#[async_trait]
+pub trait InteractionLog: Send + Sync {
+    /// Stores `interaction` with its 16 kHz `audio`.
+    async fn append(&self, interaction: Interaction, audio: Option<Audio>) -> anyhow::Result<()>;
+
+    /// The interactions of `page` that `filter` keeps, newest first.
+    async fn list(&self, filter: Filter, page: Page) -> anyhow::Result<Vec<Interaction>>;
+
+    /// The interaction `id`, or `None` when it does not exist.
+    async fn get(&self, id: u64) -> anyhow::Result<Option<Interaction>>;
 }

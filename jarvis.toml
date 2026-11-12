@@ -88,4 +88,5 @@ batch_size = 8
 holdout = 0.1
 
 [log]
+database = "jarvis.db"
 correlate_s = 10
