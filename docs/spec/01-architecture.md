@@ -21,8 +21,6 @@ The composition root (`src/lib.rs`) is the only code that knows all layers. The 
 
 `xtask/` is a separate crate in the same Cargo workspace. It holds the developer tools: the complexity gate, the PR size gate, the module graph, the layer rules and the diagram. Jarvis does not depend on it.
 
-The Jarvis add-on (`addon/` and `repository.yaml`) is outside the layers too. It runs on the HA host as an HA add-on. It is an `nginx` reverse proxy from HA ingress to the web server of Jarvis, and it has no Jarvis logic (decision 33). Rust code does not use it.
-
 `adapters/mqtt.rs` publishes the status entity. The composition root starts it with a receiver of the status channel. No use case calls it, so it has no port.
 
 The training script (`train/`) is outside the layers. It is the only Python code. It reads a training set file and writes ONNX model files. Rust code does not import it. The process adapter starts it as a process on the GPU host. The RunPod adapter starts it on RunPod. `just fixture-model` starts it on the CPU.
@@ -149,7 +147,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 9. **Request habits, not device habits.** Jarvis learns when people ask for what. Each spoken request counts in its bucket: the day type and the hour (phase 11). HA state changes and automations do not count, because native HA automations handle device schedules. Thus habits are not a model input, and they do not select entities or slot values. Request habits move work from System Two (slow and expensive) to System One (fast and cheap): before a usual time, Jarvis prepares the answer of the request (phase 14).
 10. **A habit fades.** Each day counts once for each request and bucket. The score halves each `habits.half_life_days`. A bucket is a usual time while its score is `habits.min_score` or more. With 14 and 2.0, a request on three days within 14 days is a habit on the day of the third request. Requests on two days are never a habit.
 11. **One joint model.** One model gives the intent probabilities and the slot tags. Thus one CPU pass per transcript gives all System One data. Clusters of the requests that System Two answers use OpenAI embeddings (sub-phase 14.1). These do not change when System One retrains, and the context does not change them.
-12. **Train locally first, with the full GPU.** The process adapter runs `train/train.py` on the GPU of the GPU host. A local run and live Jarvis never share the GPU. Jarvis does not announce a run. Before a local run, Jarvis mutes the microphones of the satellites that are not muted, stops answering and releases its model sessions. After the run, with success or an error, Jarvis loads them again, unmutes only the microphones that it muted, and answers again. Then it measures the new model (decision 13). When the local run fails (for example, CUDA out of memory), the training use case sends the same training set to the RunPod adapter. A RunPod run does not pause Jarvis or mute the satellites. Jarvis predicts with the ONNX model through `ort`. The Python script, the inline script of the page of the Jarvis tab and the files of the Jarvis add-on (decision 33) are the only non-Rust code. The training set file is the contract between Jarvis and the Python script.
+12. **Train locally first, with the full GPU.** The process adapter runs `train/train.py` on the GPU of the GPU host. A local run and live Jarvis never share the GPU. Jarvis does not announce a run. Before a local run, Jarvis mutes the microphones of the satellites that are not muted, stops answering and releases its model sessions. After the run, with success or an error, Jarvis loads them again, unmutes only the microphones that it muted, and answers again. Then it measures the new model (decision 13). When the local run fails (for example, CUDA out of memory), the training use case sends the same training set to the RunPod adapter. A RunPod run does not pause Jarvis or mute the satellites. Jarvis predicts with the ONNX model through `ort`. The Python script and the inline script of the page of the Jarvis tab are the only non-Rust code. The training set file is the contract between them.
 13. **Accept only an equal or better model.** Jarvis assigns each example to the held-out set by a stable hash of its text. Jarvis measures the old model and the new model on the same held-out set. Jarvis keeps the new model only when its intent accuracy and its slot accuracy are both equal or higher.
 14. **Training trigger.** Jarvis counts changes since the last training run. At `train.min_changes`, Jarvis starts a run. A voice request starts a run at any count. Only one run occurs at a time. After each run, accepted or rejected, the count starts again from 0.
 15. **Speaker identification is not on the critical path.** Jarvis calculates the voice embedding in the background after commit. Only intents with `needs_speaker = true` wait for the result.
@@ -171,7 +169,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 31. **Fixed TTS input lengths.** ONNX Runtime keeps the cuDNN state of a `Conv` node only for its last input shape, so each new reply length added about 230 ms to the TTS on the GPU host. Jarvis runs the four Supertonic-3 graphs itself through `ort`, with the fp32 vector estimator and vocoder. It adds zeros and masks to each input up to one of two lengths: 64 text ids and 64 latent frames, or 160 text ids and 192 latent frames. Each length has its own set of sessions, so a change of length builds no new plans. A longer input keeps its length (sub-phases 9.3 and 9.3b).
 32. **Plugin requests through a local folder.** When System Two finds that a cluster needs remote data that no plugin gives, Jarvis does not guess an answer source. It writes one Markdown file for the cluster into the folder `learn.plugin_requests` through the `PluginRequests` port: the example requests, the usual times, the data needed and the task (sub-phase 14.13). The file name is the name of the future fetch intent. Claude watches the folder and writes a normal code PR with the plugin, the fetch intent and its `fresh_min`, and the tests. CI, the Codex review and your review gate it as any other PR, and the next release puts it on the GPU host. How Claude watches the folder is outside Jarvis (field log of sub-phase 14.13). Without `learn.plugin_requests`, Jarvis writes no plugin requests. Thus Jarvis needs no remote service and no token for this.
 
-33. **A tab in Home Assistant.** You use Jarvis through HA, so the review page, the status and the settings form are one tab in the HA sidebar, as Music Assistant has. HA runs the Supervisor on the HA host, and Jarvis runs on the GPU host. The Jarvis add-on is an `nginx` reverse proxy on the HA host. HA ingress gives the sidebar entry, the HA login and remote access, and serves the tab under a path prefix. Thus the page uses only relative URLs. The add-on adds the bearer token of `web.token_env` to each request, so the page has no token prompt. When Jarvis does not answer, the add-on shows its own down page. The status entity does not depend on the add-on: Jarvis publishes it through MQTT discovery with a `unique_id`, a retained state and a last will `offline`. Thus the broker marks Jarvis offline when the process dies, and the entity stays after an HA restart. The settings form shows a fixed list of fields and no secret. A save checks the new file with the checks of the start, keeps the old file, and restarts Jarvis with exit code 75, which the unit restarts. When the next start fails or crashes before it is ready, Jarvis puts the old file back and starts again, and the status shows the reason. One save gives at most two automatic restarts (sub-phases 12.8 to 12.9g).
+33. **A tab in Home Assistant.** You use Jarvis through HA, so the review page and the status are one tab in the HA sidebar, as Music Assistant has. HA runs the Supervisor on the HA host, and Jarvis runs on the GPU host. The Jarvis add-on is an `nginx` reverse proxy on the HA host. HA ingress gives the sidebar entry, the HA login and remote access, and serves the tab under a path prefix. Thus the page uses only relative URLs. The add-on adds the bearer token of `web.token_env` to each request, so the page has no token prompt. When Jarvis does not answer, the add-on shows its own down page. The status entity does not depend on the add-on: Jarvis publishes it through MQTT discovery with a `unique_id`, a retained state and a last will `offline`. Thus the broker marks Jarvis offline when the process dies, and the entity stays after an HA restart. (sub-phases 12.8 to 12.9c).
 
 ## 6. Latency Budget (System One)
 
@@ -222,7 +220,6 @@ With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan c
 | `async-openai` | Adapter | OpenAI Responses API: streaming, tools, structured output, `previous_response_id`. |
 | `rusqlite` (feature `bundled`) | Adapter | Interaction log database. |
 | `axum` | Adapter | Web page and API of the Jarvis tab. |
-| `toml_edit` | Adapter | Settings form: a change of a field of `jarvis.toml` that keeps the comments and the order. |
 | `rumqttc` | Adapter | MQTT client of the status entity: discovery, retained state and last will. |
 | `rumqttd` (dev) | Adapter tests | In-process MQTT broker for the tests of `adapters/mqtt.rs`. |
 | `hound` | Adapter | WAV encode for audio playback. |
@@ -236,7 +233,6 @@ With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan c
 | `gungraun` (dev), Valgrind (tool) | Benchmarks | Deterministic instruction budgets (`Callgrind::hard_limits`). Linux only. |
 | `serde_yaml`, `tempfile` (dev) | `xtask` | Structure tests and gate test fixtures. |
 | `actionlint` (tool) | — | Workflow lint. |
-| `nginx` (in the add-on image) | Add-on | Reverse proxy of the Jarvis add-on from HA ingress to Jarvis. |
 | `gh-stack` (GitHub CLI extension) | — | GitHub native stacked PRs. |
 | Codex (GitHub app) | — | AI code review of each PR. |
 | `quint-connect` (dev) | Domain and application tests | Conformance tests: replay Quint traces against the Rust code. |
@@ -342,23 +338,15 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/adapters/web.rs` | Driving adapter | Web server of the Jarvis tab with token auth. It calls `Review` and `Control`. | 12.8 |
 | `src/adapters/review.html` | Driving adapter | The page of the Jarvis tab: review, status and settings. `web.rs` embeds it with `include_str!`. | 12.9 |
 | `src/adapters/mqtt.rs` | Adapter | The status entity through MQTT discovery, a retained state and a last will. No port (section 1). | 12.9c |
-| `src/adapters/settings.rs` | Adapter | The settings form fields: read and edit of `jarvis.toml` with `toml_edit`, backup, trial start marker, confirm and rollback. | 12.9d |
 | `src/adapters/process.rs` | Adapter | `Trainer` that runs `train/train.py` as a local process. | 13.7 |
 | `src/adapters/runpod.rs` | Adapter | `Trainer` with the RunPod REST API and network volume (fallback). | 13.8b |
 | `src/adapters/open_meteo.rs` | Adapter | `Plugin` `get_weather` with the Open-Meteo forecast API. | 17.3 |
 | `src/adapters/plex.rs` | Adapter | `Plugin` `get_new_shows` with the Plex server API. | 18.11 |
-| `repository.yaml` | Add-on | Makes the repository an HA add-on repository. | 12.9g |
-| `addon/config.yaml` | Add-on | The add-on configuration: ingress, panel, options `url` and `token`. | 12.9g |
-| `addon/build.yaml` | Add-on | The fixed base image of each architecture. | 12.9g |
-| `addon/Dockerfile` | Add-on | The add-on image: `nginx` and the three files below. | 12.9g |
-| `addon/run.sh` | Add-on | Puts the options into the `nginx` configuration and starts `nginx`. At most 10 lines. | 12.9g |
-| `addon/nginx.conf` | Add-on | The reverse proxy to Jarvis with the token header, and the down page. | 12.9g |
-| `addon/down.html` | Add-on | The static page "Jarvis is down", with no script. | 12.9g |
 | `src/testing/house.json` | Test | The reference house snapshot (section 11). | 2.1 |
 | `src/testing/fakes.rs` | Test | `#[cfg(test)]` only. A fake for each port, `FakeWyomingClient`, `speech(text)`. | 2.9 |
 | `src/testing/e2e.rs` | Test | `#[cfg(test)]` only. Pipeline harness and end-to-end latency tests. | 9.1 |
 
-Jarvis also writes these data files: `habits.json`, `voices.json`, `jarvis.db`, `generated.json`, `training.json`, `pools.json` (use counts and generated responses), `learned.toml` (learned intents), the plugin request files in the folder `learn.plugin_requests`, the model folders in `models/system-one/`, and `jarvis.toml.bak`, `jarvis.toml.trying` and `jarvis.toml.rollback` (the backup, the trial start marker and the rollback reason of the settings form, sub-phase 12.9f). They are not source files, and Git ignores them. Edit `learned.toml` only while Jarvis is stopped. `jarvis.local.toml` is the configuration of a machine other than the GPU host (section 9). Git ignores it too.
+Jarvis also writes these data files: `habits.json`, `voices.json`, `jarvis.db`, `generated.json`, `training.json`, `pools.json` (use counts and generated responses), `learned.toml` (learned intents), the plugin request files in the folder `learn.plugin_requests` and the model folders in `models/system-one/`. They are not source files, and Git ignores them. Edit `learned.toml` only while Jarvis is stopped. `jarvis.local.toml` is the configuration of a machine other than the GPU host (section 9). Git ignores it too.
 
 Unit tests are in a `#[cfg(test)] mod tests` block at the end of each source file. The conformance driver for a Quint model is in the test block of the module that it checks. Shared test code is in `src/testing/` only. The fake HA WebSocket server is in the test block of `src/adapters/ha.rs`. `src/testing/house.json` is a data file: tests embed it with `include_str!`, and the `dataset` command reads it from its `--house` path.
 
@@ -725,7 +713,7 @@ Training set file (the contract between Jarvis and `train/train.py`):
 | RunPod | RunPod serverless | GPU | — | Training fallback. |
 | HA host | Home Assistant OS with the Supervisor | — | — | Runs HA, the Jarvis add-on and the MQTT broker (Mosquitto add-on). |
 
-The GPU host runs Jarvis as the systemd unit `jarvis`: `jarvis serve jarvis.toml` in a checkout of the release tag. An environment file of the unit holds the secrets, `ORT_DYLIB_PATH`, which points to the `libonnxruntime` in the release folder, and `LD_LIBRARY_PATH`, which points to the release folder (sub-phase 6.1). Port 10700 (Wyoming) has no authentication, so the host firewall accepts it only from the HA host. Port 10701 (web) needs the token of `web.token_env`. The unit has `RestartForceExitStatus=75`: Jarvis exits with code 75 after a save of the settings form and after a failed or crashed first start with the new settings, and systemd then starts it again (sub-phase 12.9f). Other exit codes do not restart it, so the restarts do not loop.
+The GPU host runs Jarvis as the systemd unit `jarvis`: `jarvis serve jarvis.toml` in a checkout of the release tag. An environment file of the unit holds the secrets, `ORT_DYLIB_PATH`, which points to the `libonnxruntime` in the release folder, and `LD_LIBRARY_PATH`, which points to the release folder (sub-phase 6.1). Port 10700 (Wyoming) has no authentication, so the host firewall accepts it only from the HA host. Port 10701 (web) needs the token of `web.token_env`.
 
 VRAM budget of live Jarvis on the GPU host (6 GB). A local training run does not share the GPU with live Jarvis, so it has no row.
 
@@ -785,8 +773,7 @@ G10 requires that each change below touches only the listed files. Sub-phase 0.8
 |---|---|
 | Add or change an intent | `intents.toml`, `responses.toml`. The next training run adds it to the model. |
 | Change a response | `responses.toml`. |
-| Change a threshold or a time limit | `jarvis.toml`, or the settings form for the fields of `FIELDS`. |
-| Add a field to the settings form (only when you ask) | `src/adapters/settings.rs` (`FIELDS`). |
+| Change a threshold or a time limit | `jarvis.toml`. |
 | Change the STT, TTS or speaker model | `jarvis.toml`, and the download recipe in `justfile`. |
 | Change the System One base model | `jarvis.toml` (`train.base_model`). |
 | Replace the technology of a port (for example, a different LLM provider) | One new adapter file, `Cargo.toml`, `src/lib.rs`, and the port and file tables in this file. |

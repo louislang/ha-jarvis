@@ -50,7 +50,7 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 
 ## Code Rules
 
-- Rust stable, edition 2024. The other languages are Python, only in `train/`, the inline JavaScript of `src/adapters/review.html`, and the Jarvis add-on for Home Assistant: `repository.yaml` and the files of `addon/` (YAML, `Dockerfile`, `nginx` configuration, a start script of at most 10 lines, and a static page with no script). The add-on only proxies to Jarvis and has no Jarvis logic.
+- Rust stable, edition 2024. The other languages are Python, only in `train/`, and the inline JavaScript of `src/adapters/review.html`.
 - Do not repeat code. Move shared code into one function.
 - Use a crate or a tool when one gives the function. Do not write your own version.
 - As few files as possible. A file has 500 lines or fewer where possible.
@@ -101,7 +101,6 @@ Hexagonal (ports and adapters). See `01-architecture.md` section 1.
 - `src/lib.rs`: the composition root. The only code that names concrete adapters. It declares the folders as inline `pub` modules, so there are no `mod.rs` files. `src/main.rs` only calls `jarvis::main`, so `benches/` can import the library.
 - `xtask/`: developer tools (complexity, PR size, module graph, layer rules, diagram, merge gate) and the gate tests. Jarvis does not depend on it.
 - `quint/`: one Quint model for each stateful component, plus the system model.
-- `addon/`: the Jarvis add-on, a reverse proxy from HA ingress to Jarvis. Outside the layers.
 
 ## Tests
 
