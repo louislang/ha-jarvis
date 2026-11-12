@@ -252,29 +252,61 @@ This phase logs each request with its audio, action and response. You mark the a
 
 ### 12.6 Record Interactions
 
-**Goal:** Record every request in the log after the reply is sent, update the record with later announces, and prune once a day. The log is complete without adding latency.
+**Goal:** Record every request in the log after the reply is sent, and prune once a day. The log is complete without adding latency.
 
 - **Implements:** G15. **Depends on:** 12.5b.
-- **Files:** modify `src/app/conversation.rs`, `src/app/speech.rs`, `src/app/background.rs`, `src/lib.rs`.
+- **Files:** modify `src/app/conversation.rs`, `src/app/speech.rs`, `src/app/background.rs`, `src/lib.rs`, `src/testing/fakes.rs`.
 
-**Model.** `handle` makes the interaction ID before dispatch. When the context has a `satellite_id`, `handle` correlates the audio once. This call moves from `src/lib.rs` (sub-phase 12.1b) into the conversation use case. A match removes the utterance, so `handle` is the only caller: it sends the utterance with the append, and sub-phase 15.6 uses the same utterance for the speaker. Before it returns, it sends the append to the log writer task on an unbounded channel. The writer runs appends and updates in the order it receives them. Deferred work gets the ID and sends `update` messages, which thus come after the append. A dialog answer is a new interaction with `link` set to the first interaction. The background use case calls `prune` once a day.
+**Model.** `handle` makes the interaction ID before dispatch. The first ID is the clock time in microseconds at the start, and each request adds one, so the IDs stay unique after a restart. When the context has a `satellite_id`, `handle` correlates the audio once. This call moves from `src/lib.rs` (sub-phase 12.1b) into the conversation use case. A match removes the utterance, so `handle` is the only caller: it sends the utterance with the append, and sub-phase 15.6 uses the same utterance for the speaker. Before it returns, it sends the append to the log writer task on an unbounded channel. The writer runs the messages in the order it receives them. The record has these values:
+
+- `model` is `fixture`, the model folder that Jarvis loads.
+- `action` is the top label and the sorted targets of the service call of the decision. Sub-phase 12.10 changes it. `service calls` is the service call of the decision.
+- A slot gets the byte offsets of the first match of its value in the normalized transcript. A slot without a match is left out.
+- `responses` has the text that `handle` returns, with its pool and template: the reply, the filler or the question of the decision, or the deferred answer for a request without a satellite. A System Two text has an empty pool and template.
+
+Sub-phase 12.6b adds later announces and dialog answers. `FakeLog` gets `delay`: each `append` and `update` waits it. The background use case calls `prune` once a day, the first time one day after the start.
 
 **Acceptance criteria.**
 
 - AC-12.6-1: When a voice request completes, `FakeLog` has one interaction with the audio, transcript, model context, prediction, decision, service calls, response and latency.
 - AC-12.6-2: When a request comes from text with no audio, the interaction has no audio.
-- AC-12.6-3: When a deferred answer is announced, the same interaction gets the announce text.
-- AC-12.6-4: When a dialog asks questions, each answer is a new interaction with `link` set to the first interaction.
-- AC-12.6-5: When `FakeLog` takes 500 ms for each call, `handle` returns before virtual time advances.
-- AC-12.6-6: When one day passes on `FakeClock`, `FakeLog` records one `prune` call.
-- AC-12.6-7: When a deferred announce sends its update before the writer has run the append, the record has the announce text.
+- AC-12.6-3: When `FakeLog` waits 500 ms for each call, `handle` returns before virtual time advances.
+- AC-12.6-4: When one day passes on `FakeClock`, `FakeLog` records one `prune` call.
 
 **Proofs.**
 
-- P-12.6-5. Argument: a send on an unbounded channel does not wait, and `handle` does not await the writer.
-- P-12.6-7. Argument: the append message is sent before `handle` returns, and every update is sent later on the same channel. A channel keeps the order.
+- P-12.6-3. Argument: a send on an unbounded channel does not wait, and `handle` does not await the writer.
 - P-12.6-2. Argument: `correlate` returns `None` when no utterance has the text (P-12.1-2).
-- P-12.6-1, P-12.6-3, P-12.6-4, P-12.6-6. Evidence: test.
+- P-12.6-1, P-12.6-4. Evidence: test.
+
+---
+
+### 12.6b Interaction Updates and Dialog Links
+
+**Goal:** Add later announces and questions to the record of their request, and record each dialog answer with a link to the first interaction of the dialog.
+
+- **Implements:** G15. **Depends on:** 12.6.
+- **Files:** modify `src/app/conversation.rs`.
+
+**Model.** Deferred work gets the interaction ID. After an announce or a question is spoken, the work sends an `update` to the writer on the same channel, so it comes after the append. An announce that the queue drops adds nothing. A System Two sentence or question has an empty pool and template. A dialog answer is a new interaction with `link` set to the first interaction of the dialog. The queues keep the first ID for each dialog key: a new request with a key sets it, and an answer reads it. These dialog answers do not reach `decide`, and each is still a new interaction:
+
+- An unclear answer to a `Slot` question has its prediction, the top label as its action, and the decision `Ask`, or `Reply` with the `failure` answer at the turn limit.
+- An unclear answer to a System Two question has its prediction, the top label as its action, and the decision `Llm`.
+
+A cancel phrase is not logged, because it has no prediction and no action.
+
+**Acceptance criteria.**
+
+- AC-12.6b-1: When a deferred answer is announced, the same interaction gets the announce text.
+- AC-12.6b-2: When a dialog asks questions, each answer is a new interaction with `link` set to the first interaction. This includes an unclear answer to a `Slot` question and an answer to a System Two question.
+- AC-12.6b-3: When a deferred announce sends its update before the writer has run the append, the record has the announce text.
+- AC-12.6b-4: When a cancel phrase closes a dialog, `FakeLog` has no interaction for it.
+
+**Proofs.**
+
+- P-12.6b-3. Argument: the append message is sent before `handle` returns, and every update is sent later on the same channel. A channel keeps the order.
+- P-12.6b-4. Argument: the cancel branch returns before the append.
+- P-12.6b-1, P-12.6b-2. Evidence: test.
 
 ---
 
@@ -282,7 +314,7 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Goal:** Add the `Review` driving port and its use case: list, audio, mark and the intent list. Marks reach the log and the feedback model through one path.
 
-- **Implements:** G15. **Depends on:** 12.6.
+- **Implements:** G15. **Depends on:** 12.6b.
 - **Files:** create `src/app/review.rs`. Modify `src/ports.rs`, `src/lib.rs`, `src/testing/fakes.rs`.
 
 **Model.** `Review`: `list(filter, page)`, `audio(id)`, `mark(mark)`, `intents()`. `mark` checks that a correction is an intent name or `unknown`, writes the mark to the log and applies it to the feedback model. It makes the `Rated` of the marked interaction with `get`: its transcript, action and responses, and the transcript of the interaction that its `link` names.
