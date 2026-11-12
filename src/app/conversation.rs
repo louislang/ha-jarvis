@@ -210,30 +210,54 @@ impl Conversation {
     /// System One prediction of the normalized text in the area name of the satellite device, its
     /// decision and its dispatch, or the answer of a deferred job when `context` has no
     /// satellite. A question opens a dialog. A new request from a satellite counts in the habits.
-    /// Sends the record of a decided request to the log writer.
+    /// Sends the record of each request and each answer except a cancel to the log writer. An
+    /// answer links to the first interaction of its dialog.
     ///
     /// # Errors
     ///
     /// The prediction fails. The error text is a `failure` answer.
     pub async fn handle(&self, text: &str, context: Context) -> anyhow::Result<Handled> {
         let (area, name) = self.area(context.device_id.as_deref());
-        let now = self.two.clock.now();
-        let heard = self.hear(text, &context, name.as_deref(), now);
+        let mut heard = self.hear(text, &context, name.as_deref(), self.two.clock.now());
         let key = context.satellite_id.or(context.conversation_id).map(Key);
-        let open = self.take_dialog(key.clone(), now);
-        let routed = self.route(text, open, name.as_deref(), &heard, now).await?;
+        let (handled, logged) = self.respond(text, key, area, name, &mut heard).await?;
+        if let Some((prediction, decided)) = logged {
+            self.append(heard, &prediction, decided);
+        }
+        Ok(handled)
+    }
+
+    /// The reply to `text` of `heard` with the dialog key `key` from the area `area` with the name
+    /// `name`, as `handle` describes, and its record, except for a cancel.
+    ///
+    /// # Errors
+    ///
+    /// The prediction fails.
+    async fn respond(
+        &self,
+        text: &str,
+        key: Option<Key>,
+        area: Option<AreaId>,
+        name: Option<String>,
+        heard: &mut Heard,
+    ) -> anyhow::Result<Answered> {
+        let open = self.take_dialog(key.clone(), heard);
+        let routed = self.route(text, open, name.as_deref(), heard).await?;
         let (prediction, transcript, new) = match routed {
             ControlFlow::Continue(routed) => routed,
-            ControlFlow::Break(handled) => return Ok(handled),
+            ControlFlow::Break(answered) => return Ok(answered),
         };
+        if new {
+            self.begin(heard, key.clone());
+        }
+        let now = heard.time;
         let request = Request {
             transcript,
             area,
             now,
         };
-        let (handled, decided) = self.act(&prediction, &request, key, &heard, new).await;
-        self.append(heard, &prediction, decided);
-        Ok(handled)
+        let (handled, decided) = self.act(&prediction, &request, key, heard, new).await;
+        Ok((handled, Some((prediction, decided))))
     }
 
     /// `text` in `context` from the area `name` at `now`, with a new interaction ID and, from a
@@ -251,6 +275,7 @@ impl Conversation {
             transcript: text.to_owned(),
             model_context: training::context_text(name),
             utterance,
+            link: None,
         }
     }
 
@@ -279,7 +304,7 @@ impl Conversation {
             service_calls: call.into_iter().collect(),
             responses: vec![response],
             latency_ms: latency_ms(voice_end, self.two.clock.now()),
-            link: None,
+            link: heard.link,
             marks: Vec::new(),
         };
         // A send fails only after the writer ended, at shutdown.
@@ -287,12 +312,21 @@ impl Conversation {
         let _ = self.recorder.writer.send(write);
     }
 
-    /// The open dialog of `key` at `now` and its key. The dialog map no longer has it.
-    fn take_dialog(&self, key: Option<Key>, now: Timestamp) -> Option<(Dialog, Key)> {
+    /// The open dialog of `key` at the time of `heard` and its key. The dialog map no longer has
+    /// it. Its first interaction becomes the link of `heard`.
+    fn take_dialog(&self, key: Option<Key>, heard: &mut Heard) -> Option<(Dialog, Key)> {
         let key = key?;
         let timeout = self.queues.dialog.timeout_s;
-        let dialog = self.queues.dialogs().take(&key, now, timeout)?;
+        let dialog = self.queues.dialogs().take(&key, heard.time, timeout)?;
+        heard.link = self.queues.link(&key);
         Some((dialog, key))
+    }
+
+    /// Makes `heard` a new request with no link, and the first interaction of the dialogs of
+    /// `key`.
+    fn begin(&self, heard: &mut Heard, key: Option<Key>) {
+        heard.link = None;
+        self.queues.begin(key, heard.id);
     }
 
     /// The dispatch of the decision for `prediction` of `request` on the satellite of `heard`. A
@@ -367,9 +401,10 @@ impl Conversation {
     }
 
     /// The reply to `text` as an answer to the `open` dialog and its key on the satellite of
-    /// `heard` at `now`: a `cancelled` reply that closes it, or a question again. Else the
-    /// prediction to decide and its transcript: the filled intent of a `Slot` dialog, or the System
-    /// One prediction of `text` in the area `name`, with true for a new request.
+    /// `heard` at its time: a `cancelled` reply that closes it, or a question again, with the
+    /// prediction and the record parts of an unclear answer. Else the prediction to decide and its
+    /// transcript: the filled intent of a `Slot` dialog, or the System One prediction of `text` in
+    /// the area `name`, with true for a new request.
     ///
     /// # Errors
     ///
@@ -380,8 +415,7 @@ impl Conversation {
         open: Option<(Dialog, Key)>,
         name: Option<&str>,
         heard: &Heard,
-        now: Timestamp,
-    ) -> anyhow::Result<ControlFlow<Handled, (Prediction, String, bool)>> {
+    ) -> anyhow::Result<ControlFlow<Answered, (Prediction, String, bool)>> {
         let Some((dialog, key)) = open else {
             return Ok(ControlFlow::Continue((
                 self.predict(name, text).await?,
@@ -399,28 +433,27 @@ impl Conversation {
         if self.is_clear(&prediction) {
             return Ok(ControlFlow::Continue((prediction, text.to_owned(), true)));
         }
-        Ok(ControlFlow::Break(
-            self.unclear(text, dialog, key, heard, now).await,
-        ))
+        let unclear = self.unclear(text, prediction, dialog, key, heard);
+        Ok(ControlFlow::Break(unclear.await))
     }
 
-    /// The reply to the unclear answer `text` of `heard` to `dialog` of `key` at `now`: for an
-    /// `Llm` dialog, a filler and the System Two answer to the call of the dialog, or the answer
-    /// itself without a satellite. Else a question again.
+    /// The reply to the unclear answer `text` of `heard` to `dialog` of `key`, and its record with
+    /// `prediction`: for an `Llm` dialog, a filler and the System Two answer to the call of the
+    /// dialog, or the answer itself without a satellite. Else a question again.
     async fn unclear(
         &self,
         text: &str,
+        prediction: Prediction,
         dialog: Dialog,
         key: Key,
         heard: &Heard,
-        now: Timestamp,
-    ) -> Handled {
+    ) -> Answered {
         let Pending::Llm {
             response_id,
             call_id,
         } = dialog.pending
         else {
-            return self.ask_again(dialog, key, heard, now);
+            return self.ask_again(prediction, dialog, key, heard);
         };
         let thread = Thread {
             request: self.origin(heard.satellite.as_deref(), heard.id),
@@ -433,21 +466,19 @@ impl Conversation {
         };
         if thread.request.is_some() {
             let after = self.llm(text.to_owned(), None, thread);
-            let text = self.pick("filler");
-            let after = Some(after);
-            return Handled { text, after };
+            let filler = self.spoken(self.chosen("filler"));
+            return said(prediction, Route::Llm, filler, Some(after));
         }
         let answer = self.answer(text, None, &thread).await;
-        let text = self.or_failure(answer.map(|all| unpooled(all.join(" "))));
-        let text = text.text;
-        Handled { text, after: None }
+        let spoken = self.or_failure(answer.map(|all| unpooled(all.join(" "))));
+        said(prediction, Route::Llm, spoken, None)
     }
 
-    /// A `cancelled` reply. Closes the dialog of `key`.
-    fn cancel(&self, key: Key) -> Handled {
+    /// A `cancelled` reply, with no record. Closes the dialog of `key`.
+    fn cancel(&self, key: Key) -> Answered {
         self.queues.dialogs().close(key);
         let text = self.pick("cancelled");
-        Handled { text, after: None }
+        (Handled { text, after: None }, None)
     }
 
     /// The System One prediction of the normalized `text` in the area `name`.
@@ -502,12 +533,19 @@ impl Conversation {
         Some((prediction, transcript))
     }
 
-    /// `dialog` of `key` with one more question from `ask_area` on the satellite of `heard` at
-    /// `now`, in its queue with the current generation, or a `failure` answer at the turn limit.
-    fn ask_again(&self, dialog: Dialog, key: Key, heard: &Heard, now: Timestamp) -> Handled {
-        let Some(next) = dialog::next_turn(dialog, self.queues.dialog.max_turns, now) else {
-            let text = self.pick("failure");
-            return Handled { text, after: None };
+    /// `dialog` of `key` with one more question from `ask_area` on the satellite of `heard` at its
+    /// time, in its queue with the current generation, or a `failure` answer at the turn limit.
+    /// Also its record with `prediction`.
+    fn ask_again(
+        &self,
+        prediction: Prediction,
+        dialog: Dialog,
+        key: Key,
+        heard: &Heard,
+    ) -> Answered {
+        let max_turns = self.queues.dialog.max_turns;
+        let Some(next) = dialog::next_turn(dialog, max_turns, heard.time) else {
+            return said(prediction, Route::Reply, self.failure(), None);
         };
         self.queues.dialogs().dialogs.insert(key, next);
         let request = heard.satellite.as_ref().map(|satellite| Origin {
@@ -515,11 +553,12 @@ impl Conversation {
             generation: self.queues.generation(satellite),
             id: heard.id,
         });
-        let (question, after) = self.ask(self.chosen("ask_area"), request);
-        Handled {
-            text: question.text,
-            after,
-        }
+        let question = self.chosen("ask_area");
+        let response = self.spoken(question.clone());
+        let (question, after) = self.ask(question, request);
+        let (mut handled, logged) = said(prediction, Route::Ask, response, after);
+        handled.text = question.text;
+        (handled, logged)
     }
 
     /// The ID and the name of the area of the device `device` in the hot cache.
@@ -1151,6 +1190,8 @@ struct Heard {
     model_context: String,
     /// The utterance of a voice request.
     utterance: Option<Utterance>,
+    /// The ID of the first interaction of the dialog, for a dialog answer.
+    link: Option<u64>,
 }
 
 /// The satellite of a request, the generation of the request on it and the ID of its record.
@@ -1162,6 +1203,22 @@ struct Origin {
     generation: u64,
     /// The interaction ID.
     id: u64,
+}
+
+/// The reply to a dialog answer that ends the routing, with its prediction and the parts of its
+/// record, or `None` for a cancel, which is not logged.
+type Answered = (Handled, Option<(Prediction, Decided)>);
+
+/// The reply `response` with `after`, and the record of an answer with `prediction` and a
+/// decision of kind `route` with no service call and `response`.
+fn said(prediction: Prediction, route: Route, response: Spoken, after: Option<Work>) -> Answered {
+    let text = response.text.clone();
+    let decided = Decided {
+        route,
+        call: None,
+        response,
+    };
+    (Handled { text, after }, Some((prediction, decided)))
 }
 
 /// The parts of the record of a request that its decision gives.
@@ -1264,6 +1321,8 @@ pub struct Queues {
     satellites: Mutex<BTreeMap<String, Arc<Queue>>>,
     /// The open dialogs.
     dialogs: Mutex<Dialogs>,
+    /// The ID of the first interaction of the dialogs of each key.
+    links: Mutex<BTreeMap<Key, u64>>,
     /// The turn limit, the timeout, the choice similarity and the cancel phrases of a dialog.
     dialog: DialogConfig,
 }
@@ -1286,7 +1345,22 @@ impl Queues {
             idle_wait,
             satellites: Mutex::default(),
             dialogs: Mutex::default(),
+            links: Mutex::default(),
             dialog,
+        }
+    }
+
+    /// The ID of the first interaction of the dialogs of `key`.
+    fn link(&self, key: &Key) -> Option<u64> {
+        let links = self.links.lock().expect("no lock holder panics");
+        links.get(key).copied()
+    }
+
+    /// Makes the interaction `id` the first of the dialogs of `key`, when it is set.
+    fn begin(&self, key: Option<Key>, id: u64) {
+        if let Some(key) = key {
+            let mut links = self.links.lock().expect("no lock holder panics");
+            links.insert(key, id);
         }
     }
 
@@ -2687,6 +2761,34 @@ mod tests {
         Ok(())
     }
 
+    /// Handles each of `texts` from the satellite in order, with the work of each reply done.
+    async fn converse(conversation: &Conversation, texts: &[&str]) -> anyhow::Result<()> {
+        for text in texts {
+            if let Some(after) = conversation.handle(text, on_satellite()).await?.after {
+                after.await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// AC-12.6d-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_6d_1_each_answer_links_to_the_first_interaction() -> anyhow::Result<()> {
+        let reasoner = Arc::new(FakeReasoner::default());
+        reasoner.script(vec![Scripted::Ask("How many people?")]);
+        reasoner.script(vec![Scripted::Sentence("Dinner is planned.")]);
+        let classifier = scripted(&["lights_on", "unknown", "unknown", "unknown"]);
+        let (log, conversation) =
+            logging_with(&Arc::default(), classifier, reasoner, Duration::ZERO);
+        let texts = ["turn on the lights", "banana", "the kitchen"];
+        converse(&conversation, &texts).await?;
+        converse(&conversation, &["plan dinner", "four"]).await?;
+        let logged = written(&log).await;
+        let links: Vec<Option<u64>> = logged.iter().map(|(record, _)| record.link).collect();
+        assert_eq!(links, [None, Some(0), Some(0), None, Some(3)]);
+        Ok(())
+    }
+
     /// AC-12.6c-2.
     #[tokio::test(start_paused = true)]
     async fn ac_12_6c_2_update_before_append_still_lands() -> anyhow::Result<()> {
@@ -2703,6 +2805,20 @@ mod tests {
             response_texts(&log).await,
             [["One moment.", "Dinner is planned."]]
         );
+        Ok(())
+    }
+
+    /// AC-12.6d-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_6d_2_cancel_is_not_logged() -> anyhow::Result<()> {
+        let classifier = scripted(&["lights_on"]);
+        let (log, conversation) =
+            logging_with(&Arc::default(), classifier, Arc::default(), Duration::ZERO);
+        let _ = conversation
+            .handle("turn on the lights", on_satellite())
+            .await?;
+        let _ = conversation.handle("never mind", on_satellite()).await?;
+        assert_eq!(written(&log).await.len(), 1, "the cancel was logged");
         Ok(())
     }
 
