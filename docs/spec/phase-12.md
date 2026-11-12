@@ -6,27 +6,46 @@ This phase logs each request with its audio, action and response. You mark the a
 
 ### 12.1 Audio Correlation
 
-**Goal:** Keep each committed utterance with its audio for a short window and find it again by its text. The conversation use case can then attach the audio to the request, although HA sends audio and text on different connections.
+**Goal:** Add the pure rules that keep committed utterances for a short window and find one again by its text. Sub-phase 12.1b uses them, so that a request can get its audio, although HA sends audio and text on different connections.
 
 - **Implements:** G15. **Depends on:** 11.5.
-- **Files:** modify `src/domain/speech.rs`, `src/app/speech.rs`, `src/lib.rs`, `jarvis.toml`.
+- **Files:** modify `src/domain/speech.rs`.
 
-**Model.** `Utterance { text, audio, time, voice_end }`. The speech use case appends each committed utterance. Each append and each `correlate` first drops the utterances older than `log.correlate_s`, so expired audio leaves at the next use. `correlate(utterances, text, now, window) -> Option<Utterance>`: the utterance with equal normalized text and `now - time <= window`, when exactly one matches. Two or more matches are ambiguous and give `None`, so wrong audio never drives identity or enrollment. A match removes the utterance. The conversation use case correlates only when the context has a `satellite_id`, so a typed request never gets voice audio. This sub-phase adds `[log]` with `correlate_s`.
+**Model.** `Utterance { text, audio, time, voice_end }`. `expire(utterances, now, window)` keeps the utterances with `now - time <= window`, in order. `correlate(utterances, text, now, window) -> (rest, Option<Utterance>)` first drops the utterances older than `window`. Its result is the utterance with equal normalized text and `now - time <= window`, when exactly one matches. Two or more matches are ambiguous and give `None`, so wrong audio never drives identity or enrollment. A match removes the utterance from `rest`.
 
 **Acceptance criteria.**
 
 - AC-12.1-1: When an utterance has the same normalized text and is within `correlate_s`, `correlate` returns it.
 - AC-12.1-2: When the only matching utterance is older than `correlate_s`, `correlate` returns none.
 - AC-12.1-3: When two utterances in the window have the same text, `correlate` returns none.
-- AC-12.1-4: When an utterance is older than `correlate_s`, the next append or `correlate` removes it.
+- AC-12.1-4: When an utterance is older than `correlate_s`, `correlate` removes it from `rest`.
 - AC-12.1-5: When `correlate` returns an utterance, a second `correlate` for the same text returns none.
-- AC-12.1-6: When the context has no `satellite_id`, the conversation use case does not call `correlate`.
 
 **Proofs.**
 
 - P-12.1-1 to P-12.1-3. Ensures: the result is `Some(u)` if and only if `u` is the only element of `{ u | normalize(u.text) = normalize(text) and now - u.time <= window }`. Argument: `correlate` filters by both conditions and matches on the result length: one gives `Some`, any other gives `None`.
-- P-12.1-4, P-12.1-5. Ensures: after an append or a `correlate`, no entry is older than the window, and a returned utterance is no longer in the list. Argument: each append and each `correlate` first removes the entries with `now - time > window`, and a match removes its entry.
-- P-12.1-6. Evidence: test.
+- P-12.1-4, P-12.1-5. Ensures: `expire` gives exactly the entries with `now - time <= window`. After a `correlate`, no entry of `rest` is older than the window, and a returned utterance is not in `rest`. Argument: `expire` is a filter with that predicate. `correlate` first calls `expire`, and a match removes its entry, which is the only entry with its text.
+
+---
+
+### 12.1b Utterance Buffer
+
+**Goal:** Keep each committed utterance with its audio for a short window, and correlate it for each voice request. Sub-phase 12.6 can then attach the audio to the request.
+
+- **Implements:** G15. **Depends on:** 12.1.
+- **Files:** modify `src/app/speech.rs`, `src/lib.rs`, `jarvis.toml`.
+
+**Model.** The speech use case appends each transcript that it gives to HA, at a commit or at `audio-stop`, with the audio of the session. `voice_end` is the time of the last voiced sample: the time of the commit minus the pushed audio after the `voice_end_ms` of the last partial. Each append first drops the utterances older than `log.correlate_s` with `expire`, so expired audio leaves at the next use. `correlate` drops them too (sub-phase 12.1). `handle` of the `Assistant` in `src/lib.rs` correlates only when the context has a `satellite_id`, so a typed request never gets voice audio. Nothing uses the utterance before sub-phase 12.6. This sub-phase adds `[log]` with `correlate_s`.
+
+**Acceptance criteria.**
+
+- AC-12.1b-1: When an utterance is older than `correlate_s`, the next append or `correlate` removes it.
+- AC-12.1b-2: When the context has no `satellite_id`, `handle` does not call `correlate`.
+
+**Proofs.**
+
+- P-12.1b-1. Argument: an append replaces the list with `expire` of the list before it adds the new utterance, and `correlate` drops the old entries (P-12.1-4).
+- P-12.1b-2. Evidence: test.
 
 ---
 
@@ -34,7 +53,7 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Goal:** Add `quint/feedback.qnt`, the model of good and bad marks on decisions. Prove that a decision with more bad marks than good marks is never chosen again.
 
-- **Implements:** G15, G19. **Depends on:** 12.1.
+- **Implements:** G15, G19. **Depends on:** 12.1b.
 - **Files:** create `quint/feedback.qnt`.
 - **Quint:** `feedback.qnt`.
 
@@ -162,9 +181,9 @@ This phase logs each request with its audio, action and response. You mark the a
 **Goal:** Record every request in the log after the reply is sent, update the record with later announces, and prune once a day. The log is complete without adding latency.
 
 - **Implements:** G15. **Depends on:** 12.5.
-- **Files:** modify `src/app/conversation.rs`, `src/app/speech.rs`, `src/app/background.rs`.
+- **Files:** modify `src/app/conversation.rs`, `src/app/speech.rs`, `src/app/background.rs`, `src/lib.rs`.
 
-**Model.** `handle` makes the interaction ID before dispatch. When the context has a `satellite_id`, `handle` correlates the audio once (sub-phase 12.1). A match removes the utterance, so `handle` is the only caller: it sends the utterance with the append, and sub-phase 15.6 uses the same utterance for the speaker. Before it returns, it sends the append to the log writer task on an unbounded channel. The writer runs appends and updates in the order it receives them. Deferred work gets the ID and sends `update` messages, which thus come after the append. A dialog answer is a new interaction with `link` set to the first interaction. The background use case calls `prune` once a day.
+**Model.** `handle` makes the interaction ID before dispatch. When the context has a `satellite_id`, `handle` correlates the audio once. This call moves from `src/lib.rs` (sub-phase 12.1b) into the conversation use case. A match removes the utterance, so `handle` is the only caller: it sends the utterance with the append, and sub-phase 15.6 uses the same utterance for the speaker. Before it returns, it sends the append to the log writer task on an unbounded channel. The writer runs appends and updates in the order it receives them. Deferred work gets the ID and sends `update` messages, which thus come after the append. A dialog answer is a new interaction with `link` set to the first interaction. The background use case calls `prune` once a day.
 
 **Acceptance criteria.**
 
