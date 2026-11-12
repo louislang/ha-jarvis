@@ -358,11 +358,37 @@ On a final error, the old model stays and the training state does not change. Th
 
 ---
 
+### 13.10b Training Status
+
+**Goal:** Show `training` in the status of Jarvis during a local training run, and make a training run and a save of the settings exclude each other. You see the pause in the Jarvis tab and in `sensor.jarvis_status`, and a restart never stops a run.
+
+- **Implements:** G16, G24. **Depends on:** 13.10.
+- **Files:** modify `src/ports.rs`, `src/app/training.rs`, `src/lib.rs`.
+
+**Model.**
+
+- The training use case gets the sender of the status channel (sub-phase 12.9b). In step 3 of sub-phase 13.10, it sets `Training` before the mute calls of step 1, and `Online` after the unmute calls of step 5, also after an error. Both changes set only `state`, so a rollback message stays (sub-phase 12.9f). A RunPod run does not change the status, because Jarvis answers during it.
+- `Activity` gets `Training`. The shared activity of sub-phase 12.9f replaces the `active` flag of the training run (P-13.9-3). A run starts only when it changes the activity from `Idle` to `Training`, and the end of the run sets `Idle`. Sub-phase 13.11 uses the same change for the voice trigger. Thus a run cannot start while a save restarts Jarvis, and `save` returns `Busy` during a run.
+
+**Acceptance criteria.**
+
+- AC-13.10b-1: When the process trainer runs, the status is `training`. After it returns, with success or an error, the status is `online`.
+- AC-13.10b-2: When the RunPod trainer runs after a local error, the status is `online`.
+- AC-13.10b-3: When a run is active, `save` returns `Busy`, and the configuration file does not change.
+- AC-13.10b-4: When a save has changed the activity to `Restarting`, a training trigger starts no run, and `FakeTrainer` records no call. When a training trigger and a save run at the same time, exactly one of them gets the activity.
+
+**Proofs.**
+
+- P-13.10b-1, P-13.10b-2. Requires: `PauseOnlyLocal`. Argument: step 3 sends `Training` before step 1 and `Online` after step 5, in sequence, and both arms of the local result reach step 5. The RunPod call comes after step 5.
+- P-13.10b-3, P-13.10b-4. Requires: `OneRun`. Argument: the start of a run and `save` both change the activity only from `Idle`, each in one critical section of the same mutex. Thus the second of them sees `Training` or `Restarting` and does nothing.
+
+---
+
 ### 13.11 Voice Trigger
 
 **Goal:** Add the `train` intent kind and the `start_training` intent. You can say "Start training" to start a run at any change count.
 
-- **Implements:** G16. **Depends on:** 13.10.
+- **Implements:** G16. **Depends on:** 13.10b.
 - **Files:** modify `src/domain/decide.rs`, `src/app/conversation.rs`, `intents.toml`, `responses.toml`.
 
 **Model.** `kind = "train"`: if no run is active, start one (the `voiceStart` action) and reply from `start_training`. Else reply from `training_busy`.
@@ -383,7 +409,7 @@ On a final error, the old model stays and the training state does not change. Th
 These steps are not tests and gate nothing.
 
 1. On the GPU host, make `.venv` with Python 3.12 and install `./train` with `uv` (`01-architecture.md` section 10).
-2. Say "Start training". Record that the satellites that were not muted show the mute state during the run, that a satellite that you muted before the run stays muted after it, that the run uses the GPU, that the other satellites are not muted and Jarvis answers after the run, and that the log shows both accuracies and the decision.
+2. Say "Start training". Record that the satellites that were not muted show the mute state during the run, that a satellite that you muted before the run stays muted after it, that the run uses the GPU, that the other satellites are not muted and Jarvis answers after the run, and that the log shows both accuracies and the decision. Record that `sensor.jarvis_status` shows `training` during the run and `online` after it.
 3. In RunPod, make a network volume, an S3 API key and a serverless endpoint with `ghcr.io/<owner>/jarvis-train:<tag>`. Allow only GPU types with compute capability 9.0 or lower, because torch 2.2.2 has no kernels for newer GPUs (sub-phase 3.5). Set `[train.runpod]`.
 4. Set a base model that is too large for 6 GB. Say "Start training". Record that the run moves to RunPod. Set `train.base_model` back.
 5. Repeat the Phase 9 field log with the trained model.

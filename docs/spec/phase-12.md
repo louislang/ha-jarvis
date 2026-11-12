@@ -1,6 +1,6 @@
 # Phase 12: Interaction Log and Feedback
 
-This phase logs each request with its audio, action and response. You mark the action and the response as good or bad, with an optional correction, in the Jarvis tab of the HA sidebar. The tab also shows the status of Jarvis, and an HA entity shows the status. Marks change decisions at once, and Phase 13 trains on them.
+This phase logs each request with its audio, action and response. You mark the action and the response as good or bad, with an optional correction, in the Jarvis tab of the HA sidebar. The tab also shows the status of Jarvis and a form of chosen settings, and an HA entity shows the status. Marks change decisions at once, and Phase 13 trains on them.
 
 ---
 
@@ -374,7 +374,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 ### 12.8 Web API
 
-**Goal:** Add the web server of the Jarvis tab with token authentication and the review endpoints. You can now read and mark interactions over HTTP, and the Jarvis add-on (`01-architecture.md` decision 33) can put the server into the HA sidebar.
+**Goal:** Add the web server of the Jarvis tab with token authentication and the review endpoints. You can now read and mark interactions over HTTP, and the Jarvis add-on (sub-phase 12.9g) can put the server into the HA sidebar.
 
 - **Implements:** G15, G24. **Depends on:** 12.7.
 - **Files:** create `src/adapters/web.rs`. Modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
@@ -383,7 +383,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 - `GET api/interactions?filter=&page=`, `GET api/interactions/{id}/audio` (WAV), `GET api/intents`, `POST api/interactions/{id}/mark` with `{ "target": "action" | "response", "index": <n> | null, "value": "good" | "bad" | null, "correction": "<intent>" | null }`. `index` is the position of the response in the interaction (sub-phase 12.3). It is required for `response`.
 - HA ingress serves the Jarvis tab under a path prefix (`/api/hassio_ingress/<session>/`). The add-on removes the prefix before it sends a request to Jarvis. Thus the routes of the server are the same with and without the add-on.
-- Each request under `api/` needs `Authorization: Bearer <token>`. The add-on adds this header to each request that it sends to Jarvis. Thus the page has no token prompt and keeps no token. A request from another machine on the LAN needs the header too.
+- Each request under `api/` needs `Authorization: Bearer <token>`. The add-on adds this header to each request that it sends to Jarvis (sub-phase 12.9g). Thus the page has no token prompt and keeps no token. A request from another machine on the LAN needs the header too.
 - `run` serves the web server on `web.listen` next to the Wyoming server. The shutdown future of `run` stops both (sub-phase 5.4c).
 - This sub-phase adds `[web]` (`listen`, `token_env`, `page_size`) and resolves the token in `Secrets`. `web.page_size` is the page size of `list` (sub-phase 12.4).
 
@@ -442,10 +442,10 @@ A cancel phrase is not logged, because it has no prediction and no action.
 **Model.**
 
 - `Status { state: State, message: Option<String> }` and `State { Online, Training, Restarting, Offline }` are in `src/ports.rs`. The JSON form is `{ "state": "online", "message": null }`, with the state in lowercase.
-- The composition root keeps the status in a `tokio::sync::watch` channel. The channel starts with `Online` and no message. The web server starts only when the start is ready (sub-phase 12.8), so the API never gives a status before that. Sub-phase 12.9c and later sub-phases read or change the status.
+- The composition root keeps the status in a `tokio::sync::watch` channel. The channel starts with `Online` and no message. The web server starts only when the start is ready (sub-phase 12.8), so the API never gives a status before that. Sub-phases 12.9c, 12.9f and 13.10b read or change the status.
 - The new driving port `Control` has `status() -> Status`. `src/lib.rs` implements it with the receiver of the channel. `adapters/web.rs` calls it. `FakeControl` in `src/testing/fakes.rs` gives a set status.
 - `GET api/status` returns the status.
-- The page has a status section `#status` with `.state` and `.message`. The page reads `api/status` at load and each 5 s. When the request fails, for example when the add-on returns its down page (decision 33), the section shows `offline`.
+- The page has a status section `#status` with `.state` and `.message`. The page reads `api/status` at load and each 5 s. When the request fails, for example when the add-on returns its down page (sub-phase 12.9g), the section shows `offline`.
 
 **Acceptance criteria.**
 
@@ -501,11 +501,186 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 ---
 
+### 12.9d Settings Fields
+
+**Goal:** Add the fields of the settings form and the pure functions that read them from the text of `jarvis.toml` and change them in it. A change keeps the comments and the order of the file, and no secret or path is a field.
+
+- **Implements:** G24. **Depends on:** 12.9c.
+- **Files:** create `src/adapters/settings.rs`. Modify `src/lib.rs`, `Cargo.toml`.
+
+**Model.**
+
+- `FIELDS` is the fixed list of the form fields, in groups, in this order:
+
+  | Group | Fields |
+  |---|---|
+  | Speech | `asr.vad_threshold`, `asr.vad_min_silence_ms`, `asr.early_commit_ms`, `asr.endpoint_ms`, `asr.max_utterance_ms` |
+  | Voice | `tts.voice`, `tts.num_steps` |
+  | System One | `model.threshold`, `model.commit_threshold` |
+  | System Two | `openai.model`, `openai.timeout_ms`, `openai.max_output_tokens`, `openai.max_tool_calls` |
+  | Dialogs | `dialog.max_turns`, `dialog.timeout_s`, `dialog.cancel` |
+  | Announce | `announce.margin_ms`, `announce.idle_wait_s` |
+  | Habits | `habits.half_life_days`, `habits.min_score` |
+  | Log | `log.audio_days`, `log.record_days` |
+
+- The form does not have these fields:
+  - `listen` and `web.listen`: a wrong value cuts off the Jarvis tab itself.
+  - `device`, each file and folder, `ha.url`, the plugin URLs, `mqtt.url` and `[train.runpod]`: a wrong value stops the start.
+  - Each `*_env` field: it names a secret.
+  - `openai.allowed_domains`, `openai.read_services` and `learn.prefetch_services`: they decide which HA services OpenAI and a prefetch can call.
+  - `train.max_vram_gb` and `train.python`: they protect the GPU host.
+  - `[[people]]` and `[[satellites]]`: lists of tables.
+  - The backfill values, `plugins.cache_s`, `plugins.timeout_ms` and the HA time limits: internal values.
+  - Each field that a later sub-phase adds to `jarvis.toml`. A field joins the form only when you ask.
+- `Setting { group, name, value }`. `value` is a JSON number, a JSON string or a JSON list of strings.
+- `read(text) -> Result<Vec<Setting>>` gives each field of `FIELDS` with its value in `text`, in the order of `FIELDS`.
+- `edit(text, changes: BTreeMap<String, serde_json::Value>) -> Result<String, String>` sets each changed field in `text` with `toml_edit`. All other text stays the same, also the comments. A name that is not in `FIELDS` is an error that names it. A new value keeps the TOML type of the old value: integer, float, string or array of strings. A JSON number for a float field becomes a float. A JSON value of another kind is an error that names the field and the type. `edit` does not check ranges: sub-phase 12.9e checks the result with `Config::parse`.
+
+**Acceptance criteria.**
+
+- AC-12.9d-1: When `read` gets the `jarvis.toml` of the repository, it returns exactly the fields of `FIELDS`, in order, with the values of the file, and no name ends with `_env`.
+- AC-12.9d-2: When `edit` changes `asr.endpoint_ms` to 700, the result differs from the input only in that line, and the comment of the line stays.
+- AC-12.9d-3: When `edit` gets `ha.url` or `ha.token_env`, it returns an error that names the field, for each.
+- AC-12.9d-4: When `edit` gets a string for `asr.endpoint_ms`, it returns an error that names the field. When it gets the JSON number 3 for `habits.min_score`, the result has `min_score = 3.0`.
+
+**Proofs.**
+
+- P-12.9d-3. Argument: `edit` looks up each name in `FIELDS` before it changes the document, and returns the error on the first name that is not there.
+- P-12.9d-4. Argument: `edit` matches on the pair of the old TOML type and the JSON kind. Only the matching pairs and the pair of a float and a JSON number give a value.
+- P-12.9d-1, P-12.9d-2. Evidence: test.
+
+---
+
+### 12.9e Settings Form
+
+**Goal:** Show the settings fields in the Jarvis tab and save a change with the same checks as at the start. Jarvis refuses a bad value with a message and does not change the file.
+
+- **Implements:** G24. **Depends on:** 12.9d.
+- **Files:** modify `src/ports.rs`, `src/lib.rs`, `src/adapters/web.rs`, `src/adapters/review.html`, `src/testing/fakes.rs`.
+
+**Model.**
+
+- `Control` gets `settings() -> Result<Vec<Setting>>` and `save(changes) -> Result<(), Refusal>`. `Refusal::Invalid(message)`. `Setting` moves to `src/ports.rs`.
+- In `src/lib.rs`, `settings` reads the configuration file that `run` got and calls `read`. `save` reads the file, calls `edit`, and checks the new text with `Config::parse`. Thus the rules of the start apply (sub-phase 1.1 and later). Only when the check passes, `save` writes the new text with an atomic write (`tempfile`). Else it returns `Invalid` with the message of `edit` or `Config::parse`. The new values take effect at the next start. Sub-phase 12.9f restarts Jarvis.
+- `GET api/settings` returns the fields. `POST api/settings` with `{ "<name>": <value>, ... }` returns 204 on success, and 400 with `{ "error": "<message>" }` for `Invalid`.
+- The page has `form#settings` with one `fieldset` for each group and one input for each field: a number input for a number, a text input for a string, and a `textarea` with one line for each string of a list. `button#save` sends only the changed fields. `#settings-error` shows the message of a 400.
+
+**Acceptance criteria.**
+
+- AC-12.9e-1: When `save` sets `asr.endpoint_ms` to 700 in a temporary copy of `jarvis.toml`, the file has the new value, and `settings` returns it.
+- AC-12.9e-2: When `save` sets `asr.early_commit_ms` to 700 while `asr.endpoint_ms` is 600, it returns `Invalid` with the message of `Config::parse`, and the file does not change.
+- AC-12.9e-3: When `save` gets `ha.token_env`, it returns `Invalid`, and the file does not change.
+- AC-12.9e-4: When `FakeControl` refuses a save with a message, `POST api/settings` returns 400 with that message. When it accepts, the result is 204.
+- AC-12.9e-5: When `GET /` runs, the HTML contains `form#settings`, `button#save` and `#settings-error`.
+
+**Proofs.**
+
+- P-12.9e-2, P-12.9e-3. Argument: `save` calls `edit` and `Config::parse` before the write, and returns on the first error.
+- P-12.9e-1, P-12.9e-4, P-12.9e-5. Evidence: test.
+
+---
+
+### 12.9f Restart and Rollback
+
+**Goal:** Restart Jarvis after a save, so that the new settings take effect. When the start with the new file fails or crashes, put the last good file back and start again, and show the rollback in the status.
+
+- **Implements:** G24. **Depends on:** 12.9e.
+- **Files:** modify `src/ports.rs`, `src/lib.rs`, `src/adapters/settings.rs`, `src/adapters/web.rs`, `src/adapters/review.html`, `.gitignore`.
+
+**Model.**
+
+- Three files can be next to the configuration file `<config>`:
+  - `<config>.bak`: the last good text, from a save until the next start is ready.
+  - `<config>.trying`: the marker of the trial start, the first start after a save. It holds the error text of a failed trial start, or nothing.
+  - `<config>.rollback`: the reason of the last rollback.
+- `Activity { Idle, Restarting }` is in `src/ports.rs`. The root keeps one `Arc<Mutex<Activity>>`. Each change of it locks the mutex, checks the old value and sets the new value in one critical section. Sub-phase 13.10b adds `Training`.
+- `save` first changes the activity from `Idle` to `Restarting`. With another value, it returns `Refusal::Busy` and reads and writes nothing. When the check of sub-phase 12.9e fails, `save` sets `Idle` again. Else the activity stays `Restarting` until the process ends, so a second save cannot replace `<config>.bak` with an untested file. `POST api/settings` maps `Busy` to 409 with `{ "error": "Jarvis is busy" }`.
+- After the check, `save` writes the old text to `<config>.bak`, writes the new text, and removes `<config>.rollback`. Then it sets the status to `Restarting` and notifies the shutdown.
+- The shutdown future of `serve` completes on SIGINT, SIGTERM or this notification. `run` returns `Ended::Restart` after the notification and `Ended::Stop` after a signal. At `Restart`, `run` keeps the status `Restarting`, so the entity shows `restarting` while Jarvis is down (sub-phase 12.9c). At `Stop`, it sets `Offline`.
+- `run` calls `settings::begin(config)` first, before it loads the configuration:
+  - When `<config>.trying` exists, the trial start failed or crashed. `begin` renames `<config>.bak` to `<config>` and `<config>.trying` to `<config>.rollback`. An empty reason becomes `start after save crashed`. Jarvis logs one `error` event and starts with the old file.
+  - Else, when `<config>.bak` exists, this start is the trial start. `begin` makes an empty `<config>.trying`.
+- `serve_until` calls `settings::confirm(config)` when the start is ready: after the models load and after the Wyoming listener and the web listener bind, before it accepts the first connection. `confirm` removes `<config>.trying` and `<config>.bak`. Thus a bind error of the trial start is an error with `<config>.trying`, and the next start rolls back.
+- `start` gives the exit code from the result of `serve`:
+  - `Ok(Restart)`: 75.
+  - `Ok(Stop)`: 0.
+  - `Err(error)` while `<config>.trying` exists: the trial start failed. `start` writes the error text to `<config>.trying`. The exit code is 75.
+  - `Err(error)` without `<config>.trying`: 1, as before.
+- A panic in a `tokio` task is an error of `serve`. For a panic of the main thread, `serve` sets a panic hook with `panic::set_hook`. The hook calls the default hook, and then exits with `settings::panic_code(config)`: 75 when `<config>.trying` exists, else 101. Thus a crash of the trial start gives 75, and the next start rolls back with the reason `start after save crashed`.
+- The unit `jarvis` has `RestartForceExitStatus=75` (`01-architecture.md` section 10). systemd starts Jarvis again after the exit code 75 only.
+- The restarts do not loop. Jarvis exits with 75 only after a save or when the trial start fails. The start after a failed trial start rolls back and removes `<config>.trying` and `<config>.bak`, so it is not a trial start. When it fails, it exits with 1 or 101, and systemd does not start it again. Thus one save gives at most two automatic restarts.
+- When the trial start dies from a signal (for example `SIGSEGV` in native code), systemd does not start Jarvis again. `<config>.trying` stays, so the next start, by hand or at boot, rolls back.
+- When `<config>.rollback` exists at the start, the status starts with the message `settings rolled back: <reason>`. The message stays until the next save removes the file.
+- After a save gives 204, the page shows `restarting` in `#status` until `api/status` gives `online`. Then it reads `api/settings` again, so a rollback shows the old values.
+- `.gitignore` ignores `/jarvis.toml.bak`, `/jarvis.toml.trying` and `/jarvis.toml.rollback`.
+
+**Acceptance criteria.**
+
+- AC-12.9f-1: When `save` succeeds, `<config>.bak` has the old text, `<config>` has the new text, the status is `restarting`, and `run` returns `Ended::Restart`.
+- AC-12.9f-2: When `serve` returns `Ended::Restart`, the exit code is 75. When it returns `Ended::Stop`, the exit code is 0.
+- AC-12.9f-3: When `begin` runs while `<config>.bak` exists and `<config>.trying` does not exist, `<config>.trying` exists after it. When the start is ready, neither `<config>.bak` nor `<config>.trying` exists.
+- AC-12.9f-4: When `serve` returns an error while `<config>.trying` exists, `<config>.trying` has the error text, and the exit code is 75. When `panic_code` runs while `<config>.trying` exists, it returns 75.
+- AC-12.9f-5: When `begin` runs while `<config>.trying` has an error text, `<config>` has the text of the backup, `<config>.rollback` has the error text, and neither `<config>.bak` nor `<config>.trying` exists. When `<config>.trying` is empty, `<config>.rollback` has `start after save crashed`.
+- AC-12.9f-6: When a save, a failed trial start and a failed start after the rollback occur in sequence, the exit codes are 75, 75 and 1, and `<config>` has the old text. When `panic_code` runs without `<config>.trying`, it returns 101.
+- AC-12.9f-7: When `<config>.rollback` exists at the start, `GET api/status` gives the message `settings rolled back: <reason>`. After the next save, `<config>.rollback` does not exist.
+- AC-12.9f-8: When two saves run at the same time, one succeeds and the other returns `Busy`, and `<config>.bak` has the text from before both saves. When a save fails the check, the next valid save succeeds. When `FakeControl` returns `Busy`, `POST api/settings` returns 409.
+- AC-12.9f-9: When the web listener cannot bind during a trial start, because its port is in use, `<config>.trying` has the bind error, `<config>.bak` exists, and the exit code is 75. The next `begin` restores the backup.
+
+**Proofs.**
+
+- P-12.9f-1. Argument: `save` writes the backup before the new text, and both after the check (P-12.9e-2). The notification comes after the writes.
+- P-12.9f-2, P-12.9f-4. Argument: `start` matches on the result of `serve` and on the existence of `<config>.trying`. `panic_code` checks the same file.
+- P-12.9f-3, P-12.9f-5. Argument: `begin` checks `<config>.trying` first and `<config>.bak` second. `serve_until` calls `confirm` after both binds and before it accepts a connection.
+- P-12.9f-9. Argument: a bind error returns from `serve_until` before `confirm`, so `<config>.trying` stays, and the error arm of `start` writes it (P-12.9f-4). The next `begin` rolls back (P-12.9f-5).
+- P-12.9f-6. Argument: an exit code of 75 needs `Ended::Restart`, which only a save gives, or `<config>.trying`, which only `begin` makes at the start after a save. The start after a failed trial start removes `<config>.trying` and `<config>.bak` in `begin`, and only a new save writes `<config>.bak` again. Thus that start exits with 1 or 101.
+- P-12.9f-8. Argument: only the change from `Idle` to `Restarting` lets `save` read the file, and it runs in one critical section, so one save at a time gets it. Only a failed check sets `Idle` again, before any write.
+- P-12.9f-7. Evidence: test.
+
+**Field log.** Add `RestartForceExitStatus=75` to the unit `jarvis` and run `systemctl daemon-reload`. In the Jarvis tab, change `dialog.timeout_s` and save. Record that the status shows `restarting`, then `online`, and that the new value is in `jarvis.toml`. Then set `tts.voice` to a voice that the TTS model does not have and save. Record that the status and the attribute `message` of `sensor.jarvis_status` show `settings rolled back` with the error, and that `jarvis.toml` has the old value.
+
+---
+
+### 12.9g Home Assistant Add-on
+
+**Goal:** Add the Jarvis add-on, which puts the Jarvis tab into the HA sidebar through HA ingress. It is a reverse proxy to the web server of Jarvis on the GPU host, and it shows a down page when Jarvis does not answer.
+
+- **Implements:** G24. **Depends on:** 12.9f.
+- **Files:** create `repository.yaml`, `addon/config.yaml`, `addon/build.yaml`, `addon/Dockerfile`, `addon/run.sh`, `addon/nginx.conf`, `addon/down.html`. Modify `xtask/src/gates.rs`.
+
+**Model.**
+
+- The repository is an HA add-on repository. `repository.yaml` names it, and the folder `addon/` holds the one add-on. The Supervisor builds the image on the HA host from `addon/Dockerfile`.
+- `addon/config.yaml`: `name: Jarvis`, `slug: jarvis`, a `version`, `arch: [amd64, aarch64]`, `init: false`, `ingress: true`, `ingress_port: 8099`, `panel_title: Jarvis`, `panel_icon: mdi:robot`, the options `url` (default `http://192.168.1.65:10701`) and `token`, and the schema `url: url` and `token: password`. Each change of a file in `addon/` increases `version`, so HA offers the update.
+- `addon/build.yaml` names the base image of each architecture: `ghcr.io/home-assistant/<arch>-base` with a fixed version tag. The base image has `bashio` and the s6 init.
+- `addon/Dockerfile` starts with `ARG BUILD_FROM` and `FROM $BUILD_FROM`, installs `nginx` with `apk`, copies `nginx.conf` to `/etc/nginx/nginx.conf`, `down.html` to `/www/down.html` and `run.sh` to `/run.sh`, and runs `/run.sh`.
+- `addon/run.sh` has at most 10 lines. It reads the options `url` and `token` with `bashio::config`, puts them in place of `@URL@` and `@TOKEN@` in `/etc/nginx/nginx.conf` with `sed`, and runs `exec nginx -g 'daemon off;'`.
+- `addon/nginx.conf` listens on port 8099. It accepts only `172.30.32.2`, the ingress gateway of the Supervisor, and denies all other clients. It sends each request to `@URL@` with `proxy_set_header Authorization "Bearer @TOKEN@"` and a connect time limit of 5 s. `error_page 502 503 504 /down.html` serves `/www/down.html` when Jarvis does not answer. The status code stays 502, 503 or 504, so the page script sees the failure (sub-phase 12.9b).
+- `addon/down.html` is a static page with the text "Jarvis is down" and `<meta http-equiv="refresh" content="10">`. It has no script, so `src/adapters/review.html` stays the only JavaScript. The refresh loads the same relative URL again, so the tab shows Jarvis again when it answers.
+- The add-on does not publish the status entity. Jarvis publishes it through MQTT (sub-phase 12.9c), so the entity does not depend on the add-on.
+- CI has no Supervisor. Structure tests in `xtask/src/gates.rs` check the files with `serde_yaml` and text checks. The field log checks the add-on in HA.
+
+**Acceptance criteria.**
+
+- AC-12.9g-1: When `repository.yaml` is parsed, it has a `name` and the `url` `https://github.com/louislang/ha-jarvis`.
+- AC-12.9g-2: When `addon/config.yaml` is parsed, it has `slug: jarvis`, `ingress: true`, `ingress_port: 8099`, `panel_title`, `panel_icon`, `init: false`, the architectures `amd64` and `aarch64`, a `version` of the form `x.y.z`, the options `url` and `token`, and the schema `url: url` and `token: password`.
+- AC-12.9g-3: When `addon/build.yaml` is parsed, `build_from` names `ghcr.io/home-assistant/<arch>-base` for `amd64` and `aarch64`, each with a version tag and not `latest`.
+- AC-12.9g-4: When `addon/nginx.conf` is checked, it listens on the `ingress_port` of `addon/config.yaml`, has `allow 172.30.32.2;` before `deny all;`, `proxy_pass @URL@;`, `proxy_set_header Authorization "Bearer @TOKEN@";` and `error_page 502 503 504 /down.html;`.
+- AC-12.9g-5: When `addon/run.sh` and `addon/Dockerfile` are checked, `run.sh` has at most 10 lines, reads the options `url` and `token`, replaces `@URL@` and `@TOKEN@`, and ends with `exec nginx`. The `Dockerfile` copies `nginx.conf`, `down.html` and `run.sh` to the paths that `run.sh` and `nginx.conf` use.
+- AC-12.9g-6: When `addon/down.html` is checked, it has the text "Jarvis is down", a `meta` refresh, no `<script` and no URL that starts with `/`, `http:` or `https:`.
+
+**Proofs.**
+
+- P-12.9g-1 to P-12.9g-6. Evidence: test.
+
+**Field log.** Add `JARVIS_WEB_TOKEN` to `jarvis.env` with a value from `openssl rand -hex 32` (the token goes through `sed`, so use only hex characters), and restart Jarvis. In HA, open Settings, Add-ons, Add-on Store, Repositories, and add `https://github.com/louislang/ha-jarvis`. Install the add-on Jarvis. Set `url` to `http://192.168.1.65:10701` and `token` to the same value. Start the add-on and turn on "Show in sidebar". Record that the Jarvis tab shows the interactions, the status and the settings, also in the HA app outside the house. Stop the unit `jarvis` and record that the tab shows "Jarvis is down". Start the unit and record that the tab shows Jarvis again.
+
+---
+
 ### 12.10 Feedback in Decide
 
 **Goal:** Make `decide` skip blocked decisions. After a bad mark, the same request goes to the next entity, then the next likely intent, then System Two with the correction.
 
-- **Implements:** G15, G19. **Depends on:** 12.9c.
+- **Implements:** G15, G19. **Depends on:** 12.9g.
 - **Files:** modify `src/domain/decide.rs`, `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`.
 - **Quint:** `feedback.qnt` (`DecideAvoidsBlocked`).
 
@@ -559,4 +734,4 @@ A cancel phrase is not logged, because it has no prediction and no action.
 These steps are not tests and gate nothing.
 
 1. In the Jarvis tab of HA, play the audio of an interaction, and send a mark with a correction.
-2. Do the field log of sub-phase 12.9c.
+2. Do the field logs of sub-phases 12.9c, 12.9f and 12.9g.
