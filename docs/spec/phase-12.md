@@ -299,14 +299,35 @@ The background use case calls `prune` once a day, the first time one day after t
 
 ---
 
-### 12.6c Interaction Updates and Dialog Links
+### 12.6c Interaction Updates
 
-**Goal:** Add later announces and questions to the record of their request, and record each dialog answer with a link to the first interaction of the dialog.
+**Goal:** Add later announces and questions to the record of their request. The record holds everything that Jarvis said for the request.
 
 - **Implements:** G15. **Depends on:** 12.6b.
 - **Files:** modify `src/app/conversation.rs`.
 
-**Model.** Deferred work gets the interaction ID. After an announce or a question is spoken, the work sends an `update` to the writer on the same channel, so it comes after the append. An announce that the queue drops adds nothing. A System Two sentence or question has an empty pool and template. A dialog answer is a new interaction with `link` set to the first interaction of the dialog. The queues keep the first ID for each dialog key: a new request with a key sets it, and an answer reads it. These dialog answers do not reach `decide`, and each is still a new interaction:
+**Model.** Deferred work gets the interaction ID. After an announce or a question is spoken, the work sends an `update` to the writer on the same channel, so it comes after the append. An announce that the queue drops adds nothing. A System Two sentence or question has an empty pool and template.
+
+**Acceptance criteria.**
+
+- AC-12.6c-1: When a deferred answer is announced, the same interaction gets the announce text.
+- AC-12.6c-2: When a deferred announce sends its update before the writer has run the append, the record has the announce text.
+
+**Proofs.**
+
+- P-12.6c-2. Argument: the append message is sent before `handle` returns, and every update is sent later on the same channel. A channel keeps the order.
+- P-12.6c-1. Evidence: test.
+
+---
+
+### 12.6d Dialog Links
+
+**Goal:** Record each dialog answer with a link to the first interaction of the dialog. A mark on an answer can then count for the request of the dialog.
+
+- **Implements:** G15. **Depends on:** 12.6c.
+- **Files:** modify `src/app/conversation.rs`.
+
+**Model.** A dialog answer is a new interaction with `link` set to the first interaction of the dialog. The queues keep the first ID for each dialog key: a new request with a key sets it, and an answer reads it. These dialog answers do not reach `decide`, and each is still a new interaction:
 
 - An unclear answer to a `Slot` question has its prediction, the top label as its action, and the decision `Ask`, or `Reply` with the `failure` answer at the turn limit.
 - An unclear answer to a System Two question has its prediction, the top label as its action, and the decision `Llm`.
@@ -315,16 +336,13 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 **Acceptance criteria.**
 
-- AC-12.6c-1: When a deferred answer is announced, the same interaction gets the announce text.
-- AC-12.6c-2: When a dialog asks questions, each answer is a new interaction with `link` set to the first interaction. This includes an unclear answer to a `Slot` question and an answer to a System Two question.
-- AC-12.6c-3: When a deferred announce sends its update before the writer has run the append, the record has the announce text.
-- AC-12.6c-4: When a cancel phrase closes a dialog, `FakeLog` has no interaction for it.
+- AC-12.6d-1: When a dialog asks questions, each answer is a new interaction with `link` set to the first interaction. This includes an unclear answer to a `Slot` question and an answer to a System Two question.
+- AC-12.6d-2: When a cancel phrase closes a dialog, `FakeLog` has no interaction for it.
 
 **Proofs.**
 
-- P-12.6c-3. Argument: the append message is sent before `handle` returns, and every update is sent later on the same channel. A channel keeps the order.
-- P-12.6c-4. Argument: the cancel branch returns before the append.
-- P-12.6c-1, P-12.6c-2. Evidence: test.
+- P-12.6d-2. Argument: the cancel branch returns before the append.
+- P-12.6d-1. Evidence: test.
 
 ---
 
@@ -332,7 +350,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 **Goal:** Add the `Review` driving port and its use case: list, audio, mark and the intent list. Marks reach the log and the feedback model through one path.
 
-- **Implements:** G15. **Depends on:** 12.6c.
+- **Implements:** G15. **Depends on:** 12.6d.
 - **Files:** create `src/app/review.rs`. Modify `src/ports.rs`, `src/lib.rs`, `src/testing/fakes.rs`.
 
 **Model.** `Review`: `list(filter, page)`, `audio(id)`, `mark(mark)`, `intents()`. `mark` checks that a correction is an intent name or `unknown`, writes the mark to the log and applies it to the feedback model. It makes the `Rated` of the marked interaction with `get`: its transcript, action and responses, and the transcript of the interaction that its `link` names.
