@@ -206,31 +206,47 @@ This phase logs each request with its audio, action and response. You mark the a
 
 ---
 
-### 12.5 Marks, Deferred Requests and Pruning
+### 12.5 Marks
 
-**Goal:** Add `mark`, `marked`, `deferred` and `prune` to the log. Marks are stored with corrections, requests that System Two answered can be clustered later, and old audio is deleted while marked records are kept.
+**Goal:** Add `mark` and `marked` to the log, and the filter `bad` to `list`. Marks are stored with their corrections and survive an update of the schema.
 
-- **Implements:** G14, G15. **Depends on:** 12.4b.
-- **Files:** modify `src/ports.rs`, `src/adapters/sqlite.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
+- **Implements:** G15. **Depends on:** 12.4b.
+- **Files:** modify `src/ports.rs`, `src/domain/feedback.rs`, `src/adapters/sqlite.rs`, `src/testing/fakes.rs`.
 
-**Model.** `Interaction` gets `marks`. `mark(mark)` (stores the mark with its time), `marked() -> Vec<Interaction>`, `deferred(since) -> Vec<Deferred { id, text, time, spoken }>` (interactions after `since` whose decision is `Defer` with `Job::Llm`, without a bad action mark and without a `link`; `spoken` is true when the interaction has a `satellite`; `Deferred` is in `src/domain/feedback.rs`), `prune(now)`: delete audio older than `audio_days` and unmarked records older than `record_days`. `prune` keeps a record that a marked record links to, so `get` of the `link` of a marked dialog answer still makes its `Rated` (sub-phase 12.7). Thus `deferred` gives each request that System Two answered: a top label `unknown`, a top probability less than `model.threshold`, a label that is not in the catalog, a blocked decision (sub-phase 12.10), or an intent that System One cannot act on (sub-phase 4.5). A dialog answer is not a request, so `deferred` leaves it out. The marks are migration step 2 of the schema (sub-phase 12.4). This sub-phase adds `log.audio_days` and `log.record_days`.
+**Model.** `Interaction` gets `marks`: its marks, at most one for each target. `mark(mark)` stores the mark with its time instead of the earlier mark of its interaction and target. A `None` value removes the earlier mark. `marked() -> Vec<Interaction>` gives the interactions with a mark, oldest first. The filter `bad` of `list` keeps the interactions with a bad mark. Migration step 2 of the schema (sub-phase 12.4) adds a `marks` table with one row for each mark. A read adds the marks of the interaction to its record. `FakeLog` keeps the marks in its interactions.
 
 **Acceptance criteria.**
 
 - AC-12.5-1: When `mark` sets the action mark to `bad` with the correction `tv_show`, `marked` returns the interaction with the correction.
 - AC-12.5-2: When `list` gets the filter `bad`, it returns only interactions with a bad mark.
-- AC-12.5-3: When `deferred(since)` runs, it returns only interactions after `since` whose decision is `Defer` with `Job::Llm`, without a bad action mark and without a `link`. A System Two interaction whose top label is a known intent with a low probability, or a known intent that System One cannot act on, is in the result. A fetch (`Defer` with `Job::Fetch`) is not in the result. `spoken` is true only for an interaction with a `satellite`.
-- AC-12.5-4: When `prune` runs, it deletes audio older than `audio_days` and unmarked records older than `record_days`.
-- AC-12.5-5: When `prune` runs, it keeps every marked record, at any age.
-- AC-12.5-6: When the database has schema version 1 with records, the adapter migrates it to version 2 and keeps every record.
-- AC-12.5-7: When `prune` runs, it keeps an unmarked first interaction of a dialog, at any age, when a marked answer of the dialog links to it.
+- AC-12.5-3: When the database has schema version 1 with records, the adapter migrates it to version 2 and keeps every record.
 
 **Proofs.**
 
-- P-12.5-3. Argument: the query has the four conditions in its `WHERE` clause.
-- P-12.5-6. Evidence: test.
-- P-12.5-4, P-12.5-5, P-12.5-7. Argument: the record delete has `marks IS NULL AND time < now - record_days AND id NOT IN (SELECT link FROM interactions WHERE marks IS NOT NULL AND link IS NOT NULL)`. A marked record fails the first condition. A first interaction that a marked record links to fails the third condition. The delete never removes a marked record, so the link stays.
-- P-12.5-1, P-12.5-2. Evidence: test.
+- P-12.5-1 to P-12.5-3. Evidence: test.
+
+---
+
+### 12.5b Deferred Requests and Pruning
+
+**Goal:** Add `deferred` and `prune` to the log. Requests that System Two answered can be clustered later, and old audio is deleted while marked records are kept.
+
+- **Implements:** G14, G15. **Depends on:** 12.5.
+- **Files:** modify `src/ports.rs`, `src/domain/feedback.rs`, `src/adapters/sqlite.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
+
+**Model.** `deferred(since) -> Vec<Deferred { id, text, time, spoken }>` (interactions after `since` whose decision is `Defer` with `Job::Llm`, without a bad action mark and without a `link`; `spoken` is true when the interaction has a `satellite`; `Deferred` is in `src/domain/feedback.rs`), `prune(now)`: delete audio older than `audio_days` and unmarked records older than `record_days`. `prune` keeps a record that a marked record links to, so `get` of the `link` of a marked dialog answer still makes its `Rated` (sub-phase 12.7). Thus `deferred` gives each request that System Two answered: a top label `unknown`, a top probability less than `model.threshold`, a label that is not in the catalog, a blocked decision (sub-phase 12.10), or an intent that System One cannot act on (sub-phase 4.5). A dialog answer is not a request, so `deferred` leaves it out. `FakeLog` records each `prune` call for sub-phase 12.6. This sub-phase adds `log.audio_days` and `log.record_days`.
+
+**Acceptance criteria.**
+
+- AC-12.5b-1: When `deferred(since)` runs, it returns only interactions after `since` whose decision is `Defer` with `Job::Llm`, without a bad action mark and without a `link`. A System Two interaction whose top label is a known intent with a low probability, or a known intent that System One cannot act on, is in the result. A fetch (`Defer` with `Job::Fetch`) is not in the result. `spoken` is true only for an interaction with a `satellite`.
+- AC-12.5b-2: When `prune` runs, it deletes audio older than `audio_days` and unmarked records older than `record_days`.
+- AC-12.5b-3: When `prune` runs, it keeps every marked record, at any age.
+- AC-12.5b-4: When `prune` runs, it keeps an unmarked first interaction of a dialog, at any age, when a marked answer of the dialog links to it.
+
+**Proofs.**
+
+- P-12.5b-1. Argument: the query has the four conditions in its `WHERE` clause.
+- P-12.5b-2 to P-12.5b-4. Argument: the record delete has `time < now - record_days AND id NOT IN (SELECT interaction FROM marks) AND id NOT IN (the link of each marked record)`. A marked record fails the second condition. A first interaction that a marked record links to fails the third condition. The delete never removes a marked record, so the link stays.
 
 ---
 
@@ -238,7 +254,7 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Goal:** Record every request in the log after the reply is sent, update the record with later announces, and prune once a day. The log is complete without adding latency.
 
-- **Implements:** G15. **Depends on:** 12.5.
+- **Implements:** G15. **Depends on:** 12.5b.
 - **Files:** modify `src/app/conversation.rs`, `src/app/speech.rs`, `src/app/background.rs`, `src/lib.rs`.
 
 **Model.** `handle` makes the interaction ID before dispatch. When the context has a `satellite_id`, `handle` correlates the audio once. This call moves from `src/lib.rs` (sub-phase 12.1b) into the conversation use case. A match removes the utterance, so `handle` is the only caller: it sends the utterance with the append, and sub-phase 15.6 uses the same utterance for the speaker. Before it returns, it sends the append to the log writer task on an unbounded channel. The writer runs appends and updates in the order it receives them. Deferred work gets the ID and sends `update` messages, which thus come after the append. A dialog answer is a new interaction with `link` set to the first interaction. The background use case calls `prune` once a day.
