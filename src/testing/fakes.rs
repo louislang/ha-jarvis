@@ -1,6 +1,5 @@
 //! A fake for each port.
 
-use std::cmp;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
@@ -46,7 +45,9 @@ use crate::Device;
 use crate::adapters::supertonic::SupertonicTts;
 use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
+use crate::domain::feedback;
 use crate::domain::feedback::Interaction;
+use crate::domain::feedback::Mark;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
@@ -691,6 +692,33 @@ impl FakeLog {
             .find(|(found, _)| found.id == id)
             .cloned()
     }
+
+    /// The interactions that `keep` keeps, oldest first.
+    fn kept(&self, keep: impl Fn(&Interaction) -> bool) -> Vec<Interaction> {
+        let interactions = lock(&self.interactions);
+        let mut kept: Vec<Interaction> = interactions
+            .iter()
+            .filter(|(interaction, _)| keep(interaction))
+            .map(|(interaction, _)| interaction.clone())
+            .collect();
+        kept.sort_by_key(|interaction| interaction.time);
+        kept
+    }
+
+    /// Applies `change` to the interaction `id`.
+    fn change(&self, id: u64, change: impl FnOnce(&mut Interaction)) {
+        let mut interactions = lock(&self.interactions);
+        let found = interactions.iter_mut().find(|(found, _)| found.id == id);
+        if let Some((interaction, _)) = found {
+            change(interaction);
+        }
+    }
+}
+
+/// True when `interaction` has a bad mark.
+fn has_bad(interaction: &Interaction) -> bool {
+    let bad = |mark: &Mark| matches!(mark.value, Some(feedback::Value::Bad));
+    interaction.marks.iter().any(bad)
 }
 
 #[async_trait]
@@ -702,20 +730,16 @@ impl InteractionLog for FakeLog {
 
     async fn update(&self, id: u64, change: Change) -> anyhow::Result<()> {
         let Change::Response(spoken) = change;
-        let mut interactions = lock(&self.interactions);
-        let found = interactions.iter_mut().find(|(found, _)| found.id == id);
-        if let Some((interaction, _)) = found {
-            interaction.responses.push(spoken);
-        }
+        self.change(id, |interaction| interaction.responses.push(spoken));
         Ok(())
     }
 
-    async fn list(&self, Filter::All: Filter, page: Page) -> anyhow::Result<Vec<Interaction>> {
-        let mut interactions: Vec<Interaction> = lock(&self.interactions)
-            .iter()
-            .map(|(interaction, _)| interaction.clone())
-            .collect();
-        interactions.sort_by_key(|interaction| cmp::Reverse(interaction.time));
+    async fn list(&self, filter: Filter, page: Page) -> anyhow::Result<Vec<Interaction>> {
+        let mut interactions = self.kept(|interaction| match filter {
+            Filter::All => true,
+            Filter::Bad => has_bad(interaction),
+        });
+        interactions.reverse();
         let skipped = interactions.into_iter().skip(page.number * page.size);
         Ok(skipped.take(page.size).collect())
     }
@@ -726,6 +750,22 @@ impl InteractionLog for FakeLog {
 
     async fn audio(&self, id: u64) -> anyhow::Result<Option<Audio>> {
         Ok(self.find(id).and_then(|(_, audio)| audio))
+    }
+
+    async fn mark(&self, mark: Mark) -> anyhow::Result<()> {
+        self.change(mark.interaction, |interaction| {
+            interaction
+                .marks
+                .retain(|other| other.target != mark.target);
+            if mark.value.is_some() {
+                interaction.marks.push(mark);
+            }
+        });
+        Ok(())
+    }
+
+    async fn marked(&self) -> anyhow::Result<Vec<Interaction>> {
+        Ok(self.kept(|interaction| !interaction.marks.is_empty()))
     }
 }
 
