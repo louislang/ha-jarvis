@@ -59,6 +59,7 @@ use crate::app::conversation::SystemTwo;
 use crate::app::plugins::Plugins;
 use crate::app::speech::Listener;
 use crate::app::speech::Speech;
+use crate::app::speech::Utterances;
 use crate::domain::catalog::Catalog;
 use crate::domain::habits::RequestHabits;
 use crate::domain::model::Prediction;
@@ -168,6 +169,8 @@ pub struct Config {
     pub habits: HabitsConfig,
     /// Training.
     pub train: TrainConfig,
+    /// The interaction log.
+    pub log: LogConfig,
 }
 
 impl Config {
@@ -543,6 +546,14 @@ pub struct TrainConfig {
     pub holdout: f64,
 }
 
+/// The `[log]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LogConfig {
+    /// The time that a committed utterance waits for its request.
+    pub correlate_s: u64,
+}
+
 /// The `Clock` of the system time.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
@@ -577,6 +588,10 @@ impl Assistant for App {
     }
 
     async fn handle(&self, text: &str, context: ports::Context) -> anyhow::Result<Handled> {
+        // A typed request never gets voice audio. Nothing reads the utterance yet.
+        if context.satellite_id.is_some() {
+            drop(self.listener.utterances().correlate(text));
+        }
         self.conversation.handle(text, context).await
     }
 
@@ -586,7 +601,8 @@ impl Assistant for App {
 }
 
 /// The listener of `config` on `stt`, which predicts each partial with `classifier`, commits early
-/// for an answer to an open dialog of `queues` and warms `reasoner`.
+/// for an answer to an open dialog of `queues`, warms `reasoner` and keeps the utterances for
+/// `log.correlate_s`.
 fn listener(
     config: &Config,
     stt: Arc<dyn SpeechToText>,
@@ -602,7 +618,13 @@ fn listener(
     };
     let threshold = config.model.commit_threshold;
     let (queues, clock) = (Arc::clone(queues), Arc::new(SystemClock));
-    Listener::new(stt, classifier, reasoner, policy, threshold, queues, clock)
+    let utterances = Arc::new(Utterances::new(
+        Arc::clone(&clock) as _,
+        config.log.correlate_s,
+    ));
+    Listener::new(
+        stt, classifier, reasoner, policy, threshold, queues, clock, utterances,
+    )
 }
 
 /// The System One model of the conversation. A swap affects the next `predict`.
@@ -1214,6 +1236,7 @@ mod tests {
     use crate::domain::state_cache::StateCache;
     use crate::domain::training;
     use crate::ports::ModelLoader;
+    use crate::ports::Partial;
     use crate::ports::TextToSpeech;
     use crate::testing::fakes;
     use crate::testing::fakes::FakeClassifier;
@@ -1390,6 +1413,7 @@ mod tests {
                 batch_size: 8,
                 holdout: 0.1,
             },
+            log: LogConfig { correlate_s: 10 },
         };
         assert_eq!(Config::parse(VALID)?, expected);
         Ok(())
@@ -2063,6 +2087,29 @@ mod tests {
         current.0.store(Arc::new(new.clone() as _));
         let _ = handle().await;
         assert_eq!((old.calls().len(), new.calls().len()), (1, 1));
+        Ok(())
+    }
+
+    /// AC-12.1b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_1b_2_handle_without_satellite_does_not_correlate() -> anyhow::Result<()> {
+        let text = "turn on the lights";
+        let partial = Partial {
+            text: text.to_owned(),
+            voice_end_ms: None,
+            vad_ms: 20,
+        };
+        let stt = FakeStt {
+            partials: vec![partial],
+            ..FakeStt::default()
+        };
+        let app = app_with(Arc::new(FakeClassifier::default()), Arc::new(stt))?;
+        let mut session = app.listen()?;
+        session.push(vec![0; 320]).await?;
+        session.finish().await?;
+        let _ = app.handle(text, ports::Context::default()).await;
+        let found = app.listener.utterances().correlate(text);
+        assert!(found.is_some(), "handle without a satellite_id correlated");
         Ok(())
     }
 
