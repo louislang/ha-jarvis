@@ -100,7 +100,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 - **Implements:** G12, G15. **Depends on:** 15.3.
 - **Files:** modify `src/app/speech.rs`, `src/app/conversation.rs`.
 
-**Model.** At commit, the speech use case spawns `embed(audio)` in a blocking task and stores the future with the utterance. The conversation use case gets it with the utterance that `handle` correlates (sub-phases 12.1 and 12.6). Sub-phase 15.6 uses it to identify the speaker.
+**Model.** At commit, the speech use case spawns `embed(audio)` in a blocking task and stores the future with the utterance. The conversation use case gets it with the utterance that `handle` correlates (sub-phases 12.1b and 12.6). Sub-phase 15.6 uses it to identify the speaker.
 
 **Acceptance criteria.**
 
