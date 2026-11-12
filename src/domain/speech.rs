@@ -1,8 +1,11 @@
-//! Audio type, audio chunks, audio duration, commit policy and sentence split.
+//! Audio type, audio chunks, audio duration, commit policy, sentence split and audio correlation.
 
 use std::time::Duration;
 
+use jiff::Timestamp;
 use vstd::prelude::*;
+
+use crate::domain::intent;
 
 /// 16-bit mono PCM audio.
 #[verus_verify]
@@ -152,6 +155,128 @@ fn is_boundary(chars: &[char], index: usize) -> bool {
     before == '.' || before == '?' || before == '!'
 }
 
+/// A committed utterance, kept to find its audio by its transcript.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Utterance {
+    /// The transcript.
+    pub text: String,
+    /// The audio.
+    pub audio: Audio,
+    /// The time at which it was kept.
+    pub time: Timestamp,
+    /// The time of the last voiced sample, or `None` without speech.
+    pub voice_end: Option<Timestamp>,
+}
+
+/// The utterances of `utterances` that are not older than `window_s` at `now`, in order.
+#[verus_spec(kept =>
+    ensures
+        kept@ == utterances@.filter(fresh_at(now, window_s)),
+)]
+#[must_use]
+pub fn expire(utterances: Vec<Utterance>, now: Timestamp, window_s: u64) -> Vec<Utterance> {
+    let mut kept = Vec::new();
+    let all = utterances.into_iter();
+    proof_decl! {
+        let ghost seen = vstd::std_specs::iter::IteratorSpec::remaining(&all);
+    }
+    #[cfg_attr(verus_only, verus_spec(utterance_iter =>
+        invariant
+            utterance_iter.seq() == seen,
+            seen == utterances@,
+            kept@ == seen.take(utterance_iter.index() as int).filter(fresh_at(now, window_s)),
+    ))]
+    for utterance in all {
+        proof! {
+            lemma_filter_step(seen, utterance_iter.index() as int, fresh_at(now, window_s));
+        }
+        if is_fresh(&utterance, now, window_s) {
+            kept.push(utterance);
+        }
+    }
+    proof! {
+        assert(seen.take(seen.len() as int) =~= seen);
+    }
+    kept
+}
+
+/// True when `utterance` is not older than `window_s` at `now`.
+#[verus_spec(kept =>
+    ensures
+        kept == fresh(*utterance, now, window_s),
+)]
+fn is_fresh(utterance: &Utterance, now: Timestamp, window_s: u64) -> bool {
+    let window = i128::from(window_s) * 1_000_000_000;
+    match utterance.time.as_nanosecond().checked_add(window) {
+        Some(deadline) => now.as_nanosecond() <= deadline,
+        None => true,
+    }
+}
+
+/// The utterances of `utterances` that are not older than `window_s` at `now`, without the one
+/// with the normalized text of `text`, and that one. Two or more matches give `None` and remove
+/// nothing.
+#[verus_spec(correlated =>
+    ensures
+        correlated.1 == unique(matching(utterances@, text@, now, window_s)),
+        forall|index: int| 0 <= index < correlated.0@.len() ==> fresh(#[trigger] correlated.0@[index], now, window_s),
+        correlated.1 matches Some(found) ==> !correlated.0@.contains(found),
+)]
+#[must_use]
+pub fn correlate(
+    utterances: Vec<Utterance>,
+    text: &str,
+    now: Timestamp,
+    window_s: u64,
+) -> (Vec<Utterance>, Option<Utterance>) {
+    let mut kept = expire(utterances, now, window_s);
+    let (found, count) = search(&kept, text);
+    proof! {
+        assert(kept@.take(kept@.len() as int) =~= kept@);
+        lemma_all_fresh(utterances@, now, window_s);
+    }
+    match found {
+        Some(position) if count == 1 => {
+            proof! {
+                lemma_removed(kept@, position as int, same_at(text@));
+            }
+            let utterance = kept.remove(position);
+            (kept, Some(utterance))
+        }
+        _ => (kept, None),
+    }
+}
+
+/// The position of the last utterance of `utterances` with the normalized text of `text`, and
+/// the number of such utterances.
+#[verus_spec(searched =>
+    ensures
+        counted(utterances@, text@, utterances@.len() as int, searched.0, searched.1),
+)]
+fn search(utterances: &[Utterance], text: &str) -> (Option<usize>, usize) {
+    let wanted = intent::normalize(text);
+    let (mut found, mut count, mut index): (Option<usize>, usize, usize) = (None, 0, 0);
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            wanted@ == intent::normalized(text@),
+            index <= utterances@.len(),
+            counted(utterances@, text@, index as int, found, count),
+        decreases utterances@.len() - index,
+    ))]
+    while index < utterances.len() {
+        proof! {
+            lemma_filter_step(utterances@, index as int, same_at(text@));
+        }
+        if intent::normalize(utterances[index].text.as_str()).as_str() == wanted.as_str() {
+            found = Some(index);
+            count += 1;
+        }
+        index += 1;
+    }
+    (found, count)
+}
+
 verus! {
 
 /// True when `c` ends a sentence before a space.
@@ -278,6 +403,7 @@ proof fn lemma_joined_prefix(pieces: Seq<&[i16]>, samples: Seq<i16>, size: int, 
     assert(samples.subrange(0, total) =~= samples);
     if count == 0 {
         assert(joined(pieces.take(0)) =~= Seq::<i16>::empty());
+        assert(-1 * size + size == 0) by (nonlinear_arith);
         assert(samples.subrange(0, end(samples, size, -1)) =~= Seq::<i16>::empty());
     } else {
         lemma_joined_prefix(pieces, samples, size, count - 1);
@@ -295,6 +421,108 @@ proof fn lemma_joined_prefix(pieces: Seq<&[i16]>, samples: Seq<i16>, size: int, 
         prior.lemma_flatten_push(pieces[count - 1]@);
         assert(samples.subrange(0, end(samples, size, count - 1)) =~= samples.subrange(0, start)
             + samples.subrange(start, end(samples, size, count - 1)));
+    }
+}
+
+/// True when `utterance` is not older than `window_s` at `now`.
+pub open spec fn fresh(utterance: Utterance, now: Timestamp, window_s: u64) -> bool {
+    crate::domain::contracts::nanosecond(now) - crate::domain::contracts::nanosecond(utterance.time) <= window_s * 1_000_000_000
+}
+
+/// The predicate of the utterances that are not older than `window_s` at `now`.
+pub open spec fn fresh_at(now: Timestamp, window_s: u64) -> spec_fn(Utterance) -> bool {
+    |utterance: Utterance| fresh(utterance, now, window_s)
+}
+
+/// The predicate of the utterances with the normalized text of `text`.
+pub open spec fn same_at(text: Seq<char>) -> spec_fn(Utterance) -> bool {
+    |utterance: Utterance| intent::normalized(utterance.text@) == intent::normalized(text)
+}
+
+/// The utterances of `utterances` that are not older than `window_s` at `now` and have the
+/// normalized text of `text`.
+pub open spec fn matching(utterances: Seq<Utterance>, text: Seq<char>, now: Timestamp, window_s: u64) -> Seq<Utterance> {
+    utterances.filter(fresh_at(now, window_s)).filter(same_at(text))
+}
+
+/// The only utterance of `matches`, or `None` when it has none or more than one.
+pub open spec fn unique(matches: Seq<Utterance>) -> Option<Utterance> {
+    if matches.len() == 1 { Some(matches[0]) } else { None }
+}
+
+/// True when `count` of the first `index` utterances of `utterances` have the normalized text of
+/// `text`, and `found` is the position of the last of them.
+pub open spec fn counted(utterances: Seq<Utterance>, text: Seq<char>, index: int, found: Option<usize>, count: usize) -> bool {
+    let matches = utterances.take(index).filter(same_at(text));
+    &&& count <= index
+    &&& count == matches.len()
+    &&& match found {
+        Some(position) => position < index && count > 0 && matches.last() == utterances[position as int],
+        None => count == 0,
+    }
+}
+
+/// The filter of the first `index + 1` utterances is the filter of the first `index`, with the
+/// utterance at `index` when `keep` holds for it.
+proof fn lemma_filter_step(utterances: Seq<Utterance>, index: int, keep: spec_fn(Utterance) -> bool)
+    requires
+        0 <= index < utterances.len(),
+    ensures
+        utterances.take(index + 1).filter(keep) == if keep(utterances[index]) {
+            utterances.take(index).filter(keep).push(utterances[index])
+        } else {
+            utterances.take(index).filter(keep)
+        },
+{
+    reveal_with_fuel(Seq::filter, 1);
+    assert(utterances.take(index + 1).drop_last() =~= utterances.take(index));
+}
+
+/// Each utterance of the filter by `fresh_at`, also without one of them, is fresh.
+proof fn lemma_all_fresh(utterances: Seq<Utterance>, now: Timestamp, window_s: u64)
+    ensures
+        forall|index: int| 0 <= index < utterances.filter(fresh_at(now, window_s)).len()
+            ==> fresh(#[trigger] utterances.filter(fresh_at(now, window_s))[index], now, window_s),
+        forall|position: int, index: int| 0 <= position < utterances.filter(fresh_at(now, window_s)).len()
+            && 0 <= index < utterances.filter(fresh_at(now, window_s)).len() - 1
+            ==> fresh(#[trigger] utterances.filter(fresh_at(now, window_s)).remove(position)[index], now, window_s),
+{
+    broadcast use Seq::lemma_filter_pred;
+    let kept = utterances.filter(fresh_at(now, window_s));
+    assert forall|position: int, index: int| 0 <= position < kept.len() && 0 <= index < kept.len() - 1
+        implies fresh(#[trigger] kept.remove(position)[index], now, window_s) by {
+        if index < position {
+            assert(kept.remove(position)[index] == kept[index]);
+        } else {
+            assert(kept.remove(position)[index] == kept[index + 1]);
+        }
+    }
+}
+
+/// Without the only utterance at `position` for which `keep` holds, no utterance is equal to it.
+proof fn lemma_removed(utterances: Seq<Utterance>, position: int, keep: spec_fn(Utterance) -> bool)
+    requires
+        0 <= position < utterances.len(),
+        utterances.filter(keep).len() == 1,
+        keep(utterances[position]),
+    ensures
+        !utterances.remove(position).contains(utterances[position]),
+{
+    broadcast use Seq::filter_distributes_over_add, Seq::lemma_filter_contains;
+    let found = utterances[position];
+    let (before, after) = (utterances.take(position), utterances.skip(position + 1));
+    assert(utterances =~= before + seq![found] + after);
+    reveal_with_fuel(Seq::filter, 2);
+    assert(seq![found].drop_last() =~= Seq::<Utterance>::empty());
+    assert(seq![found].filter(keep) =~= seq![found]);
+    assert((before + seq![found] + after).filter(keep) == before.filter(keep) + seq![found].filter(keep) + after.filter(keep));
+    let rest = utterances.remove(position);
+    assert(rest =~= before + after);
+    assert(rest.filter(keep) == before.filter(keep) + after.filter(keep));
+    assert(rest.filter(keep).len() == 0);
+    if rest.contains(found) {
+        let index = choose|index: int| 0 <= index < rest.len() && rest[index] == found;
+        assert(rest.filter(keep).contains(rest[index]));
     }
 }
 
@@ -427,6 +655,83 @@ mod tests {
         assert_eq!(
             normal(&format!("{joined} {buffer}")),
             normal(&chunks.concat())
+        );
+    }
+
+    /// `log.correlate_s` of `jarvis.toml`.
+    const WINDOW_S: u64 = 10;
+
+    /// The time `second` seconds after the Unix epoch.
+    fn at(second: i64) -> Timestamp {
+        Timestamp::from_second(second).expect("a valid time")
+    }
+
+    /// An utterance of `text` kept at `second`, with one sample of `sample`.
+    fn utterance(text: &str, second: i64, sample: i16) -> Utterance {
+        Utterance {
+            text: text.to_owned(),
+            audio: Audio {
+                samples: vec![sample],
+                rate: 16_000,
+            },
+            time: at(second),
+            voice_end: None,
+        }
+    }
+
+    /// AC-12.1-1.
+    #[test]
+    fn ac_12_1_1_same_normalized_text_in_the_window_correlates() {
+        let kept = utterance("Turn on the lights.", 0, 1);
+        let other = utterance("turn off the fan", 0, 2);
+        let utterances = vec![other.clone(), kept.clone()];
+        let (rest, found) = correlate(utterances, "turn on the lights", at(10), WINDOW_S);
+        assert_eq!((rest, found), (vec![other], Some(kept)));
+    }
+
+    /// AC-12.1-2.
+    #[test]
+    fn ac_12_1_2_only_match_older_than_the_window_gives_none() {
+        let utterances = vec![utterance("turn on the lights", 0, 1)];
+        let (_, found) = correlate(utterances, "turn on the lights", at(11), WINDOW_S);
+        assert_eq!(found, None);
+    }
+
+    /// AC-12.1-3.
+    #[test]
+    fn ac_12_1_3_two_matches_in_the_window_give_none() {
+        let utterances = vec![
+            utterance("turn on the lights", 0, 1),
+            utterance("Turn on the lights", 5, 2),
+        ];
+        let (rest, found) = correlate(utterances.clone(), "turn on the lights", at(5), WINDOW_S);
+        assert_eq!((rest, found), (utterances, None));
+    }
+
+    /// AC-12.1-4.
+    #[test]
+    fn ac_12_1_4_correlate_removes_utterances_older_than_the_window() {
+        let old = utterance("turn off the fan", 0, 1);
+        let new = utterance("pause the music", 5, 2);
+        let (rest, _) = correlate(
+            vec![old, new.clone()],
+            "turn on the lights",
+            at(11),
+            WINDOW_S,
+        );
+        assert_eq!(rest, vec![new]);
+    }
+
+    /// AC-12.1-5.
+    #[test]
+    fn ac_12_1_5_second_correlate_for_the_same_text_gives_none() {
+        let utterances = vec![utterance("turn on the lights", 0, 1)];
+        let (rest, first) = correlate(utterances, "turn on the lights", at(1), WINDOW_S);
+        let (_, second) = correlate(rest, "turn on the lights", at(1), WINDOW_S);
+        assert_eq!(
+            (first.is_some(), second),
+            (true, None),
+            "the first did not match, or the second matched"
         );
     }
 
