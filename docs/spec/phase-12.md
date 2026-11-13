@@ -464,7 +464,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 **Model.**
 
 - `Status { state: State, message: Option<String> }` and `State { Online, Training, Restarting, Offline }` are in `src/ports.rs`. The JSON form is `{ "state": "online", "message": null }`, with the state in lowercase.
-- The composition root keeps the status in a `tokio::sync::watch` channel. The channel starts with `Online` and no message. The web server starts only when the start is ready (sub-phase 12.8b), so the API never gives a status before that. Sub-phases 12.9c, 12.9f and 13.10b read or change the status.
+- The composition root keeps the status in a `tokio::sync::watch` channel. The channel starts with `Online` and no message. The web server starts only when the start is ready (sub-phase 12.8b), so the API never gives a status before that. Sub-phases 12.9c, 12.9h, 12.9f and 13.10b read or change the status.
 - The new driving port `Control` has `status() -> Status`. `src/lib.rs` implements it with the receiver of the channel. `adapters/web.rs` calls it. `FakeControl` in `src/testing/fakes.rs` gives a set status.
 - `GET api/status` returns the status.
 - The page has a status section `#status` with `.state` and `.message`. The page reads `api/status` at load and each 5 s. When the request fails, for example when the add-on returns its down page (sub-phase 12.9g), the section shows `offline`.
@@ -484,15 +484,14 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 ### 12.9c Status Entity
 
-**Goal:** Publish the status of Jarvis as the HA entity `sensor.jarvis_status` through MQTT discovery, with a retained state and a last will. Dashboards and automations see `online`, `training`, `restarting` and `offline`, also when Jarvis dies, and the entity stays after an HA restart.
+**Goal:** Add the MQTT adapter that publishes the status of Jarvis as the HA entity `sensor.jarvis_status` through MQTT discovery, with a retained state and a last will. Sub-phase 12.9h starts it in `run`.
 
 - **Implements:** G24. **Depends on:** 12.9b.
-- **Files:** create `src/adapters/mqtt.rs`. Modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
+- **Files:** create `src/adapters/mqtt.rs`. Modify `src/lib.rs`, `Cargo.toml`, `src/testing/fakes.rs`.
 
 **Model.**
 
-- This sub-phase adds the optional section `[mqtt]`: `url` (for example `mqtt://homeassistant.local:1883`), `username_env` and `password_env`. `Secrets` resolves the user name and the password. Without the section, Jarvis publishes no status.
-- `adapters/mqtt.rs` connects to the broker with `rumqttc`, with the client ID `jarvis` and a keep-alive of 30 s. It reads the status from a receiver of the status channel. No use case calls it, so it has no port (`01-architecture.md` section 1).
+- `adapters/mqtt.rs` has `options(url, username, password)` and `publish(options, status)`. `options` makes the `rumqttc` options of the broker at `url` (for example `mqtt://homeassistant.local:1883`), with the client ID `jarvis`, a keep-alive of 30 s, the user name and the password. A `url` that `rumqttc` cannot parse is an error that names `mqtt.url`. `publish` reads the status from a receiver of the status channel (sub-phase 12.9b). No use case calls it, so it has no port (`01-architecture.md` section 1).
 - The last will is the payload `{ "state": "offline", "message": null }` on the topic `jarvis/status`, with QoS 1 and retain. The broker publishes it when the connection ends without `DISCONNECT`, at the latest 1.5 keep-alive intervals (45 s) after the last packet.
 - At each `ConnAck`, the first connection and each reconnection, the adapter publishes these two messages with QoS 1 and retain:
   - On `homeassistant/sensor/jarvis/status/config`: `{ "name": "Status", "unique_id": "jarvis_status", "device": { "identifiers": ["jarvis"], "name": "Jarvis" }, "device_class": "enum", "options": ["online", "training", "restarting", "offline"], "state_topic": "jarvis/status", "value_template": "{{ value_json.state }}", "json_attributes_topic": "jarvis/status" }`. HA makes the entity ID `sensor.jarvis_status` from the device name and the entity name. The field `message` of the status becomes an attribute of the entity.
@@ -500,9 +499,8 @@ A cancel phrase is not logged, because it has no prediction and no action.
 - Each change of the status publishes `jarvis/status` again, with retain.
 - The broker keeps both messages. The entity has a `unique_id`, so HA makes it again from the retained discovery message after an HA restart, with the retained state.
 - After a connection error, the adapter waits 5 s, and its next poll connects again.
-- When the sender of the status channel closes, the adapter publishes the last status, sends `DISCONNECT` and ends. After `DISCONNECT` the broker does not publish the will. At the end of `run`, the root sets `Offline` and then drops the sender. Thus a stop gives `offline`.
-- `run` starts the adapter when the start is ready. Thus the entity shows `online` only when Jarvis answers. Before that, the entity keeps the retained state of the earlier process.
-- The tests use an in-process `rumqttd` broker on a local port and a `rumqttc` client that subscribes. They do not pause the clock, and they do not sleep: each test waits for the messages that it expects.
+- When the sender of the status channel closes, the adapter publishes the last status, sends `DISCONNECT` and ends. After `DISCONNECT` the broker does not publish the will.
+- The tests use an in-process `rumqttd` broker on a local port and a `rumqttc` client that subscribes. Both are in `src/testing/fakes.rs`, because the tests of sub-phase 12.9h use them too. The tests do not pause the clock, and they do not sleep: each test waits for the messages that it expects.
 
 **Acceptance criteria.**
 
@@ -510,14 +508,37 @@ A cancel phrase is not logged, because it has no prediction and no action.
 - AC-12.9c-2: When the status changes to `training`, the client gets `{ "state": "training", "message": null }` with retain.
 - AC-12.9c-3: When the adapter task is aborted, so that the connection ends without `DISCONNECT`, the client gets `{ "state": "offline", "message": null }`.
 - AC-12.9c-4: When the status is `restarting` and the sender of the channel closes, the adapter ends, and a client that subscribes after the end gets `restarting`.
-- AC-12.9c-5: When the shutdown future of `run` completes, the last status in the channel is `offline`.
-- AC-12.9c-6: When `[mqtt]` is not set, `run` starts and opens no MQTT connection.
 
 **Proofs.**
 
 - P-12.9c-1. Argument: the `ConnAck` arm of the poll loop publishes both messages, so each connection publishes them again.
-- P-12.9c-5. Argument: `run` sends `Offline` after the servers stop and before it drops the sender.
-- P-12.9c-2 to P-12.9c-4, P-12.9c-6. Evidence: test.
+- P-12.9c-2 to P-12.9c-4. Evidence: test.
+
+---
+
+### 12.9h Status Entity Start
+
+**Goal:** Start the status entity of sub-phase 12.9c in `run`. Dashboards and automations see `online`, `training`, `restarting` and `offline`, also when Jarvis dies, and the entity stays after an HA restart.
+
+- **Implements:** G24. **Depends on:** 12.9c.
+- **Files:** modify `src/lib.rs`, `jarvis.toml`.
+
+**Model.**
+
+- This sub-phase adds the optional section `[mqtt]`: `url`, `username_env` and `password_env`. `Secrets` resolves the user name and the password. Without the section, Jarvis publishes no status.
+- `run` starts the adapter when the start is ready. Thus the entity shows `online` only when Jarvis answers. Before that, the entity keeps the retained state of the earlier process.
+- At the end of `run`, the root sets `Offline` and then drops the sender. Thus a stop gives `offline` (sub-phase 12.9c). The adapter task is in the task tracker, so `run` waits for it as for the other tasks, up to 5 s.
+- The tests of `run` without a broker remove `[mqtt]` from the configuration.
+
+**Acceptance criteria.**
+
+- AC-12.9h-1: When the shutdown future of `run` completes, the last status in the channel is `offline`.
+- AC-12.9h-2: When `[mqtt]` is not set, `run` starts and opens no MQTT connection.
+
+**Proofs.**
+
+- P-12.9h-1. Argument: `run` sends `Offline` after the servers stop and before it drops the sender.
+- P-12.9h-2. Evidence: test.
 
 **Field log.** In the MQTT broker on the HA host, make the user of Jarvis (for the Mosquitto add-on, an HA user or the `logins` option). Add `MQTT_USERNAME` and `MQTT_PASSWORD` to `jarvis.env`, and set `mqtt.url` to the broker. Restart Jarvis. Record that `sensor.jarvis_status` is `online` and belongs to the device Jarvis. Stop the unit `jarvis` and record `offline`. Restart HA and record that the entity keeps its state.
 
@@ -527,7 +548,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 **Goal:** Add the fields of the settings form and the pure functions that read them from the text of `jarvis.toml` and change them in it. A change keeps the comments and the order of the file, and no secret or path is a field.
 
-- **Implements:** G24. **Depends on:** 12.9c.
+- **Implements:** G24. **Depends on:** 12.9h.
 - **Files:** create `src/adapters/settings.rs`. Modify `src/lib.rs`, `Cargo.toml`.
 
 **Model.**
@@ -678,7 +699,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 - `addon/run.sh` has at most 10 lines. It reads the options `url` and `token` with `bashio::config`, puts them in place of `@URL@` and `@TOKEN@` in `/etc/nginx/nginx.conf` with `sed`, and runs `exec nginx -g 'daemon off;'`.
 - `addon/nginx.conf` listens on port 8099. It accepts only `172.30.32.2`, the ingress gateway of the Supervisor, and denies all other clients. It sends each request to `@URL@` with `proxy_set_header Authorization "Bearer @TOKEN@"` and a connect time limit of 5 s. `error_page 502 503 504 /down.html` serves `/www/down.html` when Jarvis does not answer. The status code stays 502, 503 or 504, so the page script sees the failure (sub-phase 12.9b).
 - `addon/down.html` is a static page with the text "Jarvis is down" and `<meta http-equiv="refresh" content="10">`. It has no script, so `src/adapters/review.html` stays the only JavaScript. The refresh loads the same relative URL again, so the tab shows Jarvis again when it answers.
-- The add-on does not publish the status entity. Jarvis publishes it through MQTT (sub-phase 12.9c), so the entity does not depend on the add-on.
+- The add-on does not publish the status entity. Jarvis publishes it through MQTT (sub-phases 12.9c and 12.9h), so the entity does not depend on the add-on.
 - CI has no Supervisor. Structure tests in `xtask/src/gates.rs` check the files with `serde_yaml` and text checks. The field log checks the add-on in HA.
 
 **Acceptance criteria.**
@@ -756,4 +777,4 @@ A cancel phrase is not logged, because it has no prediction and no action.
 These steps are not tests and gate nothing.
 
 1. In the Jarvis tab of HA, play the audio of an interaction, and send a mark with a correction.
-2. Do the field logs of sub-phases 12.9c, 12.9f and 12.9g.
+2. Do the field logs of sub-phases 12.9h, 12.9f and 12.9g.
