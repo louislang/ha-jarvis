@@ -600,13 +600,14 @@ impl Conversation {
         heard: &Heard,
         key: Option<Key>,
     ) -> (Handled, Option<Spoken>) {
+        let first = heard.link.unwrap_or(heard.id);
         let answer = match (decision, heard.satellite.as_deref()) {
             (Decision::Defer { job, .. }, None) => match job {
                 Job::Fetch { call, pool } => self.fetched(&call, &pool).await,
                 Job::Llm(text) => {
                     let thread = Thread {
                         key,
-                        first: Some(heard.id),
+                        first: Some(first),
                         ..Thread::default()
                     };
                     let answer = self.answer(&text, area, &thread).await;
@@ -614,7 +615,10 @@ impl Conversation {
                 }
             },
             (decision, satellite) => {
-                return (self.dispatch(decision, area, satellite, heard.id), None);
+                return (
+                    self.dispatch(decision, area, satellite, heard.id, first),
+                    None,
+                );
             }
         };
         let spoken = self.or_failure(answer);
@@ -625,13 +629,15 @@ impl Conversation {
     /// The reply, filler or question of `decision` and its service call from `area` as background
     /// work, and its fetch, answer or question only with `satellite`. Records the use of the reply.
     /// Increases the generation of `satellite`, the satellite entity of the request. Later
-    /// announces go to the record `id`.
+    /// announces go to the record `id`. A question of System Two links its answers to the record
+    /// `first`.
     pub fn dispatch(
         &self,
         decision: Decision,
         area: Option<&AreaId>,
         satellite: Option<&str>,
         id: u64,
+        first: u64,
     ) -> Handled {
         let request = self.origin(satellite, id);
         let (chosen, after) = match decision {
@@ -651,7 +657,7 @@ impl Conversation {
                     let request = Some(request);
                     let thread = Thread {
                         request,
-                        first: Some(id),
+                        first: Some(first),
                         ..Thread::default()
                     };
                     self.llm(text, area.cloned(), thread)
@@ -1785,7 +1791,7 @@ mod tests {
         });
         let (_task, _store, conversation) = start(&home)?;
         let start = Instant::now();
-        let handled = conversation.dispatch(reply(Some(call())), None, None, 0);
+        let handled = conversation.dispatch(reply(Some(call())), None, None, 0, 0);
         assert_eq!(Instant::now(), start, "dispatch waited for the call");
         assert!(handled.after.is_some(), "the call is not in after");
         Ok(())
@@ -1797,7 +1803,7 @@ mod tests {
         let home = Arc::new(FakeHome::default());
         let (_task, _store, conversation) = start(&home)?;
         let after = conversation
-            .dispatch(reply(Some(call())), None, None, 0)
+            .dispatch(reply(Some(call())), None, None, 0, 0)
             .after;
         assert_eq!(home.calls(), [], "a call came before the start");
         after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
@@ -1809,7 +1815,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_4_8_3_store_receives_new_use_count() -> anyhow::Result<()> {
         let started = start(&Arc::new(FakeHome::default()))?;
-        let _ = started.2.dispatch(reply(Some(call())), None, None, 0);
+        let _ = started.2.dispatch(reply(Some(call())), None, None, 0, 0);
         let expected = responses::record_use(unused(), "lights_on", 1);
         assert_eq!(last_save(started).await?, expected);
         Ok(())
@@ -1820,7 +1826,7 @@ mod tests {
     async fn ac_4_8_4_reply_without_call_makes_no_call() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
         let (_task, _store, conversation) = start(&home)?;
-        let handled = conversation.dispatch(reply(None), None, None, 0);
+        let handled = conversation.dispatch(reply(None), None, None, 0, 0);
         assert!(handled.after.is_none(), "a reply with no call has work");
         assert_eq!(home.calls(), []);
         Ok(())
@@ -1832,7 +1838,7 @@ mod tests {
         let started = start(&Arc::new(FakeHome::default()))?;
         thread::scope(|scope| {
             for _ in 0..100 {
-                scope.spawn(|| started.2.dispatch(reply(None), None, None, 0));
+                scope.spawn(|| started.2.dispatch(reply(None), None, None, 0, 0));
             }
         });
         let saved = last_save(started).await?;
@@ -2002,7 +2008,7 @@ mod tests {
         decision: Decision,
         satellite: Option<&str>,
     ) -> anyhow::Result<Work> {
-        let handled = conversation.dispatch(decision, None, satellite, 0);
+        let handled = conversation.dispatch(decision, None, satellite, 0, 0);
         handled.after.ok_or_else(|| anyhow::anyhow!("no after"))
     }
 
@@ -2048,7 +2054,7 @@ mod tests {
         let home = Arc::new(FakeHome::default());
         let (_cache, _changes, conversation) = still(&home, "idle");
         let first = failed(&home, &conversation)?;
-        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE), 0);
+        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE), 0, 0);
         first.await?;
         assert_eq!(announces(&home), [] as [&str; 0]);
         Ok(())
@@ -2078,7 +2084,7 @@ mod tests {
         let classifier = Arc::<FakeClassifier>::default();
         let (_cache, changes, conversation) =
             still_with(&home, "idle", classifier, Arc::clone(&reasoner));
-        let _ = conversation.dispatch(reply(None), None, None, 0);
+        let _ = conversation.dispatch(reply(None), None, None, 0, 0);
         let _ = changes
             .try_iter()
             .fold(unused(), |pools, change| change(pools));
@@ -3247,7 +3253,7 @@ mod tests {
             Decision::Defer { filler, job },
             Some(SATELLITE),
         )?;
-        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE), 0);
+        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE), 0, 0);
         old.await?;
         assert_eq!(home.calls(), []);
         Ok(())
