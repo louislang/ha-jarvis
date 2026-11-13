@@ -97,3 +97,9 @@ correlate_s = 10
 listen = "0.0.0.0:10701"
 token_env = "JARVIS_WEB_TOKEN"
 page_size = 50
+
+# Optional. Without this section, Jarvis publishes no status entity.
+[mqtt]
+url = "mqtt://homeassistant.local:1883"
+username_env = "MQTT_USERNAME"
+password_env = "MQTT_PASSWORD"

@@ -25,6 +25,7 @@ The design is in [`docs/spec/`](docs/spec/00-overview.md).
 | Responses | Each intent has a pool of replies with variety. Jarvis adds new replies when a pool runs low. A slow request gets a filler reply, then an announcement of the answer. | Local, OpenAI for new replies |
 | Interaction log | Jarvis records each request with its audio, transcript, prediction, decision, service calls, responses and latency in the SQLite file `log.database` (`jarvis.db`). Once a day, it deletes audio older than `log.audio_days` and unmarked records older than `log.record_days`. | Local |
 | Review | A web server on `web.listen` (port 10701) lists the logged requests, gives their audio as WAV and takes good or bad marks with an optional correction. `api/status` gives the status of Jarvis (`online`, `training`, `restarting` or `offline`) and an optional message. Each request under `api/` needs `Authorization: Bearer <token>`, with the token of `web.token_env`. `/` is the review page: it shows the status of Jarvis, or `offline` when Jarvis does not answer, plays each request and marks its action and responses with one click. The page sends no token, so it works only behind a proxy that adds the header, such as the Jarvis add-on. | Local |
+| Status entity | With `[mqtt]`, Jarvis publishes its status as the HA entity `sensor.jarvis_status` through MQTT discovery, with a retained state. The broker sets `offline` when Jarvis stops or dies, and the entity stays after an HA restart. | Local |
 
 Not built yet: habit learning, the Jarvis add-on, feedback, automatic training, learned intents, speaker identification and timers (phases 11 to 16 in [`docs/spec/00-overview.md`](docs/spec/00-overview.md)).
 
@@ -45,9 +46,9 @@ Steps:
 3. Download the speech models with `just models`.
 4. On a GPU host, run `just gpu-models`. It needs the fp16 speech models in `/opt/jarvis-models/fp16/`. No download has them: convert them once from the fp32 exports, as `docs/spec/phase-06.md` sub-phases 6.6c and 6.7 describe.
 5. Build the System One model with `just install-python`, then `just fixture-model`.
-6. Edit `jarvis.toml`: set `ha.url` and `plugins.plex.url`. Remove the `[plugins.plex]` section if you have no Plex.
+6. Edit `jarvis.toml`: set `ha.url`, `plugins.plex.url` and `mqtt.url` (your MQTT broker, for example the Mosquitto add-on). Remove the `[plugins.plex]` section if you have no Plex, and the `[mqtt]` section if you want no status entity.
 7. On a host without a GPU, copy `jarvis.toml` to `jarvis.local.toml` and use that file. In it, set `device = "cpu"`, change `.fp16.` to `.int8.` in `asr.encoder`, `asr.decoder` and `asr.joiner`, and remove `second_pass_dir`.
-8. Create `jarvis.env` with `HA_TOKEN=...`, `OPENAI_API_KEY=...`, `JARVIS_WEB_TOKEN=...` (a random token of your choice for the review API) and, for Plex, `PLEX_TOKEN=...`. Add `LD_LIBRARY_PATH=<folder>` and `ORT_DYLIB_PATH=<folder>/libonnxruntime.so`, where `<folder>` is the repository folder.
+8. Create `jarvis.env` with `HA_TOKEN=...`, `OPENAI_API_KEY=...`, `JARVIS_WEB_TOKEN=...` (a random token of your choice for the review API) and, for Plex, `PLEX_TOKEN=...`. For `[mqtt]`, add `MQTT_USERNAME=...` and `MQTT_PASSWORD=...` of a broker user. Add `LD_LIBRARY_PATH=<folder>` and `ORT_DYLIB_PATH=<folder>/libonnxruntime.so`, where `<folder>` is the repository folder.
 9. Start Jarvis: `set -a; . ./jarvis.env; set +a; ./jarvis serve jarvis.toml` (or `jarvis.local.toml`). It listens on port 10700 (Wyoming) and port 10701 (review page and API).
 10. In Home Assistant, add the Wyoming Protocol integration with the host of Jarvis and port 10700.
 11. Create an Assist pipeline with Jarvis as the conversation agent, speech-to-text and text-to-speech. Turn off "Prefer handling commands locally". Select this pipeline on your satellites.
