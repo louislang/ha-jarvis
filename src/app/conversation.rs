@@ -317,8 +317,10 @@ impl Conversation {
     fn take_dialog(&self, key: Option<Key>, heard: &mut Heard) -> Option<(Dialog, Key)> {
         let key = key?;
         let timeout = self.queues.dialog.timeout_s;
+        // The dialog lock also guards the link, so one request takes both.
+        let mut dialogs = self.queues.dialogs();
         let link = self.queues.take_link(&key);
-        let dialog = self.queues.dialogs().take(&key, heard.time, timeout)?;
+        let dialog = dialogs.take(&key, heard.time, timeout)?;
         heard.link = link;
         Some((dialog, key))
     }
@@ -359,9 +361,10 @@ impl Conversation {
     /// Opens a dialog on `key` that waits for `pending`, asked at the time of `heard`, with the
     /// first interaction of the dialog of `heard`, else `heard` itself, as its first.
     fn open(&self, key: Key, pending: Pending, heard: &Heard) {
+        let mut dialogs = self.queues.dialogs();
         self.queues
             .set_link(key.clone(), heard.link.unwrap_or(heard.id));
-        self.queues.open(key, pending, heard.time);
+        dialogs.open(key, pending, heard.time);
     }
 
     /// The parts of the record that `decision` gives, with its reply, filler or question as the
@@ -1364,13 +1367,15 @@ impl Queues {
         }
     }
 
-    /// Removes and returns the ID of the first interaction of the dialog of `key`.
+    /// Removes and returns the ID of the first interaction of the dialog of `key`. The caller
+    /// holds the dialog lock.
     fn take_link(&self, key: &Key) -> Option<u64> {
         let mut links = self.links.lock().expect("no lock holder panics");
         links.remove(key)
     }
 
-    /// Makes the interaction `first` the first of the dialog that opens on `key`.
+    /// Makes the interaction `first` the first of the dialog that opens on `key`. The caller holds
+    /// the dialog lock.
     fn set_link(&self, key: Key, first: u64) {
         let mut links = self.links.lock().expect("no lock holder panics");
         links.insert(key, first);
@@ -1378,10 +1383,11 @@ impl Queues {
 
     /// Opens `dialog` on `key`, with the interaction `first`, when it is set, as its first.
     fn put(&self, key: Key, dialog: Dialog, first: Option<u64>) {
+        let mut dialogs = self.dialogs();
         if let Some(first) = first {
             self.set_link(key.clone(), first);
         }
-        self.dialogs().dialogs.insert(key, dialog);
+        dialogs.dialogs.insert(key, dialog);
     }
 
     /// The queue of `satellite`.
