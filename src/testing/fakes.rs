@@ -43,6 +43,7 @@ use tracing::subscriber::NoSubscriber;
 use crate::Config;
 use crate::Device;
 use crate::adapters::supertonic::SupertonicTts;
+use crate::app::review;
 use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::feedback;
@@ -72,6 +73,7 @@ use crate::ports::Page;
 use crate::ports::Partial;
 use crate::ports::Plugin;
 use crate::ports::Reasoner;
+use crate::ports::Review;
 use crate::ports::SpeechToText;
 use crate::ports::Step;
 use crate::ports::Store;
@@ -796,6 +798,43 @@ impl InteractionLog for FakeLog {
     async fn prune(&self, now: Timestamp) -> anyhow::Result<()> {
         lock(&self.prunes).push(now);
         Ok(())
+    }
+}
+
+/// A `Review` of fixed interactions that records each mark whose correction is in `intents`.
+#[derive(Default)]
+pub struct FakeReview {
+    /// The interactions with their audio, newest first.
+    pub interactions: Vec<(Interaction, Option<Audio>)>,
+    /// The names that a correction can have.
+    pub intents: Vec<String>,
+    /// Each accepted mark, in order.
+    pub marks: Mutex<Vec<Mark>>,
+}
+
+#[async_trait]
+impl Review for FakeReview {
+    async fn list(&self, _filter: Filter, _page: Page) -> anyhow::Result<Vec<Interaction>> {
+        let interactions = self.interactions.iter();
+        Ok(interactions
+            .map(|(interaction, _)| interaction.clone())
+            .collect())
+    }
+
+    async fn audio(&self, id: u64) -> anyhow::Result<Option<Audio>> {
+        let mut interactions = self.interactions.iter();
+        let found = interactions.find(|(interaction, _)| interaction.id == id);
+        Ok(found.and_then(|(_, audio)| audio.clone()))
+    }
+
+    async fn mark(&self, mark: Mark) -> anyhow::Result<()> {
+        review::check(&mark, &self.intents)?;
+        lock(&self.marks).push(mark);
+        Ok(())
+    }
+
+    fn intents(&self) -> Vec<String> {
+        self.intents.clone()
     }
 }
 
