@@ -24,6 +24,7 @@ The design is in [`docs/spec/`](docs/spec/00-overview.md).
 | Speech | Streaming speech-to-text, then a second pass at the end of speech. Text-to-speech with a cache of rendered responses. A short answer like "Kitchen" ends listening after 100 ms. | Local |
 | Responses | Each intent has a pool of replies with variety. Jarvis adds new replies when a pool runs low. A slow request gets a filler reply, then an announcement of the answer. | Local, OpenAI for new replies |
 | Interaction log | Jarvis records each request with its audio, transcript, prediction, decision, service calls, responses and latency in the SQLite file `log.database` (`jarvis.db`). Once a day, it deletes audio older than `log.audio_days` and unmarked records older than `log.record_days`. | Local |
+| Review API | A web server on `web.listen` (port 10701) lists the logged requests, gives their audio as WAV and takes good or bad marks with an optional correction. Each request under `api/` needs `Authorization: Bearer <token>`, with the token of `web.token_env`. | Local |
 
 Not built yet: habit learning, the review page and feedback, automatic training, learned intents, speaker identification and timers (phases 11 to 16 in [`docs/spec/00-overview.md`](docs/spec/00-overview.md)).
 
@@ -46,8 +47,8 @@ Steps:
 5. Build the System One model with `just install-python`, then `just fixture-model`.
 6. Edit `jarvis.toml`: set `ha.url` and `plugins.plex.url`. Remove the `[plugins.plex]` section if you have no Plex.
 7. On a host without a GPU, copy `jarvis.toml` to `jarvis.local.toml` and use that file. In it, set `device = "cpu"`, change `.fp16.` to `.int8.` in `asr.encoder`, `asr.decoder` and `asr.joiner`, and remove `second_pass_dir`.
-8. Create `jarvis.env` with `HA_TOKEN=...`, `OPENAI_API_KEY=...` and, for Plex, `PLEX_TOKEN=...`. Add `LD_LIBRARY_PATH=<folder>` and `ORT_DYLIB_PATH=<folder>/libonnxruntime.so`, where `<folder>` is the repository folder.
-9. Start Jarvis: `set -a; . ./jarvis.env; set +a; ./jarvis serve jarvis.toml` (or `jarvis.local.toml`). It listens on port 10700.
+8. Create `jarvis.env` with `HA_TOKEN=...`, `OPENAI_API_KEY=...`, `JARVIS_WEB_TOKEN=...` (a random token of your choice for the review API) and, for Plex, `PLEX_TOKEN=...`. Add `LD_LIBRARY_PATH=<folder>` and `ORT_DYLIB_PATH=<folder>/libonnxruntime.so`, where `<folder>` is the repository folder.
+9. Start Jarvis: `set -a; . ./jarvis.env; set +a; ./jarvis serve jarvis.toml` (or `jarvis.local.toml`). It listens on port 10700 (Wyoming) and port 10701 (review API).
 10. In Home Assistant, add the Wyoming Protocol integration with the host of Jarvis and port 10700.
 11. Create an Assist pipeline with Jarvis as the conversation agent, speech-to-text and text-to-speech. Turn off "Prefer handling commands locally". Select this pipeline on your satellites.
 
