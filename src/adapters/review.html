@@ -21,6 +21,7 @@
   <option value="unmarked">Unmarked</option>
 </select>
 <div id="interactions"></div>
+<button id="more" type="button" hidden>More</button>
 <template id="interaction">
   <article>
     <time class="time"></time> <span class="satellite"></span>
@@ -47,7 +48,9 @@
   // the token.
   const list = document.getElementById('interactions');
   const filter = document.getElementById('filter');
+  const more = document.getElementById('more');
   let intents = [];
+  let page = 0;
 
   async function mark(id, body) {
     const response = await fetch(`api/interactions/${id}/mark`, {
@@ -111,25 +114,31 @@
     return shown;
   }
 
-  async function load() {
+  // Loads the first page again, or with `next` the page after the shown ones.
+  async function load(next) {
     const kept = filter.value === 'bad' ? 'bad' : 'all';
+    page = next === true ? page + 1 : 0;
     try {
-      const response = await fetch(`api/interactions?filter=${kept}`);
+      const response = await fetch(`api/interactions?filter=${kept}&page=${page}`);
       if (!response.ok) throw new Error(`status ${response.status}`);
       const interactions = await response.json();
       const unmarked = filter.value === 'unmarked';
       const shown = interactions.filter((each) => !unmarked || each.marks.length === 0);
-      list.replaceChildren(...shown.map(card));
+      if (page === 0) list.replaceChildren();
+      list.append(...shown.map(card));
+      more.hidden = interactions.length === 0;
     } catch (error) {
       list.textContent = `Jarvis did not answer: ${error.message}`;
+      more.hidden = true;
     }
   }
 
   async function start() {
     const response = await fetch('api/intents');
     if (response.ok) intents = await response.json();
-    filter.addEventListener('change', load);
-    await load();
+    filter.addEventListener('change', () => load(false));
+    more.addEventListener('click', () => load(true));
+    await load(false);
   }
 
   start();
