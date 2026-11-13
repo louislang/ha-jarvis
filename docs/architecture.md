@@ -20,6 +20,7 @@ flowchart LR
         crate_app_background[background]
         crate_app_conversation[conversation]
         crate_app_plugins[plugins]
+        crate_app_review[review]
         crate_app_speech[speech]
     end
     subgraph domain
@@ -141,6 +142,11 @@ flowchart LR
     crate_app_plugins --> crate_domain_decide
     crate_app_plugins --> crate_domain_state
     crate_app_plugins --> crate_ports
+    crate_app_review --> crate_app_review
+    crate_app_review --> crate_domain_catalog
+    crate_app_review --> crate_domain_feedback
+    crate_app_review --> crate_domain_speech
+    crate_app_review --> crate_ports
     crate_app_speech --> crate_app_conversation
     crate_app_speech --> crate_app_speech
     crate_app_speech --> crate_domain_catalog

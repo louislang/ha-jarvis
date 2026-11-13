@@ -114,6 +114,7 @@ pub mod app {
     pub mod background;
     pub mod conversation;
     pub mod plugins;
+    pub mod review;
     pub mod speech;
 }
 

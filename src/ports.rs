@@ -324,3 +324,23 @@ pub trait InteractionLog: Send + Sync {
     /// `log.record_days` that no marked record links to.
     async fn prune(&self, now: Timestamp) -> anyhow::Result<()>;
 }
+
+/// The driving port that the web server calls to review the logged interactions.
+#[async_trait]
+pub trait Review: Send + Sync {
+    /// The interactions of `page` that `filter` keeps, newest first.
+    async fn list(&self, filter: Filter, page: Page) -> anyhow::Result<Vec<Interaction>>;
+
+    /// The audio of the interaction `id`, or `None` when it has none.
+    async fn audio(&self, id: u64) -> anyhow::Result<Option<Audio>>;
+
+    /// Stores `mark` in the log and applies it to the feedback model.
+    ///
+    /// # Errors
+    ///
+    /// The correction is not an intent name, the interaction does not exist, or the log fails.
+    async fn mark(&self, mark: Mark) -> anyhow::Result<()>;
+
+    /// The names that a correction can have.
+    fn intents(&self) -> Vec<String>;
+}
