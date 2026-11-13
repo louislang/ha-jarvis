@@ -724,7 +724,7 @@ Training set file (the contract between Jarvis and `train/train.py`):
 | Machine | OS | Device | STT model | Use |
 |---|---|---|---|---|
 | GPU host (self-hosted runner `gpu`) | Linux x86-64, RTX 2060 6 GB | `cuda` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, fp16. Second pass: Parakeet Unified EN 0.6B offline, fp16. | Runs Jarvis. Runs local training while Jarvis pauses. |
-| Test machine | macOS x86-64 (Intel MacBook Pro) | `cpu` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, int8. No second pass. | Development. Runs the pre-commit hook (without `bench` and `gpu-test`). |
+| Test machine | macOS x86-64 (Intel MacBook Pro) | `cpu` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, int8. No second pass. | Development. Runs the pre-commit hook (without `rust-test`, `bench` and `gpu-test`). |
 | CI | `ubuntu-latest` | `cpu` | First pass: Nemotron Speech Streaming EN 0.6B, 160 ms, int8. No second pass. | `just check`. |
 | RunPod | RunPod serverless | GPU | — | Training fallback. |
 | HA host | Home Assistant OS with the Supervisor | — | — | Runs HA, the Jarvis add-on and the MQTT broker (Mosquitto add-on). |

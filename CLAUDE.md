@@ -18,18 +18,18 @@ Voice-controlled home automation for Home Assistant, written in Rust. `docs/spec
 5. Write the least code and proof code that makes them pass.
 6. The sub-phase is complete only when all of its acceptance tests pass in the required checks. A phase is complete only when all of its sub-phases' acceptance tests pass on `main`.
 7. Every test is deterministic: paused tokio clock and `FakeClock`, fixed seeds, local servers only, temporary folders, deterministic Torch, Quint `--seed=1`. No wall-clock sleeps or timing asserts outside `[GPU host]` tests. Under a paused clock, no timer runs while code waits for a real socket: an adapter with timers talks to its fake server over `tokio::io::duplex` (`02-rules.md` section 6.2). Setup recipes (`models`, `fixture-model`) download model files before the tests. Tests read `models/` and do not download.
-8. Coverage is more than 80% for all code written, enforced by the hook and CI from the first commit.
+8. Coverage is more than 80% for all code written, enforced by CI from the first commit.
 9. A stateful change updates the Rust code, its Quint model and its conformance driver in the same PR.
 10. The PR changes at most 400 lines against the layer below (not counting `Cargo.lock`, `docs/architecture.md`, `src/testing/house.json`). If it cannot fit, split the sub-phase in a spec PR first: the first part keeps its number, and each later part adds a letter (`4.5b`).
 11. The PR description follows `.github/pull_request_template.md`: a summary of two or three sentences that states what the PR actually did and which problem it solves or which feature it adds, short bullet points, and every check box. Write it after the code, from the real change. Do not copy the sub-phase goal.
 12. The Codex GitHub app reviews each PR. Resolve every thread.
 13. Merge only with `just merge <pr>`: it checks that the PR head contains the head of `main`, every required check, every review thread, every check box, the title, the branch and the summary, then squash merges the PR (the bottom layer of a stack, a spec PR or a fix PR) at the inspected head commit. The commit message is the PR title, a blank line and the PR summary. Only one `just merge` runs at a time. Never add "Co-Authored-By" or any AI attribution. Phase 0 layers before `just merge` exists follow the bootstrap rule in `02-rules.md` section 7.1.
-14. Never skip the hooks (`--no-verify`). The pre-push hook refuses pushes to `main`.
+14. Never skip the hooks (`--no-verify`). The pre-push hook refuses pushes to `main`. Before each commit, run `just lint` and the tests of the code that changed, so that failures show before CI.
 15. A PR that adds or changes a capability or a setup step updates `README.md` in the same PR. A spec PR does not change `README.md`.
 
 ## Required Checks
 
-`just check` runs these in the pre-commit hook. CI runs each as a separate job. `bench` runs in the hook on Linux only. `gpu-test` runs in the hook on the GPU host only. CI skips `gpu-test` for a docs-only PR, which changes only files under `docs/`, `README.md`, `CLAUDE.md` and `.github/pull_request_template.md`. `just merge` accepts a skipped `gpu-test` only for such a PR. CI skips `gpu-test` on the push to `main` after a merge: `just merge` merges only a PR whose head contains the head of `main`, so the PR ran `gpu-test` on the same tree. `pr-size` and `diagram` run in CI only, because they need the PR base.
+`just check` runs these in the pre-commit hook. CI runs each as a separate job. `rust-test` runs in CI only, because its coverage build and model tests take most of a hook run and drain the MacBook battery. `bench` runs in the hook on Linux only. `gpu-test` runs in the hook on the GPU host only. CI skips `gpu-test` for a docs-only PR, which changes only files under `docs/`, `README.md`, `CLAUDE.md` and `.github/pull_request_template.md`. `just merge` accepts a skipped `gpu-test` only for such a PR. CI skips `gpu-test` on the push to `main` after a merge: `just merge` merges only a PR whose head contains the head of `main`, so the PR ran `gpu-test` on the same tree. `pr-size` and `diagram` run in CI only, because they need the PR base.
 
 | Check | What fails it |
 |---|---|

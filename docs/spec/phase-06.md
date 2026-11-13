@@ -14,7 +14,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 **Model.**
 
 - `ort` uses the features `load-dynamic` and `cuda`. It loads the `libonnxruntime` that `ORT_DYLIB_PATH` names (decision 27).
-- `just models` downloads the sherpa-onnx 2.0.1 CPU shared libraries for the host system into one library folder in `models/`. The recipe lists one SHA-256 for each archive that it downloads, and one for each `.onnx` file and each `tokens.txt` file in it. It checks each listed file and downloads only a missing or wrong file. `models` is a setup recipe: `check` and the `rust-test` job run it before the tests, and tests do not download. CI caches `models/`.
+- `just models` downloads the sherpa-onnx 2.0.1 CPU shared libraries for the host system into one library folder in `models/`. The recipe lists one SHA-256 for each archive that it downloads, and one for each `.onnx` file and each `tokens.txt` file in it. It checks each listed file and downloads only a missing or wrong file. `models` is a setup recipe: `check` runs it before `fixture-model`, the `rust-test` job runs it before the tests, and tests do not download. CI caches `models/`.
 - `gpu-models` downloads the Parakeet Unified offline model and the sherpa-onnx 2.0.1 `cuda-12.x-cudnn-9.x-onnxruntime1.28.2` `linux-x64-gpu` libraries.
 - `test` and `cov` set `ORT_DYLIB_PATH` to the `libonnxruntime` in the CPU library folder, and `LD_LIBRARY_PATH` (`DYLD_LIBRARY_PATH` on macOS) to the folder. CI sets them in the same way.
 - `gpu-test` (sub-phase 0.13) now runs `gpu-models` first and sets `ORT_DYLIB_PATH` and `LD_LIBRARY_PATH` to the CUDA library folder.
@@ -22,7 +22,7 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 
 **Acceptance criteria.**
 
-- AC-6.1-1: When `just models` has run, the library folder exists in `models/`, and each file that the recipe lists has its SHA-256. When `ci.yml` is parsed, `rust-test` runs `just models` before `just cov`.
+- AC-6.1-1: When `just models` has run, the library folder exists in `models/`, and each file that the recipe lists has its SHA-256. When the `justfile` is dumped, `check` runs `models` before `fixture-model`. When `ci.yml` is parsed, `rust-test` runs `just models` before `just cov`.
 - AC-6.1-2: When the tests run, `ORT_DYLIB_PATH` names the `libonnxruntime` in the library folder, and the fixture classifier predicts without error.
 - AC-6.1-3 [GPU host]: With `device = cuda`, `OnnxClassifier` runs on the CUDA execution provider of the shared library.
 - AC-6.1-4: When `release.yml` is parsed, the Linux build job has a verification step that fails unless the archive contains `libonnxruntime` and the CUDA provider library, and `ldd jarvis` in the extracted archive, with `LD_LIBRARY_PATH` set to the extracted folder, reports no missing library.

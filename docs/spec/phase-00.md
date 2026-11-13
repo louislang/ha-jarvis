@@ -2,7 +2,7 @@
 
 This phase makes the repository, the gates, the PR workflow, the architecture diagram, the Quint gate, the GPU runner, the release workflow and the merge gate.
 
-The coverage gate runs in the pre-commit hook and in CI from the first commit. Every later gate is proven by a gate test: `xtask/src/gates.rs` writes a small fixture (a crate, a Python file, a Quint model) into a temporary folder, runs the real tool, and checks the exit code and the message. Workflow and hook files are checked by structure tests that parse them. All of these are normal tests in `rust-test`.
+The coverage gate runs in CI from the first commit. Every later gate is proven by a gate test: `xtask/src/gates.rs` writes a small fixture (a crate, a Python file, a Quint model) into a temporary folder, runs the real tool, and checks the exit code and the message. Workflow and hook files are checked by structure tests that parse them. All of these are normal tests in `rust-test`.
 
 The first commit (sub-phase 0.1) goes directly to `main`, because no PR process exists yet. From sub-phase 0.2, each phase is one stack of PRs (`02-rules.md` section 7). Until `just merge` exists, the bootstrap rule (`02-rules.md` section 7.1, rule 10) applies.
 
@@ -10,7 +10,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 
 ### 0.1 Repository, Coverage Gate, Hook and CI
 
-**Goal:** Create the repository, the Cargo workspace (an empty `jarvis` library and binary, and an empty `xtask` tool crate), and the coverage gate in both the pre-commit hook and CI. No code exists without a gated coverage check.
+**Goal:** Create the repository, the Cargo workspace (an empty `jarvis` library and binary, and an empty `xtask` tool crate), the pre-commit hook, and the coverage gate in CI. No code exists without a gated coverage check.
 
 - **Implements:** G10, G17, G22. **Depends on:** none.
 - **Files:** create `.gitignore`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `justfile`, `.pre-commit-config.yaml`, `.github/workflows/ci.yml`, `src/lib.rs`, `src/main.rs`, `xtask/Cargo.toml`, `xtask/src/main.rs`, `xtask/src/gates.rs`. Add the existing `CLAUDE.md` and `docs/spec/`.
@@ -20,7 +20,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - `Cargo.toml` is a workspace with the members `jarvis` (root) and `xtask`.
 - `rust-toolchain.toml` names one fixed stable version with `clippy`, `rustfmt` and `llvm-tools-preview`.
 - `src/lib.rs` and `xtask/src/main.rs` have an empty `main`. `src/main.rs` has a `main` that only calls `jarvis::main`. Each of the three files has one test that calls its `main`.
-- `justfile`: `test` (`cargo test --workspace --release`), `cov` (`cargo llvm-cov --workspace --release --fail-under-lines 80.01`), `workflow-lint` (`actionlint`), `check` (runs `workflow-lint`, then `cov`), `setup` (runs every `install-` recipe, then `pre-commit install --hook-type pre-commit`).
+- `justfile`: `test` (`cargo test --workspace --release`), `cov` (`cargo llvm-cov --workspace --release --fail-under-lines 80.01`), `workflow-lint` (`actionlint`), `check` (runs `workflow-lint`, not `cov`: the instrumented build and the tests are too slow for the hook on the test machine, `02-rules.md` section 7.3), `setup` (runs every `install-` recipe, then `pre-commit install --hook-type pre-commit`).
 - Tool versions (R23): the `justfile` has one variable for each tool version and one `install-<tool>` recipe for each tool. This sub-phase has `cargo-llvm-cov`, `actionlint` and `pre-commit`. Each later sub-phase that adds a tool adds its variable and its recipe. A CI job installs a tool only with its `install-` recipe. A `setup-node`, `setup-java` or `setup-python` step uses the version of its `justfile` variable.
 - `.pre-commit-config.yaml`: one `local` hook, `entry: just check`, `language: system`, `stages: [pre-commit]`, `pass_filenames: false`, `always_run: true`.
 - `ci.yml`: triggers `push` to `main`, `pull_request`, `workflow_call`. A push to another branch does not start CI, because its PR runs CI for `pull_request`. Jobs `rust-test` (`just cov`) and `workflow-lint` (`just workflow-lint`), on `ubuntu-latest`, with the cargo cache.
@@ -32,7 +32,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - AC-0.1-1: When you run `cargo build --workspace`, it exits with code 0.
 - AC-0.1-2: When `just test` runs, the tests `ac_0_1_2_main_returns` in `src/lib.rs`, `src/main.rs` and `xtask/src/main.rs` pass.
 - AC-0.1-3: When a fixture crate has 10 lines of which 5 are covered, `cargo llvm-cov --fail-under-lines 80.01` exits with a non-zero code. When all lines are covered, it exits with code 0.
-- AC-0.1-4: When the `justfile` is dumped, `check` runs `workflow-lint` and `cov`, and `cov` has `--fail-under-lines 80.01`.
+- AC-0.1-4: When the `justfile` is dumped, `check` runs `workflow-lint` and does not run `cov`, and `cov` has `--fail-under-lines 80.01`.
 - AC-0.1-5: When `.pre-commit-config.yaml` is parsed, it has exactly one hook, with `entry: just check`, `stages: [pre-commit]`, `always_run: true` and `pass_filenames: false`.
 - AC-0.1-6: When `ci.yml` is parsed, it has the triggers `push` to `main` only, `pull_request` and `workflow_call`, a job `rust-test` that runs `just cov`, and a job `workflow-lint` that runs `just workflow-lint`.
 - AC-0.1-7: When `git check-ignore` runs for `target/`, `models/`, `.venv/`, `jarvis.local.toml`, `habits.json`, `voices.json`, `jarvis.db`, `generated.json`, `training.json`, `pools.json` and `learned.toml`, it lists each path.
@@ -62,7 +62,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - `[workspace.lints.clippy]`: `pedantic = "deny"`, `unwrap_used = "deny"`, `string_add = "deny"`, `missing_docs_in_private_items = "deny"`, `undocumented_unsafe_blocks = "deny"`.
 - `jarvis` and `xtask` have `[lints] workspace = true`. Thus the lint levels apply to both crates.
 - `clippy.toml`: `too-many-lines-threshold = 50`, `allow-unwrap-in-tests = true`.
-- `format` runs `cargo fmt --all --check`. `lint` runs `cargo clippy --workspace --all-targets -- -D clippy::pedantic -D warnings`. `check` runs `workflow-lint`, `format`, `lint`, then `cov`. CI jobs `rust-format` and `rust-lint`.
+- `format` runs `cargo fmt --all --check`. `lint` runs `cargo clippy --workspace --all-targets -- -D clippy::pedantic -D warnings`. `check` runs `workflow-lint`, `format`, then `lint`, before the slow checks. CI jobs `rust-format` and `rust-lint`.
 
 **Acceptance criteria.**
 
@@ -72,7 +72,7 @@ The first commit (sub-phase 0.1) goes directly to `main`, because no PR process 
 - AC-0.2-4: When a fixture private function or private struct has no doc comment, `lint` fails with `missing_docs_in_private_items`.
 - AC-0.2-5: When a fixture has an `unsafe` block, the build fails with `unsafe_code`.
 - AC-0.2-6: When a fixture file is not formatted, `format` fails.
-- AC-0.2-7: When the `justfile` is dumped, `check` runs `workflow-lint`, `format`, `lint` and `cov` in that order. When `ci.yml` is parsed, the jobs `rust-format` and `rust-lint` run `just format` and `just lint`.
+- AC-0.2-7: When the `justfile` is dumped, `check` runs `workflow-lint`, `format` and `lint` in that order, and does not run `cov`. When `ci.yml` is parsed, the jobs `rust-format` and `rust-lint` run `just format` and `just lint`.
 
 **Proofs.**
 
