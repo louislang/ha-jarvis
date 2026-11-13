@@ -512,14 +512,14 @@ fn ac_0_1_3_coverage_gate() {
     );
 }
 
-/// `check` runs the workflow lint and the coverage gate with its limit.
+/// `check` runs the workflow lint but not the coverage gate, and the coverage gate has its limit.
 #[test]
-fn ac_0_1_4_check_runs_coverage_gate() {
+fn ac_0_1_4_check_skips_coverage_gate() {
     let justfile = justfile();
     let check = dependencies(&justfile, "check");
     assert!(
-        check.contains(&"workflow-lint".to_owned()) && check.contains(&"cov".to_owned()),
-        "check runs workflow-lint and cov, it runs {check:?}"
+        check.contains(&"workflow-lint".to_owned()) && !check.contains(&"cov".to_owned()),
+        "check runs workflow-lint and not cov, it runs {check:?}"
     );
     let cov = justfile["recipes"]["cov"]["body"].to_string();
     assert!(
@@ -709,7 +709,7 @@ fn ac_0_2_6_format_fails_unformatted_file() {
     );
 }
 
-/// `check` runs the lint gates before the coverage gate, and CI runs them.
+/// `check` runs the lint gates in order but not the coverage gate, and CI runs them.
 #[test]
 fn ac_0_2_7_check_and_ci_run_lint_gates() {
     let gates = ["workflow-lint", "format", "lint", "cov"];
@@ -717,7 +717,11 @@ fn ac_0_2_7_check_and_ci_run_lint_gates() {
         .into_iter()
         .filter(|recipe| gates.contains(&recipe.as_str()))
         .collect();
-    assert_eq!(check, gates, "check runs the gates in this order");
+    assert_eq!(
+        check,
+        ["workflow-lint", "format", "lint"],
+        "check runs the lint gates in this order and not cov"
+    );
     let ci = yaml(".github/workflows/ci.yml");
     for (job, command) in [("rust-format", "just format"), ("rust-lint", "just lint")] {
         assert!(runs(&ci, job).contains(&command), "{job} runs {command}");
@@ -1957,10 +1961,9 @@ fn ac_3_9_4_missing_model_is_stale_and_untracked_file_keeps_hash() {
     assert_eq!(fixture_stale(repository.path()), (Some(0), hash));
 }
 
-/// `check` runs `fixture-model` before `cov`, and the CI job `rust-test` installs `./train`, runs `jarvis dataset`, restores the fixture model with the hash of the training set as the key and runs `just fixture-model` before `just cov`.
+/// The CI job `rust-test` installs `./train`, runs `jarvis dataset`, restores the fixture model with the hash of the training set as the key and runs `just fixture-model` before `just cov`.
 #[test]
 fn ac_3_9_5_ci_restores_fixture_model() {
-    assert_check_runs_after("fixture-model", "cov");
     let install = justfile()["recipes"]["install-python"]["body"].to_string();
     assert!(install.contains("./train"), "{install}");
     let ci = yaml(".github/workflows/ci.yml");
@@ -2102,13 +2105,13 @@ fn assert_fetched(sums: &str) {
         .current_dir(root().join("models"))));
 }
 
-/// After `just models`, the library folder exists and each file of `cpu_sums` has its SHA-256, and `check` and `rust-test` run `models` before `cov`.
+/// After `just models`, the library folder exists and each file of `cpu_sums` has its SHA-256, `check` runs `models` before `fixture-model`, and `rust-test` runs `models` before `cov`.
 #[test]
 fn ac_6_1_1_models_writes_library_folder() {
     let folder = evaluate("cpu_libraries");
     assert!(Path::new(&folder).is_dir(), "{folder} exists");
     assert_fetched("cpu_sums");
-    assert_check_runs_after("models", "cov");
+    assert_check_runs_after("models", "fixture-model");
     let ci = yaml(".github/workflows/ci.yml");
     let runs = runs(&ci, "rust-test");
     let position = |command: &str| runs.iter().position(|run| *run == command);
