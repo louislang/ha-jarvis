@@ -1,4 +1,4 @@
-//! The web server of the Jarvis tab: the review API behind a bearer token.
+//! The web server of the Jarvis tab: the page, and the review API behind a bearer token.
 
 use std::io;
 use std::io::Cursor;
@@ -14,6 +14,7 @@ use axum::http::StatusCode;
 use axum::http::header;
 use axum::middleware;
 use axum::middleware::Next;
+use axum::response::Html;
 use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing;
@@ -32,6 +33,9 @@ use crate::ports::Clock;
 use crate::ports::Filter;
 use crate::ports::Page;
 use crate::ports::Review;
+
+/// The page of the Jarvis tab.
+const PAGE: &str = include_str!("review.html");
 
 /// What the routes of the web server use.
 pub struct Web {
@@ -116,7 +120,8 @@ pub async fn serve(
         .await
 }
 
-/// The routes of `web`. One layer checks the token of every route under `api/`.
+/// The routes of `web`: the page without a token, and one layer that checks the token of every
+/// route under `api/`.
 fn router(web: Web) -> Router {
     let web = Arc::new(web);
     let api = Router::new()
@@ -125,7 +130,10 @@ fn router(web: Web) -> Router {
         .route("/interactions/{id}/mark", routing::post(mark))
         .route("/intents", routing::get(intents))
         .layer(middleware::from_fn_with_state(Arc::clone(&web), authorize));
-    Router::new().nest("/api", api).with_state(web)
+    Router::new()
+        .route("/", routing::get(Html(PAGE)))
+        .nest("/api", api)
+        .with_state(web)
 }
 
 /// Runs `next` only when `request` has the header `Authorization: Bearer <token>`, else gives
@@ -389,5 +397,57 @@ mod tests {
         let (status, marks) = post_mark(review()?, body).await?;
         assert_eq!((status, marks), (StatusCode::BAD_REQUEST, Vec::new()));
         Ok(())
+    }
+
+    /// AC-12.9-1.
+    #[tokio::test]
+    async fn ac_12_9_1_page_needs_no_token_and_has_the_review_elements() -> anyhow::Result<()> {
+        let api = start(Arc::new(review()?)).await?;
+        let response = reqwest::get(api.trim_end_matches("api/")).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let html = response.text().await?;
+        let (_, template) = html
+            .split_once(r#"<template id="interaction">"#)
+            .expect("the page has template#interaction");
+        let elements = [
+            r#"id="interactions""#,
+            r#"id="filter""#,
+            r#"<button class="mark-good""#,
+            r#"<button class="mark-bad""#,
+            r#"<select class="correction""#,
+        ];
+        for element in elements {
+            assert!(html.contains(element), "the page has no {element}");
+        }
+        assert!(template.contains("<audio"), "the template has no audio");
+        Ok(())
+    }
+
+    /// AC-12.9-2.
+    #[test]
+    fn ac_12_9_2_page_script_parses() -> anyhow::Result<()> {
+        let (_, script) = PAGE.split_once("<script>").expect("the page has a script");
+        let (script, _) = script.split_once("</script>").expect("the script ends");
+        let file = tempfile::NamedTempFile::new()?;
+        std::fs::write(file.path(), script)?;
+        let status = std::process::Command::new("node")
+            .arg("--check")
+            .arg(file.path())
+            .status()?;
+        assert!(status.success(), "node --check gave {status}");
+        Ok(())
+    }
+
+    /// AC-12.9-3. A quote or `=` before `/`, `http:` or `https:` starts an absolute URL in an
+    /// attribute or a string.
+    #[test]
+    fn ac_12_9_3_page_has_only_relative_urls_and_no_token() {
+        for opener in ['"', '\'', '`', '='] {
+            for start in ["/", "http:", "https:"] {
+                let absolute = format!("{opener}{start}");
+                assert!(!PAGE.contains(&absolute), "the page contains {absolute}");
+            }
+        }
+        assert!(!PAGE.contains("Authorization"), "the page sends a token");
     }
 }

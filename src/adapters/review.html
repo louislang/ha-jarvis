@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { margin: 0 auto; max-width: 48rem; padding: 1rem; }
+  article { border-bottom: 1px solid; padding: 0.75rem 0; }
+  .transcript { font-size: 1.2rem; margin: 0.5rem 0; }
+  audio { width: 100%; }
+  button[aria-pressed="true"] { font-weight: bold; outline: 2px solid; }
+</style>
+</head>
+<body>
+<h1>Review</h1>
+<select id="filter">
+  <option value="all">All</option>
+  <option value="bad">Bad</option>
+  <option value="unmarked">Unmarked</option>
+</select>
+<div id="interactions"></div>
+<button id="more" type="button" hidden>More</button>
+<template id="interaction">
+  <article>
+    <time class="time"></time> <span class="satellite"></span>
+    <p class="transcript"></p>
+    <audio controls preload="none"></audio>
+    <div class="action">
+      <span class="intent"></span>
+      <button class="mark-good" type="button">Good</button>
+      <button class="mark-bad" type="button">Bad</button>
+      <select class="correction"><option value="">Correct intent</option></select>
+    </div>
+    <ul class="responses"></ul>
+  </article>
+</template>
+<template id="response">
+  <li>
+    <span class="text"></span>
+    <button class="mark-good" type="button">Good</button>
+    <button class="mark-bad" type="button">Bad</button>
+  </li>
+</template>
+<script>
+  // Every URL is relative: HA ingress serves the page under a path prefix, and the add-on adds
+  // the token.
+  const list = document.getElementById('interactions');
+  const filter = document.getElementById('filter');
+  const more = document.getElementById('more');
+  let intents = [];
+  let page = 0;
+  let loads = 0;
+
+  async function mark(id, body) {
+    const response = await fetch(`api/interactions/${id}/mark`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) alert(`The mark failed: ${response.status}`);
+    return response.ok;
+  }
+
+  function markOf(interaction, target) {
+    const key = JSON.stringify(target);
+    return interaction.marks.find((each) => JSON.stringify(each.target) === key);
+  }
+
+  function press(row, value) {
+    row.querySelector('.mark-good').setAttribute('aria-pressed', String(value === 'Good'));
+    row.querySelector('.mark-bad').setAttribute('aria-pressed', String(value === 'Bad'));
+  }
+
+  function rate(row, id, target, index, current, marked) {
+    press(row, current?.value);
+    for (const [name, value] of [['good', 'Good'], ['bad', 'Bad']]) {
+      row.querySelector(`.mark-${name}`).addEventListener('click', async () => {
+        const body = { target, index, value: name, correction: null };
+        if (await mark(id, body)) {
+          press(row, value);
+          marked(value);
+        }
+      });
+    }
+  }
+
+  function card(interaction) {
+    const shown = document.getElementById('interaction').content.cloneNode(true);
+    const field = (name) => shown.querySelector(`.${name}`);
+    field('time').textContent = new Date(interaction.time).toLocaleString();
+    field('satellite').textContent = interaction.satellite ?? 'typed';
+    field('transcript').textContent = interaction.transcript;
+    shown.querySelector('audio').src = `api/interactions/${interaction.id}/audio`;
+    field('intent').textContent = [interaction.action.intent, ...interaction.action.targets].join(' ');
+    const action = markOf(interaction, 'Action');
+    const correction = field('correction');
+    correction.append(...intents.map((name) => new Option(name)));
+    correction.value = action?.correction ?? '';
+    correction.hidden = action?.value !== 'Bad';
+    correction.addEventListener('change', () => mark(interaction.id,
+      { target: 'action', index: null, value: 'bad', correction: correction.value || null }));
+    rate(field('action'), interaction.id, 'action', null, action, (value) => {
+      correction.hidden = value !== 'Bad';
+      correction.value = '';
+    });
+    const template = document.getElementById('response').content.firstElementChild;
+    for (const [index, response] of interaction.responses.entries()) {
+      const row = template.cloneNode(true);
+      row.querySelector('.text').textContent = response.text;
+      rate(row, interaction.id, 'response', index, markOf(interaction, { Response: index }), () => {});
+      field('responses').append(row);
+    }
+    return shown;
+  }
+
+  async function fetchPage(kept, number) {
+    const response = await fetch(`api/interactions?filter=${kept}&page=${number}`);
+    if (!response.ok) throw new Error(`status ${response.status}`);
+    return response.json();
+  }
+
+  // Loads the first page, or with `next` every page up to one more than before. A mark can move
+  // an interaction out of the Bad filter, so the pages load again instead of from an old offset.
+  // Only the newest load shows its result, so a slow earlier load cannot replace it.
+  async function load(next) {
+    const ticket = (loads += 1);
+    const kept = filter.value === 'bad' ? 'bad' : 'all';
+    const unmarked = filter.value === 'unmarked';
+    const wanted = next === true ? page + 1 : 0;
+    try {
+      const interactions = [];
+      let last = [];
+      for (let number = 0; number <= wanted; number += 1) {
+        last = await fetchPage(kept, number);
+        interactions.push(...last);
+      }
+      if (ticket !== loads) return;
+      page = wanted;
+      const shown = interactions.filter((each) => !unmarked || each.marks.length === 0);
+      list.replaceChildren(...shown.map(card));
+      more.hidden = last.length === 0;
+    } catch (error) {
+      if (ticket !== loads) return;
+      list.textContent = `Jarvis did not answer: ${error.message}`;
+      more.hidden = true;
+    }
+  }
+
+  async function start() {
+    const response = await fetch('api/intents');
+    if (response.ok) intents = await response.json();
+    filter.addEventListener('change', () => load(false));
+    more.addEventListener('click', () => load(true));
+    await load(false);
+  }
+
+  start();
+</script>
+</body>
+</html>
