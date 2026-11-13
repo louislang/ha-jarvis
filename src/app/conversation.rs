@@ -248,7 +248,7 @@ impl Conversation {
             ControlFlow::Break(answered) => return Ok(answered),
         };
         if new {
-            self.begin(heard, key.clone());
+            heard.link = None;
         }
         let now = heard.time;
         let request = Request {
@@ -312,21 +312,15 @@ impl Conversation {
         let _ = self.recorder.writer.send(write);
     }
 
-    /// The open dialog of `key` at the time of `heard` and its key. The dialog map no longer has
-    /// it. Its first interaction becomes the link of `heard`.
+    /// The open dialog of `key` at the time of `heard` and its key. The dialog map and the link
+    /// map no longer have it. Its first interaction becomes the link of `heard`.
     fn take_dialog(&self, key: Option<Key>, heard: &mut Heard) -> Option<(Dialog, Key)> {
         let key = key?;
         let timeout = self.queues.dialog.timeout_s;
+        let link = self.queues.take_link(&key);
         let dialog = self.queues.dialogs().take(&key, heard.time, timeout)?;
-        heard.link = self.queues.link(&key);
+        heard.link = link;
         Some((dialog, key))
-    }
-
-    /// Makes `heard` a new request with no link, and the first interaction of the dialogs of
-    /// `key`.
-    fn begin(&self, heard: &mut Heard, key: Option<Key>) {
-        heard.link = None;
-        self.queues.begin(key, heard.id);
     }
 
     /// The dispatch of the decision for `prediction` of `request` on the satellite of `heard`. A
@@ -353,13 +347,21 @@ impl Conversation {
         let area = request.area.as_ref();
         let (handled, answer) = self.reply(decision, area, heard, key.clone()).await;
         if let (Some(key), Some(pending)) = (key, pending) {
-            self.queues.open(key, pending, request.now);
+            self.open(key, pending, heard);
         }
         let (top, reply) = (prediction.ranked.first(), handled.text.as_str());
         let transcript = request.transcript.as_str();
         tracing::info!(transcript, ?top, ?route, reply, "handled");
         decided.response = answer.unwrap_or(decided.response);
         (handled, decided)
+    }
+
+    /// Opens a dialog on `key` that waits for `pending`, asked at the time of `heard`, with the
+    /// first interaction of the dialog of `heard`, else `heard` itself, as its first.
+    fn open(&self, key: Key, pending: Pending, heard: &Heard) {
+        self.queues
+            .set_link(key.clone(), heard.link.unwrap_or(heard.id));
+        self.queues.open(key, pending, heard.time);
     }
 
     /// The parts of the record that `decision` gives, with its reply, filler or question as the
@@ -458,6 +460,7 @@ impl Conversation {
         let thread = Thread {
             request: self.origin(heard.satellite.as_deref(), heard.id),
             key: Some(key),
+            first: heard.link,
             turns: dialog.turns,
             answers: Some(AskCall {
                 response_id,
@@ -547,7 +550,7 @@ impl Conversation {
         let Some(next) = dialog::next_turn(dialog, max_turns, heard.time) else {
             return said(prediction, Route::Reply, self.failure(), None);
         };
-        self.queues.dialogs().dialogs.insert(key, next);
+        self.queues.put(key, next, heard.link);
         let request = heard.satellite.as_ref().map(|satellite| Origin {
             satellite: satellite.clone(),
             generation: self.queues.generation(satellite),
@@ -603,6 +606,7 @@ impl Conversation {
                 Job::Llm(text) => {
                     let thread = Thread {
                         key,
+                        first: Some(heard.id),
                         ..Thread::default()
                     };
                     let answer = self.answer(&text, area, &thread).await;
@@ -647,6 +651,7 @@ impl Conversation {
                     let request = Some(request);
                     let thread = Thread {
                         request,
+                        first: Some(id),
                         ..Thread::default()
                     };
                     self.llm(text, area.cloned(), thread)
@@ -931,14 +936,15 @@ impl Conversation {
         let question = next.is_some().then_some(question);
         let Some(origin) = &thread.request else {
             if let (Some(key), Some(next)) = (thread.key.clone(), next) {
-                self.queues.dialogs().dialogs.insert(key, next);
+                self.queues.put(key, next, thread.first);
             }
             sentences.push(question.unwrap_or_else(|| self.pick("failure")));
             return Ok(());
         };
+        let (satellite, generation) = (&origin.satellite, origin.generation);
         match self
             .queues
-            .reopen(&origin.satellite, origin.generation, next)
+            .reopen(satellite, generation, next, thread.first)
         {
             Some(generation) => self.ask_or_fail(origin, generation, question).await,
             None => Ok(()),
@@ -1170,6 +1176,8 @@ struct Thread {
     request: Option<Origin>,
     /// The key of the dialog that a question opens without a satellite.
     key: Option<Key>,
+    /// The ID of the first interaction of the dialog.
+    first: Option<u64>,
     /// The questions of the dialog so far.
     turns: u32,
     /// The `ask_user` call that the request answers.
@@ -1321,7 +1329,7 @@ pub struct Queues {
     satellites: Mutex<BTreeMap<String, Arc<Queue>>>,
     /// The open dialogs.
     dialogs: Mutex<Dialogs>,
-    /// The ID of the first interaction of the dialogs of each key.
+    /// The ID of the first interaction of the open dialog of each key.
     links: Mutex<BTreeMap<Key, u64>>,
     /// The turn limit, the timeout, the choice similarity and the cancel phrases of a dialog.
     dialog: DialogConfig,
@@ -1350,18 +1358,24 @@ impl Queues {
         }
     }
 
-    /// The ID of the first interaction of the dialogs of `key`.
-    fn link(&self, key: &Key) -> Option<u64> {
-        let links = self.links.lock().expect("no lock holder panics");
-        links.get(key).copied()
+    /// Removes and returns the ID of the first interaction of the dialog of `key`.
+    fn take_link(&self, key: &Key) -> Option<u64> {
+        let mut links = self.links.lock().expect("no lock holder panics");
+        links.remove(key)
     }
 
-    /// Makes the interaction `id` the first of the dialogs of `key`, when it is set.
-    fn begin(&self, key: Option<Key>, id: u64) {
-        if let Some(key) = key {
-            let mut links = self.links.lock().expect("no lock holder panics");
-            links.insert(key, id);
+    /// Makes the interaction `first` the first of the dialog that opens on `key`.
+    fn set_link(&self, key: Key, first: u64) {
+        let mut links = self.links.lock().expect("no lock holder panics");
+        links.insert(key, first);
+    }
+
+    /// Opens `dialog` on `key`, with the interaction `first`, when it is set, as its first.
+    fn put(&self, key: Key, dialog: Dialog, first: Option<u64>) {
+        if let Some(first) = first {
+            self.set_link(key.clone(), first);
         }
+        self.dialogs().dialogs.insert(key, dialog);
     }
 
     /// The queue of `satellite`.
@@ -1418,14 +1432,24 @@ impl Queues {
     }
 
     /// When the generation of `satellite` is `generation`, closes its dialog, which increases the
-    /// generation, and stores `next` in its place. The new generation, else `None`.
-    fn reopen(&self, satellite: &str, generation: u64, next: Option<Dialog>) -> Option<u64> {
+    /// generation, and stores `next` in its place, with the interaction `first` as its first. The
+    /// new generation, else `None`.
+    fn reopen(
+        &self,
+        satellite: &str,
+        generation: u64,
+        next: Option<Dialog>,
+        first: Option<u64>,
+    ) -> Option<u64> {
         let (mut dialogs, key) = (self.dialogs(), Key(satellite.to_owned()));
         if dialogs.generation(&key) != generation {
             return None;
         }
         dialogs.close(key.clone());
         if let Some(next) = next {
+            if let Some(first) = first {
+                self.set_link(key.clone(), first);
+            }
             dialogs.dialogs.insert(key.clone(), next);
         }
         Some(dialogs.generation(&key))
@@ -2780,13 +2804,26 @@ mod tests {
         let classifier = scripted(&["lights_on", "unknown", "unknown", "unknown"]);
         let (log, conversation) =
             logging_with(&Arc::default(), classifier, reasoner, Duration::ZERO);
-        let texts = ["turn on the lights", "banana", "the kitchen"];
+        let texts = [
+            "turn on the lights",
+            "banana",
+            "the kitchen",
+            "plan dinner",
+            "four",
+        ];
         converse(&conversation, &texts).await?;
-        converse(&conversation, &["plan dinner", "four"]).await?;
         let logged = written(&log).await;
         let links: Vec<Option<u64>> = logged.iter().map(|(record, _)| record.link).collect();
         assert_eq!(links, [None, Some(0), Some(0), None, Some(3)]);
+        assert_no_links(&conversation);
         Ok(())
+    }
+
+    /// Asserts that `conversation` keeps no link after its dialogs end.
+    fn assert_no_links(conversation: &Conversation) {
+        let kept = conversation.queues.links.lock();
+        let kept = kept.expect("no lock holder panics");
+        assert!(kept.is_empty(), "links outlive their dialogs: {kept:?}");
     }
 
     /// AC-12.6c-2.
