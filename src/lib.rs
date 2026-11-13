@@ -133,6 +133,7 @@ pub mod adapters {
     pub mod open_meteo;
     pub mod openai;
     pub mod plex;
+    pub mod settings;
     pub mod sherpa;
     pub mod sqlite;
     pub mod supertonic;
