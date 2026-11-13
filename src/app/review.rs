@@ -4,6 +4,7 @@ use std::mem;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 use tokio::sync::watch;
 
 use crate::domain::catalog;
@@ -26,6 +27,8 @@ pub struct Reviewer {
     names: Vec<String>,
     /// The feedback model.
     feedback: watch::Sender<Feedback>,
+    /// The turn to mark. The log and the feedback model then get the marks in the same order.
+    marking: Mutex<()>,
 }
 
 impl Reviewer {
@@ -41,6 +44,7 @@ impl Reviewer {
             log,
             names: catalog::labels(catalog),
             feedback,
+            marking: Mutex::new(()),
         }
     }
 
@@ -90,6 +94,7 @@ impl Review for Reviewer {
     async fn mark(&self, mark: Mark) -> anyhow::Result<()> {
         check(&mark, &self.names)?;
         let rated = self.rated(mark.interaction).await?;
+        let _turn = self.marking.lock().await;
         self.log.mark(mark.clone()).await?;
         self.feedback
             .send_modify(|feedback| *feedback = mem::take(feedback).apply(rated, mark));
