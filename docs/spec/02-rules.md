@@ -156,7 +156,7 @@ Every test gives the same result on every run with the same code.
 
 1. Domain tests use no fakes. Application tests use port fakes, with no network and no models. Adapter tests use local servers, in-memory object stores or the models in `models/`.
 2. `just models` downloads the CPU models and libraries. `just gpu-models` downloads the GPU models and libraries and copies the fp16 files. `just cuda-libraries` downloads only the CUDA libraries. `just fixture-model` trains the fixture model.
-3. Coverage is more than 80% for all code written, from the first commit. Sub-phase 0.1 puts the coverage gate in the pre-commit hook and in CI before any other code.
+3. Coverage is more than 80% for all code written, from the first commit. Sub-phase 0.1 puts the coverage gate in CI before any other code. The pre-commit hook does not run it (section 7.3).
 
 ## 7. PR, Commit and Required Check Rules
 
@@ -183,7 +183,7 @@ Every test gives the same result on every run with the same code.
 
 ### 7.2 Commits
 
-1. Each commit passes the pre-commit hook. The pre-push hook refuses a push to `main`.
+1. Each commit passes the pre-commit hook. Before each commit, the author runs `just lint` and the tests of the code that changed, so that failures show before CI. The pre-push hook refuses a push to `main`.
 2. Each merged layer is one squash commit on `main`. Its message is the PR title, a blank line and the PR summary.
 3. No "Co-Authored-By" line. No AI attribution.
 4. CI makes no commits. Each PR commits its own `docs/architecture.md` (sub-phase 0.11).
@@ -200,7 +200,7 @@ CI runs each check as a separate job. "Push" is a push to `main`. `just merge` r
 | `duplication` | `just duplication` | Push, PR | Yes |
 | `architecture` | `just architecture` | Push, PR | Yes |
 | `fixture-model` | `just fixture-model` (the fixture model for `gpu-test`, saved in the CI cache) | Push, PR | Yes |
-| `rust-test` | `just cov` (tests, gate tests, structure tests, conformance tests, coverage more than 80%) | Push, PR | Yes |
+| `rust-test` | `just cov` (tests, gate tests, structure tests, conformance tests, coverage more than 80%) | Push, PR | No (too slow for the test machine) |
 | `bench` | `just bench` (Gungraun instruction budgets) | Push, PR | Linux only (Valgrind does not run on macOS) |
 | `python` | `just python` | Push, PR | Yes |
 | `quint` | `just quint` | Push, PR | Yes |
@@ -211,6 +211,8 @@ CI runs each check as a separate job. "Push" is a push to `main`. `just merge` r
 | `diagram` | `xtask diagram --base origin/<base branch>`, posted on the PR | PR | No (needs the PR base) |
 
 A docs-only PR changes only files under `docs/`, `README.md`, `CLAUDE.md` and `.github/pull_request_template.md`. Such a PR changes no code that `gpu-test` tests, so CI skips `gpu-test` for it, and live Jarvis on the GPU host does not stop (sub-phase 0.13). `just merge` accepts a skipped `gpu-test` only for a docs-only PR (sub-phase 0.15). The PR still checks the boxes of `gpu-test` and of the `[GPU host]` criteria.
+
+The pre-commit hook does not run `rust-test`. On the test machine, its instrumented build and its tests, many of which load the real STT and TTS models on the CPU, take about 80% of a hook run, and the battery drains faster than the charger fills it. CI runs `rust-test` on each push and PR, and `just merge` requires it, so the coverage gate stays. `check` runs `lint` early, before the slow checks.
 
 CI does not run `gpu-test` on the push to `main` after a merge. `just merge` merges only a PR whose head contains the head of `main` (section 7.1, rule 9). Thus the squash commit has the tree of the PR head, and `gpu-test` passed on that tree in the PR (sub-phase 0.13). The release workflow still runs `gpu-test` (sub-phase 0.14).
 
