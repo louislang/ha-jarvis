@@ -187,6 +187,8 @@ pub struct Config {
     pub log: LogConfig,
     /// The web server of the Jarvis tab.
     pub web: WebConfig,
+    /// The MQTT broker of the status entity. Without it, Jarvis publishes no status.
+    pub mqtt: Option<MqttConfig>,
 }
 
 impl Config {
@@ -588,6 +590,18 @@ pub struct WebConfig {
     pub page_size: usize,
 }
 
+/// The `[mqtt]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MqttConfig {
+    /// The broker, `mqtt://host:port`.
+    pub url: String,
+    /// The environment variable with the user name.
+    pub username_env: String,
+    /// The environment variable with the password.
+    pub password_env: String,
+}
+
 /// The run name of the System One model that Jarvis loads.
 const MODEL: &str = "fixture";
 
@@ -689,6 +703,17 @@ pub struct Secrets {
     pub plex_token: Option<String>,
     /// Bearer token of the web API.
     pub web_token: String,
+    /// MQTT login, when `[mqtt]` is set.
+    pub mqtt: Option<MqttLogin>,
+}
+
+/// The login of the MQTT broker.
+#[derive(Clone)]
+pub struct MqttLogin {
+    /// The user name.
+    pub username: String,
+    /// The password.
+    pub password: String,
 }
 
 impl Secrets {
@@ -701,19 +726,45 @@ impl Secrets {
         config: &Config,
         lookup: impl Fn(&str) -> Option<String>,
     ) -> anyhow::Result<Self> {
-        let secret = |name: &str| match lookup(name) {
-            Some(value) if !value.is_empty() => Ok(value),
-            _ => Err(anyhow::anyhow!(
-                "environment variable {name} is not set or is empty"
-            )),
-        };
-        let plex = config.plugins.plex.as_ref();
+        let secret = |name: &str| lookup_secret(&lookup, name);
+        let (plex, mqtt) = (config.plugins.plex.as_ref(), config.mqtt.as_ref());
         Ok(Self {
             ha_token: secret(&config.ha.token_env)?,
             openai_key: secret(&config.openai.api_key_env)?,
             plex_token: plex.map(|plex| secret(&plex.token_env)).transpose()?,
             web_token: secret(&config.web.token_env)?,
+            mqtt: mqtt
+                .map(|mqtt| MqttLogin::resolve(mqtt, &lookup))
+                .transpose()?,
         })
+    }
+}
+
+impl MqttLogin {
+    /// Reads the user name and the password that `mqtt` names with `lookup`.
+    ///
+    /// # Errors
+    ///
+    /// A variable is not set or is empty. The error names the variable.
+    fn resolve(mqtt: &MqttConfig, lookup: impl Fn(&str) -> Option<String>) -> anyhow::Result<Self> {
+        Ok(Self {
+            username: lookup_secret(&lookup, &mqtt.username_env)?,
+            password: lookup_secret(&lookup, &mqtt.password_env)?,
+        })
+    }
+}
+
+/// The value of the environment variable `name` from `lookup`.
+///
+/// # Errors
+///
+/// The variable is not set or is empty. The error names the variable.
+fn lookup_secret(lookup: impl Fn(&str) -> Option<String>, name: &str) -> anyhow::Result<String> {
+    match lookup(name) {
+        Some(value) if !value.is_empty() => Ok(value),
+        _ => Err(anyhow::anyhow!(
+            "environment variable {name} is not set or is empty"
+        )),
     }
 }
 
@@ -914,32 +965,59 @@ where
         started = start_live_app(&config, &secrets, catalog, pools, home) => started?,
         () = &mut shutdown => return Ok(()),
     };
-    serve_until(&config, &secrets.web_token, started, shutdown).await
+    serve_until(&config, &secrets, started, shutdown).await
 }
 
-/// Serves the app of `started` on `listen`, and its review and the status on `web.listen` with
-/// `token`, until `shutdown` completes. Then waits as [`drain`] does.
+/// Serves the app of `started` on `listen`, its review and the status on `web.listen` with the
+/// web token of `secrets`, and the status entity on the broker of `mqtt`, until `shutdown`
+/// completes. Then sets `Offline`, closes the status and waits as [`drain`] does.
 ///
 /// # Errors
 ///
-/// A server cannot bind or accept, or a task of `started` panicked.
+/// `mqtt.url` is not valid, a server cannot bind or accept, or a task of `started` panicked.
 async fn serve_until(
     config: &Config,
-    token: &str,
+    secrets: &Secrets,
     started: Started,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     let (app, (pools_task, habits, (writer, review)), _) = started;
     let (listener, tracker) = (TcpListener::bind(config.listen).await?, TaskTracker::new());
-    let online = Status {
+    let (status, control) = watch::channel(Status {
         state: State::Online,
         message: None,
-    };
-    let (_status, control) = watch::channel(online);
-    let web = serve_web(&config.web, token, review, control, &tracker).await?;
-    adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await?;
+    });
+    let web = serve_web(&config.web, &secrets.web_token, review, control, &tracker).await?;
+    // After the bind, so a failed start leaves no `online` behind.
+    start_status_entity(config, secrets, &status, &tracker)?;
+    let served = adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await;
     drop(web);
+    status.send_replace(Status {
+        state: State::Offline,
+        message: None,
+    });
+    drop(status);
+    served?;
     drain(tracker, (pools_task, habits, writer)).await
+}
+
+/// Starts the status entity of `status` in a task of `tracker` with the `[mqtt]` of `config` and
+/// the login of `secrets`, when `[mqtt]` is set.
+///
+/// # Errors
+///
+/// `mqtt.url` is not valid.
+fn start_status_entity(
+    config: &Config,
+    secrets: &Secrets,
+    status: &watch::Sender<Status>,
+    tracker: &TaskTracker,
+) -> anyhow::Result<()> {
+    if let (Some(mqtt), Some(login)) = (&config.mqtt, &secrets.mqtt) {
+        let options = adapters::mqtt::options(&mqtt.url, &login.username, &login.password)?;
+        tracker.spawn(adapters::mqtt::publish(options, status.subscribe()));
+    }
+    Ok(())
 }
 
 /// Serves `review` and the status of `control` with `token` on `web.listen` in a task of
@@ -971,8 +1049,8 @@ async fn serve_web(
 }
 
 /// Closes `tracker` and waits up to [`SHUTDOWN_WAIT`] for its tasks: the connections, the work
-/// after their replies and the web server. Then waits for the pools task and the log writer task
-/// of `stores`, and then for the last save of its habit task.
+/// after their replies, the web server and the status entity. Then waits for the pools task and
+/// the log writer task of `stores`, and then for the last save of its habit task.
 ///
 /// # Errors
 ///
@@ -1380,6 +1458,7 @@ mod tests {
     use crate::testing::fakes::FakeStt;
     use crate::testing::fakes::FakeTts;
     use crate::testing::fakes::FakeWyomingClient;
+    use crate::testing::fakes::MqttSubscriber;
 
     /// A valid configuration with every field.
     const VALID: &str = include_str!("../jarvis.toml");
@@ -1518,6 +1597,15 @@ mod tests {
         }
     }
 
+    /// The `[mqtt]` section of `VALID`.
+    fn expected_mqtt() -> MqttConfig {
+        MqttConfig {
+            url: "mqtt://homeassistant.local:1883".to_owned(),
+            username_env: "MQTT_USERNAME".to_owned(),
+            password_env: "MQTT_PASSWORD".to_owned(),
+        }
+    }
+
     /// AC-1.1-1.
     #[test]
     fn ac_1_1_1_parse_returns_each_value() -> anyhow::Result<()> {
@@ -1567,6 +1655,7 @@ mod tests {
             },
             log: expected_log(),
             web: expected_web(),
+            mqtt: Some(expected_mqtt()),
         };
         assert_eq!(Config::parse(VALID)?, expected);
         Ok(())
@@ -1799,6 +1888,8 @@ mod tests {
             ("OPENAI_API_KEY", "k"),
             ("PLEX_TOKEN", "p"),
             ("JARVIS_WEB_TOKEN", "w"),
+            ("MQTT_USERNAME", "u"),
+            ("MQTT_PASSWORD", "m"),
         ])?;
         assert_eq!(secrets.ha_token, "abc");
         Ok(())
@@ -2339,11 +2430,16 @@ mod tests {
         }
     }
 
+    /// The `[mqtt]` section of `jarvis.toml`.
+    const MQTT: &str = "[mqtt]\nurl = \"mqtt://homeassistant.local:1883\"\nusername_env = \"MQTT_USERNAME\"\npassword_env = \"MQTT_PASSWORD\"\n";
+
     /// A CPU configuration in `folder` with the Wyoming and web server addresses on free local
-    /// ports, and both addresses. It names the int8 files and no second pass, as on a CPU machine.
+    /// ports, and both addresses. It names the int8 files and no second pass, as on a CPU machine,
+    /// and has no `[mqtt]`.
     fn listening_config(folder: &Path) -> anyhow::Result<(PathBuf, SocketAddr, SocketAddr)> {
         let (address, web) = (free_address(), free_address());
-        let text = with_stores_in(folder).replace("\"cuda\"", "\"cpu\"");
+        let text = with_stores_in(folder).replace(MQTT, "");
+        let text = text.replace("\"cuda\"", "\"cpu\"");
         let text = text.replace(".fp16.", ".int8.");
         let text = text.replace("second_pass_dir =", "# second_pass_dir =");
         let text = text.replace("0.0.0.0:10700", &address.to_string());
@@ -2504,23 +2600,84 @@ mod tests {
         Ok(())
     }
 
-    /// AC-12.9b-1.
-    #[tokio::test(start_paused = true)]
-    async fn ac_12_9b_1_after_the_start_the_status_is_online() -> anyhow::Result<()> {
+    /// The status of `api/status` after the start of `run` with the configuration of
+    /// `listening_config` and the environment `lookup`.
+    async fn status_after_start(
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<serde_json::Value> {
         let folder = tempfile::tempdir()?;
         let (config, _, web) = listening_config(folder.path())?;
         let startup = Startup {
-            lookup: |_: &str| Some("token".to_owned()),
+            lookup,
             connector: no_ha(mpsc::unbounded_channel().0),
             shutdown: future::pending(),
         };
         tokio::select! {
             result = run(&config, startup) => anyhow::bail!("run returned: {result:?}"),
-            response = get_when_listening(web, "status") => {
-                let status: serde_json::Value = response.json().await?;
-                assert_eq!(status, json!({ "state": "online", "message": null }));
-            }
+            response = get_when_listening(web, "status") => Ok(response.json().await?),
         }
+    }
+
+    /// AC-12.9b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_9b_1_after_the_start_the_status_is_online() -> anyhow::Result<()> {
+        let status = status_after_start(|_: &str| Some("token".to_owned())).await?;
+        assert_eq!(status, json!({ "state": "online", "message": null }));
+        Ok(())
+    }
+
+    /// AC-12.9h-2. Without `[mqtt]`, `run` has no broker address and needs no MQTT secret.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_9h_2_without_mqtt_run_starts() -> anyhow::Result<()> {
+        assert!(VALID.contains(MQTT), "jarvis.toml has no [mqtt]");
+        let lookup = |name: &str| (!name.starts_with("MQTT_")).then(|| "token".to_owned());
+        let status = status_after_start(lookup).await?;
+        assert_eq!(status["state"], "online");
+        Ok(())
+    }
+
+    /// Waits until `client` gets the status `online`, then stops `run` with `stop`. Ends only on
+    /// an error.
+    async fn online_then_stop(
+        client: &mut MqttSubscriber,
+        stop: oneshot::Sender<()>,
+    ) -> anyhow::Result<()> {
+        let status = client.next().await?.payload;
+        anyhow::ensure!(status["state"] == "online", "the status is {status}");
+        stop.send(())
+            .map_err(|()| anyhow::anyhow!("run dropped the shutdown future"))?;
+        future::pending().await
+    }
+
+    /// The configuration of `listening_config` in `folder` with the MQTT broker at `broker`.
+    fn mqtt_config(folder: &Path, broker: SocketAddr) -> anyhow::Result<PathBuf> {
+        let (config, _, _) = listening_config(folder)?;
+        let mqtt = MQTT.replace("homeassistant.local:1883", &broker.to_string());
+        fs::write(&config, format!("{}{mqtt}", read(&config)?))?;
+        Ok(config)
+    }
+
+    /// AC-12.9h-1. The clock runs, because the MQTT client has timers and a real socket.
+    #[tokio::test]
+    async fn ac_12_9h_1_after_the_shutdown_the_status_is_offline() -> anyhow::Result<()> {
+        let (folder, broker) = (tempfile::tempdir()?, fakes::mqtt_broker()?);
+        let config = mqtt_config(folder.path(), broker)?;
+        let (stop, stopped) = oneshot::channel();
+        let startup = Startup {
+            lookup: |_: &str| Some("token".to_owned()),
+            connector: no_ha(mpsc::unbounded_channel().0),
+            shutdown: async {
+                let _ = stopped.await;
+            },
+        };
+        let mut client = MqttSubscriber::new(broker, "early", "jarvis/status")?;
+        tokio::select! {
+            result = run(&config, startup) => result?,
+            result = online_then_stop(&mut client, stop) => anyhow::bail!("no stop: {result:?}"),
+        }
+        let mut late = MqttSubscriber::new(broker, "late", "jarvis/status")?;
+        let status = late.next().await?.payload;
+        assert_eq!(status, json!({ "state": "offline", "message": null }));
         Ok(())
     }
 
