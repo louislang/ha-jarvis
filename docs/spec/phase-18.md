@@ -187,6 +187,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - The player is the speaker of the area: `target = "entity"` and `select = [{ domain = "media_player", device_class = "speaker" }]`. The area is the area slot, else the satellite area. The speaker of a satellite device is not skipped (sub-phase 4.4b). Of two or more speakers in the area, the player is the one with the lowest entity ID (sub-phase 4.4c). A speaker that Music Assistant does not control goes in `exclude`.
 - `play_music`: examples "play [radiohead](media)", "play [jazz](media) in the [kitchen](area)", "play the album [abbey road](media)", "play my [workout](media) playlist", "play the song [yesterday](media)", "play [hip hop](media)", "play [red hot chili peppers](media)", "play some [lo fi beats](media)". `data = { media_id = "{{ media }}" }`. Pool: `Playing {{ media }}.`
 - A media name can have common words. Without the last three examples, the fixture model tagged only "hip" of "play hip hop", and Jarvis played "hip". The fix PR `Fix: Multi-Word Media Names` adds them to `intents.toml`. None of them is held out.
+- A media name can end with "music". In the field test on 2026-11-12, the fixture model gave "play christmas music downstairs" from the Office satellite `play_music` with 0.794 and only the slot `area = downstairs`. `play_music` has no `media`, so `decide` gave `Defer` with `Job::Llm` (AC-10.4-7), and System Two asked a question. With the context of the Kitchen and with no area, the model also tagged `area = christmas`. The fix PR `Fix: Genre Music Phrases` adds the examples "play [country music](media)", "play some [classical music](media) in the [kitchen](area)" and "play [rock music](media) [downstairs](area)" to `intents.toml`, after the examples of sub-phase 18.15. The media keeps the word "music", as "lo fi beats" keeps "beats". None of them is held out. "Christmas" is in no example, so AC-18.7-8 checks a phrase that the model does not train on. The fix PR also changes `src/adapters/onnx.rs` and `README.md`.
 - HA returns the result of `music_assistant.play_media` only after the search of Music Assistant. In the field test on 2026-11-09, this took 6 s to 15 s, and the 5 s `ha.request_timeout_ms` gave a false `failure` announce. Thus `ha.request_timeout_ms` is 30000 (`01-architecture.md` section 9). The reply is already spoken, so the longer wait only removes the false failure. The HA ping also waits up to 30 s for `pong` (sub-phase 2.4c). The fix PR `Fix: HA Call Timeout` changes `jarvis.toml` and the tests that read it.
 - `play_radio`: examples "play music like [radiohead](media)", "play something like [miles davis](media)", "start a radio station for [taylor swift](media)". `data = { media_id = "{{ media }}", radio_mode = "{{ true }}" }`. Pool: `Playing music like {{ media }}.`
 - `queue_music`: examples "add [yesterday](media) to the queue", "queue [abbey road](media)", "put [hey jude](media) in the queue". `data = { media_id = "{{ media }}", enqueue = "add" }`. Pool: `Adding {{ media }} to the queue.`
@@ -200,11 +201,12 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - AC-18.7-5: When the satellite is in the Bedroom, whose only speaker is on the satellite device, the target is `media_player.carson_bedroom`.
 - AC-18.7-6: When `Config::parse` reads `jarvis.toml`, `ha.request_timeout_ms` is 30000.
 - AC-18.7-7: When the fixture model gets "play hip hop", "play red hot chili peppers" and "play some lo fi beats", the slots contain `media = hip hop`, `media = red hot chili peppers` and `media = lo fi beats`.
+- AC-18.7-8: When the fixture model gets "play christmas music downstairs" with the contexts `area: Office`, `area: Kitchen` and `area: none`, the top label is `play_music` with a probability of `model.threshold` or more, and the slots are `media = christmas music` and `area = downstairs`.
 
 **Proofs.**
 
 - P-18.7-1 to P-18.7-5. Evidence: test. The rules are P-4.5c-1, P-4.5c-2, P-4.4b-6, P-4.4c-4 and P-4.5d-1.
-- P-18.7-6, P-18.7-7. Evidence: test.
+- P-18.7-6 to P-18.7-8. Evidence: test. The probabilities come from the model file (`02-rules.md` section 5, rule 5).
 
 ---
 
