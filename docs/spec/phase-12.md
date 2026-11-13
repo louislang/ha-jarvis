@@ -374,18 +374,18 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 ### 12.8 Web API
 
-**Goal:** Add the web server of the Jarvis tab with token authentication and the review endpoints. You can now read and mark interactions over HTTP, and the Jarvis add-on (sub-phase 12.9g) can put the server into the HA sidebar.
+**Goal:** Add the web adapter of the Jarvis tab with token authentication and the review endpoints. A test can then read and mark interactions over HTTP.
 
 - **Implements:** G15, G24. **Depends on:** 12.7.
-- **Files:** create `src/adapters/web.rs`. Modify `src/lib.rs`, `jarvis.toml`, `Cargo.toml`.
+- **Files:** create `src/adapters/web.rs`. Modify `src/lib.rs` (the module declaration), `Cargo.toml`.
 
 **Model.**
 
 - `GET api/interactions?filter=&page=`, `GET api/interactions/{id}/audio` (WAV), `GET api/intents`, `POST api/interactions/{id}/mark` with `{ "target": "action" | "response", "index": <n> | null, "value": "good" | "bad" | null, "correction": "<intent>" | null }`. `index` is the position of the response in the interaction (sub-phase 12.3). It is required for `response`.
+- `filter` is `all` or `bad`, and `page` is the page number from 0. Without them, the list has all interactions and page 0. The time of a mark is the time of the `Clock` port. A mark that `Review::mark` accepts gives 204. An error of `Review::list` or `Review::audio` gives 500.
 - HA ingress serves the Jarvis tab under a path prefix (`/api/hassio_ingress/<session>/`). The add-on removes the prefix before it sends a request to Jarvis. Thus the routes of the server are the same with and without the add-on.
 - Each request under `api/` needs `Authorization: Bearer <token>`. The add-on adds this header to each request that it sends to Jarvis (sub-phase 12.9g). Thus the page has no token prompt and keeps no token. A request from another machine on the LAN needs the header too.
-- `run` serves the web server on `web.listen` next to the Wyoming server. The shutdown future of `run` stops both (sub-phase 5.4c).
-- This sub-phase adds `[web]` (`listen`, `token_env`, `page_size`) and resolves the token in `Secrets`. `web.page_size` is the page size of `list` (sub-phase 12.4).
+- `serve(listener, web, shutdown)` serves the routes until the shutdown future completes. `web` has the `Review` port, the token, the page size and the `Clock` port. Sub-phase 12.8b starts it.
 
 **Acceptance criteria.**
 
@@ -394,15 +394,37 @@ A cancel phrase is not logged, because it has no prediction and no action.
 - AC-12.8-3: When `GET api/interactions/{id}/audio` runs, the result is a valid WAV file with the stored samples.
 - AC-12.8-4: When the interaction has no audio, the audio endpoint returns 404.
 - AC-12.8-5: When `POST api/interactions/{id}/mark` has a correction that is not an intent name, the adapter returns 400.
-- AC-12.8-6: When `run` starts, the web server answers on `web.listen`. When the shutdown future completes, the web server stops.
-- AC-12.8-7: When the mark request has `"target": "response"` and `"index": 2`, `FakeReview` receives a mark with `Response(2)`. Without `index`, the adapter returns 400.
+- AC-12.8-6: When the mark request has `"target": "response"` and `"index": 2`, `FakeReview` receives a mark with `Response(2)`. Without `index`, the adapter returns 400.
 
 **Proofs.**
 
 - P-12.8-1. Argument: one middleware layer wraps every route under `api/` and compares the token before the handler runs.
 - P-12.8-4, P-12.8-5. Argument: the handlers map `None` to 404 and the `Review::mark` error to 400.
-- P-12.8-7. Argument: the handler maps `("response", Some(n))` to `Response(n)` and `("response", None)` to 400.
-- P-12.8-2, P-12.8-3, P-12.8-6. Evidence: test.
+- P-12.8-6. Argument: the handler maps `("response", Some(n))` to `Response(n)` and `("response", None)` to 400.
+- P-12.8-2, P-12.8-3. Evidence: test.
+
+---
+
+### 12.8b Web Server Start
+
+**Goal:** Start the web server next to the Wyoming server. You can now read and mark interactions over HTTP, and the Jarvis add-on (sub-phase 12.9g) can put the server into the HA sidebar.
+
+- **Implements:** G15, G24. **Depends on:** 12.8.
+- **Files:** modify `src/lib.rs`, `jarvis.toml`, `README.md` (the review API and the token, `CLAUDE.md` workflow item 15).
+
+**Model.**
+
+- `run` serves the web server on `web.listen` next to the Wyoming server. The shutdown future of `run` stops both (sub-phase 5.4c). The wait of up to 5 s after the shutdown includes the open web requests.
+- This sub-phase adds `[web]` (`listen`, `token_env`, `page_size`) and resolves the token in `Secrets`. `web.page_size` is the page size of `list` (sub-phase 12.4).
+- The composition root makes the `Review` use case (sub-phase 12.7) on the interaction log, with a new feedback model. Sub-phase 12.10 gives the feedback model to `decide`.
+
+**Acceptance criteria.**
+
+- AC-12.8b-1: When `run` starts, the web server answers on `web.listen`. When the shutdown future completes, the web server stops.
+
+**Proofs.**
+
+- P-12.8b-1. Evidence: test.
 
 ---
 
@@ -410,7 +432,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 **Goal:** Add the page of the Jarvis tab with the review section. It plays the audio of each request and lets you mark the action and the response, with an optional correction. Marking takes one click per interaction, and the page works under the path prefix of HA ingress.
 
-- **Implements:** G15, G24. **Depends on:** 12.8.
+- **Implements:** G15, G24. **Depends on:** 12.8b.
 - **Files:** create `src/adapters/review.html`. Modify `src/adapters/web.rs`.
 
 **Model.**
@@ -442,7 +464,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 **Model.**
 
 - `Status { state: State, message: Option<String> }` and `State { Online, Training, Restarting, Offline }` are in `src/ports.rs`. The JSON form is `{ "state": "online", "message": null }`, with the state in lowercase.
-- The composition root keeps the status in a `tokio::sync::watch` channel. The channel starts with `Online` and no message. The web server starts only when the start is ready (sub-phase 12.8), so the API never gives a status before that. Sub-phases 12.9c, 12.9f and 13.10b read or change the status.
+- The composition root keeps the status in a `tokio::sync::watch` channel. The channel starts with `Online` and no message. The web server starts only when the start is ready (sub-phase 12.8b), so the API never gives a status before that. Sub-phases 12.9c, 12.9f and 13.10b read or change the status.
 - The new driving port `Control` has `status() -> Status`. `src/lib.rs` implements it with the receiver of the channel. `adapters/web.rs` calls it. `FakeControl` in `src/testing/fakes.rs` gives a set status.
 - `GET api/status` returns the status.
 - The page has a status section `#status` with `.state` and `.message`. The page reads `api/status` at load and each 5 s. When the request fails, for example when the add-on returns its down page (sub-phase 12.9g), the section shows `offline`.
