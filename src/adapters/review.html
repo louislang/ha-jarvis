@@ -51,6 +51,7 @@
   const more = document.getElementById('more');
   let intents = [];
   let page = 0;
+  let loads = 0;
 
   async function mark(id, body) {
     const response = await fetch(`api/interactions/${id}/mark`, {
@@ -122,21 +123,26 @@
 
   // Loads the first page, or with `next` every page up to one more than before. A mark can move
   // an interaction out of the Bad filter, so the pages load again instead of from an old offset.
+  // Only the newest load shows its result, so a slow earlier load cannot replace it.
   async function load(next) {
+    const ticket = (loads += 1);
     const kept = filter.value === 'bad' ? 'bad' : 'all';
-    page = next === true ? page + 1 : 0;
+    const unmarked = filter.value === 'unmarked';
+    const wanted = next === true ? page + 1 : 0;
     try {
       const interactions = [];
       let last = [];
-      for (let number = 0; number <= page; number += 1) {
+      for (let number = 0; number <= wanted; number += 1) {
         last = await fetchPage(kept, number);
         interactions.push(...last);
       }
-      const unmarked = filter.value === 'unmarked';
+      if (ticket !== loads) return;
+      page = wanted;
       const shown = interactions.filter((each) => !unmarked || each.marks.length === 0);
       list.replaceChildren(...shown.map(card));
       more.hidden = last.length === 0;
     } catch (error) {
+      if (ticket !== loads) return;
       list.textContent = `Jarvis did not answer: ${error.message}`;
       more.hidden = true;
     }
