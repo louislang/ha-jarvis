@@ -91,6 +91,18 @@ impl SqliteLog {
         })
     }
 
+    /// The largest stored interaction ID, or `None` without interactions.
+    ///
+    /// # Errors
+    ///
+    /// The query fails.
+    pub fn last_id(&self) -> anyhow::Result<Option<u64>> {
+        let connection = self.connection.lock();
+        let connection = connection.map_err(|_| anyhow::anyhow!("a database call panicked"))?;
+        let query = "SELECT MAX(id) FROM interactions";
+        Ok(connection.query_row(query, [], |row| row.get(0))?)
+    }
+
     /// The result of `work` on the database, in a blocking thread.
     async fn run<T: Send + 'static>(
         &self,

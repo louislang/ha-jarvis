@@ -80,6 +80,7 @@ use crate::ports::Clock;
 use crate::ports::Handled;
 use crate::ports::Home;
 use crate::ports::Info;
+use crate::ports::InteractionLog;
 use crate::ports::Listening;
 use crate::ports::ModelLoader;
 use crate::ports::Plugin;
@@ -1034,19 +1035,26 @@ async fn start_app(
     Ok((app, (task.task, habits, writer), prerender))
 }
 
-/// The recorder of the utterances of `listener` and of the log of `config`, and its new log
-/// writer task.
+/// The recorder of the utterances of `listener` and of the log of `config` with its largest
+/// stored ID, and its new log writer task. Starts the daily prune of the log.
 ///
 /// # Errors
 ///
 /// The log cannot open.
 fn recorder(config: &Config, listener: &Listener) -> anyhow::Result<(Recorder, JoinHandle<()>)> {
     let log = SqliteLog::open(&config.log)?;
-    let (writer, task) = app::conversation::start_writer(Arc::new(log));
+    let last_id = log.last_id()?;
+    let log: Arc<dyn InteractionLog> = Arc::new(log);
+    tokio::spawn(app::background::prune(
+        Arc::clone(&log),
+        Arc::new(SystemClock),
+    ));
+    let (writer, task) = app::conversation::start_writer(log);
     let recorder = Recorder {
         utterances: Arc::clone(listener.utterances()),
         writer,
         model: MODEL.to_owned(),
+        last_id,
     };
     Ok((recorder, task))
 }
@@ -1889,12 +1897,18 @@ mod tests {
             threshold,
             two(config),
             Arc::new(habits),
-            Recorder {
-                utterances,
-                writer: tokio::sync::mpsc::unbounded_channel().0,
-                model: MODEL.to_owned(),
-            },
+            recorder(utterances),
         ))
+    }
+
+    /// A recorder of `utterances` with no stored interactions and a log writer that has ended.
+    fn recorder(utterances: Arc<Utterances>) -> Recorder {
+        Recorder {
+            utterances,
+            writer: tokio::sync::mpsc::unbounded_channel().0,
+            model: MODEL.to_owned(),
+            last_id: None,
+        }
     }
 
     /// The app of `VALID` with `classifier`, `stt`, the reference house and `pools`.

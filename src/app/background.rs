@@ -1,4 +1,4 @@
-//! Hot cache sync, response backfill and the request habit store.
+//! Hot cache sync, response backfill, the request habit store and the daily log prune.
 
 use std::collections::BTreeSet;
 use std::collections::HashSet;
@@ -28,6 +28,7 @@ use crate::domain::state::Event;
 use crate::domain::state_cache::StateCache;
 use crate::ports::Clock;
 use crate::ports::Home;
+use crate::ports::InteractionLog;
 use crate::ports::Reasoner;
 use crate::ports::Store;
 
@@ -36,6 +37,9 @@ const FIRST_RETRY: Duration = Duration::from_secs(1);
 
 /// The longest wait between two snapshot retries.
 const MAX_RETRY: Duration = Duration::from_secs(30);
+
+/// The time between two prunes of the interaction log.
+const PRUNE_INTERVAL: Duration = Duration::from_hours(24);
 
 /// Keeps `cache` equal to the states and the registries of `home` until the event stream ends.
 /// Publishes each new cache to the receivers of `cache`.
@@ -352,7 +356,18 @@ pub fn start_habits(
     HabitsTask { habits, stop, task }
 }
 
-/// Tests of the sync, backfill and habit use cases and the conformance to `cache_sync.qnt` and
+/// Prunes `log` at the `clock` time once a day, the first time one day after the start. Logs a
+/// failed prune.
+pub async fn prune(log: Arc<dyn InteractionLog>, clock: Arc<dyn Clock>) {
+    loop {
+        tokio::time::sleep(PRUNE_INTERVAL).await;
+        if let Err(error) = log.prune(clock.now()).await {
+            tracing::warn!("the prune failed: {error:#}");
+        }
+    }
+}
+
+/// Tests of the sync, backfill, habit and prune use cases and the conformance to `cache_sync.qnt` and
 /// `backfill.qnt`.
 #[cfg(test)]
 mod tests {
@@ -382,6 +397,7 @@ mod tests {
     use crate::domain::state::State;
     use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
+    use crate::testing::fakes::FakeLog;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeTts;
@@ -552,6 +568,17 @@ mod tests {
         task.task.await?;
         assert_eq!(store.saves().len(), 1);
         Ok(())
+    }
+
+    /// AC-12.6b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_6b_2_one_day_gives_one_prune() {
+        let log = Arc::new(FakeLog::default());
+        let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
+        tokio::spawn(prune(Arc::clone(&log) as _, clock));
+        tokio::time::sleep(PRUNE_INTERVAL + Duration::from_secs(1)).await;
+        let prunes = log.prunes.lock().expect("no lock holder panics").clone();
+        assert_eq!(prunes, [Timestamp::UNIX_EPOCH]);
     }
 
     /// AC-8.4-1.
