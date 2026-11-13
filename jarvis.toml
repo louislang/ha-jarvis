@@ -92,3 +92,8 @@ database = "jarvis.db"
 audio_days = 30
 record_days = 90
 correlate_s = 10
+
+[web]
+listen = "0.0.0.0:10701"
+token_env = "JARVIS_WEB_TOKEN"
+page_size = 50

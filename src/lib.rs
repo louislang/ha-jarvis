@@ -33,6 +33,7 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::signal::unix;
 use tokio::signal::unix::SignalKind;
+use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::task::TaskTracker;
@@ -59,10 +60,12 @@ use crate::app::conversation::Queues;
 use crate::app::conversation::Recorder;
 use crate::app::conversation::SystemTwo;
 use crate::app::plugins::Plugins;
+use crate::app::review::Reviewer;
 use crate::app::speech::Listener;
 use crate::app::speech::Speech;
 use crate::app::speech::Utterances;
 use crate::domain::catalog::Catalog;
+use crate::domain::feedback::Feedback;
 use crate::domain::habits::RequestHabits;
 use crate::domain::model::Prediction;
 use crate::domain::responses::Pool;
@@ -178,6 +181,8 @@ pub struct Config {
     pub train: TrainConfig,
     /// The interaction log.
     pub log: LogConfig,
+    /// The web server of the Jarvis tab.
+    pub web: WebConfig,
 }
 
 impl Config {
@@ -567,6 +572,18 @@ pub struct LogConfig {
     pub correlate_s: u64,
 }
 
+/// The `[web]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct WebConfig {
+    /// Address of the web server.
+    pub listen: SocketAddr,
+    /// The environment variable with the bearer token of the API.
+    pub token_env: String,
+    /// The number of interactions on a page of the API.
+    pub page_size: usize,
+}
+
 /// The run name of the System One model that Jarvis loads.
 const MODEL: &str = "fixture";
 
@@ -660,6 +677,8 @@ pub struct Secrets {
     pub openai_key: String,
     /// Plex token, when `[plugins.plex]` is set.
     pub plex_token: Option<String>,
+    /// Bearer token of the web API.
+    pub web_token: String,
 }
 
 impl Secrets {
@@ -683,6 +702,7 @@ impl Secrets {
             ha_token: secret(&config.ha.token_env)?,
             openai_key: secret(&config.openai.api_key_env)?,
             plex_token: plex.map(|plex| secret(&plex.token_env)).transpose()?,
+            web_token: secret(&config.web.token_env)?,
         })
     }
 }
@@ -831,10 +851,11 @@ fn area_names(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(snapshot.areas.into_iter().map(|area| area.name).collect())
 }
 
-/// A started app, its pools task, habit task and log writer task, and its pre-render task.
+/// A started app, its pools task, habit task, log writer task and review, and its pre-render
+/// task.
 type Started = (
     App,
-    (JoinHandle<()>, HabitsTask, JoinHandle<()>),
+    (JoinHandle<()>, HabitsTask, (JoinHandle<()>, Reviewer)),
     JoinHandle<()>,
 );
 
@@ -879,28 +900,70 @@ where
     let home = start_home(&config.ha, &secrets.ha_token, startup.connector)?;
     let mut shutdown = pin::pin!(startup.shutdown);
     // The models can load for a long time, so a shutdown stops the start too.
-    let (app, stores, _) = tokio::select! {
+    let started = tokio::select! {
         started = start_live_app(&config, &secrets, catalog, pools, home) => started?,
         () = &mut shutdown => return Ok(()),
     };
-    serve_until(config.listen, app, stores, shutdown).await
+    serve_until(&config, &secrets.web_token, started, shutdown).await
 }
 
-/// Serves `app` on `listen` until `shutdown` completes. Then waits up to [`SHUTDOWN_WAIT`] for
-/// the connection tasks, the work after their replies, and the pools task and the log writer
-/// task of `stores`, and then for the last save of its habit task.
+/// Serves the app of `started` on `listen` and its review on `web.listen` with `token` until
+/// `shutdown` completes. Then waits as [`drain`] does.
 ///
 /// # Errors
 ///
-/// The server cannot bind or accept, or a task of `stores` panicked.
+/// A server cannot bind or accept, or a task of `started` panicked.
 async fn serve_until(
-    listen: SocketAddr,
-    app: App,
-    stores: (JoinHandle<()>, HabitsTask, JoinHandle<()>),
+    config: &Config,
+    token: &str,
+    started: Started,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
-    let (listener, tracker) = (TcpListener::bind(listen).await?, TaskTracker::new());
+    let (app, (pools_task, habits, (writer, review)), _) = started;
+    let (listener, tracker) = (TcpListener::bind(config.listen).await?, TaskTracker::new());
+    let web = serve_web(&config.web, token, review, &tracker).await?;
     adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await?;
+    drop(web);
+    drain(tracker, (pools_task, habits, writer)).await
+}
+
+/// Serves `review` with `token` on `web.listen` in a task of `tracker` until the sender that it
+/// gives drops.
+///
+/// # Errors
+///
+/// The server cannot bind.
+async fn serve_web(
+    web: &WebConfig,
+    token: &str,
+    review: Reviewer,
+    tracker: &TaskTracker,
+) -> anyhow::Result<oneshot::Sender<()>> {
+    let listener = TcpListener::bind(web.listen).await?;
+    let (stop, stopped) = oneshot::channel();
+    let web = adapters::web::Web {
+        review: Arc::new(review),
+        token: token.to_owned(),
+        page_size: web.page_size,
+        clock: Arc::new(SystemClock),
+    };
+    tracker.spawn(adapters::web::serve(listener, web, async {
+        let _ = stopped.await;
+    }));
+    Ok(stop)
+}
+
+/// Closes `tracker` and waits up to [`SHUTDOWN_WAIT`] for its tasks: the connections, the work
+/// after their replies and the web server. Then waits for the pools task and the log writer task
+/// of `stores`, and then for the last save of its habit task.
+///
+/// # Errors
+///
+/// A task of `stores` panicked.
+async fn drain(
+    tracker: TaskTracker,
+    stores: (JoinHandle<()>, HabitsTask, JoinHandle<()>),
+) -> anyhow::Result<()> {
     tracker.close();
     let (pools_task, habits, writer) = stores;
     // Both tasks run each message. They end when the tracked tasks drop the last sender.
@@ -1018,32 +1081,40 @@ async fn start_app(
     let (task, habits) = start_stores(config, pools, &cache)?;
     let (classifier, listener, speech) = load_models(config, reasoner.clone(), &queues).await?;
     let prerender = start_prerender(&speech, &task.pools, &cache);
-    let (recorder, writer) = recorder(config, &listener)?;
-    let app = App {
-        conversation: Conversation::new(
-            task.pools,
-            backfill(config, &reasoner, task.changes, &speech, &catalog, cache),
-            queues,
-            classifier,
-            catalog,
-            config.model.threshold,
-            system_two(config, reasoner, plugins),
-            habits.habits.clone(),
-            recorder,
-        ),
-        listener,
-        speech,
-    };
-    Ok((app, (task.task, habits, writer), prerender))
+    let (recorder, logged) = recorder(config, &listener, &catalog)?;
+    Ok((
+        App {
+            conversation: Conversation::new(
+                task.pools,
+                backfill(config, &reasoner, task.changes, &speech, &catalog, cache),
+                queues,
+                classifier,
+                catalog,
+                config.model.threshold,
+                system_two(config, reasoner, plugins),
+                habits.habits.clone(),
+                recorder,
+            ),
+            listener,
+            speech,
+        },
+        (task.task, habits, logged),
+        prerender,
+    ))
 }
 
 /// The recorder of the utterances of `listener` and of the log of `config` with its largest
-/// stored ID, and its new log writer task. Starts the daily prune of the log.
+/// stored ID, its new log writer task, and the review of that log with the intent names of
+/// `catalog`. Starts the daily prune of the log.
 ///
 /// # Errors
 ///
 /// The log cannot open.
-fn recorder(config: &Config, listener: &Listener) -> anyhow::Result<(Recorder, JoinHandle<()>)> {
+fn recorder(
+    config: &Config,
+    listener: &Listener,
+    catalog: &Catalog,
+) -> anyhow::Result<(Recorder, (JoinHandle<()>, Reviewer))> {
     let log = SqliteLog::open(&config.log)?;
     let last_id = log.last_id()?;
     let log: Arc<dyn InteractionLog> = Arc::new(log);
@@ -1051,6 +1122,8 @@ fn recorder(config: &Config, listener: &Listener) -> anyhow::Result<(Recorder, J
         Arc::clone(&log),
         Arc::new(SystemClock),
     ));
+    let feedback = watch::Sender::new(Feedback::default());
+    let review = Reviewer::new(Arc::clone(&log), catalog, feedback);
     let (writer, task) = app::conversation::start_writer(log);
     let recorder = Recorder {
         utterances: Arc::clone(listener.utterances()),
@@ -1058,7 +1131,7 @@ fn recorder(config: &Config, listener: &Listener) -> anyhow::Result<(Recorder, J
         model: MODEL.to_owned(),
         last_id,
     };
-    Ok((recorder, task))
+    Ok((recorder, (task, review)))
 }
 
 /// Starts the pools task of the source pools `pools` and the saved pools of `config`, and the
@@ -1419,6 +1492,15 @@ mod tests {
         }
     }
 
+    /// The `[web]` section of `jarvis.toml`.
+    fn expected_web() -> WebConfig {
+        WebConfig {
+            listen: SocketAddr::from(([0, 0, 0, 0], 10701)),
+            token_env: "JARVIS_WEB_TOKEN".to_owned(),
+            page_size: 50,
+        }
+    }
+
     /// AC-1.1-1.
     #[test]
     fn ac_1_1_1_parse_returns_each_value() -> anyhow::Result<()> {
@@ -1467,6 +1549,7 @@ mod tests {
                 holdout: 0.1,
             },
             log: expected_log(),
+            web: expected_web(),
         };
         assert_eq!(Config::parse(VALID)?, expected);
         Ok(())
@@ -1698,6 +1781,7 @@ mod tests {
             ("HA_TOKEN", "abc"),
             ("OPENAI_API_KEY", "k"),
             ("PLEX_TOKEN", "p"),
+            ("JARVIS_WEB_TOKEN", "w"),
         ])?;
         assert_eq!(secrets.ha_token, "abc");
         Ok(())
@@ -2238,15 +2322,16 @@ mod tests {
         }
     }
 
-    /// A CPU configuration in `folder` with a server address on a free local port, and the
-    /// address. It names the int8 files and no second pass, as on a CPU machine.
-    fn listening_config(folder: &Path) -> anyhow::Result<(PathBuf, SocketAddr)> {
-        let address = free_address();
+    /// A CPU configuration in `folder` with the Wyoming and web server addresses on free local
+    /// ports, and both addresses. It names the int8 files and no second pass, as on a CPU machine.
+    fn listening_config(folder: &Path) -> anyhow::Result<(PathBuf, SocketAddr, SocketAddr)> {
+        let (address, web) = (free_address(), free_address());
         let text = with_stores_in(folder).replace("\"cuda\"", "\"cpu\"");
         let text = text.replace(".fp16.", ".int8.");
         let text = text.replace("second_pass_dir =", "# second_pass_dir =");
         let text = text.replace("0.0.0.0:10700", &address.to_string());
-        Ok((config_in(folder, &text)?, address))
+        let text = text.replace("0.0.0.0:10701", &web.to_string());
+        Ok((config_in(folder, &text)?, address, web))
     }
 
     /// Connects to the Wyoming server at `address` once it listens, sends `describe` and gives
@@ -2285,7 +2370,7 @@ mod tests {
     async fn ac_5_4b_1_without_ha_the_server_accepts_and_the_sync_tries_again() -> anyhow::Result<()>
     {
         let folder = tempfile::tempdir()?;
-        let (config, address) = listening_config(folder.path())?;
+        let (config, address, _) = listening_config(folder.path())?;
         let (attempt, mut attempts) = mpsc::unbounded_channel();
         let startup = Startup {
             lookup: |_: &str| Some("token".to_owned()),
@@ -2325,7 +2410,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_5_4c_1_shutdown_stops_accepting_and_returns_within_5_s() -> anyhow::Result<()> {
         let folder = tempfile::tempdir()?;
-        let (config, address) = listening_config(folder.path())?;
+        let (config, address, _) = listening_config(folder.path())?;
         let (stop, stopped) = oneshot::channel();
         let startup = Startup {
             lookup: |_: &str| Some("token".to_owned()),
@@ -2350,6 +2435,50 @@ mod tests {
         );
         let habits = folder.path().join("habits.json");
         assert!(habits.exists(), "run did not save {}", habits.display());
+        Ok(())
+    }
+
+    /// Gets `api/intents` from the web server at `address` once it listens, then stops `run` with
+    /// `stop`. Ends only on an error.
+    async fn intents_then_stop(
+        address: SocketAddr,
+        stop: oneshot::Sender<()>,
+    ) -> anyhow::Result<()> {
+        let (url, client) = (
+            format!("http://{address}/api/intents"),
+            reqwest::Client::new(),
+        );
+        let response = loop {
+            if let Ok(response) = client.get(&url).bearer_auth("token").send().await {
+                break response;
+            }
+            tokio::task::yield_now().await;
+        };
+        anyhow::ensure!(response.status().is_success(), "the answer is {response:?}");
+        stop.send(())
+            .map_err(|()| anyhow::anyhow!("run dropped the shutdown future"))?;
+        future::pending().await
+    }
+
+    /// AC-12.8b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_8b_1_run_serves_the_web_server_until_the_shutdown() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let (config, _, web) = listening_config(folder.path())?;
+        let (stop, stopped) = oneshot::channel();
+        let startup = Startup {
+            lookup: |_: &str| Some("token".to_owned()),
+            connector: no_ha(mpsc::unbounded_channel().0),
+            shutdown: async {
+                let _ = stopped.await;
+            },
+        };
+        tokio::select! {
+            result = run(&config, startup) => result?,
+            result = intents_then_stop(web, stop) => anyhow::bail!("run did not stop: {result:?}"),
+        }
+        let connected = TcpStream::connect(web).await;
+        assert!(connected.is_err(), "the web server accepts after the stop");
         Ok(())
     }
 

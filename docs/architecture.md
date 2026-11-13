@@ -63,8 +63,10 @@ flowchart LR
     crate --> crate_app_background
     crate --> crate_app_conversation
     crate --> crate_app_plugins
+    crate --> crate_app_review
     crate --> crate_app_speech
     crate --> crate_domain_catalog
+    crate --> crate_domain_feedback
     crate --> crate_domain_habits
     crate --> crate_domain_model
     crate --> crate_domain_responses
