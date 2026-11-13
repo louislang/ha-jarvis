@@ -62,6 +62,7 @@ use crate::ports::Change;
 use crate::ports::Classifier;
 use crate::ports::Clock;
 use crate::ports::Context;
+use crate::ports::Control;
 use crate::ports::Filter;
 use crate::ports::Handled;
 use crate::ports::Home;
@@ -75,6 +76,7 @@ use crate::ports::Plugin;
 use crate::ports::Reasoner;
 use crate::ports::Review;
 use crate::ports::SpeechToText;
+use crate::ports::Status;
 use crate::ports::Step;
 use crate::ports::Store;
 use crate::ports::SttStream;
@@ -835,6 +837,15 @@ impl Review for FakeReview {
 
     fn intents(&self) -> Vec<String> {
         self.intents.clone()
+    }
+}
+
+/// A `Control` that gives a set status.
+pub struct FakeControl(pub Status);
+
+impl Control for FakeControl {
+    fn status(&self) -> Status {
+        self.0.clone()
     }
 }
 

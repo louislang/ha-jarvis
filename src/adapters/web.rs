@@ -1,4 +1,5 @@
-//! The web server of the Jarvis tab: the page, and the review API behind a bearer token.
+//! The web server of the Jarvis tab: the page, and the review and status API behind a bearer
+//! token.
 
 use std::io;
 use std::io::Cursor;
@@ -30,9 +31,11 @@ use crate::domain::feedback::Target;
 use crate::domain::feedback::Value;
 use crate::domain::speech::Audio;
 use crate::ports::Clock;
+use crate::ports::Control;
 use crate::ports::Filter;
 use crate::ports::Page;
 use crate::ports::Review;
+use crate::ports::Status;
 
 /// The page of the Jarvis tab.
 const PAGE: &str = include_str!("review.html");
@@ -47,6 +50,8 @@ pub struct Web {
     pub page_size: usize,
     /// The time of each mark.
     pub clock: Arc<dyn Clock>,
+    /// The status of Jarvis.
+    pub control: Arc<dyn Control>,
 }
 
 /// The `filter` values of `GET api/interactions`.
@@ -129,6 +134,7 @@ fn router(web: Web) -> Router {
         .route("/interactions/{id}/audio", routing::get(audio))
         .route("/interactions/{id}/mark", routing::post(mark))
         .route("/intents", routing::get(intents))
+        .route("/status", routing::get(status))
         .layer(middleware::from_fn_with_state(Arc::clone(&web), authorize));
     Router::new()
         .route("/", routing::get(Html(PAGE)))
@@ -241,12 +247,19 @@ async fn intents(State(web): State<Arc<Web>>) -> Json<Vec<String>> {
     Json(web.review.intents())
 }
 
+/// The status of Jarvis.
+async fn status(State(web): State<Arc<Web>>) -> Json<Status> {
+    Json(web.control.status())
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::ports;
     use crate::testing::fakes::FakeClock;
+    use crate::testing::fakes::FakeControl;
     use crate::testing::fakes::FakeReview;
 
     /// The token of the test server.
@@ -280,8 +293,14 @@ mod tests {
         })
     }
 
-    /// Serves `review` on a local port and gives the URL of `api/`.
-    async fn start(review: Arc<FakeReview>) -> anyhow::Result<String> {
+    /// The status of Jarvis after the start.
+    const ONLINE: Status = Status {
+        state: ports::State::Online,
+        message: None,
+    };
+
+    /// Serves `review` and `status` on a local port and gives the URL of `api/`.
+    async fn start(review: Arc<FakeReview>, status: Status) -> anyhow::Result<String> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}/api/", listener.local_addr()?);
         let web = Web {
@@ -289,6 +308,7 @@ mod tests {
             token: TOKEN.to_owned(),
             page_size: 50,
             clock: Arc::new(FakeClock(jiff::Timestamp::UNIX_EPOCH)),
+            control: Arc::new(FakeControl(status)),
         };
         tokio::spawn(serve(listener, web, std::future::pending()));
         Ok(url)
@@ -296,7 +316,7 @@ mod tests {
 
     /// The answer of a server of `review()` to `GET api/<path>` with the token.
     async fn get(path: &str) -> anyhow::Result<reqwest::Response> {
-        let url = format!("{}{path}", start(Arc::new(review()?)).await?);
+        let url = format!("{}{path}", start(Arc::new(review()?), ONLINE).await?);
         let request = reqwest::Client::new().get(url).bearer_auth(TOKEN);
         Ok(request.send().await?)
     }
@@ -307,7 +327,10 @@ mod tests {
         body: serde_json::Value,
     ) -> anyhow::Result<(StatusCode, Vec<Mark>)> {
         let review = Arc::new(review);
-        let url = format!("{}interactions/1/mark", start(Arc::clone(&review)).await?);
+        let url = format!(
+            "{}interactions/1/mark",
+            start(Arc::clone(&review), ONLINE).await?
+        );
         let request = reqwest::Client::new().post(url).bearer_auth(TOKEN);
         let response = request.json(&body).send().await?;
         let marks = review.marks.lock().expect("no test panicked").clone();
@@ -317,7 +340,7 @@ mod tests {
     /// AC-12.8-1.
     #[tokio::test]
     async fn ac_12_8_1_missing_or_wrong_token_gives_401() -> anyhow::Result<()> {
-        let url = start(Arc::new(review()?)).await?;
+        let url = start(Arc::new(review()?), ONLINE).await?;
         let client = reqwest::Client::new();
         let requests = [
             client.get(format!("{url}interactions")),
@@ -402,7 +425,7 @@ mod tests {
     /// AC-12.9-1.
     #[tokio::test]
     async fn ac_12_9_1_page_needs_no_token_and_has_the_review_elements() -> anyhow::Result<()> {
-        let api = start(Arc::new(review()?)).await?;
+        let api = start(Arc::new(review()?), ONLINE).await?;
         let response = reqwest::get(api.trim_end_matches("api/")).await?;
         assert_eq!(response.status(), StatusCode::OK);
         let html = response.text().await?;
@@ -420,6 +443,38 @@ mod tests {
             assert!(html.contains(element), "the page has no {element}");
         }
         assert!(template.contains("<audio"), "the template has no audio");
+        Ok(())
+    }
+
+    /// AC-12.9b-2.
+    #[tokio::test]
+    async fn ac_12_9b_2_status_gives_the_state_and_the_message() -> anyhow::Result<()> {
+        let training = Status {
+            state: ports::State::Training,
+            message: Some("run 7".to_owned()),
+        };
+        let url = format!("{}status", start(Arc::new(review()?), training).await?);
+        let request = reqwest::Client::new().get(url).bearer_auth(TOKEN);
+        let status: serde_json::Value = request.send().await?.json().await?;
+        assert_eq!(status, json!({ "state": "training", "message": "run 7" }));
+        Ok(())
+    }
+
+    /// AC-12.9b-3.
+    #[tokio::test]
+    async fn ac_12_9b_3_page_has_the_status_section() -> anyhow::Result<()> {
+        let api = start(Arc::new(review()?), ONLINE).await?;
+        let html = reqwest::get(api.trim_end_matches("api/"))
+            .await?
+            .text()
+            .await?;
+        let (_, section) = html
+            .split_once(r#"<section id="status">"#)
+            .expect("the page has #status");
+        let (section, _) = section.split_once("</section>").expect("#status ends");
+        for element in [r#"class="state""#, r#"class="message""#] {
+            assert!(section.contains(element), "#status has no {element}");
+        }
         Ok(())
     }
 

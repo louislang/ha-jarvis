@@ -10,6 +10,7 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use jiff::Timestamp;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Map;
 use serde_json::Value;
 
@@ -343,4 +344,33 @@ pub trait Review: Send + Sync {
 
     /// The names that a correction can have.
     fn intents(&self) -> Vec<String>;
+}
+
+/// What Jarvis does now.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum State {
+    /// Jarvis answers requests.
+    Online,
+    /// A local training run uses the GPU.
+    Training,
+    /// Jarvis restarts.
+    Restarting,
+    /// Jarvis does not answer.
+    Offline,
+}
+
+/// The status of Jarvis in the Jarvis tab.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Status {
+    /// What Jarvis does now.
+    pub state: State,
+    /// A message for the user, for example a rollback.
+    pub message: Option<String>,
+}
+
+/// The driving port that the web server calls to read and control Jarvis.
+pub trait Control: Send + Sync {
+    /// The current status.
+    fn status(&self) -> Status;
 }

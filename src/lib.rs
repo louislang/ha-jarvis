@@ -80,6 +80,7 @@ use crate::domain::training::TrainingSet;
 use crate::ports::Assistant;
 use crate::ports::Classifier;
 use crate::ports::Clock;
+use crate::ports::Control;
 use crate::ports::Handled;
 use crate::ports::Home;
 use crate::ports::Info;
@@ -89,6 +90,8 @@ use crate::ports::ModelLoader;
 use crate::ports::Plugin;
 use crate::ports::Reasoner;
 use crate::ports::SpeechToText;
+use crate::ports::State;
+use crate::ports::Status;
 use crate::ports::Store;
 
 /// Pure rules.
@@ -597,6 +600,12 @@ impl Clock for SystemClock {
     }
 }
 
+impl Control for watch::Receiver<Status> {
+    fn status(&self) -> Status {
+        self.borrow().clone()
+    }
+}
+
 /// The `Assistant` of Jarvis. It delegates each request to its use case.
 pub struct App {
     /// The `handle` use case.
@@ -907,8 +916,8 @@ where
     serve_until(&config, &secrets.web_token, started, shutdown).await
 }
 
-/// Serves the app of `started` on `listen` and its review on `web.listen` with `token` until
-/// `shutdown` completes. Then waits as [`drain`] does.
+/// Serves the app of `started` on `listen`, and its review and the status on `web.listen` with
+/// `token`, until `shutdown` completes. Then waits as [`drain`] does.
 ///
 /// # Errors
 ///
@@ -921,14 +930,19 @@ async fn serve_until(
 ) -> anyhow::Result<()> {
     let (app, (pools_task, habits, (writer, review)), _) = started;
     let (listener, tracker) = (TcpListener::bind(config.listen).await?, TaskTracker::new());
-    let web = serve_web(&config.web, token, review, &tracker).await?;
+    let online = Status {
+        state: State::Online,
+        message: None,
+    };
+    let (_status, control) = watch::channel(online);
+    let web = serve_web(&config.web, token, review, control, &tracker).await?;
     adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await?;
     drop(web);
     drain(tracker, (pools_task, habits, writer)).await
 }
 
-/// Serves `review` with `token` on `web.listen` in a task of `tracker` until the sender that it
-/// gives drops.
+/// Serves `review` and the status of `control` with `token` on `web.listen` in a task of
+/// `tracker` until the sender that it gives drops.
 ///
 /// # Errors
 ///
@@ -937,6 +951,7 @@ async fn serve_web(
     web: &WebConfig,
     token: &str,
     review: Reviewer,
+    control: watch::Receiver<Status>,
     tracker: &TaskTracker,
 ) -> anyhow::Result<oneshot::Sender<()>> {
     let listener = TcpListener::bind(web.listen).await?;
@@ -946,6 +961,7 @@ async fn serve_web(
         token: token.to_owned(),
         page_size: web.page_size,
         clock: Arc::new(SystemClock),
+        control: Arc::new(control),
     };
     tracker.spawn(adapters::web::serve(listener, web, async {
         let _ = stopped.await;
@@ -2438,22 +2454,27 @@ mod tests {
         Ok(())
     }
 
+    /// Gets `api/<path>` from the web server at `address` once it listens.
+    async fn get_when_listening(address: SocketAddr, path: &str) -> reqwest::Response {
+        let (url, client) = (
+            format!("http://{address}/api/{path}"),
+            reqwest::Client::new(),
+        );
+        loop {
+            if let Ok(response) = client.get(&url).bearer_auth("token").send().await {
+                return response;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Gets `api/intents` from the web server at `address` once it listens, then stops `run` with
     /// `stop`. Ends only on an error.
     async fn intents_then_stop(
         address: SocketAddr,
         stop: oneshot::Sender<()>,
     ) -> anyhow::Result<()> {
-        let (url, client) = (
-            format!("http://{address}/api/intents"),
-            reqwest::Client::new(),
-        );
-        let response = loop {
-            if let Ok(response) = client.get(&url).bearer_auth("token").send().await {
-                break response;
-            }
-            tokio::task::yield_now().await;
-        };
+        let response = get_when_listening(address, "intents").await;
         anyhow::ensure!(response.status().is_success(), "the answer is {response:?}");
         stop.send(())
             .map_err(|()| anyhow::anyhow!("run dropped the shutdown future"))?;
@@ -2479,6 +2500,26 @@ mod tests {
         }
         let connected = TcpStream::connect(web).await;
         assert!(connected.is_err(), "the web server accepts after the stop");
+        Ok(())
+    }
+
+    /// AC-12.9b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_9b_1_after_the_start_the_status_is_online() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let (config, _, web) = listening_config(folder.path())?;
+        let startup = Startup {
+            lookup: |_: &str| Some("token".to_owned()),
+            connector: no_ha(mpsc::unbounded_channel().0),
+            shutdown: future::pending(),
+        };
+        tokio::select! {
+            result = run(&config, startup) => anyhow::bail!("run returned: {result:?}"),
+            response = get_when_listening(web, "status") => {
+                let status: serde_json::Value = response.json().await?;
+                assert_eq!(status, json!({ "state": "online", "message": null }));
+            }
+        }
         Ok(())
     }
 

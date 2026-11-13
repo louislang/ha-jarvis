@@ -14,6 +14,7 @@
 </style>
 </head>
 <body>
+<section id="status"><span class="state"></span> <span class="message"></span></section>
 <h1>Review</h1>
 <select id="filter">
   <option value="all">All</option>
@@ -49,6 +50,7 @@
   const list = document.getElementById('interactions');
   const filter = document.getElementById('filter');
   const more = document.getElementById('more');
+  const statusSection = document.getElementById('status');
   let intents = [];
   let page = 0;
   let loads = 0;
@@ -156,6 +158,20 @@
     await load(false);
   }
 
+  async function currentStatus() {
+    const response = await fetch('api/status');
+    if (!response.ok) throw new Error(`status ${response.status}`);
+    return response.json();
+  }
+
+  async function showStatus() {
+    const shown = await currentStatus().catch(() => ({ state: 'offline', message: null }));
+    statusSection.querySelector('.state').textContent = shown.state;
+    statusSection.querySelector('.message').textContent = shown.message ?? '';
+  }
+
+  showStatus();
+  setInterval(showStatus, 5000);
   start();
 </script>
 </body>
