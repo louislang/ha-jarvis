@@ -14,6 +14,7 @@ flowchart LR
         crate_adapters_sherpa[sherpa]
         crate_adapters_sqlite[sqlite]
         crate_adapters_supertonic[supertonic]
+        crate_adapters_web[web]
         crate_adapters_wyoming[wyoming]
     end
     subgraph app
@@ -108,6 +109,9 @@ flowchart LR
     crate_adapters_supertonic --> crate_adapters_supertonic
     crate_adapters_supertonic --> crate_domain_speech
     crate_adapters_supertonic --> crate_ports
+    crate_adapters_web --> crate_domain_feedback
+    crate_adapters_web --> crate_domain_speech
+    crate_adapters_web --> crate_ports
     crate_adapters_wyoming --> crate_domain_speech
     crate_adapters_wyoming --> crate_ports
     crate_app_background --> crate

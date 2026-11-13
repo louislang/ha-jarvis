@@ -129,6 +129,7 @@ pub mod adapters {
     pub mod sherpa;
     pub mod sqlite;
     pub mod supertonic;
+    pub mod web;
     pub mod wyoming;
 }
 
