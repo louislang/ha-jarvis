@@ -159,7 +159,8 @@
   }
 
   async function currentStatus() {
-    const response = await fetch('api/status');
+    // The signal also bounds the body read, and ends before the next poll starts.
+    const response = await fetch('api/status', { signal: AbortSignal.timeout(4000) });
     if (!response.ok) throw new Error(`status ${response.status}`);
     return response.json();
   }
