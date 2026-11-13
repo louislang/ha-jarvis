@@ -13,6 +13,7 @@ use rumqttc::Outgoing;
 use rumqttc::Packet;
 use rumqttc::QoS;
 use serde_json::json;
+use tokio::sync::Notify;
 use tokio::sync::watch;
 
 use crate::ports::State;
@@ -58,21 +59,19 @@ pub fn options(url: &str, username: &str, password: &str) -> anyhow::Result<Mqtt
 /// sends `DISCONNECT` and ends.
 pub async fn publish(options: MqttOptions, status: watch::Receiver<Status>) {
     let (client, events) = AsyncClient::new(options, 10);
+    let connected = Notify::new();
     tokio::join!(
-        poll(&client, events, status.clone()),
-        follow(&client, status)
+        poll(events, &connected),
+        follow(&client, status, &connected)
     );
 }
 
-/// Polls `events` until `DISCONNECT` is sent. At each `ConnAck`, publishes the discovery message
-/// and `status` with `client`. After a connection error, waits [`RETRY`].
-async fn poll(client: &AsyncClient, mut events: EventLoop, status: watch::Receiver<Status>) {
+/// Polls `events` until `DISCONNECT` is sent, and notifies `connected` at each `ConnAck`. After a
+/// connection error, waits [`RETRY`].
+async fn poll(mut events: EventLoop, connected: &Notify) {
     loop {
         match events.poll().await {
-            Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                send(client, CONFIG_TOPIC, &discovery());
-                send(client, STATE_TOPIC, &json!(*status.borrow()));
-            }
+            Ok(Event::Incoming(Packet::ConnAck(_))) => connected.notify_one(),
             Ok(Event::Outgoing(Outgoing::Disconnect)) => return,
             Ok(_) => {}
             Err(error) => {
@@ -83,14 +82,22 @@ async fn poll(client: &AsyncClient, mut events: EventLoop, status: watch::Receiv
     }
 }
 
-/// Publishes each change of `status` with `client`. When the sender closes, publishes the last
-/// status and sends `DISCONNECT`.
-async fn follow(client: &AsyncClient, mut status: watch::Receiver<Status>) {
+/// Publishes the discovery message and the status at each notice of `connected`, and the status
+/// at each change of `status`, with `client`. When the sender closes, publishes the last status
+/// and sends `DISCONNECT`.
+async fn follow(client: &AsyncClient, mut status: watch::Receiver<Status>, connected: &Notify) {
     loop {
-        let closed = status.changed().await.is_err();
-        send(client, STATE_TOPIC, &json!(*status.borrow_and_update()));
+        let closed = tokio::select! {
+            () = connected.notified() => {
+                send(client, CONFIG_TOPIC, discovery()).await;
+                false
+            }
+            changed = status.changed() => changed.is_err(),
+        };
+        let current = json!(*status.borrow_and_update());
+        send(client, STATE_TOPIC, current).await;
         if closed {
-            if let Err(error) = client.try_disconnect() {
+            if let Err(error) = client.disconnect().await {
                 tracing::warn!("cannot disconnect from MQTT: {error}");
             }
             return;
@@ -98,10 +105,11 @@ async fn follow(client: &AsyncClient, mut status: watch::Receiver<Status>) {
     }
 }
 
-/// Publishes `payload` on `topic` with `QoS` 1 and retain.
-fn send(client: &AsyncClient, topic: &str, payload: &serde_json::Value) {
+/// Publishes `payload` on `topic` with `QoS` 1 and retain. A full request queue delays the
+/// publish until the event loop takes requests again, so no status or discovery is lost.
+async fn send(client: &AsyncClient, topic: &str, payload: serde_json::Value) {
     let payload = payload.to_string();
-    if let Err(error) = client.try_publish(topic, QoS::AtLeastOnce, true, payload) {
+    if let Err(error) = client.publish(topic, QoS::AtLeastOnce, true, payload).await {
         tracing::warn!("cannot publish {topic}: {error}");
     }
 }

@@ -107,7 +107,9 @@ pub fn log_dispatch(log: &NamedTempFile) -> io::Result<Dispatch> {
     // `tracing-core` asks every live dispatcher.
     static SILENT: LazyLock<Dispatch> = LazyLock::new(|| Dispatch::new(NoSubscriber::default()));
     LazyLock::force(&SILENT);
-    let subscriber = tracing_subscriber::fmt().with_writer(Arc::new(log.reopen()?));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(Arc::new(log.reopen()?));
     Ok(Dispatch::new(subscriber.finish()))
 }
 
