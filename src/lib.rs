@@ -987,8 +987,9 @@ async fn serve_until(
         state: State::Online,
         message: None,
     });
-    start_status_entity(config, secrets, &status, &tracker)?;
     let web = serve_web(&config.web, &secrets.web_token, review, control, &tracker).await?;
+    // After the bind, so a failed start leaves no `online` behind.
+    start_status_entity(config, secrets, &status, &tracker)?;
     let served = adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await;
     drop(web);
     status.send_replace(Status {
