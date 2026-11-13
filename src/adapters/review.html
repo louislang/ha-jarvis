@@ -114,19 +114,28 @@
     return shown;
   }
 
-  // Loads the first page again, or with `next` the page after the shown ones.
+  async function fetchPage(kept, number) {
+    const response = await fetch(`api/interactions?filter=${kept}&page=${number}`);
+    if (!response.ok) throw new Error(`status ${response.status}`);
+    return response.json();
+  }
+
+  // Loads the first page, or with `next` every page up to one more than before. A mark can move
+  // an interaction out of the Bad filter, so the pages load again instead of from an old offset.
   async function load(next) {
     const kept = filter.value === 'bad' ? 'bad' : 'all';
     page = next === true ? page + 1 : 0;
     try {
-      const response = await fetch(`api/interactions?filter=${kept}&page=${page}`);
-      if (!response.ok) throw new Error(`status ${response.status}`);
-      const interactions = await response.json();
+      const interactions = [];
+      let last = [];
+      for (let number = 0; number <= page; number += 1) {
+        last = await fetchPage(kept, number);
+        interactions.push(...last);
+      }
       const unmarked = filter.value === 'unmarked';
       const shown = interactions.filter((each) => !unmarked || each.marks.length === 0);
-      if (page === 0) list.replaceChildren();
-      list.append(...shown.map(card));
-      more.hidden = interactions.length === 0;
+      list.replaceChildren(...shown.map(card));
+      more.hidden = last.length === 0;
     } catch (error) {
       list.textContent = `Jarvis did not answer: ${error.message}`;
       more.hidden = true;
