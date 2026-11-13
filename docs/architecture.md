@@ -7,6 +7,7 @@ flowchart LR
     subgraph adapters
         crate_adapters_files[files]
         crate_adapters_ha[ha]
+        crate_adapters_mqtt[mqtt]
         crate_adapters_onnx[onnx]
         crate_adapters_open_meteo[open_meteo]
         crate_adapters_openai[openai]
@@ -81,6 +82,7 @@ flowchart LR
     crate_adapters_ha --> crate_adapters_ha
     crate_adapters_ha --> crate_domain_state
     crate_adapters_ha --> crate_ports
+    crate_adapters_mqtt --> crate_ports
     crate_adapters_onnx --> crate
     crate_adapters_onnx --> crate_adapters_onnx
     crate_adapters_onnx --> crate_domain_model

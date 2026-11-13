@@ -128,6 +128,7 @@ pub mod app {
 pub mod adapters {
     pub mod files;
     pub mod ha;
+    pub mod mqtt;
     pub mod onnx;
     pub mod open_meteo;
     pub mod openai;
