@@ -13,6 +13,7 @@ use std::sync::MutexGuard;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::thread;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -26,6 +27,11 @@ use rubato::Fft;
 use rubato::FixedSync;
 use rubato::Resampler;
 use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rumqttc::AsyncClient;
+use rumqttc::EventLoop;
+use rumqttc::MqttOptions;
+use rumqttc::Packet;
+use rumqttc::QoS;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
@@ -101,7 +107,9 @@ pub fn log_dispatch(log: &NamedTempFile) -> io::Result<Dispatch> {
     // `tracing-core` asks every live dispatcher.
     static SILENT: LazyLock<Dispatch> = LazyLock::new(|| Dispatch::new(NoSubscriber::default()));
     LazyLock::force(&SILENT);
-    let subscriber = tracing_subscriber::fmt().with_writer(Arc::new(log.reopen()?));
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(Arc::new(log.reopen()?));
     Ok(Dispatch::new(subscriber.finish()))
 }
 
@@ -1034,5 +1042,78 @@ impl<S: AsyncRead + AsyncWrite + Unpin> FakeWyomingClient<S> {
         data.truncate(length);
         let event_type = header["type"].as_str().unwrap_or_default().to_owned();
         Ok(Some((event_type, serde_json::from_slice(&data)?)))
+    }
+}
+
+/// Starts an in-process MQTT broker on a free local port in its own thread, and gives its
+/// address once it accepts connections.
+pub(crate) fn mqtt_broker() -> anyhow::Result<SocketAddr> {
+    let address = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let config: rumqttd::Config = toml::from_str(&format!(
+        "id = 0
+        [router]
+        max_connections = 10
+        max_outgoing_packet_count = 200
+        max_segment_size = 1048576
+        max_segment_count = 10
+        [v4.1]
+        name = \"v4\"
+        listen = \"{address}\"
+        next_connection_delay_ms = 1
+        [v4.1.connections]
+        connection_timeout_ms = 60000
+        max_payload_size = 20480
+        max_inflight_count = 100"
+    ))?;
+    let mut broker = rumqttd::Broker::new(config);
+    thread::spawn(move || broker.start().map_err(Box::new));
+    while std::net::TcpStream::connect(address).is_err() {
+        thread::yield_now();
+    }
+    Ok(address)
+}
+
+/// A message that [`MqttSubscriber`] gets.
+#[derive(Debug)]
+pub(crate) struct MqttMessage {
+    /// The topic.
+    pub(crate) topic: String,
+    /// The JSON payload.
+    pub(crate) payload: Value,
+    /// The retain flag.
+    pub(crate) retain: bool,
+}
+
+/// An MQTT client that subscribes to a topic filter.
+pub(crate) struct MqttSubscriber {
+    /// Keeps the request channel of `events` open.
+    _client: AsyncClient,
+    /// The connection.
+    events: EventLoop,
+}
+
+impl MqttSubscriber {
+    /// A client `id` of the broker at `address` that subscribes to `filter`.
+    pub(crate) fn new(address: SocketAddr, id: &str, filter: &str) -> anyhow::Result<Self> {
+        let options = MqttOptions::new(id, address.ip().to_string(), address.port());
+        let (client, events) = AsyncClient::new(options, 10);
+        client.try_subscribe(filter, QoS::AtLeastOnce)?;
+        Ok(Self {
+            _client: client,
+            events,
+        })
+    }
+
+    /// Waits for the next message.
+    pub(crate) async fn next(&mut self) -> anyhow::Result<MqttMessage> {
+        loop {
+            if let rumqttc::Event::Incoming(Packet::Publish(publish)) = self.events.poll().await? {
+                return Ok(MqttMessage {
+                    topic: publish.topic,
+                    payload: serde_json::from_slice(&publish.payload)?,
+                    retain: publish.retain,
+                });
+            }
+        }
     }
 }
