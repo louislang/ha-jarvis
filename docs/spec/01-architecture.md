@@ -301,7 +301,6 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `quint/commit.qnt` | Model | Commit policy. | 6.4 |
 | `quint/backfill.qnt` | Model | Response backfill. | 8.3 |
 | `quint/dialog.qnt` | Model | Dialogs. | 10.1 |
-| `quint/feedback.qnt` | Model | Marks and blocked decisions. The fix PR `Fix: Remove Feedback Quint Model` deletes this file and this row (decision 26). | 12.2 |
 | `quint/training.qnt` | Model | Training trigger, run, pause, accept and fallback. | 13.4 |
 | `quint/learned.qnt` | Model | Learned intent lifecycle, approval and plugin requests. | 14.3 |
 | `quint/prefetch.qnt` | Model | Prefetch window, refresh, freshness and side effects. | 14.8 |

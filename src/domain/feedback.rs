@@ -551,16 +551,6 @@ proof fn lemma_filter_step<T>(items: Seq<T>, index: int, keep: spec_fn(T) -> boo
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-    use std::mem;
-
-    use quint_connect::Driver;
-    use quint_connect::State as ModelState;
-    use quint_connect::Step;
-    use quint_connect::quint_run;
-    use quint_connect::switch;
-    use serde::Deserialize;
-
     use super::*;
 
     /// The request of the tests.
@@ -690,110 +680,5 @@ mod tests {
         let feedback = Feedback::default().apply(rated(TV, office()), wrong);
         let expected = "tv_on on media_player.office was wrong, the right intent is tv_show";
         assert_eq!(feedback.corrections(TV, 3), [expected]);
-    }
-
-    /// The targets of the model decision `d`: the Office or the Living Room media player.
-    fn targets(d: &str) -> Vec<String> {
-        let room = if d == "d1" { "office" } else { "living_room" };
-        vec![format!("media_player.{room}")]
-    }
-
-    /// A mark value of `feedback.qnt`.
-    #[derive(Deserialize)]
-    struct Pick {
-        /// `Good` or `Bad`.
-        tag: String,
-    }
-
-    /// The good and bad marks of `feedback.qnt` for each text and decision.
-    #[derive(Deserialize)]
-    struct Model {
-        /// The good marks.
-        good: BTreeMap<(String, String), i64>,
-        /// The bad marks.
-        bad: BTreeMap<(String, String), i64>,
-    }
-
-    /// `blocked` for each text and decision.
-    #[derive(Debug, Deserialize, PartialEq)]
-    #[serde(from = "Model")]
-    struct Blocked(BTreeMap<(String, String), bool>);
-
-    impl From<Model> for Blocked {
-        /// Bad marks more than good marks.
-        fn from(model: Model) -> Self {
-            let blocked = model.bad.into_iter().map(|(key, bad)| {
-                let good = model.good[&key];
-                (key, bad > good)
-            });
-            Self(blocked.collect())
-        }
-    }
-
-    impl ModelState<FeedbackDriver> for Blocked {
-        /// `blocked` for "turn on the tv" with each decision.
-        fn from_driver(driver: &FeedbackDriver) -> anyhow::Result<Self> {
-            let blocked = ["d1", "d2"].map(|d| {
-                let found = driver.feedback.blocked(TV, "tv_on", &targets(d));
-                (("t".to_owned(), d.to_owned()), found)
-            });
-            Ok(Self(blocked.into()))
-        }
-    }
-
-    /// Replays `feedback.qnt` against `Feedback`. The text `t` is "turn on the tv", and each mark
-    /// is on a new interaction.
-    #[derive(Default)]
-    struct FeedbackDriver {
-        /// The feedback.
-        feedback: Feedback,
-        /// The interaction, decision and value of each mark that is not removed.
-        marks: Vec<(u64, String, Value)>,
-        /// The number of marks so far, which is the ID of the last marked interaction.
-        count: u64,
-    }
-
-    impl FeedbackDriver {
-        /// Applies `mark` on the action of decision `d`.
-        fn apply(&mut self, d: &str, mark: Mark) {
-            let rated = rated(TV, targets(d));
-            self.feedback = mem::take(&mut self.feedback).apply(rated, mark);
-        }
-
-        /// Marks decision `d` with `value` on a new interaction.
-        fn mark(&mut self, d: String, value: Value) {
-            self.count += 1;
-            self.apply(&d, mark(self.count, Some(value)));
-            self.marks.push((self.count, d, value));
-        }
-
-        /// Removes a mark with `value` on decision `d`.
-        fn unmark(&mut self, d: &str, value: Value) {
-            let found = self.marks.iter().position(|m| m.1 == d && m.2 == value);
-            let (interaction, ..) = self.marks.remove(found.expect("a mark to remove"));
-            self.apply(d, mark(interaction, None));
-        }
-    }
-
-    impl Driver for FeedbackDriver {
-        type State = Blocked;
-
-        fn step(&mut self, step: &Step) -> anyhow::Result<()> {
-            switch!(step {
-                init => *self = Self::default(),
-                markGood(d: String) => self.mark(d, Value::Good),
-                markBad(d: String) => self.mark(d, Value::Bad),
-                unmark(d: String, value: Pick) => {
-                    self.unmark(&d, if value.tag == "Bad" { Value::Bad } else { Value::Good });
-                },
-                decide => {},
-            })
-        }
-    }
-
-    /// AC-12.3b-2. `quint_run` replays 100 traces by default.
-    #[quint_run(spec = "quint/feedback.qnt", max_steps = 30, seed = "1")]
-    fn ac_12_3b_2_conformance() -> impl Driver {
-        FeedbackDriver::default()
     }
 }
