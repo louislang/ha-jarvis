@@ -5,45 +5,211 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Jarvis</title>
 <style>
-  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-  body { margin: 0 auto; max-width: 48rem; padding: 1rem; }
-  article { border-bottom: 1px solid; padding: 0.75rem 0; }
-  .transcript { font-size: 1.2rem; margin: 0.5rem 0; }
-  audio { width: 100%; }
-  button[aria-pressed="true"] { font-weight: bold; outline: 2px solid; }
-  label { display: block; margin: 0.25rem 0; }
+  /* The names and the defaults are those of the Home Assistant theme. Inside HA, `followTheme`
+     copies the values of the HA page. */
+  :root {
+    color-scheme: light dark;
+    --primary-color: #009ac7;
+    --text-primary-color: #fff;
+    --primary-text-color: #141414;
+    --secondary-text-color: #5e5e5e;
+    --primary-background-color: #fafafa;
+    --card-background-color: #fff;
+    --divider-color: #0000001f;
+    --input-fill-color: #f5f5f5;
+    --success-color: #43a047;
+    --warning-color: #ffa600;
+    --error-color: #db4437;
+    --ha-card-border-radius: 12px;
+    --ha-font-family-body: Roboto, Noto, system-ui, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --primary-text-color: #e1e1e1;
+      --secondary-text-color: #9b9b9b;
+      --primary-background-color: #111;
+      --card-background-color: #1c1c1c;
+      --divider-color: #e1e1e11f;
+      --input-fill-color: #ffffff0d;
+    }
+  }
+  body {
+    margin: 0;
+    background: var(--primary-background-color);
+    color: var(--primary-text-color);
+    font: 14px/1.43 var(--ha-font-family-body);
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0 16px;
+    min-height: 56px;
+    padding: 0 16px;
+    background: var(--app-header-background-color, var(--card-background-color));
+    color: var(--app-header-text-color, var(--primary-text-color));
+    border-bottom: 1px solid var(--divider-color);
+  }
+  h1 { margin: 0; font-size: 20px; font-weight: 400; }
+  nav { display: flex; align-self: stretch; flex: 1; }
+  [role="tab"] {
+    height: auto;
+    padding: 0 16px;
+    border: 0;
+    border-radius: 0;
+    border-bottom: 2px solid transparent;
+    background: none;
+    color: var(--secondary-text-color);
+    font: 500 14px var(--ha-font-family-body);
+    cursor: pointer;
+  }
+  [role="tab"][aria-selected="true"] { color: var(--primary-color); border-bottom-color: var(--primary-color); }
+  #status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 12px;
+    border: 1px solid var(--divider-color);
+    border-radius: 9999px;
+    font-weight: 500;
+  }
+  #status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--error-color); }
+  #status[data-state="online"]::before { background: var(--success-color); }
+  #status[data-state="training"]::before, #status[data-state="restarting"]::before { background: var(--warning-color); }
+  #status .message { color: var(--secondary-text-color); font-weight: 400; }
+  main { max-width: 840px; margin: 0 auto; padding: 16px; }
+  .toolbar { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; color: var(--secondary-text-color); }
+  article, fieldset {
+    margin: 0 0 16px;
+    padding: 16px;
+    background: var(--ha-card-background, var(--card-background-color));
+    border: 1px solid var(--divider-color);
+    border-radius: var(--ha-card-border-radius);
+  }
+  #interactions:empty::after { content: "No interactions."; color: var(--secondary-text-color); }
+  .transcript { margin: 0; font-size: 16px; font-weight: 500; }
+  .meta { margin: 0 0 12px; color: var(--secondary-text-color); font-size: 12px; }
+  audio { display: block; width: 100%; height: 40px; }
+  .responses { margin: 12px 0 0; padding: 0 0 0 12px; list-style: none; border-left: 2px solid var(--primary-color); }
+  .responses:empty { display: none; }
+  .action {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin: 12px -16px -16px;
+    padding: 8px 16px;
+    border-top: 1px solid var(--divider-color);
+  }
+  .intent { flex: 1; font-family: ui-monospace, monospace; font-size: 13px; color: var(--secondary-text-color); }
+  button {
+    height: 40px;
+    padding: 0 16px;
+    border: 1px solid var(--divider-color);
+    border-radius: 9999px;
+    background: none;
+    color: var(--primary-color);
+    font: 500 14px var(--ha-font-family-body);
+    cursor: pointer;
+  }
+  .mark-good[aria-pressed="true"] { color: var(--success-color); background: color-mix(in srgb, var(--success-color) 15%, transparent); border-color: transparent; }
+  .mark-bad[aria-pressed="true"] { color: var(--error-color); background: color-mix(in srgb, var(--error-color) 15%, transparent); border-color: transparent; }
+  #more { display: block; margin: 0 auto; }
+  #more[hidden] { display: none; }
+  #save { border: 0; background: var(--primary-color); color: var(--text-primary-color); }
+  input, select, textarea {
+    box-sizing: border-box;
+    padding: 8px 12px;
+    border: 0;
+    border-bottom: 1px solid var(--secondary-text-color);
+    border-radius: 4px 4px 0 0;
+    background: var(--input-fill-color);
+    color: var(--primary-text-color);
+    font: 14px var(--ha-font-family-body);
+  }
+  input:focus, select:focus, textarea:focus { outline: none; border-bottom: 2px solid var(--primary-color); }
+  legend { float: left; width: 100%; padding: 0 0 8px; font-size: 20px; }
+  fieldset label {
+    clear: both;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+    align-items: center;
+    gap: 16px;
+    padding: 8px 0;
+    border-top: 1px solid var(--divider-color);
+    font-family: ui-monospace, monospace;
+    font-size: 13px;
+  }
+  /* A phone: one column, and 16px text in fields so that iOS does not zoom in on focus. */
+  @media (max-width: 600px) {
+    fieldset label { grid-template-columns: 1fr; gap: 4px; }
+    .intent { flex-basis: 100%; }
+    .correction { flex: 1; }
+    input, select, textarea { font-size: 16px; }
+  }
+  .actions {
+    position: sticky;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 16px;
+    padding: 12px 0;
+    background: var(--primary-background-color);
+  }
+  #settings-error { margin: 0; color: var(--error-color); }
 </style>
 </head>
 <body>
-<section id="status"><span class="state"></span> <span class="message"></span></section>
-<h1>Review</h1>
-<select id="filter">
-  <option value="all">All</option>
-  <option value="bad">Bad</option>
-  <option value="unmarked">Unmarked</option>
-</select>
-<div id="interactions"></div>
-<button id="more" type="button" hidden>More</button>
+<header>
+  <h1>Jarvis</h1>
+  <nav role="tablist">
+    <button role="tab" type="button" aria-selected="true" data-panel="review">Review</button>
+    <button role="tab" type="button" aria-selected="false" data-panel="configuration">Settings</button>
+  </nav>
+  <section id="status"><span class="state"></span><span class="message"></span></section>
+</header>
+<main>
+<section id="review" role="tabpanel">
+  <div class="toolbar">
+    Show
+    <select id="filter">
+      <option value="all">All</option>
+      <option value="bad">Bad</option>
+      <option value="unmarked">Unmarked</option>
+    </select>
+  </div>
+  <div id="interactions"></div>
+  <button id="more" type="button" hidden>More</button>
+</section>
 <template id="interaction">
   <article>
-    <time class="time"></time> <span class="satellite"></span>
     <p class="transcript"></p>
+    <p class="meta"><time class="time"></time> · <span class="satellite"></span></p>
     <audio controls preload="none"></audio>
+    <ul class="responses"></ul>
     <div class="action">
       <span class="intent"></span>
       <button class="mark-good" type="button">Good</button>
       <button class="mark-bad" type="button">Bad</button>
       <select class="correction"><option value="">Correct intent</option></select>
     </div>
-    <ul class="responses"></ul>
   </article>
 </template>
-<h1>Settings</h1>
-<form id="settings">
-  <div id="fields"></div>
-  <button id="save" type="submit">Save</button>
-  <p id="settings-error" role="alert"></p>
-</form>
+<section id="configuration" role="tabpanel" hidden>
+  <form id="settings">
+    <div id="fields"></div>
+    <div class="actions">
+      <p id="settings-error" role="alert"></p>
+      <button id="save" type="submit">Save</button>
+    </div>
+  </form>
+</section>
+</main>
 <template id="response">
   <li>
     <span class="text"></span>
@@ -172,7 +338,8 @@
     const asked = saves;
     const shown = await currentStatus().catch(() => ({ state: 'offline', message: null }));
     if (asked === saves) restarting &&= shown.state !== 'online';
-    statusSection.querySelector('.state').textContent = restarting ? 'restarting' : shown.state;
+    statusSection.dataset.state = restarting ? 'restarting' : shown.state;
+    statusSection.querySelector('.state').textContent = statusSection.dataset.state;
     statusSection.querySelector('.message').textContent = shown.message ?? '';
   }
 
@@ -248,6 +415,51 @@
     settingsError.textContent = refusal.error;
   });
 
+  // Inside HA ingress the page has the origin of the HA page around it, so it can take the theme
+  // values and the fonts of that page. A direct visit keeps the defaults.
+  const THEME = ['--primary-color', '--text-primary-color', '--primary-text-color',
+    '--secondary-text-color', '--primary-background-color', '--card-background-color',
+    '--ha-card-background', '--divider-color', '--input-fill-color', '--success-color',
+    '--warning-color', '--error-color', '--ha-card-border-radius', '--ha-font-family-body',
+    '--app-header-background-color', '--app-header-text-color'];
+
+  function rules(sheet) {
+    try {
+      return [...sheet.cssRules];
+    } catch {
+      return [];
+    }
+  }
+
+  function followTheme() {
+    let outer;
+    try {
+      outer = window.parent.document;
+    } catch {
+      return;
+    }
+    if (outer === document) return;
+    const style = getComputedStyle(outer.documentElement);
+    for (const name of THEME) {
+      const value = style.getPropertyValue(name).trim();
+      if (value) document.documentElement.style.setProperty(name, value);
+    }
+    const sheets = [...outer.styleSheets, ...outer.adoptedStyleSheets];
+    const faces = sheets.flatMap(rules).filter((rule) => rule.constructor.name === 'CSSFontFaceRule');
+    document.head.append(Object.assign(document.createElement('style'),
+      { textContent: faces.map((rule) => rule.cssText).join('\n') }));
+  }
+
+  for (const tab of document.querySelectorAll('[role="tab"]')) {
+    tab.addEventListener('click', () => {
+      for (const other of document.querySelectorAll('[role="tab"]')) {
+        other.setAttribute('aria-selected', String(other === tab));
+        document.getElementById(other.dataset.panel).hidden = other !== tab;
+      }
+    });
+  }
+
+  followTheme();
   loadSettings();
   showStatus();
   setInterval(showStatus, 5000);
