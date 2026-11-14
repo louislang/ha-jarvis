@@ -172,9 +172,15 @@
     return response.json();
   }
 
+  // After a save, the section shows `restarting` until a status asked after the save is online.
+  let restarting = false;
+  let saves = 0;
+
   async function showStatus() {
+    const asked = saves;
     const shown = await currentStatus().catch(() => ({ state: 'offline', message: null }));
-    statusSection.querySelector('.state').textContent = shown.state;
+    if (asked === saves) restarting &&= shown.state !== 'online';
+    statusSection.querySelector('.state').textContent = restarting ? 'restarting' : shown.state;
     statusSection.querySelector('.message').textContent = shown.message ?? '';
   }
 
@@ -238,6 +244,11 @@
     });
     if (response.ok) {
       settingsError.textContent = '';
+      saves += 1;
+      restarting = true;
+      while (restarting) {
+        await Promise.all([showStatus(), new Promise((resolve) => setTimeout(resolve, 1000))]);
+      }
       await loadSettings();
       return;
     }

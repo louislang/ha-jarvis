@@ -387,6 +387,17 @@ pub struct Setting {
 pub enum Refusal {
     /// The new file does not pass the checks of the start. The message names the field.
     Invalid(String),
+    /// Another save restarts Jarvis.
+    Busy,
+}
+
+/// What Jarvis does besides requests. Each change checks the old value.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Activity {
+    /// Nothing.
+    Idle,
+    /// A save restarts Jarvis.
+    Restarting,
 }
 
 /// The driving port that the web server calls to read and control Jarvis.
@@ -401,11 +412,12 @@ pub trait Control: Send + Sync {
     /// The file cannot be read, or a field is missing.
     fn settings(&self) -> anyhow::Result<Vec<Setting>>;
 
-    /// Sets each field of `changes` in the configuration file. The new values take effect at the
-    /// next start.
+    /// Sets each field of `changes` in the configuration file, keeps the old file as the backup
+    /// and restarts Jarvis.
     ///
     /// # Errors
     ///
-    /// The new file does not pass the checks of the start. The file does not change.
+    /// Another save runs, or the new file does not pass the checks of the start. The file does
+    /// not change.
     fn save(&self, changes: BTreeMap<String, Value>) -> Result<(), Refusal>;
 }

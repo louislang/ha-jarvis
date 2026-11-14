@@ -3,6 +3,7 @@
 /models/
 /.venv/
 /jarvis.local.toml
+/jarvis.toml.bak
 /habits.json
 /voices.json
 /jarvis.db

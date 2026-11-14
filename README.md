@@ -25,7 +25,7 @@ The design is in [`docs/spec/`](docs/spec/00-overview.md).
 | Responses | Each intent has a pool of replies with variety. Jarvis adds new replies when a pool runs low. A slow request gets a filler reply, then an announcement of the answer. | Local, OpenAI for new replies |
 | Interaction log | Jarvis records each request with its audio, transcript, prediction, decision, service calls, responses and latency in the SQLite file `log.database` (`jarvis.db`). Once a day, it deletes audio older than `log.audio_days` and unmarked records older than `log.record_days`. | Local |
 | Review | A web server on `web.listen` (port 10701) lists the logged requests, gives their audio as WAV and takes good or bad marks with an optional correction. `api/status` gives the status of Jarvis (`online`, `training`, `restarting` or `offline`) and an optional message. Each request under `api/` needs `Authorization: Bearer <token>`, with the token of `web.token_env`. `/` is the review page: it shows the status of Jarvis, or `offline` when Jarvis does not answer, plays each request and marks its action and responses with one click. The page sends no token, so it works only behind a proxy that adds the header, such as the Jarvis add-on. | Local |
-| Settings | The page has a settings form with a fixed list of fields of `jarvis.toml`, in groups, and no secret, address or path. `api/settings` gives the fields, and a `POST` saves the changed fields. A save checks the new file with the checks of the start. Jarvis refuses a bad value with a message and does not change the file. The new values take effect at the next start of Jarvis. | Local |
+| Settings | The page has a settings form with a fixed list of fields of `jarvis.toml`, in groups, and no secret, address or path. `api/settings` gives the fields, and a `POST` saves the changed fields. A save checks the new file with the checks of the start. Jarvis refuses a bad value with a message and does not change the file. After a save, Jarvis keeps the old file as `jarvis.toml.bak` and exits with code 75 to start again with the new values. | Local |
 | Status entity | With `[mqtt]`, Jarvis publishes its status as the HA entity `sensor.jarvis_status` through MQTT discovery, with a retained state. The broker sets `offline` when Jarvis stops or dies, and the entity stays after an HA restart. | Local |
 
 Not built yet: habit learning, the Jarvis add-on, feedback, automatic training, learned intents, speaker identification and timers (phases 11 to 16 in [`docs/spec/00-overview.md`](docs/spec/00-overview.md)).
@@ -54,7 +54,7 @@ Steps:
 10. In Home Assistant, add the Wyoming Protocol integration with the host of Jarvis and port 10700.
 11. Create an Assist pipeline with Jarvis as the conversation agent, speech-to-text and text-to-speech. Turn off "Prefer handling commands locally". Select this pipeline on your satellites.
 
-To run Jarvis as a service, use a systemd unit with `WorkingDirectory` set to the repository folder, `EnvironmentFile` set to `jarvis.env` and `ExecStart=<folder>/jarvis serve jarvis.toml`.
+To run Jarvis as a service, use a systemd unit with `WorkingDirectory` set to the repository folder, `EnvironmentFile` set to `jarvis.env` and `ExecStart=<folder>/jarvis serve jarvis.toml` and `RestartForceExitStatus=75`, so that a save of the settings restarts Jarvis.
 
 ## Development
 

@@ -36,6 +36,7 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 use tokio::signal::unix;
 use tokio::signal::unix::SignalKind;
+use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -80,6 +81,7 @@ use crate::domain::state::Snapshot;
 use crate::domain::state_cache::StateCache;
 use crate::domain::training::Settings;
 use crate::domain::training::TrainingSet;
+use crate::ports::Activity;
 use crate::ports::Assistant;
 use crate::ports::Classifier;
 use crate::ports::Clock;
@@ -621,15 +623,96 @@ impl Clock for SystemClock {
     }
 }
 
-/// The `Control` of the root: the status channel and the configuration file that `run` got.
+/// Why [`run`] returned.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Ended {
+    /// A save of the settings: Jarvis starts again with the new file.
+    Restart,
+    /// A signal: Jarvis stops.
+    Stop,
+}
+
+/// The `Control` of the root: the status channel, the activity and the configuration file that
+/// `run` got.
 struct Controller {
     /// The configuration file.
     config: PathBuf,
-    /// The receiver of the status channel.
-    status: watch::Receiver<Status>,
-    /// Held for the whole read, edit, check and write of a save, so that a parallel save
-    /// cannot write over it.
-    saving: Mutex<()>,
+    /// The sender of the status channel.
+    status: watch::Sender<Status>,
+    /// What Jarvis does besides requests.
+    activity: Arc<Mutex<Activity>>,
+    /// Notified after a save.
+    restart: Notify,
+}
+
+impl Controller {
+    /// The control of `config`, with the status `online`.
+    fn new(config: PathBuf) -> Self {
+        Self {
+            status: watch::Sender::new(Status {
+                state: State::Online,
+                message: None,
+            }),
+            activity: Arc::new(Mutex::new(Activity::Idle)),
+            restart: Notify::new(),
+            config,
+        }
+    }
+
+    /// Changes the activity from `from` to `to` in one critical section. Gives whether the
+    /// activity was `from`.
+    fn change(&self, from: Activity, to: Activity) -> bool {
+        let Ok(mut activity) = self.activity.lock() else {
+            return false;
+        };
+        let changed = *activity == from;
+        if changed {
+            *activity = to;
+        }
+        changed
+    }
+
+    /// Writes the configuration file with `changes` after the checks of the start, and keeps
+    /// the old file as the backup.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read or written, or `edit` or `Config::parse` fails.
+    fn written(&self, changes: BTreeMap<String, Value>) -> Result<(), Refusal> {
+        let text = read(&self.config).map_err(invalid)?;
+        let new = adapters::settings::edit(&text, changes).map_err(Refusal::Invalid)?;
+        Config::parse(&new).map_err(invalid)?;
+        write_atomic(&adapters::settings::beside(&self.config, ".bak"), &text)
+            .and_then(|()| write_atomic(&self.config, &new))
+            .map_err(invalid)
+    }
+
+    /// Completes when `shutdown` completes or after a save.
+    async fn until_restart(&self, shutdown: impl Future<Output = ()>) {
+        tokio::select! {
+            () = shutdown => {}
+            () = self.restart.notified() => {}
+        }
+    }
+
+    /// `Restart` after a save, which keeps the status `restarting`. Else sets `Offline` and gives
+    /// `Stop`.
+    fn ended(&self) -> Ended {
+        if self.status.borrow().state == State::Restarting {
+            return Ended::Restart;
+        }
+        self.status.send_replace(Status {
+            state: State::Offline,
+            message: None,
+        });
+        Ended::Stop
+    }
+}
+
+/// The refusal of `error`, with its message.
+#[expect(clippy::needless_pass_by_value, reason = "the argument of `map_err`")]
+fn invalid(error: anyhow::Error) -> Refusal {
+    Refusal::Invalid(format!("{error:#}"))
 }
 
 impl Control for Controller {
@@ -642,16 +725,20 @@ impl Control for Controller {
     }
 
     fn save(&self, changes: BTreeMap<String, Value>) -> Result<(), Refusal> {
-        let invalid = |error: anyhow::Error| Refusal::Invalid(format!("{error:#}"));
-        let _saving = self
-            .saving
-            .lock()
-            .map_err(|_| Refusal::Invalid("an earlier save failed".to_owned()))?;
-        let text = read(&self.config).map_err(invalid)?;
-        let new = adapters::settings::edit(&text, changes).map_err(Refusal::Invalid)?;
-        // The checks of the start, before the write.
-        Config::parse(&new).map_err(invalid)?;
-        write_atomic(&self.config, &new).map_err(invalid)
+        if !self.change(Activity::Idle, Activity::Restarting) {
+            return Err(Refusal::Busy);
+        }
+        let written = self.written(changes);
+        if written.is_err() {
+            self.change(Activity::Restarting, Activity::Idle);
+        }
+        written?;
+        self.status.send_replace(Status {
+            state: State::Restarting,
+            message: None,
+        });
+        self.restart.notify_one();
+        Ok(())
     }
 }
 
@@ -840,14 +927,16 @@ enum Command {
 }
 
 impl Command {
-    /// Runs the command.
+    /// Runs the command. A command other than `serve` gives `Stop`.
     ///
     /// # Errors
     ///
     /// The command fails.
-    fn run(self) -> anyhow::Result<()> {
+    fn run(self) -> anyhow::Result<Ended> {
         match self {
-            Self::Dataset { config, out, house } => dataset(&config, &out, house.as_deref()),
+            Self::Dataset { config, out, house } => {
+                dataset(&config, &out, house.as_deref()).map(|()| Ended::Stop)
+            }
             Self::Serve { config } => serve(&config),
         }
     }
@@ -985,28 +1074,27 @@ pub struct Startup<Lookup, Connector, Shutdown> {
     pub shutdown: Shutdown,
 }
 
-/// Starts Jarvis with the configuration file `config` and the outside world `startup`: HA, the
+/// Starts Jarvis with the configuration file `file` and the outside world `startup`: HA, the
 /// sync, the System One model, the STT and TTS models, the pre-render and the Wyoming server.
-/// When `startup.shutdown` completes, stops the start, or stops accepting connections and waits
-/// up to [`SHUTDOWN_WAIT`] for the running connections, the work after their replies and the
-/// saves of the stores.
+/// When `startup.shutdown` completes or a save restarts Jarvis, stops the start, or stops
+/// accepting connections and waits up to [`SHUTDOWN_WAIT`] for the running connections, the
+/// work after their replies and the saves of the stores. Gives `Restart` after a save.
 ///
 /// # Errors
 ///
 /// A file cannot be read or is not valid, a secret is not set, a model cannot load, or the
 /// server cannot bind or accept.
 pub async fn run<Lookup, Connector, Transport, Stream>(
-    config: &Path,
+    file: &Path,
     startup: Startup<Lookup, Connector, impl Future<Output = ()>>,
-) -> anyhow::Result<()>
+) -> anyhow::Result<Ended>
 where
     Lookup: Fn(&str) -> Option<String>,
     Connector: Fn(&str, u16) -> Transport + Send + 'static,
     Transport: Future<Output = io::Result<Stream>> + Send + 'static,
     Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let file = config.to_owned();
-    let config = Config::load(config)?;
+    let config = Config::load(file)?;
     let secrets = Secrets::resolve(&config, startup.lookup)?;
     let catalog = load_catalog(&config.intents)?;
     let pools = load_pools(&config.responses, &catalog)?;
@@ -1015,14 +1103,15 @@ where
     // The models can load for a long time, so a shutdown stops the start too.
     let started = tokio::select! {
         started = start_live_app(&config, &secrets, catalog, pools, home) => started?,
-        () = &mut shutdown => return Ok(()),
+        () = &mut shutdown => return Ok(Ended::Stop),
     };
-    serve_until(file, &config, &secrets, started, shutdown).await
+    serve_until(file.to_owned(), &config, &secrets, started, shutdown).await
 }
 
 /// Serves the app of `started` on `listen`, its review, the status and the settings of `file` on
 /// `web.listen` with the web token of `secrets`, and the status entity on the broker of `mqtt`,
-/// until `shutdown` completes. Then sets `Offline`, closes the status and waits as [`drain`] does.
+/// until `shutdown` completes or a save restarts Jarvis. Then gives [`Controller::ended`], closes
+/// the status and waits as [`drain`] does.
 ///
 /// # Errors
 ///
@@ -1033,32 +1122,21 @@ async fn serve_until(
     secrets: &Secrets,
     started: Started,
     shutdown: impl Future<Output = ()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Ended> {
     let (app, (pools_task, habits, (writer, review)), _) = started;
     let (listener, tracker) = (TcpListener::bind(config.listen).await?, TaskTracker::new());
-    let (status, control) = watch::channel(Status {
-        state: State::Online,
-        message: None,
-    });
-    let web = serve_web(
-        &config.web,
-        &secrets.web_token,
-        review,
-        (file, control),
-        &tracker,
-    )
-    .await?;
+    let control = Arc::new(Controller::new(file));
+    let web = serve_web(&config.web, &secrets.web_token, review, &control, &tracker).await?;
     // After the bind, so a failed start leaves no `online` behind.
-    start_status_entity(config, secrets, &status, &tracker)?;
+    start_status_entity(config, secrets, &control.status, &tracker)?;
+    let shutdown = control.until_restart(shutdown);
     let served = adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await;
     drop(web);
-    status.send_replace(Status {
-        state: State::Offline,
-        message: None,
-    });
-    drop(status);
+    let ended = control.ended();
+    drop(control);
     served?;
-    drain(tracker, (pools_task, habits, writer)).await
+    drain(tracker, (pools_task, habits, writer)).await?;
+    Ok(ended)
 }
 
 /// Starts the status entity of `status` in a task of `tracker` with the `[mqtt]` of `config` and
@@ -1080,9 +1158,8 @@ fn start_status_entity(
     Ok(())
 }
 
-/// Serves `review`, and the settings of the configuration file and the status of the receiver of
-/// `control`, with `token` on `web.listen` in a task of `tracker` until the sender that it gives
-/// drops.
+/// Serves `review` and `control` with `token` on `web.listen` in a task of `tracker` until the
+/// sender that it gives drops.
 ///
 /// # Errors
 ///
@@ -1091,7 +1168,7 @@ async fn serve_web(
     web: &WebConfig,
     token: &str,
     review: Reviewer,
-    control: (PathBuf, watch::Receiver<Status>),
+    control: &Arc<Controller>,
     tracker: &TaskTracker,
 ) -> anyhow::Result<oneshot::Sender<()>> {
     let listener = TcpListener::bind(web.listen).await?;
@@ -1101,11 +1178,7 @@ async fn serve_web(
         token: token.to_owned(),
         page_size: web.page_size,
         clock: Arc::new(SystemClock),
-        control: Arc::new(Controller {
-            config: control.0,
-            status: control.1,
-            saving: Mutex::default(),
-        }),
+        control: Arc::clone(control) as _,
     };
     tracker.spawn(adapters::web::serve(listener, web, async {
         let _ = stopped.await;
@@ -1404,13 +1477,13 @@ fn start_prerender(
     })
 }
 
-/// Runs Jarvis with the configuration file `config`, the environment and TCP, until it fails
-/// or gets SIGINT or SIGTERM.
+/// Runs Jarvis with the configuration file `config`, the environment and TCP, until it fails,
+/// gets SIGINT or SIGTERM, or a save restarts it.
 ///
 /// # Errors
 ///
 /// A signal handler cannot be registered, or `run` fails.
-fn serve(config: &Path) -> anyhow::Result<()> {
+fn serve(config: &Path) -> anyhow::Result<Ended> {
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async {
         let mut interrupt = unix::signal(SignalKind::interrupt())?;
@@ -1472,8 +1545,14 @@ fn start(args: impl IntoIterator<Item = OsString>) -> ExitCode {
             };
         }
     };
-    match command.run() {
-        Ok(()) => ExitCode::SUCCESS,
+    exit_code(command.run())
+}
+
+/// The exit code of `ended`, the result of a command.
+fn exit_code(ended: anyhow::Result<Ended>) -> ExitCode {
+    match ended {
+        Ok(Ended::Restart) => ExitCode::from(adapters::settings::RESTART),
+        Ok(Ended::Stop) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error:#}");
             ExitCode::FAILURE
@@ -1492,6 +1571,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU16;
     use std::sync::atomic::Ordering;
+    use std::thread;
     use std::time::Duration;
     use std::time::Instant;
 
@@ -2600,7 +2680,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         tokio::select! {
             biased;
-            result = run(&config, startup) => result?,
+            result = run(&config, startup) => { result?; }
             result = stop_while_connected(address, stop) => {
                 anyhow::bail!("run did not return after 5 s: {result:?}");
             }
@@ -2657,7 +2737,7 @@ mod tests {
             },
         };
         tokio::select! {
-            result = run(&config, startup) => result?,
+            result = run(&config, startup) => { result?; }
             result = intents_then_stop(web, stop) => anyhow::bail!("run did not stop: {result:?}"),
         }
         let connected = TcpStream::connect(web).await;
@@ -2672,13 +2752,23 @@ mod tests {
     ) -> anyhow::Result<serde_json::Value> {
         let folder = tempfile::tempdir()?;
         let (config, _, web) = listening_config(folder.path())?;
+        status_of(&config, web, lookup).await
+    }
+
+    /// The status of `api/status` on `web` after the start of `run` with `config` and the
+    /// environment `lookup`.
+    async fn status_of(
+        config: &Path,
+        web: SocketAddr,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<serde_json::Value> {
         let startup = Startup {
             lookup,
             connector: no_ha(mpsc::unbounded_channel().0),
             shutdown: future::pending(),
         };
         tokio::select! {
-            result = run(&config, startup) => anyhow::bail!("run returned: {result:?}"),
+            result = run(config, startup) => anyhow::bail!("run returned: {result:?}"),
             response = get_when_listening(web, "status") => Ok(response.json().await?),
         }
     }
@@ -2737,7 +2827,7 @@ mod tests {
         };
         let mut client = MqttSubscriber::new(broker, "early", "jarvis/status")?;
         tokio::select! {
-            result = run(&config, startup) => result?,
+            result = run(&config, startup) => { result?; }
             result = online_then_stop(&mut client, stop) => anyhow::bail!("no stop: {result:?}"),
         }
         let mut late = MqttSubscriber::new(broker, "late", "jarvis/status")?;
@@ -2750,15 +2840,7 @@ mod tests {
     fn controller(folder: &Path) -> anyhow::Result<Controller> {
         let config = folder.join("jarvis.toml");
         fs::write(&config, VALID)?;
-        let status = watch::channel(Status {
-            state: State::Online,
-            message: None,
-        });
-        Ok(Controller {
-            config,
-            status: status.1,
-            saving: Mutex::default(),
-        })
+        Ok(Controller::new(config))
     }
 
     /// The changes that set `name` to `value`.
@@ -2805,6 +2887,88 @@ mod tests {
         let refused = control.save(change("ha.token_env", json!("OTHER")));
         assert!(matches!(refused, Err(Refusal::Invalid(_))), "{refused:?}");
         assert_eq!(fs::read_to_string(&control.config)?, VALID);
+        Ok(())
+    }
+
+    /// `run` of `config` with the value `token` of each variable, no HA and no shutdown.
+    async fn run_until_save(config: &Path) -> anyhow::Result<Ended> {
+        let startup = Startup {
+            lookup: |_: &str| Some("token".to_owned()),
+            connector: no_ha(mpsc::unbounded_channel().0),
+            shutdown: future::pending(),
+        };
+        run(config, startup).await
+    }
+
+    /// Saves `dialog.timeout_s = 20` with `POST api/settings` on the web server at `address`.
+    /// Ends only on an error.
+    async fn save_then_wait(address: SocketAddr) -> anyhow::Result<()> {
+        let url = format!("http://{address}/api/settings");
+        let request = reqwest::Client::new().post(url).bearer_auth("token");
+        let status = request
+            .json(&json!({ "dialog.timeout_s": 20 }))
+            .send()
+            .await?
+            .status();
+        anyhow::ensure!(status == 204, "the answer is {status}");
+        future::pending().await
+    }
+
+    /// AC-12.9f-1. The clock runs, because the MQTT client has timers and a real socket.
+    #[tokio::test]
+    async fn ac_12_9f_1_save_keeps_the_backup_and_restarts() -> anyhow::Result<()> {
+        let (folder, broker) = (tempfile::tempdir()?, fakes::mqtt_broker()?);
+        let config = mqtt_config(folder.path(), broker)?;
+        let (old, web) = (read(&config)?, Config::load(&config)?.web.listen);
+        let mut client = MqttSubscriber::new(broker, "early", "jarvis/status")?;
+        let saved = async {
+            client.next().await?;
+            save_then_wait(web).await
+        };
+        let ended = tokio::select! {
+            ended = run_until_save(&config) => ended?,
+            result = saved => anyhow::bail!("run did not restart: {result:?}"),
+        };
+        assert_eq!(ended, Ended::Restart);
+        assert_eq!(read(&adapters::settings::beside(&config, ".bak"))?, old);
+        assert!(read(&config)?.contains("timeout_s = 20"), "the new text");
+        assert_eq!(client.next().await?.payload["state"], "restarting");
+        Ok(())
+    }
+
+    /// AC-12.9f-2.
+    #[test]
+    fn ac_12_9f_2_restart_exits_with_75_and_stop_with_0() {
+        assert_eq!(exit_code(Ok(Ended::Restart)), ExitCode::from(75));
+        assert_eq!(exit_code(Ok(Ended::Stop)), ExitCode::SUCCESS);
+    }
+
+    /// The results of two saves of `control` on two threads at the same time.
+    fn saves_at_once(control: &Controller) -> [Result<(), Refusal>; 2] {
+        let save = |seconds: u64| control.save(change("dialog.timeout_s", json!(seconds)));
+        thread::scope(|scope| {
+            let other = scope.spawn(|| save(20));
+            [save(30), other.join().expect("the save does not panic")]
+        })
+    }
+
+    /// AC-12.9f-3.
+    #[test]
+    fn ac_12_9f_3_one_save_at_a_time() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let control = controller(folder.path())?;
+        let mut saved = saves_at_once(&control);
+        saved.sort_by_key(Result::is_err);
+        assert_eq!(saved, [Ok(()), Err(Refusal::Busy)]);
+        assert_eq!(
+            read(&adapters::settings::beside(&control.config, ".bak"))?,
+            VALID
+        );
+        let other = tempfile::tempdir()?;
+        let control = controller(other.path())?;
+        let refused = control.save(change("asr.early_commit_ms", json!(700)));
+        assert!(matches!(refused, Err(Refusal::Invalid(_))), "{refused:?}");
+        assert_eq!(control.save(change("dialog.timeout_s", json!(20))), Ok(()));
         Ok(())
     }
 

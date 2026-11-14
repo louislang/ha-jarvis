@@ -263,17 +263,18 @@ async fn settings(State(web): State<Arc<Web>>) -> Result<Json<Vec<Setting>>, Sta
     Ok(Json(settings))
 }
 
-/// Saves the changed fields of `changes`. Gives 400 with the message of a refusal.
+/// Saves the changed fields of `changes`. Gives 400 with the message of an invalid value, and
+/// 409 while another save runs.
 async fn save(
     State(web): State<Arc<Web>>,
     Json(changes): Json<BTreeMap<String, serde_json::Value>>,
 ) -> Response {
-    match web.control.save(changes) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(Refusal::Invalid(message)) => {
-            (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
-        }
-    }
+    let (status, message) = match web.control.save(changes) {
+        Ok(()) => return StatusCode::NO_CONTENT.into_response(),
+        Err(Refusal::Invalid(message)) => (StatusCode::BAD_REQUEST, message),
+        Err(Refusal::Busy) => (StatusCode::CONFLICT, "Jarvis is busy".to_owned()),
+    };
+    (status, Json(json!({ "error": message }))).into_response()
 }
 
 #[cfg(test)]
@@ -532,6 +533,17 @@ mod tests {
             post_settings(ONLINE).await?.status(),
             StatusCode::NO_CONTENT
         );
+        Ok(())
+    }
+
+    /// AC-12.9f-3.
+    #[tokio::test]
+    async fn ac_12_9f_3_busy_gives_409() -> anyhow::Result<()> {
+        let busy = FakeControl {
+            refusal: Some(Refusal::Busy),
+            ..ONLINE
+        };
+        assert_eq!(post_settings(busy).await?.status(), StatusCode::CONFLICT);
         Ok(())
     }
 
