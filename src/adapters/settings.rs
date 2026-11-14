@@ -10,6 +10,8 @@ use toml_edit::DocumentMut;
 use toml_edit::Item;
 use toml_edit::Value;
 
+use crate::ports::Setting;
+
 /// The form fields in their groups, in the order of the form. No secret, path or address is a
 /// field.
 pub const FIELDS: [(&str, &[&str]); 8] = [
@@ -42,17 +44,6 @@ pub const FIELDS: [(&str, &[&str]); 8] = [
     ("Habits", &["habits.half_life_days", "habits.min_score"]),
     ("Log", &["log.audio_days", "log.record_days"]),
 ];
-
-/// A form field with its value in `jarvis.toml`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Setting {
-    /// The group of the field in the form.
-    pub group: &'static str,
-    /// The dotted name, for example `asr.endpoint_ms`.
-    pub name: &'static str,
-    /// A JSON number, string or list of strings.
-    pub value: Json,
-}
 
 /// Each field of [`FIELDS`] with its value in `text`, in the order of [`FIELDS`].
 ///

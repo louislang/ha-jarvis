@@ -80,7 +80,9 @@ use crate::ports::Page;
 use crate::ports::Partial;
 use crate::ports::Plugin;
 use crate::ports::Reasoner;
+use crate::ports::Refusal;
 use crate::ports::Review;
+use crate::ports::Setting;
 use crate::ports::SpeechToText;
 use crate::ports::Status;
 use crate::ports::Step;
@@ -848,12 +850,25 @@ impl Review for FakeReview {
     }
 }
 
-/// A `Control` that gives a set status.
-pub struct FakeControl(pub Status);
+/// A `Control` that gives a set status, has no settings and gives a set answer to each save.
+pub struct FakeControl {
+    /// The status.
+    pub status: Status,
+    /// The refusal of each save, or `None` to accept it.
+    pub refusal: Option<Refusal>,
+}
 
 impl Control for FakeControl {
     fn status(&self) -> Status {
-        self.0.clone()
+        self.status.clone()
+    }
+
+    fn settings(&self) -> anyhow::Result<Vec<Setting>> {
+        Ok(Vec::new())
+    }
+
+    fn save(&self, _: BTreeMap<String, Value>) -> Result<(), Refusal> {
+        self.refusal.clone().map_or(Ok(()), Err)
     }
 }
 

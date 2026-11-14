@@ -1,6 +1,7 @@
-//! The web server of the Jarvis tab: the page, and the review and status API behind a bearer
-//! token.
+//! The web server of the Jarvis tab: the page, and the review, status and settings API behind a
+//! bearer token.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use hound::SampleFormat;
 use hound::WavSpec;
 use hound::WavWriter;
 use serde::Deserialize;
+use serde_json::json;
 use tokio::net::TcpListener;
 
 use crate::domain::feedback::Interaction;
@@ -34,7 +36,9 @@ use crate::ports::Clock;
 use crate::ports::Control;
 use crate::ports::Filter;
 use crate::ports::Page;
+use crate::ports::Refusal;
 use crate::ports::Review;
+use crate::ports::Setting;
 use crate::ports::Status;
 
 /// The page of the Jarvis tab.
@@ -50,7 +54,7 @@ pub struct Web {
     pub page_size: usize,
     /// The time of each mark.
     pub clock: Arc<dyn Clock>,
-    /// The status of Jarvis.
+    /// The status and the settings of Jarvis.
     pub control: Arc<dyn Control>,
 }
 
@@ -135,6 +139,7 @@ fn router(web: Web) -> Router {
         .route("/interactions/{id}/mark", routing::post(mark))
         .route("/intents", routing::get(intents))
         .route("/status", routing::get(status))
+        .route("/settings", routing::get(settings).post(save))
         .layer(middleware::from_fn_with_state(Arc::clone(&web), authorize));
     Router::new()
         .route("/", routing::get(Html(PAGE)))
@@ -252,10 +257,27 @@ async fn status(State(web): State<Arc<Web>>) -> Json<Status> {
     Json(web.control.status())
 }
 
+/// The fields of the settings form with their values.
+async fn settings(State(web): State<Arc<Web>>) -> Result<Json<Vec<Setting>>, StatusCode> {
+    let settings = web.control.settings().map_err(|error| failed(&error))?;
+    Ok(Json(settings))
+}
+
+/// Saves the changed fields of `changes`. Gives 400 with the message of a refusal.
+async fn save(
+    State(web): State<Arc<Web>>,
+    Json(changes): Json<BTreeMap<String, serde_json::Value>>,
+) -> Response {
+    match web.control.save(changes) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(Refusal::Invalid(message)) => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
     use crate::ports;
     use crate::testing::fakes::FakeClock;
@@ -293,14 +315,17 @@ mod tests {
         })
     }
 
-    /// The status of Jarvis after the start.
-    const ONLINE: Status = Status {
-        state: ports::State::Online,
-        message: None,
+    /// The control of Jarvis after the start, which accepts each save.
+    const ONLINE: FakeControl = FakeControl {
+        status: Status {
+            state: ports::State::Online,
+            message: None,
+        },
+        refusal: None,
     };
 
-    /// Serves `review` and `status` on a local port and gives the URL of `api/`.
-    async fn start(review: Arc<FakeReview>, status: Status) -> anyhow::Result<String> {
+    /// Serves `review` and `control` on a local port and gives the URL of `api/`.
+    async fn start(review: Arc<FakeReview>, control: FakeControl) -> anyhow::Result<String> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let url = format!("http://{}/api/", listener.local_addr()?);
         let web = Web {
@@ -308,7 +333,7 @@ mod tests {
             token: TOKEN.to_owned(),
             page_size: 50,
             clock: Arc::new(FakeClock(jiff::Timestamp::UNIX_EPOCH)),
-            control: Arc::new(FakeControl(status)),
+            control: Arc::new(control),
         };
         tokio::spawn(serve(listener, web, std::future::pending()));
         Ok(url)
@@ -449,9 +474,12 @@ mod tests {
     /// AC-12.9b-2.
     #[tokio::test]
     async fn ac_12_9b_2_status_gives_the_state_and_the_message() -> anyhow::Result<()> {
-        let training = Status {
-            state: ports::State::Training,
-            message: Some("run 7".to_owned()),
+        let training = FakeControl {
+            status: Status {
+                state: ports::State::Training,
+                message: Some("run 7".to_owned()),
+            },
+            refusal: None,
         };
         let url = format!("{}status", start(Arc::new(review()?), training).await?);
         let request = reqwest::Client::new().get(url).bearer_auth(TOKEN);
@@ -474,6 +502,53 @@ mod tests {
         let (section, _) = section.split_once("</section>").expect("#status ends");
         for element in [r#"class="state""#, r#"class="message""#] {
             assert!(section.contains(element), "#status has no {element}");
+        }
+        Ok(())
+    }
+
+    /// The answer of a server of `control` to `POST api/settings` with a change.
+    async fn post_settings(control: FakeControl) -> anyhow::Result<reqwest::Response> {
+        let url = format!("{}settings", start(Arc::new(review()?), control).await?);
+        let request = reqwest::Client::new().post(url).bearer_auth(TOKEN);
+        Ok(request
+            .json(&json!({ "asr.endpoint_ms": 700 }))
+            .send()
+            .await?)
+    }
+
+    /// AC-12.9e-4.
+    #[tokio::test]
+    async fn ac_12_9e_4_save_gives_400_with_the_refusal_or_204() -> anyhow::Result<()> {
+        let message = "asr.endpoint_ms is too long";
+        let refusing = FakeControl {
+            refusal: Some(Refusal::Invalid(message.to_owned())),
+            ..ONLINE
+        };
+        let refused = post_settings(refusing).await?;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = refused.json().await?;
+        assert_eq!(body, json!({ "error": message }));
+        assert_eq!(
+            post_settings(ONLINE).await?.status(),
+            StatusCode::NO_CONTENT
+        );
+        Ok(())
+    }
+
+    /// AC-12.9e-5.
+    #[tokio::test]
+    async fn ac_12_9e_5_page_has_the_settings_form() -> anyhow::Result<()> {
+        let api = start(Arc::new(review()?), ONLINE).await?;
+        let html = reqwest::get(api.trim_end_matches("api/"))
+            .await?
+            .text()
+            .await?;
+        for element in [
+            r#"<form id="settings""#,
+            r#"<button id="save""#,
+            r#"id="settings-error""#,
+        ] {
+            assert!(html.contains(element), "the page has no {element}");
         }
         Ok(())
     }

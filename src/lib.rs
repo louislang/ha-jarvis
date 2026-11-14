@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::pin;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -27,6 +28,8 @@ use jiff::Timestamp;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::Deserialize;
+use serde_json::Value;
+use tempfile::NamedTempFile;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
@@ -89,6 +92,8 @@ use crate::ports::Listening;
 use crate::ports::ModelLoader;
 use crate::ports::Plugin;
 use crate::ports::Reasoner;
+use crate::ports::Refusal;
+use crate::ports::Setting;
 use crate::ports::SpeechToText;
 use crate::ports::State;
 use crate::ports::Status;
@@ -616,10 +621,55 @@ impl Clock for SystemClock {
     }
 }
 
-impl Control for watch::Receiver<Status> {
+/// The `Control` of the root: the status channel and the configuration file that `run` got.
+struct Controller {
+    /// The configuration file.
+    config: PathBuf,
+    /// The receiver of the status channel.
+    status: watch::Receiver<Status>,
+    /// Held for the whole read, edit, check and write of a save, so that a parallel save
+    /// cannot write over it.
+    saving: Mutex<()>,
+}
+
+impl Control for Controller {
     fn status(&self) -> Status {
-        self.borrow().clone()
+        self.status.borrow().clone()
     }
+
+    fn settings(&self) -> anyhow::Result<Vec<Setting>> {
+        adapters::settings::read(&read(&self.config)?)
+    }
+
+    fn save(&self, changes: BTreeMap<String, Value>) -> Result<(), Refusal> {
+        let invalid = |error: anyhow::Error| Refusal::Invalid(format!("{error:#}"));
+        let _saving = self
+            .saving
+            .lock()
+            .map_err(|_| Refusal::Invalid("an earlier save failed".to_owned()))?;
+        let text = read(&self.config).map_err(invalid)?;
+        let new = adapters::settings::edit(&text, changes).map_err(Refusal::Invalid)?;
+        // The checks of the start, before the write.
+        Config::parse(&new).map_err(invalid)?;
+        write_atomic(&self.config, &new).map_err(invalid)
+    }
+}
+
+/// Writes `text` to the file at `path` with a rename, so that a reader gets the old or the new
+/// text.
+///
+/// # Errors
+///
+/// The write or the rename fails.
+fn write_atomic(path: &Path, text: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    // A rename is atomic only inside one file system, so the temporary file is in the folder of
+    // the target.
+    let mut file = NamedTempFile::new_in(path.parent().unwrap_or(Path::new("")))?;
+    file.write_all(text.as_bytes())?;
+    file.as_file().sync_all()?;
+    file.persist(path)?;
+    Ok(())
 }
 
 /// The `Assistant` of Jarvis. It delegates each request to its use case.
@@ -955,6 +1005,7 @@ where
     Transport: Future<Output = io::Result<Stream>> + Send + 'static,
     Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let file = config.to_owned();
     let config = Config::load(config)?;
     let secrets = Secrets::resolve(&config, startup.lookup)?;
     let catalog = load_catalog(&config.intents)?;
@@ -966,17 +1017,18 @@ where
         started = start_live_app(&config, &secrets, catalog, pools, home) => started?,
         () = &mut shutdown => return Ok(()),
     };
-    serve_until(&config, &secrets, started, shutdown).await
+    serve_until(file, &config, &secrets, started, shutdown).await
 }
 
-/// Serves the app of `started` on `listen`, its review and the status on `web.listen` with the
-/// web token of `secrets`, and the status entity on the broker of `mqtt`, until `shutdown`
-/// completes. Then sets `Offline`, closes the status and waits as [`drain`] does.
+/// Serves the app of `started` on `listen`, its review, the status and the settings of `file` on
+/// `web.listen` with the web token of `secrets`, and the status entity on the broker of `mqtt`,
+/// until `shutdown` completes. Then sets `Offline`, closes the status and waits as [`drain`] does.
 ///
 /// # Errors
 ///
 /// `mqtt.url` is not valid, a server cannot bind or accept, or a task of `started` panicked.
 async fn serve_until(
+    file: PathBuf,
     config: &Config,
     secrets: &Secrets,
     started: Started,
@@ -988,7 +1040,14 @@ async fn serve_until(
         state: State::Online,
         message: None,
     });
-    let web = serve_web(&config.web, &secrets.web_token, review, control, &tracker).await?;
+    let web = serve_web(
+        &config.web,
+        &secrets.web_token,
+        review,
+        (file, control),
+        &tracker,
+    )
+    .await?;
     // After the bind, so a failed start leaves no `online` behind.
     start_status_entity(config, secrets, &status, &tracker)?;
     let served = adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await;
@@ -1021,8 +1080,9 @@ fn start_status_entity(
     Ok(())
 }
 
-/// Serves `review` and the status of `control` with `token` on `web.listen` in a task of
-/// `tracker` until the sender that it gives drops.
+/// Serves `review`, and the settings of the configuration file and the status of the receiver of
+/// `control`, with `token` on `web.listen` in a task of `tracker` until the sender that it gives
+/// drops.
 ///
 /// # Errors
 ///
@@ -1031,7 +1091,7 @@ async fn serve_web(
     web: &WebConfig,
     token: &str,
     review: Reviewer,
-    control: watch::Receiver<Status>,
+    control: (PathBuf, watch::Receiver<Status>),
     tracker: &TaskTracker,
 ) -> anyhow::Result<oneshot::Sender<()>> {
     let listener = TcpListener::bind(web.listen).await?;
@@ -1041,7 +1101,11 @@ async fn serve_web(
         token: token.to_owned(),
         page_size: web.page_size,
         clock: Arc::new(SystemClock),
-        control: Arc::new(control),
+        control: Arc::new(Controller {
+            config: control.0,
+            status: control.1,
+            saving: Mutex::default(),
+        }),
     };
     tracker.spawn(adapters::web::serve(listener, web, async {
         let _ = stopped.await;
@@ -2679,6 +2743,68 @@ mod tests {
         let mut late = MqttSubscriber::new(broker, "late", "jarvis/status")?;
         let status = late.next().await?.payload;
         assert_eq!(status, json!({ "state": "offline", "message": null }));
+        Ok(())
+    }
+
+    /// A `Controller` of a copy of `jarvis.toml` in `folder`.
+    fn controller(folder: &Path) -> anyhow::Result<Controller> {
+        let config = folder.join("jarvis.toml");
+        fs::write(&config, VALID)?;
+        let status = watch::channel(Status {
+            state: State::Online,
+            message: None,
+        });
+        Ok(Controller {
+            config,
+            status: status.1,
+            saving: Mutex::default(),
+        })
+    }
+
+    /// The changes that set `name` to `value`.
+    fn change(name: &str, value: Value) -> BTreeMap<String, Value> {
+        BTreeMap::from([(name.to_owned(), value)])
+    }
+
+    /// AC-12.9e-1.
+    #[test]
+    fn ac_12_9e_1_save_writes_the_value_and_settings_reads_it() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let control = controller(folder.path())?;
+        assert_eq!(control.save(change("asr.endpoint_ms", json!(700))), Ok(()));
+        let text = fs::read_to_string(&control.config)?;
+        assert!(text.contains("endpoint_ms = 700"), "{text}");
+        let settings = control.settings()?;
+        let endpoint = settings
+            .iter()
+            .find(|setting| setting.name == "asr.endpoint_ms");
+        assert_eq!(endpoint.map(|setting| &setting.value), Some(&json!(700)));
+        Ok(())
+    }
+
+    /// AC-12.9e-2.
+    #[test]
+    fn ac_12_9e_2_save_refuses_what_parse_refuses_and_keeps_the_file() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let control = controller(folder.path())?;
+        let changes = change("asr.early_commit_ms", json!(700));
+        let edited =
+            adapters::settings::edit(VALID, changes.clone()).map_err(anyhow::Error::msg)?;
+        let error = Config::parse(&edited).expect_err("early_commit_ms after endpoint_ms");
+        let refused = control.save(changes);
+        assert_eq!(refused, Err(Refusal::Invalid(format!("{error:#}"))));
+        assert_eq!(fs::read_to_string(&control.config)?, VALID);
+        Ok(())
+    }
+
+    /// AC-12.9e-3.
+    #[test]
+    fn ac_12_9e_3_save_refuses_a_secret_and_keeps_the_file() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let control = controller(folder.path())?;
+        let refused = control.save(change("ha.token_env", json!("OTHER")));
+        assert!(matches!(refused, Err(Refusal::Invalid(_))), "{refused:?}");
+        assert_eq!(fs::read_to_string(&control.config)?, VALID);
         Ok(())
     }
 
