@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::pin;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -626,6 +627,9 @@ struct Controller {
     config: PathBuf,
     /// The receiver of the status channel.
     status: watch::Receiver<Status>,
+    /// Held for the whole read, edit, check and write of a save, so that a parallel save
+    /// cannot write over it.
+    saving: Mutex<()>,
 }
 
 impl Control for Controller {
@@ -639,6 +643,10 @@ impl Control for Controller {
 
     fn save(&self, changes: BTreeMap<String, Value>) -> Result<(), Refusal> {
         let invalid = |error: anyhow::Error| Refusal::Invalid(format!("{error:#}"));
+        let _saving = self
+            .saving
+            .lock()
+            .map_err(|_| Refusal::Invalid("an earlier save failed".to_owned()))?;
         let text = read(&self.config).map_err(invalid)?;
         let new = adapters::settings::edit(&text, changes).map_err(Refusal::Invalid)?;
         // The checks of the start, before the write.
@@ -1096,6 +1104,7 @@ async fn serve_web(
         control: Arc::new(Controller {
             config: control.0,
             status: control.1,
+            saving: Mutex::default(),
         }),
     };
     tracker.spawn(adapters::web::serve(listener, web, async {
@@ -2748,6 +2757,7 @@ mod tests {
         Ok(Controller {
             config,
             status: status.1,
+            saving: Mutex::default(),
         })
     }
 
