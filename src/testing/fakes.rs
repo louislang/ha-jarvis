@@ -735,11 +735,12 @@ impl FakeLog {
     }
 }
 
-/// True when `interaction` has a bad mark on a target that `on` keeps.
-fn has_bad(interaction: &Interaction, on: impl Fn(feedback::Target) -> bool) -> bool {
+/// True when `interaction` has a bad mark.
+fn has_bad(interaction: &Interaction) -> bool {
     let marks = &interaction.marks;
-    let bad = |mark: &Mark| matches!(mark.value, Some(feedback::Value::Bad)) && on(mark.target);
-    marks.iter().any(bad)
+    marks
+        .iter()
+        .any(|mark| matches!(mark.value, Some(feedback::Value::Bad)))
 }
 
 #[async_trait]
@@ -760,7 +761,7 @@ impl InteractionLog for FakeLog {
     async fn list(&self, filter: Filter, page: Page) -> anyhow::Result<Vec<Interaction>> {
         let mut interactions = self.kept(|interaction| match filter {
             Filter::All => true,
-            Filter::Bad => has_bad(interaction, |_| true),
+            Filter::Bad => has_bad(interaction),
         });
         interactions.reverse();
         let skipped = interactions.into_iter().skip(page.number * page.size);
@@ -777,9 +778,7 @@ impl InteractionLog for FakeLog {
 
     async fn mark(&self, mark: Mark) -> anyhow::Result<()> {
         self.change(mark.interaction, |interaction| {
-            interaction
-                .marks
-                .retain(|other| other.target != mark.target);
+            interaction.marks.clear();
             if mark.value.is_some() {
                 interaction.marks.push(mark);
             }
@@ -796,7 +795,7 @@ impl InteractionLog for FakeLog {
             interaction.time > since
                 && interaction.decision == Route::Llm
                 && interaction.link.is_none()
-                && !has_bad(interaction, |target| target == feedback::Target::Action)
+                && !has_bad(interaction)
         });
         let deferred = found.into_iter().map(|interaction| Deferred {
             id: interaction.id,

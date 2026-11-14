@@ -38,9 +38,9 @@ const ADD: &str = "INSERT INTO marks (interaction, mark) VALUES (?1, ?2)";
 const BAD: &str =
     "id IN (SELECT interaction FROM marks WHERE json_extract(mark, '$.value') = 'Bad')";
 
-/// The System Two requests after `?1` without a bad action mark, oldest first.
+/// The System Two requests after `?1` without a bad mark, oldest first.
 const DEFERRED: &str = "WHERE time > ?1 AND json_extract(record, '$.decision') = 'Llm' AND json_extract(record, '$.link') IS NULL \
-    AND id NOT IN (SELECT interaction FROM marks WHERE json_extract(mark, '$.target') = 'Action' AND json_extract(mark, '$.value') = 'Bad') \
+    AND id NOT IN (SELECT interaction FROM marks WHERE json_extract(mark, '$.value') = 'Bad') \
     ORDER BY time, id";
 
 /// Deletes the unmarked records older than `?2` days before `?1` that no marked record links to.
@@ -226,8 +226,7 @@ impl InteractionLog for SqliteLog {
         let record = serde_json::to_string(&mark)?;
         self.run(move |connection| {
             let transaction = connection.unchecked_transaction()?;
-            let remove = "DELETE FROM marks WHERE interaction = ?1 AND json_extract(mark, '$.target') = json_extract(?2, '$.target')";
-            transaction.execute(remove, params![id, record])?;
+            transaction.execute("DELETE FROM marks WHERE interaction = ?1", params![id])?;
             if kept {
                 transaction.execute(ADD, params![id, record])?;
             }
@@ -281,7 +280,6 @@ mod tests {
     use crate::domain::feedback::Route;
     use crate::domain::feedback::Spoken;
     use crate::domain::feedback::Tagged;
-    use crate::domain::feedback::Target;
     use crate::domain::feedback::Value;
     use crate::domain::state::ServiceCall;
 
@@ -313,11 +311,10 @@ mod tests {
         Timestamp::from_second(day * 86_400).expect("a valid day")
     }
 
-    /// The mark `value` on `target` of the interaction `id`, with the correction `tv_show`.
-    fn mark(id: u64, target: Target, value: Option<Value>) -> Mark {
+    /// The mark `value` on the interaction `id`, with the correction `tv_show`.
+    fn mark(id: u64, value: Option<Value>) -> Mark {
         Mark {
             interaction: id,
-            target,
             value,
             correction: Some("tv_show".to_owned()),
             time: day(1),
@@ -471,9 +468,7 @@ mod tests {
     async fn append_keeps_the_marks() -> anyhow::Result<()> {
         let (log, _folder) = log();
         let mut marked = interaction(7);
-        marked
-            .marks
-            .push(mark(7, Target::Action, Some(Value::Good)));
+        marked.marks.push(mark(7, Some(Value::Good)));
         log.append(marked.clone(), None).await?;
         assert_eq!(log.get(7).await?, Some(marked));
         Ok(())
@@ -485,7 +480,7 @@ mod tests {
         let (log, _folder) = log();
         log.append(interaction(7), None).await?;
         log.append(interaction(8), None).await?;
-        let bad = mark(7, Target::Action, Some(Value::Bad));
+        let bad = mark(7, Some(Value::Bad));
         log.mark(bad.clone()).await?;
         let mut expected = interaction(7);
         expected.marks.push(bad);
@@ -501,11 +496,11 @@ mod tests {
             log.append(interaction(id), None).await?;
         }
         let marks = [
-            mark(1, Target::Action, Some(Value::Good)),
-            mark(2, Target::Response(0), Some(Value::Bad)),
-            mark(4, Target::Action, Some(Value::Bad)),
-            mark(4, Target::Action, None),
-            mark(5, Target::Action, Some(Value::Bad)),
+            mark(1, Some(Value::Good)),
+            mark(2, Some(Value::Bad)),
+            mark(4, Some(Value::Bad)),
+            mark(4, None),
+            mark(5, Some(Value::Bad)),
         ];
         for marked in marks {
             log.mark(marked).await?;
@@ -579,9 +574,7 @@ mod tests {
         for each in requests() {
             log.append(each, None).await?;
         }
-        log.mark(mark(10, Target::Action, Some(Value::Bad))).await?;
-        log.mark(mark(11, Target::Response(0), Some(Value::Bad)))
-            .await?;
+        log.mark(mark(10, Some(Value::Bad))).await?;
         let deferred = log.deferred(Timestamp::from_second(5)?).await?;
         let found: Vec<(u64, bool)> = deferred.iter().map(|each| (each.id, each.spoken)).collect();
         assert_eq!(found, [(6, true), (7, false), (11, true)]);
@@ -623,8 +616,7 @@ mod tests {
     #[tokio::test]
     async fn ac_12_5b_3_prune_keeps_marked_records() -> anyhow::Result<()> {
         let (log, _folder) = aged(&[(1, 1), (2, 2)]).await?;
-        log.mark(mark(1, Target::Response(0), Some(Value::Good)))
-            .await?;
+        log.mark(mark(1, Some(Value::Good))).await?;
         log.prune(day(1000)).await?;
         assert_eq!(ids(&log.list(Filter::All, PAGE).await?), [1]);
         Ok(())
@@ -640,7 +632,7 @@ mod tests {
             ..interaction(2)
         };
         log.append(answer, None).await?;
-        log.mark(mark(2, Target::Action, Some(Value::Bad))).await?;
+        log.mark(mark(2, Some(Value::Bad))).await?;
         log.prune(day(1000)).await?;
         assert_eq!(ids(&log.list(Filter::All, PAGE).await?), [2, 1]);
         Ok(())

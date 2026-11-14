@@ -29,7 +29,6 @@ use tokio::net::TcpListener;
 
 use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
-use crate::domain::feedback::Target;
 use crate::domain::feedback::Value;
 use crate::domain::speech::Audio;
 use crate::ports::Clock;
@@ -80,16 +79,6 @@ struct ListQuery {
     page: usize,
 }
 
-/// The `target` values of a mark.
-#[derive(Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Part {
-    /// The action.
-    Action,
-    /// The response at `index`.
-    Response,
-}
-
 /// The `value` values of a mark.
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -103,10 +92,6 @@ enum Rating {
 /// The body of `POST api/interactions/{id}/mark`.
 #[derive(Deserialize)]
 struct MarkBody {
-    /// The rated part.
-    target: Part,
-    /// The position of the rated response in the interaction.
-    index: Option<usize>,
     /// The rating, or `None` to remove the earlier mark.
     value: Option<Rating>,
     /// The intent that Jarvis should have selected.
@@ -215,25 +200,19 @@ fn wav(audio: &Audio) -> anyhow::Result<Vec<u8>> {
     Ok(bytes.into_inner())
 }
 
-/// Marks the interaction `id` with `body` at the time of the clock. Gives 400 for a response
-/// without `index` and for an error of `Review::mark`.
+/// Marks the action of the interaction `id` with `body` at the time of the clock. Gives 400 for
+/// an error of `Review::mark`.
 async fn mark(
     State(web): State<Arc<Web>>,
     Path(id): Path<u64>,
     Json(body): Json<MarkBody>,
 ) -> StatusCode {
-    let target = match (body.target, body.index) {
-        (Part::Action, _) => Target::Action,
-        (Part::Response, Some(index)) => Target::Response(index),
-        (Part::Response, None) => return StatusCode::BAD_REQUEST,
-    };
     let value = body.value.map(|rating| match rating {
         Rating::Good => Value::Good,
         Rating::Bad => Value::Bad,
     });
     let mark = Mark {
         interaction: id,
-        target,
         value,
         correction: body.correction,
         time: web.clock.now(),
@@ -422,29 +401,25 @@ mod tests {
     /// AC-12.8-5.
     #[tokio::test]
     async fn ac_12_8_5_unknown_correction_gives_400() -> anyhow::Result<()> {
-        let body = json!({ "target": "action", "value": "bad", "correction": "tv_onn" });
+        let body = json!({ "value": "bad", "correction": "tv_onn" });
         let (status, marks) = post_mark(review()?, body).await?;
         assert_eq!((status, marks), (StatusCode::BAD_REQUEST, Vec::new()));
         Ok(())
     }
 
-    /// AC-12.8-6.
+    /// AC-12.8-5. A known correction reaches the review as a mark on the action.
     #[tokio::test]
-    async fn ac_12_8_6_response_mark_needs_its_index() -> anyhow::Result<()> {
-        let body = json!({ "target": "response", "index": 2, "value": "bad", "correction": null });
+    async fn ac_12_8_5_known_correction_reaches_the_review() -> anyhow::Result<()> {
+        let body = json!({ "value": "bad", "correction": "tv_on" });
         let (status, marks) = post_mark(review()?, body).await?;
         let expected = Mark {
             interaction: 1,
-            target: Target::Response(2),
             value: Some(Value::Bad),
-            correction: None,
+            correction: Some("tv_on".to_owned()),
             time: jiff::Timestamp::UNIX_EPOCH,
         };
         assert!(status.is_success(), "{status}");
         assert_eq!(marks, vec![expected]);
-        let body = json!({ "target": "response", "value": "bad" });
-        let (status, marks) = post_mark(review()?, body).await?;
-        assert_eq!((status, marks), (StatusCode::BAD_REQUEST, Vec::new()));
         Ok(())
     }
 

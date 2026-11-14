@@ -7,15 +7,6 @@ use vstd::prelude::*;
 
 use crate::domain::state::ServiceCall;
 
-/// The part of an interaction that a mark rates.
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
-pub enum Target {
-    /// The action: the intent and its targets.
-    Action,
-    /// The response at this position in the interaction: filler, reply, announce or question.
-    Response(usize),
-}
-
 /// A rating.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub enum Value {
@@ -25,14 +16,12 @@ pub enum Value {
     Bad,
 }
 
-/// A rating of one part of one interaction.
+/// A rating of the action of one interaction.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Mark {
     /// The ID of the interaction.
     pub interaction: u64,
-    /// The rated part.
-    pub target: Target,
-    /// The rating. `None` removes the earlier mark of the interaction and target.
+    /// The rating. `None` removes the earlier mark of the interaction.
     pub value: Option<Value>,
     /// The intent that Jarvis should have selected, or `unknown` for System Two.
     pub correction: Option<String>,
@@ -118,7 +107,7 @@ pub struct Interaction {
     pub latency_ms: Option<u64>,
     /// The ID of the first interaction of the dialog, for a dialog answer.
     pub link: Option<u64>,
-    /// The marks, at most one for each target.
+    /// The marks, at most one.
     pub marks: Vec<Mark>,
 }
 
