@@ -2160,3 +2160,152 @@ fn ac_9_3_1_models_writes_fp32_tts_files() {
     assert_fetched("vector_estimator_sums");
     assert_fetched("vocoder_sums");
 }
+
+/// `repository.yaml` names the add-on repository and gives its URL.
+#[test]
+fn ac_12_9g_1_repository_names_addon_repository() {
+    let repository = yaml("repository.yaml");
+    assert!(repository["name"].is_string(), "a name: {repository:?}");
+    assert_eq!(
+        repository["url"].as_str(),
+        Some("https://github.com/louislang/ha-jarvis")
+    );
+}
+
+/// `addon/config.yaml` configures ingress, the panel, the architectures, the version and the options.
+#[test]
+fn ac_12_9g_2_config_has_ingress_and_options() {
+    let config = yaml("addon/config.yaml");
+    let expected: serde_yaml::Value = serde_yaml::from_str(
+        "{slug: jarvis, ingress: true, ingress_port: 8099, init: false, arch: [amd64, aarch64], schema: {url: url, token: password}}",
+    )
+    .expect("the expected fields are YAML");
+    let expected = expected.as_mapping().expect("a mapping");
+    for (key, value) in expected {
+        assert_eq!(&config[key], value, "{key:?} in {config:?}");
+    }
+    for key in ["panel_title", "panel_icon"] {
+        assert!(config[key].is_string(), "{key} in {config:?}");
+    }
+    let version = config["version"].as_str().expect("a version");
+    let parts: Vec<&str> = version.split('.').collect();
+    assert!(
+        parts.len() == 3 && parts.iter().all(|part| part.parse::<u32>().is_ok()),
+        "the version {version} is x.y.z"
+    );
+    let options = config["options"].as_mapping().expect("options");
+    for key in ["url", "token"] {
+        assert!(options.contains_key(key), "the option {key} in {options:?}");
+    }
+}
+
+/// `addon/build.yaml` names a fixed HA base image for each architecture.
+#[test]
+fn ac_12_9g_3_build_has_fixed_base_images() {
+    let build = yaml("addon/build.yaml");
+    for arch in ["amd64", "aarch64"] {
+        let image = build["build_from"][arch].as_str().expect("a base image");
+        let tag = image
+            .strip_prefix(&format!("ghcr.io/home-assistant/{arch}-base:"))
+            .expect("the HA base image of the architecture");
+        assert!(
+            tag.starts_with(|first: char| first.is_ascii_digit()),
+            "the tag of {image} is a version"
+        );
+    }
+}
+
+/// `addon/nginx.conf` listens on the ingress port, accepts only the ingress gateway and proxies with the token.
+#[test]
+fn ac_12_9g_4_nginx_proxies_ingress_with_token() {
+    let nginx = read("addon/nginx.conf");
+    let port = yaml("addon/config.yaml")["ingress_port"]
+        .as_u64()
+        .expect("an ingress port");
+    for line in [
+        format!("listen {port};"),
+        "proxy_pass @URL@;".to_owned(),
+        "proxy_set_header Authorization \"Bearer @TOKEN@\";".to_owned(),
+        "error_page 502 503 504 /down.html;".to_owned(),
+    ] {
+        assert!(nginx.contains(&line), "{line} in {nginx}");
+    }
+    let allow = nginx.find("allow 172.30.32.2;").expect("allow the gateway");
+    let deny = nginx.find("deny all;").expect("deny the rest");
+    assert!(allow < deny, "allow before deny: {nginx}");
+}
+
+/// The source and destination of each `COPY` line of `addon/Dockerfile`.
+fn copies(dockerfile: &str) -> Vec<(&str, &str)> {
+    dockerfile
+        .lines()
+        .filter_map(|line| line.strip_prefix("COPY "))
+        .filter_map(|line| line.split_once(' '))
+        .collect()
+}
+
+/// `addon/run.sh` fills in the options and starts nginx, and `addon/Dockerfile` puts the files where they are read.
+#[test]
+fn ac_12_9g_5_run_script_and_dockerfile_match() {
+    let script = read("addon/run.sh");
+    let lines: Vec<&str> = script.lines().collect();
+    assert!(lines.len() <= 10, "at most 10 lines: {script}");
+    for part in [
+        "bashio::config 'url'",
+        "bashio::config 'token'",
+        "@URL@",
+        "@TOKEN@",
+    ] {
+        assert!(script.contains(part), "{part} in {script}");
+    }
+    let last = lines.last().expect("the script has lines");
+    assert!(
+        last.starts_with("exec nginx"),
+        "ends with exec nginx: {script}"
+    );
+    let dockerfile = read("addon/Dockerfile");
+    let copies = copies(&dockerfile);
+    let nginx = read("addon/nginx.conf");
+    for (source, destination) in [
+        ("nginx.conf", "/etc/nginx/nginx.conf"),
+        ("down.html", "/www/down.html"),
+        ("run.sh", "/run.sh"),
+    ] {
+        assert!(
+            copies.contains(&(source, destination)),
+            "{source} to {destination}: {copies:?}"
+        );
+    }
+    assert!(
+        script.contains("/etc/nginx/nginx.conf"),
+        "run.sh edits the copied configuration: {script}"
+    );
+    assert!(
+        nginx.contains("root /www;"),
+        "nginx.conf serves the copied down page: {nginx}"
+    );
+    assert!(
+        dockerfile.contains("CMD [\"/run.sh\"]"),
+        "the image runs the copied script: {dockerfile}"
+    );
+}
+
+/// `addon/down.html` is a static page that refreshes itself and loads nothing else.
+#[test]
+fn ac_12_9g_6_down_page_is_static() {
+    let page = read("addon/down.html");
+    for part in ["Jarvis is down", "<meta http-equiv=\"refresh\""] {
+        assert!(page.contains(part), "{part} in {page}");
+    }
+    assert!(!page.contains("<script"), "no script: {page}");
+    let values: Vec<&str> = page.split("=\"").skip(1).collect();
+    let absolute: Vec<&&str> = values
+        .iter()
+        .filter(|value| {
+            ["/", "http:", "https:"]
+                .iter()
+                .any(|start| value.starts_with(start))
+        })
+        .collect();
+    assert!(absolute.is_empty(), "no absolute URL: {absolute:?}");
+}
