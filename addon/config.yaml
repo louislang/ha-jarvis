@@ -1,0 +1,18 @@
+name: Jarvis
+version: 0.1.0
+slug: jarvis
+description: The Jarvis tab with the interactions, the status and the settings of Jarvis.
+arch:
+  - amd64
+  - aarch64
+init: false
+ingress: true
+ingress_port: 8099
+panel_title: Jarvis
+panel_icon: mdi:robot
+options:
+  url: http://192.168.1.65:10701
+  token: null
+schema:
+  url: url
+  token: password
