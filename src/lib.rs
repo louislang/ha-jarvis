@@ -10,13 +10,16 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
+use std::panic;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin;
+use std::process;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -646,12 +649,13 @@ struct Controller {
 }
 
 impl Controller {
-    /// The control of `config`, with the status `online`.
+    /// The control of `config`, with the status `online` and the message of the last rollback.
     fn new(config: PathBuf) -> Self {
+        let message = adapters::settings::rolled_back(&config);
         Self {
             status: watch::Sender::new(Status {
                 state: State::Online,
-                message: None,
+                message,
             }),
             activity: Arc::new(Mutex::new(Activity::Idle)),
             restart: Notify::new(),
@@ -672,8 +676,8 @@ impl Controller {
         changed
     }
 
-    /// Writes the configuration file with `changes` after the checks of the start, and keeps
-    /// the old file as the backup.
+    /// Writes the configuration file with `changes` after the checks of the start, keeps the
+    /// old file as the backup and removes the reason of an earlier rollback.
     ///
     /// # Errors
     ///
@@ -684,6 +688,7 @@ impl Controller {
         Config::parse(&new).map_err(invalid)?;
         write_atomic(&adapters::settings::beside(&self.config, ".bak"), &text)
             .and_then(|()| write_atomic(&self.config, &new))
+            .and_then(|()| adapters::settings::clear_rollback(&self.config))
             .map_err(invalid)
     }
 
@@ -937,7 +942,7 @@ impl Command {
             Self::Dataset { config, out, house } => {
                 dataset(&config, &out, house.as_deref()).map(|()| Ended::Stop)
             }
-            Self::Serve { config } => serve(&config),
+            Self::Serve { config } => trial(&config, serve(&config)),
         }
     }
 }
@@ -1074,7 +1079,7 @@ pub struct Startup<Lookup, Connector, Shutdown> {
     pub shutdown: Shutdown,
 }
 
-/// Starts Jarvis with the configuration file `file` and the outside world `startup`: HA, the
+/// Starts Jarvis with the configuration file `file` of [`begin`] and the outside world `startup`: HA, the
 /// sync, the System One model, the STT and TTS models, the pre-render and the Wyoming server.
 /// When `startup.shutdown` completes or a save restarts Jarvis, stops the start, or stops
 /// accepting connections and waits up to [`SHUTDOWN_WAIT`] for the running connections, the
@@ -1094,7 +1099,7 @@ where
     Transport: Future<Output = io::Result<Stream>> + Send + 'static,
     Stream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let config = Config::load(file)?;
+    let config = begin(file)?;
     let secrets = Secrets::resolve(&config, startup.lookup)?;
     let catalog = load_catalog(&config.intents)?;
     let pools = load_pools(&config.responses, &catalog)?;
@@ -1106,6 +1111,17 @@ where
         () = &mut shutdown => return Ok(Ended::Stop),
     };
     serve_until(file.to_owned(), &config, &secrets, started, shutdown).await
+}
+
+/// Rolls back or marks the trial start with `adapters::settings::begin`, then loads the
+/// configuration file `config`.
+///
+/// # Errors
+///
+/// A file of the trial start cannot change, or [`Config::load`] fails.
+fn begin(config: &Path) -> anyhow::Result<Config> {
+    adapters::settings::begin(config)?;
+    Config::load(config)
 }
 
 /// Serves the app of `started` on `listen`, its review, the status and the settings of `file` on
@@ -1159,11 +1175,12 @@ fn start_status_entity(
 }
 
 /// Serves `review` and `control` with `token` on `web.listen` in a task of `tracker` until the
-/// sender that it gives drops.
+/// sender that it gives drops. The Wyoming listener binds before, so after the bind the start is
+/// ready, and `adapters::settings::confirm` ends a trial start before the first connection.
 ///
 /// # Errors
 ///
-/// The server cannot bind.
+/// The server cannot bind, or the trial start cannot end.
 async fn serve_web(
     web: &WebConfig,
     token: &str,
@@ -1172,6 +1189,7 @@ async fn serve_web(
     tracker: &TaskTracker,
 ) -> anyhow::Result<oneshot::Sender<()>> {
     let listener = TcpListener::bind(web.listen).await?;
+    adapters::settings::confirm(&control.config)?;
     let (stop, stopped) = oneshot::channel();
     let web = adapters::web::Web {
         review: Arc::new(review),
@@ -1477,13 +1495,28 @@ fn start_prerender(
     })
 }
 
+/// Sets a panic hook that, after the default hook, exits with `adapters::settings::panic_code`
+/// of `config` when the main thread panics.
+fn exit_on_panic(config: &Path) {
+    let (file, default) = (config.to_owned(), panic::take_hook());
+    panic::set_hook(Box::new(move |info| {
+        default(info);
+        // A panic of a `tokio` task is an error of `run`.
+        if thread::current().name() == Some("main") {
+            process::exit(adapters::settings::panic_code(&file));
+        }
+    }));
+}
+
 /// Runs Jarvis with the configuration file `config`, the environment and TCP, until it fails,
-/// gets SIGINT or SIGTERM, or a save restarts it.
+/// gets SIGINT or SIGTERM, or a save restarts it. A panic of the main thread exits as
+/// [`exit_on_panic`] says.
 ///
 /// # Errors
 ///
 /// A signal handler cannot be registered, or `run` fails.
 fn serve(config: &Path) -> anyhow::Result<Ended> {
+    exit_on_panic(config);
     let runtime = tokio::runtime::Runtime::new()?;
     let result = runtime.block_on(async {
         let mut interrupt = unix::signal(SignalKind::interrupt())?;
@@ -1548,6 +1581,18 @@ fn start(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     exit_code(command.run())
 }
 
+/// `served`, the result of `serve` with the configuration file `config`, or `Restart` after an
+/// error of the trial start, which goes to `<config>.trying`.
+fn trial(config: &Path, served: anyhow::Result<Ended>) -> anyhow::Result<Ended> {
+    match served {
+        Err(error) if adapters::settings::failed_trial(config, &format!("{error:#}")) => {
+            eprintln!("{error:#}");
+            Ok(Ended::Restart)
+        }
+        served => served,
+    }
+}
+
 /// The exit code of `ended`, the result of a command.
 fn exit_code(ended: anyhow::Result<Ended>) -> ExitCode {
     match ended {
@@ -1571,7 +1616,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU16;
     use std::sync::atomic::Ordering;
-    use std::thread;
     use std::time::Duration;
     use std::time::Instant;
 
@@ -2969,6 +3013,104 @@ mod tests {
         let refused = control.save(change("asr.early_commit_ms", json!(700)));
         assert!(matches!(refused, Err(Refusal::Invalid(_))), "{refused:?}");
         assert_eq!(control.save(change("dialog.timeout_s", json!(20))), Ok(()));
+        Ok(())
+    }
+
+    /// Whether `begin` makes the marker of the trial start for a configuration with a backup.
+    fn begin_marks() -> anyhow::Result<bool> {
+        let folder = tempfile::tempdir()?;
+        let config = config_in(folder.path(), VALID)?;
+        fs::write(adapters::settings::beside(&config, ".bak"), VALID)?;
+        adapters::settings::begin(&config)?;
+        Ok(adapters::settings::beside(&config, ".trying").exists())
+    }
+
+    /// AC-12.9i-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_9i_1_ready_start_ends_the_trial_start() -> anyhow::Result<()> {
+        assert!(begin_marks()?, "begin marks the trial start");
+        let folder = tempfile::tempdir()?;
+        let (config, _, web) = listening_config(folder.path())?;
+        fs::write(adapters::settings::beside(&config, ".bak"), VALID)?;
+        status_of(&config, web, |_: &str| Some("token".to_owned())).await?;
+        let left =
+            [".bak", ".trying"].map(|suffix| adapters::settings::beside(&config, suffix).exists());
+        assert_eq!(left, [false, false], "the backup and the marker are gone");
+        Ok(())
+    }
+
+    /// AC-12.9i-2.
+    #[test]
+    fn ac_12_9i_2_error_of_the_trial_start_is_kept_and_restarts() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let config = config_in(folder.path(), VALID)?;
+        let trying = adapters::settings::beside(&config, ".trying");
+        fs::write(&trying, "")?;
+        let code = exit_code(trial(&config, Err(anyhow::anyhow!("no model"))));
+        assert_eq!(
+            (code, read(&trying)?),
+            (ExitCode::from(75), "no model".to_owned())
+        );
+        assert_eq!(adapters::settings::panic_code(&config), 75);
+        Ok(())
+    }
+
+    /// AC-12.9i-4. A missing secret fails each start.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_9i_4_failed_start_after_the_rollback_ends_the_restarts() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let control = controller(folder.path())?;
+        assert_eq!(control.save(change("dialog.timeout_s", json!(20))), Ok(()));
+        let config = &control.config;
+        let mut codes = vec![exit_code(Ok(Ended::Restart))];
+        for _ in 0..2 {
+            let startup = Startup {
+                lookup: |_: &str| None,
+                connector: no_ha(mpsc::unbounded_channel().0),
+                shutdown: future::pending(),
+            };
+            codes.push(exit_code(trial(config, run(config, startup).await)));
+        }
+        assert_eq!(codes, [75, 75, 1].map(ExitCode::from));
+        assert_eq!(read(config)?, VALID);
+        assert_eq!(adapters::settings::panic_code(config), 101);
+        Ok(())
+    }
+
+    /// AC-12.9i-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_9i_5_rollback_message_stays_until_the_next_save() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let (config, _, web) = listening_config(folder.path())?;
+        let rollback = adapters::settings::beside(&config, ".rollback");
+        fs::write(&rollback, "bind failed")?;
+        let status = status_of(&config, web, |_: &str| Some("token".to_owned())).await?;
+        assert_eq!(status["message"], "settings rolled back: bind failed");
+        let saved = Controller::new(config).save(change("dialog.timeout_s", json!(20)));
+        assert_eq!(saved, Ok(()));
+        assert!(!rollback.exists(), "the save removes the reason");
+        Ok(())
+    }
+
+    /// AC-12.9i-6.
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_9i_6_bind_error_of_the_trial_start_rolls_back() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let (config, _, web) = listening_config(folder.path())?;
+        let backup = adapters::settings::beside(&config, ".bak");
+        fs::write(&backup, "old")?;
+        let _taken = std::net::TcpListener::bind(web)?;
+        let error = run_until_save(&config).await.err().context("run started")?;
+        let error = format!("{error:#}");
+        let code = exit_code(trial(&config, Err(anyhow::anyhow!(error.clone()))));
+        assert_eq!(code, ExitCode::from(75));
+        assert_eq!(
+            read(&adapters::settings::beside(&config, ".trying"))?,
+            error
+        );
+        assert!(error.contains("in use") && backup.exists(), "{error}");
+        adapters::settings::begin(&config)?;
+        assert_eq!(read(&config)?, "old");
         Ok(())
     }
 

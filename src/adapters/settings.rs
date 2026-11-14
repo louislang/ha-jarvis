@@ -1,7 +1,9 @@
 //! The fields of the settings form: read and edit of `jarvis.toml` that keep its comments and
-//! order, and the backup of a save.
+//! order, and the backup, trial start marker and rollback of a save.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -16,6 +18,9 @@ use crate::ports::Setting;
 
 /// The exit code after which systemd starts Jarvis again.
 pub const RESTART: u8 = 75;
+
+/// The rollback reason when the trial start left no error text.
+const CRASHED: &str = "start after save crashed";
 
 /// The form fields in their groups, in the order of the form. No secret, path or address is a
 /// field.
@@ -150,6 +155,90 @@ pub fn beside(config: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
+/// Removes the file at `path` when it exists.
+///
+/// # Errors
+///
+/// The file exists and cannot be removed.
+fn removed(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
+
+/// Removes `<config>.rollback`, so that the status has no rollback message after the next start.
+///
+/// # Errors
+///
+/// The file exists and cannot be removed.
+pub fn clear_rollback(config: &Path) -> anyhow::Result<()> {
+    Ok(removed(&beside(config, ".rollback"))?)
+}
+
+/// Starts with `config`. When `<config>.trying` exists, the trial start after a save failed or
+/// crashed: puts `<config>.bak` back and keeps the reason in `<config>.rollback`. Else, when
+/// `<config>.bak` exists, makes an empty `<config>.trying`: this start is the trial start.
+///
+/// # Errors
+///
+/// A file cannot be read, written, removed or renamed.
+pub fn begin(config: &Path) -> anyhow::Result<()> {
+    let (backup, trying) = (beside(config, ".bak"), beside(config, ".trying"));
+    if trying.exists() {
+        let error = fs::read_to_string(&trying)?;
+        let reason = if error.is_empty() { CRASHED } else { &error };
+        fs::write(beside(config, ".rollback"), reason)?;
+        // Before the rename: a crash between them gives one more trial start, not a loop.
+        fs::remove_file(&trying)?;
+        fs::rename(&backup, config)?;
+        tracing::error!("settings rolled back: {reason}");
+    } else if backup.exists() {
+        fs::write(&trying, "")?;
+    }
+    Ok(())
+}
+
+/// Ends the trial start of `config`: removes `<config>.trying`, then `<config>.bak`.
+///
+/// # Errors
+///
+/// A file exists and cannot be removed.
+pub fn confirm(config: &Path) -> io::Result<()> {
+    removed(&beside(config, ".trying"))?;
+    removed(&beside(config, ".bak"))
+}
+
+/// Writes `error` to `<config>.trying` when it exists. Gives whether it exists, that is whether
+/// the trial start failed.
+#[must_use]
+pub fn failed_trial(config: &Path, error: &str) -> bool {
+    let trying = beside(config, ".trying");
+    let exists = trying.exists();
+    if exists {
+        // An empty marker rolls back too, with the reason of a crash.
+        let _ = fs::write(&trying, error);
+    }
+    exists
+}
+
+/// The exit code of a panic: [`RESTART`] during the trial start of `config`, else 101.
+#[must_use]
+pub fn panic_code(config: &Path) -> i32 {
+    if beside(config, ".trying").exists() {
+        i32::from(RESTART)
+    } else {
+        101
+    }
+}
+
+/// The status message of the last rollback of `config`, when `<config>.rollback` exists.
+#[must_use]
+pub fn rolled_back(config: &Path) -> Option<String> {
+    let reason = fs::read_to_string(beside(config, ".rollback")).ok()?;
+    Some(format!("settings rolled back: {reason}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,5 +331,23 @@ mod tests {
         );
         let changed = edit(REPOSITORY, change("habits.min_score", json!(3))).expect("a number");
         assert!(changed.contains("min_score = 3.0"), "{changed}");
+    }
+
+    /// AC-12.9i-3.
+    #[test]
+    fn ac_12_9i_3_begin_after_a_failed_trial_puts_the_backup_back() -> anyhow::Result<()> {
+        for (error, reason) in [("bind failed", "bind failed"), ("", CRASHED)] {
+            let folder = tempfile::tempdir()?;
+            let config = folder.path().join("jarvis.toml");
+            fs::write(&config, "new")?;
+            fs::write(beside(&config, ".bak"), "old")?;
+            fs::write(beside(&config, ".trying"), error)?;
+            begin(&config)?;
+            assert_eq!(fs::read_to_string(&config)?, "old");
+            assert_eq!(fs::read_to_string(beside(&config, ".rollback"))?, reason);
+            let left = [".bak", ".trying"].map(|suffix| beside(&config, suffix).exists());
+            assert_eq!(left, [false, false], "the backup and the marker are gone");
+        }
+        Ok(())
     }
 }
