@@ -8,7 +8,7 @@ This phase improves the System One model. Jarvis builds the training set, trains
 
 **Goal:** Turn marks into labeled examples and build the full training set from seeds, generated examples and marks. Your marks become training data. Sub-phase 14.11 adds the active learned intents.
 
-- **Implements:** G15, G16. **Depends on:** 12.11.
+- **Implements:** G15, G16. **Depends on:** 12.9g.
 - **Files:** modify `src/domain/training.rs`.
 
 **Model.**
@@ -78,17 +78,16 @@ This phase improves the System One model. Jarvis builds the training set, trains
 - **Implements:** G16. **Depends on:** 13.2.
 - **Files:** modify `src/domain/training.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `TrainingState { current: Option<run_id>, last_time }`. `changes(state, marked) = |action marks with a mark time after last_time|`. Only action marks count, because a response mark gives no training example. Request habits are not training data (`01-architecture.md` decision 9), so they do not count. `should_train(count, min_changes) = count >= min_changes`. This sub-phase adds `train.state` and `train.min_changes`.
+**Model.** `TrainingState { current: Option<run_id>, last_time }`. `changes(state, marked) = |action marks with a mark time after last_time|`. Request habits are not training data (`01-architecture.md` decision 9), so they do not count. `should_train(count, min_changes) = count >= min_changes`. This sub-phase adds `train.state` and `train.min_changes`.
 
 **Acceptance criteria.**
 
 - AC-13.3-1: When 20 action marks occur after the last run and 3 before it, `changes` returns 20.
 - AC-13.3-2: When the count is `min_changes - 1`, `should_train` returns false. At `min_changes`, it returns true.
-- AC-13.3-3: When a response mark occurs after the last run, `changes` does not count it.
 
 **Proofs.**
 
-- P-13.3-1, P-13.3-3. Ensures: `changes` is the number of action marks after `last_time`. Argument: `changes` is the size of the marks filtered by target and time.
+- P-13.3-1. Ensures: `changes` is the number of action marks after `last_time`. Argument: `changes` is the size of the marks filtered by time.
 - P-13.3-2. Ensures: `should_train(c, m)` is true if and only if `c >= m`. Argument: `should_train` is `>=`.
 
 ---

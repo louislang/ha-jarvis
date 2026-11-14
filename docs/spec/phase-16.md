@@ -65,12 +65,12 @@ This phase composes the component models into one Quint model of the whole reque
 
 - **Implements:** G19. **Depends on:** 16.2.
 - **Files:** modify `quint/jarvis.qnt`.
-- **Quint:** `jarvis.qnt`, which imports one instance of `commit` for each request, one instance of `announce` for each satellite, and one instance of `dialog`, `feedback`, `training`, `learned` and `prefetch`, with small constants. `cache_sync`, `backfill` and `speaker` are not in the composition: the request reads the cache, a backfill changes only pools, and the speaker is a slot value. Their own models cover them.
+- **Quint:** `jarvis.qnt`, which imports one instance of `commit` for each request, one instance of `announce` for each satellite, and one instance of `dialog`, `training`, `learned` and `prefetch`, with small constants. `cache_sync`, `backfill` and `speaker` are not in the composition: the request reads the cache, a backfill changes only pools, and the speaker is a slot value. Their own models cover them.
 
 **Model.**
 
 - `commit(r)` uses the `commit` instance of `r`. `announce(r)` and `pipelineEnd(s)` use the `announce` instance of `s`.
-- New actions: `ask(r)` and `answer(r)` (from `dialog`; `ask` increments `handled` and moves `Handling` to `Replied`), `mark` (from `feedback`), and `swap` (from `training`: `activeModel := v`).
+- New actions: `ask(r)` and `answer(r)` (from `dialog`; `ask` increments `handled` and moves `Handling` to `Replied`), and `swap` (from `training`: `activeModel := v`).
 - The pause of sub-phase 13.10: the `training` start actions are enabled only when no request is in `Listening` or `Handling`. `release` waits for the uses in progress, and the mute calls do not wait for a satellite. Thus the driver completes a start action without a later trace step. While `training.paused`, `audio`, `handle` and `answer` are not enabled.
 - The invariants of the imported models also hold in the composition.
 
@@ -90,13 +90,13 @@ This phase composes the component models into one Quint model of the whole reque
 
 ### 16.4 Composed Conformance
 
-**Goal:** Extend the system driver to the composed actions: questions, answers, marks and training swaps. The whole Rust application now follows the composed model on the replayed traces.
+**Goal:** Extend the system driver to the composed actions: questions, answers and training swaps. The whole Rust application now follows the composed model on the replayed traces.
 
 - **Implements:** G19. **Depends on:** 16.3.
 - **Files:** modify `src/testing/e2e.rs`.
 - **Quint:** `jarvis.qnt` (conformance).
 
-**Model.** The driver of sub-phase 16.2 maps `ask` and `answer` through `Assistant::handle` with an open dialog, `mark` through `Review`, and `swap` through the training use case with `FakeTrainer`. A start action of `training` also runs the pause with `FakeModels`. The driver does not compare the `switch` calls of the mute, because `jarvis.qnt` has no action for them. After each step, it also reads the dialogs, the marks and the training state.
+**Model.** The driver of sub-phase 16.2 maps `ask` and `answer` through `Assistant::handle` with an open dialog, and `swap` through the training use case with `FakeTrainer`. A start action of `training` also runs the pause with `FakeModels`. The driver does not compare the `switch` calls of the mute, because `jarvis.qnt` has no action for them. After each step, it also reads the dialogs and the training state.
 
 **Acceptance criteria.**
 
