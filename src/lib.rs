@@ -677,8 +677,9 @@ impl Controller {
         changed
     }
 
-    /// Writes the configuration file with `changes` after the checks of the start, keeps the
-    /// old file as the backup and removes the reason of an earlier rollback.
+    /// Writes the configuration file with `changes` after the checks of the start, and keeps the
+    /// old file as the backup. First removes the reason of an earlier rollback, so that a failure
+    /// there leaves both files unchanged.
     ///
     /// # Errors
     ///
@@ -687,9 +688,9 @@ impl Controller {
         let text = read(&self.config).map_err(invalid)?;
         let new = adapters::settings::edit(&text, changes).map_err(Refusal::Invalid)?;
         Config::parse(&new).map_err(invalid)?;
-        write_atomic(&adapters::settings::beside(&self.config, ".bak"), &text)
+        adapters::settings::clear_rollback(&self.config)
+            .and_then(|()| write_atomic(&adapters::settings::beside(&self.config, ".bak"), &text))
             .and_then(|()| write_atomic(&self.config, &new))
-            .and_then(|()| adapters::settings::clear_rollback(&self.config))
             .map_err(invalid)
     }
 
