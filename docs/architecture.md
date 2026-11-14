@@ -12,6 +12,7 @@ flowchart LR
         crate_adapters_open_meteo[open_meteo]
         crate_adapters_openai[openai]
         crate_adapters_plex[plex]
+        crate_adapters_settings[settings]
         crate_adapters_sherpa[sherpa]
         crate_adapters_sqlite[sqlite]
         crate_adapters_supertonic[supertonic]
