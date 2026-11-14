@@ -172,9 +172,13 @@
     return response.json();
   }
 
+  // After a save, the section shows `restarting` until Jarvis is online again.
+  let restarting = false;
+
   async function showStatus() {
     const shown = await currentStatus().catch(() => ({ state: 'offline', message: null }));
-    statusSection.querySelector('.state').textContent = shown.state;
+    restarting &&= shown.state !== 'online';
+    statusSection.querySelector('.state').textContent = restarting ? 'restarting' : shown.state;
     statusSection.querySelector('.message').textContent = shown.message ?? '';
   }
 
@@ -238,6 +242,10 @@
     });
     if (response.ok) {
       settingsError.textContent = '';
+      restarting = true;
+      while (restarting) {
+        await Promise.all([showStatus(), new Promise((resolve) => setTimeout(resolve, 1000))]);
+      }
       await loadSettings();
       return;
     }

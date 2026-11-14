@@ -1,7 +1,9 @@
 //! The fields of the settings form: read and edit of `jarvis.toml` that keep its comments and
-//! order.
+//! order, and the backup of a save.
 
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use serde_json::Value as Json;
@@ -11,6 +13,9 @@ use toml_edit::Item;
 use toml_edit::Value;
 
 use crate::ports::Setting;
+
+/// The exit code after which systemd starts Jarvis again.
+pub const RESTART: u8 = 75;
 
 /// The form fields in their groups, in the order of the form. No secret, path or address is a
 /// field.
@@ -135,6 +140,14 @@ fn restyled(old: &Array, strings: &[&str]) -> Array {
         }
     }
     array
+}
+
+/// The file `<config><suffix>`, for example the backup `<config>.bak`.
+#[must_use]
+pub fn beside(config: &Path, suffix: &str) -> PathBuf {
+    let mut path = config.as_os_str().to_owned();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 #[cfg(test)]
