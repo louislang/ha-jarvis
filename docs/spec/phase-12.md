@@ -1,6 +1,6 @@
 # Phase 12: Interaction Log and Feedback
 
-This phase logs each request with its audio, action and response. You mark the action and the response as good or bad, with an optional correction, in the Jarvis tab of the HA sidebar. The tab also shows the status of Jarvis and a form of chosen settings, and an HA entity shows the status. Marks change decisions at once, and Phase 13 trains on them.
+This phase logs each request with its audio, action and response. You mark the action as good or bad, with an optional correction, in the Jarvis tab of the HA sidebar. The tab also shows the status of Jarvis and a form of chosen settings, and an HA entity shows the status. Marks are labeled training data for Phase 13. No mark changes a decision or a response before a training run.
 
 ---
 
@@ -53,6 +53,8 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Goal:** Add `quint/feedback.qnt`, the model of good and bad marks on decisions. Prove that a decision with more bad marks than good marks is never chosen again.
 
+This sub-phase is merged. No mark changes a decision (`01-architecture.md` decision 26), so no part of the model stays. The fix PR `Fix: Remove Feedback Quint Model` deletes `quint/feedback.qnt` and its row in `01-architecture.md` section 8.
+
 - **Implements:** G15, G19. **Depends on:** 12.1b.
 - **Files:** create `quint/feedback.qnt`.
 - **Quint:** `feedback.qnt`.
@@ -83,6 +85,8 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Goal:** Add the pure feedback model that implements `feedback.qnt`, with its types and `blocked`: a decision with more bad marks than good marks for a text. Every later use of feedback reads from this one model.
 
+This sub-phase is merged. No mark changes a decision or a response (`01-architecture.md` decision 26). The fix PR `Fix: Remove Blocked Decisions` removes `blocked` and the tests of AC-12.3-1 to AC-12.3-3. The fix PR `Fix: Remove Feedback Model` then removes the feedback model: `Feedback` and `Rated`. You mark only the action, so the fix PR `Fix: Action Marks Only` removes `Target` and the `target` of `Mark`. `Value`, `Mark` and `Action` stay, because the log (sub-phases 12.4 and 12.5) and Phase 13 read them.
+
 - **Implements:** G15, G19. **Depends on:** 12.2.
 - **Files:** create `src/domain/feedback.rs`. Modify `src/lib.rs`.
 
@@ -109,6 +113,8 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Goal:** Add `Feedback::apply`, which adds, replaces and removes marks, and replay `feedback.qnt` against it. A mark changes `blocked` at once.
 
+This sub-phase is merged. The fix PR `Fix: Remove Feedback Quint Model` removes the conformance driver and the test of AC-12.3b-2. The fix PR `Fix: Remove Blocked Decisions` removes the rule for a dialog answer and the tests of AC-12.3b-1 and AC-12.3b-3. The fix PR `Fix: Remove Feedback Model` removes `apply`. The log keeps the rule that a mark replaces or removes the earlier mark of its interaction (sub-phase 12.5).
+
 - **Implements:** G15, G19. **Depends on:** 12.3.
 - **Files:** modify `src/domain/feedback.rs`.
 - **Quint:** `feedback.qnt` (conformance).
@@ -134,7 +140,9 @@ This phase logs each request with its audio, action and response. You mark the a
 
 ### 12.3c Bad Responses and Corrections
 
-**Goal:** Add the feedback rules for responses and System Two: bad responses, corrections and examples. Sub-phases 12.10 and 12.11 read them.
+**Goal:** Add the feedback rules for responses and System Two: bad responses, corrections and examples.
+
+This sub-phase is merged. No mark changes a response, and a correction is training data for Phase 13 only. The fix PR `Fix: Remove Blocked Decisions` removes `corrections` and the test of AC-12.3c-2. The fix PR `Fix: Remove Feedback Model` removes `bad_responses`, `examples` and the test of AC-12.3c-1. `Spoken` stays, because `Interaction` records each response with it (sub-phase 12.4).
 
 - **Implements:** G15. **Depends on:** 12.3b.
 - **Files:** modify `src/domain/feedback.rs`.
@@ -166,9 +174,9 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Model.**
 
-- `Interaction` (in `src/domain/feedback.rs`, because the training domain reads it): `id`, `time`, `satellite`, `transcript`, `model_context`, `model` (the run name of the classifier), `top labels` (three labels with probabilities), `slots` (name, value, byte offsets in the normalized transcript), `action` (the `Action` of sub-phase 12.3: the intent of the decision and its targets), `decision` (the kind of the decision: `Reply`, `Fetch` for `Defer` with `Job::Fetch`, `Llm` for `Defer` with `Job::Llm`, or `Ask`), `service calls`, `responses` (text, pool, template), `latency_ms` (from the `voice_end` of the correlated utterance to the end of `handle`; none without audio), `link` (the ID of the first interaction of a dialog). The intent of `action` can be a next intent (sub-phase 12.10), so it is not always the top label. Sub-phase 12.5 adds `marks`.
+- `Interaction` (in `src/domain/feedback.rs`, because the training domain reads it): `id`, `time`, `satellite`, `transcript`, `model_context`, `model` (the run name of the classifier), `top labels` (three labels with probabilities), `slots` (name, value, byte offsets in the normalized transcript), `action` (the `Action` of sub-phase 12.3: the intent of the decision and its targets), `decision` (the kind of the decision: `Reply`, `Fetch` for `Defer` with `Job::Fetch`, `Llm` for `Defer` with `Job::Llm`, or `Ask`), `service calls`, `responses` (text, pool, template), `latency_ms` (from the `voice_end` of the correlated utterance to the end of `handle`; none without audio), `link` (the ID of the first interaction of a dialog). Sub-phase 12.5 adds `marks`.
 - The audio is a BLOB of 16-bit mono PCM at 16 kHz.
-- `append(interaction, audio)`, `list(filter, page) -> Vec<Interaction>` (newest first, `web.page_size`), `get(id) -> Option<Interaction>`. `get` gives the interaction that a mark or a `link` names, so the caller can make its `Rated` (sub-phase 12.3).
+- `append(interaction, audio)`, `list(filter, page) -> Vec<Interaction>` (newest first, `web.page_size`), `get(id) -> Option<Interaction>`. `get` gives the interaction that a mark or a `link` names.
 - The adapter creates the schema when the database file does not exist. It stores the schema version in `PRAGMA user_version`. The version starts at 1. A later sub-phase that changes the schema adds one migration step and increases the version. On start, the adapter runs the steps from the stored version to the current version in one transaction, so marks survive an update. A version newer than the code is an error with both versions.
 - This sub-phase adds `log.database`.
 
@@ -210,6 +218,8 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Goal:** Add `mark` and `marked` to the log, and the filter `bad` to `list`. Marks are stored with their corrections and survive an update of the schema.
 
+This sub-phase is merged. You mark only the action, so the fix PR `Fix: Action Marks Only` removes the target from the stored mark. The log keeps at most one mark for each interaction, and `deferred` (sub-phase 12.5b) no longer checks a target. No release has the interaction log, so no stored mark is on a response, and the schema does not change.
+
 - **Implements:** G15. **Depends on:** 12.4b.
 - **Files:** modify `src/ports.rs`, `src/domain/feedback.rs`, `src/adapters/sqlite.rs`, `src/testing/fakes.rs`.
 
@@ -234,7 +244,7 @@ This phase logs each request with its audio, action and response. You mark the a
 - **Implements:** G14, G15. **Depends on:** 12.5.
 - **Files:** modify `src/ports.rs`, `src/domain/feedback.rs`, `src/adapters/sqlite.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `deferred(since) -> Vec<Deferred { id, text, time, spoken }>` (interactions after `since` whose decision is `Defer` with `Job::Llm`, without a bad action mark and without a `link`; `spoken` is true when the interaction has a `satellite`; `Deferred` is in `src/domain/feedback.rs`), `prune(now)`: delete audio older than `audio_days` and unmarked records older than `record_days`. `prune` keeps a record that a marked record links to, so `get` of the `link` of a marked dialog answer still makes its `Rated` (sub-phase 12.7). Thus `deferred` gives each request that System Two answered: a top label `unknown`, a top probability less than `model.threshold`, a label that is not in the catalog, a blocked decision (sub-phase 12.10), or an intent that System One cannot act on (sub-phase 4.5). A dialog answer is not a request, so `deferred` leaves it out. `FakeLog` records each `prune` call for sub-phase 12.6. This sub-phase adds `log.audio_days` and `log.record_days`.
+**Model.** `deferred(since) -> Vec<Deferred { id, text, time, spoken }>` (interactions after `since` whose decision is `Defer` with `Job::Llm`, without a bad action mark and without a `link`; `spoken` is true when the interaction has a `satellite`; `Deferred` is in `src/domain/feedback.rs`), `prune(now)`: delete audio older than `audio_days` and unmarked records older than `record_days`. `prune` keeps a record that a marked record links to, so `get` of the `link` of a marked dialog answer still gives the first interaction (sub-phase 13.1). Thus `deferred` gives each request that System Two answered: a top label `unknown`, a top probability less than `model.threshold`, a label that is not in the catalog, or an intent that System One cannot act on (sub-phase 4.5). A dialog answer is not a request, so `deferred` leaves it out. `FakeLog` records each `prune` call for sub-phase 12.6. This sub-phase adds `log.audio_days` and `log.record_days`.
 
 **Acceptance criteria.**
 
@@ -282,7 +292,7 @@ This phase logs each request with its audio, action and response. You mark the a
 
 **Model.** The record gets these values:
 
-- `action` is the top label and the sorted targets of the service call of the decision. Sub-phase 12.10 changes it. `service calls` is the service call of the decision.
+- `action` is the top label and the sorted targets of the service call of the decision. `service calls` is the service call of the decision.
 - A slot gets the byte offsets of the first match of its value in the normalized transcript. A slot without a match is left out.
 - `responses` has the text that `handle` returns, with its pool and template: the reply, the filler or the question of the decision, or the deferred answer for a request without a satellite. A System Two text has an empty pool and template.
 
@@ -357,6 +367,8 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 **Model.** `Review`: `list(filter, page)`, `audio(id)`, `mark(mark)`, `intents()`. `mark` checks that a correction is an intent name or `unknown`, writes the mark to the log and applies it to the feedback model. It makes the `Rated` of the marked interaction with `get`: its transcript, action and responses, and the transcript of the interaction that its `link` names.
 
+This sub-phase is merged. The fix PR `Fix: Remove Blocked Decisions` removes the `get` of the interaction that `link` names and the check of `blocked` in the test of AC-12.7-1. The fix PR `Fix: Remove Feedback Model` removes the feedback model from the use case (sub-phase 12.3). `mark` then checks the correction, checks with `get` that the interaction exists, and writes the mark to the log. The tests of AC-12.7-1 and AC-12.7-2 then check only the log, and P-12.7-2 no longer applies. After the fix PR `Fix: Action Marks Only`, a mark has no `target`.
+
 **Acceptance criteria.**
 
 - AC-12.7-1: When `mark` runs, `FakeLog` records the mark and the feedback model contains it.
@@ -375,6 +387,8 @@ A cancel phrase is not logged, because it has no prediction and no action.
 ### 12.8 Web API
 
 **Goal:** Add the web adapter of the Jarvis tab with token authentication and the review endpoints. A test can then read and mark interactions over HTTP.
+
+This sub-phase is merged. You mark only the action, so the fix PR `Fix: Action Marks Only` removes `target` and `index` from the body of `POST api/interactions/{id}/mark`, and the test of AC-12.8-6.
 
 - **Implements:** G15, G24. **Depends on:** 12.7.
 - **Files:** create `src/adapters/web.rs`. Modify `src/lib.rs` (the module declaration), `Cargo.toml`.
@@ -416,7 +430,7 @@ A cancel phrase is not logged, because it has no prediction and no action.
 
 - `run` serves the web server on `web.listen` next to the Wyoming server. The shutdown future of `run` stops both (sub-phase 5.4c). The wait of up to 5 s after the shutdown includes the open web requests.
 - This sub-phase adds `[web]` (`listen`, `token_env`, `page_size`) and resolves the token in `Secrets`. `web.page_size` is the page size of `list` (sub-phase 12.4).
-- The composition root makes the `Review` use case (sub-phase 12.7) on the interaction log, with a new feedback model. Sub-phase 12.10 gives the feedback model to `decide`.
+- The composition root makes the `Review` use case (sub-phase 12.7) on the interaction log, with a new feedback model. The fix PR `Fix: Remove Feedback Model` removes the feedback model.
 
 **Acceptance criteria.**
 
@@ -431,6 +445,8 @@ A cancel phrase is not logged, because it has no prediction and no action.
 ### 12.9 Review Page
 
 **Goal:** Add the page of the Jarvis tab with the review section. It plays the audio of each request and lets you mark the action and the response, with an optional correction. Marking takes one click per interaction, and the page works under the path prefix of HA ingress.
+
+This sub-phase is merged. The fix PR `Fix: Action Marks Only` removes the good and bad buttons of each response. The page still shows the responses, and the good and bad buttons of the action stay (AC-12.9-1).
 
 - **Implements:** G15, G24. **Depends on:** 12.8b.
 - **Files:** create `src/adapters/review.html`. Modify `src/adapters/web.rs`.
@@ -736,59 +752,6 @@ A cancel phrase is not logged, because it has no prediction and no action.
 - P-12.9g-1 to P-12.9g-6. Evidence: test.
 
 **Field log.** Add `JARVIS_WEB_TOKEN` to `jarvis.env` with a value from `openssl rand -hex 32` (the token goes through `sed`, so use only hex characters), and restart Jarvis. In HA, open Settings, Add-ons, Add-on Store, Repositories, and add `https://github.com/louislang/ha-jarvis`. Install the add-on Jarvis. Set `url` to `http://192.168.1.65:10701` and `token` to the same value. Start the add-on and turn on "Show in sidebar". Record that the Jarvis tab shows the interactions, the status and the settings, also in the HA app outside the house. Stop the unit `jarvis` and record that the tab shows "Jarvis is down". Start the unit and record that the tab shows Jarvis again.
-
----
-
-### 12.10 Feedback in Decide
-
-**Goal:** Make `decide` skip blocked decisions. After a bad mark, the same request goes to the next entity, then the next likely intent, then System Two with the correction.
-
-- **Implements:** G15, G19. **Depends on:** 12.9g.
-- **Files:** modify `src/domain/decide.rs`, `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`.
-- **Quint:** `feedback.qnt` (`DecideAvoidsBlocked`).
-
-**Model.** Candidates in order: for the top intent, its target choices. With `target = "entity"`, each matching entity is one choice, in selection order. With `target = "entities"`, the set of all matching entities is the only choice. Then the same for each next intent with probability at least `model.next_threshold`. A next intent with a missing slot that is not `optional` is skipped, because Jarvis does not ask about a second guess. Softmax probabilities sum to 1 and `model.threshold > 0.5` (sub-phase 2.2), so a next intent cannot also reach `model.threshold`. This sub-phase adds `model.next_threshold`. `decide` returns the first candidate that is not `blocked`. If none remains, it returns `Defer` with `Job::Llm`, and the `Question` contains `corrections(text, 3)`.
-
-**Acceptance criteria.**
-
-- AC-12.10-1: When the action for "turn on the tv" with the Office media player is marked bad, the next "turn on the tv" targets the next media player candidate.
-- AC-12.10-2: When all entity candidates of the top intent are blocked and the probabilities are 0.7 for the top intent and 0.25 for the next intent, `decide` uses the next intent.
-- AC-12.10-3: When all candidates are blocked, `decide` returns `Defer` with `Job::Llm`, and the `Question` contains the correction.
-- AC-12.10-4: When a `target = "entities"` action with all kitchen lights is blocked, `decide` does not try a single light.
-- AC-12.10-5: When the next intent needs a slot that the prediction does not have, `decide` does not use it.
-
-**Proofs.**
-
-- P-12.10-4. Ensures: a `target = "entities"` intent gives one candidate, the set of all matching entities. Argument: a `target = "entities"` intent has one choice, the whole set, so no single entity is a candidate.
-- P-12.10-1 to P-12.10-3. Requires: `DecideAvoidsBlocked` (P-12.2-2). Ensures: `decide` gives the first candidate that is not blocked, else `Defer` with `Job::Llm` and the corrections. Argument: `decide` is `candidates.find(not blocked)`, with `None` mapped to `Defer(Llm)`. This is the `decide` action of the model, with the candidate order of this sub-phase.
-- P-12.10-5. Ensures: no candidate comes from a next intent with a missing slot that is not `optional`. Argument: the candidate list filters the next intents by their slots before it adds their choices.
-
----
-
-### 12.11 Feedback in Responses and System Two
-
-**Goal:** Remove bad responses from selection, guide backfill with marked examples, and load all marks at startup. A response marked bad is never spoken again.
-
-- **Implements:** G4, G5, G15. **Depends on:** 12.10.
-- **Files:** modify `src/domain/responses.rs`, `src/adapters/openai.rs`, `src/app/background.rs`, `src/lib.rs`.
-
-**Model.** `select` now returns `Option<usize>`. The allowed responses are those that are not bad. If two or more are allowed, `last` is also excluded. With none allowed, `select` returns `None`, and dispatch replies with empty text. No-bad takes precedence over no-repeat. `needs_backfill` counts only responses that are not bad. The `generate` prompt includes `examples(pool, 5)`. At startup, the feedback model is built from `marked()`, with the `Rated` of each interaction as in sub-phase 12.7.
-
-**Acceptance criteria.**
-
-- AC-12.11-1: When a response is marked bad, `select` never returns it.
-- AC-12.11-2: When all responses in a pool whose templates use only `area` are marked bad, `needs_backfill` returns true.
-- AC-12.11-3: When the backfill prompt runs, it contains the good and bad examples of the pool.
-- AC-12.11-4: When Jarvis restarts, the feedback model contains every mark from the log.
-- AC-12.11-5 [GPU host]: With 10,000 interactions and 1,000 marks, all Phase 9.2 latency tests pass.
-- AC-12.11-6: When every response of a pool is bad, `select` returns none and the reply text is empty. When a pool of two has one bad response, `select` returns the other one, also when it is `last`. AC-4.1-1 now applies to the responses that are not bad.
-
-**Proofs.**
-
-- P-12.11-1, P-12.11-6. Ensures: `select` never returns a bad response, excludes `last` only when two or more responses are not bad, and returns `None` when every response is bad. Argument: `select` first removes `bad_responses`, then removes `last` only when two or more remain, then takes the minimum. An empty set gives `None`.
-- P-12.11-2. Ensures: a pool with every response bad needs a backfill. Argument: with all responses bad, the count of fresh responses that are not bad is 0, which is less than `min_fresh >= 1`.
-- P-12.11-4. Ensures: the feedback model after startup has every mark of the log. Argument: startup folds `apply` over `marked()`.
-- P-12.11-3, P-12.11-5. Evidence: test.
 
 ---
 

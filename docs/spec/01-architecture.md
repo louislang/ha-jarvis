@@ -163,7 +163,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 23. **Discovery from HA.** Jarvis reads the HA registries in the hot cache. Each `person` entity lists its `device_trackers`. The sensors on the same device as a tracker give its area and distance (for example from Bermuda with the satellites as Bluetooth proxies). The `binary_sensor` entities with device class `occupancy`, `presence` or `motion` on the satellite device are its presence sensors. Configuration can override discovery. In the reference house (section 11) the presence sensors have no device class. Set their device class to `occupancy` in HA, or list them in `[[satellites]]`.
 24. **Audio correlation.** HA sends the audio (`asr`) and the transcript (`handle`) on different connections with no shared ID. The speech use case keeps each committed utterance (text, audio, time) for `log.correlate_s`. For a voice request (a context with a `satellite_id`), the conversation use case finds the one utterance with the same normalized text and removes it. An ambiguous match gives no audio. Speaker identification uses the same correlation.
 25. **Logging is not on the critical path.** Jarvis writes the interaction after it returns `Handled`. Later announces and questions update the same record.
-26. **Feedback rules.** A bad action blocks that decision (intent and targets) for that normalized text at once. `decide` then uses the next entity candidate, then the next intent with enough probability. Else it sends the request to System Two with the bad action as a correction. A bad response leaves its pool. The next training run learns from all marks and corrections.
+26. **Feedback rules.** No mark changes a decision or a response. Marks are labeled training data in the log: the next training run of System One learns from the action marks and their corrections (phase 13).
 27. **One ONNX Runtime, GPU or CPU.** `sherpa-onnx` (feature `shared`) and `ort` (feature `load-dynamic`) load the same ONNX Runtime 1.28.2 shared library from sherpa-onnx 2.0.1. On the GPU host, it is the CUDA 12 and cuDNN 9 build from the sherpa-onnx `linux-x64-gpu` release. On other machines, it is the CPU build. Thus the two crates cannot conflict, and `device` selects the CUDA or the CPU execution provider for all models.
 28. **Two-pass STT.** The first pass streams, so Jarvis knows the words while the user speaks. It uses NVIDIA Nemotron Speech Streaming EN 0.6B with 160 ms chunks on the GPU host. The first pass gives the last word only after the VAD ends the segment and flushes the model (sub-phase 6.6c). The VAD ends the segment `vad_min_silence_ms` after the voice end, and an early commit comes `early_commit_ms` after the voice end (sub-phase 9.1b). `vad_min_silence_ms < early_commit_ms` (sub-phase 2.2), so the flush comes before an early commit. At commit, the second pass decodes the whole utterance with NVIDIA Parakeet Unified EN 0.6B in offline mode. The second pass has full context, so it is more accurate. The second pass adds zeros to each utterance up to 4 s, or up to `max_utterance_ms` for a longer utterance, so each decode has one of two input lengths (sub-phase 6.7). On the Open ASR Leaderboard sets, the average word error rate goes from 7.67% to 5.91%, and on LibriSpeech test-clean from 2.56% to 1.63%. HA receives the second-pass text on the GPU host. Both models are official sherpa-onnx exports. The GPU host runs fp16 conversions of them (sub-phase 6.6c). Cloud streaming APIs take about 250 ms to 300 ms to give the final text, so they cannot meet G1. CPU machines use the same first pass and have no second pass.
 29. **Blocking work off the async workers.** STT decoding, the second pass, `predict`, TTS synthesis, voice embedding and SQLite calls run in `tokio::task::spawn_blocking`. The async workers only move bytes and wait. Thus a decode for one satellite does not delay `handle` for another.
@@ -301,7 +301,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `quint/commit.qnt` | Model | Commit policy. | 6.4 |
 | `quint/backfill.qnt` | Model | Response backfill. | 8.3 |
 | `quint/dialog.qnt` | Model | Dialogs. | 10.1 |
-| `quint/feedback.qnt` | Model | Marks and blocked decisions. | 12.2 |
+| `quint/feedback.qnt` | Model | Marks and blocked decisions. The fix PR `Fix: Remove Feedback Quint Model` deletes this file and this row (decision 26). | 12.2 |
 | `quint/training.qnt` | Model | Training trigger, run, pause, accept and fallback. | 13.4 |
 | `quint/learned.qnt` | Model | Learned intent lifecycle, approval and plugin requests. | 14.3 |
 | `quint/prefetch.qnt` | Model | Prefetch window, refresh, freshness and side effects. | 14.8 |
@@ -323,7 +323,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/domain/speech.rs` | Domain | Audio type, commit policy, audio chunks, sentence split, audio correlation, hotword list. | 6.2 |
 | `src/domain/dialog.rs` | Domain | Dialog state, answer fill, cancel, turn limit. | 10.2 |
 | `src/domain/habits.rs` | Domain | Request habits: buckets, decayed day scores, usual times. | 11.1 |
-| `src/domain/feedback.rs` | Domain | Marks, corrections, feedback rules. | 12.3 |
+| `src/domain/feedback.rs` | Domain | Interactions and marks. | 12.3 |
 | `src/domain/learn.rs` | Domain | Clusters, proposal validation, approval rule, prefetch schedule and freshness. | 14.1 |
 | `src/domain/speaker.rs` | Domain | Discovery, presence, proximity and identification. | 15.1 |
 | `src/app/background.rs` | Application | Hot cache sync, request habit store, backfill, learned intents, prefetch, hotword refresh. | 2.9 |
@@ -387,7 +387,6 @@ ping_interval_s = 30
 dir = "models/system-one"
 threshold = 0.6
 commit_threshold = 0.9
-next_threshold = 0.2
 
 [asr]
 model_dir = "models/sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25"
@@ -810,7 +809,6 @@ Each model has state variables, actions and named invariants. `02-rules.md` sect
 | `commit.qnt` | Commit policy and VAD | `domain/speech.rs` | `CommitOnlyWhenAllowed`, `NoLateCommit`, `NoCommitDuringSpeech` |
 | `backfill.qnt` | Backfill | `app/background.rs` | `OneBackfillPerPool`, `PoolsChangeOnlyOnSuccess` |
 | `dialog.qnt` | Dialogs and deferred jobs | `domain/dialog.rs`, `app/conversation.rs` | `TurnLimit`, `NoCallAfterCancel` |
-| `feedback.qnt` | Marks | `domain/feedback.rs` | `DecideAvoidsBlocked` |
 | `training.qnt` | Training | `domain/training.rs`, `app/training.rs` | `OneRun`, `SwapNeverWorse`, `CountResetsAfterRun`, `FailureKeepsModel`, `FallbackOnce`, `PauseOnlyLocal` |
 | `learned.qnt` | Learned intents | `domain/learn.rs`, `app/background.rs` | `ServiceNeedsApproval`, `NoReproposal`, `ActivationCountsOnce`, `OneRequestPerCluster` |
 | `prefetch.qnt` | Prefetch | `domain/learn.rs`, `app/background.rs` | `NoCallFromPrefetch`, `ServedAnswerIsFresh`, `PrefetchOnlyInWindow`, `NoEarlyRefresh` |
