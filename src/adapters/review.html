@@ -431,6 +431,15 @@
     }
   }
 
+  function copyTheme(outer) {
+    const style = getComputedStyle(outer.documentElement);
+    for (const name of THEME) {
+      const value = style.getPropertyValue(name).trim();
+      if (value) document.documentElement.style.setProperty(name, value);
+      else document.documentElement.style.removeProperty(name);
+    }
+  }
+
   function followTheme() {
     let outer;
     try {
@@ -439,11 +448,9 @@
       return;
     }
     if (outer === document) return;
-    const style = getComputedStyle(outer.documentElement);
-    for (const name of THEME) {
-      const value = style.getPropertyValue(name).trim();
-      if (value) document.documentElement.style.setProperty(name, value);
-    }
+    copyTheme(outer);
+    // HA writes its theme into the style of its root element, also on a light or dark change.
+    new MutationObserver(() => copyTheme(outer)).observe(outer.documentElement, { attributes: true });
     const sheets = [...outer.styleSheets, ...outer.adoptedStyleSheets];
     const faces = sheets.flatMap(rules).filter((rule) => rule.constructor.name === 'CSSFontFaceRule');
     document.head.append(Object.assign(document.createElement('style'),
