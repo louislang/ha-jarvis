@@ -80,7 +80,6 @@ mod tests {
     use super::*;
     use crate::domain::feedback::Action;
     use crate::domain::feedback::Route;
-    use crate::domain::feedback::Target;
     use crate::domain::feedback::Value;
     use crate::testing::fakes::FakeLog;
 
@@ -132,11 +131,10 @@ mod tests {
         (review, log)
     }
 
-    /// The action mark `value` with `correction` on the dialog answer.
+    /// The mark `value` with `correction` on the dialog answer.
     fn mark(value: Option<Value>, correction: &str) -> Mark {
         Mark {
             interaction: 2,
-            target: Target::Action,
             value,
             correction: Some(correction.to_owned()),
             time: Timestamp::UNIX_EPOCH,

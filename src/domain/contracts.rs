@@ -220,13 +220,9 @@ pub struct ExRoute(Route);
 #[verifier::external_type_specification]
 pub struct ExInteraction(Interaction);
 
-/// A rating of one part of one interaction.
+/// A rating of the action of one interaction.
 #[verifier::external_type_specification]
 pub struct ExMark(feedback::Mark);
-
-/// The part of an interaction that a mark rates.
-#[verifier::external_type_specification]
-pub struct ExMarkTarget(feedback::Target);
 
 /// A rating.
 #[verifier::external_type_specification]
