@@ -48,20 +48,12 @@ impl Reviewer {
         }
     }
 
-    /// The parts of the interaction `id` that its marks rate, with the transcript of the
-    /// interaction that its link names.
+    /// The parts of the interaction `id` that its marks rate.
     async fn rated(&self, id: u64) -> anyhow::Result<Rated> {
         let Some(interaction) = self.log.get(id).await? else {
             anyhow::bail!("no interaction has the ID {id}");
         };
-        let link = match interaction.link {
-            Some(first) => self.log.get(first).await?.map(|first| first.transcript),
-            None => None,
-        };
         Ok(Rated {
-            transcript: interaction.transcript,
-            link,
-            action: interaction.action,
             responses: interaction.responses,
         })
     }
@@ -206,13 +198,6 @@ mod tests {
         let bad = mark(Some(Value::Bad), "tv_show");
         review.mark(bad.clone()).await?;
         assert_eq!(marks(&log, &feedback).await, (vec![bad.clone()], vec![bad]));
-        let targets = [OFFICE.to_owned()];
-        assert!(
-            feedback
-                .borrow()
-                .blocked("turn on the tv", "tv_on", &targets),
-            "the answer mark counts for the text of the first interaction"
-        );
         Ok(())
     }
 

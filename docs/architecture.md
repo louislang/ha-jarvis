@@ -193,8 +193,6 @@ flowchart LR
     crate_domain_dialog --> crate_domain_select
     crate_domain_feedback --> crate_domain_contracts
     crate_domain_feedback --> crate_domain_feedback
-    crate_domain_feedback --> crate_domain_intent
-    crate_domain_feedback --> crate_domain_select
     crate_domain_feedback --> crate_domain_state
     crate_domain_habits --> crate_domain_contracts
     crate_domain_habits --> crate_domain_habits
