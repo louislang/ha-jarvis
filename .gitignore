@@ -4,6 +4,8 @@
 /.venv/
 /jarvis.local.toml
 /jarvis.toml.bak
+/jarvis.toml.trying
+/jarvis.toml.rollback
 /habits.json
 /voices.json
 /jarvis.db
