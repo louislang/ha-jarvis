@@ -672,17 +672,19 @@ impl Controller {
         changed
     }
 
-    /// The old and the new text of the configuration file with `changes`, after the checks of
-    /// the start.
+    /// Writes the configuration file with `changes` after the checks of the start, and keeps
+    /// the old file as the backup.
     ///
     /// # Errors
     ///
-    /// The file cannot be read, or `edit` or `Config::parse` fails.
-    fn checked(&self, changes: BTreeMap<String, Value>) -> Result<(String, String), Refusal> {
+    /// The file cannot be read or written, or `edit` or `Config::parse` fails.
+    fn written(&self, changes: BTreeMap<String, Value>) -> Result<(), Refusal> {
         let text = read(&self.config).map_err(invalid)?;
         let new = adapters::settings::edit(&text, changes).map_err(Refusal::Invalid)?;
         Config::parse(&new).map_err(invalid)?;
-        Ok((text, new))
+        write_atomic(&adapters::settings::beside(&self.config, ".bak"), &text)
+            .and_then(|()| write_atomic(&self.config, &new))
+            .map_err(invalid)
     }
 
     /// Completes when `shutdown` completes or after a save.
@@ -726,15 +728,11 @@ impl Control for Controller {
         if !self.change(Activity::Idle, Activity::Restarting) {
             return Err(Refusal::Busy);
         }
-        let checked = self.checked(changes);
-        if checked.is_err() {
+        let written = self.written(changes);
+        if written.is_err() {
             self.change(Activity::Restarting, Activity::Idle);
         }
-        let (old, new) = checked?;
-        let backup = adapters::settings::beside(&self.config, ".bak");
-        write_atomic(&backup, &old)
-            .and_then(|()| write_atomic(&self.config, &new))
-            .map_err(invalid)?;
+        written?;
         self.status.send_replace(Status {
             state: State::Restarting,
             message: None,
