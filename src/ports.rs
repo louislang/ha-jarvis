@@ -1,5 +1,6 @@
 //! Port traits and their data types.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -369,8 +370,42 @@ pub struct Status {
     pub message: Option<String>,
 }
 
+/// A field of the settings form with its value in the configuration file.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Setting {
+    /// The group of the field in the form.
+    pub group: &'static str,
+    /// The dotted name, for example `asr.endpoint_ms`.
+    pub name: &'static str,
+    /// A JSON number, string or list of strings.
+    pub value: Value,
+}
+
+/// Why Jarvis refuses a save of the settings.
+#[must_use]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Refusal {
+    /// The new file does not pass the checks of the start. The message names the field.
+    Invalid(String),
+}
+
 /// The driving port that the web server calls to read and control Jarvis.
 pub trait Control: Send + Sync {
     /// The current status.
     fn status(&self) -> Status;
+
+    /// The fields of the settings form with their values in the configuration file.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be read, or a field is missing.
+    fn settings(&self) -> anyhow::Result<Vec<Setting>>;
+
+    /// Sets each field of `changes` in the configuration file. The new values take effect at the
+    /// next start.
+    ///
+    /// # Errors
+    ///
+    /// The new file does not pass the checks of the start. The file does not change.
+    fn save(&self, changes: BTreeMap<String, Value>) -> Result<(), Refusal>;
 }

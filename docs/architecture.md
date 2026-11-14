@@ -102,6 +102,7 @@ flowchart LR
     crate_adapters_plex --> crate_adapters_plex
     crate_adapters_plex --> crate_domain_state
     crate_adapters_plex --> crate_ports
+    crate_adapters_settings --> crate_ports
     crate_adapters_sherpa --> crate
     crate_adapters_sherpa --> crate_adapters_sherpa
     crate_adapters_sherpa --> crate_ports

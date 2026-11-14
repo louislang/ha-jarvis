@@ -11,6 +11,7 @@
   .transcript { font-size: 1.2rem; margin: 0.5rem 0; }
   audio { width: 100%; }
   button[aria-pressed="true"] { font-weight: bold; outline: 2px solid; }
+  label { display: block; margin: 0.25rem 0; }
 </style>
 </head>
 <body>
@@ -37,6 +38,12 @@
     <ul class="responses"></ul>
   </article>
 </template>
+<h1>Settings</h1>
+<form id="settings">
+  <div id="fields"></div>
+  <button id="save" type="submit">Save</button>
+  <p id="settings-error" role="alert"></p>
+</form>
 <template id="response">
   <li>
     <span class="text"></span>
@@ -171,6 +178,74 @@
     statusSection.querySelector('.message').textContent = shown.message ?? '';
   }
 
+  const settingsForm = document.getElementById('settings');
+  const settingsError = document.getElementById('settings-error');
+  let settings = [];
+
+  function input(setting) {
+    if (Array.isArray(setting.value)) {
+      const area = document.createElement('textarea');
+      area.value = setting.value.join('\n');
+      area.rows = setting.value.length + 1;
+      return area;
+    }
+    const field = document.createElement('input');
+    field.type = typeof setting.value === 'number' ? 'number' : 'text';
+    field.step = 'any';
+    field.value = String(setting.value);
+    return field;
+  }
+
+  // The value of the form field of `setting`, with the type of its old value.
+  function edited(setting) {
+    const text = settingsForm.elements.namedItem(setting.name).value;
+    if (Array.isArray(setting.value)) return text.split('\n').map((line) => line.trim()).filter(Boolean);
+    return typeof setting.value === 'number' ? Number(text) : text;
+  }
+
+  async function loadSettings() {
+    const response = await fetch('api/settings');
+    if (!response.ok) {
+      settingsError.textContent = `The settings did not load: ${response.status}`;
+      return;
+    }
+    settings = await response.json();
+    const groups = new Map();
+    for (const setting of settings) {
+      if (!groups.has(setting.group)) {
+        const fieldset = document.createElement('fieldset');
+        fieldset.append(Object.assign(document.createElement('legend'), { textContent: setting.group }));
+        groups.set(setting.group, fieldset);
+      }
+      const label = document.createElement('label');
+      const field = Object.assign(input(setting), { name: setting.name });
+      label.append(`${setting.name} `, field);
+      groups.get(setting.group).append(label);
+    }
+    document.getElementById('fields').replaceChildren(...groups.values());
+  }
+
+  // Sends only the changed fields.
+  settingsForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const changed = settings.filter((setting) =>
+      JSON.stringify(edited(setting)) !== JSON.stringify(setting.value));
+    const body = Object.fromEntries(changed.map((setting) => [setting.name, edited(setting)]));
+    const response = await fetch('api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (response.ok) {
+      settingsError.textContent = '';
+      await loadSettings();
+      return;
+    }
+    const refusal = await response.json().catch(() => ({ error: `status ${response.status}` }));
+    settingsError.textContent = refusal.error;
+  });
+
+  loadSettings();
   showStatus();
   setInterval(showStatus, 5000);
   start();
