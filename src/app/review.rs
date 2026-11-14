@@ -1,61 +1,35 @@
 //! The review use case: the logged interactions, their audio and their marks.
 
-use std::mem;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tokio::sync::Mutex;
-use tokio::sync::watch;
 
 use crate::domain::catalog;
 use crate::domain::catalog::Catalog;
-use crate::domain::feedback::Feedback;
 use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
-use crate::domain::feedback::Rated;
 use crate::domain::speech::Audio;
 use crate::ports::Filter;
 use crate::ports::InteractionLog;
 use crate::ports::Page;
 use crate::ports::Review;
 
-/// The review of the logged interactions. A mark reaches the log and the feedback model.
+/// The review of the logged interactions. A mark reaches the log.
 pub struct Reviewer {
     /// The log of the interactions.
     log: Arc<dyn InteractionLog>,
     /// The names that a correction can have: `unknown` and the intent names.
     names: Vec<String>,
-    /// The feedback model.
-    feedback: watch::Sender<Feedback>,
-    /// The turn to mark. The log and the feedback model then get the marks in the same order.
-    marking: Mutex<()>,
 }
 
 impl Reviewer {
-    /// The review of `log` with the intent names of `catalog` that applies the marks to
-    /// `feedback`.
+    /// The review of `log` with the intent names of `catalog`.
     #[must_use]
-    pub fn new(
-        log: Arc<dyn InteractionLog>,
-        catalog: &Catalog,
-        feedback: watch::Sender<Feedback>,
-    ) -> Self {
+    pub fn new(log: Arc<dyn InteractionLog>, catalog: &Catalog) -> Self {
         Self {
             log,
             names: catalog::labels(catalog),
-            feedback,
-            marking: Mutex::new(()),
         }
-    }
-
-    /// The parts of the interaction `id` that its marks rate.
-    async fn rated(&self, id: u64) -> anyhow::Result<Rated> {
-        let Some(interaction) = self.log.get(id).await? else {
-            anyhow::bail!("no interaction has the ID {id}");
-        };
-        Ok(Rated {
-            responses: interaction.responses,
-        })
     }
 }
 
@@ -85,12 +59,11 @@ impl Review for Reviewer {
 
     async fn mark(&self, mark: Mark) -> anyhow::Result<()> {
         check(&mark, &self.names)?;
-        let rated = self.rated(mark.interaction).await?;
-        let _turn = self.marking.lock().await;
-        self.log.mark(mark.clone()).await?;
-        self.feedback
-            .send_modify(|feedback| *feedback = mem::take(feedback).apply(rated, mark));
-        Ok(())
+        let id = mark.interaction;
+        if self.log.get(id).await?.is_none() {
+            anyhow::bail!("no interaction has the ID {id}");
+        }
+        self.log.mark(mark).await
     }
 
     fn intents(&self) -> Vec<String> {
@@ -145,8 +118,8 @@ mod tests {
     }
 
     /// The review of a log with the request "turn on the tv" (1) and its dialog answer "the
-    /// office" (2), the log, and the receiver of the feedback model.
-    fn review() -> (Reviewer, Arc<FakeLog>, watch::Receiver<Feedback>) {
+    /// office" (2), and the log.
+    fn review() -> (Reviewer, Arc<FakeLog>) {
         let logged = vec![
             (interaction(1, "turn on the tv", None), None),
             (interaction(2, "the office", Some(1)), None),
@@ -155,13 +128,8 @@ mod tests {
             interactions: Mutex::new(logged),
             ..FakeLog::default()
         });
-        let (feedback, receiver) = watch::channel(Feedback::default());
-        let review = Reviewer::new(
-            Arc::clone(&log) as Arc<dyn InteractionLog>,
-            &catalog(),
-            feedback,
-        );
-        (review, log, receiver)
+        let review = Reviewer::new(Arc::clone(&log) as Arc<dyn InteractionLog>, &catalog());
+        (review, log)
     }
 
     /// The action mark `value` with `correction` on the dialog answer.
@@ -175,59 +143,53 @@ mod tests {
         }
     }
 
-    /// The marks of the dialog answer in the log, and the marks of the feedback model.
-    async fn marks(log: &FakeLog, feedback: &watch::Receiver<Feedback>) -> (Vec<Mark>, Vec<Mark>) {
+    /// The marks of the dialog answer in the log.
+    async fn marks(log: &FakeLog) -> Vec<Mark> {
         let answer = log
             .get(2)
             .await
             .expect("the fake log reads")
             .expect("it has the answer");
-        let applied = feedback
-            .borrow()
-            .marks
-            .iter()
-            .map(|marked| marked.mark.clone())
-            .collect();
-        (answer.marks, applied)
+        answer.marks
     }
 
     /// AC-12.7-1.
     #[tokio::test]
-    async fn ac_12_7_1_mark_reaches_the_log_and_the_feedback_model() -> anyhow::Result<()> {
-        let (review, log, feedback) = review();
+    async fn ac_12_7_1_mark_reaches_the_log() -> anyhow::Result<()> {
+        let (review, log) = review();
         let bad = mark(Some(Value::Bad), "tv_show");
         review.mark(bad.clone()).await?;
-        assert_eq!(marks(&log, &feedback).await, (vec![bad.clone()], vec![bad]));
+        assert_eq!(marks(&log).await, [bad]);
         Ok(())
     }
 
     /// AC-12.7-2.
     #[tokio::test]
     async fn ac_12_7_2_none_removes_the_earlier_mark() -> anyhow::Result<()> {
-        let (review, log, feedback) = review();
+        let (review, log) = review();
         review.mark(mark(Some(Value::Bad), "tv_show")).await?;
-        assert_eq!(feedback.borrow().marks.len(), 1, "the bad mark is applied");
+        assert_eq!(marks(&log).await.len(), 1, "the bad mark is logged");
         review.mark(mark(None, "tv_show")).await?;
-        assert_eq!(marks(&log, &feedback).await, (Vec::new(), Vec::new()));
+        assert_eq!(marks(&log).await, []);
         Ok(())
     }
 
     /// AC-12.7-3.
     #[tokio::test]
     async fn ac_12_7_3_unknown_correction_changes_nothing() {
-        let (review, log, feedback) = review();
+        let (review, log) = review();
         let result = review.mark(mark(Some(Value::Bad), "tv_shows")).await;
         assert!(
             result.is_err(),
             "tv_shows is not an intent name: {result:?}"
         );
-        assert_eq!(marks(&log, &feedback).await, (Vec::new(), Vec::new()));
+        assert_eq!(marks(&log).await, []);
     }
 
     /// AC-12.7-4.
     #[test]
     fn ac_12_7_4_intents_are_the_catalog_names_and_unknown() {
-        let (review, _log, _feedback) = review();
+        let (review, _log) = review();
         let mut expected: Vec<String> = catalog()
             .intents
             .into_iter()

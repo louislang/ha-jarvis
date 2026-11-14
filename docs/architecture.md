@@ -68,7 +68,6 @@ flowchart LR
     crate --> crate_app_review
     crate --> crate_app_speech
     crate --> crate_domain_catalog
-    crate --> crate_domain_feedback
     crate --> crate_domain_habits
     crate --> crate_domain_model
     crate --> crate_domain_responses
@@ -191,8 +190,6 @@ flowchart LR
     crate_domain_dialog --> crate_domain_intent
     crate_domain_dialog --> crate_domain_model
     crate_domain_dialog --> crate_domain_select
-    crate_domain_feedback --> crate_domain_contracts
-    crate_domain_feedback --> crate_domain_feedback
     crate_domain_feedback --> crate_domain_state
     crate_domain_habits --> crate_domain_contracts
     crate_domain_habits --> crate_domain_habits

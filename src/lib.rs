@@ -73,7 +73,6 @@ use crate::app::speech::Listener;
 use crate::app::speech::Speech;
 use crate::app::speech::Utterances;
 use crate::domain::catalog::Catalog;
-use crate::domain::feedback::Feedback;
 use crate::domain::habits::RequestHabits;
 use crate::domain::model::Prediction;
 use crate::domain::responses::Pool;
@@ -1386,8 +1385,7 @@ fn recorder(
         Arc::clone(&log),
         Arc::new(SystemClock),
     ));
-    let feedback = watch::Sender::new(Feedback::default());
-    let review = Reviewer::new(Arc::clone(&log), catalog, feedback);
+    let review = Reviewer::new(Arc::clone(&log), catalog);
     let (writer, task) = app::conversation::start_writer(log);
     let recorder = Recorder {
         utterances: Arc::clone(listener.utterances()),
