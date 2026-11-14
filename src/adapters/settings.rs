@@ -122,12 +122,28 @@ fn converted(old: &Value, new: &Json) -> Option<Value> {
         (Value::Integer(_), Json::Number(number)) => number.as_i64().map(Value::from),
         (Value::Float(_), Json::Number(number)) => number.as_f64().map(Value::from),
         (Value::String(_), Json::String(string)) => Some(Value::from(string.as_str())),
-        (Value::Array(_), Json::Array(items)) => {
-            let strings: Option<Array> = items.iter().map(Json::as_str).collect();
-            strings.map(Value::Array)
+        (Value::Array(array), Json::Array(items)) => {
+            let strings: Option<Vec<&str>> = items.iter().map(Json::as_str).collect();
+            strings.map(|strings| Value::Array(restyled(array, &strings)))
         }
         _ => None,
     }
+}
+
+/// `strings` in the layout of `old`: its comments before `]`, its trailing comma, and the
+/// comments of the item at each position that stays.
+fn restyled(old: &Array, strings: &[&str]) -> Array {
+    let mut array = old.clone();
+    array.clear();
+    for string in strings {
+        array.push(*string);
+    }
+    for (index, item) in array.iter_mut().enumerate() {
+        if let Some(before) = old.get(index) {
+            *item.decor_mut() = before.decor().clone();
+        }
+    }
+    array
 }
 
 #[cfg(test)]
@@ -194,6 +210,14 @@ mod tests {
         let changed = edit(&input, change("asr.endpoint_ms", json!(700))).expect("valid change");
         let expected = input.replace("600 # end of speech", "700 # end of speech");
         assert_eq!(changed, expected, "only the endpoint_ms line differs");
+    }
+
+    #[test]
+    fn ac_12_9d_2_edit_keeps_the_comments_inside_an_array() {
+        let text = "[dialog]\ncancel = [\n    \"never mind\", # the usual\n    \"cancel\",\n    # more later\n]\n";
+        let edited = edit(text, change("dialog.cancel", json!(["stop", "cancel"])));
+        let expected = "[dialog]\ncancel = [\n    \"stop\", # the usual\n    \"cancel\",\n    # more later\n]\n";
+        assert_eq!(edited.as_deref(), Ok(expected));
     }
 
     #[test]
