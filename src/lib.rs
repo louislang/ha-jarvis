@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
@@ -1108,9 +1109,20 @@ where
     // The models can load for a long time, so a shutdown stops the start too.
     let started = tokio::select! {
         started = start_live_app(&config, &secrets, catalog, pools, home) => started?,
-        () = &mut shutdown => return Ok(Ended::Stop),
+        () = &mut shutdown => return stopped(file),
     };
     serve_until(file.to_owned(), &config, &secrets, started, shutdown).await
+}
+
+/// `Stop` after a signal before the start of `file` was ready. Keeps the saved file for the next
+/// trial start with `adapters::settings::cancel`.
+///
+/// # Errors
+///
+/// The marker of the trial start cannot be removed.
+fn stopped(file: &Path) -> anyhow::Result<Ended> {
+    adapters::settings::cancel(file)?;
+    Ok(Ended::Stop)
 }
 
 /// Rolls back or marks the trial start with `adapters::settings::begin`, then loads the
@@ -1120,7 +1132,7 @@ where
 ///
 /// A file of the trial start cannot change, or [`Config::load`] fails.
 fn begin(config: &Path) -> anyhow::Result<Config> {
-    adapters::settings::begin(config)?;
+    adapters::settings::begin(config).context(NoRestart)?;
     Config::load(config)
 }
 
@@ -1581,11 +1593,25 @@ fn start(args: impl IntoIterator<Item = OsString>) -> ExitCode {
     exit_code(command.run())
 }
 
+/// The context of an error of the rollback or of the mark of the trial start. It ends Jarvis
+/// without a restart, so a rollback that keeps failing cannot restart Jarvis in a loop.
+#[derive(Debug)]
+struct NoRestart;
+
+impl fmt::Display for NoRestart {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the settings rollback failed")
+    }
+}
+
 /// `served`, the result of `serve` with the configuration file `config`, or `Restart` after an
 /// error of the trial start, which goes to `<config>.trying`.
 fn trial(config: &Path, served: anyhow::Result<Ended>) -> anyhow::Result<Ended> {
     match served {
-        Err(error) if adapters::settings::failed_trial(config, &format!("{error:#}")) => {
+        Err(error)
+            if !error.is::<NoRestart>()
+                && adapters::settings::failed_trial(config, &format!("{error:#}")) =>
+        {
             eprintln!("{error:#}");
             Ok(Ended::Restart)
         }
@@ -3052,6 +3078,33 @@ mod tests {
             (ExitCode::from(75), "no model".to_owned())
         );
         assert_eq!(adapters::settings::panic_code(&config), 75);
+        Ok(())
+    }
+
+    /// AC-12.9i-1. A signal before the start is ready keeps the saved file for the next trial.
+    #[test]
+    fn ac_12_9i_1_stopped_trial_start_keeps_the_saved_file() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let config = config_in(folder.path(), VALID)?;
+        fs::write(adapters::settings::beside(&config, ".bak"), "old")?;
+        adapters::settings::begin(&config)?;
+        adapters::settings::cancel(&config)?;
+        adapters::settings::begin(&config)?;
+        assert_eq!(read(&config)?, VALID, "no rollback");
+        assert!(adapters::settings::beside(&config, ".trying").exists());
+        Ok(())
+    }
+
+    /// AC-12.9i-4. A rollback that cannot keep its reason stops Jarvis without a restart.
+    #[test]
+    fn ac_12_9i_4_failed_rollback_does_not_restart() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let config = config_in(folder.path(), VALID)?;
+        fs::write(adapters::settings::beside(&config, ".trying"), "no model")?;
+        // A folder in place of the reason makes the rollback fail.
+        fs::create_dir(adapters::settings::beside(&config, ".rollback"))?;
+        let code = exit_code(trial(&config, begin(&config).map(|_| Ended::Stop)));
+        assert_eq!(code, ExitCode::FAILURE);
         Ok(())
     }
 

@@ -209,6 +209,16 @@ pub fn confirm(config: &Path) -> io::Result<()> {
     removed(&beside(config, ".bak"))
 }
 
+/// Ends a trial start of `config` that a signal stopped before it was ready: removes
+/// `<config>.trying` and keeps `<config>.bak`, so the next start tries the saved file again.
+///
+/// # Errors
+///
+/// The marker exists and cannot be removed.
+pub fn cancel(config: &Path) -> io::Result<()> {
+    removed(&beside(config, ".trying"))
+}
+
 /// Writes `error` to `<config>.trying` when it exists. Gives whether it exists, that is whether
 /// the trial start failed.
 #[must_use]
