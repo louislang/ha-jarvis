@@ -200,6 +200,9 @@ pub trait SpeechToText: Send + Sync {
     ///
     /// The second pass gives no result.
     fn transcribe(&self, samples: &[i16]) -> anyhow::Result<Option<String>>;
+
+    /// Keeps `phrases` as the hotwords of the next `transcribe` calls.
+    fn set_hotwords(&self, phrases: &[String]);
 }
 
 /// The first pass of one utterance. `accept` blocks while it decodes.

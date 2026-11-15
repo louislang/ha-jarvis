@@ -236,6 +236,7 @@ impl Config {
         }
         let positive = [
             ("asr.vad_threshold", f64::from(self.asr.vad_threshold)),
+            ("asr.hotwords_score", f64::from(self.asr.hotwords_score)),
             ("habits.half_life_days", self.habits.half_life_days),
             ("habits.min_score", self.habits.min_score),
         ];
@@ -439,6 +440,10 @@ pub struct AsrConfig {
     pub endpoint_ms: u64,
     /// The utterance length that always commits.
     pub max_utterance_ms: u64,
+    /// True for a second pass with modified beam search and hotwords, false for greedy search.
+    pub hotwords: bool,
+    /// The score that each token of a matched hotword adds.
+    pub hotwords_score: f32,
 }
 
 /// The `[tts]` section.
@@ -1732,6 +1737,8 @@ mod tests {
             early_commit_ms: 100,
             endpoint_ms: 600,
             max_utterance_ms: 8000,
+            hotwords: true,
+            hotwords_score: 1.5,
         }
     }
 
@@ -2065,6 +2072,16 @@ mod tests {
                 "error for {broken} does not name {names:?}: {error}"
             );
         }
+    }
+
+    /// AC-18.17-8.
+    #[test]
+    fn ac_18_17_8_zero_hotwords_score_names_field_and_range() {
+        let error = parse_error(&VALID.replace("hotwords_score = 1.5", "hotwords_score = 0"));
+        assert!(
+            error.contains("asr.hotwords_score") && error.contains("more than 0"),
+            "error has no field or range: {error}"
+        );
     }
 
     /// AC-9.1b-3.

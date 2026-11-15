@@ -611,15 +611,18 @@ pub struct FakeStt {
     pub second_pass: Result<Option<String>, String>,
     /// The lock that each `accept` takes first. A test holds it to block `accept`.
     pub gate: Arc<tokio::sync::Mutex<()>>,
+    /// The hotwords of each `set_hotwords`, in order.
+    pub hotwords: Mutex<Vec<Vec<String>>>,
 }
 
 impl Default for FakeStt {
-    /// No partials, no second pass and an open gate.
+    /// No partials, no second pass, an open gate and no hotwords.
     fn default() -> Self {
         Self {
             partials: Vec::new(),
             second_pass: Ok(None),
             gate: Arc::default(),
+            hotwords: Mutex::default(),
         }
     }
 }
@@ -635,6 +638,10 @@ impl SpeechToText for FakeStt {
 
     fn transcribe(&self, _samples: &[i16]) -> anyhow::Result<Option<String>> {
         self.second_pass.clone().map_err(anyhow::Error::msg)
+    }
+
+    fn set_hotwords(&self, phrases: &[String]) {
+        lock(&self.hotwords).push(phrases.to_vec());
     }
 }
 

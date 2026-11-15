@@ -2177,6 +2177,12 @@ fn ac_9_3_1_models_writes_fp32_tts_files() {
     assert_fetched("vocoder_sums");
 }
 
+/// After `just models`, the int8 second-pass folder exists and each file of `parakeet_sums` has its SHA-256.
+#[test]
+fn ac_18_17_1_models_writes_second_pass_folder() {
+    assert_fetched("parakeet_sums");
+}
+
 /// `repository.yaml` names the add-on repository and gives its URL.
 #[test]
 fn ac_12_9g_1_repository_names_addon_repository() {
