@@ -565,12 +565,16 @@ pub struct HabitsConfig {
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TrainConfig {
+    /// The saved training state.
+    pub state: PathBuf,
     /// The model to fine-tune.
     pub base_model: String,
     /// The number of passes over the examples.
     pub epochs: usize,
     /// The number of examples in one step.
     pub batch_size: usize,
+    /// The number of changes that starts an automatic training run.
+    pub min_changes: usize,
     /// The share of the examples in the held-out split.
     pub holdout: f64,
 }
@@ -1792,6 +1796,18 @@ mod tests {
         }
     }
 
+    /// The `[train]` section of `jarvis.toml`.
+    fn expected_train() -> TrainConfig {
+        TrainConfig {
+            state: PathBuf::from("training.json"),
+            base_model: "sentence-transformers/all-MiniLM-L12-v2".to_owned(),
+            epochs: 8,
+            batch_size: 8,
+            min_changes: 20,
+            holdout: 0.1,
+        }
+    }
+
     /// The `[log]` section of `jarvis.toml`.
     fn expected_log() -> LogConfig {
         LogConfig {
@@ -1861,12 +1877,7 @@ mod tests {
             },
             dialog: expected_dialog(),
             habits: expected_habits(),
-            train: TrainConfig {
-                base_model: "sentence-transformers/all-MiniLM-L12-v2".to_owned(),
-                epochs: 8,
-                batch_size: 8,
-                holdout: 0.1,
-            },
+            train: expected_train(),
             log: expected_log(),
             web: expected_web(),
             mqtt: Some(expected_mqtt()),

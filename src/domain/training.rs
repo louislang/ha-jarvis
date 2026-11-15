@@ -1,5 +1,6 @@
-//! Training set, context samples, held-out split and accuracy measures.
+//! Training set, context samples, held-out split, accuracy measures and change count.
 
+use jiff::Timestamp;
 use rand::Rng;
 use rand::rngs::StdRng;
 use serde::Deserialize;
@@ -877,6 +878,51 @@ pub fn accept(new: Metrics, old: Metrics) -> bool {
     intent && slots
 }
 
+/// The state of the training runs.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrainingState {
+    /// The run of the active model, or `None` for the fixture model.
+    pub current: Option<String>,
+    /// The start time of the last run.
+    pub last_time: Timestamp,
+}
+
+/// The number of action marks of `marked` with a mark time after the last run of `state`.
+#[verus_spec(count =>
+    ensures
+        count == changed(marked@, crate::domain::contracts::nanosecond(state.last_time), marked@.len() as int),
+)]
+#[must_use]
+pub fn changes(state: &TrainingState, marked: &[Interaction]) -> usize {
+    let after = state.last_time.as_nanosecond();
+    let (mut count, mut index) = (0, 0);
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= marked@.len(),
+            count <= index,
+            count == changed(marked@, after, index as int),
+        decreases marked@.len() - index,
+    ))]
+    while index < marked.len() {
+        if matches!(marked[index].marks.first(), Some(mark) if mark.time.as_nanosecond() > after) {
+            count += 1;
+        }
+        index += 1;
+    }
+    count
+}
+
+/// True when `count` changes are enough to start a training run.
+#[verus_spec(train =>
+    ensures
+        train == (count >= min_changes),
+)]
+#[must_use]
+pub fn should_train(count: usize, min_changes: usize) -> bool {
+    count >= min_changes
+}
+
 verus! {
 
 broadcast use vstd::utf8::encode_utf8_push;
@@ -1112,6 +1158,20 @@ pub open spec fn same_set(slots: Seq<Slot>, text: Seq<char>, spans: Seq<Span>) -
     &&& forall|index: int| 0 <= index < spans.len() ==> in_slots(text, slots, #[trigger] spans[index])
 }
 
+/// The number of the first `count` interactions of `marked` with an action mark after the
+/// nanosecond `after`.
+pub open spec fn changed(marked: Seq<Interaction>, after: i128, count: int) -> int
+    decreases count,
+{
+    if count <= 0 {
+        0
+    } else {
+        let marks = marked[count - 1].marks@;
+        let new = if marks.len() > 0 && crate::domain::contracts::nanosecond(marks[0].time) > after { 1int } else { 0int };
+        changed(marked, after, count - 1) + new
+    }
+}
+
 /// The conversion from `Example` has no spec function. Only Verus has this trait.
 #[cfg(verus_only)]
 impl vstd::std_specs::convert::FromSpecImpl<Example> for ExampleFile {
@@ -1143,7 +1203,6 @@ impl vstd::std_specs::convert::FromSpecImpl<ExampleFile> for Example {
 mod tests {
     use super::*;
 
-    use jiff::Timestamp;
     use rand::SeedableRng;
 
     use crate::domain::feedback::Action;
@@ -1385,6 +1444,29 @@ mod tests {
         };
         assert!(accept(old, old), "equal measures are accepted");
         assert!(!accept(new, old), "a lower slot accuracy is rejected");
+    }
+
+    /// AC-13.3-1.
+    #[test]
+    fn ac_13_3_1_changes_counts_marks_after_last_run() {
+        let state = TrainingState {
+            current: Some("run-1".to_owned()),
+            last_time: "2026-11-15T07:00:00Z".parse().expect("a timestamp"),
+        };
+        let mut marks: Vec<Interaction> = (0..23)
+            .map(|id| marked(id, Some(Value::Good), None))
+            .collect();
+        for interaction in &mut marks[..3] {
+            interaction.marks[0].time = "2026-11-15T06:00:00Z".parse().expect("a timestamp");
+        }
+        assert_eq!(changes(&state, &marks), 20);
+    }
+
+    /// AC-13.3-2.
+    #[test]
+    fn ac_13_3_2_should_train_at_min_changes() {
+        assert!(!should_train(19, 20), "one change short starts no run");
+        assert!(should_train(20, 20), "min_changes starts a run");
     }
 
     /// AC-11.5-1.
