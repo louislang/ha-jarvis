@@ -114,6 +114,7 @@ jobs:
 
   rust-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
       - uses: extractions/setup-just@v4
@@ -257,7 +258,9 @@ jobs:
           key: fixture-model-${{ hashFiles('target/fixture/train.json', 'justfile', 'train/**') }}
           fail-on-cache-miss: true
       - run: sudo systemctl stop jarvis
+      # A hung test must not keep live Jarvis stopped. The next step then starts it again.
       - run: just gpu-test
+        timeout-minutes: 30
       - if: always()
         run: sudo systemctl start jarvis
 
