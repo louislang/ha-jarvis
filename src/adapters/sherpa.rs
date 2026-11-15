@@ -1037,9 +1037,11 @@ mod tests {
 
     /// AC-18.17-5.
     #[tokio::test]
-    async fn ac_18_17_5_hotword_gives_radiohead() -> anyhow::Result<()> {
+    #[ignore = "GPU host"]
+    async fn ac_18_17_5_cuda_hotword_gives_radiohead() -> anyhow::Result<()> {
         let audio = fakes::speech("play radiohead").await?;
-        let stt = int8_second_pass(true, &["Radiohead".to_owned()])?;
+        let stt = stt(Device::Cuda)?;
+        stt.set_hotwords(&["Radiohead".to_owned()]);
         assert_eq!(second_pass_text(&stt, &audio)?, "play radiohead");
         Ok(())
     }
