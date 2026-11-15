@@ -26,6 +26,7 @@ use crate::Config;
 use crate::Device;
 use crate::adapters::sherpa;
 use crate::adapters::wyoming;
+use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
 use crate::ports::Home;
 use crate::ports::Reasoner;
@@ -100,6 +101,7 @@ impl Pipeline {
         let folder = tempfile::tempdir()?;
         let config = config(device, folder.path())?;
         let home = Arc::new(FakeHome::default());
+        home.send(Event::Reconnected);
         let reasoner = Arc::new(FakeReasoner::default());
         let (house, two) = (Arc::clone(&home) as _, Arc::clone(&reasoner) as _);
         let (address, tracker) = serve(&config, house, two).await?;
