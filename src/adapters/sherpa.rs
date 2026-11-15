@@ -160,7 +160,7 @@ fn beam_search(
     recognizer.decoding_method = Some("modified_beam_search".to_owned());
     // On the GPU host, 4 active paths made a decode about 100 ms slower, and 1 path costs the
     // same as greedy search.
-    recognizer.max_active_paths = 1;
+    recognizer.max_active_paths = 2;
     recognizer.hotwords_score = config.hotwords_score;
     recognizer.model_config.modeling_unit = Some("bpe".to_owned());
     recognizer.model_config.bpe_vocab = Some(file.path().to_string_lossy().into_owned());
