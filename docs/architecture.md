@@ -126,6 +126,7 @@ flowchart LR
     crate_app_background --> crate_domain_catalog
     crate_app_background --> crate_domain_habits
     crate_app_background --> crate_domain_responses
+    crate_app_background --> crate_domain_speech
     crate_app_background --> crate_domain_state
     crate_app_background --> crate_domain_state_cache
     crate_app_background --> crate_ports

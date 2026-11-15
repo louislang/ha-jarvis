@@ -1353,9 +1353,9 @@ async fn start_app(
     reasoner: Arc<dyn Reasoner>,
     plugins: Arc<Plugins>,
 ) -> anyhow::Result<Started> {
-    let (cache, queues) = start_sync(home, config);
-    let (task, habits) = start_stores(config, pools, &cache)?;
-    let (classifier, listener, speech) = load_models(config, reasoner.clone(), &queues).await?;
+    let (cache, queues, task, habits) = start_tasks(&home, config, pools)?;
+    let (classifier, listener, speech) =
+        load_models(config, reasoner.clone(), &queues, home, &cache, &catalog).await?;
     let prerender = start_prerender(&speech, &task.pools, &cache);
     let (recorder, logged) = recorder(config, &listener, &catalog)?;
     Ok((
@@ -1407,6 +1407,27 @@ fn recorder(
         last_id,
     };
     Ok((recorder, (task, review)))
+}
+
+/// Starts the sync of a hot cache with `home`, and the pools task of the source pools `pools` and
+/// the habit task of `config` on it. Gives the hot cache, its announce queues and the two tasks.
+///
+/// # Errors
+///
+/// The saved pools or the habit file cannot load.
+fn start_tasks(
+    home: &Arc<dyn Home>,
+    config: &Config,
+    pools: Pools,
+) -> anyhow::Result<(
+    watch::Receiver<StateCache>,
+    Arc<Queues>,
+    PoolsTask,
+    HabitsTask,
+)> {
+    let (cache, queues) = start_sync(Arc::clone(home), config);
+    let (task, habits) = start_stores(config, pools, &cache)?;
+    Ok((cache, queues, task, habits))
 }
 
 /// Starts the pools task of the source pools `pools` and the saved pools of `config`, and the
@@ -1466,7 +1487,8 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
 
 /// The System One model of `config`, then the listener on the STT models of `config`, which
 /// predicts with that model, sees the dialogs of `queues` and warms `reasoner`, and the speech use
-/// case on the TTS model of `config`. The STT and TTS models load on a blocking thread.
+/// case on the TTS model of `config`. Starts the hotword refresh of the STT with `home`, `cache`
+/// and `catalog`.
 ///
 /// # Errors
 ///
@@ -1475,16 +1497,44 @@ async fn load_models(
     config: &Config,
     reasoner: Arc<dyn Reasoner>,
     queues: &Arc<Queues>,
+    home: Arc<dyn Home>,
+    cache: &watch::Receiver<StateCache>,
+    catalog: &Arc<Catalog>,
 ) -> anyhow::Result<(Arc<dyn Classifier>, Listener, Arc<Speech>)> {
     let dir = config.model.dir.join(MODEL);
     let model = OnnxLoader.load(&dir, config.device).await?;
     let classifier: Arc<dyn Classifier> = Arc::new(CurrentClassifier(ArcSwap::from_pointee(model)));
+    let (stt, speech) = load_speech(config).await?;
+    start_hotwords(config, home, cache, catalog, Arc::clone(&stt));
+    let listener = listener(config, stt, Arc::clone(&classifier), reasoner, queues);
+    Ok((classifier, listener, speech))
+}
+
+/// The STT of `config` and the speech use case on the TTS model of `config`. Both models load on
+/// a blocking thread.
+///
+/// # Errors
+///
+/// A model cannot load.
+async fn load_speech(config: &Config) -> anyhow::Result<(Arc<dyn SpeechToText>, Arc<Speech>)> {
     let (asr, tts, device) = (config.asr.clone(), config.tts.clone(), config.device);
     let stt = tokio::task::spawn_blocking(move || SherpaStt::try_new(&asr, device)).await??;
     let tts = tokio::task::spawn_blocking(move || SupertonicTts::try_new(&tts, device)).await??;
-    let stt: Arc<dyn SpeechToText> = Arc::new(stt);
-    let listener = listener(config, stt, Arc::clone(&classifier), reasoner, queues);
-    Ok((classifier, listener, Arc::new(Speech::new(Arc::new(tts)))))
+    Ok((Arc::new(stt), Arc::new(Speech::new(Arc::new(tts)))))
+}
+
+/// Starts the hotword refresh of `stt` with `home`, `cache` and `catalog` when `asr.hotwords` is
+/// true and `asr.second_pass_dir` is set in `config`.
+fn start_hotwords(
+    config: &Config,
+    home: Arc<dyn Home>,
+    cache: &watch::Receiver<StateCache>,
+    catalog: &Arc<Catalog>,
+    stt: Arc<dyn SpeechToText>,
+) {
+    if config.asr.hotwords && config.asr.second_pass_dir.is_some() {
+        app::background::start_hotwords(home, cache.clone(), Arc::clone(catalog), stt);
+    }
 }
 
 /// Starts the sync of a hot cache with `home`. Gives the hot cache and the announce queues of

@@ -1,4 +1,5 @@
-//! Hot cache sync, response backfill, the request habit store and the daily log prune.
+//! Hot cache sync, response backfill, the request habit store, the daily log prune and the hotword
+//! refresh.
 
 use std::collections::BTreeSet;
 use std::collections::HashSet;
@@ -12,6 +13,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
+use serde::Deserialize;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -24,12 +26,15 @@ use crate::domain::habits::RequestHabits;
 use crate::domain::responses;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Pools;
+use crate::domain::speech;
 use crate::domain::state::Event;
+use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
 use crate::ports::Clock;
 use crate::ports::Home;
 use crate::ports::InteractionLog;
 use crate::ports::Reasoner;
+use crate::ports::SpeechToText;
 use crate::ports::Store;
 
 /// The wait before the first retry of a failed snapshot.
@@ -40,6 +45,12 @@ const MAX_RETRY: Duration = Duration::from_secs(30);
 
 /// The time between two prunes of the interaction log.
 const PRUNE_INTERVAL: Duration = Duration::from_hours(24);
+
+/// The time between two hotword refreshes.
+const HOTWORDS_REFRESH: Duration = Duration::from_hours(1);
+
+/// The media types of the library names that are hotwords, in the order of their calls.
+const LIBRARY_TYPES: [&str; 3] = ["playlist", "artist", "album"];
 
 /// Keeps `cache` equal to the states and the registries of `home` until the event stream ends,
 /// from the first `Reconnected`. Publishes each new cache to the receivers of `cache`.
@@ -366,8 +377,95 @@ pub async fn prune(log: Arc<dyn InteractionLog>, clock: Arc<dyn Clock>) {
     }
 }
 
-/// Tests of the sync, backfill, habit and prune use cases and the conformance to `cache_sync.qnt` and
-/// `backfill.qnt`.
+/// Starts a task that waits for the first snapshot in `cache`, then gives `stt` the hotwords of
+/// `home`, `cache` and `catalog` at once and each [`HOTWORDS_REFRESH`].
+pub fn start_hotwords(
+    home: Arc<dyn Home>,
+    mut cache: watch::Receiver<StateCache>,
+    catalog: Arc<Catalog>,
+    stt: Arc<dyn SpeechToText>,
+) {
+    tokio::spawn(async move {
+        let Ok(_) = cache.wait_for(|cache| cache.config.is_some()).await else {
+            return;
+        };
+        let mut refresh = tokio::time::interval(HOTWORDS_REFRESH);
+        loop {
+            refresh.tick().await;
+            refresh_hotwords(home.as_ref(), &cache, &catalog, stt.as_ref()).await;
+        }
+    });
+}
+
+/// Gives `stt` the hotwords of the hot cache `cache` and `catalog`, with the playlist, artist and
+/// album names of the Music Assistant library on `home`. Logs a failed library call and the
+/// number of hotwords.
+async fn refresh_hotwords(
+    home: &dyn Home,
+    cache: &watch::Receiver<StateCache>,
+    catalog: &Catalog,
+    stt: &dyn SpeechToText,
+) {
+    let entry = speech::music_entry(&cache.borrow()).map(str::to_owned);
+    let names = match entry {
+        Some(entry) => music_names(home, &entry).await,
+        None => Vec::new(),
+    };
+    let words = speech::hotwords(&cache.borrow(), catalog, &names);
+    tracing::info!("the second pass has {} hotwords", words.len());
+    stt.set_hotwords(&words);
+}
+
+/// The playlist, artist and album names of the library of the Music Assistant config entry
+/// `entry` on `home`. Logs a failed call.
+async fn music_names(home: &dyn Home, entry: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for media_type in LIBRARY_TYPES {
+        match library(home, entry, media_type).await {
+            Ok(found) => names.extend(found),
+            Err(error) => tracing::warn!("the {media_type} library call failed: {error:#}"),
+        }
+    }
+    names
+}
+
+/// The names of the 500 most played items of `media_type` in the library of the Music
+/// Assistant config entry `entry` on `home`.
+///
+/// # Errors
+///
+/// The call fails or its response does not parse.
+async fn library(home: &dyn Home, entry: &str, media_type: &str) -> anyhow::Result<Vec<String>> {
+    let data = serde_json::json!({ "config_entry_id": entry, "media_type": media_type,
+        "limit": 500, "order_by": "play_count_desc" });
+    let call = ServiceCall {
+        domain: "music_assistant".to_owned(),
+        service: "get_library".to_owned(),
+        target: Vec::new(),
+        data: serde_json::from_value(data)?,
+        return_response: true,
+    };
+    let response = home.call(call).await?.unwrap_or_default();
+    let library: Library = serde_json::from_value(response)?;
+    Ok(library.items.into_iter().map(|item| item.name).collect())
+}
+
+/// The response data of a `music_assistant.get_library` call.
+#[derive(Deserialize)]
+struct Library {
+    /// The items of the library.
+    items: Vec<LibraryItem>,
+}
+
+/// One item of a library.
+#[derive(Deserialize)]
+struct LibraryItem {
+    /// The name that Music Assistant shows.
+    name: String,
+}
+
+/// Tests of the sync, backfill, habit, prune and hotword use cases and the conformance to
+/// `cache_sync.qnt` and `backfill.qnt`.
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -384,6 +482,7 @@ mod tests {
     use quint_connect::quint_run;
     use quint_connect::switch;
     use serde::Deserialize;
+    use serde_json::json;
     use tokio::runtime::Runtime;
     use tokio::time::Instant;
 
@@ -399,6 +498,7 @@ mod tests {
     use crate::testing::fakes::FakeLog;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
+    use crate::testing::fakes::FakeStt;
     use crate::testing::fakes::FakeTts;
     use crate::testing::fakes::house;
     use crate::testing::fakes::log_dispatch;
@@ -712,6 +812,131 @@ mod tests {
         })
     }
 
+    /// The catalog of `intents.toml`.
+    fn catalog() -> Catalog {
+        toml::from_str(include_str!("../../intents.toml")).expect("it is a catalog")
+    }
+
+    /// The speaker that the hotword tests make a Music Assistant player.
+    const SPEAKER: &str = "media_player.carson_kitchen";
+
+    /// The reference house with [`SPEAKER`] as a Music Assistant player.
+    fn music_house() -> StateCache {
+        let mut snapshot = house();
+        let mut entities = snapshot.entities.iter_mut();
+        let speaker = entities.find(|entity| entity.entity_id.0 == SPEAKER);
+        speaker.expect("the house has it").config_entry_id = Some("music_assistant".to_owned());
+        let mut states = snapshot.states.iter_mut();
+        let state = states.find(|state| state.entity_id == SPEAKER);
+        let attributes = &mut state.expect("the house has it").attributes;
+        attributes.insert("mass_player_type".to_owned(), json!("player"));
+        StateCache::load(snapshot)
+    }
+
+    /// A `FakeHome` whose library has the playlist "Jazzy", the artist "Radiohead" and the album
+    /// "OK Computer".
+    fn library_home() -> FakeHome {
+        let home = FakeHome::default();
+        let names = [
+            ("playlist", "Jazzy"),
+            ("artist", "Radiohead"),
+            ("album", "OK Computer"),
+        ];
+        for (media_type, name) in names {
+            home.respond_library(media_type, json!({ "items": [{ "name": name }] }));
+        }
+        home
+    }
+
+    /// The calls of `home` and the hotword lists of `FakeStt` after one refresh with `cache` and
+    /// the catalog of `intents.toml`.
+    async fn refreshed(home: &FakeHome, cache: StateCache) -> (Vec<ServiceCall>, Vec<Vec<String>>) {
+        let stt = FakeStt::default();
+        refresh_hotwords(home, &watch::channel(cache).1, &catalog(), &stt).await;
+        let lists = stt.hotwords.into_inner().expect("no lock holder panics");
+        (home.calls(), lists)
+    }
+
+    /// One list: the hotwords of `cache` and the catalog of `intents.toml` with `music`.
+    fn expected(cache: &StateCache, music: &[&str]) -> Vec<Vec<String>> {
+        let music: Vec<String> = music.iter().map(|&name| name.to_owned()).collect();
+        vec![speech::hotwords(cache, &catalog(), &music)]
+    }
+
+    /// AC-18.18b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_18b_1_three_library_calls_in_order() {
+        let (calls, _) = refreshed(&FakeHome::default(), music_house()).await;
+        let call = |media_type: &str| ServiceCall {
+            domain: "music_assistant".to_owned(),
+            service: "get_library".to_owned(),
+            target: Vec::new(),
+            data: serde_json::from_value(json!({ "config_entry_id": "music_assistant",
+                "media_type": media_type, "limit": 500, "order_by": "play_count_desc" }))
+            .expect("the data is an object"),
+            return_response: true,
+        };
+        assert_eq!(calls, ["playlist", "artist", "album"].map(call));
+    }
+
+    /// AC-18.18b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_18b_2_library_names_are_hotwords() {
+        let cache = music_house();
+        let (_, lists) = refreshed(&library_home(), cache.clone()).await;
+        assert_eq!(
+            lists,
+            expected(&cache, &["Jazzy", "Radiohead", "OK Computer"])
+        );
+    }
+
+    /// AC-18.18b-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_18b_3_failed_call_gives_no_names_of_its_type() {
+        let (home, cache) = (library_home(), music_house());
+        let playlist = home.delay();
+        drop(home.delay());
+        playlist.send(()).expect("the playlist call waits");
+        let (_, lists) = refreshed(&home, cache.clone()).await;
+        assert_eq!(lists, expected(&cache, &["Jazzy", "OK Computer"]));
+    }
+
+    /// AC-18.18b-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_18b_4_no_music_player_gives_no_calls() {
+        let cache = StateCache::load(house());
+        let (calls, lists) = refreshed(&library_home(), cache.clone()).await;
+        assert!(calls.is_empty(), "the calls are {calls:?}");
+        assert_eq!(lists, expected(&cache, &[]));
+    }
+
+    /// Renames the office fan of `cache` to "Study Fan".
+    fn rename_fan(cache: &mut StateCache) {
+        let mut entities = Arc::make_mut(&mut cache.entities).iter_mut();
+        let fan = entities.find(|entity| entity.entity_id.0 == "fan.office_fan");
+        fan.expect("the house has it").name = "Study Fan".to_owned();
+    }
+
+    /// AC-18.18b-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_18b_5_first_snapshot_then_each_hour() {
+        let (sender, cache) = watch::channel(StateCache::default());
+        let stt = Arc::new(FakeStt::default());
+        let (home, catalog) = (Arc::new(FakeHome::default()), Arc::new(catalog()));
+        start_hotwords(home, cache, catalog, Arc::clone(&stt) as _);
+        let lists = || stt.hotwords.lock().expect("no lock holder panics").clone();
+        settle().await;
+        assert!(lists().is_empty(), "a list before the first snapshot");
+        sender.send_replace(StateCache::load(house()));
+        settle().await;
+        assert_eq!(lists().len(), 1);
+        sender.send_modify(rename_fan);
+        tokio::time::sleep(HOTWORDS_REFRESH).await;
+        let lists = lists();
+        assert_eq!(lists.len(), 2);
+        assert!(lists[1].contains(&"Study Fan".to_owned()), "{lists:?}");
+    }
+
     /// The model state that the conformance test compares.
     #[derive(Debug, Deserialize, PartialEq)]
     struct CacheSync {
@@ -857,10 +1082,9 @@ mod tests {
     ) -> Arc<Backfill> {
         let mut config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
         config.backfill.max_pool = usize::MAX;
-        let catalog = toml::from_str(include_str!("../../intents.toml")).expect("it is a catalog");
         let speech = Arc::new(Speech::new(Arc::clone(tts) as _));
         let cache = watch::channel(StateCache::load(house())).1;
-        let catalog = Arc::new(catalog);
+        let catalog = Arc::new(catalog());
         let backfill = Backfill::new(config.backfill, reasoner, changes, speech, catalog, cache);
         Arc::new(backfill)
     }

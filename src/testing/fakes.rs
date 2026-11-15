@@ -121,7 +121,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// A `Home` with a settable snapshot, scripted events, a count of snapshot calls, recorded calls
-/// and announces, delayed calls and response data.
+/// and announces, delayed calls, response data and library responses.
 pub(crate) struct FakeHome {
     /// The snapshot that `snapshot` returns.
     snapshot: Mutex<Snapshot>,
@@ -139,6 +139,8 @@ pub(crate) struct FakeHome {
     response: Mutex<Option<Value>>,
     /// The response data of the next calls, in order, before `response`.
     next: Mutex<VecDeque<Value>>,
+    /// The response data of a `get_library` call for each media type, before `next`.
+    library: Mutex<BTreeMap<String, Value>>,
 }
 
 impl FakeHome {
@@ -155,6 +157,7 @@ impl FakeHome {
             calls: Mutex::default(),
             response: Mutex::default(),
             next: Mutex::default(),
+            library: Mutex::default(),
         }
     }
 
@@ -186,6 +189,18 @@ impl FakeHome {
     /// data.
     pub(crate) fn respond_next(&self, response: Value) {
         lock(&self.next).push_back(response);
+    }
+
+    /// Makes each `get_library` call of `media_type` give `response` as its response data.
+    pub(crate) fn respond_library(&self, media_type: &str, response: Value) {
+        lock(&self.library).insert(media_type.to_owned(), response);
+    }
+
+    /// The `respond_library` response data of `call` when it is a `get_library` call.
+    fn library(&self, call: &ServiceCall) -> Option<Value> {
+        let media_type = call.data.get("media_type").and_then(Value::as_str);
+        let media_type = media_type.filter(|_| call.service == "get_library")?;
+        lock(&self.library).get(media_type).cloned()
     }
 
     /// The number of `snapshot` calls.
@@ -232,9 +247,10 @@ impl Home for FakeHome {
     }
 
     async fn call(&self, call: ServiceCall) -> anyhow::Result<Option<Value>> {
+        let library = self.library(&call);
         lock(&self.calls).push(call);
         self.wait().await?;
-        let next = lock(&self.next).pop_front();
+        let next = library.or_else(|| lock(&self.next).pop_front());
         Ok(next.or_else(|| lock(&self.response).clone()))
     }
 
