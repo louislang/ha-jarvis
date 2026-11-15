@@ -367,7 +367,7 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 
 **Model.**
 
-- `training_set` (sub-phase 13.1) gets the active learned intents. Their labels, slots and examples join those of the catalog. The precedence rule counts their examples as seeds.
+- `training_set` (sub-phase 13.1b) gets the active learned intents. Their labels, slots and examples join those of the catalog. The precedence rule counts their examples as seeds.
 - `changes` (sub-phase 13.3) adds the number of learned intents activated after `last_time`.
 - `refresh` (sub-phase 13.6) treats an active learned intent like a catalog intent, with its examples as seeds. It removes the entries of intents that are neither in the catalog nor active.
 
