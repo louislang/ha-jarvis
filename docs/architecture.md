@@ -25,6 +25,7 @@ flowchart LR
         crate_app_plugins[plugins]
         crate_app_review[review]
         crate_app_speech[speech]
+        crate_app_training[training]
     end
     subgraph domain
         crate_domain_catalog[catalog]
@@ -165,6 +166,11 @@ flowchart LR
     crate_app_speech --> crate_domain_speech
     crate_app_speech --> crate_domain_training
     crate_app_speech --> crate_ports
+    crate_app_training --> crate
+    crate_app_training --> crate_app_training
+    crate_app_training --> crate_domain_catalog
+    crate_app_training --> crate_domain_intent
+    crate_app_training --> crate_ports
     crate_domain_catalog --> crate_domain_contracts
     crate_domain_catalog --> crate_domain_intent
     crate_domain_contracts --> crate_domain_catalog

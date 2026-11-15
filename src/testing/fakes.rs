@@ -358,7 +358,7 @@ type Reply = oneshot::Receiver<anyhow::Result<Option<Value>>>;
 
 /// A `Reasoner` that counts the `warm` calls, records each question, answers with the scripted
 /// steps, keeps the reply of each call, records the pool of each `generate` call and holds
-/// it until `release`, and gives no `paraphrase` examples.
+/// it until `release`, records the target of each `paraphrase` call and gives its scripted result.
 #[derive(Default)]
 pub(crate) struct FakeReasoner {
     /// The number of `warm` calls.
@@ -373,6 +373,10 @@ pub(crate) struct FakeReasoner {
     generated: Mutex<Vec<String>>,
     /// The result sender of each held `generate` call, by pool.
     held: Mutex<BTreeMap<String, oneshot::Sender<anyhow::Result<Vec<String>>>>>,
+    /// The target of each `paraphrase` call, in order.
+    paraphrased: Mutex<Vec<String>>,
+    /// The `paraphrase` result of each target: the examples or the error text. Else no examples.
+    paraphrases: Mutex<BTreeMap<String, Result<Vec<String>, &'static str>>>,
 }
 
 impl FakeReasoner {
@@ -427,6 +431,21 @@ impl FakeReasoner {
         let sender = lock(&self.held).remove(pool);
         let sender = sender.expect("a generate call of the pool waits");
         sender.send(result).expect("the generate call waits");
+    }
+
+    /// The target of each `paraphrase` call, in order.
+    #[must_use]
+    pub(crate) fn paraphrased(&self) -> Vec<String> {
+        lock(&self.paraphrased).clone()
+    }
+
+    /// Makes each `paraphrase` call for `target` give `result`: the examples or the error text.
+    pub(crate) fn script_paraphrase(
+        &self,
+        target: &str,
+        result: Result<Vec<String>, &'static str>,
+    ) {
+        lock(&self.paraphrases).insert(target.to_owned(), result);
     }
 }
 
@@ -487,12 +506,14 @@ impl Reasoner for FakeReasoner {
 
     async fn paraphrase(
         &self,
-        _target: &str,
+        target: &str,
         _seeds: &BTreeMap<String, Vec<String>>,
         _slots: &BTreeSet<String>,
         _n: usize,
     ) -> anyhow::Result<Vec<String>> {
-        Ok(Vec::new())
+        lock(&self.paraphrased).push(target.to_owned());
+        let result = lock(&self.paraphrases).get(target).cloned();
+        result.unwrap_or(Ok(Vec::new())).map_err(anyhow::Error::msg)
     }
 }
 

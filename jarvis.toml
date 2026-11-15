@@ -85,6 +85,7 @@ save_interval_s = 300
 
 [train]
 state = "training.json"
+generated = "generated.json"
 base_model = "sentence-transformers/all-MiniLM-L12-v2"
 epochs = 8
 batch_size = 8

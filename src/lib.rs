@@ -132,6 +132,7 @@ pub mod app {
     pub mod plugins;
     pub mod review;
     pub mod speech;
+    pub mod training;
 }
 
 /// Port implementations, one technology each.
@@ -572,6 +573,8 @@ pub struct HabitsConfig {
 pub struct TrainConfig {
     /// The saved training state.
     pub state: PathBuf,
+    /// The saved generated examples.
+    pub generated: PathBuf,
     /// The model to fine-tune.
     pub base_model: String,
     /// The number of passes over the examples.
@@ -1861,6 +1864,7 @@ mod tests {
     fn expected_train() -> TrainConfig {
         TrainConfig {
             state: PathBuf::from("training.json"),
+            generated: PathBuf::from("generated.json"),
             base_model: "sentence-transformers/all-MiniLM-L12-v2".to_owned(),
             epochs: 8,
             batch_size: 8,
