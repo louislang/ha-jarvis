@@ -139,7 +139,7 @@ pub enum Event {
     },
     /// An area, device or entity registry changed.
     RegistryUpdated,
-    /// The connection to HA opened again.
+    /// A connection to HA opened, also the first.
     Reconnected,
 }
 

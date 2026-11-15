@@ -41,11 +41,10 @@ const MAX_RETRY: Duration = Duration::from_secs(30);
 /// The time between two prunes of the interaction log.
 const PRUNE_INTERVAL: Duration = Duration::from_hours(24);
 
-/// Keeps `cache` equal to the states and the registries of `home` until the event stream ends.
-/// Publishes each new cache to the receivers of `cache`.
+/// Keeps `cache` equal to the states and the registries of `home` until the event stream ends,
+/// from the first `Reconnected`. Publishes each new cache to the receivers of `cache`.
 pub async fn sync(home: &dyn Home, cache: &watch::Sender<StateCache>) {
     let mut events = home.events();
-    load(home, cache).await;
     while let Some(event) = events.next().await {
         match event {
             Event::StateChanged { .. } => {
@@ -407,8 +406,16 @@ mod tests {
     /// The entity that the tests change.
     const KITCHEN: &str = "light.kitchen";
 
-    /// Starts sync of a new cache with `home` and waits until it waits.
+    /// Starts sync of a new cache with `home`, sends `Reconnected` and waits until sync waits.
     async fn start(home: FakeHome) -> (Arc<FakeHome>, watch::Receiver<StateCache>) {
+        let (home, cache) = spawn(home).await;
+        home.send(Event::Reconnected);
+        settle().await;
+        (home, cache)
+    }
+
+    /// Starts sync of a new cache with `home` and waits until it waits.
+    async fn spawn(home: FakeHome) -> (Arc<FakeHome>, watch::Receiver<StateCache>) {
         let home = Arc::new(home);
         let (sender, cache) = watch::channel(StateCache::default());
         let task_home = Arc::clone(&home);
@@ -443,8 +450,11 @@ mod tests {
 
     /// AC-2.9-1.
     #[tokio::test(start_paused = true)]
-    async fn ac_2_9_1_start_loads_snapshot() {
-        let (_home, cache) = start(FakeHome::default()).await;
+    async fn ac_2_9_1_first_reconnect_loads_snapshot() {
+        let (home, cache) = spawn(FakeHome::default()).await;
+        assert_eq!(home.snapshots(), 0, "sync loaded before a connection");
+        home.send(Event::Reconnected);
+        settle().await;
         assert_eq!(*cache.borrow(), StateCache::load(house()));
     }
 
@@ -495,14 +505,15 @@ mod tests {
     }
 
     /// Starts sync with `failures` failed `snapshot` calls. Checks that `snapshot` call `k + 2`
-    /// starts `retries[k]` seconds after the start, and not before.
+    /// starts `retries[k]` seconds after `Reconnected`, and not before.
     async fn assert_retries(failures: usize, retries: &[u64]) -> watch::Receiver<StateCache> {
         let home = FakeHome::default();
         for _ in 0..failures {
             drop(home.delay());
         }
+        let (home, cache) = spawn(home).await;
         let begin = Instant::now();
-        let (home, cache) = start(home).await;
+        home.send(Event::Reconnected);
         for (calls, &retry) in (1..).zip(retries) {
             let at = begin + Duration::from_secs(retry);
             tokio::time::sleep_until(at - Duration::from_millis(1)).await;
