@@ -679,7 +679,7 @@ pub struct Metrics {
 }
 
 /// The accuracy of `predictions` on `examples`, the prediction at each position for the example
-/// at the same position.
+/// at the same position. An example without a prediction is wrong.
 #[verus_verify]
 #[must_use]
 pub fn metrics(predictions: &[Prediction], examples: &[Example], threshold: f32) -> Metrics {
@@ -692,21 +692,21 @@ pub fn metrics(predictions: &[Prediction], examples: &[Example], threshold: f32)
             index <= examples@.len(),
         decreases examples@.len() - index,
     ))]
-    while index < predictions.len() && index < examples.len() {
-        let (prediction, example) = (&predictions[index], &examples[index]);
-        if correct_label(prediction, &example.label, threshold) {
+    while index < examples.len() {
+        let (found, example) = (index < predictions.len(), &examples[index]);
+        if found && correct_label(&predictions[index], &example.label, threshold) {
             intent += 1;
         }
         if let Some(spans) = &example.spans {
             spanned += 1;
-            if same_slots(&prediction.slots, &example.text, spans) {
+            if found && same_slots(&predictions[index].slots, &example.text, spans) {
                 slots += 1;
             }
         }
         index += 1;
     }
     Metrics {
-        intent: share(intent, index),
+        intent: share(intent, examples.len()),
         slots: share(slots, spanned),
     }
 }
@@ -1358,6 +1358,18 @@ mod tests {
         let not = Label::Not("lights_on".to_owned());
         let examples = [held(not.clone()), held(not)];
         assert_eq!(metrics(&predictions, &examples, 0.7).intent, 0.5);
+    }
+
+    /// An example without a prediction is wrong in both measures.
+    #[test]
+    fn missing_prediction_is_wrong() {
+        let predictions = [predicted("lights_on", 0.8, "kitchen")];
+        let examples = [held(intent("lights_on")), held(intent("lights_on"))];
+        let expected = Metrics {
+            intent: 0.5,
+            slots: 0.5,
+        };
+        assert_eq!(metrics(&predictions, &examples, 0.7), expected);
     }
 
     /// AC-13.2-4.
