@@ -10,6 +10,10 @@ use xxhash_rust::xxh3;
 use crate::domain::catalog;
 use crate::domain::catalog::Catalog;
 use crate::domain::catalog::Intent;
+use crate::domain::feedback::Interaction;
+use crate::domain::feedback::Route;
+use crate::domain::feedback::Tagged;
+use crate::domain::feedback::Value;
 use crate::domain::intent;
 use crate::domain::intent::Span;
 
@@ -369,6 +373,96 @@ fn push_unknown(texts: &[String], areas: &[String], rng: &mut StdRng, examples: 
     }
 }
 
+/// The labeled examples of the action marks of `marked`, which also holds the first interaction
+/// of each marked dialog answer.
+#[verus_spec(examples =>
+    ensures
+        forall|index: int| 0 <= index < examples@.len()
+            ==> #[trigger] from_mark(examples@[index], marked@),
+)]
+#[must_use]
+pub fn mark_examples(marked: &[Interaction]) -> Vec<Example> {
+    let mut examples = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= marked@.len(),
+            forall|done: int| 0 <= done < examples@.len()
+                ==> #[trigger] from_mark(examples@[done], marked@),
+        decreases marked@.len() - index,
+    ))]
+    while index < marked.len() {
+        if let Some(example) = mark_example(&marked[index], marked) {
+            examples.push(example);
+        }
+        index += 1;
+    }
+    examples
+}
+
+/// The example of the action mark of `interaction`, or `None` without a mark or without the
+/// first interaction of its dialog in `marked`.
+#[verus_spec(example =>
+    ensures
+        interaction.marks@.len() == 0 ==> example is None,
+        example matches Some(example) ==> interaction.marks@.len() > 0
+            && labeled(example.label, *interaction),
+        example matches Some(example) ==> (interaction.link matches Some(link)
+            ==> example.spans is None && started(example, marked@, link)),
+)]
+fn mark_example(interaction: &Interaction, marked: &[Interaction]) -> Option<Example> {
+    let mark = interaction.marks.first()?;
+    let (request, spans) = match interaction.link {
+        Some(link) => (&marked[position(marked, link)?], None),
+        None => (interaction, Some(spans(&interaction.slots))),
+    };
+    let selected = interaction.action.intent.clone();
+    let (label, spans) = match (mark.value?, &mark.correction, interaction.decision) {
+        (Value::Good, _, Route::Llm) => (Label::Intent("unknown".to_owned()), None),
+        (Value::Good, _, _) => (Label::Intent(selected), spans),
+        (Value::Bad, Some(correction), _) => (Label::Intent(correction.clone()), None),
+        (Value::Bad, None, _) => (Label::Not(selected), None),
+    };
+    Some(Example {
+        context: request.model_context.clone(),
+        text: intent::normalize(&request.transcript),
+        label,
+        spans,
+    })
+}
+
+/// The position of the interaction `id` in `marked`.
+#[verus_spec(found =>
+    ensures
+        found matches Some(index) ==> index < marked@.len() && marked@[index as int].id == id,
+)]
+fn position(marked: &[Interaction], id: u64) -> Option<usize> {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= marked@.len(),
+        decreases marked@.len() - index,
+    ))]
+    while index < marked.len() {
+        if marked[index].id == id {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// The logged slot values `slots` as spans.
+#[verus_verify]
+fn spans(slots: &[Tagged]) -> Vec<Span> {
+    let spans = slots.iter().map(|slot| Span {
+        slot: slot.name.clone(),
+        start: slot.start,
+        end: slot.end,
+    });
+    spans.collect()
+}
+
 /// True when the normalized `text` is in the held-out split of size `holdout`.
 #[verus_verify]
 #[must_use]
@@ -508,6 +602,43 @@ pub open spec fn seeds(intents: Seq<Intent>) -> int
     if intents.len() == 0 { 0 } else { seeds(intents.drop_last()) + intents.last().examples@.len() }
 }
 
+/// The kind and the intent name of `label`: `true` for `Intent`.
+pub open spec fn label_view(label: Label) -> (bool, Seq<char>) {
+    match label {
+        Label::Intent(name) => (true, name@),
+        Label::Not(name) => (false, name@),
+    }
+}
+
+/// True when `label` is the label of the action mark of `interaction`: `unknown` for a good mark
+/// on System Two, the selected intent for another good mark, the correction for a bad mark with
+/// one, and `Not` the selected intent for a bad mark without one.
+pub open spec fn labeled(label: Label, interaction: Interaction) -> bool {
+    let mark = interaction.marks@[0];
+    let selected = interaction.action.intent@;
+    match (mark.value, mark.correction, interaction.decision) {
+        (Some(Value::Good), _, Route::Llm) => label_view(label) == (true, "unknown"@),
+        (Some(Value::Good), _, _) => label_view(label) == (true, selected),
+        (Some(Value::Bad), Some(correction), _) => label_view(label) == (true, correction@),
+        (Some(Value::Bad), None, _) => label_view(label) == (false, selected),
+        (None, _, _) => false,
+    }
+}
+
+/// True when `example` comes from the action mark of an interaction of `marked`.
+pub open spec fn from_mark(example: Example, marked: Seq<Interaction>) -> bool {
+    exists|index: int| 0 <= index < marked.len() && marked[index].marks@.len() > 0
+        && #[trigger] labeled(example.label, marked[index])
+}
+
+/// True when `example` has the normalized transcript and the context of the interaction `link`
+/// of `marked`.
+pub open spec fn started(example: Example, marked: Seq<Interaction>, link: u64) -> bool {
+    exists|index: int| 0 <= index < marked.len() && #[trigger] marked[index].id == link
+        && example.context@ == marked[index].model_context@
+        && example.text@ == intent::normalized(marked[index].transcript@)
+}
+
 /// The conversion from `Example` has no spec function. Only Verus has this trait.
 #[cfg(verus_only)]
 impl vstd::std_specs::convert::FromSpecImpl<Example> for ExampleFile {
@@ -539,7 +670,11 @@ impl vstd::std_specs::convert::FromSpecImpl<ExampleFile> for Example {
 mod tests {
     use super::*;
 
+    use jiff::Timestamp;
     use rand::SeedableRng;
+
+    use crate::domain::feedback::Action;
+    use crate::domain::feedback::Mark;
 
     /// The catalog of `intents.toml` and its seed training set.
     fn training_set() -> (Catalog, TrainingSet) {
@@ -553,6 +688,126 @@ mod tests {
         let areas = ["kitchen".to_owned(), "office".to_owned()];
         let set = seed_set(&catalog, &areas, &mut StdRng::seed_from_u64(1), settings);
         (catalog, set)
+    }
+
+    /// The `lights_on` reply to "Turn on the Kitchen lights." in the office, with the action mark
+    /// `value` and `correction`, or no mark.
+    fn marked(id: u64, value: Option<Value>, correction: Option<&str>) -> Interaction {
+        let time: Timestamp = "2026-11-15T08:00:00Z".parse().expect("a timestamp");
+        let mark = value.map(|value| Mark {
+            interaction: id,
+            value: Some(value),
+            correction: correction.map(str::to_owned),
+            time,
+        });
+        Interaction {
+            id,
+            time,
+            satellite: None,
+            transcript: "Turn on the Kitchen lights.".to_owned(),
+            model_context: context_text(Some("office")),
+            model: "fixture".to_owned(),
+            top_labels: Vec::new(),
+            slots: vec![Tagged {
+                name: "area".to_owned(),
+                value: "kitchen".to_owned(),
+                start: 12,
+                end: 19,
+            }],
+            action: Action {
+                intent: "lights_on".to_owned(),
+                targets: Vec::new(),
+            },
+            decision: Route::Reply,
+            service_calls: Vec::new(),
+            responses: Vec::new(),
+            latency_ms: None,
+            link: None,
+            marks: mark.into_iter().collect(),
+        }
+    }
+
+    /// The labels and the spans of the mark examples of `marked`.
+    fn labels_and_spans(marked: &[Interaction]) -> Vec<(Label, Option<Vec<Span>>)> {
+        let examples = mark_examples(marked).into_iter();
+        examples
+            .map(|example| (example.label, example.spans))
+            .collect()
+    }
+
+    /// The label `Intent(name)`.
+    fn intent(name: &str) -> Label {
+        Label::Intent(name.to_owned())
+    }
+
+    /// AC-13.1-1.
+    #[test]
+    fn ac_13_1_1_good_mark_gives_logged_spans_and_context() {
+        let span = Span {
+            slot: "area".to_owned(),
+            start: 12,
+            end: 19,
+        };
+        let example = Example {
+            context: context_text(Some("office")),
+            text: "turn on the kitchen lights".to_owned(),
+            label: intent("lights_on"),
+            spans: Some(vec![span]),
+        };
+        assert_eq!(
+            mark_examples(&[marked(1, Some(Value::Good), None)]),
+            [example]
+        );
+    }
+
+    /// AC-13.1-2.
+    #[test]
+    fn ac_13_1_2_correction_gives_example_without_spans() {
+        let examples = labels_and_spans(&[marked(1, Some(Value::Bad), Some("tv_show"))]);
+        assert_eq!(examples, [(intent("tv_show"), None)]);
+    }
+
+    /// AC-13.1-3.
+    #[test]
+    fn ac_13_1_3_bad_mark_gives_not_example() {
+        let examples = labels_and_spans(&[marked(1, Some(Value::Bad), None)]);
+        assert_eq!(examples, [(Label::Not("lights_on".to_owned()), None)]);
+    }
+
+    /// AC-13.1-4.
+    #[test]
+    fn ac_13_1_4_no_mark_gives_no_example() {
+        assert_eq!(mark_examples(&[marked(1, None, None)]), []);
+    }
+
+    /// AC-13.1-6.
+    #[test]
+    fn ac_13_1_6_unknown_correction_and_good_system_two_give_unknown() {
+        let mut llm = marked(2, Some(Value::Good), None);
+        llm.decision = Route::Llm;
+        let examples = labels_and_spans(&[marked(1, Some(Value::Bad), Some("unknown")), llm]);
+        assert_eq!(
+            examples,
+            [(intent("unknown"), None), (intent("unknown"), None)]
+        );
+    }
+
+    /// AC-13.1-7.
+    #[test]
+    fn ac_13_1_7_dialog_answer_gives_first_text_and_context() {
+        let mut first = marked(1, None, None);
+        first.transcript = "Turn on the lights".to_owned();
+        let mut answer = marked(2, Some(Value::Good), None);
+        answer.transcript = "The kitchen.".to_owned();
+        answer.model_context = context_text(Some("kitchen"));
+        answer.link = Some(1);
+        let example = Example {
+            context: context_text(Some("office")),
+            text: "turn on the lights".to_owned(),
+            label: intent("lights_on"),
+            spans: None,
+        };
+        assert_eq!(mark_examples(&[first, answer]), [example]);
     }
 
     /// AC-11.5-1.
