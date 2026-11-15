@@ -342,7 +342,7 @@ type Reply = oneshot::Receiver<anyhow::Result<Option<Value>>>;
 
 /// A `Reasoner` that counts the `warm` calls, records each question, answers with the scripted
 /// steps, keeps the reply of each call, records the pool of each `generate` call and holds
-/// it until `release`.
+/// it until `release`, and gives no `paraphrase` examples.
 #[derive(Default)]
 pub(crate) struct FakeReasoner {
     /// The number of `warm` calls.
@@ -467,6 +467,16 @@ impl Reasoner for FakeReasoner {
         let (sender, receiver) = oneshot::channel();
         lock(&self.held).insert(pool.to_owned(), sender);
         receiver.await?
+    }
+
+    async fn paraphrase(
+        &self,
+        _target: &str,
+        _seeds: &BTreeMap<String, Vec<String>>,
+        _slots: &BTreeSet<String>,
+        _n: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        Ok(Vec::new())
     }
 }
 

@@ -1,5 +1,6 @@
 //! `Reasoner` with the `OpenAI` Responses API.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::mem;
 use std::sync::Mutex;
@@ -114,27 +115,54 @@ fn generate_prompt(
     )
 }
 
-/// The structured output format of `generate`: `{ "responses": [string] }`.
-fn responses_format() -> ResponseFormatJsonSchema {
+/// The `paraphrase` input: `n` new examples of `target` with only the slots `slots`, or for
+/// `unknown`, `n` requests that match none of the intents, with the seed examples of each intent
+/// in `seeds`.
+fn paraphrase_prompt(
+    target: &str,
+    seeds: &BTreeMap<String, Vec<String>>,
+    slots: &BTreeSet<String>,
+    n: usize,
+) -> String {
+    let task = if target == "unknown" {
+        format!(
+            "Write {n} requests to the voice assistant Jarvis that match none of these intents, \
+             with no [value](slot) markup."
+        )
+    } else {
+        let slots: Vec<&str> = slots.iter().map(String::as_str).collect();
+        format!(
+            "Write {n} new requests to the voice assistant Jarvis for the intent {target}, in \
+             other words than its examples. Mark each slot value as [value](slot), with only \
+             these slots: {}.",
+            slots.join(", ")
+        )
+    };
+    let mut lines = Vec::new();
+    for (name, examples) in seeds {
+        lines.push(format!("{name}:\n"));
+        lines.extend(examples.iter().map(|example| format!("- {example}\n")));
+    }
+    format!(
+        "{task} Use only lowercase letters, digits, apostrophes and single spaces.\nIntents and \
+         examples:\n{}",
+        lines.concat()
+    )
+}
+
+/// The structured output format `{ "<key>": [string] }`.
+fn strings_format(key: &str) -> ResponseFormatJsonSchema {
     ResponseFormatJsonSchema {
         description: None,
-        name: "responses".to_owned(),
+        name: key.to_owned(),
         schema: json!({
             "type": "object",
-            "properties": {"responses": {"type": "array", "items": {"type": "string"}}},
-            "required": ["responses"],
+            "properties": {key: {"type": "array", "items": {"type": "string"}}},
+            "required": [key],
             "additionalProperties": false,
         }),
         strict: Some(true),
     }
-}
-
-/// The output of `generate`.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Generated {
-    /// The new responses.
-    responses: Vec<String>,
 }
 
 /// The `call_service` tool: one HA service call, with a description that names the
@@ -526,6 +554,27 @@ impl OpenAiReasoner {
         Ok(true)
     }
 
+    /// The strings of the structured output `{ "<key>": [string] }` of the input `prompt`.
+    ///
+    /// # Errors
+    ///
+    /// The request fails, or the output does not fit the format.
+    async fn strings(&self, key: &str, prompt: String) -> anyhow::Result<Vec<String>> {
+        let request = CreateResponseArgs::default()
+            .model(&self.model)
+            .input(prompt)
+            .text(strings_format(key))
+            .max_output_tokens(self.bulk_max_output_tokens)
+            .build()?;
+        self.record_when_idle(Duration::ZERO)?;
+        let response = self.create(request).await?;
+        let text = response.output_text().context("the response has no text")?;
+        let mut object: Map<String, Value> = serde_json::from_str(&text)?;
+        let strings = object.remove(key).context("the output has no strings")?;
+        anyhow::ensure!(object.is_empty(), "the output has other fields: {object:?}");
+        Ok(serde_json::from_value(strings)?)
+    }
+
     /// The first response request of the answer to `question`, with `call_service`, `get_states`,
     /// `ask_user` and the plugin tools, and one tool call at a time. When `question` answers an
     /// `ask_user` call, only its text as the output of the call, after the response of the call.
@@ -609,19 +658,19 @@ impl Reasoner for OpenAiReasoner {
         variables: &BTreeSet<String>,
         n: usize,
     ) -> anyhow::Result<Vec<String>> {
-        let request = CreateResponseArgs::default()
-            .model(&self.model)
-            .input(generate_prompt(pool, existing, variables, n))
-            .text(responses_format())
-            .max_output_tokens(self.bulk_max_output_tokens)
-            .build()?;
-        self.record_when_idle(Duration::ZERO)?;
-        let response = self.create(request).await?;
-        let text = response.output_text().context("the response has no text")?;
-        // Serde also reads a struct from a JSON array, which the schema does not permit.
-        let object: Map<String, Value> = serde_json::from_str(&text)?;
-        let generated: Generated = serde_json::from_value(Value::Object(object))?;
-        Ok(generated.responses)
+        let prompt = generate_prompt(pool, existing, variables, n);
+        self.strings("responses", prompt).await
+    }
+
+    async fn paraphrase(
+        &self,
+        target: &str,
+        seeds: &BTreeMap<String, Vec<String>>,
+        slots: &BTreeSet<String>,
+        n: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        let prompt = paraphrase_prompt(target, seeds, slots, n);
+        self.strings("examples", prompt).await
     }
 }
 
@@ -638,10 +687,13 @@ mod tests {
     use wiremock::matchers;
 
     use crate::Config;
+    use crate::domain::catalog::Catalog;
     use crate::domain::decide;
     use crate::domain::decide::AskCall;
+    use crate::domain::intent;
     use crate::domain::state::AreaId;
     use crate::domain::state_cache::StateCache;
+    use crate::domain::training;
     use crate::testing::fakes::FakePlugin;
     use crate::testing::fakes::house;
 
@@ -1317,12 +1369,9 @@ mod tests {
         }
     }
 
-    /// The result of `generate` when a mock `OpenAI` server replies with `status` and the output
-    /// text `text`, and the body of the request.
-    async fn generated(
-        status: &str,
-        text: &str,
-    ) -> anyhow::Result<(anyhow::Result<Vec<String>>, Value)> {
+    /// A mock `OpenAI` server that replies with `status` and the output text `text`, and a
+    /// reasoner on it.
+    async fn structured(status: &str, text: &str) -> anyhow::Result<(MockServer, OpenAiReasoner)> {
         let mut body = response(status);
         body["output"] = json!([{
             "type": "message",
@@ -1331,7 +1380,16 @@ mod tests {
             "status": "completed",
             "content": [{"type": "output_text", "annotations": [], "text": text}],
         }]);
-        let (server, reasoner) = serve(ResponseTemplate::new(200).set_body_json(body)).await?;
+        serve(ResponseTemplate::new(200).set_body_json(body)).await
+    }
+
+    /// The result of `generate` when a mock `OpenAI` server replies with `status` and the output
+    /// text `text`, and the body of the request.
+    async fn generated(
+        status: &str,
+        text: &str,
+    ) -> anyhow::Result<(anyhow::Result<Vec<String>>, Value)> {
+        let (server, reasoner) = structured(status, text).await?;
         let result = reasoner.generate("lights_on", &[], &variables(), 2).await;
         let requests = server.received_requests().await.context("no requests")?;
         Ok((result, requests[0].body_json()?))
@@ -1361,6 +1419,81 @@ mod tests {
                 result.is_err(),
                 "the result of {status} {text} is {result:?}"
             );
+        }
+        Ok(())
+    }
+
+    /// `seeds` as the examples of `lights_on`, by intent name.
+    fn lights_on(seeds: Vec<String>) -> BTreeMap<String, Vec<String>> {
+        BTreeMap::from([("lights_on".to_owned(), seeds)])
+    }
+
+    /// The slots of `lights_on`.
+    fn area() -> BTreeSet<String> {
+        BTreeSet::from(["area".to_owned()])
+    }
+
+    /// The seed examples of `lights_on` in `intents.toml`.
+    fn seeds() -> anyhow::Result<Vec<String>> {
+        let catalog: Catalog = toml::from_str(include_str!("../../intents.toml"))?;
+        let intents = catalog.intents.into_iter();
+        let mut lights_on = intents.filter(|intent| intent.name == "lights_on");
+        Ok(lights_on.next().context("no lights_on")?.examples)
+    }
+
+    /// AC-13.5-1.
+    #[test]
+    fn ac_13_5_1_prompt_has_seeds_and_slot_names() -> anyhow::Result<()> {
+        let seeds = seeds()?;
+        let prompt = paraphrase_prompt("lights_on", &lights_on(seeds.clone()), &area(), 50);
+        let wanted = seeds.iter().map(String::as_str).chain(["area", "50"]);
+        for wanted in wanted {
+            assert!(prompt.contains(wanted), "{wanted:?} is not in {prompt:?}");
+        }
+        Ok(())
+    }
+
+    /// AC-13.5-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_5_2_schema_reply_gives_its_examples() -> anyhow::Result<()> {
+        let text = r#"{"examples": ["turn the [den](area) lights on"]}"#;
+        let (_server, reasoner) = structured("completed", text).await?;
+        let seeds = lights_on(seeds()?);
+        let examples = reasoner.paraphrase("lights_on", &seeds, &area(), 2).await?;
+        assert_eq!(examples, ["turn the [den](area) lights on"]);
+        Ok(())
+    }
+
+    /// AC-13.5-6.
+    #[test]
+    fn ac_13_5_6_prompt_has_no_held_out_seed() -> anyhow::Result<()> {
+        let seeds = seeds()?;
+        let unheld = intent::unheld(&seeds, 0.5);
+        assert!(
+            unheld.len() < seeds.len(),
+            "no seed of {seeds:?} is held out"
+        );
+        let prompt = paraphrase_prompt("lights_on", &lights_on(unheld), &area(), 50);
+        for seed in &seeds {
+            let example = intent::parse_example(seed).expect("seed markup is valid");
+            let held = training::held_out(&example.text, 0.5);
+            assert_eq!(
+                prompt.contains(seed.as_str()),
+                !held,
+                "{seed:?} in {prompt:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The `unknown` prompt has each intent name and its examples.
+    #[test]
+    fn unknown_prompt_has_intent_names_and_examples() -> anyhow::Result<()> {
+        let mut seeds = lights_on(seeds()?);
+        seeds.insert("fan_on".to_owned(), vec!["turn on the fan".to_owned()]);
+        let prompt = paraphrase_prompt("unknown", &seeds, &BTreeSet::new(), 300);
+        for wanted in ["lights_on", "fan_on", "turn on the fan", "match none"] {
+            assert!(prompt.contains(wanted), "{wanted:?} is not in {prompt:?}");
         }
         Ok(())
     }

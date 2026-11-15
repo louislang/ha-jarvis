@@ -1,10 +1,13 @@
-//! Text normalization and example markup.
+//! Text normalization, example markup and generated example checks.
 
+use std::collections::BTreeSet;
 use std::mem;
 
 use serde::Deserialize;
 use serde::Serialize;
 use vstd::prelude::*;
+
+use crate::domain::training;
 
 /// A seed example without its slot markup.
 #[verus_verify]
@@ -39,6 +42,21 @@ pub enum MarkupError {
     },
     /// A slot name is empty.
     EmptySlot,
+}
+
+/// The reason that `validate_example` rejects a generated example.
+#[verus_verify]
+#[must_use]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Rejection {
+    /// The markup has an error.
+    Markup(MarkupError),
+    /// The text differs from its `normalize` result.
+    NotNormal(String),
+    /// The intent does not have this slot.
+    Slot(String),
+    /// The text equals a seed.
+    Seed(String),
 }
 
 /// The text with ASCII letters in lowercase, and only letters, digits, apostrophes, dots between
@@ -163,6 +181,69 @@ pub fn parse_example(markup: &str) -> Result<Example, MarkupError> {
         lemma_prefix(chars@, index as int);
     }
     parser.finish()
+}
+
+/// The example of the generated `markup` when it parses, its text is normalized, it uses only
+/// the intent slots `slots` and its text is not in `seeds`, the normalized seed texts.
+///
+/// # Errors
+///
+/// The first check that `markup` fails.
+#[verus_spec(result =>
+    ensures
+        result matches Ok(example) ==> accepted(markup@) && acceptable(example, slots@, seeds@),
+        result matches Err(Rejection::Markup(_)) ==> !accepted(markup@),
+        result matches Err(Rejection::NotNormal(text)) ==> !is_normal(text@),
+        result matches Err(Rejection::Slot(slot)) ==> !slots@.contains(slot),
+        result matches Err(Rejection::Seed(text)) ==> seeds@.contains(text),
+)]
+pub fn validate_example(
+    markup: &str,
+    slots: &BTreeSet<String>,
+    seeds: &BTreeSet<String>,
+) -> Result<Example, Rejection> {
+    let example = match parse_example(markup) {
+        Ok(example) => example,
+        Err(error) => return Err(Rejection::Markup(error)),
+    };
+    if normalize(example.text.as_str()).as_str() != example.text.as_str() {
+        return Err(Rejection::NotNormal(example.text));
+    }
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= example.spans@.len(),
+            forall|earlier: int| 0 <= earlier < index
+                ==> slots@.contains(#[trigger] example.spans@[earlier].slot),
+        decreases example.spans@.len() - index,
+    ))]
+    while index < example.spans.len() {
+        if !slots.contains(&example.spans[index].slot) {
+            return Err(Rejection::Slot(example.spans[index].slot.clone()));
+        }
+        index += 1;
+    }
+    if seeds.contains(&example.text) {
+        return Err(Rejection::Seed(example.text));
+    }
+    Ok(example)
+}
+
+/// The markup strings of `seeds` whose text is not in the held-out split of size `holdout`. A
+/// seed with a markup error is left out.
+#[verus_verify]
+#[must_use]
+pub fn unheld(seeds: &[String], holdout: f64) -> Vec<String> {
+    let mut kept = Vec::new();
+    for seed in seeds {
+        match parse_example(seed.as_str()) {
+            Ok(example) if !training::held_out(example.text.as_str(), holdout) => {
+                kept.push(seed.clone());
+            }
+            _ => {}
+        }
+    }
+    kept
 }
 
 /// The state of the markup parser.
@@ -293,7 +374,12 @@ impl Parser {
 
 verus! {
 
-broadcast use {crate::domain::contracts::axiom_ascii_alphabetic, vstd::utf8::encode_utf8_push};
+broadcast use {
+    crate::domain::contracts::axiom_ascii_alphabetic,
+    crate::domain::contracts::axiom_string_obeys_cmp,
+    vstd::std_specs::btree::axiom_set_contains_deref_key,
+    vstd::utf8::encode_utf8_push,
+};
 
 /// True when `c` is a letter that is not an ASCII capital, a digit, an apostrophe, a dot or a
 /// space.
@@ -442,6 +528,15 @@ proof fn lemma_trimmed(text: Seq<char>, normal: Seq<char>, space: bool)
     if is_normal(text) && text.len() > 0 {
         assert(fits(text, text.len() - 1));
     }
+}
+
+/// True when the text of `example` is normalized, its slots are in `slots` and its text is not in
+/// `seeds`.
+pub open spec fn acceptable(example: Example, slots: Set<String>, seeds: Set<String>) -> bool {
+    &&& is_normal(example.text@)
+    &&& forall|index: int| 0 <= index < example.spans@.len()
+        ==> slots.contains(#[trigger] example.spans@[index].slot)
+    &&& !seeds.contains(example.text)
 }
 
 /// True when the markup `chars` has no error.
@@ -647,6 +742,64 @@ mod tests {
             parse_example("turn on the [kitchen]() lights"),
             Err(MarkupError::EmptySlot)
         );
+    }
+
+    /// The slots of `lights_on`.
+    fn slots() -> BTreeSet<String> {
+        BTreeSet::from(["area".to_owned()])
+    }
+
+    /// The normalized seed texts of `lights_on`.
+    fn seeds() -> BTreeSet<String> {
+        BTreeSet::from(["turn on the lights".to_owned(), "lights on".to_owned()])
+    }
+
+    /// AC-13.5-3.
+    #[test]
+    fn ac_13_5_3_unknown_slot_is_rejected() {
+        assert_eq!(
+            validate_example("turn on the [lamp](device)", &slots(), &seeds()),
+            Err(Rejection::Slot("device".to_owned()))
+        );
+        let valid = validate_example("turn the [den](area) lights on", &slots(), &seeds());
+        assert_eq!(
+            valid.map(|example| example.text),
+            Ok("turn the den lights on".to_owned())
+        );
+    }
+
+    /// AC-13.5-4.
+    #[test]
+    fn ac_13_5_4_seed_text_is_rejected() {
+        assert_eq!(
+            validate_example("turn on the lights", &slots(), &seeds()),
+            Err(Rejection::Seed("turn on the lights".to_owned()))
+        );
+    }
+
+    /// AC-13.5-5.
+    #[test]
+    fn ac_13_5_5_markup_error_is_rejected() {
+        assert_eq!(
+            validate_example("turn on the [den lights", &slots(), &seeds()),
+            Err(Rejection::Markup(MarkupError::Unclosed { position: 12 }))
+        );
+    }
+
+    /// AC-13.5-7.
+    #[test]
+    fn ac_13_5_7_capital_or_punctuation_is_rejected() {
+        let generated = [
+            ("Turn on the [den](area) lights", "Turn on the den lights"),
+            ("turn on the [den](area) lights!", "turn on the den lights!"),
+        ];
+        for (markup, text) in generated {
+            assert_eq!(
+                validate_example(markup, &slots(), &seeds()),
+                Err(Rejection::NotNormal(text.to_owned())),
+                "markup {markup:?}"
+            );
+        }
     }
 
     /// AC-3.1-7.
