@@ -178,16 +178,18 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 
 | Step | Budget |
 |---|---|
-| From the VAD voice end to the early commit: `early_commit_ms` (100 ms) of silence | 200 ms |
-| Second pass of an utterance with zeros up to 4 s (GPU host). | 40 ms |
+| From the VAD voice end to the early commit: `early_commit_ms` (100 ms) of silence | 180 ms |
+| Second pass of an utterance with zeros up to 4 s, beam search with 2 active paths and the hotwords (GPU host, sub-phase 18.17). | 90 ms |
 | Wyoming `Transcript` → `Handled` (model prediction 10 ms, decide, select) | 20 ms |
 | Wyoming `Synthesize` → first audio chunk (cache hit) | 10 ms |
-| Margin | 30 ms |
+| Margin | 0 ms |
 | **Total response latency** | **300 ms** |
 
 The budget is the response latency (`00-overview.md` section 0.3). HA's own time between the events, and HA to satellite audio delivery, are outside Jarvis. The Phase 9 field log records the end-to-end time on real hardware.
 
 The budget applies to the GPU host. The `gpu-test` job runs the latency tests there (section 10).
+
+Sub-phase 18.17 raised the second pass from 40 ms to 90 ms for the hotwords and took the time from the margin and the early commit. In `gpu-test`, the voice end to the early commit took about 170 ms, and "turn on the office fan" had a response latency p95 of 253 ms.
 
 With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan commands and 353 ms to 378 ms for the light commands. Thus AC-9.2-5 gives the light commands 400 ms. A response that is not in the audio cache waits for the synthesis. With sherpa-onnx, the TTS alone took about 315 ms to the first audio chunk, and the p95 was 654 ms, so AC-9.2-4 gave it 700 ms. With fixed input lengths (decision 31), the TTS of a reply in `responses.toml` has a p95 of 53.0 ms on the GPU host. AC-9.3c-1 gives an uncached response 400 ms, the target of the light commands. The `unknown` filler measures 697 ms, so AC-9.2-3 gives it `endpoint_ms` + 150 ms.
 
