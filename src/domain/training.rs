@@ -373,6 +373,17 @@ fn push_unknown(texts: &[String], areas: &[String], rng: &mut StdRng, examples: 
     }
 }
 
+/// An example with its precedence in the training set.
+#[verus_verify]
+struct Ranked {
+    /// The example.
+    example: Example,
+    /// 0 for a generated example, 1 for a seed and 2 for a mark.
+    rank: u8,
+    /// The mark time in nanoseconds, or 0 for another example.
+    time: i128,
+}
+
 /// The labeled examples of the action marks of `marked`, which also holds the first interaction
 /// of each marked dialog answer.
 #[verus_spec(examples =>
@@ -461,6 +472,184 @@ fn spans(slots: &[Tagged]) -> Vec<Span> {
         end: slot.end,
     });
     spans.collect()
+}
+
+/// The full training set: the seeds of `catalog`, `generated` and the mark examples of `marked`.
+/// Of the examples with the same text and different labels, only the newest mark, else a seed,
+/// else a generated example stays.
+///
+/// # Panics
+///
+/// An example of `catalog` has a markup error, which `validate_catalog` rejects.
+#[verus_spec(
+    requires
+        catalog::valid_catalog(*catalog),
+)]
+#[must_use]
+pub fn training_set(
+    catalog: &Catalog,
+    generated: Vec<Example>,
+    marked: &[Interaction],
+    areas: &[String],
+    rng: &mut StdRng,
+    settings: Settings,
+) -> TrainingSet {
+    let seeds = seed_set(catalog, areas, rng, settings);
+    let mut all = Vec::new();
+    push_ranked(generated, 0, &mut all);
+    push_ranked(seeds.examples, 1, &mut all);
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= marked@.len(),
+        decreases marked@.len() - index,
+    ))]
+    while index < marked.len() {
+        let interaction = &marked[index];
+        if let (Some(example), Some(mark)) =
+            (mark_example(interaction, marked), interaction.marks.first())
+        {
+            let time = mark.time.as_nanosecond();
+            all.push(Ranked {
+                example,
+                rank: 2,
+                time,
+            });
+        }
+        index += 1;
+    }
+    TrainingSet {
+        examples: kept(all),
+        ..seeds
+    }
+}
+
+/// Pushes each of `examples` with the rank `rank` and no mark time to `ranked`.
+#[verus_verify]
+fn push_ranked(examples: Vec<Example>, rank: u8, ranked: &mut Vec<Ranked>) {
+    for example in examples {
+        ranked.push(Ranked {
+            example,
+            rank,
+            time: 0,
+        });
+    }
+}
+
+/// The examples of `ranked` that no example with the same text and another label outranks.
+#[verus_spec(examples =>
+    ensures
+        examples@ == chosen(ranked@, ranked@.len() as int),
+)]
+#[expect(
+    clippy::explicit_counter_loop,
+    reason = "Verus has no specification of `enumerate`"
+)]
+fn kept(ranked: Vec<Ranked>) -> Vec<Example> {
+    let winners = winners(&ranked);
+    let mut examples = Vec::new();
+    let mut index = 0;
+    let all = ranked.into_iter();
+    proof_decl! {
+        let ghost seen = vstd::std_specs::iter::IteratorSpec::remaining(&all);
+    }
+    #[cfg_attr(verus_only, verus_spec(ranked_iter =>
+        invariant
+            ranked_iter.seq() == seen,
+            seen == ranked@,
+            index == ranked_iter.index(),
+            index <= seen.len() == winners@.len() <= usize::MAX,
+            forall|done: int| 0 <= done < seen.len() ==> #[trigger] winners@[done] == wins(seen, done),
+            examples@ == chosen(seen, index as int),
+    ))]
+    for candidate in all {
+        if winners[index] {
+            examples.push(candidate.example);
+        }
+        index += 1;
+    }
+    examples
+}
+
+/// For each example of `ranked`, true when no example outranks it.
+#[verus_spec(winners =>
+    ensures
+        winners@.len() == ranked@.len() <= usize::MAX,
+        forall|index: int| 0 <= index < ranked@.len()
+            ==> #[trigger] winners@[index] == wins(ranked@, index),
+)]
+fn winners(ranked: &[Ranked]) -> Vec<bool> {
+    let mut winners = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= ranked@.len(),
+            winners@.len() == index,
+            forall|done: int| 0 <= done < index ==> #[trigger] winners@[done] == wins(ranked@, done),
+        decreases ranked@.len() - index,
+    ))]
+    while index < ranked.len() {
+        winners.push(wins_at(ranked, index));
+        index += 1;
+    }
+    winners
+}
+
+/// True when no example of `ranked` outranks `ranked[index]`.
+#[verus_spec(won =>
+    requires
+        index < ranked@.len(),
+    ensures
+        won == wins(ranked@, index as int),
+)]
+fn wins_at(ranked: &[Ranked], index: usize) -> bool {
+    let mut other = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            other <= ranked@.len(),
+            index < ranked@.len(),
+            forall|done: int| 0 <= done < other ==> !#[trigger] outranks(ranked@, done, index as int),
+        decreases ranked@.len() - other,
+    ))]
+    while other < ranked.len() {
+        if outranks_at(ranked, other, index) {
+            return false;
+        }
+        other += 1;
+    }
+    true
+}
+
+/// True when `ranked[other]` outranks `ranked[index]`.
+#[verus_spec(result =>
+    requires
+        other < ranked@.len(),
+        index < ranked@.len(),
+    ensures
+        result == outranks(ranked@, other as int, index as int),
+)]
+fn outranks_at(ranked: &[Ranked], other: usize, index: usize) -> bool {
+    let (high, low) = (&ranked[other], &ranked[index]);
+    let higher = high.rank > low.rank
+        || (high.rank == low.rank
+            && (high.time > low.time || (high.time == low.time && other > index)));
+    high.example.text.as_str() == low.example.text.as_str()
+        && !same_label(&high.example.label, &low.example.label)
+        && higher
+}
+
+/// True when `a` and `b` are the same label.
+#[verus_spec(same =>
+    ensures
+        same == (label_view(*a) == label_view(*b)),
+)]
+fn same_label(a: &Label, b: &Label) -> bool {
+    match (a, b) {
+        (Label::Intent(a), Label::Intent(b)) | (Label::Not(a), Label::Not(b)) => {
+            a.as_str() == b.as_str()
+        }
+        _ => false,
+    }
 }
 
 /// True when the normalized `text` is in the held-out split of size `holdout`.
@@ -639,6 +828,34 @@ pub open spec fn started(example: Example, marked: Seq<Interaction>, link: u64) 
         && example.text@ == intent::normalized(marked[index].transcript@)
 }
 
+/// True when `ranked[other]` has the text of `ranked[index]`, another label, and a
+/// higher precedence: a higher rank, a later mark time, or a later position.
+spec fn outranks(ranked: Seq<Ranked>, other: int, index: int) -> bool {
+    let (high, low) = (ranked[other], ranked[index]);
+    &&& high.example.text@ == low.example.text@
+    &&& label_view(high.example.label) != label_view(low.example.label)
+    &&& high.rank > low.rank || (high.rank == low.rank && (high.time > low.time
+        || (high.time == low.time && other > index)))
+}
+
+/// True when no example of `ranked` outranks `ranked[index]`.
+spec fn wins(ranked: Seq<Ranked>, index: int) -> bool {
+    forall|other: int| 0 <= other < ranked.len() ==> !#[trigger] outranks(ranked, other, index)
+}
+
+/// The examples of the first `count` of `ranked` that win, in order.
+spec fn chosen(ranked: Seq<Ranked>, count: int) -> Seq<Example>
+    decreases count,
+{
+    if count <= 0 {
+        Seq::empty()
+    } else if wins(ranked, count - 1) {
+        chosen(ranked, count - 1).push(ranked[count - 1].example)
+    } else {
+        chosen(ranked, count - 1)
+    }
+}
+
 /// The conversion from `Example` has no spec function. Only Verus has this trait.
 #[cfg(verus_only)]
 impl vstd::std_specs::convert::FromSpecImpl<Example> for ExampleFile {
@@ -676,17 +893,21 @@ mod tests {
     use crate::domain::feedback::Action;
     use crate::domain::feedback::Mark;
 
+    /// The training settings of the tests.
+    fn settings() -> Settings {
+        Settings {
+            base_model: "microsoft/MiniLM-L12-H384-uncased".to_owned(),
+            epochs: 8,
+            batch_size: 8,
+        }
+    }
+
     /// The catalog of `intents.toml` and its seed training set.
     fn training_set() -> (Catalog, TrainingSet) {
         let catalog: Catalog =
             toml::from_str(include_str!("../../intents.toml")).expect("intents.toml is a catalog");
-        let settings = Settings {
-            base_model: "microsoft/MiniLM-L12-H384-uncased".to_owned(),
-            epochs: 8,
-            batch_size: 8,
-        };
         let areas = ["kitchen".to_owned(), "office".to_owned()];
-        let set = seed_set(&catalog, &areas, &mut StdRng::seed_from_u64(1), settings);
+        let set = seed_set(&catalog, &areas, &mut StdRng::seed_from_u64(1), settings());
         (catalog, set)
     }
 
@@ -808,6 +1029,20 @@ mod tests {
             spans: None,
         };
         assert_eq!(mark_examples(&[first, answer]), [example]);
+    }
+
+    /// AC-13.1b-1.
+    #[test]
+    fn ac_13_1b_1_mark_wins_over_seed() {
+        let mut mark = marked(1, Some(Value::Bad), Some("fan_on"));
+        mark.transcript = "Turn on the lights!".to_owned();
+        let (catalog, _) = training_set();
+        let mut rng = StdRng::seed_from_u64(1);
+        let set = super::training_set(&catalog, Vec::new(), &[mark], &[], &mut rng, settings());
+        let examples = set.examples.into_iter();
+        let same = examples.filter(|example| example.text == "turn on the lights");
+        let labels: Vec<Label> = same.map(|example| example.label).collect();
+        assert_eq!(labels, [intent("fan_on")]);
     }
 
     /// AC-11.5-1.
