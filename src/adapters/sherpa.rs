@@ -142,9 +142,9 @@ fn second_pass(config: &AsrConfig, device: Device) -> anyhow::Result<Option<Offl
     Ok(Some(recognizer))
 }
 
-/// Sets modified beam search with the hotwords score of `config` in `recognizer`, with the BPE
-/// vocabulary of `tokens.txt` in `dir`. Gives the vocabulary file, which sherpa-onnx reads during
-/// the load.
+/// Sets modified beam search with one active path and the hotwords score of `config` in
+/// `recognizer`, with the BPE vocabulary of `tokens.txt` in `dir`. Gives the vocabulary file,
+/// which sherpa-onnx reads during the load.
 ///
 /// # Errors
 ///
@@ -158,6 +158,9 @@ fn beam_search(
     let file = NamedTempFile::new()?;
     fs::write(file.path(), bpe_vocab(&tokens))?;
     recognizer.decoding_method = Some("modified_beam_search".to_owned());
+    // On the GPU host, 4 active paths made a decode about 100 ms slower, and 1 path costs the
+    // same as greedy search.
+    recognizer.max_active_paths = 1;
     recognizer.hotwords_score = config.hotwords_score;
     recognizer.model_config.modeling_unit = Some("bpe".to_owned());
     recognizer.model_config.bpe_vocab = Some(file.path().to_string_lossy().into_owned());
