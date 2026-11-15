@@ -127,6 +127,17 @@ pub trait Reasoner: Send + Sync {
         variables: &BTreeSet<String>,
         n: usize,
     ) -> anyhow::Result<Vec<String>>;
+
+    /// `n` new examples of the label `target` in `[value](slot)` markup, with only the slots
+    /// `slots`, from the seed examples of each intent in `seeds`. For `unknown`, `n` requests
+    /// that match none of the intents in `seeds`.
+    async fn paraphrase(
+        &self,
+        target: &str,
+        seeds: &BTreeMap<String, Vec<String>>,
+        slots: &BTreeSet<String>,
+        n: usize,
+    ) -> anyhow::Result<Vec<String>>;
 }
 
 /// One step of a System Two answer.

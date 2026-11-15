@@ -577,6 +577,10 @@ pub struct TrainConfig {
     pub min_changes: usize,
     /// The share of the examples in the held-out split.
     pub holdout: f64,
+    /// The number of generated examples of each intent.
+    pub paraphrases: usize,
+    /// The number of generated examples of `unknown`.
+    pub unknown_paraphrases: usize,
 }
 
 /// The `[log]` section.
@@ -1805,6 +1809,8 @@ mod tests {
             batch_size: 8,
             min_changes: 20,
             holdout: 0.1,
+            paraphrases: 50,
+            unknown_paraphrases: 300,
         }
     }
 
