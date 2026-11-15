@@ -306,10 +306,10 @@ This phase adds the shared ONNX Runtime, TTS, the audio cache, the commit policy
 - AC-6.7-1: When no second pass is configured, `transcribe` returns `None`.
 - AC-6.7-2 [GPU host]: `transcribe` of `speech("add dentist to my calendar for monday")` gives the normalized text "add dentist to my calendar for monday".
 - AC-6.7-3 [GPU host]: Over 50 different `speech` phrases, 10 of them with numbers, percents or times, the word error rate of the `transcribe` text is equal to or less than the word error rate of the first-pass text.
-- AC-6.7-4 [GPU host]: `transcribe` of a 3 s utterance has a p95 of less than 40 ms.
+- AC-6.7-4 [GPU host]: `transcribe` of a 3 s utterance has a p95 of less than 90 ms. Greedy search took 29 ms. Sub-phase 18.17 raised the budget from 40 ms for beam search with hotwords.
 - AC-6.7-5 [GPU host]: With `device = cuda`, the second pass runs on the CUDA execution provider.
 - AC-6.7-6: When the second-pass text is "Set the lights to 30% at 7.30 p.m. and the heat to 72.5 at 3 p.m.", the normalized converted text is "set the lights to thirty percent at seven thirty pm and the heat to seventy two point five at three pm".
-- AC-6.7-7 [GPU host]: Over 20 runs of `transcribe`, each with a different length, the p95 is 50 ms or less. The runs decode the first 1.5 s to 3.4 s, in 0.1 s steps, of `speech("add dentist to my calendar for monday")` with zeros to 3.4 s.
+- AC-6.7-7 [GPU host]: Over 20 runs of `transcribe`, each with a different length, the p95 is 90 ms or less (50 ms before sub-phase 18.17). The runs decode the first 1.5 s to 3.4 s, in 0.1 s steps, of `speech("add dentist to my calendar for monday")` with zeros to 3.4 s.
 - AC-6.7-8: When the samples are shorter than 4 s, the second-pass input is the samples, then zeros up to 4 s of audio. When the samples are longer than 4 s and shorter than `max_utterance_ms`, the input is the samples, then zeros up to `max_utterance_ms` of audio.
 
 **Proofs.**
