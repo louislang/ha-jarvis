@@ -28,6 +28,9 @@ const CONFIG_TOPIC: &str = "homeassistant/sensor/jarvis/status/config";
 /// The wait after a connection error.
 const RETRY: Duration = Duration::from_secs(5);
 
+/// The longest wait for the broker to close the connection after `DISCONNECT`.
+const CLOSE_WAIT: Duration = Duration::from_secs(5);
+
 /// The options of the broker at `url` (`mqtt://host:port`) with `username` and `password`: the
 /// client ID `jarvis`, a keep-alive of 30 s and the last will `offline`.
 ///
@@ -66,13 +69,22 @@ pub async fn publish(options: MqttOptions, status: watch::Receiver<Status>) {
     );
 }
 
-/// Polls `events` until `DISCONNECT` is sent, and notifies `connected` at each `ConnAck`. After a
-/// connection error, waits [`RETRY`].
+/// Polls `events` until the broker closes the connection after `DISCONNECT`, at most
+/// [`CLOSE_WAIT`], and notifies `connected` at each `ConnAck`. After a connection error, waits
+/// [`RETRY`].
 async fn poll(mut events: EventLoop, connected: &Notify) {
     loop {
         match events.poll().await {
             Ok(Event::Incoming(Packet::ConnAck(_))) => connected.notify_one(),
-            Ok(Event::Outgoing(Outgoing::Disconnect)) => return,
+            // A close with unread acks resets the connection, and the broker can then lose
+            // `DISCONNECT` and publish the will.
+            Ok(Event::Outgoing(Outgoing::Disconnect)) => {
+                let closed = async { while events.poll().await.is_ok() {} };
+                if tokio::time::timeout(CLOSE_WAIT, closed).await.is_err() {
+                    tracing::warn!("the MQTT broker did not close the connection");
+                }
+                return;
+            }
             Ok(_) => {}
             Err(error) => {
                 tracing::warn!("MQTT connection error: {error}");
@@ -132,6 +144,10 @@ fn discovery() -> serde_json::Value {
 mod tests {
     use std::net::SocketAddr;
 
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+    use tokio::net::TcpStream;
     use tokio::task::JoinHandle;
 
     use super::*;
@@ -229,6 +245,60 @@ mod tests {
         drop(sender);
         task.await?;
         assert_eq!(retained(broker).await?.payload, payload("restarting"));
+        Ok(())
+    }
+
+    /// The `CONNACK` packet that accepts a connection.
+    const CONNACK: [u8; 4] = [0x20, 2, 0, 0];
+
+    /// The `DISCONNECT` packet.
+    const DISCONNECT: [u8; 2] = [0xE0, 0];
+
+    /// A `PUBLISH` with `QoS` 1 and packet ID 1 of the payload `x` on the topic `late`.
+    const LATE_PUBLISH: [u8; 11] = [0x32, 9, 0, 4, b'l', b'a', b't', b'e', 0, 1, b'x'];
+
+    /// The `PUBACK` of packet ID 1.
+    const PUBACK: [u8; 4] = [0x40, 2, 0, 1];
+
+    /// Reads `stream` until the bytes read end with `end`.
+    async fn read_until(stream: &mut TcpStream, end: &[u8]) -> anyhow::Result<()> {
+        let mut read = Vec::new();
+        while !read.ends_with(end) {
+            let mut chunk = [0; 1024];
+            let count = stream.read(&mut chunk).await?;
+            anyhow::ensure!(count > 0, "the stream ended before {end:?}");
+            read.extend_from_slice(&chunk[..count]);
+        }
+        Ok(())
+    }
+
+    /// Starts the adapter with the status `restarting` on a fake broker and accepts its
+    /// connection. Gives the sender of the status, the adapter task and the connection.
+    async fn fake_broker() -> anyhow::Result<(watch::Sender<Status>, JoinHandle<()>, TcpStream)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("mqtt://{}", listener.local_addr()?);
+        let (sender, receiver) = watch::channel(status(State::Restarting));
+        let task = tokio::spawn(publish(options(&url, "jarvis", "secret")?, receiver));
+        let (mut stream, _) = listener.accept().await?;
+        // The client sends nothing after `CONNECT` until it gets `CONNACK`.
+        anyhow::ensure!(stream.read(&mut [0; 1024]).await? > 0, "no CONNECT");
+        stream.write_all(&CONNACK).await?;
+        Ok((sender, task, stream))
+    }
+
+    /// AC-12.9c-4: the adapter reads until the broker closes the connection after `DISCONNECT`,
+    /// so a close with unread acks does not reset the connection before the broker reads it.
+    #[tokio::test]
+    async fn ac_12_9c_4_disconnect_reads_until_the_broker_closes() -> anyhow::Result<()> {
+        let (sender, task, mut stream) = fake_broker().await?;
+        drop(sender);
+        read_until(&mut stream, &DISCONNECT).await?;
+        stream.write_all(&LATE_PUBLISH).await?;
+        let mut answer = [0; 4];
+        stream.read_exact(&mut answer).await?;
+        assert_eq!(answer, PUBACK, "the answer after DISCONNECT");
+        drop(stream);
+        task.await?;
         Ok(())
     }
 }
