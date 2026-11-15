@@ -213,7 +213,7 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
 **Model.**
 
 - `context_text(area) -> String`: `"area: <area or none>"`. The parameter `habit_lines`, the helper `join`, the spec function `joined` and the test of AC-3.3-2 go away. The spec function `context_spec` loses its `habit_lines` parameter.
-- `sample_context` (sub-phase 3.3), `handle` (sub-phase 5.3), the speculative prediction (sub-phase 6.8) and the test of AC-3.4-2 call `context_text` with the area only. Thus the training set file of the `dataset` command, the fixture model and the training sets of sub-phase 13.1 get the new context.
+- `sample_context` (sub-phase 3.3), `handle` (sub-phase 5.3), the speculative prediction (sub-phase 6.8) and the test of AC-3.4-2 call `context_text` with the area only. Thus the training set file of the `dataset` command, the fixture model and the training sets of sub-phase 13.1b get the new context.
 - `train/train.py` gives the context to the tokenizer as one text segment, and it does not parse it. Thus it does not change. The fixtures of `train/test_train.py` use the new context, as the training set file does.
 - The tests that give a context directly use the new context: the adapter tests of `src/adapters/onnx.rs`, and the tests of AC-5.3-3, AC-5.4c-1 and AC-6.8-11.
 - The training set file changes, so `just fixture-model` and the CI job `fixture-model` train the fixture model again (sub-phase 3.9). Every criterion that uses the fixture model must pass with the new model. When one fails, change the specification first.

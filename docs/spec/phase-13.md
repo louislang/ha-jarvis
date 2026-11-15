@@ -4,26 +4,25 @@ This phase improves the System One model. Jarvis builds the training set, trains
 
 ---
 
-### 13.1 Mark Examples and Training Set
+### 13.1 Mark Examples
 
-**Goal:** Turn marks into labeled examples and build the full training set from seeds, generated examples and marks. Your marks become training data. Sub-phase 14.11 adds the active learned intents.
+**Goal:** Turn marks into labeled examples. Your marks become training data.
 
 - **Implements:** G15, G16. **Depends on:** 12.9g.
 - **Files:** modify `src/domain/training.rs`.
 
 **Model.**
 
-- `mark_examples(marked) -> Vec<Example>`:
+- `mark_examples(marked) -> Vec<Example>`. `marked` holds the marked interactions and the first interaction that each marked dialog answer links to (the caller gets it with `get`, sub-phase 12.5b).
   - A good action mark gives an `Intent` example for the selected intent, with the logged slots as spans.
   - A bad action mark with a correction gives an `Intent` example for the correction, with `spans = None`.
-  - A bad action mark without a correction gives a `Not` example for the selected intent.
+  - A bad action mark without a correction gives a `Not` example for the selected intent, with `spans = None`.
   - A bad action mark with the correction `unknown` gives an `Intent(unknown)` example.
-  - A good action mark on a System Two interaction gives an `Intent(unknown)` example, so System One keeps sending it to System Two.
+  - A good action mark on a System Two interaction gives an `Intent(unknown)` example with `spans = None`, so System One keeps sending it to System Two.
   - An interaction without an action mark gives no example.
   - A mark example uses the normalized transcript and the logged model context.
-  - A mark on a dialog answer (an interaction with `link`) gives the example with the normalized transcript and the context of the first interaction of the dialog, and `spans = None`. The answer alone ("the kitchen") is not a request.
+  - A mark on a dialog answer (an interaction with `link`) gives the example with the normalized transcript and the context of the first interaction of the dialog, and `spans = None`. The answer alone ("the kitchen") is not a request. When `marked` does not hold the first interaction, the mark gives no example.
 - Request habits are not a model input (`01-architecture.md` decision 9), so `sample_context` (sub-phase 3.3) does not change.
-- `training_set(catalog, generated, marked, areas, rng, settings) -> TrainingSet`. When two examples have the same normalized text and different labels, the newest mark wins, then a seed, then a generated example.
 
 **Acceptance criteria.**
 
@@ -31,15 +30,38 @@ This phase improves the System One model. Jarvis builds the training set, trains
 - AC-13.1-2: When an interaction has a bad action mark with the correction `tv_show`, `mark_examples` returns a `tv_show` example with `spans = None`.
 - AC-13.1-3: When an interaction has a bad action mark without a correction, `mark_examples` returns a `Not` example for the selected intent.
 - AC-13.1-4: When an interaction has no action mark, `mark_examples` returns no example.
-- AC-13.1-5: When a mark and a seed have the same normalized text and different labels, the training set has only the mark example.
 - AC-13.1-6: When a bad action mark has the correction `unknown`, or a good action mark is on a System Two interaction, `mark_examples` returns an `Intent(unknown)` example.
 - AC-13.1-7: When a good action mark is on a dialog answer, the example has the text and the context of the first interaction and `spans = None`.
 
+AC-13.1-5 moves to sub-phase 13.1b as AC-13.1b-1.
+
 **Proofs.**
 
-- P-13.1-1 to P-13.1-4, P-13.1-6. Ensures: `mark_examples` is a total function of the action mark and the decision. Argument: it is a `filter_map` over the interactions with a `match` on `(value, correction, decision)`. The arms are `(Good, _, System Two)`, `(Good, _, _)`, `(Bad, Some(unknown), _)`, `(Bad, Some(k), _)`, `(Bad, None, _)` and no mark. They cover every case once.
-- P-13.1-5 (AC-13.1-5). Ensures: of the examples with the same normalized text and different labels, the set keeps only the one with the highest precedence: the newest mark, then a seed, then a generated example. Argument: the builder groups the examples by normalized text and keeps the maximum of each group by the key `(source rank, mark time)`.
+- P-13.1-1 to P-13.1-4, P-13.1-6. Ensures: `mark_examples` is a total function of the action mark and the decision. Argument: it is a `filter_map` over the interactions with a `match` on `(value, correction, decision)`. The arms are `(Good, _, System Two)`, `(Good, _, _)`, `(Bad, Some(k), _)` (also for `k = unknown`), `(Bad, None, _)` and no mark. They cover every case once.
 - P-13.1-7. Ensures: an example from a dialog answer has the text and the context of the first interaction and no spans. Argument: before the `match`, the builder replaces the text and the context with those of the interaction that `link` names, and sets `spans = None`.
+
+---
+
+### 13.1b Training Set
+
+**Goal:** Build the full training set from seeds, generated examples and marks. Sub-phase 14.11 adds the active learned intents.
+
+- **Implements:** G16. **Depends on:** 13.1.
+- **Files:** modify `src/domain/training.rs`.
+
+**Model.**
+
+- `training_set(catalog, generated, marked, areas, rng, settings) -> TrainingSet`: the examples of `seed_set` (sub-phase 3.3b), `generated` (labeled examples) and `mark_examples(marked)`. The text of each example is normalized, so the builder compares the texts.
+- Precedence: a mark is higher than a seed, and a seed is higher than a generated example. Of two marks, the newer mark is higher. Of two examples with the same source and time, the later one in the order generated, seeds, marks is higher.
+- The set keeps an example only when no example with the same text and a different label is higher.
+
+**Acceptance criteria.**
+
+- AC-13.1b-1: When a mark and a seed have the same normalized text and different labels, the training set has only the mark example.
+
+**Proofs.**
+
+- P-13.1b-1 (AC-13.1b-1). Ensures: of the examples with the same normalized text and different labels, the set keeps only the one with the highest precedence: the newest mark, then a seed, then a generated example. Argument: the builder keeps an example only when no other example has the same text, a different label and a higher key `(source rank, mark time, position)`.
 
 ---
 
@@ -47,7 +69,7 @@ This phase improves the System One model. Jarvis builds the training set, trains
 
 **Goal:** Add the accuracy measures and the accept rule on the held-out split of sub-phase 3.3. A new model can be compared fairly with the old one on the same examples.
 
-- **Implements:** G16. **Depends on:** 13.1.
+- **Implements:** G16. **Depends on:** 13.1b.
 - **Files:** modify `src/domain/training.rs`.
 
 **Model.**
