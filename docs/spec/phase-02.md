@@ -153,7 +153,7 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 
 **Model.**
 
-- After a disconnect, the adapter connects again with backoff (100 ms, doubled, at most 2 s). After `Ready` and the new subscriptions, it gives `Reconnected`.
+- After a disconnect, the adapter connects again with backoff (100 ms, doubled, at most 2 s). After `Ready` and the new subscriptions of each connection, also the first, it gives `Reconnected`.
 - When the first connection at `start` fails, the adapter tries again with the same backoff.
 - Every `ha.ping_interval_s`, the adapter sends `ping`. No `pong` within `ha.request_timeout_ms` is a disconnect. Thus a dead TCP connection does not leave the cache stale. This sub-phase adds `ha.ping_interval_s`.
 - A connection that reaches `Ready` resets the backoff attempt to 0.
@@ -344,11 +344,11 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 - **Files:** create `src/app/background.rs`, `src/testing/fakes.rs`. Modify `src/lib.rs`, `Cargo.toml`.
 - **Quint:** `cache_sync.qnt` (conformance).
 
-**Model.** `sync(home, cache: ArcSwap<StateCache>)`: take the `events` stream first, then load the snapshot. A failed `snapshot` keeps the old cache, logs one `warn` event with the error, and runs again after a delay: 1 s, doubled after each failure, at most 30 s. The delay starts at 1 s again after a successful load. Events wait in the stream during the retries, as during a load. Events that arrive during a load wait in the stream and apply after it. For each event: `StateChanged` applies it, `RegistryUpdated` and `Reconnected` load a new snapshot. `FakeHome` returns `house.json`, sends scripted events, records calls, can delay calls and can fail the next `snapshot` calls.
+**Model.** `sync(home, cache: ArcSwap<StateCache>)`: take the `events` stream, then load the snapshot at the first `Reconnected`. A request before the first connection gets a disconnect error (sub-phase 2.4), so sync does not load the snapshot before it. A failed `snapshot` keeps the old cache, logs one `warn` event with the error, and runs again after a delay: 1 s, doubled after each failure, at most 30 s. The delay starts at 1 s again after a successful load. Events wait in the stream during the retries, as during a load. Events that arrive during a load wait in the stream and apply after it. For each event: `StateChanged` applies it, `RegistryUpdated` and `Reconnected` load a new snapshot. `FakeHome` returns `house.json`, sends scripted events, records calls, can delay calls and can fail the next `snapshot` calls.
 
 **Acceptance criteria.**
 
-- AC-2.9-1: When sync starts, the cache contains all states and registries from `FakeHome`.
+- AC-2.9-1: When sync starts, `FakeHome` records no `snapshot` call. When `FakeHome` then sends `Reconnected`, the cache contains all states and registries from `FakeHome`.
 - AC-2.9-2: When `FakeHome` sends a state change, the cache shows the new state before virtual time advances.
 - AC-2.9-3: When `FakeHome` sends `RegistryUpdated`, `FakeHome` records a second `snapshot` call.
 - AC-2.9-4: When `FakeHome` sends `Reconnected`, the cache replaces all old data with the new snapshot.
@@ -360,7 +360,7 @@ This phase adds the `Home` port, its HA adapter, the hot cache, its Quint model 
 
 **Proofs.**
 
-- P-2.9-1, P-2.9-3, P-2.9-4. Argument: the event loop is a match on the event type. `RegistryUpdated` and `Reconnected` both call `load(snapshot())`, and `load` replaces all data (P-2.7-1).
+- P-2.9-1, P-2.9-3, P-2.9-4. Argument: sync calls `snapshot` only in the event loop, which is a match on the event type. `RegistryUpdated` and `Reconnected` both call `load(snapshot())`, and `load` replaces all data (P-2.7-1).
 - P-2.9-2. Argument: the event loop applies each event when it is received, with no timer between receive and apply.
 - P-2.9-6. Argument: the stream exists before the load, so the event waits in it and applies after the load (P-2.6-2).
 - P-2.9-7, P-2.9-9. Argument: the `Err` arm of the load sleeps for the delay, doubles it up to 30 s and calls `snapshot` again. The event loop reads no event during the load.
