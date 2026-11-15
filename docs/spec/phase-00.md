@@ -438,6 +438,8 @@ The push to `main` after a merge does not run the job either. `just merge` merge
 - `ci.yml` runs on `push` only for the branch `main`. `release.yml` runs on `push` only for tags, and in its call to `ci.yml`, `github.event_name` is `push` and `github.ref` is the tag.
 - The `if` of `gpu-test` also requires `github.ref != 'refs/heads/main'`. Thus the job skips only the push run on `main`. Every other job of the push run still runs.
 
+A hung test must not keep live Jarvis stopped. The step that runs `just gpu-test` has `timeout-minutes: 30`, and the step with `if: always()` then starts `jarvis` again. A normal run of the step takes about 10 minutes. The job `rust-test` has `timeout-minutes: 40`. A normal run takes about 15 minutes.
+
 **Acceptance criteria.**
 
 - AC-0.13-1: When `ci.yml` is parsed, the job `gpu-test` runs on `[self-hosted, linux, gpu]` and runs `just gpu-test`. Its `if` is `github.ref != 'refs/heads/main' && needs.fixture-model.outputs.docs-only != 'true' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)`.
@@ -447,10 +449,11 @@ The push to `main` after a merge does not run the job either. `just merge` merge
 - AC-0.13-5: When the step `changes` runs in a temporary repository after a commit that adds only `docs/spec/phase-00.md`, `README.md`, `CLAUDE.md` and `.github/pull_request_template.md`, it writes `docs-only=true`. When the commit also adds `src/main.rs`, or only renames `src/lib.rs` to `docs/lib.md`, it writes `docs-only=false`.
 - AC-0.13-6: When `ci.yml` is parsed, the job `fixture-model` checks out with `fetch-depth: 2`, runs the step `changes` only on `pull_request`, and has the output `docs-only` of that step.
 - AC-0.13-7: When `ci.yml` and `release.yml` are parsed, `ci.yml` runs on `push` only for the branch `main`, `release.yml` runs on `push` only for tags `v*` and calls `ci.yml`, and the first condition of the `if` of `gpu-test` is `github.ref != 'refs/heads/main'`.
+- AC-0.13-8: When `ci.yml` is parsed, the step of the job `gpu-test` that runs `just gpu-test` has `timeout-minutes: 30`, and the job `rust-test` has `timeout-minutes: 40`.
 
 **Proofs.**
 
-- P-0.13-1 to P-0.13-7. Evidence: test.
+- P-0.13-1 to P-0.13-8. Evidence: test.
 
 **Field log.** On the GPU host, install the NVIDIA driver, CUDA 12 and cuDNN 9. Register the GitHub Actions runner with the labels `self-hosted`, `linux` and `gpu`. Create the systemd unit `jarvis` and its environment file (`01-architecture.md` section 10). Until sub-phase 5.4, `jarvis` prints its usage and exits, so `stop` and `start` succeed. Let the runner user run `systemctl stop jarvis` and `systemctl start jarvis` without a password. Record that the `gpu-test` job runs on the runner.
 
