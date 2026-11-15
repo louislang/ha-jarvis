@@ -1112,6 +1112,22 @@ fn ac_0_13_7_gpu_test_skips_only_push_to_main() {
     );
 }
 
+/// The step that runs `just gpu-test` stops after 30 minutes, and the job `rust-test` after 40.
+#[test]
+fn ac_0_13_8_test_jobs_have_time_limits() {
+    let ci = yaml(".github/workflows/ci.yml");
+    let steps = ci["jobs"]["gpu-test"]["steps"]
+        .as_sequence()
+        .expect("the job exists");
+    let test = steps
+        .iter()
+        .find(|step| step["run"].as_str() == Some("just gpu-test"));
+    let limit = test.and_then(|step| step["timeout-minutes"].as_u64());
+    assert_eq!(limit, Some(30), "the gpu-test step limit");
+    let limit = ci["jobs"]["rust-test"]["timeout-minutes"].as_u64();
+    assert_eq!(limit, Some(40), "the rust-test job limit");
+}
+
 /// `gpu-test` runs the ignored tests on CUDA, and `check` runs it only when `JARVIS_DEVICE=cuda` is set.
 #[test]
 fn ac_0_13_2_check_runs_gpu_test_on_cuda() {
