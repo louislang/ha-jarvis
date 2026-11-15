@@ -33,6 +33,9 @@ pub struct Intent {
     pub kind: Kind,
     /// The seed examples in `[value](slot)` markup.
     pub examples: Vec<String>,
+    /// The command verbs that start a request, with a capital first letter.
+    #[serde(default)]
+    pub verbs: Vec<String>,
     /// True when the intent acts for the speaker.
     #[serde(default)]
     pub needs_speaker: bool,
@@ -673,5 +676,21 @@ mod tests {
             service.starts_with("lock.")
         });
         assert_eq!(locking, None, "no intent has a service in the lock domain");
+    }
+
+    /// AC-18.18-4.
+    #[test]
+    fn ac_18_18_4_intents_toml_has_the_command_verbs() {
+        let catalog = catalog();
+        let verbs = |name: &str| {
+            let intent = catalog.intents.iter().find(|intent| intent.name == name);
+            intent.map(|intent| intent.verbs.join("/"))
+        };
+        assert_eq!(verbs("music_resume").as_deref(), Some("Resume/Unpause"));
+        assert_eq!(verbs("lights_on").as_deref(), Some("Turn on"));
+        let all: Vec<&String> = catalog.intents.iter().flat_map(|i| &i.verbs).collect();
+        for short in ["Play", "Stop", "Start", "Set", "Put", "Make"] {
+            assert!(!all.iter().any(|verb| *verb == short), "{short} is a verb");
+        }
     }
 }
