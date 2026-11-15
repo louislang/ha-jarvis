@@ -5,6 +5,7 @@ unknown_examples = ["what is the meaning of life", "tell me about rome", "how fa
 name = "lights_on"
 kind = "command"
 examples = ["turn on the lights", "turn on the [kitchen](area) lights", "lights on", "switch the lights on in the [living room](area)", "can you turn the [office](area) lights on"]
+verbs = ["Turn on"]
 service = "homeassistant.turn_on"
 target = "entities"
 select = [{ domain = "light" }, { domain = "switch", name = "light" }]
@@ -13,6 +14,7 @@ select = [{ domain = "light" }, { domain = "switch", name = "light" }]
 name = "fan_on"
 kind = "command"
 examples = ["turn on the fan", "turn on the [office](area) fan", "fan on please", "start the fan"]
+verbs = ["Turn on"]
 service = "homeassistant.turn_on"
 target = "entity"
 select = [{ domain = "fan" }, { domain = "switch", name = "fan" }]
@@ -145,6 +147,7 @@ data = { media_id = "{{ media }}", radio_mode = "{{ true }}" }
 name = "queue_music"
 kind = "command"
 examples = ["add [yesterday](media) to the queue", "queue [abbey road](media)", "put [hey jude](media) in the queue"]
+verbs = ["Queue"]
 service = "music_assistant.play_media"
 target = "entity"
 select = [{ domain = "media_player", device_class = "speaker" }]
@@ -162,6 +165,7 @@ select = [{ domain = "media_player", device_class = "speaker" }]
 name = "music_pause"
 kind = "command"
 examples = ["pause the music", "stop the music", "pause the music in the [kitchen](area)", "stop the music [downstairs](area)", "pause the music on the [downstairs speakers](area)"]
+verbs = ["Pause"]
 service = "media_player.media_pause"
 target = "entity"
 select = [{ domain = "media_player", device_class = "speaker" }]
@@ -170,6 +174,7 @@ select = [{ domain = "media_player", device_class = "speaker" }]
 name = "volume_up"
 kind = "command"
 examples = ["turn it up", "volume up", "turn up the music", "make the music louder", "turn up the music on the [downstairs speakers](area)"]
+verbs = ["Turn up"]
 service = "media_player.volume_up"
 target = "entity"
 select = [{ domain = "media_player", device_class = "speaker" }]
@@ -178,6 +183,7 @@ select = [{ domain = "media_player", device_class = "speaker" }]
 name = "volume_down"
 kind = "command"
 examples = ["turn it down", "volume down", "turn down the music", "make the music quieter"]
+verbs = ["Turn down"]
 service = "media_player.volume_down"
 target = "entity"
 select = [{ domain = "media_player", device_class = "speaker" }]
@@ -204,6 +210,7 @@ data = { media_content_type = "movie", media_content_id = 'plex://{"library_name
 name = "continue_show"
 kind = "command"
 examples = ["continue [the office](show)", "play the next episode of [bluey](show)", "keep watching [severance](show)", "next episode of [the office](show)"]
+verbs = ["Continue", "Keep watching"]
 service = "media_player.play_media"
 target = "entity"
 select = [{ domain = "media_player", name = "tv" }]
@@ -222,6 +229,7 @@ data = { media_content_type = "episode", media_content_id = 'plex://{"library_na
 name = "tv_pause"
 kind = "command"
 examples = ["pause the tv", "pause the show", "pause the movie"]
+verbs = ["Pause"]
 service = "media_player.media_pause"
 target = "entity"
 select = [{ domain = "media_player", name = "tv" }]
@@ -230,6 +238,7 @@ select = [{ domain = "media_player", name = "tv" }]
 name = "tv_skip"
 kind = "command"
 examples = ["skip ahead", "skip ahead on the tv", "fast forward the movie"]
+verbs = ["Fast forward"]
 service = "media_player.media_seek"
 target = "entity"
 select = [{ domain = "media_player", name = "tv" }]
@@ -253,6 +262,7 @@ plugin = "get_new_shows"
 name = "lights_off"
 kind = "command"
 examples = ["turn off the lights", "turn off the [kitchen](area) lights", "lights off", "turn the lights off", "switch the lights off in the [living room](area)", "can you turn the [office](area) lights off"]
+verbs = ["Turn off"]
 service = "homeassistant.turn_off"
 target = "entities"
 select = [{ domain = "light" }, { domain = "switch", name = "light" }]
@@ -261,6 +271,7 @@ select = [{ domain = "light" }, { domain = "switch", name = "light" }]
 name = "fan_off"
 kind = "command"
 examples = ["turn off the fan", "turn off the [office](area) fan", "fan off please", "turn the fan off", "stop the fan"]
+verbs = ["Turn off"]
 service = "homeassistant.turn_off"
 target = "entity"
 select = [{ domain = "fan" }, { domain = "switch", name = "fan" }]
@@ -278,6 +289,7 @@ data = { temperature = "{{ entity.attributes.temperature + 2 }}" }
 name = "music_resume"
 kind = "command"
 examples = ["unpause the music", "resume the music", "resume the music in the [kitchen](area)", "start the music again"]
+verbs = ["Resume", "Unpause"]
 service = "media_player.media_play"
 target = "entity"
 select = [{ domain = "media_player", device_class = "speaker" }]
@@ -294,6 +306,7 @@ select = [{ domain = "media_player", device_class = "speaker" }]
 name = "tv_off"
 kind = "command"
 examples = ["turn off the tv", "turn the tv off", "switch off the tv", "tv off"]
+verbs = ["Turn off"]
 service = "media_player.turn_off"
 target = "entity"
 select = [{ domain = "media_player", name = "tv" }]

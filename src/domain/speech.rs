@@ -1,11 +1,15 @@
-//! Audio type, audio chunks, audio duration, commit policy, sentence split and audio correlation.
+//! Audio type, audio chunks, audio duration, commit policy, sentence split, audio correlation and
+//! hotword list.
 
 use std::time::Duration;
 
 use jiff::Timestamp;
 use vstd::prelude::*;
 
+use crate::domain::catalog::Catalog;
 use crate::domain::intent;
+use crate::domain::select;
+use crate::domain::state_cache::StateCache;
 
 /// 16-bit mono PCM audio.
 #[verus_verify]
@@ -277,7 +281,203 @@ fn search(utterances: &[Utterance], text: &str) -> (Option<usize>, usize) {
     (found, count)
 }
 
+/// The domains of the entities whose names and aliases are hotwords.
+#[verus_verify]
+#[expect(
+    clippy::redundant_static_lifetimes,
+    reason = "Verus makes a function of the constant, which needs the lifetime"
+)]
+pub const HOTWORD_DOMAINS: [&'static str; 10] = [
+    "automation",
+    "climate",
+    "cover",
+    "fan",
+    "light",
+    "lock",
+    "media_player",
+    "scene",
+    "script",
+    "switch",
+];
+
+/// The second-pass hotwords: the names and aliases of the areas, the names and aliases of the
+/// entities of `HOTWORD_DOMAINS` that are not skipped, the verbs of `catalog`, then `music`.
+#[verus_spec(words =>
+    ensures
+        views(words@) == area_words(cache.areas@, cache.areas@.len() as int) + entity_words(*cache, cache.entities@, cache.entities@.len() as int)
+            + verb_words(catalog.intents@, catalog.intents@.len() as int) + views(music@),
+)]
+#[must_use]
+pub fn hotwords(cache: &StateCache, catalog: &Catalog, music: &[String]) -> Vec<String> {
+    let mut words = Vec::new();
+    push_area_words(&mut words, cache);
+    push_entity_words(&mut words, cache);
+    push_verb_words(&mut words, catalog);
+    push_words(&mut words, music);
+    proof! {
+        assert(views(Seq::empty()) =~= Seq::empty());
+    }
+    words
+}
+
+/// Appends the name and then the aliases of each area of `cache` to `words`.
+#[verus_spec(
+    ensures
+        views(final(words)@) == views(old(words)@) + area_words(cache.areas@, cache.areas@.len() as int),
+)]
+fn push_area_words(words: &mut Vec<String>, cache: &StateCache) {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= cache.areas@.len(),
+            views(words@) == views(old(words)@) + area_words(cache.areas@, index as int),
+        decreases cache.areas@.len() - index,
+    ))]
+    while index < cache.areas.len() {
+        let area = &cache.areas[index];
+        push_named(words, area.name.as_str(), &area.aliases);
+        index += 1;
+    }
+}
+
+/// Appends the name and then the aliases of each entity of `cache` that is in a domain of
+/// `HOTWORD_DOMAINS` and is not skipped to `words`.
+#[verus_spec(
+    ensures
+        views(final(words)@) == views(old(words)@) + entity_words(*cache, cache.entities@, cache.entities@.len() as int),
+)]
+fn push_entity_words(words: &mut Vec<String>, cache: &StateCache) {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= cache.entities@.len(),
+            views(words@) == views(old(words)@) + entity_words(*cache, cache.entities@, index as int),
+        decreases cache.entities@.len() - index,
+    ))]
+    while index < cache.entities.len() {
+        let entity = &cache.entities[index];
+        if is_hotword_domain(entity.entity_id.0.as_str()) && !select::is_skipped(cache, entity) {
+            push_named(words, entity.name.as_str(), &entity.aliases);
+        }
+        index += 1;
+    }
+}
+
+/// Appends the verbs of each intent of `catalog` to `words`.
+#[verus_spec(
+    ensures
+        views(final(words)@) == views(old(words)@) + verb_words(catalog.intents@, catalog.intents@.len() as int),
+)]
+fn push_verb_words(words: &mut Vec<String>, catalog: &Catalog) {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= catalog.intents@.len(),
+            views(words@) == views(old(words)@) + verb_words(catalog.intents@, index as int),
+        decreases catalog.intents@.len() - index,
+    ))]
+    while index < catalog.intents.len() {
+        push_words(words, &catalog.intents[index].verbs);
+        index += 1;
+    }
+}
+
+/// Appends `name` and then `aliases` to `words`.
+#[verus_spec(
+    ensures
+        views(final(words)@) == views(old(words)@) + seq![name@] + views(aliases@),
+)]
+fn push_named(words: &mut Vec<String>, name: &str, aliases: &[String]) {
+    words.push(name.to_owned());
+    proof! {
+        assert(views(words@) =~= views(old(words)@) + seq![name@]);
+    }
+    push_words(words, aliases);
+}
+
+/// Appends a copy of each phrase of `phrases` to `words`.
+#[verus_spec(
+    ensures
+        views(final(words)@) == views(old(words)@) + views(phrases@),
+)]
+fn push_words(words: &mut Vec<String>, phrases: &[String]) {
+    words.extend_from_slice(phrases);
+    proof! {
+        assert(views(words@) =~= views(old(words)@) + views(phrases@));
+    }
+}
+
+/// True when the entity ID `entity_id` is in a domain of `HOTWORD_DOMAINS`.
+#[verus_spec(found =>
+    ensures
+        found == hotword_domain(entity_id@),
+)]
+fn is_hotword_domain(entity_id: &str) -> bool {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= HOTWORD_DOMAINS@.len(),
+            forall|earlier: int| 0 <= earlier < index
+                ==> !crate::domain::state_cache::in_domain(entity_id@, #[trigger] HOTWORD_DOMAINS@[earlier]@),
+        decreases HOTWORD_DOMAINS@.len() - index,
+    ))]
+    while index < HOTWORD_DOMAINS.len() {
+        if StateCache::in_domain(entity_id, HOTWORD_DOMAINS[index]) {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// The config entry of the first entity of `cache` with a config entry and a state with the
+/// attribute `mass_player_type`: the config entry of Music Assistant.
+#[verus_spec(entry =>
+    ensures
+        match entry {
+            Some(found) => exists|index: int| #[trigger] first_music(*cache, index)
+                && (cache.entities@[index].config_entry_id matches Some(id) && id@ == found@),
+            None => forall|index: int| 0 <= index < cache.entities@.len()
+                ==> !music_player(*cache, #[trigger] cache.entities@[index]),
+        },
+)]
+#[must_use]
+pub fn music_entry(cache: &StateCache) -> Option<&str> {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= cache.entities@.len(),
+            forall|earlier: int| 0 <= earlier < index
+                ==> !music_player(*cache, #[trigger] cache.entities@[earlier]),
+        decreases cache.entities@.len() - index,
+    ))]
+    while index < cache.entities.len() {
+        let entity = &cache.entities[index];
+        let typed = match cache.states.get(entity.entity_id.0.as_str()) {
+            Some(state) => state.attributes.get("mass_player_type").is_some(),
+            None => false,
+        };
+        match &entity.config_entry_id {
+            Some(entry) if typed => {
+                proof! {
+                    assert(first_music(*cache, index as int));
+                }
+                return Some(entry.as_str());
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
 verus! {
+
+broadcast use {
+    crate::domain::contracts::axiom_arc_str_obeys_cmp,
+    crate::domain::contracts::axiom_arc_str_borrow,
+    crate::domain::contracts::axiom_arc_str_contains_borrowed_key,
+    crate::domain::contracts::axiom_arc_str_maps_borrowed_key,
+};
 
 /// True when `c` ends a sentence before a space.
 pub open spec fn mark(c: char) -> bool {
@@ -526,6 +726,74 @@ proof fn lemma_removed(utterances: Seq<Utterance>, position: int, keep: spec_fn(
     }
 }
 
+/// The texts of `strings`.
+pub open spec fn views(strings: Seq<String>) -> Seq<Seq<char>> {
+    crate::domain::catalog::views(strings)
+}
+
+/// The name and then the aliases of each of the first `count` areas of `areas`, in order.
+pub open spec fn area_words(areas: Seq<crate::domain::state::Area>, count: int) -> Seq<Seq<char>>
+    decreases count,
+{
+    if count <= 0 {
+        Seq::empty()
+    } else {
+        let area = areas[count - 1];
+        area_words(areas, count - 1) + seq![area.name@] + views(area.aliases@)
+    }
+}
+
+/// The name and then the aliases of each of the first `count` entities of `entities` that is in
+/// a domain of `HOTWORD_DOMAINS` and is not skipped in `cache`, in order.
+pub open spec fn entity_words(cache: StateCache, entities: Seq<crate::domain::state::Entity>, count: int) -> Seq<Seq<char>>
+    decreases count,
+{
+    if count <= 0 {
+        Seq::empty()
+    } else {
+        let entity = entities[count - 1];
+        let earlier = entity_words(cache, entities, count - 1);
+        if hotword_domain(entity.entity_id.0@) && !select::skipped(cache, entity) {
+            earlier + seq![entity.name@] + views(entity.aliases@)
+        } else {
+            earlier
+        }
+    }
+}
+
+/// The verbs of each of the first `count` intents of `intents`, in order.
+pub open spec fn verb_words(intents: Seq<crate::domain::catalog::Intent>, count: int) -> Seq<Seq<char>>
+    decreases count,
+{
+    if count <= 0 {
+        Seq::empty()
+    } else {
+        verb_words(intents, count - 1) + views(intents[count - 1].verbs@)
+    }
+}
+
+/// True when the entity ID `entity_id` is in a domain of `HOTWORD_DOMAINS`.
+pub open spec fn hotword_domain(entity_id: Seq<char>) -> bool {
+    exists|index: int| 0 <= index < HOTWORD_DOMAINS@.len()
+        && crate::domain::state_cache::in_domain(entity_id, #[trigger] HOTWORD_DOMAINS@[index]@)
+}
+
+/// True when `entity` has a config entry and its state in `cache` has the attribute
+/// `mass_player_type`.
+pub open spec fn music_player(cache: StateCache, entity: crate::domain::state::Entity) -> bool {
+    let key = crate::domain::contracts::str_key(entity.entity_id.0@);
+    &&& entity.config_entry_id is Some
+    &&& cache.states@.contains_key(key)
+    &&& crate::domain::contracts::attribute(cache.states@[key].attributes, "mass_player_type") is Some
+}
+
+/// True when the entity at `index` of `cache` is the first music player of `cache`.
+pub open spec fn first_music(cache: StateCache, index: int) -> bool {
+    &&& 0 <= index < cache.entities@.len()
+    &&& music_player(cache, cache.entities@[index])
+    &&& forall|earlier: int| 0 <= earlier < index ==> !music_player(cache, #[trigger] cache.entities@[earlier])
+}
+
 } // verus!
 
 #[cfg(test)]
@@ -536,8 +804,12 @@ mod tests {
     use quint_connect::quint_run;
     use quint_connect::switch;
     use serde::Deserialize;
+    use serde_json::Value;
 
     use super::*;
+    use crate::domain::state::Entity;
+    use crate::domain::state::Snapshot;
+    use crate::testing::fakes::house;
 
     #[test]
     fn ac_6_3_4_chunks_join_to_the_audio_in_pieces_of_1024() {
@@ -836,5 +1108,93 @@ mod tests {
     #[quint_run(spec = "quint/commit.qnt", max_steps = 30, seed = "1")]
     fn ac_6_5_4_conformance() -> impl Driver {
         CommitDriver::new()
+    }
+
+    /// The catalog with only `music_resume`, with the verbs "Resume" and "Unpause".
+    fn resume_catalog() -> Catalog {
+        let mut catalog: Catalog =
+            toml::from_str(include_str!("../../intents.toml")).expect("intents.toml is a catalog");
+        catalog
+            .intents
+            .retain(|intent| intent.name == "music_resume");
+        catalog.intents[0].verbs = vec!["Resume".to_owned(), "Unpause".to_owned()];
+        catalog
+    }
+
+    /// The hotwords of `snapshot`, the `music_resume` catalog and "Jazzy" and "Radiohead".
+    fn words(snapshot: Snapshot) -> Vec<String> {
+        let music = ["Jazzy".to_owned(), "Radiohead".to_owned()];
+        hotwords(&StateCache::load(snapshot), &resume_catalog(), &music)
+    }
+
+    /// The house with `change` on the entity `entity_id`.
+    fn changed(entity_id: &str, change: impl FnOnce(&mut Entity)) -> Snapshot {
+        let mut snapshot = house();
+        let entity = snapshot
+            .entities
+            .iter_mut()
+            .find(|entity| entity.entity_id.0 == entity_id);
+        change(entity.unwrap_or_else(|| panic!("the house has no {entity_id}")));
+        snapshot
+    }
+
+    /// AC-18.18-1.
+    #[test]
+    fn ac_18_18_1_areas_entities_verbs_then_music() {
+        let expected = "Bedroom/Kitchen/Living Room/Office/Bathroom/Garage/Outside/\
+            Carson Bedroom/Carson Kitchen/Carson Kitchen Media Player/Carson Living Room/\
+            Carson Living Room Media Player/Carson Office/Carson Office Media Player/Thermostat/\
+            Office Fan/Office Fan Light/Bedroom Fan Light/Bedroom Lamp Left/Bedroom Lamp Right/\
+            Bedroom Corner Lamp/Ali's Living Room Lamp/Louis's Living Room Lamp/\
+            Living Room Corner Lamp/Living Room Overhead Light/TV Lamp/Overhead Light/\
+            Strawberry Lamp/Desk LED/Office Lamp/Workbench LED/Front Porch Light/Porch Light/\
+            Garage Light/Living Room Fan/Apple TV/the TV/plex/Office/Downstairs Speakers/\
+            Downstairs Speakers/Office Speakers/Office Speakers/Bathtub Blind/\
+            Water Closet Blinds/Bedtime/Resume/Unpause/Jazzy/Radiohead";
+        let words = words(house());
+        assert_eq!(words.join("/"), expected);
+        assert!(!words.contains(&"Kitchen Presence".to_owned()), "{words:?}");
+    }
+
+    /// AC-18.18-2.
+    #[test]
+    fn ac_18_18_2_skipped_entity_is_not_a_hotword() {
+        let changes: [fn(&mut Entity); 3] = [
+            |entity| entity.entity_category = Some("config".to_owned()),
+            |entity| entity.hidden_by = Some("user".to_owned()),
+            |entity| entity.disabled_by = Some("user".to_owned()),
+        ];
+        for change in changes {
+            let words = words(changed("fan.office_fan", change));
+            assert!(!words.contains(&"Office Fan".to_owned()), "{words:?}");
+        }
+    }
+
+    /// AC-18.18-3.
+    #[test]
+    fn ac_18_18_3_music_entry_is_the_entry_of_a_music_assistant_player() {
+        let id = "media_player.carson_kitchen";
+        let entry =
+            |entity: &mut Entity| entity.config_entry_id = Some("music_assistant".to_owned());
+        let mut snapshot = changed(id, entry);
+        assert_eq!(
+            music_entry(&StateCache::load(snapshot.clone())),
+            None,
+            "no attribute"
+        );
+        let state = snapshot
+            .states
+            .iter_mut()
+            .find(|state| state.entity_id == id);
+        let state = state.unwrap_or_else(|| panic!("the house has no state of {id}"));
+        let kind = Value::String("player".to_owned());
+        state.attributes.insert("mass_player_type".to_owned(), kind);
+        let cache = StateCache::load(snapshot);
+        assert_eq!(music_entry(&cache), Some("music_assistant"));
+        assert_eq!(
+            music_entry(&StateCache::load(house())),
+            None,
+            "no config entry"
+        );
     }
 }
