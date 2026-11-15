@@ -214,6 +214,7 @@ flowchart LR
     crate_domain_training --> crate_domain_catalog
     crate_domain_training --> crate_domain_feedback
     crate_domain_training --> crate_domain_intent
+    crate_domain_training --> crate_domain_model
     crate_ports --> crate
     crate_ports --> crate_domain_decide
     crate_ports --> crate_domain_feedback
