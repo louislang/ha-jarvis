@@ -164,7 +164,9 @@ fn seed_texts(catalog: &Catalog) -> BTreeSet<String> {
     let intents = catalog.intents.iter().flat_map(|intent| &intent.examples);
     let markups = intents.chain(&catalog.unknown_examples);
     let examples = markups.filter_map(|markup| intent::parse_example(markup).ok());
-    examples.map(|example| example.text).collect()
+    examples
+        .map(|example| intent::normalize(&example.text))
+        .collect()
 }
 
 /// The hash of `texts`, stable across builds.
@@ -292,5 +294,18 @@ mod tests {
             "lights_on is gone: {:?}",
             refreshed.intents.keys()
         );
+    }
+
+    #[tokio::test]
+    async fn unknown_seed_with_capitals_rejects_its_copy() {
+        let mut catalog = catalog();
+        catalog.unknown_examples = vec!["Tell me about Rome!".to_owned()];
+        let reasoner = FakeReasoner::default();
+        let examples = ["tell me about rome", "what is the capital of peru"];
+        reasoner.script_paraphrase("unknown", Ok(examples.map(str::to_owned).to_vec()));
+
+        let refreshed = refreshed(&reasoner, &catalog, Generated::default()).await;
+
+        assert_eq!(refreshed.unknown.examples, ["what is the capital of peru"]);
     }
 }
