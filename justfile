@@ -75,7 +75,7 @@ cov:
     {{ cpu_runtime }} cargo llvm-cov --workspace --release --fail-under-lines 80.01
 
 # Download the CPU libraries and models.
-models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/tts-models" supertonic_sums) (fetch supertonic_fp32 vector_estimator_sums) (fetch supertonic_fp32 vocoder_sums) (fetch sherpa_onnx + "/asr-models" silero_sums)
+models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/tts-models" supertonic_sums) (fetch supertonic_fp32 vector_estimator_sums) (fetch supertonic_fp32 vocoder_sums) (fetch sherpa_onnx + "/asr-models" silero_sums) (fetch sherpa_onnx + "/asr-models" parakeet_sums)
 
 # Download the GPU models and the CUDA libraries, and copy the fp16 files next to the int8 files of the same model.
 gpu-models: cuda-libraries (fetch sherpa_onnx + "/asr-models" parakeet_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (copy-fp16 nemotron_fp16_sums "nemotron-160ms-" "sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25") (copy-fp16 parakeet_fp16_sums "parakeet-unified-" "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming")

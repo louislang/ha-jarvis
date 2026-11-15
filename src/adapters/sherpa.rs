@@ -1,11 +1,13 @@
 //! `SpeechToText` with sherpa-onnx.
 
+use std::fs;
 use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use arc_swap::ArcSwap;
 use sherpa_onnx::OfflineModelConfig;
 use sherpa_onnx::OfflineRecognizer;
 use sherpa_onnx::OfflineRecognizerConfig;
@@ -18,6 +20,7 @@ use sherpa_onnx::OnlineTransducerModelConfig;
 use sherpa_onnx::SileroVadModelConfig;
 use sherpa_onnx::VadModelConfig;
 use sherpa_onnx::VoiceActivityDetector;
+use tempfile::NamedTempFile;
 
 use crate::AsrConfig;
 use crate::Device;
@@ -52,6 +55,10 @@ pub struct SherpaStt {
     min_silence: u64,
     /// The length of a second-pass input longer than `SHORT_UTTERANCE_MS`.
     max_utterance_ms: u64,
+    /// True when the second pass decodes with hotwords.
+    hotwords: bool,
+    /// The `hotword_text` of the last `set_hotwords`.
+    hotword_text: ArcSwap<String>,
 }
 
 impl SherpaStt {
@@ -61,38 +68,44 @@ impl SherpaStt {
     ///
     /// The model cannot load.
     pub fn try_new(config: &AsrConfig, device: Device) -> anyhow::Result<Self> {
-        let vad = vad(config);
-        let min_silence = config.vad_min_silence_ms * u64::from(RATE) / 1000;
-        let max_utterance_ms = config.max_utterance_ms;
-        let second_pass = second_pass(config, device)?;
-        let dir = &config.model_dir;
-        let file = |name: &str| Some(file(dir, name));
-        let transducer = OnlineTransducerModelConfig {
-            encoder: file(&config.encoder),
-            decoder: file(&config.decoder),
-            joiner: file(&config.joiner),
-        };
-        let model_config = OnlineModelConfig {
-            transducer,
-            tokens: file("tokens.txt"),
-            provider: Some(stt_provider(device)),
-            num_threads: 4,
-            ..OnlineModelConfig::default()
-        };
-        let config = OnlineRecognizerConfig {
-            model_config,
-            ..OnlineRecognizerConfig::default()
-        };
-        let recognizer = OnlineRecognizer::create(&config)
-            .with_context(|| format!("cannot load the STT model in {}", dir.display()))?;
         Ok(Self {
-            recognizer: Arc::new(recognizer),
-            second_pass,
-            vad,
-            min_silence,
-            max_utterance_ms,
+            second_pass: second_pass(config, device)?,
+            recognizer: Arc::new(first_pass(config, device)?),
+            vad: vad(config),
+            min_silence: config.vad_min_silence_ms * u64::from(RATE) / 1000,
+            max_utterance_ms: config.max_utterance_ms,
+            hotwords: config.hotwords,
+            hotword_text: ArcSwap::default(),
         })
     }
+}
+
+/// The streaming recognizer of the Nemotron model in `model_dir` of `config` on `device`.
+///
+/// # Errors
+///
+/// The model cannot load.
+fn first_pass(config: &AsrConfig, device: Device) -> anyhow::Result<OnlineRecognizer> {
+    let dir = &config.model_dir;
+    let file = |name: &str| Some(file(dir, name));
+    let transducer = OnlineTransducerModelConfig {
+        encoder: file(&config.encoder),
+        decoder: file(&config.decoder),
+        joiner: file(&config.joiner),
+    };
+    let model_config = OnlineModelConfig {
+        transducer,
+        tokens: file("tokens.txt"),
+        provider: Some(stt_provider(device)),
+        num_threads: 4,
+        ..OnlineModelConfig::default()
+    };
+    let config = OnlineRecognizerConfig {
+        model_config,
+        ..OnlineRecognizerConfig::default()
+    };
+    OnlineRecognizer::create(&config)
+        .with_context(|| format!("cannot load the STT model in {}", dir.display()))
 }
 
 /// The offline recognizer of the Parakeet model in `second_pass_dir` of `config` on `device`, or
@@ -115,13 +128,81 @@ fn second_pass(config: &AsrConfig, device: Device) -> anyhow::Result<Option<Offl
         model_type: Some("nemo_transducer".to_owned()),
         ..OfflineModelConfig::default()
     };
-    let config = OfflineRecognizerConfig {
+    let mut recognizer_config = OfflineRecognizerConfig {
         model_config,
         ..OfflineRecognizerConfig::default()
     };
-    let recognizer = OfflineRecognizer::create(&config)
+    let _vocabulary = if config.hotwords {
+        Some(beam_search(config, dir, &mut recognizer_config)?)
+    } else {
+        None
+    };
+    let recognizer = OfflineRecognizer::create(&recognizer_config)
         .with_context(|| format!("cannot load the second-pass model in {}", dir.display()))?;
     Ok(Some(recognizer))
+}
+
+/// Sets modified beam search with the hotwords score of `config` in `recognizer`, with the BPE
+/// vocabulary of `tokens.txt` in `dir`. Gives the vocabulary file, which sherpa-onnx reads during
+/// the load.
+///
+/// # Errors
+///
+/// `tokens.txt` cannot be read, or the file cannot be written.
+fn beam_search(
+    config: &AsrConfig,
+    dir: &Path,
+    recognizer: &mut OfflineRecognizerConfig,
+) -> anyhow::Result<NamedTempFile> {
+    let tokens = fs::read_to_string(dir.join("tokens.txt"))?;
+    let file = NamedTempFile::new()?;
+    fs::write(file.path(), bpe_vocab(&tokens))?;
+    recognizer.decoding_method = Some("modified_beam_search".to_owned());
+    recognizer.hotwords_score = config.hotwords_score;
+    recognizer.model_config.modeling_unit = Some("bpe".to_owned());
+    recognizer.model_config.bpe_vocab = Some(file.path().to_string_lossy().into_owned());
+    Ok(file)
+}
+
+/// The BPE vocabulary of the text of `tokens.txt`: each token with the score -100 for `<unk>`,
+/// else -1.
+fn bpe_vocab(tokens: &str) -> String {
+    let tokens = tokens
+        .lines()
+        .filter_map(|line| line.split_whitespace().next());
+    let lines: Vec<String> = tokens
+        .map(|token| {
+            let score = if token == "<unk>" { -100 } else { -1 };
+            format!("{token}\t{score}\n")
+        })
+        .collect();
+    lines.concat()
+}
+
+/// The hotwords text of `phrases` for sherpa-onnx: each phrase in ASCII letters, digits,
+/// apostrophes and single spaces, without empty phrases, joined by `/`.
+fn hotword_text(phrases: &[String]) -> String {
+    let words: Vec<String> = phrases
+        .iter()
+        .map(|phrase| hotword(phrase))
+        .filter(|phrase| !phrase.is_empty())
+        .collect();
+    words.join("/")
+}
+
+/// `phrase` after NFKD without the characters that are not ASCII, with each other character
+/// that is not a letter, a digit or an apostrophe as a space, and with single spaces.
+fn hotword(phrase: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+
+    let kept = |c: char| c.is_ascii_alphanumeric() || c == '\'';
+    let ascii: String = phrase
+        .nfkd()
+        .filter(char::is_ascii)
+        .map(|c| if kept(c) { c } else { ' ' })
+        .collect();
+    let words: Vec<&str> = ascii.split_whitespace().collect();
+    words.join(" ")
 }
 
 /// The Silero VAD configuration of `config`. The VAD runs on the CPU, where it is faster than on
@@ -201,7 +282,12 @@ impl SpeechToText for SherpaStt {
         let Some(recognizer) = &self.second_pass else {
             return Ok(None);
         };
-        let stream = recognizer.create_stream();
+        let text = self.hotword_text.load();
+        let stream = if self.hotwords && !text.is_empty() {
+            recognizer.create_stream_with_hotwords(&text)
+        } else {
+            recognizer.create_stream()
+        };
         let wave = padded(samples, self.max_utterance_ms)?;
         stream.accept_waveform(i32::from(RATE), &wave);
         recognizer.decode(&stream);
@@ -209,6 +295,10 @@ impl SpeechToText for SherpaStt {
             .get_result()
             .context("the second pass gives no result")?;
         Ok(Some(number_words(&result.text)))
+    }
+
+    fn set_hotwords(&self, phrases: &[String]) {
+        self.hotword_text.store(Arc::new(hotword_text(phrases)));
     }
 }
 
@@ -403,6 +493,7 @@ fn provider(device: Device) -> String {
 /// Tests of the STT adapter with the Nemotron model and the Silero VAD.
 #[cfg(test)]
 mod tests {
+    use std::iter;
     use std::thread;
     use std::time::Instant;
 
@@ -429,12 +520,49 @@ mod tests {
     fn stt(device: Device) -> anyhow::Result<SherpaStt> {
         let mut asr = config()?.asr;
         if device == Device::Cpu {
-            let int8 = |part: &str| format!("{part}.int8.onnx");
-            (asr.encoder, asr.decoder, asr.joiner) =
-                (int8("encoder"), int8("decoder"), int8("joiner"));
-            asr.second_pass_dir = None;
+            asr = AsrConfig {
+                second_pass_dir: None,
+                ..int8(asr)
+            };
         }
         SherpaStt::try_new(&asr, device)
+    }
+
+    /// `asr` with the int8 files.
+    fn int8(asr: AsrConfig) -> AsrConfig {
+        let int8 = |part: &str| format!("{part}.int8.onnx");
+        AsrConfig {
+            encoder: int8("encoder"),
+            decoder: int8("decoder"),
+            joiner: int8("joiner"),
+            ..asr
+        }
+    }
+
+    /// The `SherpaStt` of `jarvis.toml` on the CPU with the int8 files of both passes, `hotwords`
+    /// and the hotwords `phrases`.
+    fn int8_second_pass(hotwords: bool, phrases: &[String]) -> anyhow::Result<SherpaStt> {
+        let asr = AsrConfig {
+            hotwords,
+            ..int8(config()?.asr)
+        };
+        let stt = SherpaStt::try_new(&asr, Device::Cpu)?;
+        stt.set_hotwords(phrases);
+        Ok(stt)
+    }
+
+    /// The names and aliases of the areas and entities of the reference house.
+    fn house_names() -> Vec<String> {
+        let house = fakes::house();
+        let areas = house
+            .areas
+            .into_iter()
+            .flat_map(|area| iter::once(area.name).chain(area.aliases));
+        let entities = house
+            .entities
+            .into_iter()
+            .flat_map(|entity| iter::once(entity.name).chain(entity.aliases));
+        areas.chain(entities).collect()
     }
 
     /// The normalized second-pass text of `audio`.
@@ -799,10 +927,13 @@ mod tests {
         Ok(samples)
     }
 
-    /// The p95 of the `transcribe` times of each of `inputs` on CUDA, after a warm-up with
+    /// The p95 of the `transcribe` times of `stt` of each of `inputs`, after a warm-up with
     /// `warm_up`, and the sorted times.
-    fn cuda_p95(warm_up: &[i16], inputs: &[&[i16]]) -> anyhow::Result<(Duration, Vec<Duration>)> {
-        let stt = stt(Device::Cuda)?;
+    fn p95(
+        stt: &SherpaStt,
+        warm_up: &[i16],
+        inputs: &[&[i16]],
+    ) -> anyhow::Result<(Duration, Vec<Duration>)> {
         stt.transcribe(warm_up)?;
         let mut times = Vec::new();
         for input in inputs {
@@ -820,7 +951,7 @@ mod tests {
     #[ignore = "GPU host"]
     async fn ac_6_7_4_three_second_utterance_p95() -> anyhow::Result<()> {
         let samples = dentist(30).await?;
-        let (p95, times) = cuda_p95(&samples, &[samples.as_slice(); 20])?;
+        let (p95, times) = p95(&stt(Device::Cuda)?, &samples, &[samples.as_slice(); 20])?;
         assert!(p95 < Duration::from_millis(40), "p95 {p95:?} of {times:?}");
         Ok(())
     }
@@ -835,7 +966,7 @@ mod tests {
         let prefix = |tenths: usize| &samples[..tenths * usize::from(RATE) / 10];
         let inputs: Vec<&[i16]> = (15..35).map(prefix).collect();
         // The warm-up has a length that no run has.
-        let (p95, times) = cuda_p95(prefix(10), &inputs)?;
+        let (p95, times) = p95(&stt(Device::Cuda)?, prefix(10), &inputs)?;
         // The test harness captures `eprintln!` of a test that passes, but not a direct write.
         writeln!(std::io::stderr(), "AC-6.7-7: p95 {p95:?} of {times:?}")?;
         assert!(p95 <= Duration::from_millis(50), "p95 {p95:?} of {times:?}");
@@ -862,6 +993,76 @@ mod tests {
             assert_eq!(speech, wave(&samples));
             assert!(zeros.iter().all(|&zero| zero == 0.0), "{zeros:?}");
         }
+        Ok(())
+    }
+
+    /// AC-18.17-2.
+    #[test]
+    fn ac_18_17_2_hotword_text_has_ascii_phrases() {
+        let phrases = [
+            "Beyoncé",
+            "AC/DC",
+            " Guns N' Roses ",
+            "Night: Day",
+            "",
+            "Desk Lamp",
+        ]
+        .map(str::to_owned);
+        assert_eq!(
+            hotword_text(&phrases),
+            "Beyonce/AC DC/Guns N' Roses/Night Day/Desk Lamp"
+        );
+    }
+
+    /// AC-18.17-3.
+    #[test]
+    fn ac_18_17_3_bpe_vocab_scores_each_token() {
+        assert_eq!(
+            bpe_vocab("<unk> 0\n\u{2581}the 1\ns 2\n"),
+            "<unk>\t-100\n\u{2581}the\t-1\ns\t-1\n"
+        );
+    }
+
+    /// AC-18.17-4.
+    #[tokio::test]
+    async fn ac_18_17_4_without_hotwords_radiohead_is_two_words() -> anyhow::Result<()> {
+        let audio = fakes::speech("play radiohead").await?;
+        let stt = int8_second_pass(false, &["Radiohead".to_owned()])?;
+        assert_eq!(second_pass_text(&stt, &audio)?, "play radio head");
+        Ok(())
+    }
+
+    /// AC-18.17-5.
+    #[tokio::test]
+    async fn ac_18_17_5_hotword_gives_radiohead() -> anyhow::Result<()> {
+        let audio = fakes::speech("play radiohead").await?;
+        let stt = int8_second_pass(true, &["Radiohead".to_owned()])?;
+        assert_eq!(second_pass_text(&stt, &audio)?, "play radiohead");
+        Ok(())
+    }
+
+    /// AC-18.17-6.
+    #[tokio::test]
+    async fn ac_18_17_6_house_hotwords_keep_the_request() -> anyhow::Result<()> {
+        let request = "add dentist to my calendar for monday";
+        let audio = fakes::speech(request).await?;
+        let stt = int8_second_pass(true, &house_names())?;
+        assert_eq!(second_pass_text(&stt, &audio)?, request);
+        Ok(())
+    }
+
+    /// AC-18.17-7.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn ac_18_17_7_two_thousand_hotwords_p95() -> anyhow::Result<()> {
+        let mut phrases = house_names();
+        let count = 2000_usize.saturating_sub(phrases.len());
+        phrases.extend((1..=count).map(|number| format!("Name {number}")));
+        let stt = stt(Device::Cuda)?;
+        stt.set_hotwords(&phrases);
+        let samples = dentist(30).await?;
+        let (p95, times) = p95(&stt, &samples, &[samples.as_slice(); 20])?;
+        assert!(p95 < Duration::from_millis(40), "p95 {p95:?} of {times:?}");
         Ok(())
     }
 }
