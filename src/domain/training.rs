@@ -1,4 +1,4 @@
-//! Training set, context samples and held-out split.
+//! Training set, context samples, held-out split and accuracy measures.
 
 use rand::Rng;
 use rand::rngs::StdRng;
@@ -16,6 +16,8 @@ use crate::domain::feedback::Tagged;
 use crate::domain::feedback::Value;
 use crate::domain::intent;
 use crate::domain::intent::Span;
+use crate::domain::model::Prediction;
+use crate::domain::model::Slot;
 
 /// The training set file: the contract between Jarvis and `train/train.py`.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -666,6 +668,215 @@ pub fn held_out(text: &str, holdout: f64) -> bool {
     bucket < holdout * 10000.0
 }
 
+/// The accuracy of a model on the held-out examples.
+#[verus_verify]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Metrics {
+    /// The share of examples with a correct top label.
+    pub intent: f64,
+    /// The share of examples with spans whose decoded slots equal the spans.
+    pub slots: f64,
+}
+
+/// The accuracy of `predictions` on `examples`, the prediction at each position for the example
+/// at the same position.
+#[verus_verify]
+#[must_use]
+pub fn metrics(predictions: &[Prediction], examples: &[Example], threshold: f32) -> Metrics {
+    let (mut intent, mut slots, mut spanned) = (0, 0, 0);
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            intent <= index,
+            slots <= spanned <= index,
+            index <= examples@.len(),
+        decreases examples@.len() - index,
+    ))]
+    while index < predictions.len() && index < examples.len() {
+        let (prediction, example) = (&predictions[index], &examples[index]);
+        if correct_label(prediction, &example.label, threshold) {
+            intent += 1;
+        }
+        if let Some(spans) = &example.spans {
+            spanned += 1;
+            if same_slots(&prediction.slots, &example.text, spans) {
+                slots += 1;
+            }
+        }
+        index += 1;
+    }
+    Metrics {
+        intent: share(intent, index),
+        slots: share(slots, spanned),
+    }
+}
+
+/// `part` divided by `whole`, or 0 when `whole` is 0.
+#[verus_verify]
+fn share(part: usize, whole: usize) -> f64 {
+    if whole == 0 {
+        return 0.0;
+    }
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "an f64 holds each example count below 2^53 exactly"
+    )]
+    let (part, whole) = (part as f64, whole as f64);
+    part / whole
+}
+
+/// True when the top label of `prediction` is correct for `label` at `threshold`.
+#[verus_spec(correct =>
+    ensures
+        judged(*prediction, *label, threshold, correct),
+)]
+fn correct_label(prediction: &Prediction, label: &Label, threshold: f32) -> bool {
+    let Some((top, probability)) = prediction.ranked.first() else {
+        return false;
+    };
+    let confident = *probability >= threshold;
+    match label {
+        Label::Intent(name) => {
+            (confident && top.as_str() == name.as_str())
+                || (!confident && name.as_str() == "unknown")
+        }
+        Label::Not(name) => !confident || top.as_str() != name.as_str(),
+    }
+}
+
+/// True when `slots` and the values of `spans` in `text` are the same set.
+#[verus_spec(same =>
+    ensures
+        same == same_set(slots@, text@, spans@),
+)]
+fn same_slots(slots: &[Slot], text: &str, spans: &[Span]) -> bool {
+    all_in_spans(slots, text, spans) && all_in_slots(slots, text, spans)
+}
+
+/// True when each of `slots` is the value of a span of `spans` in `text`.
+#[verus_spec(all =>
+    ensures
+        all == forall|index: int| 0 <= index < slots@.len() ==> in_spans(text@, spans@, #[trigger] slots@[index]),
+)]
+fn all_in_spans(slots: &[Slot], text: &str, spans: &[Span]) -> bool {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= slots@.len(),
+            forall|done: int| 0 <= done < index ==> in_spans(text@, spans@, #[trigger] slots@[done]),
+        decreases slots@.len() - index,
+    ))]
+    while index < slots.len() {
+        if !has_span(&slots[index], text, spans) {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// True when the value of each of `spans` in `text` is a slot of `slots`.
+#[verus_spec(all =>
+    ensures
+        all == forall|index: int| 0 <= index < spans@.len() ==> in_slots(text@, slots@, #[trigger] spans@[index]),
+)]
+fn all_in_slots(slots: &[Slot], text: &str, spans: &[Span]) -> bool {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= spans@.len(),
+            forall|done: int| 0 <= done < index ==> in_slots(text@, slots@, #[trigger] spans@[done]),
+        decreases spans@.len() - index,
+    ))]
+    while index < spans.len() {
+        if !has_slot(slots, text, &spans[index]) {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// True when `slot` is the value of a span of `spans` in `text`.
+#[verus_spec(found =>
+    ensures
+        found == in_spans(text@, spans@, *slot),
+)]
+fn has_span(slot: &Slot, text: &str, spans: &[Span]) -> bool {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= spans@.len(),
+            forall|done: int| 0 <= done < index ==> !#[trigger] slot_of(text@, spans@[done], *slot),
+        decreases spans@.len() - index,
+    ))]
+    while index < spans.len() {
+        if is_value(slot, text, &spans[index]) {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// True when the value of `span` in `text` is a slot of `slots`.
+#[verus_spec(found =>
+    ensures
+        found == in_slots(text@, slots@, *span),
+)]
+fn has_slot(slots: &[Slot], text: &str, span: &Span) -> bool {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= slots@.len(),
+            forall|done: int| 0 <= done < index ==> !#[trigger] slot_of(text@, *span, slots@[done]),
+        decreases slots@.len() - index,
+    ))]
+    while index < slots.len() {
+        if is_value(&slots[index], text, span) {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// True when `slot` has the slot name of `span` and the text of `span` in `text`.
+#[verus_spec(same =>
+    ensures
+        same == slot_of(text@, *span, *slot),
+)]
+fn is_value(slot: &Slot, text: &str, span: &Span) -> bool {
+    if slot.name.as_str() != span.slot.as_str() {
+        return false;
+    }
+    match text.get(span.start..span.end) {
+        Some(value) => {
+            proof! {
+                vstd::utf8::encode_utf8_decode_utf8(value@);
+                vstd::utf8::encode_utf8_decode_utf8(slot.value@);
+            }
+            value == slot.value.as_str()
+        }
+        None => false,
+    }
+}
+
+/// True when the new model is never worse than the old one: both measures of `new` are equal or
+/// higher.
+#[verus_spec(accepted =>
+    ensures
+        exists|intent: bool, slots: bool| #[trigger] vstd::std_specs::cmp::ge_ensures::<f64>(new.intent, old.intent, intent)
+            && #[trigger] vstd::std_specs::cmp::ge_ensures::<f64>(new.slots, old.slots, slots)
+            && accepted == (intent && slots),
+)]
+#[must_use]
+pub fn accept(new: Metrics, old: Metrics) -> bool {
+    let intent = new.intent >= old.intent;
+    let slots = new.slots >= old.slots;
+    intent && slots
+}
+
 verus! {
 
 broadcast use vstd::utf8::encode_utf8_push;
@@ -856,6 +1067,51 @@ spec fn chosen(ranked: Seq<Ranked>, count: int) -> Seq<Example>
     }
 }
 
+/// True when `correct` is the verdict on the top label of `prediction` for `label`, with
+/// `confident` the result of `p(top) >= threshold`. A prediction without labels is wrong.
+pub open spec fn judged(prediction: Prediction, label: Label, threshold: f32, correct: bool) -> bool {
+    if prediction.ranked@.len() == 0 {
+        !correct
+    } else {
+        exists|confident: bool| #[trigger] vstd::std_specs::cmp::ge_ensures::<f32>(prediction.ranked@[0].1, threshold, confident)
+            && correct == verdict(prediction.ranked@[0].0@, label, confident)
+    }
+}
+
+/// True when the top label `top` is correct for `label`: `Intent(k)` needs `k` with `confident`,
+/// or `unknown` without it. `Not(k)` needs another label or no `confident`.
+pub open spec fn verdict(top: Seq<char>, label: Label, confident: bool) -> bool {
+    match label {
+        Label::Intent(name) => (confident && top == name@) || (!confident && name@ == "unknown"@),
+        Label::Not(name) => !confident || top != name@,
+    }
+}
+
+/// True when `slot` has the slot name of `span`, and the span is a character range of `text`
+/// with the bytes of the value.
+pub open spec fn slot_of(text: Seq<char>, span: Span, slot: Slot) -> bool {
+    &&& slot.name@ == span.slot@
+    &&& crate::domain::model::char_range(text, span.start, span.end)
+    &&& vstd::utf8::encode_utf8(slot.value@)
+        == vstd::utf8::encode_utf8(text).subrange(span.start as int, span.end as int)
+}
+
+/// True when `slot` is the value of a span of `spans` in `text`.
+pub open spec fn in_spans(text: Seq<char>, spans: Seq<Span>, slot: Slot) -> bool {
+    exists|index: int| 0 <= index < spans.len() && #[trigger] slot_of(text, spans[index], slot)
+}
+
+/// True when the value of `span` in `text` is a slot of `slots`.
+pub open spec fn in_slots(text: Seq<char>, slots: Seq<Slot>, span: Span) -> bool {
+    exists|index: int| 0 <= index < slots.len() && #[trigger] slot_of(text, span, slots[index])
+}
+
+/// True when `slots` and the values of `spans` in `text` are the same set.
+pub open spec fn same_set(slots: Seq<Slot>, text: Seq<char>, spans: Seq<Span>) -> bool {
+    &&& forall|index: int| 0 <= index < slots.len() ==> in_spans(text, spans, #[trigger] slots[index])
+    &&& forall|index: int| 0 <= index < spans.len() ==> in_slots(text, slots, #[trigger] spans[index])
+}
+
 /// The conversion from `Example` has no spec function. Only Verus has this trait.
 #[cfg(verus_only)]
 impl vstd::std_specs::convert::FromSpecImpl<Example> for ExampleFile {
@@ -1043,6 +1299,80 @@ mod tests {
         let same = examples.filter(|example| example.text == "turn on the lights");
         let labels: Vec<Label> = same.map(|example| example.label).collect();
         assert_eq!(labels, [intent("fan_on")]);
+    }
+
+    /// The example "turn on the kitchen lights" with `label` and the `area` span of "kitchen".
+    fn held(label: Label) -> Example {
+        Example {
+            context: context_text(None),
+            text: "turn on the kitchen lights".to_owned(),
+            label,
+            spans: Some(vec![Span {
+                slot: "area".to_owned(),
+                start: 12,
+                end: 19,
+            }]),
+        }
+    }
+
+    /// The prediction of `label` with `probability` and the `area` slot `area`.
+    fn predicted(label: &str, probability: f32, area: &str) -> Prediction {
+        Prediction {
+            ranked: vec![(label.to_owned(), probability)],
+            slots: vec![Slot {
+                name: "area".to_owned(),
+                value: area.to_owned(),
+            }],
+        }
+    }
+
+    /// AC-13.2-1.
+    #[test]
+    fn ac_13_2_1_top_label_below_threshold_is_wrong() {
+        let predictions = [
+            predicted("lights_on", 0.6, "kitchen"),
+            predicted("lights_on", 0.8, "kitchen"),
+        ];
+        let examples = [held(intent("lights_on")), held(intent("lights_on"))];
+        assert_eq!(metrics(&predictions, &examples, 0.7).intent, 0.5);
+    }
+
+    /// AC-13.2-2.
+    #[test]
+    fn ac_13_2_2_other_slots_are_wrong() {
+        let predictions = [
+            predicted("lights_on", 0.8, "office"),
+            predicted("lights_on", 0.8, "kitchen"),
+        ];
+        let examples = [held(intent("lights_on")), held(intent("lights_on"))];
+        assert_eq!(metrics(&predictions, &examples, 0.7).slots, 0.5);
+    }
+
+    /// AC-13.2-3.
+    #[test]
+    fn ac_13_2_3_not_example_with_other_top_label_is_correct() {
+        let predictions = [
+            predicted("fan_on", 0.9, "kitchen"),
+            predicted("lights_on", 0.9, "kitchen"),
+        ];
+        let not = Label::Not("lights_on".to_owned());
+        let examples = [held(not.clone()), held(not)];
+        assert_eq!(metrics(&predictions, &examples, 0.7).intent, 0.5);
+    }
+
+    /// AC-13.2-4.
+    #[test]
+    fn ac_13_2_4_accept_needs_both_measures() {
+        let old = Metrics {
+            intent: 0.8,
+            slots: 0.9,
+        };
+        let new = Metrics {
+            intent: 0.9,
+            slots: 0.8,
+        };
+        assert!(accept(old, old), "equal measures are accepted");
+        assert!(!accept(new, old), "a lower slot accuracy is rejected");
     }
 
     /// AC-11.5-1.
