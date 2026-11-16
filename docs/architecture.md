@@ -179,7 +179,10 @@ flowchart LR
     crate_app_training --> crate
     crate_app_training --> crate_app_training
     crate_app_training --> crate_domain_catalog
+    crate_app_training --> crate_domain_feedback
     crate_app_training --> crate_domain_intent
+    crate_app_training --> crate_domain_state_cache
+    crate_app_training --> crate_domain_training
     crate_app_training --> crate_ports
     crate_domain_catalog --> crate_domain_contracts
     crate_domain_catalog --> crate_domain_intent
