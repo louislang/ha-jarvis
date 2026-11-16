@@ -369,46 +369,54 @@ impl Trigger {
         }
     }
 
-    /// Starts a run when no failed run ended less than the backoff ago and the change count
-    /// reaches `min_changes`.
+    /// Starts a run after the failure backoff when the change count reaches `min_changes`.
     ///
     /// # Errors
     ///
     /// The change count cannot be read.
     pub async fn check(self: &Arc<Self>) -> anyhow::Result<()> {
-        let failed = *self.failed();
-        let now = self.training.clock.now();
-        if failed.is_some_and(|end| now.duration_since(end) < self.backoff) {
+        // A run that ends while the check reads the count cannot let a second run start.
+        if !self.reserve() {
             return Ok(());
         }
-        let changes = self.training.changes().await?;
-        if training::should_train(changes, self.training.config.train.min_changes) {
+        let (failed, min) = (*self.failed(), self.training.config.train.min_changes);
+        let now = self.training.clock.now();
+        let needed = if failed.is_some_and(|end| now.duration_since(end) < self.backoff) {
+            Ok(false)
+        } else {
+            let changes = self.training.changes().await;
+            changes.map(|count| training::should_train(count, min))
+        };
+        if matches!(needed, Ok(true)) {
             self.start();
+        } else {
+            self.active.store(false, Ordering::SeqCst);
         }
-        Ok(())
+        needed.map(drop)
     }
 
     /// Starts a run at any change count and without the backoff.
     pub fn voice(self: &Arc<Self>) {
-        self.start();
+        if self.reserve() {
+            self.start();
+        }
     }
 
-    /// Runs `Training::run` in a new task when no run is active. Keeps the end time of a failed
-    /// run.
-    fn start(self: &Arc<Self>) {
+    /// True when `active` changes from false to true, the `run = Idle` guard of `training.qnt`.
+    fn reserve(&self) -> bool {
         let swapped = self
             .active
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
-        // The `run = Idle` guard of both start actions of `training.qnt`.
-        if swapped.is_err() {
-            return;
-        }
+        swapped.is_ok()
+    }
+
+    /// Runs `Training::run` in a new task after `reserve`. Keeps the end time of a failed run.
+    fn start(self: &Arc<Self>) {
         let trigger = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(error) = trigger.training.run().await {
                 tracing::warn!("the training run failed: {error:#}");
-                let end = trigger.training.clock.now();
-                *trigger.failed() = Some(end);
+                *trigger.failed() = Some(trigger.training.clock.now());
             }
             trigger.active.store(false, Ordering::SeqCst);
         });
@@ -1066,8 +1074,6 @@ mod tests {
         levels: [Arc<FakeClassifier>; 3],
         /// The trainer gate, which the driver holds between steps.
         gate: Option<OwnedMutexGuard<()>>,
-        /// The ID of the last mark.
-        marks: u64,
     }
 
     impl TrainingDriver {
@@ -1089,14 +1095,12 @@ mod tests {
                 training.config.train.holdout = 1.0;
                 training.config.train.min_changes = 2;
             });
-            let gate = Arc::clone(&harness.trainer.gate).try_lock_owned().ok();
             Self {
                 runtime: runtime.expect("the runtime builds"),
                 trigger: trigger(&harness, 0),
+                gate: Arc::clone(&harness.trainer.gate).try_lock_owned().ok(),
                 harness,
                 levels,
-                gate,
-                marks: 0,
             }
         }
 
@@ -1118,9 +1122,8 @@ mod tests {
             switch!(step {
                 initLocal => *self = Self::new(),
                 change => {
-                    self.marks += 1;
                     let now = self.harness.training.clock.now().as_second();
-                    mark(&self.harness.log, self.marks, now);
+                    mark(&self.harness.log, now.unsigned_abs(), now);
                 },
                 autoStart => self.runtime.block_on(self.trigger.check())?,
                 voiceStart => {
