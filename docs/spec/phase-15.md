@@ -73,7 +73,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 - **Implements:** G12. **Depends on:** 15.2.
 - **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `justfile`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `VoiceEmbedder::embed(audio) -> Result<Vec<f32>>` with `SpeakerEmbeddingExtractor`. `VoiceProfiles::enroll(person, embedding)` and `similarities(embedding) -> Map<person, f32>` with `SpeakerEmbeddingManager`, saved to `speaker.voices`. A profile keeps the newest `max_samples` embeddings. `just models` also downloads the speaker model and the multi-speaker test voice `vits-piper-en_US-libritts_r-medium`. This sub-phase adds `[speaker]` (`model`, `voices`, `max_samples`, `voice_threshold`). `voice_threshold` is a voice similarity. Sub-phase 15.6 adds `threshold`, which is a combined score. `LiveModels` (sub-phase 13.10) also keeps the voice embedder session, so the training pause releases it and loads it again.
+**Model.** `VoiceEmbedder::embed(audio) -> Result<Vec<f32>>` with `SpeakerEmbeddingExtractor`. `VoiceProfiles::enroll(person, embedding)` and `similarities(embedding) -> Map<person, f32>` with `SpeakerEmbeddingManager`, saved to `speaker.voices`. A profile keeps the newest `max_samples` embeddings. `just models` also downloads the speaker model and the multi-speaker test voice `vits-piper-en_US-libritts_r-medium`. This sub-phase adds `[speaker]` (`model`, `voices`, `max_samples`, `voice_threshold`). `voice_threshold` is a voice similarity. Sub-phase 15.6 adds `threshold`, which is a combined score. `LiveModels` (sub-phase 13.10d) also keeps the voice embedder session, so the training pause releases it and loads it again.
 
 **Acceptance criteria.**
 

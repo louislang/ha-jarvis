@@ -71,7 +71,7 @@ This phase composes the component models into one Quint model of the whole reque
 
 - `commit(r)` uses the `commit` instance of `r`. `announce(r)` and `pipelineEnd(s)` use the `announce` instance of `s`.
 - New actions: `ask(r)` and `answer(r)` (from `dialog`; `ask` increments `handled` and moves `Handling` to `Replied`), and `swap` (from `training`: `activeModel := v`).
-- The pause of sub-phase 13.10: the `training` start actions are enabled only when no request is in `Listening` or `Handling`. `release` waits for the uses in progress, and the mute calls do not wait for a satellite. Thus the driver completes a start action without a later trace step. While `training.paused`, `audio`, `handle` and `answer` are not enabled.
+- The pause of sub-phase 13.10e: the `training` start actions are enabled only when no request is in `Listening` or `Handling`. `release` waits for the uses in progress, and the mute calls do not wait for a satellite. Thus the driver completes a start action without a later trace step. While `training.paused`, `audio`, `handle` and `answer` are not enabled.
 - The invariants of the imported models also hold in the composition.
 
 **Acceptance criteria.**
