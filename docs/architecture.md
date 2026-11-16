@@ -63,6 +63,7 @@ flowchart LR
     crate --> crate_adapters_openai
     crate --> crate_adapters_plex
     crate --> crate_adapters_process
+    crate --> crate_adapters_runpod
     crate --> crate_adapters_sherpa
     crate --> crate_adapters_sqlite
     crate --> crate_adapters_supertonic

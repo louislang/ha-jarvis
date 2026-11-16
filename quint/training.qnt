@@ -80,6 +80,9 @@ module training {
   /// The start without a RunPod fallback, which the conformance test replays.
   action initLocal = initWith(false)
 
+  /// The start with a RunPod fallback, which the conformance test replays.
+  action initRunPod = initWith(true)
+
   /// A new action mark.
   action change = all {
     record(Change),
