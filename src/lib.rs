@@ -1403,8 +1403,8 @@ fn area_names(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(snapshot.areas.into_iter().map(|area| area.name).collect())
 }
 
-/// A started app, its pools task, habit task, log writer task and review, its pre-render task,
-/// and its live models.
+/// A started app, its pools task, habit task, log writer task, review and stop receiver, its
+/// pre-render task, and its live models.
 type Started = (
     App,
     (JoinHandle<()>, HabitsTask, Logged),
@@ -1412,8 +1412,9 @@ type Started = (
     Arc<LiveModels>,
 );
 
-/// A log writer task and the review of its log.
-type Logged = (JoinHandle<()>, Reviewer);
+/// A log writer task, the review of its log, and the receiver of the error text of a failed
+/// `restore` of the training run.
+type Logged = (JoinHandle<()>, Reviewer, watch::Receiver<Option<String>>);
 
 /// The longest wait of [`run`] for the running tasks and the saves after the shutdown future
 /// completes.
@@ -1487,12 +1488,14 @@ fn begin(config: &Path) -> anyhow::Result<Config> {
 
 /// Serves the app of `started` on `listen`, its review, the status and the settings of `file` on
 /// `web.listen` with the web token of `secrets`, and the status entity on the broker of `mqtt`,
-/// until `shutdown` completes or a save restarts Jarvis. Then gives [`Controller::ended`], closes
-/// the status and waits as [`drain`] does.
+/// until `shutdown` completes, a save restarts Jarvis or the stop receiver of `started` gets the
+/// error text of a failed `restore`. Then gives [`Controller::ended`], closes the status and waits
+/// as [`drain`] does.
 ///
 /// # Errors
 ///
-/// `mqtt.url` is not valid, a server cannot bind or accept, or a task of `started` panicked.
+/// `mqtt.url` is not valid, a server cannot bind or accept, a task of `started` panicked, or
+/// `restore` failed.
 async fn serve_until(
     file: PathBuf,
     config: &Config,
@@ -1500,20 +1503,59 @@ async fn serve_until(
     started: Started,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<Ended> {
-    let (app, (pools_task, habits, (writer, review)), _, _) = started;
+    let (app, (pools_task, habits, (writer, review, mut stopped)), _, _) = started;
     let (listener, tracker) = (TcpListener::bind(config.listen).await?, TaskTracker::new());
     let control = Arc::new(Controller::new(file));
-    let web = serve_web(&config.web, &secrets.web_token, review, &control, &tracker).await?;
-    // After the bind, so a failed start leaves no `online` behind.
-    start_status_entity(config, secrets, &control.status, &tracker)?;
-    let shutdown = control.until_restart(shutdown);
+    let web = serve_control(config, secrets, review, &control, &tracker).await?;
+    let shutdown = until_stopped(control.until_restart(shutdown), &mut stopped);
     let served = adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await;
     drop(web);
     let ended = control.ended();
     drop(control);
     served?;
     drain(tracker, (pools_task, habits, writer)).await?;
-    Ok(ended)
+    failed(&stopped, ended)
+}
+
+/// Serves `review` and `control` with the `[web]` and the web token of `secrets` as [`serve_web`]
+/// does, and starts the status entity of `control` with `config` and `secrets`, in tasks of
+/// `tracker`. Gives the stop sender of the web server.
+///
+/// # Errors
+///
+/// The web server cannot bind, the trial start cannot end, or `mqtt.url` is not valid.
+async fn serve_control(
+    config: &Config,
+    secrets: &Secrets,
+    review: Reviewer,
+    control: &Arc<Controller>,
+    tracker: &TaskTracker,
+) -> anyhow::Result<oneshot::Sender<()>> {
+    let web = serve_web(&config.web, &secrets.web_token, review, control, tracker).await?;
+    // After the bind, so a failed start leaves no `online` behind.
+    start_status_entity(config, secrets, &control.status, tracker)?;
+    Ok(web)
+}
+
+/// `ended`, or an error with the text of `stopped`.
+///
+/// # Errors
+///
+/// `stopped` has a text.
+fn failed(stopped: &watch::Receiver<Option<String>>, ended: Ended) -> anyhow::Result<Ended> {
+    let text = stopped.borrow().clone();
+    text.map_or(Ok(ended), |text| Err(anyhow::anyhow!(text)))
+}
+
+/// Completes when `shutdown` completes or `stopped` gets a text.
+async fn until_stopped(
+    shutdown: impl Future<Output = ()>,
+    stopped: &mut watch::Receiver<Option<String>>,
+) {
+    tokio::select! {
+        () = shutdown => {}
+        Ok(_) = stopped.wait_for(Option::is_some) => {}
+    }
 }
 
 /// Starts the status entity of `status` in a task of `tracker` with the `[mqtt]` of `config` and
@@ -1733,10 +1775,11 @@ async fn start_app(
     ))
 }
 
-/// The recorder of the utterances of `listener` on the log of `config`, its log writer task, and
-/// the review of the log with the intent names of `catalog`. Starts the training trigger on the
-/// log with `reasoner`, `catalog`, the hot cache `cache`, the `RunPod` trainer `runpod` and the
-/// house and live models of `pause`, which checks each `train.check_interval_s`.
+/// The recorder of the utterances of `listener` on the log of `config`, its log writer task, the
+/// review of the log with the intent names of `catalog`, and the receiver of the error text of a
+/// failed `restore`. Starts the training trigger on the log with `reasoner`, `catalog`, the hot
+/// cache `cache`, the `RunPod` trainer `runpod`, the house `home` and the live models `models`,
+/// which checks each `train.check_interval_s`.
 ///
 /// # Errors
 ///
@@ -1748,14 +1791,22 @@ fn start_log(
     reasoner: &Arc<dyn Reasoner>,
     cache: &watch::Receiver<StateCache>,
     runpod: Option<Arc<dyn Trainer>>,
-    pause: (Arc<dyn Home>, Arc<LiveModels>),
+    (home, models): (Arc<dyn Home>, Arc<LiveModels>),
 ) -> anyhow::Result<(Recorder, Logged)> {
     let (log, last_id) = open_log(config)?;
-    let recorded = recorder(listener, catalog, &log, last_id);
-    let reasoner = Arc::clone(reasoner);
-    let trigger = trigger(config, reasoner, log, catalog, cache, runpod, pause)?;
+    let (recorded, (writer, review)) = recorder(listener, catalog, &log, last_id);
+    let (reasoner, (stop, stopped)) = (Arc::clone(reasoner), watch::channel(None));
+    let trigger = trigger(
+        config,
+        reasoner,
+        log,
+        catalog,
+        cache,
+        runpod,
+        (home, models, stop),
+    )?;
     app::training::start_trigger(trigger, Duration::from_secs(config.train.check_interval_s));
-    Ok(recorded)
+    Ok((recorded, (writer, review, stopped)))
 }
 
 /// The log of `config` and its largest stored ID. Starts the daily prune of the log.
@@ -1781,7 +1832,7 @@ fn recorder(
     catalog: &Catalog,
     log: &Arc<dyn InteractionLog>,
     last_id: Option<u64>,
-) -> (Recorder, Logged) {
+) -> (Recorder, (JoinHandle<()>, Reviewer)) {
     let review = Reviewer::new(Arc::clone(log), catalog);
     let (writer, task) = app::conversation::start_writer(Arc::clone(log));
     let recorder = Recorder {
@@ -1794,8 +1845,9 @@ fn recorder(
 
 /// The training trigger of `config` with the backoff `train.failure_backoff_s`, the process
 /// trainer, the `RunPod` trainer `runpod`, the ONNX loader, the stores of `train.state` and
-/// `train.generated`, the system time, `reasoner`, `log`, `catalog`, the hot cache `cache`, and
-/// the house and the live models of `pause`, whose classifier the run swaps.
+/// `train.generated`, the system time, `reasoner`, `log`, `catalog`, the hot cache `cache`, the
+/// house `home`, the live models `models`, whose classifier the run swaps, and `stop`, which gets
+/// the error text of a failed `restore`.
 ///
 /// # Errors
 ///
@@ -1807,7 +1859,11 @@ fn trigger(
     catalog: &Arc<Catalog>,
     cache: &watch::Receiver<StateCache>,
     runpod: Option<Arc<dyn Trainer>>,
-    (home, models): (Arc<dyn Home>, Arc<LiveModels>),
+    (home, models, stop): (
+        Arc<dyn Home>,
+        Arc<LiveModels>,
+        watch::Sender<Option<String>>,
+    ),
 ) -> anyhow::Result<Arc<Trigger>> {
     let train = &config.train;
     let training = Training {
@@ -1825,6 +1881,7 @@ fn trigger(
         config: config.clone(),
         home,
         models,
+        stop,
     };
     Ok(Arc::new(Trigger::new(Arc::new(training), backoff(train)?)))
 }
@@ -3478,6 +3535,54 @@ mod tests {
         );
         let habits = folder.path().join("habits.json");
         assert!(habits.exists(), "run did not save {}", habits.display());
+        Ok(())
+    }
+
+    /// Sends the text `no model` on `stop` once the Wyoming server at `address` answers. Ends
+    /// only on an error.
+    async fn stop_when_listening(
+        address: SocketAddr,
+        stop: &watch::Sender<Option<String>>,
+    ) -> anyhow::Result<()> {
+        describe_when_listening(address).await?;
+        stop.send_replace(Some("no model".to_owned()));
+        future::pending().await
+    }
+
+    /// The configuration and the secrets of `file`, and its app started on `FakeHome` with the
+    /// stop receiver `stopped`.
+    async fn started_with(
+        file: &Path,
+        stopped: watch::Receiver<Option<String>>,
+    ) -> anyhow::Result<(Config, Secrets, Started)> {
+        let config = Config::load(file)?;
+        let secrets = Secrets::resolve(&config, |_: &str| Some("token".to_owned()))?;
+        let catalog = load_catalog(&config.intents)?;
+        let pools = load_pools(&config.responses, &catalog)?;
+        let home = Arc::new(FakeHome::default());
+        let (app, (pools_task, habits, (writer, review, _)), prerender, models) =
+            start_live_app(&config, &secrets, catalog, pools, home).await?;
+        let stores = (pools_task, habits, (writer, review, stopped));
+        Ok((config, secrets, (app, stores, prerender, models)))
+    }
+
+    /// AC-13.10g-2. The test holds the sender of a new stop channel.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_10g_2_restore_error_stops_the_server() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let (file, address, _) = listening_config(folder.path())?;
+        let (stop, stopped) = watch::channel(None);
+        let (config, secrets, started) = started_with(&file, stopped).await?;
+        tokio::select! {
+            biased;
+            served = serve_until(file, &config, &secrets, started, future::pending()) => {
+                let error = served.err().context("serve_until gave no error")?;
+                assert_eq!(format!("{error:#}"), "no model");
+            }
+            result = stop_when_listening(address, &stop) => anyhow::bail!("no stop: {result:?}"),
+        }
+        let connected = TcpStream::connect(address).await;
+        assert!(connected.is_err(), "the server accepts after the stop");
         Ok(())
     }
 
