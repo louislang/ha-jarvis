@@ -24,7 +24,9 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::CurrentClassifier;
 use crate::DialogConfig;
+use crate::RunClassifier;
 use crate::app::background::Backfill;
 use crate::app::background::Habits;
 use crate::app::plugins::Plugins;
@@ -62,7 +64,6 @@ use crate::domain::state::AreaId;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
 use crate::domain::training;
-use crate::ports::Classifier;
 use crate::ports::Clock;
 use crate::ports::Context;
 use crate::ports::Handled;
@@ -100,8 +101,6 @@ pub struct Recorder {
     pub utterances: Arc<Utterances>,
     /// The sender to the log writer task.
     pub writer: UnboundedSender<Write>,
-    /// The run name of the System One model.
-    pub model: String,
     /// The largest stored interaction ID at the start, or `None` without interactions.
     pub last_id: Option<u64>,
 }
@@ -147,7 +146,7 @@ pub struct Conversation {
     /// The random source of the response selection.
     rng: Arc<Mutex<StdRng>>,
     /// The System One model.
-    classifier: Arc<dyn Classifier>,
+    classifier: Arc<CurrentClassifier>,
     /// The intent catalog.
     catalog: Arc<Catalog>,
     /// The least top probability that System One acts on.
@@ -177,7 +176,7 @@ impl Conversation {
         pools: Arc<ArcSwap<Pools>>,
         backfill: Arc<Backfill>,
         queues: Arc<Queues>,
-        classifier: Arc<dyn Classifier>,
+        classifier: Arc<CurrentClassifier>,
         catalog: Arc<Catalog>,
         threshold: f32,
         two: SystemTwo,
@@ -220,15 +219,15 @@ impl Conversation {
         let (area, name) = self.area(context.device_id.as_deref());
         let mut heard = self.hear(text, &context, name.as_deref(), self.two.clock.now());
         let key = context.satellite_id.or(context.conversation_id).map(Key);
-        let (handled, logged) = self.respond(text, key, area, name, &mut heard).await?;
+        let (handled, logged) = self.respond(text, key, area, &mut heard).await?;
         if let Some((prediction, decided)) = logged {
             self.append(heard, &prediction, decided);
         }
         Ok(handled)
     }
 
-    /// The reply to `text` of `heard` with the dialog key `key` from the area `area` with the name
-    /// `name`, as `handle` describes, and its record, except for a cancel.
+    /// The reply to `text` of `heard` with the dialog key `key` from the area `area`, as `handle`
+    /// describes, and its record, except for a cancel.
     ///
     /// # Errors
     ///
@@ -238,11 +237,10 @@ impl Conversation {
         text: &str,
         key: Option<Key>,
         area: Option<AreaId>,
-        name: Option<String>,
         heard: &mut Heard,
     ) -> anyhow::Result<Answered> {
         let open = self.take_dialog(key.clone(), heard);
-        let routed = self.route(text, open, name.as_deref(), heard).await?;
+        let routed = self.route(text, open, heard).await?;
         let (prediction, transcript, new) = match routed {
             ControlFlow::Continue(routed) => routed,
             ControlFlow::Break(answered) => return Ok(answered),
@@ -274,6 +272,7 @@ impl Conversation {
             satellite,
             transcript: text.to_owned(),
             model_context: training::context_text(name),
+            model: self.classifier.0.load_full(),
             utterance,
             link: None,
         }
@@ -297,7 +296,7 @@ impl Conversation {
             slots: tagged(&prediction.slots, &intent::normalize(&heard.transcript)),
             transcript: heard.transcript,
             model_context: heard.model_context,
-            model: self.recorder.model.clone(),
+            model: heard.model.run.clone(),
             top_labels: prediction.ranked.iter().take(3).cloned().collect(),
             action: action(prediction, call.as_ref()),
             decision: route,
@@ -409,7 +408,7 @@ impl Conversation {
     /// `heard` at its time: a `cancelled` reply that closes it, or a question again, with the
     /// prediction and the record parts of an unclear answer. Else the prediction to decide and its
     /// transcript: the filled intent of a `Slot` dialog, or the System One prediction of `text` in
-    /// the area `name`, with true for a new request.
+    /// the area of `heard`, with true for a new request.
     ///
     /// # Errors
     ///
@@ -418,12 +417,11 @@ impl Conversation {
         &self,
         text: &str,
         open: Option<(Dialog, Key)>,
-        name: Option<&str>,
         heard: &Heard,
     ) -> anyhow::Result<ControlFlow<Answered, (Prediction, String, bool)>> {
         let Some((dialog, key)) = open else {
             return Ok(ControlFlow::Continue((
-                self.predict(name, text).await?,
+                self.predict(text, heard).await?,
                 text.to_owned(),
                 true,
             )));
@@ -434,7 +432,7 @@ impl Conversation {
         if let Some((prediction, transcript)) = self.filled(&dialog, text) {
             return Ok(ControlFlow::Continue((prediction, transcript, false)));
         }
-        let prediction = self.predict(name, text).await?;
+        let prediction = self.predict(text, heard).await?;
         if self.is_clear(&prediction) {
             return Ok(ControlFlow::Continue((prediction, text.to_owned(), true)));
         }
@@ -487,17 +485,15 @@ impl Conversation {
         (Handled { text, after: None }, None)
     }
 
-    /// The System One prediction of the normalized `text` in the area `name`.
+    /// The prediction of the normalized `text` in the model context of `heard` by the System One
+    /// model of `heard`.
     ///
     /// # Errors
     ///
     /// The prediction fails. The error text is a `failure` answer.
-    async fn predict(&self, name: Option<&str>, text: &str) -> anyhow::Result<Prediction> {
-        let model_context = training::context_text(name);
-        let prediction = self
-            .classifier
-            .predict(&model_context, &intent::normalize(text))
-            .await;
+    async fn predict(&self, text: &str, heard: &Heard) -> anyhow::Result<Prediction> {
+        let (classifier, text) = (&heard.model.classifier, intent::normalize(text));
+        let prediction = classifier.predict(&heard.model_context, &text).await;
         prediction.map_err(|error| {
             tracing::warn!("the prediction failed: {error:#}");
             anyhow::anyhow!(self.pick("failure"))
@@ -1205,6 +1201,8 @@ struct Heard {
     transcript: String,
     /// Segment A of the model input.
     model_context: String,
+    /// The System One model at the time of the request. It predicts, and the record names its run.
+    model: Arc<RunClassifier>,
     /// The utterance of a voice request.
     utterance: Option<Utterance>,
     /// The ID of the first interaction of the dialog, for a dialog answer.
@@ -1605,6 +1603,7 @@ mod tests {
 
     use super::*;
     use crate::app::speech::Speech;
+    use crate::app::training::FIXTURE;
     use crate::domain::habits::Bucket;
     use crate::domain::habits::DayType;
     use crate::domain::habits::RequestHabits;
@@ -1612,6 +1611,7 @@ mod tests {
     use crate::domain::responses::Pool;
     use crate::domain::state::ServiceCall;
     use crate::domain::state::State;
+    use crate::ports::Classifier;
     use crate::ports::Plugin;
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
@@ -1686,7 +1686,7 @@ mod tests {
             pools,
             backfill,
             queues,
-            classifier,
+            Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), classifier)),
             Arc::new(catalog),
             0.6,
             SystemTwo {
@@ -2561,13 +2561,12 @@ mod tests {
     /// The text of the logged requests of the tests.
     const LIGHTS: &str = "turn on the kitchen lights";
 
-    /// A recorder with no utterances, the model `fixture` and a writer that has ended.
+    /// A recorder with no utterances and a writer that has ended.
     fn recorder() -> Recorder {
         let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
         Recorder {
             utterances: Arc::new(Utterances::new(clock, 10)),
             writer: tokio::sync::mpsc::unbounded_channel().0,
-            model: "fixture".to_owned(),
             last_id: None,
         }
     }
@@ -2661,6 +2660,27 @@ mod tests {
         after.ok_or_else(|| anyhow::anyhow!("no call"))?.await?;
         let expected = lights_record(text, home.calls());
         assert_eq!(written(&log).await, [(expected, Some(audio))]);
+        Ok(())
+    }
+
+    /// AC-13.9d-2. A swap of `Training::run` stores the new classifier with its run.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9d_2_next_record_names_the_run_of_the_prediction() -> anyhow::Result<()> {
+        let (log, conversation) = logging(&Arc::default(), Duration::ZERO);
+        let run = "20260101-000000".to_owned();
+        let classifier = Arc::clone(&conversation.classifier.0.load().classifier);
+        let new = RunClassifier {
+            run: run.clone(),
+            classifier,
+        };
+        conversation.classifier.0.store(Arc::new(new));
+        let _ = conversation.handle(LIGHTS, on_satellite()).await?;
+        let models: Vec<String> = written(&log)
+            .await
+            .into_iter()
+            .map(|(record, _)| record.model)
+            .collect();
+        assert_eq!(models, [run]);
         Ok(())
     }
 

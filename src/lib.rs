@@ -28,6 +28,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use clap::Parser;
 use clap::error::ErrorKind;
+use jiff::SignedDuration;
 use jiff::Timestamp;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -55,6 +56,7 @@ use crate::adapters::onnx::OnnxLoader;
 use crate::adapters::open_meteo::OpenMeteo;
 use crate::adapters::openai::OpenAiReasoner;
 use crate::adapters::plex::Plex;
+use crate::adapters::process::ProcessTrainer;
 use crate::adapters::sherpa::SherpaStt;
 use crate::adapters::sqlite::SqliteLog;
 use crate::adapters::supertonic::SupertonicTts;
@@ -72,6 +74,9 @@ use crate::app::review::Reviewer;
 use crate::app::speech::Listener;
 use crate::app::speech::Speech;
 use crate::app::speech::Utterances;
+use crate::app::training::FIXTURE;
+use crate::app::training::Training;
+use crate::app::training::Trigger;
 use crate::domain::catalog::Catalog;
 use crate::domain::habits::RequestHabits;
 use crate::domain::model::Prediction;
@@ -84,6 +89,7 @@ use crate::domain::state::Snapshot;
 use crate::domain::state_cache::StateCache;
 use crate::domain::training::Settings;
 use crate::domain::training::TrainingSet;
+use crate::domain::training::TrainingState;
 use crate::ports::Activity;
 use crate::ports::Assistant;
 use crate::ports::Classifier;
@@ -279,7 +285,7 @@ impl Config {
     }
 
     /// The name and the value of each timeout and interval.
-    fn durations(&self) -> [(&'static str, u64); 15] {
+    fn durations(&self) -> [(&'static str, u64); 16] {
         let (ha, asr, openai) = (&self.ha, &self.asr, &self.openai);
         [
             ("ha.request_timeout_ms", ha.request_timeout_ms),
@@ -297,6 +303,7 @@ impl Config {
             ("announce.idle_wait_s", self.announce.idle_wait_s),
             ("dialog.timeout_s", self.dialog.timeout_s),
             ("habits.save_interval_s", self.habits.save_interval_s),
+            ("train.check_interval_s", self.train.check_interval_s),
         ]
     }
 
@@ -585,8 +592,12 @@ pub struct TrainConfig {
     pub batch_size: usize,
     /// The number of changes that starts an automatic training run.
     pub min_changes: usize,
+    /// The time between two checks of the change count.
+    pub check_interval_s: u64,
     /// The share of the examples in the held-out split.
     pub holdout: f64,
+    /// The wait after a failed run before the next automatic run.
+    pub failure_backoff_s: u64,
     /// The time after which a training run stops.
     pub timeout_min: u64,
     /// The GPU memory cap of a local run, in GB.
@@ -662,9 +673,6 @@ pub struct MqttConfig {
     /// The environment variable with the password.
     pub password_env: String,
 }
-
-/// The run name of the System One model that Jarvis loads.
-const MODEL: &str = "fixture";
 
 /// The `Clock` of the system time.
 #[derive(Clone, Copy, Debug, Default)]
@@ -874,15 +882,31 @@ fn listener(
     )
 }
 
+/// A System One classifier and the name of its run.
+pub struct RunClassifier {
+    /// The run name, which the log records.
+    pub run: String,
+    /// The classifier.
+    pub classifier: Arc<dyn Classifier>,
+}
+
 /// The System One model of the conversation. A swap affects the next `predict`.
-pub struct CurrentClassifier(pub ArcSwap<Arc<dyn Classifier>>);
+pub struct CurrentClassifier(pub ArcSwap<RunClassifier>);
+
+impl CurrentClassifier {
+    /// The classifier `classifier` of the run `run`.
+    #[must_use]
+    pub fn new(run: String, classifier: Arc<dyn Classifier>) -> Self {
+        Self(ArcSwap::from_pointee(RunClassifier { run, classifier }))
+    }
+}
 
 #[async_trait]
 impl Classifier for CurrentClassifier {
     async fn predict(&self, context: &str, text: &str) -> anyhow::Result<Prediction> {
         // One load, so that one prediction uses one classifier.
-        let classifier = self.0.load_full();
-        classifier.predict(context, text).await
+        let current = self.0.load_full();
+        current.classifier.predict(context, text).await
     }
 }
 
@@ -1145,11 +1169,10 @@ fn area_names(path: &Path) -> anyhow::Result<Vec<String>> {
 
 /// A started app, its pools task, habit task, log writer task and review, and its pre-render
 /// task.
-type Started = (
-    App,
-    (JoinHandle<()>, HabitsTask, (JoinHandle<()>, Reviewer)),
-    JoinHandle<()>,
-);
+type Started = (App, (JoinHandle<()>, HabitsTask, Logged), JoinHandle<()>);
+
+/// A log writer task and the review of its log.
+type Logged = (JoinHandle<()>, Reviewer);
 
 /// The longest wait of [`run`] for the running tasks and the saves after the shutdown future
 /// completes.
@@ -1412,11 +1435,11 @@ fn registry(config: &Config, plugins: Vec<Arc<dyn Plugin>>) -> Arc<Plugins> {
 /// The app of `config`, `catalog` and the source pools `pools` on `home`, `reasoner` and the
 /// plugin registry `plugins`, its pools task and habit task, and its pre-render task. Starts the
 /// sync, the pools task and the habit task, and loads the System One model, then the STT and TTS
-/// models. Then starts the pre-render.
+/// models, and starts the training trigger. Then starts the pre-render.
 ///
 /// # Errors
 ///
-/// The saved pools, the habits or a model cannot load.
+/// The saved pools, the habits, the training state, a model or the log cannot load.
 async fn start_app(
     config: &Config,
     catalog: Arc<Catalog>,
@@ -1426,10 +1449,9 @@ async fn start_app(
     plugins: Arc<Plugins>,
 ) -> anyhow::Result<Started> {
     let (cache, queues, task, habits) = start_tasks(&home, config, pools)?;
-    let (classifier, listener, speech) =
-        load_models(config, reasoner.clone(), &queues, home, &cache, &catalog).await?;
+    let (classifier, listener, speech, (recorder, logged)) =
+        load_models(config, &reasoner, &queues, home, &cache, &catalog).await?;
     let prerender = start_prerender(&speech, &task.pools, &cache);
-    let (recorder, logged) = recorder(config, &listener, &catalog)?;
     Ok((
         App {
             conversation: Conversation::new(
@@ -1451,18 +1473,43 @@ async fn start_app(
     ))
 }
 
-/// The recorder of the utterances of `listener` and of the log of `config` with its largest
-/// stored ID, its new log writer task, and the review of that log with the intent names of
-/// `catalog`. Starts the daily prune of the log.
+/// The recorder of the utterances of `listener` on the log of `config`, its log writer task, and
+/// the review of the log with the intent names of `catalog`. Starts the training trigger on the
+/// log with `reasoner`, `classifier`, `catalog` and the hot cache `cache`, which checks each
+/// `train.check_interval_s`.
+///
+/// # Errors
+///
+/// The log cannot open, or a store path of `[train]` is not a `.toml` or `.json` file.
+fn start_log(
+    config: &Config,
+    listener: &Listener,
+    catalog: &Arc<Catalog>,
+    reasoner: &Arc<dyn Reasoner>,
+    classifier: &Arc<CurrentClassifier>,
+    cache: &watch::Receiver<StateCache>,
+) -> anyhow::Result<(Recorder, Logged)> {
+    let (log, last_id) = open_log(config)?;
+    let recorded = recorder(listener, catalog, &log, last_id);
+    let classifier = Arc::clone(classifier);
+    let trigger = trigger(
+        config,
+        Arc::clone(reasoner),
+        log,
+        classifier,
+        catalog,
+        cache,
+    )?;
+    app::training::start_trigger(trigger, Duration::from_secs(config.train.check_interval_s));
+    Ok(recorded)
+}
+
+/// The log of `config` and its largest stored ID. Starts the daily prune of the log.
 ///
 /// # Errors
 ///
 /// The log cannot open.
-fn recorder(
-    config: &Config,
-    listener: &Listener,
-    catalog: &Catalog,
-) -> anyhow::Result<(Recorder, (JoinHandle<()>, Reviewer))> {
+fn open_log(config: &Config) -> anyhow::Result<(Arc<dyn InteractionLog>, Option<u64>)> {
     let log = SqliteLog::open(&config.log)?;
     let last_id = log.last_id()?;
     let log: Arc<dyn InteractionLog> = Arc::new(log);
@@ -1470,15 +1517,65 @@ fn recorder(
         Arc::clone(&log),
         Arc::new(SystemClock),
     ));
-    let review = Reviewer::new(Arc::clone(&log), catalog);
-    let (writer, task) = app::conversation::start_writer(log);
+    Ok((log, last_id))
+}
+
+/// The recorder of the utterances of `listener` and `log` with the largest stored ID `last_id`,
+/// its new log writer task, and the review of `log` with the intent names of `catalog`.
+fn recorder(
+    listener: &Listener,
+    catalog: &Catalog,
+    log: &Arc<dyn InteractionLog>,
+    last_id: Option<u64>,
+) -> (Recorder, Logged) {
+    let review = Reviewer::new(Arc::clone(log), catalog);
+    let (writer, task) = app::conversation::start_writer(Arc::clone(log));
     let recorder = Recorder {
         utterances: Arc::clone(listener.utterances()),
         writer,
-        model: MODEL.to_owned(),
         last_id,
     };
-    Ok((recorder, (task, review)))
+    (recorder, (task, review))
+}
+
+/// The training trigger of `config` with the backoff `train.failure_backoff_s`, the process
+/// trainer, the ONNX loader, the stores of `train.state` and `train.generated`, the system time,
+/// `reasoner`, `log`, `classifier`, `catalog` and the hot cache `cache`.
+///
+/// # Errors
+///
+/// A store path is not a `.toml` or `.json` file.
+fn trigger(
+    config: &Config,
+    reasoner: Arc<dyn Reasoner>,
+    log: Arc<dyn InteractionLog>,
+    classifier: Arc<CurrentClassifier>,
+    catalog: &Arc<Catalog>,
+    cache: &watch::Receiver<StateCache>,
+) -> anyhow::Result<Arc<Trigger>> {
+    let train = &config.train;
+    let trainer = ProcessTrainer {
+        python: train.python.clone(),
+        dir: config.model.dir.clone(),
+        device: config.device,
+        max_vram_gb: train.max_vram_gb,
+        timeout: Duration::from_secs(train.timeout_min * 60),
+    };
+    let training = Training {
+        reasoner,
+        generated: Arc::new(FileStore::try_new(train.generated.clone())?),
+        state: Arc::new(FileStore::try_new(train.state.clone())?),
+        log,
+        trainer: Arc::new(trainer),
+        loader: Arc::new(OnnxLoader),
+        classifier,
+        catalog: Arc::clone(catalog),
+        cache: cache.clone(),
+        clock: Arc::new(SystemClock),
+        config: config.clone(),
+    };
+    let backoff = SignedDuration::try_from(Duration::from_secs(train.failure_backoff_s))?;
+    Ok(Arc::new(Trigger::new(Arc::new(training), backoff)))
 }
 
 /// Starts the sync of a hot cache with `home`, and the pools task of the source pools `pools` and
@@ -1558,28 +1655,48 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
 }
 
 /// The System One model of `config`, then the listener on the STT models of `config`, which
-/// predicts with that model, sees the dialogs of `queues` and warms `reasoner`, and the speech use
-/// case on the TTS model of `config`. Starts the hotword refresh of the STT with `home`, `cache`
-/// and `catalog`.
+/// predicts with that model, sees the dialogs of `queues` and warms `reasoner`, the speech use
+/// case on the TTS model of `config`, and the recorder of [`start_log`]. Starts the hotword
+/// refresh of the STT with `home`, `cache` and `catalog`, and the training trigger.
 ///
 /// # Errors
 ///
-/// A model cannot load.
+/// The training state, a model or the log cannot load.
 async fn load_models(
     config: &Config,
-    reasoner: Arc<dyn Reasoner>,
+    reasoner: &Arc<dyn Reasoner>,
     queues: &Arc<Queues>,
     home: Arc<dyn Home>,
     cache: &watch::Receiver<StateCache>,
     catalog: &Arc<Catalog>,
-) -> anyhow::Result<(Arc<dyn Classifier>, Listener, Arc<Speech>)> {
-    let dir = config.model.dir.join(MODEL);
-    let model = OnnxLoader.load(&dir, config.device).await?;
-    let classifier: Arc<dyn Classifier> = Arc::new(CurrentClassifier(ArcSwap::from_pointee(model)));
+) -> anyhow::Result<(
+    Arc<CurrentClassifier>,
+    Listener,
+    Arc<Speech>,
+    (Recorder, Logged),
+)> {
+    let model = load_classifier(config).await?;
     let (stt, speech) = load_speech(config).await?;
     start_hotwords(config, home, cache, catalog, Arc::clone(&stt));
-    let listener = listener(config, stt, Arc::clone(&classifier), reasoner, queues);
-    Ok((classifier, listener, speech))
+    let classifier = Arc::clone(&model) as _;
+    let listener = listener(config, stt, classifier, Arc::clone(reasoner), queues);
+    let recorded = start_log(config, &listener, catalog, reasoner, &model, cache)?;
+    Ok((model, listener, speech, recorded))
+}
+
+/// The System One model of the run that `train.state` of `config` names, else of the fixture.
+///
+/// # Errors
+///
+/// The training state or the model cannot load.
+async fn load_classifier(config: &Config) -> anyhow::Result<Arc<CurrentClassifier>> {
+    let state: Option<TrainingState> = FileStore::try_new(config.train.state.clone())?.load()?;
+    let run = state.and_then(|state| state.current);
+    let run = run.unwrap_or_else(|| FIXTURE.to_owned());
+    let model = OnnxLoader
+        .load(&config.model.dir.join(&run), config.device)
+        .await?;
+    Ok(Arc::new(CurrentClassifier::new(run, model)))
 }
 
 /// The STT of `config` and the speech use case on the TTS model of `config`. Both models load on
@@ -1938,7 +2055,9 @@ mod tests {
             epochs: 8,
             batch_size: 8,
             min_changes: 20,
+            check_interval_s: 600,
             holdout: 0.1,
+            failure_backoff_s: 21600,
             timeout_min: 60,
             max_vram_gb: 4.5,
             paraphrases: 50,
@@ -2113,6 +2232,7 @@ mod tests {
             ("habits.save_interval_s", 300),
             ("train.epochs", 8),
             ("train.batch_size", 8),
+            ("train.check_interval_s", 600),
         ];
         for (name, value) in fields {
             let (_, key) = name.split_once('.').expect("the name has a section");
@@ -2494,7 +2614,7 @@ mod tests {
             task.pools,
             backfill,
             queues,
-            classifier,
+            Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), classifier)),
             catalog,
             threshold,
             two(config),
@@ -2508,7 +2628,6 @@ mod tests {
         Recorder {
             utterances,
             writer: tokio::sync::mpsc::unbounded_channel().0,
-            model: MODEL.to_owned(),
             last_id: None,
         }
     }
@@ -2677,11 +2796,14 @@ mod tests {
         Ok(format!("{error:#}"))
     }
 
-    /// `VALID` with the files `pools.json`, `habits.json` and `jarvis.db` in `folder`.
+    /// `VALID` with the files `pools.json`, `habits.json`, `jarvis.db`, `training.json` and
+    /// `generated.json` in `folder`.
     fn with_stores_in(folder: &Path) -> String {
         let in_folder = |file: &str| format!("\"{}\"", folder.join(file).display());
         let text = VALID.replace("\"pools.json\"", &in_folder("pools.json"));
         let text = text.replace("\"jarvis.db\"", &in_folder("jarvis.db"));
+        let text = text.replace("\"training.json\"", &in_folder("training.json"));
+        let text = text.replace("\"generated.json\"", &in_folder("generated.json"));
         text.replace("\"habits.json\"", &in_folder("habits.json"))
     }
 
@@ -2730,16 +2852,36 @@ mod tests {
         Ok(())
     }
 
+    /// The error of `run` on the CPU with the stores in `folder` and the model folders in
+    /// `<folder>/models`, which does not exist, and the folder of the run `name` in it.
+    async fn missing_model(folder: &Path, name: &str) -> anyhow::Result<(String, String)> {
+        let models = folder.join("models");
+        let text = with_stores_in(folder).replace("\"cuda\"", "\"cpu\"");
+        let text = text.replace("models/system-one", &models.display().to_string());
+        let error = run_error(&text).await?;
+        Ok((error, models.join(name).display().to_string()))
+    }
+
     /// AC-5.4-3.
     #[tokio::test(start_paused = true)]
     async fn ac_5_4_3_missing_model_folder_is_named() -> anyhow::Result<()> {
         let folder = tempfile::tempdir()?;
-        let models = folder.path().join("models");
-        let text = with_stores_in(folder.path()).replace("\"cuda\"", "\"cpu\"");
-        let text = text.replace("models/system-one", &models.display().to_string());
-        let error = run_error(&text).await?;
-        let fixture = models.join("fixture").display().to_string();
+        let (error, fixture) = missing_model(folder.path(), FIXTURE).await?;
         assert!(error.contains(&fixture), "no folder: {error}");
+        Ok(())
+    }
+
+    /// AC-13.9d-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9d_1_run_loads_the_current_run() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let state = TrainingState {
+            current: Some("20260101-000000".to_owned()),
+            ..TrainingState::default()
+        };
+        FileStore::try_new(folder.path().join("training.json"))?.save(&state)?;
+        let (error, run) = missing_model(folder.path(), "20260101-000000").await?;
+        assert!(error.contains(&run), "no folder: {error}");
         Ok(())
     }
 
@@ -2747,11 +2889,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_5_4_4_swap_gives_the_next_handle_the_new_classifier() -> anyhow::Result<()> {
         let (old, new): (Arc<FakeClassifier>, Arc<FakeClassifier>) = Default::default();
-        let current = Arc::new(CurrentClassifier(ArcSwap::from_pointee(old.clone() as _)));
+        let current = Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), old.clone()));
         let app = app_with(Arc::clone(&current) as _, Arc::new(FakeStt::default()))?;
         let handle = || app.handle("turn on the lights", ports::Context::default());
         let _ = handle().await;
-        current.0.store(Arc::new(new.clone() as _));
+        let (run, classifier) = (FIXTURE.to_owned(), new.clone() as _);
+        current.0.store(Arc::new(RunClassifier { run, classifier }));
         let _ = handle().await;
         assert_eq!((old.calls().len(), new.calls().len()), (1, 1));
         Ok(())

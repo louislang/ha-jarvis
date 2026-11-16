@@ -23,6 +23,7 @@ use xxhash_rust::xxh3;
 
 use crate::Config;
 use crate::CurrentClassifier;
+use crate::RunClassifier;
 use crate::TrainConfig;
 use crate::domain::catalog;
 use crate::domain::catalog::Catalog;
@@ -263,7 +264,11 @@ impl Training {
         let last_time = started;
         self.state.save(&TrainingState { current, last_time })?;
         if let Some(new) = new {
-            self.classifier.0.store(Arc::new(new));
+            let (run, classifier) = (run_id.to_owned(), new);
+            // One store, so that a prediction and its run name come from the same model.
+            self.classifier
+                .0
+                .store(Arc::new(RunClassifier { run, classifier }));
             let keep = [run_id, previous.as_deref().unwrap_or(FIXTURE)];
             if let Err(error) = prune(&self.config.model.dir, keep) {
                 tracing::warn!("the delete of the old model folders failed: {error}");
@@ -283,7 +288,7 @@ impl Training {
         let old = self.classifier.0.load_full();
         let threshold = self.config.model.threshold;
         let new_metrics = measure(new, held, threshold).await?;
-        let old_metrics = measure(old.as_ref().as_ref(), held, threshold).await?;
+        let old_metrics = measure(old.classifier.as_ref(), held, threshold).await?;
         let accepted = training::accept(new_metrics, old_metrics);
         tracing::info!(
             "run {run_id}: new {new_metrics:?}, old {old_metrics:?}, accepted {accepted}"
@@ -504,7 +509,6 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use arc_swap::ArcSwap;
     use quint_connect::Driver;
     use quint_connect::State as ModelState;
     use quint_connect::Step;
@@ -670,9 +674,10 @@ mod tests {
             log: Arc::new(FakeLog::default()),
             trainer: Arc::clone(&trainer) as _,
             loader: Arc::new(FakeModelLoader::default()),
-            classifier: Arc::new(CurrentClassifier(ArcSwap::from_pointee(
-                Arc::<FakeClassifier>::default() as _,
-            ))),
+            classifier: Arc::new(CurrentClassifier::new(
+                FIXTURE.to_owned(),
+                Arc::<FakeClassifier>::default(),
+            )),
             catalog: Arc::new(catalog()),
             cache: watch::channel(StateCache::load(fakes::house())).1,
             clock: Arc::new(FakeClock(Timestamp::UNIX_EPOCH)),
@@ -748,13 +753,13 @@ mod tests {
         let models = tempfile::tempdir().expect("a temporary folder");
         let (training, trainer) = harness(0.1, &models);
         let (loader, log) = (Arc::<FakeModelLoader>::default(), Arc::<FakeLog>::default());
-        let current = ArcSwap::from_pointee(Arc::clone(old) as Arc<dyn Classifier>);
+        let current = CurrentClassifier::new(FIXTURE.to_owned(), Arc::clone(old) as _);
         let start = Timestamp::from_second(START).expect("a time");
         let clock = Arc::new(SetClock(Mutex::new(start)));
         let mut training = Training {
             log: Arc::clone(&log) as _,
             loader: Arc::clone(&loader) as _,
-            classifier: Arc::new(CurrentClassifier(current)),
+            classifier: Arc::new(current),
             clock: Arc::clone(&clock) as _,
             ..training
         };
@@ -933,6 +938,24 @@ mod tests {
         Ok(())
     }
 
+    /// AC-13.9d-2. The conversation logs the run of the classifier that predicts (its own
+    /// AC-13.9d-2 test).
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9d_2_swap_stores_the_new_classifier_with_its_run() -> anyhow::Result<()> {
+        let (old, new) = (classifier(&wrong_slot()), classifier(&[]));
+        let harness = swap(&old);
+        script(&harness, &new, Ok(()));
+        harness.training.run().await?;
+        let current = harness.training.classifier.0.load_full();
+        assert_eq!(current.run, RUN);
+        let classifier = Arc::as_ptr(&current.classifier);
+        assert!(
+            ptr::addr_eq(classifier, Arc::as_ptr(&new)),
+            "an old classifier"
+        );
+        Ok(())
+    }
+
     /// The number of `train` calls of `harness`.
     fn calls(harness: &Harness) -> usize {
         harness.trainer.calls.lock().expect("no test panics").len()
@@ -1049,7 +1072,7 @@ mod tests {
             let active = driver.trigger.active.load(Ordering::SeqCst);
             let current = training.classifier.0.load_full();
             let same = |level: &Arc<FakeClassifier>| {
-                ptr::addr_eq(Arc::as_ptr(level), Arc::as_ptr(current.as_ref()))
+                ptr::addr_eq(Arc::as_ptr(level), Arc::as_ptr(&current.classifier))
             };
             let level = driver.levels.iter().position(same);
             let tag = if active { "Local" } else { "Idle" }.to_owned();
