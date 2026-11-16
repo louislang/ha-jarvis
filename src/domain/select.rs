@@ -333,7 +333,8 @@ pub fn is_skipped(cache: &StateCache, entity: &Entity) -> bool {
     ensures
         found == satellite(*cache, device@),
 )]
-fn is_satellite(cache: &StateCache, device: &str) -> bool {
+#[must_use]
+pub fn is_satellite(cache: &StateCache, device: &str) -> bool {
     let mut index = 0;
     #[cfg_attr(verus_only, verus_spec(
         invariant
