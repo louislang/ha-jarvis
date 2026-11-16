@@ -882,15 +882,31 @@ fn listener(
     )
 }
 
+/// A System One classifier and the name of its run.
+pub struct RunClassifier {
+    /// The run name, which the log records.
+    pub run: String,
+    /// The classifier.
+    pub classifier: Arc<dyn Classifier>,
+}
+
 /// The System One model of the conversation. A swap affects the next `predict`.
-pub struct CurrentClassifier(pub ArcSwap<Arc<dyn Classifier>>);
+pub struct CurrentClassifier(pub ArcSwap<RunClassifier>);
+
+impl CurrentClassifier {
+    /// The classifier `classifier` of the run `run`.
+    #[must_use]
+    pub fn new(run: String, classifier: Arc<dyn Classifier>) -> Self {
+        Self(ArcSwap::from_pointee(RunClassifier { run, classifier }))
+    }
+}
 
 #[async_trait]
 impl Classifier for CurrentClassifier {
     async fn predict(&self, context: &str, text: &str) -> anyhow::Result<Prediction> {
         // One load, so that one prediction uses one classifier.
-        let classifier = self.0.load_full();
-        classifier.predict(context, text).await
+        let current = self.0.load_full();
+        current.classifier.predict(context, text).await
     }
 }
 
@@ -1457,10 +1473,10 @@ async fn start_app(
     ))
 }
 
-/// The recorder of the utterances of `listener` and the run name of `model` on the log of
-/// `config`, its log writer task, and the review of the log with the intent names of `catalog`.
-/// Starts the training trigger on the log with `reasoner`, the classifier of `model`, `catalog` and
-/// the hot cache `cache`, which checks each `train.check_interval_s`.
+/// The recorder of the utterances of `listener` on the log of `config`, its log writer task, and
+/// the review of the log with the intent names of `catalog`. Starts the training trigger on the
+/// log with `reasoner`, `classifier`, `catalog` and the hot cache `cache`, which checks each
+/// `train.check_interval_s`.
 ///
 /// # Errors
 ///
@@ -1470,13 +1486,20 @@ fn start_log(
     listener: &Listener,
     catalog: &Arc<Catalog>,
     reasoner: &Arc<dyn Reasoner>,
-    model: &(Arc<CurrentClassifier>, Arc<ArcSwap<String>>),
+    classifier: &Arc<CurrentClassifier>,
     cache: &watch::Receiver<StateCache>,
 ) -> anyhow::Result<(Recorder, Logged)> {
     let (log, last_id) = open_log(config)?;
-    let recorded = recorder(listener, catalog, &model.1, &log, last_id);
-    let model = (Arc::clone(&model.0), Arc::clone(&model.1));
-    let trigger = trigger(config, Arc::clone(reasoner), log, model, catalog, cache)?;
+    let recorded = recorder(listener, catalog, &log, last_id);
+    let classifier = Arc::clone(classifier);
+    let trigger = trigger(
+        config,
+        Arc::clone(reasoner),
+        log,
+        classifier,
+        catalog,
+        cache,
+    )?;
     app::training::start_trigger(trigger, Duration::from_secs(config.train.check_interval_s));
     Ok(recorded)
 }
@@ -1497,13 +1520,11 @@ fn open_log(config: &Config) -> anyhow::Result<(Arc<dyn InteractionLog>, Option<
     Ok((log, last_id))
 }
 
-/// The recorder of the utterances of `listener`, the run name `model` and `log` with the largest
-/// stored ID `last_id`, its new log writer task, and the review of `log` with the intent names of
-/// `catalog`.
+/// The recorder of the utterances of `listener` and `log` with the largest stored ID `last_id`,
+/// its new log writer task, and the review of `log` with the intent names of `catalog`.
 fn recorder(
     listener: &Listener,
     catalog: &Catalog,
-    model: &Arc<ArcSwap<String>>,
     log: &Arc<dyn InteractionLog>,
     last_id: Option<u64>,
 ) -> (Recorder, Logged) {
@@ -1512,7 +1533,6 @@ fn recorder(
     let recorder = Recorder {
         utterances: Arc::clone(listener.utterances()),
         writer,
-        model: Arc::clone(model),
         last_id,
     };
     (recorder, (task, review))
@@ -1520,8 +1540,7 @@ fn recorder(
 
 /// The training trigger of `config` with the backoff `train.failure_backoff_s`, the process
 /// trainer, the ONNX loader, the stores of `train.state` and `train.generated`, the system time,
-/// `reasoner`, `log`, the classifier and its run name of `model`, `catalog` and the hot cache
-/// `cache`.
+/// `reasoner`, `log`, `classifier`, `catalog` and the hot cache `cache`.
 ///
 /// # Errors
 ///
@@ -1530,7 +1549,7 @@ fn trigger(
     config: &Config,
     reasoner: Arc<dyn Reasoner>,
     log: Arc<dyn InteractionLog>,
-    model: (Arc<CurrentClassifier>, Arc<ArcSwap<String>>),
+    classifier: Arc<CurrentClassifier>,
     catalog: &Arc<Catalog>,
     cache: &watch::Receiver<StateCache>,
 ) -> anyhow::Result<Arc<Trigger>> {
@@ -1549,8 +1568,7 @@ fn trigger(
         log,
         trainer: Arc::new(trainer),
         loader: Arc::new(OnnxLoader),
-        classifier: model.0,
-        model: model.1,
+        classifier,
         catalog: Arc::clone(catalog),
         cache: cache.clone(),
         clock: Arc::new(SystemClock),
@@ -1660,29 +1678,25 @@ async fn load_models(
     let model = load_classifier(config).await?;
     let (stt, speech) = load_speech(config).await?;
     start_hotwords(config, home, cache, catalog, Arc::clone(&stt));
-    let classifier = Arc::clone(&model.0) as _;
+    let classifier = Arc::clone(&model) as _;
     let listener = listener(config, stt, classifier, Arc::clone(reasoner), queues);
     let recorded = start_log(config, &listener, catalog, reasoner, &model, cache)?;
-    Ok((model.0, listener, speech, recorded))
+    Ok((model, listener, speech, recorded))
 }
 
-/// The System One model of the run that `train.state` of `config` names, else of the fixture, and
-/// its run name.
+/// The System One model of the run that `train.state` of `config` names, else of the fixture.
 ///
 /// # Errors
 ///
 /// The training state or the model cannot load.
-async fn load_classifier(
-    config: &Config,
-) -> anyhow::Result<(Arc<CurrentClassifier>, Arc<ArcSwap<String>>)> {
+async fn load_classifier(config: &Config) -> anyhow::Result<Arc<CurrentClassifier>> {
     let state: Option<TrainingState> = FileStore::try_new(config.train.state.clone())?.load()?;
     let run = state.and_then(|state| state.current);
     let run = run.unwrap_or_else(|| FIXTURE.to_owned());
     let model = OnnxLoader
         .load(&config.model.dir.join(&run), config.device)
         .await?;
-    let classifier = Arc::new(CurrentClassifier(ArcSwap::from_pointee(model)));
-    Ok((classifier, Arc::new(ArcSwap::from_pointee(run))))
+    Ok(Arc::new(CurrentClassifier::new(run, model)))
 }
 
 /// The STT of `config` and the speech use case on the TTS model of `config`. Both models load on
@@ -2600,7 +2614,7 @@ mod tests {
             task.pools,
             backfill,
             queues,
-            classifier,
+            Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), classifier)),
             catalog,
             threshold,
             two(config),
@@ -2614,7 +2628,6 @@ mod tests {
         Recorder {
             utterances,
             writer: tokio::sync::mpsc::unbounded_channel().0,
-            model: Arc::new(ArcSwap::from_pointee(FIXTURE.to_owned())),
             last_id: None,
         }
     }
@@ -2876,11 +2889,12 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_5_4_4_swap_gives_the_next_handle_the_new_classifier() -> anyhow::Result<()> {
         let (old, new): (Arc<FakeClassifier>, Arc<FakeClassifier>) = Default::default();
-        let current = Arc::new(CurrentClassifier(ArcSwap::from_pointee(old.clone() as _)));
+        let current = Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), old.clone()));
         let app = app_with(Arc::clone(&current) as _, Arc::new(FakeStt::default()))?;
         let handle = || app.handle("turn on the lights", ports::Context::default());
         let _ = handle().await;
-        current.0.store(Arc::new(new.clone() as _));
+        let (run, classifier) = (FIXTURE.to_owned(), new.clone() as _);
+        current.0.store(Arc::new(RunClassifier { run, classifier }));
         let _ = handle().await;
         assert_eq!((old.calls().len(), new.calls().len()), (1, 1));
         Ok(())
