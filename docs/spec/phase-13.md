@@ -630,9 +630,15 @@ AC-13.10d-1 moves to sub-phase 13.10f as AC-13.10f-1.
 **Goal:** Add the `train` intent kind and the `start_training` intent. You can say "Start training" to start a run at any change count.
 
 - **Implements:** G16. **Depends on:** 13.10b.
-- **Files:** modify `src/domain/decide.rs`, `src/app/conversation.rs`, `intents.toml`, `responses.toml`.
+- **Files:** modify `src/domain/decide.rs`, `src/domain/responses.rs`, `src/app/conversation.rs`, `src/app/training.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `intents.toml`, `responses.toml`, `README.md` (the "Start training" request, `CLAUDE.md` workflow item 15).
 
-**Model.** `kind = "train"`: if no run is active, start one (the `voiceStart` action, `voice` of sub-phase 13.9c) and reply from `start_training`. Else reply from `training_busy`.
+**Model.**
+
+- `kind = "train"`: if no run is active, start one (the `voiceStart` action, `voice` of sub-phase 13.9c) and reply from `start_training`. Else reply from `training_busy`.
+- `decide` gives `Train` for a confident `train` intent: a reply from the pool of the intent and a reply from `training_busy`.
+- `voice` gives true when its compare-and-swap starts a run. `run` gives the trigger to the conversation use case. The use case calls `voice` for `Train` and keeps the reply that matches the result.
+- `validate_pools` checks that the pool `training_busy` exists, as it checks `cancelled` (sub-phase 10.5c).
+- The training run on fakes of the tests of `src/app/training.rs` moves to `src/testing/fakes.rs`. The conversation tests then build a trigger with it.
 
 **Acceptance criteria.**
 
