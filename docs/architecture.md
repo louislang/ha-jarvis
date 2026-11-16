@@ -12,6 +12,7 @@ flowchart LR
         crate_adapters_open_meteo[open_meteo]
         crate_adapters_openai[openai]
         crate_adapters_plex[plex]
+        crate_adapters_process[process]
         crate_adapters_settings[settings]
         crate_adapters_sherpa[sherpa]
         crate_adapters_sqlite[sqlite]
@@ -102,6 +103,10 @@ flowchart LR
     crate_adapters_plex --> crate_adapters_plex
     crate_adapters_plex --> crate_domain_state
     crate_adapters_plex --> crate_ports
+    crate_adapters_process --> crate
+    crate_adapters_process --> crate_adapters_process
+    crate_adapters_process --> crate_domain_training
+    crate_adapters_process --> crate_ports
     crate_adapters_settings --> crate_ports
     crate_adapters_sherpa --> crate
     crate_adapters_sherpa --> crate_adapters_sherpa
@@ -234,4 +239,5 @@ flowchart LR
     crate_ports --> crate_domain_model
     crate_ports --> crate_domain_speech
     crate_ports --> crate_domain_state
+    crate_ports --> crate_domain_training
 ```

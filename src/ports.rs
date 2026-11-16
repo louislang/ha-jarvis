@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -28,6 +29,7 @@ use crate::domain::state::Event;
 use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
+use crate::domain::training::TrainingSet;
 
 /// The name and the version that Jarvis gives to HA.
 #[derive(Clone, Debug, PartialEq)]
@@ -274,6 +276,17 @@ pub trait Plugin: Send + Sync {
         arguments: &Map<String, Value>,
         home: &HomeConfig,
     ) -> anyhow::Result<Value>;
+}
+
+/// Trains System One models.
+#[async_trait]
+pub trait Trainer: Send + Sync {
+    /// The model folder of the run `run_id`, trained on `set`.
+    ///
+    /// # Errors
+    ///
+    /// The run fails or times out. The model folder of the run then does not exist.
+    async fn train(&self, run_id: &str, set: &TrainingSet) -> anyhow::Result<PathBuf>;
 }
 
 /// The current time.

@@ -144,6 +144,7 @@ pub mod adapters {
     pub mod open_meteo;
     pub mod openai;
     pub mod plex;
+    pub mod process;
     pub mod settings;
     pub mod sherpa;
     pub mod sqlite;
@@ -585,10 +586,16 @@ pub struct TrainConfig {
     pub min_changes: usize,
     /// The share of the examples in the held-out split.
     pub holdout: f64,
+    /// The time after which a training run stops.
+    pub timeout_min: u64,
+    /// The GPU memory cap of a local run, in GB.
+    pub max_vram_gb: f64,
     /// The number of generated examples of each intent.
     pub paraphrases: usize,
     /// The number of generated examples of `unknown`.
     pub unknown_paraphrases: usize,
+    /// The Python interpreter of a local run.
+    pub python: PathBuf,
 }
 
 /// The `[log]` section.
@@ -1870,8 +1877,11 @@ mod tests {
             batch_size: 8,
             min_changes: 20,
             holdout: 0.1,
+            timeout_min: 60,
+            max_vram_gb: 4.5,
             paraphrases: 50,
             unknown_paraphrases: 300,
+            python: PathBuf::from(".venv/bin/python"),
         }
     }
 
