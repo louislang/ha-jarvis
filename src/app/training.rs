@@ -19,6 +19,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Map;
 use tokio::sync::watch;
 use xxhash_rust::xxh3;
 
@@ -29,6 +30,9 @@ use crate::domain::catalog;
 use crate::domain::catalog::Catalog;
 use crate::domain::feedback::Interaction;
 use crate::domain::intent;
+use crate::domain::state::EntityId;
+use crate::domain::state::ServiceCall;
+use crate::domain::state_cache;
 use crate::domain::state_cache::StateCache;
 use crate::domain::training;
 use crate::domain::training::Example;
@@ -38,8 +42,10 @@ use crate::domain::training::TrainingSet;
 use crate::domain::training::TrainingState;
 use crate::ports::Classifier;
 use crate::ports::Clock;
+use crate::ports::Home;
 use crate::ports::InteractionLog;
 use crate::ports::ModelLoader;
+use crate::ports::Models;
 use crate::ports::Reasoner;
 use crate::ports::Store;
 use crate::ports::Trainer;
@@ -218,6 +224,10 @@ pub struct Training {
     pub clock: Arc<dyn Clock>,
     /// The configuration.
     pub config: Config,
+    /// The house, which mutes the satellites during a local run.
+    pub home: Arc<dyn Home>,
+    /// The model sessions of Jarvis, which a local run frees.
+    pub models: Arc<dyn Models>,
 }
 
 impl Training {
@@ -249,8 +259,12 @@ impl Training {
 
     /// The model folder of `set` from the local trainer, or after its error from the `RunPod`
     /// trainer when it is set.
+    ///
+    /// # Errors
+    ///
+    /// Both trainers fail, or `restore` fails.
     async fn train(&self, run_id: &str, set: &TrainingSet) -> anyhow::Result<PathBuf> {
-        let local = self.trainer.train(run_id, set).await;
+        let local = self.paused(run_id, set).await?;
         match (local, &self.runpod) {
             (Err(error), Some(runpod)) => {
                 tracing::warn!("the local training failed, so RunPod trains: {error:#}");
@@ -258,6 +272,49 @@ impl Training {
             }
             (local, _) => local,
         }
+    }
+
+    /// The result of the local trainer for `set`, with the satellites muted and the models
+    /// released. Restores the models and unmutes the same satellites after it.
+    ///
+    /// # Errors
+    ///
+    /// `restore` fails.
+    async fn paused(
+        &self,
+        run_id: &str,
+        set: &TrainingSet,
+    ) -> anyhow::Result<anyhow::Result<PathBuf>> {
+        let switches = state_cache::mute_switches(&self.cache.borrow());
+        for satellite in &switches.missing {
+            tracing::warn!("the satellite {} has no mute switch", satellite.0);
+        }
+        let muted = self.switch("turn_on", switches.off).await;
+        self.models.release().await;
+        let local = self.trainer.train(run_id, set).await;
+        let restored = self.models.restore().await;
+        self.switch("turn_off", muted).await;
+        restored.map(|()| local)
+    }
+
+    /// Calls `switch.<service>` for each of `switches`, and logs each failed call. Gives the
+    /// switches whose call succeeded.
+    async fn switch(&self, service: &str, switches: Vec<EntityId>) -> Vec<EntityId> {
+        let mut done = Vec::new();
+        for switch in switches {
+            let call = ServiceCall {
+                domain: "switch".to_owned(),
+                service: service.to_owned(),
+                target: vec![switch.0.clone()],
+                data: Map::new(),
+                return_response: false,
+            };
+            match self.home.call(call).await {
+                Ok(_) => done.push(switch),
+                Err(error) => tracing::warn!("switch.{service} of {} failed: {error:#}", switch.0),
+            }
+        }
+        done
     }
 
     /// Saves the state of the run `run_id` that started at `started` and trained `dir`. Swaps in
@@ -536,8 +593,10 @@ mod tests {
     use crate::testing::fakes;
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
+    use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeLog;
     use crate::testing::fakes::FakeModelLoader;
+    use crate::testing::fakes::FakeModels;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeTrainer;
@@ -690,6 +749,8 @@ mod tests {
             cache: watch::channel(StateCache::load(fakes::house())).1,
             clock: Arc::new(FakeClock(Timestamp::UNIX_EPOCH)),
             config,
+            home: Arc::new(FakeHome::default()),
+            models: Arc::new(FakeModels::default()),
         };
         (training, trainer)
     }
@@ -759,12 +820,22 @@ mod tests {
         models: TempDir,
         /// The clock of the run.
         clock: Arc<SetClock>,
+        /// The house with the mute switches.
+        home: Arc<FakeHome>,
+        /// The model sessions that a local run releases.
+        sessions: Arc<FakeModels>,
     }
 
     /// The run of `harness` with the held-out share 0.1, the old classifier `old` and the start
     /// `START`.
     fn swap(old: &Arc<FakeClassifier>) -> Harness {
         edited(old, |_| ())
+    }
+
+    /// A clock at `START`.
+    fn start_clock() -> Arc<SetClock> {
+        let start = Timestamp::from_second(START).expect("a time");
+        Arc::new(SetClock(Mutex::new(start)))
     }
 
     /// The run of `swap` with `FakeRunPodTrainer` after `edit`.
@@ -774,14 +845,16 @@ mod tests {
         let runpod = trainer_in(&models);
         let (loader, log) = (Arc::<FakeModelLoader>::default(), Arc::<FakeLog>::default());
         let current = CurrentClassifier::new(FIXTURE.to_owned(), Arc::clone(old) as _);
-        let start = Timestamp::from_second(START).expect("a time");
-        let clock = Arc::new(SetClock(Mutex::new(start)));
+        let clock = start_clock();
+        let (home, sessions) = (Arc::<FakeHome>::default(), Arc::<FakeModels>::default());
         let mut training = Training {
             log: Arc::clone(&log) as _,
             loader: Arc::clone(&loader) as _,
             classifier: Arc::new(current),
             clock: Arc::clone(&clock) as _,
             runpod: Some(Arc::clone(&runpod) as _),
+            home: Arc::clone(&home) as _,
+            models: Arc::clone(&sessions) as _,
             ..training
         };
         edit(&mut training);
@@ -793,6 +866,8 @@ mod tests {
             log,
             models,
             clock,
+            home,
+            sessions,
         }
     }
 
@@ -1117,6 +1192,131 @@ mod tests {
         Ok(())
     }
 
+    /// The mute switch of the kitchen satellite, the only one that is `off` in the reference house.
+    const KITCHEN: &str = "switch.carson_kitchen_mute_microphones";
+
+    /// The `switch.<service>` call of `KITCHEN`.
+    fn kitchen(service: &str) -> ServiceCall {
+        ServiceCall {
+            domain: "switch".to_owned(),
+            service: service.to_owned(),
+            target: vec![KITCHEN.to_owned()],
+            data: Map::new(),
+            return_response: false,
+        }
+    }
+
+    /// The number of `WARN` lines of the log file `log` that name `name`.
+    fn warns(log: &tempfile::NamedTempFile, name: &str) -> anyhow::Result<usize> {
+        let text = fs::read_to_string(log.path())?;
+        let lines = text.lines().filter(|line| line.contains(" WARN "));
+        Ok(lines.filter(|line| line.contains(name)).count())
+    }
+
+    /// AC-13.10e-1. Checks the order while `FakeRunPodTrainer` waits after a local error.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_10e_1_local_run_mutes_and_releases() -> anyhow::Result<()> {
+        for result in [Ok(()), Err("CUDA out of memory")] {
+            let old = classifier(&[]);
+            let harness = swap(&old);
+            script(&harness, &old, result);
+            let runpod = &harness.runpod;
+            runpod
+                .results
+                .lock()
+                .expect("no test panics")
+                .push_back(Ok(()));
+            let (local, waiting) = (harness.trainer.gate.lock().await, runpod.gate.lock().await);
+            let task = started(&harness).await;
+            assert_eq!(harness.home.calls(), [kitchen("turn_on")]);
+            assert!(harness.sessions.released(), "the models are not released");
+            drop(local);
+            settle().await;
+            assert_eq!(harness.sessions.calls(), ["release", "restore"]);
+            let unmuted = ["turn_on", "turn_off"].map(kitchen);
+            assert_eq!(harness.home.calls(), unmuted);
+            drop(waiting);
+            task.await??;
+        }
+        Ok(())
+    }
+
+    /// The run of `swap` of `old` to the end with the new classifier `new`, where the switch call
+    /// after `passed` calls fails.
+    async fn failing(
+        old: &Arc<FakeClassifier>,
+        new: &Arc<FakeClassifier>,
+        passed: usize,
+    ) -> anyhow::Result<Harness> {
+        let harness = swap(old);
+        script(&harness, new, Ok(()));
+        for _ in 0..passed {
+            let gate = harness.home.delay();
+            gate.send(())
+                .map_err(|()| anyhow::anyhow!("the call ended"))?;
+        }
+        drop(harness.home.delay());
+        harness.training.run().await?;
+        Ok(harness)
+    }
+
+    /// AC-13.10e-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_10e_2_failed_switch_call_is_logged() -> anyhow::Result<()> {
+        let log = tempfile::NamedTempFile::new()?;
+        let _default = tracing::dispatcher::set_default(&fakes::log_dispatch(&log)?);
+        let old = classifier(&[]);
+        let harness = failing(&old, &old, 0).await?;
+        assert_eq!(warns(&log, KITCHEN)?, 1, "warns after a failed turn_on");
+        assert_eq!(calls(&harness), 1, "the process trainer did not run");
+        assert_eq!(harness.home.calls(), [kitchen("turn_on")]);
+        let (old, new) = (classifier(&wrong_slot()), classifier(&[]));
+        let harness = failing(&old, &new, 1).await?;
+        assert_eq!(warns(&log, KITCHEN)?, 2, "warns after a failed turn_off");
+        assert_eq!(
+            next_calls(&harness, &new).await,
+            1,
+            "the new classifier predicts"
+        );
+        Ok(())
+    }
+
+    /// AC-13.10e-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_10e_3_satellite_without_mute_switch_is_logged() -> anyhow::Result<()> {
+        let log = tempfile::NamedTempFile::new()?;
+        let _default = tracing::dispatcher::set_default(&fakes::log_dispatch(&log)?);
+        let mut house = fakes::house();
+        let bedroom = "switch.carson_bedroom_mute_microphones";
+        house
+            .entities
+            .retain(|entity| entity.entity_id.0 != bedroom);
+        let old = classifier(&[]);
+        let harness = edited(&old, |training| {
+            training.cache = watch::channel(StateCache::load(house)).1;
+        });
+        script(&harness, &old, Ok(()));
+        harness.training.run().await?;
+        assert_eq!(warns(&log, "assist_satellite.carson_bedroom")?, 1);
+        let turn_on = kitchen("turn_on");
+        assert!(harness.home.calls().contains(&turn_on), "no turn_on call");
+        Ok(())
+    }
+
+    /// A failed `restore` ends the run with its error after the unmute calls, with no `RunPod` call.
+    #[tokio::test(start_paused = true)]
+    async fn failed_restore_unmutes_and_ends_the_run() {
+        let old = classifier(&[]);
+        let harness = swap(&old);
+        script(&harness, &old, Err("CUDA out of memory"));
+        harness.sessions.fail_restore();
+        let error = harness.training.run().await.expect_err("the run ends");
+        assert_eq!(format!("{error:#}"), "no model");
+        let turn_off = kitchen("turn_off");
+        assert!(harness.home.calls().contains(&turn_off), "no turn_off call");
+        assert_eq!(recorded(&harness.runpod), [], "RunPod has a call");
+    }
+
     /// The model state of `training.qnt` that the conformance test compares.
     #[derive(Debug, Deserialize, PartialEq)]
     struct TrainingModel {
@@ -1128,6 +1328,8 @@ mod tests {
         /// The accuracy level of the active classifier.
         #[serde(rename = "modelAcc")]
         model_acc: usize,
+        /// The release state of `FakeModels`.
+        paused: bool,
     }
 
     /// The variant of a Quint sum type value.
@@ -1160,6 +1362,7 @@ mod tests {
                 run_state: Tag { tag },
                 changes: driver.runtime.block_on(training.changes())?,
                 model_acc: level.ok_or_else(|| anyhow::anyhow!("an unknown classifier"))?,
+                paused: driver.harness.sessions.released(),
             })
         }
     }
@@ -1287,5 +1490,28 @@ mod tests {
     )]
     fn ac_13_10_4_conformance() -> impl Driver {
         TrainingDriver::new(true)
+    }
+
+    /// AC-13.10e-4. Replays 100 traces from each start.
+    #[test]
+    fn ac_13_10e_4_conformance() -> anyhow::Result<()> {
+        for (init, runpod) in [("initLocal", false), ("initRunPod", true)] {
+            let gen_config = quint_connect::runner::RunConfig {
+                spec: "quint/training.qnt".to_owned(),
+                main: None,
+                init: Some(init.to_owned()),
+                step: None,
+                max_samples: None,
+                max_steps: Some(30),
+                seed: "1".to_owned(),
+            };
+            let test_name = format!("ac_13_10e_4_conformance from {init}");
+            let config = quint_connect::runner::Config {
+                test_name,
+                gen_config,
+            };
+            quint_connect::runner::run_test(TrainingDriver::new(runpod), config)?;
+        }
+        Ok(())
     }
 }

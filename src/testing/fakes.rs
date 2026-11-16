@@ -78,6 +78,7 @@ use crate::ports::Info;
 use crate::ports::InteractionLog;
 use crate::ports::Listening;
 use crate::ports::ModelLoader;
+use crate::ports::Models;
 use crate::ports::Page;
 use crate::ports::Partial;
 use crate::ports::Plugin;
@@ -367,6 +368,47 @@ impl Trainer for FakeTrainer {
         let dir = self.dir.join(run_id);
         std::fs::create_dir(&dir)?;
         Ok(dir)
+    }
+}
+
+/// A `Models` that records the calls and can fail the next `restore`.
+#[derive(Default)]
+pub struct FakeModels {
+    /// The calls in order: `release` or `restore`.
+    calls: Mutex<Vec<&'static str>>,
+    /// True when the next `restore` fails.
+    fail: AtomicBool,
+}
+
+impl FakeModels {
+    /// The calls in order: `release` or `restore`.
+    #[must_use]
+    pub fn calls(&self) -> Vec<&'static str> {
+        lock(&self.calls).clone()
+    }
+
+    /// True when the last call is `release`.
+    #[must_use]
+    pub fn released(&self) -> bool {
+        lock(&self.calls).last() == Some(&"release")
+    }
+
+    /// Makes the next `restore` fail.
+    pub fn fail_restore(&self) {
+        self.fail.store(true, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Models for FakeModels {
+    async fn release(&self) {
+        lock(&self.calls).push("release");
+    }
+
+    async fn restore(&self) -> anyhow::Result<()> {
+        lock(&self.calls).push("restore");
+        anyhow::ensure!(!self.fail.swap(false, Ordering::SeqCst), "no model");
+        Ok(())
     }
 }
 

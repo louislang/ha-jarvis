@@ -19,6 +19,7 @@ use std::process;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::Weak;
 use std::sync::mpsc;
 use std::thread;
@@ -955,6 +956,8 @@ pub struct Live {
     models: Arc<Mutex<Vec<Weak<Model>>>>,
     /// The System One model of this handle. `None` gives no prediction.
     model: Option<Arc<Model>>,
+    /// The hotwords of the last `set_hotwords`, which `restore` gives to the new second pass.
+    hotwords: Arc<Mutex<Vec<String>>>,
 }
 
 /// The System One model of one run. `release` empties it, also while a request holds it.
@@ -987,6 +990,11 @@ impl Live {
         }
     }
 
+    /// The hotwords of the last `set_hotwords`.
+    fn hotwords(&self) -> MutexGuard<'_, Vec<String>> {
+        self.hotwords.lock().expect("no lock holder panics")
+    }
+
     /// A read guard of the loaded sessions, or an error while `release` waits or after it.
     fn read(&self) -> anyhow::Result<OwnedRwLockReadGuard<Option<Sessions>, Sessions>> {
         let guard = Arc::clone(&self.sessions).try_read_owned().ok();
@@ -1011,9 +1019,11 @@ impl SpeechToText for Live {
     }
 
     fn set_hotwords(&self, phrases: &[String]) {
-        match self.read() {
-            Ok(sessions) => sessions.stt.set_hotwords(phrases),
-            Err(error) => tracing::warn!("the hotwords are lost: {error:#}"),
+        // The lock stays held until the sessions get the list, so `restore` cannot miss it.
+        let mut hotwords = self.hotwords();
+        phrases.clone_into(&mut hotwords);
+        if let Ok(sessions) = self.read() {
+            sessions.stt.set_hotwords(phrases);
         }
     }
 }
@@ -1124,7 +1134,13 @@ impl Models for LiveModels {
 
     async fn restore(&self) -> anyhow::Result<()> {
         let (sessions, model) = (self.load)().await?;
-        *self.live.sessions.write().await = Some(sessions);
+        let mut loaded = self.live.sessions.write().await;
+        // A `set_hotwords` during the pause waits for this lock, then reaches the new sessions.
+        let hotwords = self.live.hotwords();
+        sessions.stt.set_hotwords(&hotwords);
+        *loaded = Some(sessions);
+        drop(loaded);
+        drop(hotwords);
         self.classifier.swap(model.run, model.classifier);
         Ok(())
     }
@@ -1393,7 +1409,7 @@ type Started = (
     App,
     (JoinHandle<()>, HabitsTask, Logged),
     JoinHandle<()>,
-    LiveModels,
+    Arc<LiveModels>,
 );
 
 /// A log writer task and the review of its log.
@@ -1719,9 +1735,8 @@ async fn start_app(
 
 /// The recorder of the utterances of `listener` on the log of `config`, its log writer task, and
 /// the review of the log with the intent names of `catalog`. Starts the training trigger on the
-/// log with `reasoner`, `classifier`, `catalog`, the hot cache `cache` and the `RunPod` trainer
-/// `runpod`, which checks each
-/// `train.check_interval_s`.
+/// log with `reasoner`, `catalog`, the hot cache `cache`, the `RunPod` trainer `runpod` and the
+/// house and live models of `pause`, which checks each `train.check_interval_s`.
 ///
 /// # Errors
 ///
@@ -1731,22 +1746,14 @@ fn start_log(
     listener: &Listener,
     catalog: &Arc<Catalog>,
     reasoner: &Arc<dyn Reasoner>,
-    classifier: &Arc<CurrentClassifier>,
     cache: &watch::Receiver<StateCache>,
     runpod: Option<Arc<dyn Trainer>>,
+    pause: (Arc<dyn Home>, Arc<LiveModels>),
 ) -> anyhow::Result<(Recorder, Logged)> {
     let (log, last_id) = open_log(config)?;
     let recorded = recorder(listener, catalog, &log, last_id);
-    let classifier = Arc::clone(classifier);
-    let trigger = trigger(
-        config,
-        Arc::clone(reasoner),
-        log,
-        classifier,
-        catalog,
-        cache,
-        runpod,
-    )?;
+    let reasoner = Arc::clone(reasoner);
+    let trigger = trigger(config, reasoner, log, catalog, cache, runpod, pause)?;
     app::training::start_trigger(trigger, Duration::from_secs(config.train.check_interval_s));
     Ok(recorded)
 }
@@ -1787,8 +1794,8 @@ fn recorder(
 
 /// The training trigger of `config` with the backoff `train.failure_backoff_s`, the process
 /// trainer, the `RunPod` trainer `runpod`, the ONNX loader, the stores of `train.state` and
-/// `train.generated`, the system time, `reasoner`, `log`, `classifier`, `catalog` and the hot
-/// cache `cache`.
+/// `train.generated`, the system time, `reasoner`, `log`, `catalog`, the hot cache `cache`, and
+/// the house and the live models of `pause`, whose classifier the run swaps.
 ///
 /// # Errors
 ///
@@ -1797,10 +1804,10 @@ fn trigger(
     config: &Config,
     reasoner: Arc<dyn Reasoner>,
     log: Arc<dyn InteractionLog>,
-    classifier: Arc<CurrentClassifier>,
     catalog: &Arc<Catalog>,
     cache: &watch::Receiver<StateCache>,
     runpod: Option<Arc<dyn Trainer>>,
+    (home, models): (Arc<dyn Home>, Arc<LiveModels>),
 ) -> anyhow::Result<Arc<Trigger>> {
     let train = &config.train;
     let training = Training {
@@ -1811,14 +1818,26 @@ fn trigger(
         trainer: Arc::new(process_trainer(config)),
         runpod,
         loader: Arc::new(OnnxLoader),
-        classifier,
+        classifier: Arc::clone(models.classifier()),
         catalog: Arc::clone(catalog),
         cache: cache.clone(),
         clock: Arc::new(SystemClock),
         config: config.clone(),
+        home,
+        models,
     };
-    let backoff = SignedDuration::try_from(Duration::from_secs(train.failure_backoff_s))?;
-    Ok(Arc::new(Trigger::new(Arc::new(training), backoff)))
+    Ok(Arc::new(Trigger::new(Arc::new(training), backoff(train)?)))
+}
+
+/// The failure backoff `train.failure_backoff_s` of `train`.
+///
+/// # Errors
+///
+/// The backoff is too large for a `SignedDuration`.
+fn backoff(train: &TrainConfig) -> anyhow::Result<SignedDuration> {
+    Ok(SignedDuration::try_from(Duration::from_secs(
+        train.failure_backoff_s,
+    ))?)
 }
 
 /// The process trainer of `config`.
@@ -1912,7 +1931,8 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
 /// The live models of `config`, then the listener on their STT, which predicts with their System
 /// One model, sees the dialogs of `queues` and warms `reasoner`, the speech use case on their TTS,
 /// and the recorder of [`start_log`]. Starts the hotword refresh of the STT with `home`, `cache`
-/// and `catalog`, and the training trigger with the `RunPod` trainer `runpod`.
+/// and `catalog`, and the training trigger with the `RunPod` trainer `runpod`, `home` and the live
+/// models.
 ///
 /// # Errors
 ///
@@ -1925,14 +1945,22 @@ async fn load_models(
     cache: &watch::Receiver<StateCache>,
     catalog: &Arc<Catalog>,
     runpod: Option<Arc<dyn Trainer>>,
-) -> anyhow::Result<(LiveModels, Listener, Arc<Speech>, (Recorder, Logged))> {
-    let models = LiveModels::try_new(load(config)).await?;
-    let (model, live) = (models.classifier(), models.live());
+) -> anyhow::Result<(Arc<LiveModels>, Listener, Arc<Speech>, (Recorder, Logged))> {
+    let models = Arc::new(LiveModels::try_new(load(config)).await?);
+    let live = models.live();
     let (stt, speech) = (Arc::clone(&live) as _, Arc::new(Speech::new(live)));
-    start_hotwords(config, home, cache, catalog, Arc::clone(&stt));
-    let classifier = Arc::clone(model) as _;
+    start_hotwords(config, &home, cache, catalog, Arc::clone(&stt));
+    let classifier = Arc::clone(models.classifier()) as _;
     let listener = listener(config, stt, classifier, Arc::clone(reasoner), queues);
-    let recorded = start_log(config, &listener, catalog, reasoner, model, cache, runpod)?;
+    let recorded = start_log(
+        config,
+        &listener,
+        catalog,
+        reasoner,
+        cache,
+        runpod,
+        (home, Arc::clone(&models)),
+    )?;
     Ok((models, listener, speech, recorded))
 }
 
@@ -1976,13 +2004,13 @@ async fn load_classifier(config: &Config) -> anyhow::Result<RunClassifier> {
 /// true and `asr.second_pass_dir` is set in `config`.
 fn start_hotwords(
     config: &Config,
-    home: Arc<dyn Home>,
+    home: &Arc<dyn Home>,
     cache: &watch::Receiver<StateCache>,
     catalog: &Arc<Catalog>,
     stt: Arc<dyn SpeechToText>,
 ) {
     if config.asr.hotwords && config.asr.second_pass_dir.is_some() {
-        app::background::start_hotwords(home, cache.clone(), Arc::clone(catalog), stt);
+        app::background::start_hotwords(Arc::clone(home), cache.clone(), Arc::clone(catalog), stt);
     }
 }
 
@@ -3229,6 +3257,25 @@ mod tests {
         fails.store(true, Ordering::SeqCst);
         let error = models.restore().await.err().context("restore loaded")?;
         assert_eq!(format!("{error:#}"), "no model");
+        Ok(())
+    }
+
+    /// After a release and a restore, the new second pass has the hotwords of the last
+    /// `set_hotwords`, also of one during the pause.
+    #[tokio::test(start_paused = true)]
+    async fn restore_gives_the_last_hotwords() -> anyhow::Result<()> {
+        let (loaded, fails): (Loaded, Arc<AtomicBool>) = Default::default();
+        let models = LiveModels::try_new(fake_load(&loaded, &fails)).await?;
+        let live = models.live();
+        live.set_hotwords(&["kitchen".to_owned()]);
+        models.release().await;
+        let words = vec!["radiohead".to_owned()];
+        live.set_hotwords(&words);
+        models.restore().await?;
+        let stt = loaded.lock().expect("no panic")[3].upgrade();
+        let stt = stt.context("the new second pass")?.downcast::<FakeStt>();
+        let stt = stt.map_err(|_| anyhow::anyhow!("the fake is not a FakeStt"))?;
+        assert_eq!(*stt.hotwords.lock().expect("no panic"), [words]);
         Ok(())
     }
 
