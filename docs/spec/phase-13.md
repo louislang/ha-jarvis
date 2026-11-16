@@ -437,7 +437,7 @@ AC-13.9-5 to AC-13.9-8, AC-13.9-10 and AC-13.9-11 move to sub-phase 13.9b as AC-
 **Goal:** Send the same training set to RunPod when the local training run fails. A run that does not fit in the GPU of the GPU host still completes.
 
 - **Implements:** G16, G19. **Depends on:** 13.9d.
-- **Files:** modify `src/app/training.rs`, `src/lib.rs`, `quint/training.qnt`.
+- **Files:** modify `src/app/training.rs`, `src/lib.rs`, `src/testing/e2e.rs`, `quint/training.qnt`.
 - **Quint:** `training.qnt` (conformance with `RUNPOD = true`).
 
 **Model.**
