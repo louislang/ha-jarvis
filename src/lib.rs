@@ -1387,9 +1387,14 @@ fn area_names(path: &Path) -> anyhow::Result<Vec<String>> {
     Ok(snapshot.areas.into_iter().map(|area| area.name).collect())
 }
 
-/// A started app, its pools task, habit task, log writer task and review, and its pre-render
-/// task.
-type Started = (App, (JoinHandle<()>, HabitsTask, Logged), JoinHandle<()>);
+/// A started app, its pools task, habit task, log writer task and review, its pre-render task,
+/// and its live models.
+type Started = (
+    App,
+    (JoinHandle<()>, HabitsTask, Logged),
+    JoinHandle<()>,
+    LiveModels,
+);
 
 /// A log writer task and the review of its log.
 type Logged = (JoinHandle<()>, Reviewer);
@@ -1479,7 +1484,7 @@ async fn serve_until(
     started: Started,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<Ended> {
-    let (app, (pools_task, habits, (writer, review)), _) = started;
+    let (app, (pools_task, habits, (writer, review)), _, _) = started;
     let (listener, tracker) = (TcpListener::bind(config.listen).await?, TaskTracker::new());
     let control = Arc::new(Controller::new(file));
     let web = serve_web(&config.web, &secrets.web_token, review, &control, &tracker).await?;
@@ -1607,7 +1612,7 @@ where
 /// The app of `config`, `catalog` and the source pools `pools` on `home`, the plugin registry of
 /// `config`, the reasoner of `config` with the tools of that registry and the `OpenAI` API key
 /// of `secrets`, and the `RunPod` trainer of [`runpod`]. Gives the app, its pools task and habit
-/// task, and its pre-render task.
+/// task, its pre-render task and its live models.
 ///
 /// # Errors
 ///
@@ -1670,9 +1675,9 @@ fn registry(config: &Config, plugins: Vec<Arc<dyn Plugin>>) -> Arc<Plugins> {
 }
 
 /// The app of `config`, `catalog` and the source pools `pools` on `home`, `reasoner` and the
-/// plugin registry `plugins`, its pools task and habit task, and its pre-render task. Starts the
-/// sync, the pools task and the habit task, loads the live models, and starts the training
-/// trigger with the `RunPod` trainer `runpod`. Then starts the pre-render.
+/// plugin registry `plugins`, its pools task and habit task, its pre-render task and its live
+/// models. Starts the sync, the pools task and the habit task, loads the live models, and starts
+/// the training trigger with the `RunPod` trainer `runpod`. Then starts the pre-render.
 ///
 /// # Errors
 ///
@@ -1708,6 +1713,7 @@ async fn start_app(
         },
         (task.task, habits, logged),
         prerender,
+        models,
     ))
 }
 
@@ -3998,6 +4004,53 @@ mod tests {
             peak <= 5_500_000_000 >> 20,
             "GPU memory in MiB after the loads and after each synthesis: {memory:?}"
         );
+        Ok(())
+    }
+
+    /// The free GPU memory in MiB that `nvidia-smi` reports.
+    fn free_gpu_memory() -> anyhow::Result<u32> {
+        let query = ["--query-gpu=memory.free", "--format=csv,noheader,nounits"];
+        let output = std::process::Command::new("nvidia-smi")
+            .args(query)
+            .output()?;
+        anyhow::ensure!(output.status.success(), "nvidia-smi fails: {output:?}");
+        let text = String::from_utf8(output.stdout)?;
+        Ok(text.lines().next().context("no GPU")?.trim().parse()?)
+    }
+
+    /// AC-13.10f-1. The other GPU tests change the memory of their process, so the test runs again
+    /// alone in a child process. The Phase 9.2 tests run after a release and a restore of the
+    /// models of their pipeline (`testing::e2e`).
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn ac_13_10f_1_release_frees_the_gpu_for_a_local_run() -> anyhow::Result<()> {
+        if !alone("tests::ac_13_10f_1_release_frees_the_gpu_for_a_local_run")? {
+            return Ok(());
+        }
+        let config = Config::parse(VALID)?;
+        let models = LiveModels::try_new(load(&config)).await?;
+        let loaded = gpu_memory()?;
+        models.release().await;
+        let (released, free) = (gpu_memory()?, free_gpu_memory()?);
+        // GB in MiB, as in AC-9.3c-2.
+        let needed = (config.train.max_vram_gb + 0.5) * 1e9 / f64::from(1 << 20);
+        assert!(
+            released < loaded && f64::from(free) >= needed,
+            "GPU memory in MiB: {loaded} loaded, {released} released, {free} free, {needed} needed"
+        );
+        models.restore().await?;
+        answers(&models).await
+    }
+
+    /// Runs one prediction, one first pass and one synthesis of `models`.
+    async fn answers(models: &LiveModels) -> anyhow::Result<()> {
+        let classifier = models.classifier();
+        classifier
+            .predict("area: kitchen", "turn on the lights")
+            .await?;
+        models.live().stream()?;
+        let audio = models.live().synth("Hello").await?;
+        anyhow::ensure!(!audio.samples.is_empty(), "the audio has no samples");
         Ok(())
     }
 }

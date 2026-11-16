@@ -21,14 +21,17 @@ use tokio::net::TcpStream;
 use tokio::time::Interval;
 use tokio_util::task::TaskTracker;
 
+use crate::App;
 use crate::AsrConfig;
 use crate::Config;
 use crate::Device;
+use crate::Started;
 use crate::adapters::sherpa;
 use crate::adapters::wyoming;
 use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
 use crate::ports::Home;
+use crate::ports::Models;
 use crate::ports::Reasoner;
 use crate::testing::fakes;
 use crate::testing::fakes::FakeHome;
@@ -212,8 +215,8 @@ impl Pipeline {
 }
 
 /// Starts the app of `config` on `home`, `reasoner` and a `get_weather` plugin with no result,
-/// waits for its pre-render and serves it on a local port. Gives the address and the tracker of
-/// the connection tasks.
+/// waits for it as [`ready`] does, and serves it on a local port. Gives the address and the
+/// tracker of the connection tasks.
 ///
 /// # Errors
 ///
@@ -227,15 +230,30 @@ async fn serve(
     let pools = crate::load_pools(&config.responses, &catalog)?;
     let plugins = crate::registry(config, vec![Arc::new(FakePlugin::new("get_weather"))]);
     let catalog = Arc::new(catalog);
-    let (app, _, prerender) =
-        crate::start_app(config, catalog, pools, home, reasoner, plugins, None).await?;
-    prerender.await?;
-    let app = Arc::new(app);
+    let started = crate::start_app(config, catalog, pools, home, reasoner, plugins, None).await?;
+    let app = Arc::new(ready(config, started).await?);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let (address, tracker) = (listener.local_addr()?, TaskTracker::new());
     let tasks = tracker.clone();
     tokio::spawn(async move { wyoming::serve(listener, app, &tasks, future::pending()).await });
     Ok((address, tracker))
+}
+
+/// The app of `started` after its pre-render. On the CUDA device of `config`, its models are
+/// released and restored first, so the GPU latency tests run after the pause of a local training
+/// run (AC-13.10f-1).
+///
+/// # Errors
+///
+/// The pre-render panicked, or a model cannot load.
+async fn ready(config: &Config, started: Started) -> anyhow::Result<App> {
+    let (app, _, prerender, models) = started;
+    prerender.await?;
+    if config.device == Device::Cuda {
+        models.release().await;
+        models.restore().await?;
+    }
+    Ok(app)
 }
 
 /// A connection to the server at `address` with a started `asr` session, as a reader and a
