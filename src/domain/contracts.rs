@@ -77,6 +77,7 @@ use crate::domain::training::ExampleFile;
 use crate::domain::training::Label;
 use crate::domain::training::SpanFile;
 use crate::domain::training::TrainingSet;
+use crate::domain::training::TrainingState;
 use vstd::prelude::*;
 
 verus! {
@@ -243,6 +244,10 @@ pub struct ExArtist(Artist);
 /// The training set file.
 #[verifier::external_type_specification]
 pub struct ExTrainingSet(TrainingSet);
+
+/// The state of the training runs.
+#[verifier::external_type_specification]
+pub struct ExTrainingState(TrainingState);
 
 /// One labeled transcript with its model context.
 #[verifier::external_type_specification]
