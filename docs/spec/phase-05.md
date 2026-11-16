@@ -102,7 +102,7 @@ This phase adds the driving port and the Wyoming adapter. HA can use Jarvis as i
 - `src/lib.rs` reads `responses.toml` (`[pools.<name>] responses = ["..."]`) into `Pools`, with `uses = 0` and `last = None`, as it reads the catalog. `run` calls `validate_catalog` and `validate_pools` before the server binds.
 - `start_pools` takes the source `Pools`, not a `Store`, because Jarvis never writes `responses.toml`. `Pool` and `Response` derive the serde traits `Serialize` and `Deserialize`, so `FileStore` saves and loads `pools.json`. Verus cannot verify a `#[verus_verify]` type with a serde derive (`02-rules.md` section 5.1, rule 5). Thus the two types lose `#[verus_verify]`, and `src/domain/contracts.rs` gets an `external_type_specification` for each, as for `Catalog`. The spec functions still see the fields.
 - `main` calls `run` only for the command `jarvis serve <config>`. With no command or an unknown command, `main` prints the usage and returns. Thus `./jarvis` still exits with code 0 (sub-phase 0.14).
-- The model folder is `<model.dir>/fixture`. Sub-phase 13.9 adds the training state.
+- The model folder is `<model.dir>/fixture`. Sub-phase 13.9d adds the training state.
 - A `Classifier` wrapper in `src/lib.rs` holds the model in an `ArcSwap` and loads it once for each `predict`. A swap affects the next `handle`. `Conversation` does not change for this.
 - This sub-phase adds `model.dir` to `jarvis.toml`. It adds the `tokio` feature `rt-multi-thread` to `Cargo.toml`, and `macros` if `run` or `main` uses it.
 
