@@ -289,6 +289,21 @@ pub trait Trainer: Send + Sync {
     async fn train(&self, run_id: &str, set: &TrainingSet) -> anyhow::Result<PathBuf>;
 }
 
+/// The model sessions of Jarvis, which a local training run frees.
+#[async_trait]
+pub trait Models: Send + Sync {
+    /// Drops the model sessions after the uses in progress end. Each later use fails at once
+    /// until `restore`.
+    async fn release(&self);
+
+    /// Loads the model sessions again.
+    ///
+    /// # Errors
+    ///
+    /// A model cannot load. Each use then still fails.
+    async fn restore(&self) -> anyhow::Result<()>;
+}
+
 /// The current time.
 pub trait Clock: Send + Sync {
     /// The time now.

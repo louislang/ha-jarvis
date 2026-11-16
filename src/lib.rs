@@ -19,6 +19,7 @@ use std::process;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -28,6 +29,7 @@ use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use clap::Parser;
 use clap::error::ErrorKind;
+use futures::future::BoxFuture;
 use jiff::SignedDuration;
 use jiff::Timestamp;
 use rand::SeedableRng;
@@ -42,6 +44,8 @@ use tokio::net::TcpStream;
 use tokio::signal::unix;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::Notify;
+use tokio::sync::OwnedRwLockReadGuard;
+use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -102,6 +106,8 @@ use crate::ports::Info;
 use crate::ports::InteractionLog;
 use crate::ports::Listening;
 use crate::ports::ModelLoader;
+use crate::ports::Models;
+use crate::ports::Partial;
 use crate::ports::Plugin;
 use crate::ports::Reasoner;
 use crate::ports::Refusal;
@@ -110,6 +116,8 @@ use crate::ports::SpeechToText;
 use crate::ports::State;
 use crate::ports::Status;
 use crate::ports::Store;
+use crate::ports::SttStream;
+use crate::ports::TextToSpeech;
 use crate::ports::Trainer;
 
 /// Pure rules.
@@ -892,14 +900,27 @@ pub struct RunClassifier {
     pub classifier: Arc<dyn Classifier>,
 }
 
-/// The System One model of the conversation. A swap affects the next `predict`.
-pub struct CurrentClassifier(pub ArcSwap<RunClassifier>);
+/// The System One model of the conversation, and the live sessions that guard each use of it.
+/// A swap affects the next `predict`.
+pub struct CurrentClassifier(pub ArcSwap<RunClassifier>, Option<Live>);
 
 impl CurrentClassifier {
     /// The classifier `classifier` of the run `run`.
     #[must_use]
     pub fn new(run: String, classifier: Arc<dyn Classifier>) -> Self {
-        Self(ArcSwap::from_pointee(RunClassifier { run, classifier }))
+        let current = RunClassifier { run, classifier };
+        Self(ArcSwap::from_pointee(current), None)
+    }
+
+    /// Swaps in `classifier` of the run `run`. Each use of it takes a read guard of the live
+    /// sessions when they are set.
+    pub fn swap(&self, run: String, classifier: Arc<dyn Classifier>) {
+        let classifier = match &self.1 {
+            Some(live) => Arc::new(live.with(classifier)),
+            None => classifier,
+        };
+        // One store, so that a prediction and its run name come from the same model.
+        self.0.store(Arc::new(RunClassifier { run, classifier }));
     }
 }
 
@@ -909,6 +930,203 @@ impl Classifier for CurrentClassifier {
         // One load, so that one prediction uses one classifier.
         let current = self.0.load_full();
         current.classifier.predict(context, text).await
+    }
+}
+
+/// The STT and TTS sessions of [`LiveModels`].
+pub struct Sessions {
+    /// Both STT passes.
+    pub stt: Arc<dyn SpeechToText>,
+    /// The TTS.
+    pub tts: Arc<dyn TextToSpeech>,
+}
+
+/// Loads the sessions and the System One model of the current run.
+pub type Load =
+    Box<dyn Fn() -> BoxFuture<'static, anyhow::Result<(Sessions, RunClassifier)>> + Send + Sync>;
+
+/// A use of the sessions of [`LiveModels`]. Each use takes a read guard with `try_read`, so it
+/// fails at once while `release` waits or after it.
+#[derive(Clone, Default)]
+pub struct Live {
+    /// The sessions, `None` after `release`.
+    sessions: Arc<RwLock<Option<Sessions>>>,
+    /// Each System One model that a handle still holds.
+    models: Arc<Mutex<Vec<Weak<Model>>>>,
+    /// The System One model of this handle. `None` gives no prediction.
+    model: Option<Arc<Model>>,
+}
+
+/// The System One model of one run. `release` empties it, also while a request holds it.
+type Model = Mutex<Option<Arc<dyn Classifier>>>;
+
+impl Live {
+    /// The same sessions with `classifier`.
+    fn with(&self, classifier: Arc<dyn Classifier>) -> Self {
+        let model = Arc::new(Mutex::new(Some(classifier)));
+        if let Ok(mut models) = self.models.lock() {
+            models.retain(|model| model.strong_count() > 0);
+            models.push(Arc::downgrade(&model));
+        }
+        Self {
+            model: Some(model),
+            ..self.clone()
+        }
+    }
+
+    /// Empties each System One model that a handle still holds.
+    fn empty(&self) {
+        let Ok(models) = self.models.lock() else {
+            return;
+        };
+        let held = models.iter().filter_map(Weak::upgrade);
+        for model in held {
+            if let Ok(mut model) = model.lock() {
+                *model = None;
+            }
+        }
+    }
+
+    /// A read guard of the loaded sessions, or an error while `release` waits or after it.
+    fn read(&self) -> anyhow::Result<OwnedRwLockReadGuard<Option<Sessions>, Sessions>> {
+        let guard = Arc::clone(&self.sessions).try_read_owned().ok();
+        let loaded =
+            guard.and_then(|guard| OwnedRwLockReadGuard::try_map(guard, Option::as_ref).ok());
+        loaded.context("the models are released")
+    }
+}
+
+impl SpeechToText for Live {
+    fn stream(&self) -> anyhow::Result<Box<dyn SttStream>> {
+        let guard = self.read()?;
+        let stream = guard.stt.stream()?;
+        Ok(Box::new(LiveStream {
+            stream,
+            _guard: guard,
+        }))
+    }
+
+    fn transcribe(&self, samples: &[i16]) -> anyhow::Result<Option<String>> {
+        self.read()?.stt.transcribe(samples)
+    }
+
+    fn set_hotwords(&self, phrases: &[String]) {
+        match self.read() {
+            Ok(sessions) => sessions.stt.set_hotwords(phrases),
+            Err(error) => tracing::warn!("the hotwords are lost: {error:#}"),
+        }
+    }
+}
+
+#[async_trait]
+impl TextToSpeech for Live {
+    async fn synth(&self, text: &str) -> anyhow::Result<Audio> {
+        let (sessions, text) = (self.read()?, text.to_owned());
+        // A task keeps the guard until the synthesis ends, also when the caller stops waiting.
+        tokio::spawn(async move { sessions.tts.synth(&text).await }).await?
+    }
+}
+
+#[async_trait]
+impl Classifier for Live {
+    async fn predict(&self, context: &str, text: &str) -> anyhow::Result<Prediction> {
+        let guard = self.read()?;
+        let model = self
+            .model
+            .as_ref()
+            .and_then(|model| model.lock().ok()?.clone());
+        let model = model.context("no System One model")?;
+        let (context, text) = (context.to_owned(), text.to_owned());
+        // A task keeps the guard until the prediction ends, also when the caller stops waiting.
+        tokio::spawn(async move {
+            let _guard = guard;
+            model.predict(&context, &text).await
+        })
+        .await?
+    }
+}
+
+/// A first pass that keeps a read guard of the live sessions until it drops.
+struct LiveStream {
+    /// The first pass.
+    stream: Box<dyn SttStream>,
+    /// The read guard. It drops after the first pass.
+    _guard: OwnedRwLockReadGuard<Option<Sessions>, Sessions>,
+}
+
+impl SttStream for LiveStream {
+    fn accept(&mut self, samples: &[i16]) {
+        self.stream.accept(samples);
+    }
+
+    fn partial(&self) -> Partial {
+        self.stream.partial()
+    }
+
+    fn reset(&mut self) {
+        self.stream.reset();
+    }
+}
+
+/// The model sessions of Jarvis: both STT passes, TTS and the System One model.
+pub struct LiveModels {
+    /// The STT and TTS sessions, with no System One model.
+    live: Live,
+    /// The System One model of the conversation.
+    classifier: Arc<CurrentClassifier>,
+    /// Loads the sessions again.
+    load: Load,
+}
+
+impl LiveModels {
+    /// The sessions of `load`.
+    ///
+    /// # Errors
+    ///
+    /// A model cannot load.
+    pub async fn try_new(load: Load) -> anyhow::Result<Self> {
+        let (sessions, model) = load().await?;
+        let live = Live::default();
+        *live.sessions.write().await = Some(sessions);
+        let classifier = Arc::new(live.with(model.classifier));
+        let current = ArcSwap::from_pointee(RunClassifier {
+            run: model.run,
+            classifier,
+        });
+        let classifier = Arc::new(CurrentClassifier(current, Some(live.clone())));
+        Ok(Self {
+            live,
+            classifier,
+            load,
+        })
+    }
+
+    /// The System One model of the conversation.
+    #[must_use]
+    pub fn classifier(&self) -> &Arc<CurrentClassifier> {
+        &self.classifier
+    }
+
+    /// Both STT passes and the TTS.
+    #[must_use]
+    pub fn live(&self) -> Arc<Live> {
+        Arc::new(self.live.clone())
+    }
+}
+
+#[async_trait]
+impl Models for LiveModels {
+    async fn release(&self) {
+        let mut sessions = self.live.sessions.write().await;
+        *sessions = None;
+        self.live.empty();
+    }
+
+    async fn restore(&self) -> anyhow::Result<()> {
+        let (sessions, model) = (self.load)().await?;
+        *self.live.sessions.write().await = Some(sessions);
+        self.classifier.swap(model.run, model.classifier);
+        Ok(())
     }
 }
 
@@ -1453,9 +1671,8 @@ fn registry(config: &Config, plugins: Vec<Arc<dyn Plugin>>) -> Arc<Plugins> {
 
 /// The app of `config`, `catalog` and the source pools `pools` on `home`, `reasoner` and the
 /// plugin registry `plugins`, its pools task and habit task, and its pre-render task. Starts the
-/// sync, the pools task and the habit task, and loads the System One model, then the STT and TTS
-/// models, and starts the training trigger with the `RunPod` trainer `runpod`. Then starts the
-/// pre-render.
+/// sync, the pools task and the habit task, loads the live models, and starts the training
+/// trigger with the `RunPod` trainer `runpod`. Then starts the pre-render.
 ///
 /// # Errors
 ///
@@ -1470,7 +1687,7 @@ async fn start_app(
     runpod: Option<Arc<dyn Trainer>>,
 ) -> anyhow::Result<Started> {
     let (cache, queues, task, habits) = start_tasks(&home, config, pools)?;
-    let (classifier, listener, speech, (recorder, logged)) =
+    let (models, listener, speech, (recorder, logged)) =
         load_models(config, &reasoner, &queues, home, &cache, &catalog, runpod).await?;
     let prerender = start_prerender(&speech, &task.pools, &cache);
     Ok((
@@ -1479,7 +1696,7 @@ async fn start_app(
                 task.pools,
                 backfill(config, &reasoner, task.changes, &speech, &catalog, cache),
                 queues,
-                classifier,
+                Arc::clone(models.classifier()),
                 catalog,
                 config.model.threshold,
                 system_two(config, reasoner, plugins),
@@ -1686,11 +1903,10 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
     }
 }
 
-/// The System One model of `config`, then the listener on the STT models of `config`, which
-/// predicts with that model, sees the dialogs of `queues` and warms `reasoner`, the speech use
-/// case on the TTS model of `config`, and the recorder of [`start_log`]. Starts the hotword
-/// refresh of the STT with `home`, `cache` and `catalog`, and the training trigger with the
-/// `RunPod` trainer `runpod`.
+/// The live models of `config`, then the listener on their STT, which predicts with their System
+/// One model, sees the dialogs of `queues` and warms `reasoner`, the speech use case on their TTS,
+/// and the recorder of [`start_log`]. Starts the hotword refresh of the STT with `home`, `cache`
+/// and `catalog`, and the training trigger with the `RunPod` trainer `runpod`.
 ///
 /// # Errors
 ///
@@ -1703,19 +1919,36 @@ async fn load_models(
     cache: &watch::Receiver<StateCache>,
     catalog: &Arc<Catalog>,
     runpod: Option<Arc<dyn Trainer>>,
-) -> anyhow::Result<(
-    Arc<CurrentClassifier>,
-    Listener,
-    Arc<Speech>,
-    (Recorder, Logged),
-)> {
-    let model = load_classifier(config).await?;
-    let (stt, speech) = load_speech(config).await?;
+) -> anyhow::Result<(LiveModels, Listener, Arc<Speech>, (Recorder, Logged))> {
+    let models = LiveModels::try_new(load(config)).await?;
+    let (model, live) = (models.classifier(), models.live());
+    let (stt, speech) = (Arc::clone(&live) as _, Arc::new(Speech::new(live)));
     start_hotwords(config, home, cache, catalog, Arc::clone(&stt));
-    let classifier = Arc::clone(&model) as _;
+    let classifier = Arc::clone(model) as _;
     let listener = listener(config, stt, classifier, Arc::clone(reasoner), queues);
-    let recorded = start_log(config, &listener, catalog, reasoner, &model, cache, runpod)?;
-    Ok((model, listener, speech, recorded))
+    let recorded = start_log(config, &listener, catalog, reasoner, model, cache, runpod)?;
+    Ok((models, listener, speech, recorded))
+}
+
+/// The load of [`load_sessions`] of `config`.
+fn load(config: &Config) -> Load {
+    let config = config.clone();
+    Box::new(move || Box::pin(load_sessions(config.clone())))
+}
+
+/// The STT and TTS sessions of `config`, loaded on a blocking thread, and the System One model of
+/// [`load_classifier`].
+///
+/// # Errors
+///
+/// The training state or a model cannot load.
+async fn load_sessions(config: Config) -> anyhow::Result<(Sessions, RunClassifier)> {
+    let model = load_classifier(&config).await?;
+    let (asr, tts, device) = (config.asr, config.tts, config.device);
+    let stt = tokio::task::spawn_blocking(move || SherpaStt::try_new(&asr, device)).await??;
+    let tts = tokio::task::spawn_blocking(move || SupertonicTts::try_new(&tts, device)).await??;
+    let (stt, tts) = (Arc::new(stt), Arc::new(tts));
+    Ok((Sessions { stt, tts }, model))
 }
 
 /// The System One model of the run that `train.state` of `config` names, else of the fixture.
@@ -1723,27 +1956,14 @@ async fn load_models(
 /// # Errors
 ///
 /// The training state or the model cannot load.
-async fn load_classifier(config: &Config) -> anyhow::Result<Arc<CurrentClassifier>> {
+async fn load_classifier(config: &Config) -> anyhow::Result<RunClassifier> {
     let state: Option<TrainingState> = FileStore::try_new(config.train.state.clone())?.load()?;
     let run = state.and_then(|state| state.current);
     let run = run.unwrap_or_else(|| FIXTURE.to_owned());
-    let model = OnnxLoader
+    let classifier = OnnxLoader
         .load(&config.model.dir.join(&run), config.device)
         .await?;
-    Ok(Arc::new(CurrentClassifier::new(run, model)))
-}
-
-/// The STT of `config` and the speech use case on the TTS model of `config`. Both models load on
-/// a blocking thread.
-///
-/// # Errors
-///
-/// A model cannot load.
-async fn load_speech(config: &Config) -> anyhow::Result<(Arc<dyn SpeechToText>, Arc<Speech>)> {
-    let (asr, tts, device) = (config.asr.clone(), config.tts.clone(), config.device);
-    let stt = tokio::task::spawn_blocking(move || SherpaStt::try_new(&asr, device)).await??;
-    let tts = tokio::task::spawn_blocking(move || SupertonicTts::try_new(&tts, device)).await??;
-    Ok((Arc::new(stt), Arc::new(Speech::new(Arc::new(tts)))))
+    Ok(RunClassifier { run, classifier })
 }
 
 /// Starts the hotword refresh of `stt` with `home`, `cache` and `catalog` when `asr.hotwords` is
@@ -1921,10 +2141,12 @@ fn exit_code(ended: anyhow::Result<Ended>) -> ExitCode {
 mod tests {
     use super::*;
 
+    use std::any::Any;
     use std::collections::BTreeMap;
     use std::ffi::OsStr;
     use std::future;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU16;
     use std::sync::atomic::Ordering;
     use std::time::Duration;
@@ -2931,6 +3153,76 @@ mod tests {
         current.0.store(Arc::new(RunClassifier { run, classifier }));
         let _ = handle().await;
         assert_eq!((old.calls().len(), new.calls().len()), (1, 1));
+        Ok(())
+    }
+
+    /// Weak references to the fakes of each load of [`fake_load`].
+    type Loaded = Arc<Mutex<Vec<Weak<dyn Any + Send + Sync>>>>;
+
+    /// A load of [`fake_sessions`] into `loaded`. It fails while `fails` is true.
+    fn fake_load(loaded: &Loaded, fails: &Arc<AtomicBool>) -> Load {
+        let (loaded, fails) = (Arc::clone(loaded), Arc::clone(fails));
+        Box::new(move || {
+            let result = if fails.load(Ordering::SeqCst) {
+                Err(anyhow::anyhow!("no model"))
+            } else {
+                Ok(fake_sessions(&loaded))
+            };
+            Box::pin(future::ready(result))
+        })
+    }
+
+    /// A new `FakeStt`, `FakeTts` and `FakeClassifier` that gives `unknown` once, so `handle`
+    /// answers with a filler. Keeps weak references to them in `loaded`.
+    fn fake_sessions(loaded: &Loaded) -> (Sessions, RunClassifier) {
+        let (stt, tts) = (Arc::new(FakeStt::default()), Arc::new(FakeTts::default()));
+        let classifier = Arc::new(FakeClassifier::default());
+        classifier.script(Prediction {
+            ranked: vec![("unknown".to_owned(), 0.9)],
+            slots: Vec::new(),
+        });
+        let fakes: [Weak<dyn Any + Send + Sync>; 3] = [
+            Arc::downgrade(&stt) as _,
+            Arc::downgrade(&tts) as _,
+            Arc::downgrade(&classifier) as _,
+        ];
+        loaded.lock().expect("no panic").extend(fakes);
+        let model = RunClassifier {
+            run: FIXTURE.to_owned(),
+            classifier,
+        };
+        (Sessions { stt, tts }, model)
+    }
+
+    /// The number of fakes of `loaded` that still have a reference.
+    fn alive(loaded: &Loaded) -> usize {
+        let fakes = loaded.lock().expect("no panic");
+        fakes.iter().filter(|fake| fake.strong_count() > 0).count()
+    }
+
+    /// The reply of `app` to "turn on the lights" with no context.
+    async fn request(app: &App) -> anyhow::Result<Handled> {
+        app.handle("turn on the lights", ports::Context::default())
+            .await
+    }
+
+    /// AC-13.10d-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_10d_2_release_drops_the_sessions_until_restore() -> anyhow::Result<()> {
+        let (loaded, fails): (Loaded, Arc<AtomicBool>) = Default::default();
+        let models = LiveModels::try_new(fake_load(&loaded, &fails)).await?;
+        let app = app_with(Arc::clone(models.classifier()) as _, models.live())?;
+        // A request keeps its snapshot of the classifier until it ends.
+        let _held = models.classifier().0.load_full();
+        models.release().await;
+        assert_eq!(alive(&loaded), 0, "references to the fakes after release");
+        assert!(app.listen().is_err(), "listen works after release");
+        assert!(request(&app).await.is_err(), "handle works after release");
+        models.restore().await?;
+        let _: Handled = request(&app).await?;
+        fails.store(true, Ordering::SeqCst);
+        let error = models.restore().await.err().context("restore loaded")?;
+        assert_eq!(format!("{error:#}"), "no model");
         Ok(())
     }
 

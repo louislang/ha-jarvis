@@ -24,7 +24,6 @@ use xxhash_rust::xxh3;
 
 use crate::Config;
 use crate::CurrentClassifier;
-use crate::RunClassifier;
 use crate::TrainConfig;
 use crate::domain::catalog;
 use crate::domain::catalog::Catalog;
@@ -280,11 +279,7 @@ impl Training {
         let last_time = started;
         self.state.save(&TrainingState { current, last_time })?;
         if let Some(new) = new {
-            let (run, classifier) = (run_id.to_owned(), new);
-            // One store, so that a prediction and its run name come from the same model.
-            self.classifier
-                .0
-                .store(Arc::new(RunClassifier { run, classifier }));
+            self.classifier.swap(run_id.to_owned(), new);
             let keep = [run_id, previous.as_deref().unwrap_or(FIXTURE)];
             if let Err(error) = prune(&self.config.model.dir, keep) {
                 tracing::warn!("the delete of the old model folders failed: {error}");
