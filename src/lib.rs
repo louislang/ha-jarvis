@@ -57,6 +57,7 @@ use crate::adapters::open_meteo::OpenMeteo;
 use crate::adapters::openai::OpenAiReasoner;
 use crate::adapters::plex::Plex;
 use crate::adapters::process::ProcessTrainer;
+use crate::adapters::runpod::RunPodTrainer;
 use crate::adapters::sherpa::SherpaStt;
 use crate::adapters::sqlite::SqliteLog;
 use crate::adapters::supertonic::SupertonicTts;
@@ -109,6 +110,7 @@ use crate::ports::SpeechToText;
 use crate::ports::State;
 use crate::ports::Status;
 use crate::ports::Store;
+use crate::ports::Trainer;
 
 /// Pure rules.
 pub mod domain {
@@ -1385,12 +1387,14 @@ where
 }
 
 /// The app of `config`, `catalog` and the source pools `pools` on `home`, the plugin registry of
-/// `config` and the reasoner of `config` with the tools of that registry and the `OpenAI` API key
-/// of `secrets`. Gives the app, its pools task and habit task, and its pre-render task.
+/// `config`, the reasoner of `config` with the tools of that registry and the `OpenAI` API key
+/// of `secrets`, and the `RunPod` trainer of [`runpod`]. Gives the app, its pools task and habit
+/// task, and its pre-render task.
 ///
 /// # Errors
 ///
-/// An HTTP client cannot be built, or the saved pools, the habits or a model cannot load.
+/// An HTTP client or the S3 store cannot be built, or the saved pools, the habits or a model
+/// cannot load.
 async fn start_live_app(
     config: &Config,
     secrets: &Secrets,
@@ -1405,7 +1409,22 @@ async fn start_live_app(
         &secrets.openai_key,
         tools,
     )?);
-    start_app(config, Arc::new(catalog), pools, home, reasoner, plugins).await
+    let runpod = runpod(config, secrets)?;
+    let catalog = Arc::new(catalog);
+    start_app(config, catalog, pools, home, reasoner, plugins, runpod).await
+}
+
+/// The `RunPod` trainer of `[train.runpod]` of `config` with the keys of `secrets`, when it is set.
+///
+/// # Errors
+///
+/// The HTTP client or the S3 store cannot be built.
+fn runpod(config: &Config, secrets: &Secrets) -> anyhow::Result<Option<Arc<dyn Trainer>>> {
+    let (Some(runpod), Some(keys)) = (&config.train.runpod, &secrets.runpod) else {
+        return Ok(None);
+    };
+    let trainer = RunPodTrainer::try_new(runpod, keys, config.model.dir.clone())?;
+    Ok(Some(Arc::new(trainer)))
 }
 
 /// The plugins of `config`: the Open-Meteo weather plugin, and the Plex plugin with the token of
@@ -1435,7 +1454,8 @@ fn registry(config: &Config, plugins: Vec<Arc<dyn Plugin>>) -> Arc<Plugins> {
 /// The app of `config`, `catalog` and the source pools `pools` on `home`, `reasoner` and the
 /// plugin registry `plugins`, its pools task and habit task, and its pre-render task. Starts the
 /// sync, the pools task and the habit task, and loads the System One model, then the STT and TTS
-/// models, and starts the training trigger. Then starts the pre-render.
+/// models, and starts the training trigger with the `RunPod` trainer `runpod`. Then starts the
+/// pre-render.
 ///
 /// # Errors
 ///
@@ -1447,10 +1467,11 @@ async fn start_app(
     home: Arc<dyn Home>,
     reasoner: Arc<dyn Reasoner>,
     plugins: Arc<Plugins>,
+    runpod: Option<Arc<dyn Trainer>>,
 ) -> anyhow::Result<Started> {
     let (cache, queues, task, habits) = start_tasks(&home, config, pools)?;
     let (classifier, listener, speech, (recorder, logged)) =
-        load_models(config, &reasoner, &queues, home, &cache, &catalog).await?;
+        load_models(config, &reasoner, &queues, home, &cache, &catalog, runpod).await?;
     let prerender = start_prerender(&speech, &task.pools, &cache);
     Ok((
         App {
@@ -1475,7 +1496,8 @@ async fn start_app(
 
 /// The recorder of the utterances of `listener` on the log of `config`, its log writer task, and
 /// the review of the log with the intent names of `catalog`. Starts the training trigger on the
-/// log with `reasoner`, `classifier`, `catalog` and the hot cache `cache`, which checks each
+/// log with `reasoner`, `classifier`, `catalog`, the hot cache `cache` and the `RunPod` trainer
+/// `runpod`, which checks each
 /// `train.check_interval_s`.
 ///
 /// # Errors
@@ -1488,6 +1510,7 @@ fn start_log(
     reasoner: &Arc<dyn Reasoner>,
     classifier: &Arc<CurrentClassifier>,
     cache: &watch::Receiver<StateCache>,
+    runpod: Option<Arc<dyn Trainer>>,
 ) -> anyhow::Result<(Recorder, Logged)> {
     let (log, last_id) = open_log(config)?;
     let recorded = recorder(listener, catalog, &log, last_id);
@@ -1499,6 +1522,7 @@ fn start_log(
         classifier,
         catalog,
         cache,
+        runpod,
     )?;
     app::training::start_trigger(trigger, Duration::from_secs(config.train.check_interval_s));
     Ok(recorded)
@@ -1539,8 +1563,9 @@ fn recorder(
 }
 
 /// The training trigger of `config` with the backoff `train.failure_backoff_s`, the process
-/// trainer, the ONNX loader, the stores of `train.state` and `train.generated`, the system time,
-/// `reasoner`, `log`, `classifier`, `catalog` and the hot cache `cache`.
+/// trainer, the `RunPod` trainer `runpod`, the ONNX loader, the stores of `train.state` and
+/// `train.generated`, the system time, `reasoner`, `log`, `classifier`, `catalog` and the hot
+/// cache `cache`.
 ///
 /// # Errors
 ///
@@ -1552,21 +1577,16 @@ fn trigger(
     classifier: Arc<CurrentClassifier>,
     catalog: &Arc<Catalog>,
     cache: &watch::Receiver<StateCache>,
+    runpod: Option<Arc<dyn Trainer>>,
 ) -> anyhow::Result<Arc<Trigger>> {
     let train = &config.train;
-    let trainer = ProcessTrainer {
-        python: train.python.clone(),
-        dir: config.model.dir.clone(),
-        device: config.device,
-        max_vram_gb: train.max_vram_gb,
-        timeout: Duration::from_secs(train.timeout_min * 60),
-    };
     let training = Training {
         reasoner,
         generated: Arc::new(FileStore::try_new(train.generated.clone())?),
         state: Arc::new(FileStore::try_new(train.state.clone())?),
         log,
-        trainer: Arc::new(trainer),
+        trainer: Arc::new(process_trainer(config)),
+        runpod,
         loader: Arc::new(OnnxLoader),
         classifier,
         catalog: Arc::clone(catalog),
@@ -1576,6 +1596,18 @@ fn trigger(
     };
     let backoff = SignedDuration::try_from(Duration::from_secs(train.failure_backoff_s))?;
     Ok(Arc::new(Trigger::new(Arc::new(training), backoff)))
+}
+
+/// The process trainer of `config`.
+fn process_trainer(config: &Config) -> ProcessTrainer {
+    let train = &config.train;
+    ProcessTrainer {
+        python: train.python.clone(),
+        dir: config.model.dir.clone(),
+        device: config.device,
+        max_vram_gb: train.max_vram_gb,
+        timeout: Duration::from_secs(train.timeout_min * 60),
+    }
 }
 
 /// Starts the sync of a hot cache with `home`, and the pools task of the source pools `pools` and
@@ -1657,7 +1689,8 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
 /// The System One model of `config`, then the listener on the STT models of `config`, which
 /// predicts with that model, sees the dialogs of `queues` and warms `reasoner`, the speech use
 /// case on the TTS model of `config`, and the recorder of [`start_log`]. Starts the hotword
-/// refresh of the STT with `home`, `cache` and `catalog`, and the training trigger.
+/// refresh of the STT with `home`, `cache` and `catalog`, and the training trigger with the
+/// `RunPod` trainer `runpod`.
 ///
 /// # Errors
 ///
@@ -1669,6 +1702,7 @@ async fn load_models(
     home: Arc<dyn Home>,
     cache: &watch::Receiver<StateCache>,
     catalog: &Arc<Catalog>,
+    runpod: Option<Arc<dyn Trainer>>,
 ) -> anyhow::Result<(
     Arc<CurrentClassifier>,
     Listener,
@@ -1680,7 +1714,7 @@ async fn load_models(
     start_hotwords(config, home, cache, catalog, Arc::clone(&stt));
     let classifier = Arc::clone(&model) as _;
     let listener = listener(config, stt, classifier, Arc::clone(reasoner), queues);
-    let recorded = start_log(config, &listener, catalog, reasoner, &model, cache)?;
+    let recorded = start_log(config, &listener, catalog, reasoner, &model, cache, runpod)?;
     Ok((model, listener, speech, recorded))
 }
 

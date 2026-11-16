@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -204,6 +205,8 @@ pub struct Training {
     pub log: Arc<dyn InteractionLog>,
     /// The local trainer.
     pub trainer: Arc<dyn Trainer>,
+    /// The `RunPod` trainer, which trains after an error of the local trainer.
+    pub runpod: Option<Arc<dyn Trainer>>,
     /// Opens the new model folder.
     pub loader: Arc<dyn ModelLoader>,
     /// The classifier of the conversation.
@@ -239,10 +242,23 @@ impl Training {
             ..set
         };
         let run_id = started.strftime("%Y%m%d-%H%M%S").to_string();
-        let dir = self.trainer.train(&run_id, &upload).await?;
+        let dir = self.train(&run_id, &upload).await?;
         let new = self.loader.load(&dir, self.config.device).await?;
         let accepted = self.never_worse(new.as_ref(), &held, &run_id).await?;
         self.finish(started, &run_id, &dir, accepted.then_some(new))
+    }
+
+    /// The model folder of `set` from the local trainer, or after its error from the `RunPod`
+    /// trainer when it is set.
+    async fn train(&self, run_id: &str, set: &TrainingSet) -> anyhow::Result<PathBuf> {
+        let local = self.trainer.train(run_id, set).await;
+        match (local, &self.runpod) {
+            (Err(error), Some(runpod)) => {
+                tracing::warn!("the local training failed, so RunPod trains: {error:#}");
+                runpod.train(run_id, set).await
+            }
+            (local, _) => local,
+        }
     }
 
     /// Saves the state of the run `run_id` that started at `started` and trained `dir`. Swaps in
@@ -662,17 +678,14 @@ mod tests {
     fn harness(holdout: f64, models: &TempDir) -> (Training, Arc<FakeTrainer>) {
         let mut config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
         (config.train.holdout, config.model.dir) = (holdout, models.path().to_owned());
-        let dir = models.path().to_owned();
-        let trainer = Arc::new(FakeTrainer {
-            dir,
-            ..FakeTrainer::default()
-        });
+        let trainer = trainer_in(models);
         let training = Training {
             reasoner: Arc::new(FakeReasoner::default()),
             generated: Arc::new(FakeStore::new(None)),
             state: Arc::new(FakeStore::new(None)),
             log: Arc::new(FakeLog::default()),
             trainer: Arc::clone(&trainer) as _,
+            runpod: None,
             loader: Arc::new(FakeModelLoader::default()),
             classifier: Arc::new(CurrentClassifier::new(
                 FIXTURE.to_owned(),
@@ -684,6 +697,15 @@ mod tests {
             config,
         };
         (training, trainer)
+    }
+
+    /// A trainer that creates the model folders in `models`.
+    fn trainer_in(models: &TempDir) -> Arc<FakeTrainer> {
+        let dir = models.path().to_owned();
+        Arc::new(FakeTrainer {
+            dir,
+            ..FakeTrainer::default()
+        })
     }
 
     /// AC-13.9-4.
@@ -732,6 +754,8 @@ mod tests {
         training: Arc<Training>,
         /// The local trainer.
         trainer: Arc<FakeTrainer>,
+        /// `FakeRunPodTrainer`, the `RunPod` trainer of the run unless `edit` removes it.
+        runpod: Arc<FakeTrainer>,
         /// The model loader.
         loader: Arc<FakeModelLoader>,
         /// The log.
@@ -748,10 +772,11 @@ mod tests {
         edited(old, |_| ())
     }
 
-    /// The run of `swap` after `edit`.
+    /// The run of `swap` with `FakeRunPodTrainer` after `edit`.
     fn edited(old: &Arc<FakeClassifier>, edit: impl FnOnce(&mut Training)) -> Harness {
         let models = tempfile::tempdir().expect("a temporary folder");
         let (training, trainer) = harness(0.1, &models);
+        let runpod = trainer_in(&models);
         let (loader, log) = (Arc::<FakeModelLoader>::default(), Arc::<FakeLog>::default());
         let current = CurrentClassifier::new(FIXTURE.to_owned(), Arc::clone(old) as _);
         let start = Timestamp::from_second(START).expect("a time");
@@ -761,12 +786,14 @@ mod tests {
             loader: Arc::clone(&loader) as _,
             classifier: Arc::new(current),
             clock: Arc::clone(&clock) as _,
+            runpod: Some(Arc::clone(&runpod) as _),
             ..training
         };
         edit(&mut training);
         Harness {
             training: Arc::new(training),
             trainer,
+            runpod,
             loader,
             log,
             models,
@@ -1043,10 +1070,62 @@ mod tests {
         Ok(())
     }
 
+    /// The run ID and the set of each `train` call of `trainer`.
+    fn recorded(trainer: &FakeTrainer) -> Vec<(String, TrainingSet)> {
+        trainer.calls.lock().expect("no test panics").clone()
+    }
+
+    /// AC-13.10-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_10_1_local_error_sends_the_set_to_runpod() -> anyhow::Result<()> {
+        let (old, new) = (classifier(&wrong_slot()), classifier(&[]));
+        let harness = swap(&old);
+        script(&harness, &new, Err("CUDA out of memory"));
+        let results = &harness.runpod.results;
+        results.lock().expect("no test panics").push_back(Ok(()));
+        harness.training.run().await?;
+        let runpod = recorded(&harness.runpod);
+        assert_eq!(runpod.len(), 1, "RunPod calls");
+        assert_eq!(runpod, recorded(&harness.trainer));
+        Ok(())
+    }
+
+    /// AC-13.10-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_10_2_local_success_does_not_call_runpod() -> anyhow::Result<()> {
+        let old = classifier(&[]);
+        let harness = swap(&old);
+        script(&harness, &old, Ok(()));
+        harness.training.run().await?;
+        assert_eq!(recorded(&harness.runpod), [], "RunPod has a call");
+        Ok(())
+    }
+
+    /// AC-13.10-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_10_3_local_error_without_runpod_keeps_the_model() -> anyhow::Result<()> {
+        let log = tempfile::NamedTempFile::new()?;
+        // The current-thread runtime polls the run task on this thread, so it logs here too.
+        let _default = tracing::dispatcher::set_default(&fakes::log_dispatch(&log)?);
+        let (old, new) = (classifier(&wrong_slot()), classifier(&[]));
+        let harness = edited(&old, |training| training.runpod = None);
+        script(&harness, &new, Err("CUDA out of memory"));
+        trigger(&harness, 0).voice();
+        settle().await;
+        assert_eq!(
+            next_calls(&harness, &old).await,
+            1,
+            "the old classifier predicts"
+        );
+        let text = fs::read_to_string(log.path())?;
+        assert!(text.contains("CUDA out of memory"), "the log is {text:?}");
+        Ok(())
+    }
+
     /// The model state of `training.qnt` that the conformance test compares.
     #[derive(Debug, Deserialize, PartialEq)]
     struct TrainingModel {
-        /// `Idle`, or `Local` while a run is active.
+        /// `Idle`, `RunPod` while `FakeRunPodTrainer` has a waiting call, else `Local`.
         #[serde(rename = "runState")]
         run_state: Tag,
         /// The change count.
@@ -1064,8 +1143,8 @@ mod tests {
     }
 
     impl ModelState<TrainingDriver> for TrainingModel {
-        /// The `active` flag, the change count and the level of the classifier of the wrapper,
-        /// after each task runs until it waits.
+        /// The `active` flag with the waiting trainer, the change count and the level of the
+        /// classifier of the wrapper, after each task runs until it waits.
         fn from_driver(driver: &TrainingDriver) -> anyhow::Result<Self> {
             driver.runtime.block_on(settle());
             let training = &driver.harness.training;
@@ -1075,7 +1154,13 @@ mod tests {
                 ptr::addr_eq(Arc::as_ptr(level), Arc::as_ptr(&current.classifier))
             };
             let level = driver.levels.iter().position(same);
-            let tag = if active { "Local" } else { "Idle" }.to_owned();
+            let runpod = recorded(&driver.harness.runpod).len() > driver.runpod_ends;
+            let tag = match (active, runpod) {
+                (false, _) => "Idle",
+                (true, false) => "Local",
+                (true, true) => "RunPod",
+            };
+            let tag = tag.to_owned();
             Ok(Self {
                 run_state: Tag { tag },
                 changes: driver.runtime.block_on(training.changes())?,
@@ -1084,8 +1169,8 @@ mod tests {
         }
     }
 
-    /// Replays `training.qnt` from `initLocal` against the trigger with the backoff 0 and
-    /// `min_changes` 2. Each step takes one second. Each `train` waits until a done or fail step.
+    /// Replays `training.qnt` against the trigger with the backoff 0 and `min_changes` 2. Each step
+    /// takes one second. Each `train` waits until a done or fail step.
     struct TrainingDriver {
         /// The paused runtime that runs the runs.
         runtime: Runtime,
@@ -1097,11 +1182,15 @@ mod tests {
         levels: [Arc<FakeClassifier>; 3],
         /// The trainer gate, which the driver holds between steps.
         gate: Option<OwnedMutexGuard<()>>,
+        /// The gate of `FakeRunPodTrainer`, which the driver holds between steps.
+        runpod_gate: Option<OwnedMutexGuard<()>>,
+        /// The number of ended `FakeRunPodTrainer` calls.
+        runpod_ends: usize,
     }
 
     impl TrainingDriver {
-        /// A driver at `initLocal`: no run, no changes and the classifier of level 0.
-        fn new() -> Self {
+        /// A driver at `initWith(runpod)`: no run, no changes and the classifier of level 0.
+        fn new(runpod: bool) -> Self {
             let mut runtime = tokio::runtime::Builder::new_current_thread();
             let runtime = runtime.enable_time().start_paused(true).build();
             let levels = [
@@ -1117,23 +1206,38 @@ mod tests {
                 // Each example is held out, so each level gives strictly higher measures.
                 training.config.train.holdout = 1.0;
                 training.config.train.min_changes = 2;
+                if !runpod {
+                    training.runpod = None;
+                }
             });
             Self {
                 runtime: runtime.expect("the runtime builds"),
                 trigger: trigger(&harness, 0),
                 gate: Arc::clone(&harness.trainer.gate).try_lock_owned().ok(),
+                runpod_gate: Arc::clone(&harness.runpod.gate).try_lock_owned().ok(),
+                runpod_ends: 0,
                 harness,
                 levels,
             }
         }
 
-        /// Ends the active run with the trainer result `result`.
-        fn end(&mut self, result: Result<(), &'static str>) {
-            let results = &self.harness.trainer.results;
-            results.lock().expect("no test panics").push_back(result);
-            self.gate = None;
+        /// Ends the waiting call of the local trainer, or of `FakeRunPodTrainer` when `runpod`,
+        /// with `result`.
+        fn end(&mut self, runpod: bool, result: Result<(), &'static str>) {
+            let (trainer, gate) = if runpod {
+                self.runpod_ends += 1;
+                (&self.harness.runpod, &mut self.runpod_gate)
+            } else {
+                (&self.harness.trainer, &mut self.gate)
+            };
+            trainer
+                .results
+                .lock()
+                .expect("no test panics")
+                .push_back(result);
+            *gate = None;
             self.runtime.block_on(settle());
-            self.gate = Arc::clone(&self.harness.trainer.gate).try_lock_owned().ok();
+            *gate = Arc::clone(&trainer.gate).try_lock_owned().ok();
         }
     }
 
@@ -1143,7 +1247,8 @@ mod tests {
         fn step(&mut self, step: &Step) -> anyhow::Result<()> {
             advance(&self.harness, 1);
             switch!(step {
-                initLocal => *self = Self::new(),
+                initLocal => *self = Self::new(false),
+                initRunPod => *self = Self::new(true),
                 change => {
                     let now = self.harness.training.clock.now().as_second();
                     mark(&self.harness.log, now.unsigned_abs(), now);
@@ -1155,9 +1260,14 @@ mod tests {
                 },
                 localDone(a: usize) => {
                     self.harness.loader.script(Arc::clone(&self.levels[a]) as _);
-                    self.end(Ok(()));
+                    self.end(false, Ok(()));
                 },
-                localFail => self.end(Err("CUDA out of memory")),
+                localFail => self.end(false, Err("CUDA out of memory")),
+                runpodDone(a: usize) => {
+                    self.harness.loader.script(Arc::clone(&self.levels[a]) as _);
+                    self.end(true, Ok(()));
+                },
+                runpodFail => self.end(true, Err("the RunPod job failed")),
             })
         }
     }
@@ -1170,6 +1280,17 @@ mod tests {
         seed = "1"
     )]
     fn ac_13_9c_5_conformance() -> impl Driver {
-        TrainingDriver::new()
+        TrainingDriver::new(false)
+    }
+
+    /// AC-13.10-4.
+    #[quint_run(
+        spec = "quint/training.qnt",
+        init = "initRunPod",
+        max_steps = 30,
+        seed = "1"
+    )]
+    fn ac_13_10_4_conformance() -> impl Driver {
+        TrainingDriver::new(true)
     }
 }

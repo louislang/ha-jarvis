@@ -228,7 +228,7 @@ async fn serve(
     let plugins = crate::registry(config, vec![Arc::new(FakePlugin::new("get_weather"))]);
     let catalog = Arc::new(catalog);
     let (app, _, prerender) =
-        crate::start_app(config, catalog, pools, home, reasoner, plugins).await?;
+        crate::start_app(config, catalog, pools, home, reasoner, plugins, None).await?;
     prerender.await?;
     let app = Arc::new(app);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
