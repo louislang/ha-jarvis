@@ -14,14 +14,23 @@ use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt as _;
 use object_store::PutPayload;
+use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as StorePath;
 use serde_json::Value;
 use serde_json::json;
 use tokio::time;
 use tokio::time::Instant;
 
+use crate::RunPodConfig;
+use crate::RunPodKeys;
 use crate::domain::training::TrainingSet;
 use crate::ports::Trainer;
+
+/// The `RunPod` REST API.
+const API: &str = "https://api.runpod.ai";
+
+/// The longest time of one request, so that a stalled request returns to the deadline check.
+const REQUEST: Duration = Duration::from_secs(30);
 
 /// Trains with the `RunPod` handler of the training image.
 pub struct RunPodTrainer {
@@ -49,6 +58,34 @@ fn folder(run_id: &str) -> StorePath {
 }
 
 impl RunPodTrainer {
+    /// The trainer of the endpoint and the volume of `config`, with model folders in `dir`.
+    ///
+    /// # Errors
+    ///
+    /// The S3 settings are not valid, or the HTTP client cannot start.
+    pub fn try_new(config: &RunPodConfig, keys: &RunPodKeys, dir: PathBuf) -> anyhow::Result<Self> {
+        // Only production gets a request timeout: under the paused test clock it fires at once
+        // while a real socket waits (`02-rules.md` section 6.2).
+        let client = reqwest::Client::builder().timeout(REQUEST).build()?;
+        let store = AmazonS3Builder::new()
+            .with_endpoint(&config.s3_endpoint)
+            .with_region(&config.s3_region)
+            .with_bucket_name(&config.volume_id)
+            .with_access_key_id(&keys.s3_key)
+            .with_secret_access_key(&keys.s3_secret)
+            .build()?;
+        Ok(Self {
+            client,
+            api: API.to_owned(),
+            endpoint_id: config.endpoint_id.clone(),
+            api_key: keys.api_key.clone(),
+            store: Arc::new(store),
+            dir,
+            poll: Duration::from_secs(config.poll_s),
+            timeout: Duration::from_secs(config.timeout_min * 60),
+        })
+    }
+
     /// Sends a request to `<api>/v2/<endpoint_id>/<path>` with the API key and parses the reply.
     ///
     /// # Errors
@@ -305,6 +342,27 @@ mod tests {
             anyhow::bail!("a failed job gave a model folder");
         };
         Ok(format!("{error:#}"))
+    }
+
+    /// AC-13.8c-3.
+    #[test]
+    fn ac_13_8c_3_section_gives_poll_and_timeout() -> anyhow::Result<()> {
+        let text = fs::read_to_string("jarvis.toml")?;
+        let lines = text.lines().skip_while(|line| *line != "# [train.runpod]");
+        let section: Vec<&str> = lines
+            .skip(1)
+            .map_while(|line| line.strip_prefix("# "))
+            .collect();
+        let config: RunPodConfig = toml::from_str(&section.join("\n"))?;
+        let keys = RunPodKeys {
+            api_key: "key".to_owned(),
+            s3_key: "s3".to_owned(),
+            s3_secret: "secret".to_owned(),
+        };
+        let trainer = RunPodTrainer::try_new(&config, &keys, PathBuf::from("models"))?;
+        assert_eq!(trainer.poll, Duration::from_secs(30));
+        assert_eq!(trainer.timeout, Duration::from_secs(3600));
+        Ok(())
     }
 
     /// AC-13.8b-1.

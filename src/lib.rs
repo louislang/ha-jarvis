@@ -597,6 +597,32 @@ pub struct TrainConfig {
     pub unknown_paraphrases: usize,
     /// The Python interpreter of a local run.
     pub python: PathBuf,
+    /// The training fallback. Without it, Jarvis has no training fallback.
+    pub runpod: Option<RunPodConfig>,
+}
+
+/// The `[train.runpod]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RunPodConfig {
+    /// The environment variable with the `RunPod` API key.
+    pub api_key_env: String,
+    /// The serverless endpoint of the training image.
+    pub endpoint_id: String,
+    /// The network volume, which is the bucket of the S3 API.
+    pub volume_id: String,
+    /// The S3 API of the data center of the volume.
+    pub s3_endpoint: String,
+    /// The region of the S3 API.
+    pub s3_region: String,
+    /// The environment variable with the S3 access key.
+    pub s3_key_env: String,
+    /// The environment variable with the S3 secret key.
+    pub s3_secret_env: String,
+    /// The time between two status requests of a job.
+    pub poll_s: u64,
+    /// The time after which a job is cancelled.
+    pub timeout_min: u64,
 }
 
 /// The `[log]` section.
@@ -873,6 +899,19 @@ pub struct Secrets {
     pub web_token: String,
     /// MQTT login, when `[mqtt]` is set.
     pub mqtt: Option<MqttLogin>,
+    /// `RunPod` keys, when `[train.runpod]` is set.
+    pub runpod: Option<RunPodKeys>,
+}
+
+/// The keys of `RunPod`.
+#[derive(Clone)]
+pub struct RunPodKeys {
+    /// The API key of the REST API.
+    pub api_key: String,
+    /// The access key of the S3 API.
+    pub s3_key: String,
+    /// The secret key of the S3 API.
+    pub s3_secret: String,
 }
 
 /// The login of the MQTT broker.
@@ -904,6 +943,7 @@ impl Secrets {
             mqtt: mqtt
                 .map(|mqtt| MqttLogin::resolve(mqtt, &lookup))
                 .transpose()?,
+            runpod: RunPodKeys::resolve(config.train.runpod.as_ref(), &lookup)?,
         })
     }
 }
@@ -919,6 +959,27 @@ impl MqttLogin {
             username: lookup_secret(&lookup, &mqtt.username_env)?,
             password: lookup_secret(&lookup, &mqtt.password_env)?,
         })
+    }
+}
+
+impl RunPodKeys {
+    /// Reads the keys that `runpod` names with `lookup`, when `runpod` is set.
+    ///
+    /// # Errors
+    ///
+    /// A variable is not set or is empty. The error names the variable.
+    fn resolve(
+        runpod: Option<&RunPodConfig>,
+        lookup: impl Fn(&str) -> Option<String>,
+    ) -> anyhow::Result<Option<Self>> {
+        let Some(runpod) = runpod else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            api_key: lookup_secret(&lookup, &runpod.api_key_env)?,
+            s3_key: lookup_secret(&lookup, &runpod.s3_key_env)?,
+            s3_secret: lookup_secret(&lookup, &runpod.s3_secret_env)?,
+        }))
     }
 }
 
@@ -1883,6 +1944,7 @@ mod tests {
             paraphrases: 50,
             unknown_paraphrases: 300,
             python: PathBuf::from(".venv/bin/python"),
+            runpod: None,
         }
     }
 
@@ -2177,12 +2239,27 @@ mod tests {
         }
     }
 
-    /// Resolves the secrets of `VALID` from an environment with `variables`.
-    fn resolve(variables: &[(&str, &str)]) -> anyhow::Result<Secrets> {
+    /// The secrets of `VALID`.
+    const ENVIRONMENT: [(&str, &str); 6] = [
+        ("HA_TOKEN", "abc"),
+        ("OPENAI_API_KEY", "k"),
+        ("PLEX_TOKEN", "p"),
+        ("JARVIS_WEB_TOKEN", "w"),
+        ("MQTT_USERNAME", "u"),
+        ("MQTT_PASSWORD", "m"),
+    ];
+
+    /// Resolves the secrets of the configuration `text` from an environment with `variables`.
+    fn resolve_in(text: &str, variables: &[(&str, &str)]) -> anyhow::Result<Secrets> {
         let environment: BTreeMap<&str, &str> = variables.iter().copied().collect();
-        Secrets::resolve(&Config::parse(VALID)?, |name| {
+        Secrets::resolve(&Config::parse(text)?, |name| {
             environment.get(name).map(|value| (*value).to_owned())
         })
+    }
+
+    /// Resolves the secrets of `VALID` from an environment with `variables`.
+    fn resolve(variables: &[(&str, &str)]) -> anyhow::Result<Secrets> {
+        resolve_in(VALID, variables)
     }
 
     /// Returns the text of the error that `resolve` gives for `variables`.
@@ -2196,14 +2273,7 @@ mod tests {
     /// AC-1.2-1.
     #[test]
     fn ac_1_2_1_resolve_returns_ha_token() -> anyhow::Result<()> {
-        let secrets = resolve(&[
-            ("HA_TOKEN", "abc"),
-            ("OPENAI_API_KEY", "k"),
-            ("PLEX_TOKEN", "p"),
-            ("JARVIS_WEB_TOKEN", "w"),
-            ("MQTT_USERNAME", "u"),
-            ("MQTT_PASSWORD", "m"),
-        ])?;
+        let secrets = resolve(&ENVIRONMENT)?;
         assert_eq!(secrets.ha_token, "abc");
         Ok(())
     }
@@ -2220,6 +2290,31 @@ mod tests {
     fn ac_1_2_3_empty_token_names_variable() {
         let error = resolve_error(&[("HA_TOKEN", "")]);
         assert!(error.contains("HA_TOKEN"), "error has no variable: {error}");
+    }
+
+    /// AC-13.8c-1.
+    #[test]
+    fn ac_13_8c_1_no_section_needs_no_runpod_keys() -> anyhow::Result<()> {
+        let secrets = resolve(&ENVIRONMENT)?;
+        assert!(
+            secrets.runpod.is_none(),
+            "RunPod keys without [train.runpod]"
+        );
+        Ok(())
+    }
+
+    /// AC-13.8c-2.
+    #[test]
+    fn ac_13_8c_2_section_needs_the_s3_secret() {
+        let lines = VALID.lines().skip_while(|line| *line != "# [train.runpod]");
+        let section: Vec<&str> = lines.map_while(|line| line.strip_prefix("# ")).collect();
+        let text = VALID.replace(&format!("# {}", section.join("\n# ")), &section.join("\n"));
+        let keys = [("RUNPOD_API_KEY", "a"), ("RUNPOD_S3_KEY", "s")];
+        let variables = [ENVIRONMENT.as_slice(), &keys].concat();
+        let Err(error) = resolve_in(&text, &variables) else {
+            panic!("resolve without RUNPOD_S3_SECRET passed");
+        };
+        assert!(error.to_string().contains("RUNPOD_S3_SECRET"), "{error}");
     }
 
     /// Runs `jarvis dataset jarvis.toml <out> <options>` and returns the text of `<out>`.

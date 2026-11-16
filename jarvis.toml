@@ -97,6 +97,19 @@ paraphrases = 50
 unknown_paraphrases = 300
 python = ".venv/bin/python"
 
+# Optional. Without this section, Jarvis has no training fallback. To use RunPod, remove the
+# "# " in front of each line below and set RUNPOD_API_KEY, RUNPOD_S3_KEY and RUNPOD_S3_SECRET.
+# [train.runpod]
+# api_key_env = "RUNPOD_API_KEY"
+# endpoint_id = "your-endpoint-id"
+# volume_id = "your-volume-id"
+# s3_endpoint = "https://s3api-eu-ro-1.runpod.io"
+# s3_region = "EU-RO-1"
+# s3_key_env = "RUNPOD_S3_KEY"
+# s3_secret_env = "RUNPOD_S3_SECRET"
+# poll_s = 30
+# timeout_min = 60
+
 [log]
 database = "jarvis.db"
 audio_days = 30
