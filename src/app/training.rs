@@ -280,9 +280,9 @@ impl Training {
         }
     }
 
-    /// The result of the local trainer for `set`, with the status `training`, the satellites muted
-    /// and the models released. Restores the models, unmutes the same satellites and sets the
-    /// status `online` after it.
+    /// The result of the local trainer for `set`, with the satellites muted and the models
+    /// released. Restores the models and unmutes the same satellites after it.
+    /// The status is `training` during it.
     ///
     /// # Errors
     ///
@@ -296,19 +296,28 @@ impl Training {
         for satellite in &switches.missing {
             tracing::warn!("the satellite {} has no mute switch", satellite.0);
         }
-        self.status
-            .send_modify(|status| status.state = State::Training);
+        self.show(State::Online, State::Training);
         let muted = self.switch("turn_on", switches.off).await;
         self.models.release().await;
         let local = self.trainer.train(run_id, set).await;
         let restored = self.models.restore().await;
         self.switch("turn_off", muted).await;
-        self.status
-            .send_modify(|status| status.state = State::Online);
+        self.show(State::Training, State::Online);
         if let Err(error) = &restored {
             self.stop.send_replace(Some(format!("{error:#}")));
         }
         restored.map(|()| local)
+    }
+
+    /// Changes only the state from `from` to `to`, so a rollback message and `offline` stay.
+    fn show(&self, from: State, to: State) {
+        self.status.send_if_modified(|status| {
+            let changed = status.state == from;
+            if changed {
+                status.state = to;
+            }
+            changed
+        });
     }
 
     /// Calls `switch.<service>` for each of `switches`, and logs each failed call. Gives the
@@ -480,12 +489,7 @@ impl Trigger {
         Ok(())
     }
 
-    /// True when no failed run ended less than the backoff ago and the change count reaches
-    /// `min_changes`.
-    ///
-    /// # Errors
-    ///
-    /// The change count cannot be read.
+    /// True when the backoff after a failed run has passed and the count reaches `min_changes`.
     async fn needed(&self) -> anyhow::Result<bool> {
         let (failed, min) = (*self.failed(), self.training.config.train.min_changes);
         let now = self.training.clock.now();
@@ -502,8 +506,7 @@ impl Trigger {
         }
     }
 
-    /// True when the activity changes from `Idle` to `Training`, the `run = Idle` guard of
-    /// `training.qnt`.
+    /// The `run = Idle` guard of `training.qnt`: changes the activity from `Idle` to `Training`.
     fn reserve(&self) -> bool {
         change(&self.activity, Activity::Idle, Activity::Training)
     }
@@ -543,8 +546,8 @@ pub fn change(activity: &Mutex<Activity>, from: Activity, to: Activity) -> bool 
     changed
 }
 
-/// Starts a task that calls `check` of `trigger` each `interval`. Logs a failed check. Gives the
-/// task, which runs until it is aborted.
+/// Starts a task that calls `check` of `trigger` each `interval`. Logs a failed check.
+/// Gives the task, which runs until it is aborted.
 pub fn start_trigger(trigger: Arc<Trigger>, interval: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(interval);
@@ -1118,11 +1121,8 @@ mod tests {
     /// A trigger of the run of `harness` with the backoff `backoff_s` in seconds.
     fn trigger(harness: &Harness, backoff_s: i64) -> Arc<Trigger> {
         let backoff = SignedDuration::from_secs(backoff_s);
-        Arc::new(Trigger::new(
-            Arc::clone(&harness.training),
-            backoff,
-            Arc::default(),
-        ))
+        let training = Arc::clone(&harness.training);
+        Arc::new(Trigger::new(training, backoff, Arc::default()))
     }
 
     /// Lets each task run until it waits.
@@ -1395,24 +1395,31 @@ mod tests {
         for result in [Ok(()), Err("CUDA out of memory")] {
             let old = classifier(&[]);
             let harness = edited(&old, |training| training.runpod = None);
-            harness
-                .training
-                .status
-                .send_replace(rolled_back(State::Online));
+            let status = &harness.training.status;
+            status.send_replace(rolled_back(State::Online));
             script(&harness, &old, result);
             let local = harness.trainer.gate.lock().await;
             let task = started(&harness).await;
-            assert_eq!(
-                *harness.training.status.borrow(),
-                rolled_back(State::Training)
-            );
+            assert_eq!(*status.borrow(), rolled_back(State::Training));
             drop(local);
             let _ended = task.await?;
-            assert_eq!(
-                *harness.training.status.borrow(),
-                rolled_back(State::Online)
-            );
+            assert_eq!(*status.borrow(), rolled_back(State::Online));
         }
+        Ok(())
+    }
+
+    /// The stop of Jarvis sets `Offline`, and a run that ends during the stop keeps it.
+    #[tokio::test(start_paused = true)]
+    async fn offline_during_a_run_stays() -> anyhow::Result<()> {
+        let old = classifier(&[]);
+        let harness = swap(&old);
+        script(&harness, &old, Ok(()));
+        let local = harness.trainer.gate.lock().await;
+        let task = started(&harness).await;
+        (harness.training.status).send_modify(|status| status.state = State::Offline);
+        drop(local);
+        task.await??;
+        assert_eq!(harness.training.status.borrow().state, State::Offline);
         Ok(())
     }
 
@@ -1433,18 +1440,15 @@ mod tests {
         Ok(())
     }
 
-    /// The `Controller` of a copy of `jarvis.toml` in `folder` that shares `shared`.
-    fn controller(folder: &TempDir, shared: &Shared) -> anyhow::Result<Controller> {
+    /// The run of `swap`, its trigger with no backoff, and the `Controller` of a copy of
+    /// `jarvis.toml` in `folder`, which share one activity.
+    fn shared(folder: &TempDir) -> anyhow::Result<(Harness, Arc<Trigger>, Controller)> {
+        let (harness, shared) = (swap(&classifier(&[])), Shared::default());
+        let (training, activity) = (Arc::clone(&harness.training), Arc::clone(&shared.activity));
+        let trigger = Arc::new(Trigger::new(training, SignedDuration::ZERO, activity));
         let config = folder.path().join("jarvis.toml");
         fs::write(&config, include_str!("../../jarvis.toml"))?;
-        Ok(Controller::new(config, shared.clone()))
-    }
-
-    /// A trigger of the run of `harness` with no backoff on the activity of `shared`.
-    fn shared_trigger(harness: &Harness, shared: &Shared) -> Arc<Trigger> {
-        let activity = Arc::clone(&shared.activity);
-        let training = Arc::clone(&harness.training);
-        Arc::new(Trigger::new(training, SignedDuration::ZERO, activity))
+        Ok((harness, trigger, Controller::new(config, shared)))
     }
 
     /// A save of `dialog.timeout_s` with `control`.
@@ -1455,14 +1459,10 @@ mod tests {
     /// AC-13.10b-3.
     #[tokio::test(start_paused = true)]
     async fn ac_13_10b_3_save_during_a_run_is_busy() -> anyhow::Result<()> {
-        let (harness, shared, folder) = (
-            swap(&classifier(&[])),
-            Shared::default(),
-            tempfile::tempdir()?,
-        );
-        let control = controller(&folder, &shared)?;
+        let folder = tempfile::tempdir()?;
+        let (harness, trigger, control) = shared(&folder)?;
         let closed = harness.trainer.gate.lock().await;
-        shared_trigger(&harness, &shared).voice();
+        trigger.voice();
         settle().await;
         assert_eq!(save(&control), Err(Refusal::Busy));
         assert_eq!(
@@ -1476,14 +1476,10 @@ mod tests {
     /// AC-13.10b-4.
     #[tokio::test(start_paused = true)]
     async fn ac_13_10b_4_restart_starts_no_run() -> anyhow::Result<()> {
-        let (harness, shared, folder) = (
-            swap(&classifier(&[])),
-            Shared::default(),
-            tempfile::tempdir()?,
-        );
+        let folder = tempfile::tempdir()?;
+        let (harness, trigger, control) = shared(&folder)?;
         marks(&harness, 20);
-        let trigger = shared_trigger(&harness, &shared);
-        assert_eq!(save(&controller(&folder, &shared)?), Ok(()));
+        assert_eq!(save(&control), Ok(()));
         trigger.voice();
         trigger.check().await?;
         settle().await;
@@ -1494,15 +1490,8 @@ mod tests {
     /// AC-13.10b-4. Either of them can win.
     #[tokio::test(start_paused = true)]
     async fn ac_13_10b_4_run_and_save_exclude_each_other() -> anyhow::Result<()> {
-        let (harness, shared, folder) = (
-            swap(&classifier(&[])),
-            Shared::default(),
-            tempfile::tempdir()?,
-        );
-        let (control, trigger) = (
-            controller(&folder, &shared)?,
-            shared_trigger(&harness, &shared),
-        );
+        let folder = tempfile::tempdir()?;
+        let (harness, trigger, control) = shared(&folder)?;
         let saved = thread::scope(|scope| {
             let other = scope.spawn(|| save(&control));
             trigger.voice();

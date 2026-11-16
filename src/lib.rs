@@ -794,13 +794,12 @@ impl Control for Controller {
     }
 
     fn save(&self, changes: BTreeMap<String, Value>) -> Result<(), Refusal> {
-        let activity = &self.activity;
-        if !app::training::change(activity, Activity::Idle, Activity::Restarting) {
+        if !app::training::change(&self.activity, Activity::Idle, Activity::Restarting) {
             return Err(Refusal::Busy);
         }
         let written = self.written(changes);
         if written.is_err() {
-            app::training::change(activity, Activity::Restarting, Activity::Idle);
+            app::training::change(&self.activity, Activity::Restarting, Activity::Idle);
         }
         written?;
         self.status.send_replace(Status {
@@ -1407,9 +1406,8 @@ type Started = (
     Arc<LiveModels>,
 );
 
-/// A log writer task with the training trigger task, the review of its log, the receiver of the
-/// error text of a failed `restore` of the training run, and the status and activity that the
-/// trigger shares.
+/// A log writer task, the review of its log, and the receiver of the error text of a failed
+/// `restore` of the training run. Also the training trigger task and its [`Shared`].
 type Logged = (
     (JoinHandle<()>, JoinHandle<()>),
     Reviewer,
@@ -1608,10 +1606,10 @@ async fn serve_web(
     Ok(stop)
 }
 
-/// Stops the training trigger task of `stores`, closes `tracker` and waits up to
-/// [`SHUTDOWN_WAIT`] for its tasks: the connections, the work after their replies, the web server
-/// and the status entity. Then waits for the pools task and the log writer task of `stores`, and
-/// then for the last save of its habit task.
+/// Closes `tracker` and waits up to [`SHUTDOWN_WAIT`] for its tasks: the connections, the work
+/// after their replies, the web server and the status entity. Then waits for the pools task and
+/// the log writer task of `stores`, and then for the last save of its habit task.
+/// First stops the training trigger task of `stores`.
 ///
 /// # Errors
 ///
@@ -1621,8 +1619,7 @@ async fn drain(
     stores: (JoinHandle<()>, HabitsTask, (JoinHandle<()>, JoinHandle<()>)),
 ) -> anyhow::Result<()> {
     let (pools_task, habits, (writer, trigger)) = stores;
-    // The trigger task keeps a status sender, and the status entity ends only when the status
-    // channel closes.
+    // The status entity ends only when the trigger task drops its status sender.
     trigger.abort();
     tracker.close();
     // Both tasks run each message. They end when the tracked tasks drop the last sender.
@@ -1781,11 +1778,10 @@ async fn start_app(
 }
 
 /// The recorder of the utterances of `listener` on the log of `config`, its log writer task, the
-/// review of the log with the intent names of `catalog`, the receiver of the error text of a
-/// failed `restore`, the status and activity of the trigger, and the trigger task. Starts the
-/// training trigger on the log with `reasoner`, `catalog`, the hot cache `cache`, the `RunPod`
-/// trainer `runpod`, the house `home` and the live models `models`, which checks each
-/// `train.check_interval_s`.
+/// review of the log with the intent names of `catalog`, and the receiver of the error text of a
+/// failed `restore`. Starts the training trigger on the log with `reasoner`, `catalog`, the hot
+/// cache `cache`, the `RunPod` trainer `runpod`, the house `home` and the live models `models`,
+/// which checks each `train.check_interval_s`. Also gives the trigger task and its [`Shared`].
 ///
 /// # Errors
 ///
@@ -1854,8 +1850,9 @@ fn recorder(
 /// The training trigger of `config` with the backoff `train.failure_backoff_s`, the process
 /// trainer, the `RunPod` trainer `runpod`, the ONNX loader, the stores of `train.state` and
 /// `train.generated`, the system time, `reasoner`, `log`, `catalog`, the hot cache `cache`, the
-/// house `home`, the live models `models`, whose classifier the run swaps, `stop`, which gets
-/// the error text of a failed `restore`, and the status and activity of `shared`.
+/// house `home`, the live models `models`, whose classifier the run swaps, and `stop`, which gets
+/// the error text of a failed `restore`. The run and the trigger use the status and the activity
+/// of `shared`.
 ///
 /// # Errors
 ///
@@ -1893,8 +1890,11 @@ fn trigger(
         stop,
         status: shared.status,
     };
-    let trigger = Trigger::new(Arc::new(training), backoff(train)?, shared.activity);
-    Ok(Arc::new(trigger))
+    Ok(Arc::new(Trigger::new(
+        Arc::new(training),
+        backoff(train)?,
+        shared.activity,
+    )))
 }
 
 /// The failure backoff `train.failure_backoff_s` of `train`.
