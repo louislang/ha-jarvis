@@ -15,8 +15,6 @@ use object_store::ObjectStore;
 use object_store::ObjectStoreExt as _;
 use object_store::PutPayload;
 use object_store::path::Path as StorePath;
-use serde::Deserialize;
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 use serde_json::json;
 use tokio::time;
@@ -45,22 +43,6 @@ pub struct RunPodTrainer {
     timeout: Duration,
 }
 
-/// The reply to a new job.
-#[derive(Deserialize)]
-struct Job {
-    /// The job ID.
-    id: String,
-}
-
-/// The status of a job.
-#[derive(Deserialize)]
-struct Status {
-    /// `IN_QUEUE`, `IN_PROGRESS`, `COMPLETED`, `FAILED`, `CANCELLED` or `TIMED_OUT`.
-    status: String,
-    /// The error text of a failed job.
-    error: Option<String>,
-}
-
 /// The volume folder of the run `run_id`.
 fn folder(run_id: &str) -> StorePath {
     StorePath::from_iter(["jarvis", "runs", run_id])
@@ -72,25 +54,29 @@ impl RunPodTrainer {
     /// # Errors
     ///
     /// The request fails, or the reply has an error status or another form.
-    async fn send<T: DeserializeOwned>(
+    async fn send(
         &self,
         method: reqwest::Method,
         path: &str,
         body: Option<Value>,
-    ) -> anyhow::Result<T> {
+    ) -> anyhow::Result<Value> {
         let url = format!("{}/v2/{}/{path}", self.api, self.endpoint_id);
         let mut request = self.client.request(method, &url).bearer_auth(&self.api_key);
         if let Some(body) = body {
             request = request.json(&body);
         }
-        let reply = request.send().await?.error_for_status()?;
-        reply
-            .json()
-            .await
-            .with_context(|| format!("bad reply of {url}"))
+        Ok(request.send().await?.error_for_status()?.json().await?)
     }
 
-    /// Waits until the job `id` completes, and cancels it after the timeout.
+    /// Cancels the job `id`. A failed cancel only logs, because the run already has an error.
+    async fn cancel(&self, id: &str) {
+        let cancel = format!("cancel/{id}");
+        if let Err(error) = self.send(reqwest::Method::POST, &cancel, None).await {
+            tracing::warn!("cannot cancel RunPod job {id}: {error:#}");
+        }
+    }
+
+    /// Waits until the job `id` completes.
     ///
     /// # Errors
     ///
@@ -98,20 +84,15 @@ impl RunPodTrainer {
     async fn wait(&self, id: &str) -> anyhow::Result<()> {
         let deadline = Instant::now() + self.timeout;
         loop {
-            if Instant::now() >= deadline {
-                let cancel = format!("cancel/{id}");
-                let _: Value = self.send(reqwest::Method::POST, &cancel, None).await?;
-                anyhow::bail!("RunPod job {id} timed out after {:?}", self.timeout);
-            }
+            anyhow::ensure!(Instant::now() < deadline, "RunPod job {id} timed out");
             let status = format!("status/{id}");
-            let status: Status = self.send(reqwest::Method::GET, &status, None).await?;
-            match status.status.as_str() {
-                "COMPLETED" => return Ok(()),
-                "FAILED" | "CANCELLED" | "TIMED_OUT" => anyhow::bail!(
-                    "RunPod job {id} {}: {}",
-                    status.status,
-                    status.error.unwrap_or_default()
-                ),
+            let status = self.send(reqwest::Method::GET, &status, None).await?;
+            let error = status["error"].as_str().unwrap_or_default();
+            match status["status"].as_str() {
+                Some("COMPLETED") => return Ok(()),
+                Some(end @ ("FAILED" | "CANCELLED" | "TIMED_OUT")) => {
+                    anyhow::bail!("RunPod job {id} {end}: {error}")
+                }
                 _ => time::sleep(self.poll).await,
             }
         }
@@ -148,8 +129,13 @@ impl RunPodTrainer {
             .put(&folder(run_id).join("train.json"), data)
             .await?;
         let input = json!({ "input": { "run_id": run_id } });
-        let job: Job = self.send(reqwest::Method::POST, "run", Some(input)).await?;
-        self.wait(&job.id).await?;
+        let job: Value = self.send(reqwest::Method::POST, "run", Some(input)).await?;
+        let id = job["id"].as_str().context("no job ID")?;
+        if let Err(error) = self.wait(id).await {
+            // The job can still run and write to the volume after the delete of `train`.
+            self.cancel(id).await;
+            return Err(error);
+        }
         let out = self.dir.join(run_id);
         self.download(&folder(run_id).join("model"), &out).await?;
         Ok(out)
@@ -259,6 +245,17 @@ mod tests {
             .await;
     }
 
+    /// Mounts on `server` the mock of the job cancel, which expects one request with the key.
+    async fn mount_cancel(server: &MockServer) {
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path(format!("/v2/endpoint/cancel/{JOB}")))
+            .and(matchers::header("authorization", "Bearer key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": JOB })))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
     /// A fixture whose job has `statuses` in order.
     async fn fixture(statuses: Vec<&'static str>) -> anyhow::Result<Fixture> {
         let (server, store) = (MockServer::start().await, Arc::new(InMemory::new()));
@@ -358,15 +355,25 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_13_8b_5_long_job_is_cancelled() -> anyhow::Result<()> {
         let fixture = fixture(vec!["IN_PROGRESS"]).await?;
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path(format!("/v2/endpoint/cancel/{JOB}")))
-            .and(matchers::header("authorization", "Bearer key"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": JOB })))
-            .expect(1)
-            .mount(&fixture.server)
-            .await;
+        mount_cancel(&fixture.server).await;
         let error = train_error(&fixture).await?;
         assert!(error.contains("timed out"), "error: {error}");
+        fixture.server.verify().await;
+        Ok(())
+    }
+
+    /// AC-13.8b-5: a status error after the job start also cancels the job.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_8b_5_status_error_cancels_the_job() -> anyhow::Result<()> {
+        let fixture = fixture(vec!["IN_PROGRESS"]).await?;
+        Mock::given(matchers::path(format!("/v2/endpoint/status/{JOB}")))
+            .respond_with(ResponseTemplate::new(503))
+            .with_priority(1)
+            .mount(&fixture.server)
+            .await;
+        mount_cancel(&fixture.server).await;
+        let error = train_error(&fixture).await?;
+        assert!(error.contains("503"), "error: {error}");
         fixture.server.verify().await;
         Ok(())
     }
