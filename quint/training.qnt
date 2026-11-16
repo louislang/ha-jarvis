@@ -12,7 +12,7 @@ module training {
   /// The accuracies of a model.
   pure val ACC = Set(0, 1, 2)
 
-  /// A RunPod fallback is configured. `init` chooses it and no action changes it, so each check covers both values.
+  /// A RunPod fallback is configured. `init` chooses it, `initLocal` sets false and no action changes it, so each check covers both values.
   var RUNPOD: bool
 
   /// The change count.
@@ -55,24 +55,30 @@ module training {
     lastAction' = e,
   }
 
-  /// No run and no changes. The installed model has the lowest accuracy.
+  /// No run and no changes, with the fallback `runpod`. The installed model has the lowest accuracy.
+  action initWith(runpod: bool): bool = all {
+    RUNPOD' = runpod,
+    changes' = 0,
+    during' = 0,
+    runState' = Idle,
+    paused' = false,
+    starts' = 0,
+    ends' = 0,
+    modelAcc' = 0,
+    prevAcc' = 0,
+    swaps' = List(),
+    attempts' = List(),
+    lastAction' = Init,
+  }
+
+  /// The start with or without a RunPod fallback.
   action init = {
     nondet runpod = Bool.oneOf()
-    all {
-      RUNPOD' = runpod,
-      changes' = 0,
-      during' = 0,
-      runState' = Idle,
-      paused' = false,
-      starts' = 0,
-      ends' = 0,
-      modelAcc' = 0,
-      prevAcc' = 0,
-      swaps' = List(),
-      attempts' = List(),
-      lastAction' = Init,
-    }
+    initWith(runpod)
   }
+
+  /// The start without a RunPod fallback, which the conformance test replays.
+  action initLocal = initWith(false)
 
   /// A new action mark.
   action change = all {
