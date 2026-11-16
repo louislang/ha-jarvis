@@ -145,6 +145,7 @@ pub mod adapters {
     pub mod openai;
     pub mod plex;
     pub mod process;
+    pub mod runpod;
     pub mod settings;
     pub mod sherpa;
     pub mod sqlite;

@@ -13,6 +13,7 @@ flowchart LR
         crate_adapters_openai[openai]
         crate_adapters_plex[plex]
         crate_adapters_process[process]
+        crate_adapters_runpod[runpod]
         crate_adapters_settings[settings]
         crate_adapters_sherpa[sherpa]
         crate_adapters_sqlite[sqlite]
@@ -107,6 +108,9 @@ flowchart LR
     crate_adapters_process --> crate_adapters_process
     crate_adapters_process --> crate_domain_training
     crate_adapters_process --> crate_ports
+    crate_adapters_runpod --> crate_adapters_runpod
+    crate_adapters_runpod --> crate_domain_training
+    crate_adapters_runpod --> crate_ports
     crate_adapters_settings --> crate_ports
     crate_adapters_sherpa --> crate
     crate_adapters_sherpa --> crate_adapters_sherpa
