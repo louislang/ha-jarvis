@@ -1407,10 +1407,11 @@ type Started = (
     Arc<LiveModels>,
 );
 
-/// A log writer task, the review of its log, the receiver of the error text of a failed
-/// `restore` of the training run, and the status and activity that the training trigger shares.
+/// A log writer task with the training trigger task, the review of its log, the receiver of the
+/// error text of a failed `restore` of the training run, and the status and activity that the
+/// trigger shares.
 type Logged = (
-    JoinHandle<()>,
+    (JoinHandle<()>, JoinHandle<()>),
     Reviewer,
     watch::Receiver<Option<String>>,
     Shared,
@@ -1503,7 +1504,7 @@ async fn serve_until(
     started: Started,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<Ended> {
-    let (app, (pools_task, habits, (writer, review, mut stopped, shared)), _, _) = started;
+    let (app, (pools_task, habits, (tasks, review, mut stopped, shared)), _, _) = started;
     let (listener, tracker) = (TcpListener::bind(config.listen).await?, TaskTracker::new());
     let control = Arc::new(Controller::new(file, shared));
     let web = serve_control(config, secrets, review, &control, &tracker).await?;
@@ -1513,7 +1514,7 @@ async fn serve_until(
     let ended = control.ended();
     drop(control);
     served?;
-    drain(tracker, (pools_task, habits, writer)).await?;
+    drain(tracker, (pools_task, habits, tasks)).await?;
     failed(&stopped, ended)
 }
 
@@ -1607,19 +1608,23 @@ async fn serve_web(
     Ok(stop)
 }
 
-/// Closes `tracker` and waits up to [`SHUTDOWN_WAIT`] for its tasks: the connections, the work
-/// after their replies, the web server and the status entity. Then waits for the pools task and
-/// the log writer task of `stores`, and then for the last save of its habit task.
+/// Stops the training trigger task of `stores`, closes `tracker` and waits up to
+/// [`SHUTDOWN_WAIT`] for its tasks: the connections, the work after their replies, the web server
+/// and the status entity. Then waits for the pools task and the log writer task of `stores`, and
+/// then for the last save of its habit task.
 ///
 /// # Errors
 ///
 /// A task of `stores` panicked.
 async fn drain(
     tracker: TaskTracker,
-    stores: (JoinHandle<()>, HabitsTask, JoinHandle<()>),
+    stores: (JoinHandle<()>, HabitsTask, (JoinHandle<()>, JoinHandle<()>)),
 ) -> anyhow::Result<()> {
+    let (pools_task, habits, (writer, trigger)) = stores;
+    // The trigger task keeps a status sender, and the status entity ends only when the status
+    // channel closes.
+    trigger.abort();
     tracker.close();
-    let (pools_task, habits, writer) = stores;
     // Both tasks run each message. They end when the tracked tasks drop the last sender.
     let drained = async {
         tracker.wait().await;
@@ -1777,9 +1782,10 @@ async fn start_app(
 
 /// The recorder of the utterances of `listener` on the log of `config`, its log writer task, the
 /// review of the log with the intent names of `catalog`, the receiver of the error text of a
-/// failed `restore`, and the status and activity of the trigger. Starts the training trigger on
-/// the log with `reasoner`, `catalog`, the hot cache `cache`, the `RunPod` trainer `runpod`, the
-/// house `home` and the live models `models`, which checks each `train.check_interval_s`.
+/// failed `restore`, the status and activity of the trigger, and the trigger task. Starts the
+/// training trigger on the log with `reasoner`, `catalog`, the hot cache `cache`, the `RunPod`
+/// trainer `runpod`, the house `home` and the live models `models`, which checks each
+/// `train.check_interval_s`.
 ///
 /// # Errors
 ///
@@ -1806,8 +1812,9 @@ fn start_log(
         runpod,
         (home, models, stop, shared.clone()),
     )?;
-    app::training::start_trigger(trigger, Duration::from_secs(config.train.check_interval_s));
-    Ok((recorded, (writer, review, stopped, shared)))
+    let interval = Duration::from_secs(config.train.check_interval_s);
+    let trigger = app::training::start_trigger(trigger, interval);
+    Ok((recorded, ((writer, trigger), review, stopped, shared)))
 }
 
 /// The log of `config` and its largest stored ID. Starts the daily prune of the log.
@@ -3564,9 +3571,9 @@ mod tests {
         let catalog = load_catalog(&config.intents)?;
         let pools = load_pools(&config.responses, &catalog)?;
         let home = Arc::new(FakeHome::default());
-        let (app, (pools_task, habits, (writer, review, _, shared)), prerender, models) =
+        let (app, (pools_task, habits, (tasks, review, _, shared)), prerender, models) =
             start_live_app(&config, &secrets, catalog, pools, home).await?;
-        let stores = (pools_task, habits, (writer, review, stopped, shared));
+        let stores = (pools_task, habits, (tasks, review, stopped, shared));
         Ok((config, secrets, (app, stores, prerender, models)))
     }
 
@@ -3588,6 +3595,20 @@ mod tests {
         let connected = TcpStream::connect(address).await;
         assert!(connected.is_err(), "the server accepts after the stop");
         Ok(())
+    }
+
+    /// The status entity ends only when the status channel closes.
+    #[tokio::test(start_paused = true)]
+    async fn status_channel_closes_after_serve_until() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let (file, _, _) = listening_config(folder.path())?;
+        let (config, secrets, started) = started_with(&file, watch::channel(None).1).await?;
+        let mut status = (started.1).2.3.status.subscribe();
+        serve_until(file, &config, &secrets, started, future::ready(())).await?;
+        let closed = async { while status.changed().await.is_ok() {} };
+        tokio::time::timeout(Duration::from_secs(60), closed)
+            .await
+            .context("the status channel is open")
     }
 
     /// Gets `api/<path>` from the web server at `address` once it listens.

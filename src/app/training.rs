@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Map;
 use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use xxhash_rust::xxh3;
 
 use crate::Config;
@@ -542,8 +543,9 @@ pub fn change(activity: &Mutex<Activity>, from: Activity, to: Activity) -> bool 
     changed
 }
 
-/// Starts a task that calls `check` of `trigger` each `interval`. Logs a failed check.
-pub fn start_trigger(trigger: Arc<Trigger>, interval: Duration) {
+/// Starts a task that calls `check` of `trigger` each `interval`. Logs a failed check. Gives the
+/// task, which runs until it is aborted.
+pub fn start_trigger(trigger: Arc<Trigger>, interval: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticks = tokio::time::interval(interval);
         loop {
@@ -552,7 +554,7 @@ pub fn start_trigger(trigger: Arc<Trigger>, interval: Duration) {
                 tracing::warn!("the training check failed: {error:#}");
             }
         }
-    });
+    })
 }
 
 /// The accuracy of `classifier` on `held` at `threshold`.
