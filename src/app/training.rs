@@ -499,11 +499,13 @@ impl Trigger {
         Ok(training::should_train(self.training.changes().await?, min))
     }
 
-    /// Starts a run at any change count and without the backoff.
-    pub fn voice(self: &Arc<Self>) {
-        if self.reserve() {
+    /// Starts a run at any change count and without the backoff. Gives whether it started one.
+    pub fn voice(self: &Arc<Self>) -> bool {
+        let started = self.reserve();
+        if started {
             self.start();
         }
+        started
     }
 
     /// The `run = Idle` guard of `training.qnt`: changes the activity from `Idle` to `Training`.
@@ -643,7 +645,6 @@ mod tests {
     use crate::ports::Refusal;
     use crate::testing::fakes;
     use crate::testing::fakes::FakeClassifier;
-    use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeLog;
     use crate::testing::fakes::FakeModelLoader;
@@ -778,50 +779,11 @@ mod tests {
         assert_eq!(refreshed.unknown.examples, ["what is the capital of peru"]);
     }
 
-    /// A training run on `intents.toml` and the reference house with fakes, with the held-out
-    /// share `holdout`, and its trainer, which creates the model folders in `models`.
-    fn harness(holdout: f64, models: &TempDir) -> (Training, Arc<FakeTrainer>) {
-        let mut config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
-        (config.train.holdout, config.model.dir) = (holdout, models.path().to_owned());
-        let trainer = trainer_in(models);
-        let training = Training {
-            reasoner: Arc::new(FakeReasoner::default()),
-            generated: Arc::new(FakeStore::new(None)),
-            state: Arc::new(FakeStore::new(None)),
-            log: Arc::<FakeLog>::default(),
-            trainer: Arc::clone(&trainer) as _,
-            runpod: None,
-            loader: Arc::new(FakeModelLoader::default()),
-            classifier: Arc::new(CurrentClassifier::new(
-                FIXTURE.to_owned(),
-                Arc::<FakeClassifier>::default(),
-            )),
-            catalog: Arc::new(catalog()),
-            cache: watch::channel(StateCache::load(fakes::house())).1,
-            clock: Arc::new(FakeClock(Timestamp::UNIX_EPOCH)),
-            config,
-            home: Arc::new(FakeHome::default()),
-            models: Arc::new(FakeModels::default()),
-            stop: watch::Sender::default(),
-            status: watch::Sender::default(),
-        };
-        (training, trainer)
-    }
-
-    /// A trainer that creates the model folders in `models`.
-    fn trainer_in(models: &TempDir) -> Arc<FakeTrainer> {
-        let dir = models.path().to_owned();
-        Arc::new(FakeTrainer {
-            dir,
-            ..FakeTrainer::default()
-        })
-    }
-
     /// AC-13.9-4.
     #[tokio::test(start_paused = true)]
     async fn ac_13_9_4_upload_has_no_held_out_example() -> anyhow::Result<()> {
         let models = tempfile::tempdir()?;
-        let (training, trainer) = harness(0.1, &models);
+        let (training, trainer) = fakes::training(0.1, models.path());
         trainer
             .results
             .lock()
@@ -843,7 +805,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_13_9_13_empty_held_out_set_stops_before_training() -> anyhow::Result<()> {
         let models = tempfile::tempdir()?;
-        let (training, trainer) = harness(0.0, &models);
+        let (training, trainer) = fakes::training(0.0, models.path());
         let error = training.run().await.expect_err("the run stops");
         assert!(error.to_string().contains("held-out"), "{error}");
         let calls = trainer.calls.lock().expect("no test panics");
@@ -894,8 +856,8 @@ mod tests {
     /// The run of `swap` with `FakeRunPodTrainer` after `edit`.
     fn edited(old: &Arc<FakeClassifier>, edit: impl FnOnce(&mut Training)) -> Harness {
         let models = tempfile::tempdir().expect("a temporary folder");
-        let (training, trainer) = harness(0.1, &models);
-        let runpod = trainer_in(&models);
+        let (training, trainer) = fakes::training(0.1, models.path());
+        let runpod = fakes::trainer_in(models.path());
         let (loader, log) = (Arc::<FakeModelLoader>::default(), Arc::<FakeLog>::default());
         let current = CurrentClassifier::new(FIXTURE.to_owned(), Arc::clone(old) as _);
         let clock = start_clock();
@@ -1192,6 +1154,21 @@ mod tests {
         settle().await;
         assert_eq!(calls(&harness), 3, "the voice trigger waited");
         Ok(())
+    }
+
+    /// AC-13.11-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_11_3_worse_voice_run_keeps_the_old_model() {
+        let (old, new) = (classifier(&[]), classifier(&wrong_slot()));
+        let harness = swap(&old);
+        script(&harness, &new, Ok(()));
+        assert!(trigger(&harness, 0).voice(), "no run started");
+        settle().await;
+        assert_eq!(
+            next_calls(&harness, &old).await,
+            1,
+            "the old classifier predicts"
+        );
     }
 
     /// The run ID and the set of each `train` call of `trainer`.

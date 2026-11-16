@@ -31,6 +31,7 @@ use crate::app::background::Backfill;
 use crate::app::background::Habits;
 use crate::app::plugins::Plugins;
 use crate::app::speech::Utterances;
+use crate::app::training::Trigger;
 use crate::domain::catalog::Catalog;
 use crate::domain::decide;
 use crate::domain::decide::AskCall;
@@ -94,7 +95,7 @@ pub struct SystemTwo {
     pub read_services: Vec<String>,
 }
 
-/// The parts of the log of the requests.
+/// The parts of the log of the requests, and the training trigger, which trains on its marks.
 #[derive(Clone)]
 pub struct Recorder {
     /// The committed utterances, which give the audio of a voice request.
@@ -103,6 +104,8 @@ pub struct Recorder {
     pub writer: UnboundedSender<Write>,
     /// The largest stored interaction ID at the start, or `None` without interactions.
     pub last_id: Option<u64>,
+    /// The training trigger of a `train` request.
+    pub trigger: Arc<Trigger>,
 }
 
 /// One message to the log writer task.
@@ -166,7 +169,8 @@ impl Conversation {
     /// `queues`, their house and `backfill`, which records the uses of `pools`. Selects the
     /// responses with a random source seeded from the time of `two`. Records the requests in
     /// `habits` and in `recorder`, with IDs from the time of `two` in microseconds, above the
-    /// stored IDs of `recorder`.
+    /// stored IDs of `recorder`. Starts the training runs of `train` requests with the trigger of
+    /// `recorder`.
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
@@ -335,7 +339,7 @@ impl Conversation {
         heard: &Heard,
         new: bool,
     ) -> (Handled, Decided) {
-        let decision = self.decide(prediction, request);
+        let decision = self.started(self.decide(prediction, request));
         let (mut decided, pending) = self.parts(&decision);
         let route = decided.route;
         // Only a spoken request counts. Text from the HA UI has no satellite.
@@ -355,6 +359,20 @@ impl Conversation {
         tracing::info!(transcript, ?top, ?route, reply, "handled");
         decided.response = answer.unwrap_or(decided.response);
         (handled, decided)
+    }
+
+    /// `decision`, with a `Train` as a `Reply` with its reply when `voice` of the trigger starts a
+    /// run, else with its `busy` reply.
+    fn started(&self, decision: Decision) -> Decision {
+        let Decision::Train { reply, busy } = decision else {
+            return decision;
+        };
+        let reply = if self.recorder.trigger.voice() {
+            reply
+        } else {
+            busy
+        };
+        Decision::Reply { reply, call: None }
     }
 
     /// Opens a dialog on `key` that waits for `pending`, asked at the time of `heard`, with the
@@ -382,6 +400,7 @@ impl Conversation {
             Decision::Ask { question, pending } => {
                 (Route::Ask, None, question, Some(pending.clone()))
             }
+            Decision::Train { .. } => unreachable!("`act` makes a train decision a reply"),
         };
         let response = self.spoken(chosen.clone());
         let decided = Decided {
@@ -653,9 +672,8 @@ impl Conversation {
                 job: Job::Llm(text),
             } => {
                 let llm = request.map(|request| {
-                    let request = Some(request);
                     let thread = Thread {
-                        request,
+                        request: Some(request),
                         first: Some(first),
                         ..Thread::default()
                     };
@@ -664,6 +682,7 @@ impl Conversation {
                 (filler, llm)
             }
             Decision::Ask { question, .. } => self.ask(question, request),
+            Decision::Train { .. } => unreachable!("`act` makes a train decision a reply"),
         };
         let Chosen { text, pool, index } = chosen;
         self.backfill.record_use(pool, index);
@@ -1613,6 +1632,7 @@ mod tests {
     use crate::domain::state::State;
     use crate::ports::Classifier;
     use crate::ports::Plugin;
+    use crate::testing::fakes;
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
@@ -1620,6 +1640,7 @@ mod tests {
     use crate::testing::fakes::FakePlugin;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
+    use crate::testing::fakes::FakeTrainer;
     use crate::testing::fakes::FakeTts;
     use crate::testing::fakes::Scripted;
     use crate::testing::fakes::SetClock;
@@ -2568,6 +2589,7 @@ mod tests {
             utterances: Arc::new(Utterances::new(clock, 10)),
             writer: tokio::sync::mpsc::unbounded_channel().0,
             last_id: None,
+            trigger: fakes::trigger(Path::new("unused")).0,
         }
     }
 
@@ -3420,6 +3442,62 @@ mod tests {
         let home = Arc::new(FakeHome::default());
         let text = typed("weather", "what is the weather like", &home, Vec::new()).await?;
         assert_eq!(text, "It is sunny.");
+        Ok(())
+    }
+
+    /// A conversation with the pools of `responses.toml`, a classifier that gives `start_training`
+    /// `count` times and a new trigger, and the trainer of the trigger.
+    fn training(count: usize) -> anyhow::Result<(Conversation, Arc<FakeTrainer>)> {
+        let classifier = scripted(&vec!["start_training"; count]);
+        let home = Arc::new(FakeHome::default());
+        let (_cache, _changes, conversation) =
+            still_with(&home, "idle", classifier, Arc::default());
+        let catalog = crate::load_catalog(Path::new("intents.toml"))?;
+        let pools = crate::load_pools(Path::new("responses.toml"), &catalog)?;
+        let pools = Arc::new(ArcSwap::from_pointee(pools));
+        let (trigger, trainer) = fakes::trigger(Path::new("unused"));
+        let recorder = Recorder {
+            trigger,
+            ..conversation.recorder.clone()
+        };
+        let conversation = Conversation {
+            pools,
+            recorder,
+            ..conversation
+        };
+        Ok((conversation, trainer))
+    }
+
+    /// The reply to "start training" from the satellite after each task runs until it waits.
+    async fn start_training(conversation: &Conversation) -> anyhow::Result<String> {
+        let Handled { text, .. } = conversation
+            .handle("start training", on_satellite())
+            .await?;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        Ok(text)
+    }
+
+    /// AC-13.11-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_11_1_start_training_replies_and_starts_a_run() -> anyhow::Result<()> {
+        let (conversation, trainer) = training(1)?;
+        let text = start_training(&conversation).await?;
+        assert_eq!(text, "I will start training now.");
+        assert_eq!(trainer.calls.lock().expect("no test panics").len(), 1);
+        Ok(())
+    }
+
+    /// AC-13.11-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_11_2_active_run_replies_busy() -> anyhow::Result<()> {
+        let (conversation, trainer) = training(2)?;
+        let closed = trainer.gate.lock().await;
+        let _first = start_training(&conversation).await?;
+        let text = start_training(&conversation).await?;
+        assert_eq!(text, "Training is already running.");
+        let calls = trainer.calls.lock().expect("no test panics").len();
+        assert_eq!(calls, 1, "a second run started");
+        drop(closed);
         Ok(())
     }
 

@@ -23,6 +23,7 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use futures::channel::oneshot;
 use futures::stream::BoxStream;
+use jiff::SignedDuration;
 use jiff::Timestamp;
 use rubato::Fft;
 use rubato::FixedSync;
@@ -44,13 +45,18 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tracing::Dispatch;
 use tracing::subscriber::NoSubscriber;
 
 use crate::Config;
+use crate::CurrentClassifier;
 use crate::Device;
 use crate::adapters::supertonic::SupertonicTts;
 use crate::app::review;
+use crate::app::training::FIXTURE;
+use crate::app::training::Training;
+use crate::app::training::Trigger;
 use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::feedback;
@@ -64,6 +70,7 @@ use crate::domain::state::Event;
 use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
+use crate::domain::state_cache::StateCache;
 use crate::domain::training::TrainingSet;
 use crate::ports::Assistant;
 use crate::ports::Change;
@@ -369,6 +376,65 @@ impl Trainer for FakeTrainer {
         std::fs::create_dir(&dir)?;
         Ok(dir)
     }
+}
+
+/// A training run on `intents.toml` and the reference house with fakes, with the held-out share
+/// `holdout`, and its trainer, which creates the model folders in `models`.
+///
+/// # Panics
+///
+/// `jarvis.toml` or `intents.toml` is not valid.
+#[must_use]
+pub fn training(holdout: f64, models: &Path) -> (Training, Arc<FakeTrainer>) {
+    let trainer = trainer_in(models);
+    let catalog = toml::from_str(include_str!("../../intents.toml")).expect("it is a catalog");
+    let training = Training {
+        reasoner: Arc::new(FakeReasoner::default()),
+        generated: Arc::new(FakeStore::new(None)),
+        state: Arc::new(FakeStore::new(None)),
+        log: Arc::<FakeLog>::default(),
+        trainer: Arc::clone(&trainer) as _,
+        runpod: None,
+        loader: Arc::new(FakeModelLoader::default()),
+        classifier: Arc::new(CurrentClassifier::new(
+            FIXTURE.to_owned(),
+            Arc::<FakeClassifier>::default(),
+        )),
+        catalog: Arc::new(catalog),
+        cache: watch::channel(StateCache::load(house())).1,
+        clock: Arc::new(FakeClock(Timestamp::UNIX_EPOCH)),
+        config: training_config(holdout, models),
+        home: Arc::new(FakeHome::default()),
+        models: Arc::new(FakeModels::default()),
+        stop: watch::Sender::default(),
+        status: watch::Sender::default(),
+    };
+    (training, trainer)
+}
+
+/// `jarvis.toml` with the held-out share `holdout` and the model folder `models`.
+fn training_config(holdout: f64, models: &Path) -> Config {
+    let mut config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
+    (config.train.holdout, config.model.dir) = (holdout, models.to_owned());
+    config
+}
+
+/// A trainer that creates the model folders in `models`.
+#[must_use]
+pub fn trainer_in(models: &Path) -> Arc<FakeTrainer> {
+    Arc::new(FakeTrainer {
+        dir: models.to_owned(),
+        ..FakeTrainer::default()
+    })
+}
+
+/// A trigger with no backoff of the run of [`training`] in `models`, and its trainer.
+#[must_use]
+pub fn trigger(models: &Path) -> (Arc<Trigger>, Arc<FakeTrainer>) {
+    let (training, trainer) = training(0.1, models);
+    let training = Arc::new(training);
+    let trigger = Trigger::new(training, SignedDuration::ZERO, Arc::default());
+    (Arc::new(trigger), trainer)
 }
 
 /// A `Models` that records the calls and can fail the next `restore`.

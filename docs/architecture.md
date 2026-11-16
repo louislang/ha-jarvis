@@ -149,6 +149,7 @@ flowchart LR
     crate_app_conversation --> crate_app_conversation
     crate_app_conversation --> crate_app_plugins
     crate_app_conversation --> crate_app_speech
+    crate_app_conversation --> crate_app_training
     crate_app_conversation --> crate_domain_catalog
     crate_app_conversation --> crate_domain_decide
     crate_app_conversation --> crate_domain_dialog
