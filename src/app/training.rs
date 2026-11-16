@@ -2,6 +2,9 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::fs;
+use std::io;
+use std::path::Path;
 use std::sync::Arc;
 
 use jiff::Timestamp;
@@ -13,6 +16,7 @@ use tokio::sync::watch;
 use xxhash_rust::xxh3;
 
 use crate::Config;
+use crate::CurrentClassifier;
 use crate::TrainConfig;
 use crate::domain::catalog;
 use crate::domain::catalog::Catalog;
@@ -21,13 +25,20 @@ use crate::domain::intent;
 use crate::domain::state_cache::StateCache;
 use crate::domain::training;
 use crate::domain::training::Example;
+use crate::domain::training::Metrics;
 use crate::domain::training::Settings;
 use crate::domain::training::TrainingSet;
+use crate::domain::training::TrainingState;
+use crate::ports::Classifier;
 use crate::ports::Clock;
 use crate::ports::InteractionLog;
+use crate::ports::ModelLoader;
 use crate::ports::Reasoner;
 use crate::ports::Store;
 use crate::ports::Trainer;
+
+/// The run name of the fixture model.
+pub const FIXTURE: &str = "fixture";
 
 /// The generated examples of `train.generated`.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -180,10 +191,16 @@ pub struct Training {
     pub reasoner: Arc<dyn Reasoner>,
     /// The generated examples of `train.generated`.
     pub generated: Arc<dyn Store<Generated>>,
+    /// The training state of `train.state`.
+    pub state: Arc<dyn Store<TrainingState>>,
     /// The log with the marks.
     pub log: Arc<dyn InteractionLog>,
     /// The local trainer.
     pub trainer: Arc<dyn Trainer>,
+    /// Opens the new model folder.
+    pub loader: Arc<dyn ModelLoader>,
+    /// The classifier of the conversation.
+    pub classifier: Arc<CurrentClassifier>,
     /// The intents.
     pub catalog: Arc<Catalog>,
     /// The hot cache, which gives the area names.
@@ -195,11 +212,12 @@ pub struct Training {
 }
 
 impl Training {
-    /// One run: trains on the examples that are not held out.
+    /// One run: trains on the examples that are not held out, and swaps the classifier when the
+    /// new one is never worse on the held-out examples. Saves the start time and the current run.
     ///
     /// # Errors
     ///
-    /// A step fails, or the held-out set is empty.
+    /// A step fails, or the held-out set is empty. The classifier and the state then do not change.
     pub async fn run(&self) -> anyhow::Result<()> {
         let started = self.clock.now();
         let set = self.training_set(started).await?;
@@ -214,8 +232,67 @@ impl Training {
             ..set
         };
         let run_id = started.strftime("%Y%m%d-%H%M%S").to_string();
-        self.trainer.train(&run_id, &upload).await?;
+        let dir = self.trainer.train(&run_id, &upload).await?;
+        let new = self.loader.load(&dir, self.config.device).await?;
+        let accepted = self.never_worse(new.as_ref(), &held, &run_id).await?;
+        self.finish(started, &run_id, &dir, accepted.then_some(new))
+    }
+
+    /// Saves the state of the run `run_id` that started at `started` and trained `dir`. Swaps in
+    /// `new` and deletes the old model folders when the run gives one, else deletes `dir`.
+    fn finish(
+        &self,
+        started: Timestamp,
+        run_id: &str,
+        dir: &Path,
+        new: Option<Arc<dyn Classifier>>,
+    ) -> anyhow::Result<()> {
+        let previous = self.state.load()?.unwrap_or_default().current;
+        let current = if new.is_some() {
+            Some(run_id.to_owned())
+        } else {
+            fs::remove_dir_all(dir)?;
+            previous.clone()
+        };
+        let last_time = started;
+        self.state.save(&TrainingState { current, last_time })?;
+        if let Some(new) = new {
+            self.classifier.0.store(Arc::new(new));
+            let keep = [run_id, previous.as_deref().unwrap_or(FIXTURE)];
+            if let Err(error) = prune(&self.config.model.dir, keep) {
+                tracing::warn!("the delete of the old model folders failed: {error}");
+            }
+        }
         Ok(())
+    }
+
+    /// True when `new` of the run `run_id` is never worse than the current classifier on `held`.
+    /// Logs both measures and the decision.
+    async fn never_worse(
+        &self,
+        new: &dyn Classifier,
+        held: &[Example],
+        run_id: &str,
+    ) -> anyhow::Result<bool> {
+        let old = self.classifier.0.load_full();
+        let threshold = self.config.model.threshold;
+        let new_metrics = measure(new, held, threshold).await?;
+        let old_metrics = measure(old.as_ref().as_ref(), held, threshold).await?;
+        let accepted = training::accept(new_metrics, old_metrics);
+        tracing::info!(
+            "run {run_id}: new {new_metrics:?}, old {old_metrics:?}, accepted {accepted}"
+        );
+        Ok(accepted)
+    }
+
+    /// The number of action marks after the start of the last run.
+    ///
+    /// # Errors
+    ///
+    /// The state or the log cannot be read.
+    pub async fn changes(&self) -> anyhow::Result<usize> {
+        let state = self.state.load()?.unwrap_or_default();
+        Ok(training::changes(&state, &self.log.marked().await?))
     }
 
     /// The full training set of a run that starts at `started`, after a `refresh`.
@@ -262,6 +339,30 @@ impl Training {
     }
 }
 
+/// The accuracy of `classifier` on `held` at `threshold`.
+async fn measure(
+    classifier: &dyn Classifier,
+    held: &[Example],
+    threshold: f32,
+) -> anyhow::Result<Metrics> {
+    let mut predictions = Vec::new();
+    for example in held {
+        predictions.push(classifier.predict(&example.context, &example.text).await?);
+    }
+    Ok(training::metrics(&predictions, held, threshold))
+}
+
+/// Deletes the folders in `dir` other than `keep`.
+fn prune(dir: &Path, keep: [&str; 2]) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && !keep.iter().any(|name| entry.file_name() == *name) {
+            fs::remove_dir_all(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
 /// A copy of `catalog` whose seeds are the examples of `generated`, so that `seed_set` labels
 /// them.
 fn generated_catalog(catalog: &Catalog, generated: Generated) -> Catalog {
@@ -297,11 +398,18 @@ mod tests {
 
     use std::slice;
 
+    use arc_swap::ArcSwap;
+    use serde_json::json;
     use tempfile::TempDir;
+    use tokio::task::JoinHandle;
 
+    use crate::domain::model::Prediction;
+    use crate::domain::model::Slot;
     use crate::testing::fakes;
+    use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeLog;
+    use crate::testing::fakes::FakeModelLoader;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeTrainer;
@@ -435,7 +543,7 @@ mod tests {
     /// share `holdout`, and its trainer, which creates the model folders in `models`.
     fn harness(holdout: f64, models: &TempDir) -> (Training, Arc<FakeTrainer>) {
         let mut config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
-        config.train.holdout = holdout;
+        (config.train.holdout, config.model.dir) = (holdout, models.path().to_owned());
         let dir = models.path().to_owned();
         let trainer = Arc::new(FakeTrainer {
             dir,
@@ -444,8 +552,13 @@ mod tests {
         let training = Training {
             reasoner: Arc::new(FakeReasoner::default()),
             generated: Arc::new(FakeStore::new(None)),
+            state: Arc::new(FakeStore::new(None)),
             log: Arc::new(FakeLog::default()),
             trainer: Arc::clone(&trainer) as _,
+            loader: Arc::new(FakeModelLoader::default()),
+            classifier: Arc::new(CurrentClassifier(ArcSwap::from_pointee(
+                Arc::<FakeClassifier>::default() as _,
+            ))),
             catalog: Arc::new(catalog()),
             cache: watch::channel(StateCache::load(fakes::house())).1,
             clock: Arc::new(FakeClock(Timestamp::UNIX_EPOCH)),
@@ -464,7 +577,8 @@ mod tests {
             .lock()
             .expect("no test panics")
             .push_back(Ok(()));
-        training.run().await?;
+        // The run then stops at the load, which has no scripted classifier.
+        let _stopped = training.run().await;
         let calls = trainer.calls.lock().expect("no test panics");
         let examples = &calls[0].1.examples;
         let held = examples
@@ -484,6 +598,209 @@ mod tests {
         assert!(error.to_string().contains("held-out"), "{error}");
         let calls = trainer.calls.lock().expect("no test panics");
         assert!(calls.is_empty(), "the trainer has a call");
+        Ok(())
+    }
+
+    /// The start of each run of `swap`, in seconds.
+    const START: i64 = 1_000_000;
+
+    /// The run ID of a run that starts at `START`.
+    const RUN: &str = "19700112-134640";
+
+    /// A training run with the old classifier `old`, and its fakes.
+    struct Harness {
+        /// The run.
+        training: Arc<Training>,
+        /// The local trainer.
+        trainer: Arc<FakeTrainer>,
+        /// The model loader.
+        loader: Arc<FakeModelLoader>,
+        /// The log.
+        log: Arc<FakeLog>,
+        /// The model folder.
+        models: TempDir,
+    }
+
+    /// The run of `harness` with the held-out share 0.1, the old classifier `old` and the start
+    /// `START`.
+    fn swap(old: &Arc<FakeClassifier>) -> Harness {
+        let models = tempfile::tempdir().expect("a temporary folder");
+        let (training, trainer) = harness(0.1, &models);
+        let (loader, log) = (Arc::<FakeModelLoader>::default(), Arc::<FakeLog>::default());
+        let current = ArcSwap::from_pointee(Arc::clone(old) as Arc<dyn Classifier>);
+        let training = Arc::new(Training {
+            log: Arc::clone(&log) as _,
+            loader: Arc::clone(&loader) as _,
+            classifier: Arc::new(CurrentClassifier(current)),
+            clock: Arc::new(FakeClock(Timestamp::from_second(START).expect("a time"))),
+            ..training
+        });
+        Harness {
+            training,
+            trainer,
+            loader,
+            log,
+            models,
+        }
+    }
+
+    /// A classifier that gives `lights_on` with 0.9 and `slots` for each text.
+    fn classifier(slots: &[Slot]) -> Arc<FakeClassifier> {
+        let classifier = FakeClassifier::default();
+        for _ in 0..1000 {
+            let ranked = vec![("lights_on".to_owned(), 0.9)];
+            let slots = slots.to_vec();
+            classifier.script(Prediction { ranked, slots });
+        }
+        Arc::new(classifier)
+    }
+
+    /// A slot that no example has, so that each example with spans is wrong in `slots`.
+    fn wrong_slot() -> Vec<Slot> {
+        let (name, value) = ("area".to_owned(), "nowhere".to_owned());
+        vec![Slot { name, value }]
+    }
+
+    /// Logs the request `id` with a good action mark at `second`.
+    fn mark(log: &FakeLog, id: u64, second: i64) {
+        let time = Timestamp::from_second(second).expect("a time");
+        let interaction = json!({
+            "id": id, "time": time, "transcript": "turn on the lights", "model_context": "",
+            "model": FIXTURE, "top_labels": [], "slots": [], "service_calls": [], "responses": [],
+            "action": { "intent": "lights_on", "targets": [] }, "decision": "Reply",
+            "marks": [{ "interaction": id, "value": "Good", "time": time }],
+        });
+        let interaction = serde_json::from_value(interaction).expect("an interaction");
+        let mut interactions = log.interactions.lock().expect("no test panics");
+        interactions.push((interaction, None));
+    }
+
+    /// Scripts the new classifier `new` and the trainer result `result` of the next run.
+    fn script(harness: &Harness, new: &Arc<FakeClassifier>, result: Result<(), &'static str>) {
+        harness.loader.script(Arc::clone(new) as _);
+        let mut results = harness.trainer.results.lock().expect("no test panics");
+        results.push_back(result);
+    }
+
+    /// The number of `predict` calls of `classifier` in the next `predict` of the wrapper.
+    async fn next_calls(harness: &Harness, classifier: &FakeClassifier) -> usize {
+        let before = classifier.calls().len();
+        let _ = harness.training.classifier.predict("", "lights on").await;
+        classifier.calls().len() - before
+    }
+
+    /// Starts the run of `harness` in a task, and returns when the trainer has the call or the
+    /// run ended.
+    async fn started(harness: &Harness) -> JoinHandle<anyhow::Result<()>> {
+        let training = Arc::clone(&harness.training);
+        let task = tokio::spawn(async move { training.run().await });
+        let calls = || harness.trainer.calls.lock().expect("no test panics").len();
+        while calls() == 0 && !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        task
+    }
+
+    /// AC-13.9b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9b_1_never_worse_model_is_swapped() -> anyhow::Result<()> {
+        let (old, new) = (classifier(&wrong_slot()), classifier(&[]));
+        let harness = swap(&old);
+        script(&harness, &new, Ok(()));
+        harness.training.run().await?;
+        assert_eq!(
+            next_calls(&harness, &new).await,
+            1,
+            "the new classifier predicts"
+        );
+        let state = harness.training.state.load()?.expect("a saved state");
+        assert_eq!(state.current.as_deref(), Some(RUN));
+        Ok(())
+    }
+
+    /// AC-13.9b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9b_2_worse_model_is_rejected() -> anyhow::Result<()> {
+        let (old, new) = (classifier(&[]), classifier(&wrong_slot()));
+        let harness = swap(&old);
+        script(&harness, &new, Ok(()));
+        harness.training.run().await?;
+        assert_eq!(
+            next_calls(&harness, &old).await,
+            1,
+            "the old classifier predicts"
+        );
+        let folder = harness.models.path().join(RUN);
+        assert!(!folder.exists(), "{} exists", folder.display());
+        Ok(())
+    }
+
+    /// AC-13.9b-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9b_3_run_resets_the_change_count() -> anyhow::Result<()> {
+        for slots in [Vec::new(), wrong_slot()] {
+            let (old, new) = (classifier(&[]), classifier(&slots));
+            let harness = swap(&old);
+            mark(&harness.log, 1, START - 1);
+            assert_eq!(harness.training.changes().await?, 1);
+            script(&harness, &new, Ok(()));
+            harness.training.run().await?;
+            assert_eq!(harness.training.changes().await?, 0, "slots {slots:?}");
+        }
+        Ok(())
+    }
+
+    /// AC-13.9b-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9b_4_trainer_error_keeps_model_and_count() -> anyhow::Result<()> {
+        let (old, new) = (classifier(&wrong_slot()), classifier(&[]));
+        let harness = swap(&old);
+        mark(&harness.log, 1, START - 1);
+        script(&harness, &new, Err("CUDA out of memory"));
+        assert!(harness.training.run().await.is_err(), "the run succeeded");
+        assert_eq!(
+            next_calls(&harness, &old).await,
+            1,
+            "the old classifier predicts"
+        );
+        assert_eq!(harness.training.changes().await?, 1);
+        Ok(())
+    }
+
+    /// AC-13.9b-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9b_5_blocked_load_does_not_delay_predict() -> anyhow::Result<()> {
+        let old = classifier(&[]);
+        let harness = swap(&old);
+        let closed = harness.loader.gate.lock().await;
+        script(&harness, &old, Ok(()));
+        let task = started(&harness).await;
+        tokio::task::yield_now().await;
+        let before = tokio::time::Instant::now();
+        assert_eq!(
+            next_calls(&harness, &old).await,
+            1,
+            "the old classifier predicts"
+        );
+        assert_eq!(tokio::time::Instant::now(), before, "virtual time advanced");
+        assert!(!task.is_finished(), "the run did not wait for the load");
+        drop(closed);
+        task.await?
+    }
+
+    /// AC-13.9b-6.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9b_6_mark_during_run_counts_for_the_next() -> anyhow::Result<()> {
+        let old = classifier(&[]);
+        let harness = swap(&old);
+        mark(&harness.log, 1, START - 1);
+        script(&harness, &old, Ok(()));
+        let closed = harness.trainer.gate.lock().await;
+        let task = started(&harness).await;
+        mark(&harness.log, 2, START + 1);
+        drop(closed);
+        task.await??;
+        assert_eq!(harness.training.changes().await?, 1);
         Ok(())
     }
 }

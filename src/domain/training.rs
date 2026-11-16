@@ -879,8 +879,7 @@ pub fn accept(new: Metrics, old: Metrics) -> bool {
 }
 
 /// The state of the training runs.
-#[verus_verify]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct TrainingState {
     /// The run of the active model, or `None` for the fixture model.
     pub current: Option<String>,

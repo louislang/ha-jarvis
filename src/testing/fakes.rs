@@ -321,6 +321,8 @@ impl Classifier for FakeClassifier {
 pub struct FakeModelLoader {
     /// The classifiers of the next loads, in order.
     classifiers: Mutex<VecDeque<Arc<dyn Classifier>>>,
+    /// The lock that each `load` takes first. A test holds it to block `load`.
+    pub gate: tokio::sync::Mutex<()>,
 }
 
 impl FakeModelLoader {
@@ -333,6 +335,7 @@ impl FakeModelLoader {
 #[async_trait]
 impl ModelLoader for FakeModelLoader {
     async fn load(&self, dir: &Path, _device: Device) -> anyhow::Result<Arc<dyn Classifier>> {
+        drop(self.gate.lock().await);
         let classifier = lock(&self.classifiers).pop_front();
         classifier.ok_or_else(|| anyhow::anyhow!("no scripted classifier for {}", dir.display()))
     }
