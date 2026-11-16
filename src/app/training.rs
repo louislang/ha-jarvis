@@ -6,7 +6,13 @@ use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
+use jiff::SignedDuration;
 use jiff::Timestamp;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -339,6 +345,102 @@ impl Training {
     }
 }
 
+/// Starts training runs, one at a time.
+pub struct Trigger {
+    /// The run.
+    training: Arc<Training>,
+    /// The wait after a failed run before the next automatic run.
+    backoff: SignedDuration,
+    /// True while a run is active.
+    active: AtomicBool,
+    /// The end time of the last failed run.
+    failed: Mutex<Option<Timestamp>>,
+}
+
+impl Trigger {
+    /// A trigger of `training` with no active run and no failed run.
+    #[must_use]
+    pub fn new(training: Arc<Training>, backoff: SignedDuration) -> Self {
+        Self {
+            training,
+            backoff,
+            active: AtomicBool::new(false),
+            failed: Mutex::new(None),
+        }
+    }
+
+    /// Starts a run after the failure backoff when the change count reaches `min_changes`.
+    ///
+    /// # Errors
+    ///
+    /// The change count cannot be read.
+    pub async fn check(self: &Arc<Self>) -> anyhow::Result<()> {
+        // A run that ends while the check reads the count cannot let a second run start.
+        if !self.reserve() {
+            return Ok(());
+        }
+        let (failed, min) = (*self.failed(), self.training.config.train.min_changes);
+        let now = self.training.clock.now();
+        let needed = if failed.is_some_and(|end| now.duration_since(end) < self.backoff) {
+            Ok(false)
+        } else {
+            let changes = self.training.changes().await;
+            changes.map(|count| training::should_train(count, min))
+        };
+        if matches!(needed, Ok(true)) {
+            self.start();
+        } else {
+            self.active.store(false, Ordering::SeqCst);
+        }
+        needed.map(drop)
+    }
+
+    /// Starts a run at any change count and without the backoff.
+    pub fn voice(self: &Arc<Self>) {
+        if self.reserve() {
+            self.start();
+        }
+    }
+
+    /// True when `active` changes from false to true, the `run = Idle` guard of `training.qnt`.
+    fn reserve(&self) -> bool {
+        let swapped = self
+            .active
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+        swapped.is_ok()
+    }
+
+    /// Runs `Training::run` in a new task after `reserve`. Keeps the end time of a failed run.
+    fn start(self: &Arc<Self>) {
+        let trigger = Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = trigger.training.run().await {
+                tracing::warn!("the training run failed: {error:#}");
+                *trigger.failed() = Some(trigger.training.clock.now());
+            }
+            trigger.active.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// The end time of the last failed run.
+    fn failed(&self) -> MutexGuard<'_, Option<Timestamp>> {
+        self.failed.lock().expect("no lock holder panics")
+    }
+}
+
+/// Starts a task that calls `check` of `trigger` each `interval`. Logs a failed check.
+pub fn start_trigger(trigger: Arc<Trigger>, interval: Duration) {
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(interval);
+        loop {
+            ticks.tick().await;
+            if let Err(error) = trigger.check().await {
+                tracing::warn!("the training check failed: {error:#}");
+            }
+        }
+    });
+}
+
 /// The accuracy of `classifier` on `held` at `threshold`.
 async fn measure(
     classifier: &dyn Classifier,
@@ -398,9 +500,20 @@ mod tests {
 
     use std::slice;
 
+    use std::ptr;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
     use arc_swap::ArcSwap;
+    use quint_connect::Driver;
+    use quint_connect::State as ModelState;
+    use quint_connect::Step;
+    use quint_connect::quint_run;
+    use quint_connect::switch;
     use serde_json::json;
     use tempfile::TempDir;
+    use tokio::runtime::Runtime;
+    use tokio::sync::OwnedMutexGuard;
     use tokio::task::JoinHandle;
 
     use crate::domain::model::Prediction;
@@ -413,6 +526,7 @@ mod tests {
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeTrainer;
+    use crate::testing::fakes::SetClock;
 
     /// The catalog of `intents.toml`.
     fn catalog() -> Catalog {
@@ -619,36 +733,52 @@ mod tests {
         log: Arc<FakeLog>,
         /// The model folder.
         models: TempDir,
+        /// The clock of the run.
+        clock: Arc<SetClock>,
     }
 
     /// The run of `harness` with the held-out share 0.1, the old classifier `old` and the start
     /// `START`.
     fn swap(old: &Arc<FakeClassifier>) -> Harness {
+        edited(old, |_| ())
+    }
+
+    /// The run of `swap` after `edit`.
+    fn edited(old: &Arc<FakeClassifier>, edit: impl FnOnce(&mut Training)) -> Harness {
         let models = tempfile::tempdir().expect("a temporary folder");
         let (training, trainer) = harness(0.1, &models);
         let (loader, log) = (Arc::<FakeModelLoader>::default(), Arc::<FakeLog>::default());
         let current = ArcSwap::from_pointee(Arc::clone(old) as Arc<dyn Classifier>);
-        let training = Arc::new(Training {
+        let start = Timestamp::from_second(START).expect("a time");
+        let clock = Arc::new(SetClock(Mutex::new(start)));
+        let mut training = Training {
             log: Arc::clone(&log) as _,
             loader: Arc::clone(&loader) as _,
             classifier: Arc::new(CurrentClassifier(current)),
-            clock: Arc::new(FakeClock(Timestamp::from_second(START).expect("a time"))),
+            clock: Arc::clone(&clock) as _,
             ..training
-        });
+        };
+        edit(&mut training);
         Harness {
-            training,
+            training: Arc::new(training),
             trainer,
             loader,
             log,
             models,
+            clock,
         }
     }
 
     /// A classifier that gives `lights_on` with 0.9 and `slots` for each text.
     fn classifier(slots: &[Slot]) -> Arc<FakeClassifier> {
+        predicting("lights_on", slots)
+    }
+
+    /// A classifier that gives `label` with 0.9 and `slots` for each text.
+    fn predicting(label: &str, slots: &[Slot]) -> Arc<FakeClassifier> {
         let classifier = FakeClassifier::default();
         for _ in 0..1000 {
-            let ranked = vec![("lights_on".to_owned(), 0.9)];
+            let ranked = vec![(label.to_owned(), 0.9)];
             let slots = slots.to_vec();
             classifier.script(Prediction { ranked, slots });
         }
@@ -694,8 +824,7 @@ mod tests {
     async fn started(harness: &Harness) -> JoinHandle<anyhow::Result<()>> {
         let training = Arc::clone(&harness.training);
         let task = tokio::spawn(async move { training.run().await });
-        let calls = || harness.trainer.calls.lock().expect("no test panics").len();
-        while calls() == 0 && !task.is_finished() {
+        while calls(harness) == 0 && !task.is_finished() {
             tokio::task::yield_now().await;
         }
         task
@@ -802,5 +931,222 @@ mod tests {
         task.await??;
         assert_eq!(harness.training.changes().await?, 1);
         Ok(())
+    }
+
+    /// The number of `train` calls of `harness`.
+    fn calls(harness: &Harness) -> usize {
+        harness.trainer.calls.lock().expect("no test panics").len()
+    }
+
+    /// Logs `count` good action marks before `START`.
+    fn marks(harness: &Harness, count: u64) {
+        for id in 0..count {
+            mark(&harness.log, id, START - 1);
+        }
+    }
+
+    /// A trigger of the run of `harness` with the backoff `backoff_s` in seconds.
+    fn trigger(harness: &Harness, backoff_s: i64) -> Arc<Trigger> {
+        let backoff = SignedDuration::from_secs(backoff_s);
+        Arc::new(Trigger::new(Arc::clone(&harness.training), backoff))
+    }
+
+    /// Lets each task run until it waits.
+    async fn settle() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    /// Moves the clock of `harness` forward by `seconds`.
+    fn advance(harness: &Harness, seconds: i64) {
+        *harness.clock.0.lock().expect("no test panics") += SignedDuration::from_secs(seconds);
+    }
+
+    /// AC-13.9c-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9c_1_count_below_min_changes_starts_no_run() {
+        let harness = swap(&classifier(&[]));
+        marks(&harness, 19);
+        start_trigger(trigger(&harness, 0), Duration::from_secs(1));
+        settle().await;
+        assert_eq!(calls(&harness), 0, "a run started");
+    }
+
+    /// AC-13.9c-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9c_2_count_at_min_changes_starts_one_run() {
+        let harness = swap(&classifier(&[]));
+        marks(&harness, 20);
+        start_trigger(trigger(&harness, 0), Duration::from_secs(1));
+        settle().await;
+        assert_eq!(calls(&harness), 1);
+    }
+
+    /// AC-13.9c-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9c_3_active_run_blocks_a_second_start() -> anyhow::Result<()> {
+        let harness = swap(&classifier(&[]));
+        marks(&harness, 20);
+        let trigger = trigger(&harness, 0);
+        let closed = harness.trainer.gate.lock().await;
+        trigger.voice();
+        settle().await;
+        trigger.voice();
+        trigger.check().await?;
+        settle().await;
+        assert_eq!(calls(&harness), 1, "a second run started");
+        drop(closed);
+        Ok(())
+    }
+
+    /// AC-13.9c-4. Each run fails, because the trainer has no scripted result.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9c_4_failed_run_waits_for_the_backoff() -> anyhow::Result<()> {
+        let harness = swap(&classifier(&[]));
+        marks(&harness, 20);
+        let trigger = trigger(&harness, 60);
+        trigger.voice();
+        settle().await;
+        advance(&harness, 59);
+        trigger.check().await?;
+        settle().await;
+        assert_eq!(calls(&harness), 1, "a run started before the backoff");
+        advance(&harness, 1);
+        trigger.check().await?;
+        settle().await;
+        assert_eq!(calls(&harness), 2, "no run after the backoff");
+        trigger.voice();
+        settle().await;
+        assert_eq!(calls(&harness), 3, "the voice trigger waited");
+        Ok(())
+    }
+
+    /// The model state of `training.qnt` that the conformance test compares.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TrainingModel {
+        /// `Idle`, or `Local` while a run is active.
+        #[serde(rename = "runState")]
+        run_state: Tag,
+        /// The change count.
+        changes: usize,
+        /// The accuracy level of the active classifier.
+        #[serde(rename = "modelAcc")]
+        model_acc: usize,
+    }
+
+    /// The variant of a Quint sum type value.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Tag {
+        /// The variant name.
+        tag: String,
+    }
+
+    impl ModelState<TrainingDriver> for TrainingModel {
+        /// The `active` flag, the change count and the level of the classifier of the wrapper,
+        /// after each task runs until it waits.
+        fn from_driver(driver: &TrainingDriver) -> anyhow::Result<Self> {
+            driver.runtime.block_on(settle());
+            let training = &driver.harness.training;
+            let active = driver.trigger.active.load(Ordering::SeqCst);
+            let current = training.classifier.0.load_full();
+            let same = |level: &Arc<FakeClassifier>| {
+                ptr::addr_eq(Arc::as_ptr(level), Arc::as_ptr(current.as_ref()))
+            };
+            let level = driver.levels.iter().position(same);
+            let tag = if active { "Local" } else { "Idle" }.to_owned();
+            Ok(Self {
+                run_state: Tag { tag },
+                changes: driver.runtime.block_on(training.changes())?,
+                model_acc: level.ok_or_else(|| anyhow::anyhow!("an unknown classifier"))?,
+            })
+        }
+    }
+
+    /// Replays `training.qnt` from `initLocal` against the trigger with the backoff 0 and
+    /// `min_changes` 2. Each step takes one second. Each `train` waits until a done or fail step.
+    struct TrainingDriver {
+        /// The paused runtime that runs the runs.
+        runtime: Runtime,
+        /// The run and its fakes.
+        harness: Harness,
+        /// The trigger of the run.
+        trigger: Arc<Trigger>,
+        /// The classifiers of the accuracy levels 0, 1 and 2.
+        levels: [Arc<FakeClassifier>; 3],
+        /// The trainer gate, which the driver holds between steps.
+        gate: Option<OwnedMutexGuard<()>>,
+    }
+
+    impl TrainingDriver {
+        /// A driver at `initLocal`: no run, no changes and the classifier of level 0.
+        fn new() -> Self {
+            let mut runtime = tokio::runtime::Builder::new_current_thread();
+            let runtime = runtime.enable_time().start_paused(true).build();
+            let levels = [
+                predicting("unknown", &wrong_slot()),
+                classifier(&wrong_slot()),
+                classifier(&[]),
+            ];
+            let harness = edited(&levels[0], |training| {
+                let mut catalog = catalog();
+                catalog.intents.retain(|intent| intent.name == "lights_on");
+                catalog.unknown_examples.clear();
+                training.catalog = Arc::new(catalog);
+                // Each example is held out, so each level gives strictly higher measures.
+                training.config.train.holdout = 1.0;
+                training.config.train.min_changes = 2;
+            });
+            Self {
+                runtime: runtime.expect("the runtime builds"),
+                trigger: trigger(&harness, 0),
+                gate: Arc::clone(&harness.trainer.gate).try_lock_owned().ok(),
+                harness,
+                levels,
+            }
+        }
+
+        /// Ends the active run with the trainer result `result`.
+        fn end(&mut self, result: Result<(), &'static str>) {
+            let results = &self.harness.trainer.results;
+            results.lock().expect("no test panics").push_back(result);
+            self.gate = None;
+            self.runtime.block_on(settle());
+            self.gate = Arc::clone(&self.harness.trainer.gate).try_lock_owned().ok();
+        }
+    }
+
+    impl Driver for TrainingDriver {
+        type State = TrainingModel;
+
+        fn step(&mut self, step: &Step) -> anyhow::Result<()> {
+            advance(&self.harness, 1);
+            switch!(step {
+                initLocal => *self = Self::new(),
+                change => {
+                    let now = self.harness.training.clock.now().as_second();
+                    mark(&self.harness.log, now.unsigned_abs(), now);
+                },
+                autoStart => self.runtime.block_on(self.trigger.check())?,
+                voiceStart => {
+                    let _context = self.runtime.enter();
+                    self.trigger.voice();
+                },
+                localDone(a: usize) => {
+                    self.harness.loader.script(Arc::clone(&self.levels[a]) as _);
+                    self.end(Ok(()));
+                },
+                localFail => self.end(Err("CUDA out of memory")),
+            })
+        }
+    }
+
+    /// AC-13.9c-5. `quint_run` replays 100 traces by default.
+    #[quint_run(
+        spec = "quint/training.qnt",
+        init = "initLocal",
+        max_steps = 30,
+        seed = "1"
+    )]
+    fn ac_13_9c_5_conformance() -> impl Driver {
+        TrainingDriver::new()
     }
 }
