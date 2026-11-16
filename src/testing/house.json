@@ -890,6 +890,58 @@
         "user_id": null,
         "parent_id": null
       }
+    },
+    {
+      "entity_id": "switch.carson_bedroom_mute_microphones",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Carson Bedroom Mute Microphones"
+      },
+      "last_updated": "2026-10-25T13:01:00.000000Z",
+      "context": {
+        "id": "22F874C3060FFC42547758744C",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "switch.carson_kitchen_mute_microphones",
+      "state": "off",
+      "attributes": {
+        "friendly_name": "Carson Kitchen Mute Microphones"
+      },
+      "last_updated": "2026-10-25T13:02:00.000000Z",
+      "context": {
+        "id": "04E806784145B25544E5779F1A",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "switch.carson_living_room_mute_microphones",
+      "state": "on",
+      "attributes": {
+        "friendly_name": "Carson Living Room Mute Microphones"
+      },
+      "last_updated": "2026-10-25T13:03:00.000000Z",
+      "context": {
+        "id": "CFF0D44FD8FAF8B37F579A4C84",
+        "user_id": null,
+        "parent_id": null
+      }
+    },
+    {
+      "entity_id": "switch.carson_office_mute_microphones",
+      "state": "unavailable",
+      "attributes": {
+        "friendly_name": "Carson Office Mute Microphones"
+      },
+      "last_updated": "2026-10-25T13:04:00.000000Z",
+      "context": {
+        "id": "38CDABF850A165634717F06124",
+        "user_id": null,
+        "parent_id": null
+      }
     }
   ],
   "areas": [
@@ -1602,6 +1654,46 @@
       ],
       "area_id": null,
       "device_id": null,
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "switch.carson_bedroom_mute_microphones",
+      "name": "Carson Bedroom Mute Microphones",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "6a3812757f5f0043a18115e60036f9ab",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "switch.carson_kitchen_mute_microphones",
+      "name": "Carson Kitchen Mute Microphones",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "98f4aacf9c4152ffe32dff212df91521",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "switch.carson_living_room_mute_microphones",
+      "name": "Carson Living Room Mute Microphones",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "b80f5f77cdcc0c658356532eff4e844c",
+      "entity_category": null,
+      "hidden_by": null,
+      "disabled_by": null
+    },
+    {
+      "entity_id": "switch.carson_office_mute_microphones",
+      "name": "Carson Office Mute Microphones",
+      "aliases": [],
+      "area_id": null,
+      "device_id": "1c8aff5b3943869c175c09b3c12f63d4",
       "entity_category": null,
       "hidden_by": null,
       "disabled_by": null
