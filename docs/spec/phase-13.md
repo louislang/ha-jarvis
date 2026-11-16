@@ -413,7 +413,7 @@ AC-13.9-5 to AC-13.9-8, AC-13.9-10 and AC-13.9-11 move to sub-phase 13.9b as AC-
 **Goal:** Start the training trigger in `run`, and load the model of the last accepted run. Jarvis trains in production and keeps the trained model after a restart.
 
 - **Implements:** G3, G16. **Depends on:** 13.9c.
-- **Files:** modify `src/app/training.rs`, `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`.
+- **Files:** modify `src/app/training.rs`, `src/app/conversation.rs`, `src/lib.rs`, `src/testing/e2e.rs`, `jarvis.toml`.
 
 **Model.**
 
@@ -468,7 +468,7 @@ The mute switch parts of AC-13.10-6 and AC-13.10-9 move to sub-phase 13.10c as A
 **Goal:** Find the mute switch of each satellite in the hot cache. The training pause can then mute exactly the satellites that are not muted.
 
 - **Implements:** G16. **Depends on:** 13.10.
-- **Files:** modify `src/domain/state_cache.rs`, `src/testing/house.json`.
+- **Files:** modify `src/domain/state_cache.rs`, `src/domain/select.rs`, `src/testing/house.json`.
 
 **Model.**
 
