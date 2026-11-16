@@ -19,6 +19,7 @@ use std::process;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -946,30 +947,47 @@ pub type Load =
 
 /// A use of the sessions of [`LiveModels`]. Each use takes a read guard with `try_read`, so it
 /// fails at once while `release` waits or after it.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Live {
     /// The sessions, `None` after `release`.
     sessions: Arc<RwLock<Option<Sessions>>>,
-    /// The System One model of one run. `None` gives no prediction.
-    classifier: Option<Arc<dyn Classifier>>,
+    /// Each System One model that a handle still holds.
+    models: Arc<Mutex<Vec<Weak<Model>>>>,
+    /// The System One model of this handle. `None` gives no prediction.
+    model: Option<Arc<Model>>,
 }
+
+/// The System One model of one run. `release` empties it, also while a request holds it.
+type Model = Mutex<Option<Arc<dyn Classifier>>>;
 
 impl Live {
     /// The same sessions with `classifier`.
     fn with(&self, classifier: Arc<dyn Classifier>) -> Self {
-        let sessions = Arc::clone(&self.sessions);
-        let classifier = Some(classifier);
+        let model = Arc::new(Mutex::new(Some(classifier)));
+        if let Ok(mut models) = self.models.lock() {
+            models.retain(|model| model.strong_count() > 0);
+            models.push(Arc::downgrade(&model));
+        }
         Self {
-            sessions,
-            classifier,
+            model: Some(model),
+            ..self.clone()
         }
     }
 
-    /// A read guard of the loaded sessions.
-    ///
-    /// # Errors
-    ///
-    /// `release` waits or ran.
+    /// Empties each System One model that a handle still holds.
+    fn empty(&self) {
+        let Ok(models) = self.models.lock() else {
+            return;
+        };
+        let held = models.iter().filter_map(Weak::upgrade);
+        for model in held {
+            if let Ok(mut model) = model.lock() {
+                *model = None;
+            }
+        }
+    }
+
+    /// A read guard of the loaded sessions, or an error while `release` waits or after it.
     fn read(&self) -> anyhow::Result<OwnedRwLockReadGuard<Option<Sessions>, Sessions>> {
         let guard = Arc::clone(&self.sessions).try_read_owned().ok();
         let loaded =
@@ -1003,17 +1021,28 @@ impl SpeechToText for Live {
 #[async_trait]
 impl TextToSpeech for Live {
     async fn synth(&self, text: &str) -> anyhow::Result<Audio> {
-        let sessions = self.read()?;
-        sessions.tts.synth(text).await
+        let (sessions, text) = (self.read()?, text.to_owned());
+        // A task keeps the guard until the synthesis ends, also when the caller stops waiting.
+        tokio::spawn(async move { sessions.tts.synth(&text).await }).await?
     }
 }
 
 #[async_trait]
 impl Classifier for Live {
     async fn predict(&self, context: &str, text: &str) -> anyhow::Result<Prediction> {
-        let _guard = self.read()?;
-        let classifier = self.classifier.as_ref().context("no System One model")?;
-        classifier.predict(context, text).await
+        let guard = self.read()?;
+        let model = self
+            .model
+            .as_ref()
+            .and_then(|model| model.lock().ok()?.clone());
+        let model = model.context("no System One model")?;
+        let (context, text) = (context.to_owned(), text.to_owned());
+        // A task keeps the guard until the prediction ends, also when the caller stops waiting.
+        tokio::spawn(async move {
+            let _guard = guard;
+            model.predict(&context, &text).await
+        })
+        .await?
     }
 }
 
@@ -1057,11 +1086,8 @@ impl LiveModels {
     /// A model cannot load.
     pub async fn try_new(load: Load) -> anyhow::Result<Self> {
         let (sessions, model) = load().await?;
-        let sessions = Arc::new(RwLock::new(Some(sessions)));
-        let live = Live {
-            sessions,
-            classifier: None,
-        };
+        let live = Live::default();
+        *live.sessions.write().await = Some(sessions);
         let classifier = Arc::new(live.with(model.classifier));
         let current = ArcSwap::from_pointee(RunClassifier {
             run: model.run,
@@ -1093,12 +1119,7 @@ impl Models for LiveModels {
     async fn release(&self) {
         let mut sessions = self.live.sessions.write().await;
         *sessions = None;
-        let run = self.classifier.0.load().run.clone();
-        // A swapped model is outside the lock, so it drops here.
-        let classifier = self.live();
-        self.classifier
-            .0
-            .store(Arc::new(RunClassifier { run, classifier }));
+        self.live.empty();
     }
 
     async fn restore(&self) -> anyhow::Result<()> {
@@ -2125,7 +2146,6 @@ mod tests {
     use std::ffi::OsStr;
     use std::future;
     use std::sync::Arc;
-    use std::sync::Weak;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicU16;
     use std::sync::atomic::Ordering;
@@ -3192,7 +3212,8 @@ mod tests {
         let (loaded, fails): (Loaded, Arc<AtomicBool>) = Default::default();
         let models = LiveModels::try_new(fake_load(&loaded, &fails)).await?;
         let app = app_with(Arc::clone(models.classifier()) as _, models.live())?;
-        let _: Handled = request(&app).await?;
+        // A request keeps its snapshot of the classifier until it ends.
+        let _held = models.classifier().0.load_full();
         models.release().await;
         assert_eq!(alive(&loaded), 0, "references to the fakes after release");
         assert!(app.listen().is_err(), "listen works after release");
