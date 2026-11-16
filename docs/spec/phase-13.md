@@ -310,17 +310,43 @@ AC-13.1-5 moves to sub-phase 13.1b as AC-13.1b-1.
 
 ### 13.9 Training Run
 
-**Goal:** Add the training run of `training.qnt`: build and split the set, train, evaluate both models on the held-out set, and swap or reject. A run never makes the model worse.
+**Goal:** Add the first half of the training run of `training.qnt`: build and split the set, and train on the examples that are not held out. A run never trains on the examples that measure it.
 
-- **Implements:** G3, G16, G19. **Depends on:** 13.8c.
-- **Files:** modify `src/app/training.rs`, `src/domain/training.rs`, `src/testing/fakes.rs`.
+- **Implements:** G3, G16. **Depends on:** 13.8c.
+- **Files:** modify `src/app/training.rs`, `src/testing/fakes.rs`.
 
-**Model.** `Training::run` does one run:
+**Model.** `Training::run` does steps 0 to 3 of one run. Sub-phase 13.9b adds steps 4 to 7.
 
 0. Keep `started := now`.
 1. `refresh` the generated examples.
-2. Build the training set with `training_set` from the catalog, the generated examples, the marked interactions with the first interaction of each marked dialog answer (`get`), the area names of the hot cache and an RNG with the seed `started` in seconds. Upload only the examples that are not held out. When the held-out set is empty, stop with an error before training.
+2. Build the training set with `training_set` from the catalog, the generated examples, the marked interactions with the first interaction of each marked dialog answer (`get`), the area names of the hot cache and an RNG with the seed `started` in seconds. The generated examples are the seeds of a copy of the catalog whose intents have the generated examples (`seed_set`). Upload only the examples that are not held out. When the held-out set is empty, stop with an error before training.
 3. `train` of the local `Trainer` with the run ID `started` in the format `%Y%m%d-%H%M%S`. Sub-phase 13.10 mutes the satellites and pauses Jarvis for this call.
+
+- `FakeTrainer` records each call, waits while a test holds its gate, and gives the scripted results in order. A success creates `<dir>/<run_id>/`.
+
+**Acceptance criteria.**
+
+- AC-13.9-4: When the uploaded set is checked, it contains no held-out example.
+- AC-13.9-13: When the held-out set is empty, the run stops with an error and `FakeTrainer` records no call.
+
+AC-13.9-5 to AC-13.9-8, AC-13.9-10 and AC-13.9-11 move to sub-phase 13.9b as AC-13.9b-1 to AC-13.9b-6. AC-13.9-1 to AC-13.9-3, AC-13.9-12 and AC-13.9-9 move to sub-phase 13.9c as AC-13.9c-1 to AC-13.9c-5. AC-13.9-14 moves to sub-phase 13.9d as AC-13.9d-1.
+
+**Proofs.**
+
+- P-13.9-4. Argument: the upload filters `not held_out(text)` (P-3.3-8), and evaluation uses the complement.
+- P-13.9-13. Evidence: test.
+
+---
+
+### 13.9b Training Swap
+
+**Goal:** Add the second half of the training run: evaluate both models on the held-out set, and swap or reject. The model never gets worse.
+
+- **Implements:** G3, G16, G19. **Depends on:** 13.9.
+- **Files:** modify `src/app/training.rs`, `src/domain/training.rs`, `src/testing/fakes.rs`.
+
+**Model.** `Training::run` gets steps 4 to 7:
+
 4. `ModelLoader::load` the new folder.
 5. Predict the held-out set with the old and the new classifier.
 6. Log both measures and the decision. If `accept`, set `current :=` the new run. Else delete the new folder.
@@ -329,69 +355,64 @@ AC-13.1-5 moves to sub-phase 13.1b as AC-13.1b-1.
 - On a final error, the old model stays and the training state does not change.
 - `Training::changes` gives the change count: `changes` (sub-phase 13.3) of the saved training state and the marked interactions.
 - The `Store` of `train.state` holds `TrainingState` as JSON. Without the file, the state has no `current`, and `last_time` is the Unix epoch.
-- `FakeTrainer` records each call and waits for the next scripted result. A success creates `<dir>/<run_id>/`. `FakeModelLoader` gets a gate that blocks `load`.
+- `FakeModelLoader` gets a gate that blocks `load`.
 
 **Acceptance criteria.**
 
-- AC-13.9-4: When the uploaded set is checked, it contains no held-out example.
-- AC-13.9-5: When both new measures are equal or higher, the next `predict` of the `Classifier` wrapper of sub-phase 5.4 uses the new classifier, and the training state names the new run. Thus the next `handle` uses the new classifier (AC-5.4-4).
-- AC-13.9-6: When one new measure is lower, the old classifier stays and the new folder does not exist.
-- AC-13.9-7: When a run ends, accepted or rejected, and no change occurred during the run, the change count is 0.
-- AC-13.9-8: When the trainer returns an error, the old classifier stays and the change count does not change.
-- AC-13.9-10: When `ModelLoader::load` is blocked during a run, `predict` of the `Classifier` wrapper returns before virtual time advances. `handle` reads the classifier only through it.
-- AC-13.9-11: When a mark arrives during a run, the change count after the run is 1.
-- AC-13.9-13: When the held-out set is empty, the run stops with an error and `FakeTrainer` records no call.
-
-AC-13.9-1 to AC-13.9-3, AC-13.9-12 and AC-13.9-9 move to sub-phase 13.9b as AC-13.9b-1 to AC-13.9b-5. AC-13.9-14 moves to sub-phase 13.9c as AC-13.9c-1.
+- AC-13.9b-1: When both new measures are equal or higher, the next `predict` of the `Classifier` wrapper of sub-phase 5.4 uses the new classifier, and the training state names the new run. Thus the next `handle` uses the new classifier (AC-5.4-4).
+- AC-13.9b-2: When one new measure is lower, the old classifier stays and the new folder does not exist.
+- AC-13.9b-3: When a run ends, accepted or rejected, and no change occurred during the run, the change count is 0.
+- AC-13.9b-4: When the trainer returns an error, the old classifier stays and the change count does not change.
+- AC-13.9b-5: When `ModelLoader::load` is blocked during a run, `predict` of the `Classifier` wrapper returns before virtual time advances. `handle` reads the classifier only through it.
+- AC-13.9b-6: When a mark arrives during a run, the change count after the run is 1.
 
 **Proofs.**
 
-- P-13.9-4. Argument: the upload filters `not held_out(text)` (P-3.3-8), and evaluation uses the complement.
-- P-13.9-5, P-13.9-6. Requires: `SwapNeverWorse`. Argument: step 6 swaps only when `accept(new, old)`, which is `new >= old`.
-- P-13.9-7, P-13.9-8. Requires: `CountResetsAfterRun`, `FailureKeepsModel`. Argument: step 7 runs after both branches of step 6. The error path returns before step 6.
-- P-13.9-10. Argument: `handle` reads the classifier through the `Classifier` wrapper of sub-phase 5.4, which calls `ArcSwap::load` once. `load` never waits for a writer.
-- P-13.9-11, P-13.9-13. Evidence: test.
+- P-13.9b-1, P-13.9b-2. Requires: `SwapNeverWorse`. Argument: step 6 swaps only when `accept(new, old)`, which is `new >= old`.
+- P-13.9b-3, P-13.9b-4. Requires: `CountResetsAfterRun`, `FailureKeepsModel`. Argument: step 7 runs after both branches of step 6. The error path returns before step 6.
+- P-13.9b-5. Argument: `handle` reads the classifier through the `Classifier` wrapper of sub-phase 5.4, which calls `ArcSwap::load` once. `load` never waits for a writer.
+- P-13.9b-6. Evidence: test.
 
 ---
 
-### 13.9b Training Trigger
+### 13.9c Training Trigger
 
 **Goal:** Start a training run when the change count reaches `min_changes`, one run at a time, and wait after a failed run. The model improves without manual steps.
 
-- **Implements:** G16, G19. **Depends on:** 13.9.
+- **Implements:** G16, G19. **Depends on:** 13.9b.
 - **Files:** modify `src/app/training.rs`, `quint/training.qnt`.
 - **Quint:** `training.qnt` (conformance).
 
 **Model.**
 
-- `Trigger` has the training run of sub-phase 13.9, an `active` flag, the backoff and the end time of the last failed run.
+- `Trigger` has the training run of sub-phases 13.9 and 13.9b, an `active` flag, the backoff and the end time of the last failed run.
 - `check`: if no run is active, no failed run ended less than the backoff ago, and `should_train(changes, min_changes)`, start a run.
 - `voice`: start a run at any change count and without the backoff. Sub-phase 13.11 calls it.
 - A start changes `active` from false to true with an atomic compare-and-swap and runs `Training::run` in a new task. The end of the run sets `active` to false. A failed run logs one `warn` event with the error and keeps its end time.
-- `start_trigger(trigger, interval)` calls `check` each interval. Sub-phase 13.9c gives the interval and the backoff from `jarvis.toml`.
-- `training.qnt` gets `initWith(runpod)`. `init` is `initWith` of a nondeterministic value, and `initLocal` is `initWith(false)`. The conformance test replays the traces from `initLocal`. The model has no backoff, so the driver uses a backoff of 0. AC-13.9b-4 tests the backoff.
+- `start_trigger(trigger, interval)` calls `check` each interval. Sub-phase 13.9d gives the interval and the backoff from `jarvis.toml`.
+- `training.qnt` gets `initWith(runpod)`. `init` is `initWith` of a nondeterministic value, and `initLocal` is `initWith(false)`. The conformance test replays the traces from `initLocal`. The model has no backoff, so the driver uses a backoff of 0. AC-13.9c-4 tests the backoff.
 
 **Acceptance criteria.**
 
-- AC-13.9b-1: When the change count is less than `min_changes`, `FakeTrainer` records no call.
-- AC-13.9b-2: When the change count reaches `min_changes`, `FakeTrainer` records one call.
-- AC-13.9b-3: When a run is active, a second trigger starts no run.
-- AC-13.9b-4: When a run fails, the next automatic run does not start before the backoff. A voice trigger starts a run at once.
-- AC-13.9b-5: When `quint-connect` replays 100 traces of `training.qnt` from `initLocal`, the run state, the change count and the accuracy of the active model match the model after each step.
+- AC-13.9c-1: When the change count is less than `min_changes`, `FakeTrainer` records no call.
+- AC-13.9c-2: When the change count reaches `min_changes`, `FakeTrainer` records one call.
+- AC-13.9c-3: When a run is active, a second trigger starts no run.
+- AC-13.9c-4: When a run fails, the next automatic run does not start before the backoff. A voice trigger starts a run at once.
+- AC-13.9c-5: When `quint-connect` replays 100 traces of `training.qnt` from `initLocal`, the run state, the change count and the accuracy of the active model match the model after each step.
 
 **Proofs.**
 
-- P-13.9b-1, P-13.9b-2. Argument: the start condition is `should_train` (P-13.3-2).
-- P-13.9b-3. Requires: `OneRun` (P-13.4-2). Argument: the start is guarded by an atomic compare-and-swap on the `active` flag from false to true.
-- P-13.9b-4, P-13.9b-5. Evidence: test.
+- P-13.9c-1, P-13.9c-2. Argument: the start condition is `should_train` (P-13.3-2).
+- P-13.9c-3. Requires: `OneRun` (P-13.4-2). Argument: the start is guarded by an atomic compare-and-swap on the `active` flag from false to true.
+- P-13.9c-4, P-13.9c-5. Evidence: test.
 
 ---
 
-### 13.9c Training Start
+### 13.9d Training Start
 
 **Goal:** Start the training trigger in `run`, and load the model of the last accepted run. Jarvis trains in production and keeps the trained model after a restart.
 
-- **Implements:** G3, G16. **Depends on:** 13.9b.
+- **Implements:** G3, G16. **Depends on:** 13.9c.
 - **Files:** modify `src/app/training.rs`, `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.**
@@ -402,12 +423,12 @@ AC-13.9-1 to AC-13.9-3, AC-13.9-12 and AC-13.9-9 move to sub-phase 13.9b as AC-1
 
 **Acceptance criteria.**
 
-- AC-13.9c-1: When a training state names `current`, `run` loads that folder.
-- AC-13.9c-2: When a run swaps the classifier, the next logged interaction names the new run.
+- AC-13.9d-1: When a training state names `current`, `run` loads that folder.
+- AC-13.9d-2: When a run swaps the classifier, the next logged interaction names the new run.
 
 **Proofs.**
 
-- P-13.9c-1, P-13.9c-2. Evidence: test.
+- P-13.9d-1, P-13.9d-2. Evidence: test.
 
 ---
 
@@ -415,7 +436,7 @@ AC-13.9-1 to AC-13.9-3, AC-13.9-12 and AC-13.9-9 move to sub-phase 13.9b as AC-1
 
 **Goal:** Mute the satellites and pause Jarvis for a local training run, and send the same training set to RunPod when the local run fails. A local run gets the full GPU of the GPU host, and a run that does not fit in it still completes.
 
-- **Implements:** G16, G18, G19. **Depends on:** 13.9c.
+- **Implements:** G16, G18, G19. **Depends on:** 13.9d.
 - **Files:** modify `src/ports.rs`, `src/domain/state_cache.rs`, `src/app/training.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `src/testing/house.json`.
 - **Quint:** `training.qnt` (conformance with `RUNPOD = true`).
 
@@ -468,7 +489,7 @@ AC-13.9-1 to AC-13.9-3, AC-13.9-12 and AC-13.9-9 move to sub-phase 13.9b as AC-1
 **Model.**
 
 - The training use case gets the sender of the status channel (sub-phase 12.9b). In step 3 of sub-phase 13.10, it sets `Training` before the mute calls of step 1, and `Online` after the unmute calls of step 5, also after an error. Both changes set only `state`, so a rollback message stays (sub-phase 12.9f). A RunPod run does not change the status, because Jarvis answers during it.
-- `Activity` gets `Training`. The shared activity of sub-phase 12.9f replaces the `active` flag of the training trigger (P-13.9b-3). A run starts only when it changes the activity from `Idle` to `Training`, and the end of the run sets `Idle`. Sub-phase 13.11 uses the same change for the voice trigger. Thus a run cannot start while a save restarts Jarvis, and `save` returns `Busy` during a run.
+- `Activity` gets `Training`. The shared activity of sub-phase 12.9f replaces the `active` flag of the training trigger (P-13.9c-3). A run starts only when it changes the activity from `Idle` to `Training`, and the end of the run sets `Idle`. Sub-phase 13.11 uses the same change for the voice trigger. Thus a run cannot start while a save restarts Jarvis, and `save` returns `Busy` during a run.
 
 **Acceptance criteria.**
 
@@ -491,7 +512,7 @@ AC-13.9-1 to AC-13.9-3, AC-13.9-12 and AC-13.9-9 move to sub-phase 13.9b as AC-1
 - **Implements:** G16. **Depends on:** 13.10b.
 - **Files:** modify `src/domain/decide.rs`, `src/app/conversation.rs`, `intents.toml`, `responses.toml`.
 
-**Model.** `kind = "train"`: if no run is active, start one (the `voiceStart` action, `voice` of sub-phase 13.9b) and reply from `start_training`. Else reply from `training_busy`.
+**Model.** `kind = "train"`: if no run is active, start one (the `voiceStart` action, `voice` of sub-phase 13.9c) and reply from `start_training`. Else reply from `training_busy`.
 
 **Acceptance criteria.**
 
@@ -501,8 +522,8 @@ AC-13.9-1 to AC-13.9-3, AC-13.9-12 and AC-13.9-9 move to sub-phase 13.9b as AC-1
 
 **Proofs.**
 
-- P-13.11-1, P-13.11-2. Requires: `OneRun`. Argument: the handler uses the same compare-and-swap as P-13.9b-3. Success replies from `start_training`, failure from `training_busy`.
-- P-13.11-3. Argument: the voice run uses the same run function, so P-13.9-6 applies.
+- P-13.11-1, P-13.11-2. Requires: `OneRun`. Argument: the handler uses the same compare-and-swap as P-13.9c-3. Success replies from `start_training`, failure from `training_busy`.
+- P-13.11-3. Argument: the voice run uses the same run function, so P-13.9b-2 applies.
 
 ## Field Log
 
