@@ -108,6 +108,7 @@ flowchart LR
     crate_adapters_process --> crate_adapters_process
     crate_adapters_process --> crate_domain_training
     crate_adapters_process --> crate_ports
+    crate_adapters_runpod --> crate
     crate_adapters_runpod --> crate_adapters_runpod
     crate_adapters_runpod --> crate_domain_training
     crate_adapters_runpod --> crate_ports
