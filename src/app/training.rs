@@ -228,6 +228,8 @@ pub struct Training {
     pub home: Arc<dyn Home>,
     /// The model sessions of Jarvis, which a local run frees.
     pub models: Arc<dyn Models>,
+    /// Gets the error text of a failed `restore`, which stops Jarvis.
+    pub stop: watch::Sender<Option<String>>,
 }
 
 impl Training {
@@ -294,6 +296,9 @@ impl Training {
         let local = self.trainer.train(run_id, set).await;
         let restored = self.models.restore().await;
         self.switch("turn_off", muted).await;
+        if let Err(error) = &restored {
+            self.stop.send_replace(Some(format!("{error:#}")));
+        }
         restored.map(|()| local)
     }
 
@@ -751,6 +756,7 @@ mod tests {
             config,
             home: Arc::new(FakeHome::default()),
             models: Arc::new(FakeModels::default()),
+            stop: watch::Sender::new(None),
         };
         (training, trainer)
     }
@@ -1303,18 +1309,30 @@ mod tests {
         Ok(())
     }
 
-    /// A failed `restore` ends the run with its error after the unmute calls, with no `RunPod` call.
+    /// AC-13.10g-1. Holds the `turn_off` call to check that the text comes after it.
     #[tokio::test(start_paused = true)]
-    async fn failed_restore_unmutes_and_ends_the_run() {
+    async fn ac_13_10g_1_failed_restore_sends_its_error_after_the_unmute() -> anyhow::Result<()> {
         let old = classifier(&[]);
         let harness = swap(&old);
         script(&harness, &old, Err("CUDA out of memory"));
         harness.sessions.fail_restore();
-        let error = harness.training.run().await.expect_err("the run ends");
+        let stopped = harness.training.stop.subscribe();
+        harness.home.delay().send(()).expect("the call waits");
+        let unmute = harness.home.delay();
+        let task = started(&harness).await;
+        settle().await;
+        assert_eq!(harness.home.calls(), ["turn_on", "turn_off"].map(kitchen));
+        assert_eq!(
+            *stopped.borrow(),
+            None,
+            "the text must come after the unmute"
+        );
+        unmute.send(()).expect("the call waits");
+        let error = task.await?.expect_err("the run ends");
         assert_eq!(format!("{error:#}"), "no model");
-        let turn_off = kitchen("turn_off");
-        assert!(harness.home.calls().contains(&turn_off), "no turn_off call");
+        assert_eq!(stopped.borrow().as_deref(), Some("no model"));
         assert_eq!(recorded(&harness.runpod), [], "RunPod has a call");
+        Ok(())
     }
 
     /// The model state of `training.qnt` that the conformance test compares.
