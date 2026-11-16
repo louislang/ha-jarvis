@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import NotRequired, TypedDict
 
+import runpod
 import torch
 from torch import nn
 from torch.nn import functional
@@ -26,6 +27,9 @@ IGNORE = -100
 
 INPUTS = ["input_ids", "attention_mask", "token_type_ids"]
 """The input names of the model, in `forward` order."""
+
+VOLUME = Path("/runpod-volume")
+"""The mount folder of the RunPod network volume."""
 
 
 @dataclass(frozen=True)
@@ -317,8 +321,20 @@ def export(
     (out / "labels.json").write_text(json.dumps(labels), encoding="utf-8")
 
 
+def handle(
+    job: dict[str, dict[str, str]], volume: Path = VOLUME, device: str = "cuda"
+) -> None:
+    """Train on `jarvis/runs/<run_id>/train.json` of `volume` into its `model/`."""
+    run = volume / "jarvis" / "runs" / job["input"]["run_id"]
+    data, out = str(run / "train.json"), str(run / "model")
+    main(["--data", data, "--out", out, "--device", device])
+
+
 def main(argv: Sequence[str]) -> None:
-    """Train on the training set file of `argv` and write the model folder."""
+    """Serve RunPod jobs for `--serve`, else train on the set file of `argv`."""
+    if list(argv) == ["--serve"]:
+        runpod.serverless.start({"handler": handle})
+        return
     args = parse_args(argv)
     training_set = load_set(args.data)
     if args.epochs is not None:

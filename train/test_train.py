@@ -29,6 +29,7 @@ from train import (
     align,
     encode,
     export,
+    handle,
     load_set,
     load_tokenizer,
     loss,
@@ -379,6 +380,16 @@ def test_epochs_option_replaces_set_epochs(
         ]
     )
     assert len(batches) == BATCHES
+
+
+def test_ac_13_8_1_handler_writes_model_files(set_path: Path, tmp_path: Path) -> None:
+    """A job reads `train.json` of its run on the volume and writes the model files."""
+    run = tmp_path / "jarvis" / "runs" / "r1"
+    run.mkdir(parents=True)
+    (run / "train.json").write_bytes(set_path.read_bytes())
+    handle({"input": {"run_id": "r1"}}, tmp_path, "cpu")
+    names = sorted(path.name for path in (run / "model").iterdir())
+    assert names == ["labels.json", "model.onnx", "tokenizer.json"]
 
 
 def record_texts(monkeypatch: pytest.MonkeyPatch) -> list[str]:
