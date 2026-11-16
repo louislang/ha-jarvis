@@ -251,7 +251,7 @@ AC-13.1-5 moves to sub-phase 13.1b as AC-13.1b-1.
 **Goal:** Add `RunPodTrainer`, which sends a training set to the RunPod handler through the network volume and the RunPod REST API. The training run gets a second `Trainer` for the fallback.
 
 - **Implements:** G16. **Depends on:** 13.8.
-- **Files:** create `src/adapters/runpod.rs`. Modify `src/lib.rs`, `src/testing/fakes.rs`, `jarvis.toml`, `Cargo.toml`.
+- **Files:** create `src/adapters/runpod.rs`. Modify `src/lib.rs`, `Cargo.toml`.
 
 **Model.**
 
@@ -261,10 +261,10 @@ AC-13.1-5 moves to sub-phase 13.1b as AC-13.1b-1.
   3. Poll `GET /v2/<endpoint_id>/status/<job_id>` each `poll_s`.
   4. On `COMPLETED`, download `jarvis/runs/<run_id>/model/` to `<model.dir>/<run_id>/`.
   5. After `timeout_min`, send `POST /v2/<endpoint_id>/cancel/<job_id>` and return a timeout error.
-  6. At the end, success or error, delete `jarvis/runs/<run_id>/` from the volume.
-- The adapter gets an `object_store` instance. Tests use `InMemory`. Production uses `AmazonS3` with the RunPod endpoint and region, and the bucket `volume_id`.
+  6. At the end, success or error, delete `jarvis/runs/<run_id>/` from the volume. A failed delete logs one `warn` event and does not change the result, because a left object costs only volume space.
+- The adapter gets an `object_store` instance. Tests use `InMemory`. Sub-phase 13.8c adds the production instance.
+- The download writes into a temporary folder in `<model.dir>` and renames it to `<model.dir>/<run_id>/`. Thus after an error, `<model.dir>/<run_id>/` does not exist (the `Trainer` contract).
 - The poll loop checks the deadline between requests and sleeps only between them. Thus no timer runs while a request waits for the socket, and the tests can pause the clock (`02-rules.md` section 6.2).
-- This sub-phase adds `[train.runpod]` and resolves its secrets.
 
 **Acceptance criteria.**
 
@@ -282,11 +282,37 @@ AC-13.1-5 moves to sub-phase 13.1b as AC-13.1b-1.
 
 ---
 
+### 13.8c RunPod Configuration
+
+**Goal:** Add `[train.runpod]`, its secrets and the production `RunPodTrainer`. The training run can build the fallback trainer from `jarvis.toml`.
+
+- **Implements:** G16. **Depends on:** 13.8b.
+- **Files:** modify `src/adapters/runpod.rs`, `src/lib.rs`, `jarvis.toml`.
+
+**Model.**
+
+- This sub-phase adds the optional section `[train.runpod]` (`01-architecture.md` section 9). `Secrets` resolves `api_key_env`, `s3_key_env` and `s3_secret_env`, as it resolves `[mqtt]`. Without the section, Jarvis has no training fallback and needs no RunPod variable. With it, a missing variable stops the start with the variable name.
+- In `jarvis.toml`, each line of the section starts with `# `, so Jarvis starts without a RunPod account. To use RunPod, remove the `# ` and set the variables.
+- `RunPodTrainer::try_new(config, keys, dir)` gives the production trainer: the REST API `https://api.runpod.ai`, and `AmazonS3` with `s3_endpoint`, `s3_region`, the bucket `volume_id` and the S3 keys. `poll_s` is the poll time and `timeout_min` is the timeout.
+- Nothing builds the trainer in `run` before sub-phase 13.10.
+
+**Acceptance criteria.**
+
+- AC-13.8c-1: When `jarvis.toml` has no `[train.runpod]` section and no RunPod variable is set, `Secrets::resolve` succeeds and gives no RunPod keys.
+- AC-13.8c-2: When the section of `jarvis.toml` is set without `# ` and `RUNPOD_S3_SECRET` is not set, `Secrets::resolve` returns an error that names `RUNPOD_S3_SECRET`.
+- AC-13.8c-3: When `try_new` gets the section of `jarvis.toml`, it returns a trainer with a poll time of 30 s and a timeout of 60 min.
+
+**Proofs.**
+
+- P-13.8c-1 to P-13.8c-3. Evidence: test.
+
+---
+
 ### 13.9 Training Run
 
 **Goal:** Add the training run that implements `training.qnt`: check the change count, build and split the set, train, evaluate both models on the held-out set, and swap or reject. The model improves without manual steps and never gets worse.
 
-- **Implements:** G3, G16, G19. **Depends on:** 13.8b.
+- **Implements:** G3, G16, G19. **Depends on:** 13.8c.
 - **Files:** modify `src/app/training.rs`, `src/app/conversation.rs`, `src/lib.rs`, `jarvis.toml`.
 - **Quint:** `training.qnt` (conformance).
 
