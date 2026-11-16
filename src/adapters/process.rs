@@ -94,7 +94,10 @@ fn tail(errors: &[u8]) -> String {
 impl Trainer for ProcessTrainer {
     async fn train(&self, run_id: &str, set: &TrainingSet) -> anyhow::Result<PathBuf> {
         let out = self.dir.join(run_id);
-        fs::create_dir_all(&out).with_context(|| format!("cannot create {}", out.display()))?;
+        fs::create_dir_all(&self.dir)
+            .with_context(|| format!("cannot create {}", self.dir.display()))?;
+        // An existing run folder is not this run's, so a failure must not delete it.
+        fs::create_dir(&out).with_context(|| format!("cannot create {}", out.display()))?;
         if let Err(error) = self.run(&out, set).await {
             fs::remove_dir_all(&out)
                 .with_context(|| format!("cannot delete {} after: {error:#}", out.display()))?;
