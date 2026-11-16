@@ -9,8 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use jiff::SignedDuration;
@@ -40,6 +38,7 @@ use crate::domain::training::Metrics;
 use crate::domain::training::Settings;
 use crate::domain::training::TrainingSet;
 use crate::domain::training::TrainingState;
+use crate::ports::Activity;
 use crate::ports::Classifier;
 use crate::ports::Clock;
 use crate::ports::Home;
@@ -47,6 +46,8 @@ use crate::ports::InteractionLog;
 use crate::ports::ModelLoader;
 use crate::ports::Models;
 use crate::ports::Reasoner;
+use crate::ports::State;
+use crate::ports::Status;
 use crate::ports::Store;
 use crate::ports::Trainer;
 
@@ -230,6 +231,8 @@ pub struct Training {
     pub models: Arc<dyn Models>,
     /// Gets the error text of a failed `restore`, which stops Jarvis.
     pub stop: watch::Sender<Option<String>>,
+    /// The sender of the status channel, which shows a local run.
+    pub status: watch::Sender<Status>,
 }
 
 impl Training {
@@ -276,8 +279,9 @@ impl Training {
         }
     }
 
-    /// The result of the local trainer for `set`, with the satellites muted and the models
-    /// released. Restores the models and unmutes the same satellites after it.
+    /// The result of the local trainer for `set`, with the status `training`, the satellites muted
+    /// and the models released. Restores the models, unmutes the same satellites and sets the
+    /// status `online` after it.
     ///
     /// # Errors
     ///
@@ -291,11 +295,15 @@ impl Training {
         for satellite in &switches.missing {
             tracing::warn!("the satellite {} has no mute switch", satellite.0);
         }
+        self.status
+            .send_modify(|status| status.state = State::Training);
         let muted = self.switch("turn_on", switches.off).await;
         self.models.release().await;
         let local = self.trainer.train(run_id, set).await;
         let restored = self.models.restore().await;
         self.switch("turn_off", muted).await;
+        self.status
+            .send_modify(|status| status.state = State::Online);
         if let Err(error) = &restored {
             self.stop.send_replace(Some(format!("{error:#}")));
         }
@@ -429,20 +437,24 @@ pub struct Trigger {
     training: Arc<Training>,
     /// The wait after a failed run before the next automatic run.
     backoff: SignedDuration,
-    /// True while a run is active.
-    active: AtomicBool,
+    /// What Jarvis does besides requests, shared with the save of the settings.
+    activity: Arc<Mutex<Activity>>,
     /// The end time of the last failed run.
     failed: Mutex<Option<Timestamp>>,
 }
 
 impl Trigger {
-    /// A trigger of `training` with no active run and no failed run.
+    /// A trigger of `training` on the shared `activity`, with no failed run.
     #[must_use]
-    pub fn new(training: Arc<Training>, backoff: SignedDuration) -> Self {
+    pub fn new(
+        training: Arc<Training>,
+        backoff: SignedDuration,
+        activity: Arc<Mutex<Activity>>,
+    ) -> Self {
         Self {
             training,
             backoff,
-            active: AtomicBool::new(false),
+            activity,
             failed: Mutex::new(None),
         }
     }
@@ -453,24 +465,33 @@ impl Trigger {
     ///
     /// The change count cannot be read.
     pub async fn check(self: &Arc<Self>) -> anyhow::Result<()> {
-        // A run that ends while the check reads the count cannot let a second run start.
-        if !self.reserve() {
-            return Ok(());
+        // The activity stays `Idle` for the first count, so a save is not busy then. The second
+        // count sees the reset of a run that ended after the first, so no second run starts.
+        if self.needed().await? && self.reserve() {
+            let needed = self.needed().await;
+            if matches!(needed, Ok(true)) {
+                self.start();
+            } else {
+                self.end();
+            }
+            needed?;
         }
+        Ok(())
+    }
+
+    /// True when no failed run ended less than the backoff ago and the change count reaches
+    /// `min_changes`.
+    ///
+    /// # Errors
+    ///
+    /// The change count cannot be read.
+    async fn needed(&self) -> anyhow::Result<bool> {
         let (failed, min) = (*self.failed(), self.training.config.train.min_changes);
         let now = self.training.clock.now();
-        let needed = if failed.is_some_and(|end| now.duration_since(end) < self.backoff) {
-            Ok(false)
-        } else {
-            let changes = self.training.changes().await;
-            changes.map(|count| training::should_train(count, min))
-        };
-        if matches!(needed, Ok(true)) {
-            self.start();
-        } else {
-            self.active.store(false, Ordering::SeqCst);
+        if failed.is_some_and(|end| now.duration_since(end) < self.backoff) {
+            return Ok(false);
         }
-        needed.map(drop)
+        Ok(training::should_train(self.training.changes().await?, min))
     }
 
     /// Starts a run at any change count and without the backoff.
@@ -480,12 +501,15 @@ impl Trigger {
         }
     }
 
-    /// True when `active` changes from false to true, the `run = Idle` guard of `training.qnt`.
+    /// True when the activity changes from `Idle` to `Training`, the `run = Idle` guard of
+    /// `training.qnt`.
     fn reserve(&self) -> bool {
-        let swapped = self
-            .active
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
-        swapped.is_ok()
+        change(&self.activity, Activity::Idle, Activity::Training)
+    }
+
+    /// Sets the activity `Idle` again after `reserve`.
+    fn end(&self) {
+        change(&self.activity, Activity::Training, Activity::Idle);
     }
 
     /// Runs `Training::run` in a new task after `reserve`. Keeps the end time of a failed run.
@@ -496,7 +520,7 @@ impl Trigger {
                 tracing::warn!("the training run failed: {error:#}");
                 *trigger.failed() = Some(trigger.training.clock.now());
             }
-            trigger.active.store(false, Ordering::SeqCst);
+            trigger.end();
         });
     }
 
@@ -504,6 +528,18 @@ impl Trigger {
     fn failed(&self) -> MutexGuard<'_, Option<Timestamp>> {
         self.failed.lock().expect("no lock holder panics")
     }
+}
+
+/// Changes `activity` from `from` to `to` in one critical section. Gives whether it was `from`.
+pub fn change(activity: &Mutex<Activity>, from: Activity, to: Activity) -> bool {
+    let Ok(mut activity) = activity.lock() else {
+        return false;
+    };
+    let changed = *activity == from;
+    if changed {
+        *activity = to;
+    }
+    changed
 }
 
 /// Starts a task that calls `check` of `trigger` each `interval`. Logs a failed check.
@@ -580,6 +616,7 @@ mod tests {
 
     use std::ptr;
     use std::sync::Mutex;
+    use std::thread;
     use std::time::Duration;
 
     use quint_connect::Driver;
@@ -593,8 +630,12 @@ mod tests {
     use tokio::sync::OwnedMutexGuard;
     use tokio::task::JoinHandle;
 
+    use crate::Controller;
+    use crate::Shared;
     use crate::domain::model::Prediction;
     use crate::domain::model::Slot;
+    use crate::ports::Control;
+    use crate::ports::Refusal;
     use crate::testing::fakes;
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
@@ -742,7 +783,7 @@ mod tests {
             reasoner: Arc::new(FakeReasoner::default()),
             generated: Arc::new(FakeStore::new(None)),
             state: Arc::new(FakeStore::new(None)),
-            log: Arc::new(FakeLog::default()),
+            log: Arc::<FakeLog>::default(),
             trainer: Arc::clone(&trainer) as _,
             runpod: None,
             loader: Arc::new(FakeModelLoader::default()),
@@ -756,7 +797,8 @@ mod tests {
             config,
             home: Arc::new(FakeHome::default()),
             models: Arc::new(FakeModels::default()),
-            stop: watch::Sender::new(None),
+            stop: watch::Sender::default(),
+            status: watch::Sender::default(),
         };
         (training, trainer)
     }
@@ -1074,7 +1116,11 @@ mod tests {
     /// A trigger of the run of `harness` with the backoff `backoff_s` in seconds.
     fn trigger(harness: &Harness, backoff_s: i64) -> Arc<Trigger> {
         let backoff = SignedDuration::from_secs(backoff_s);
-        Arc::new(Trigger::new(Arc::clone(&harness.training), backoff))
+        Arc::new(Trigger::new(
+            Arc::clone(&harness.training),
+            backoff,
+            Arc::default(),
+        ))
     }
 
     /// Lets each task run until it waits.
@@ -1335,6 +1381,136 @@ mod tests {
         Ok(())
     }
 
+    /// A status with `state` and a rollback message.
+    fn rolled_back(state: State) -> Status {
+        let message = Some("settings rolled back: no voice".to_owned());
+        Status { state, message }
+    }
+
+    /// AC-13.10b-1. The rollback message stays.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_10b_1_local_run_shows_training() -> anyhow::Result<()> {
+        for result in [Ok(()), Err("CUDA out of memory")] {
+            let old = classifier(&[]);
+            let harness = edited(&old, |training| training.runpod = None);
+            harness
+                .training
+                .status
+                .send_replace(rolled_back(State::Online));
+            script(&harness, &old, result);
+            let local = harness.trainer.gate.lock().await;
+            let task = started(&harness).await;
+            assert_eq!(
+                *harness.training.status.borrow(),
+                rolled_back(State::Training)
+            );
+            drop(local);
+            let _ended = task.await?;
+            assert_eq!(
+                *harness.training.status.borrow(),
+                rolled_back(State::Online)
+            );
+        }
+        Ok(())
+    }
+
+    /// AC-13.10b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_10b_2_runpod_run_shows_online() -> anyhow::Result<()> {
+        let old = classifier(&[]);
+        let harness = swap(&old);
+        script(&harness, &old, Err("CUDA out of memory"));
+        let waiting = harness.runpod.gate.lock().await;
+        let task = started(&harness).await;
+        while recorded(&harness.runpod).is_empty() {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(harness.training.status.borrow().state, State::Online);
+        drop(waiting);
+        let _ended = task.await?;
+        Ok(())
+    }
+
+    /// The `Controller` of a copy of `jarvis.toml` in `folder` that shares `shared`.
+    fn controller(folder: &TempDir, shared: &Shared) -> anyhow::Result<Controller> {
+        let config = folder.path().join("jarvis.toml");
+        fs::write(&config, include_str!("../../jarvis.toml"))?;
+        Ok(Controller::new(config, shared.clone()))
+    }
+
+    /// A trigger of the run of `harness` with no backoff on the activity of `shared`.
+    fn shared_trigger(harness: &Harness, shared: &Shared) -> Arc<Trigger> {
+        let activity = Arc::clone(&shared.activity);
+        let training = Arc::clone(&harness.training);
+        Arc::new(Trigger::new(training, SignedDuration::ZERO, activity))
+    }
+
+    /// A save of `dialog.timeout_s` with `control`.
+    fn save(control: &Controller) -> Result<(), Refusal> {
+        control.save(BTreeMap::from([("dialog.timeout_s".to_owned(), json!(20))]))
+    }
+
+    /// AC-13.10b-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_10b_3_save_during_a_run_is_busy() -> anyhow::Result<()> {
+        let (harness, shared, folder) = (
+            swap(&classifier(&[])),
+            Shared::default(),
+            tempfile::tempdir()?,
+        );
+        let control = controller(&folder, &shared)?;
+        let closed = harness.trainer.gate.lock().await;
+        shared_trigger(&harness, &shared).voice();
+        settle().await;
+        assert_eq!(save(&control), Err(Refusal::Busy));
+        assert_eq!(
+            fs::read_to_string(&control.config)?,
+            include_str!("../../jarvis.toml")
+        );
+        drop(closed);
+        Ok(())
+    }
+
+    /// AC-13.10b-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_10b_4_restart_starts_no_run() -> anyhow::Result<()> {
+        let (harness, shared, folder) = (
+            swap(&classifier(&[])),
+            Shared::default(),
+            tempfile::tempdir()?,
+        );
+        marks(&harness, 20);
+        let trigger = shared_trigger(&harness, &shared);
+        assert_eq!(save(&controller(&folder, &shared)?), Ok(()));
+        trigger.voice();
+        trigger.check().await?;
+        settle().await;
+        assert_eq!(calls(&harness), 0, "a run started during the restart");
+        Ok(())
+    }
+
+    /// AC-13.10b-4. Either of them can win.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_10b_4_run_and_save_exclude_each_other() -> anyhow::Result<()> {
+        let (harness, shared, folder) = (
+            swap(&classifier(&[])),
+            Shared::default(),
+            tempfile::tempdir()?,
+        );
+        let (control, trigger) = (
+            controller(&folder, &shared)?,
+            shared_trigger(&harness, &shared),
+        );
+        let saved = thread::scope(|scope| {
+            let other = scope.spawn(|| save(&control));
+            trigger.voice();
+            other.join().expect("the save does not panic")
+        });
+        settle().await;
+        assert_ne!(saved.is_ok(), calls(&harness) == 1, "{saved:?}");
+        Ok(())
+    }
+
     /// The model state of `training.qnt` that the conformance test compares.
     #[derive(Debug, Deserialize, PartialEq)]
     struct TrainingModel {
@@ -1363,7 +1539,8 @@ mod tests {
         fn from_driver(driver: &TrainingDriver) -> anyhow::Result<Self> {
             driver.runtime.block_on(settle());
             let training = &driver.harness.training;
-            let active = driver.trigger.active.load(Ordering::SeqCst);
+            let active =
+                *driver.trigger.activity.lock().expect("no test panics") == Activity::Training;
             let current = training.classifier.0.load_full();
             let same = |level: &Arc<FakeClassifier>| {
                 ptr::addr_eq(Arc::as_ptr(level), Arc::as_ptr(&current.classifier))

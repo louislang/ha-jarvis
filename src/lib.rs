@@ -704,6 +704,15 @@ pub enum Ended {
     Stop,
 }
 
+/// The status channel and the activity that the training trigger and the [`Controller`] share.
+#[derive(Clone, Default)]
+struct Shared {
+    /// The sender of the status channel.
+    status: watch::Sender<Status>,
+    /// What Jarvis does besides requests.
+    activity: Arc<Mutex<Activity>>,
+}
+
 /// The `Control` of the root: the status channel, the activity and the configuration file that
 /// `run` got.
 struct Controller {
@@ -718,31 +727,16 @@ struct Controller {
 }
 
 impl Controller {
-    /// The control of `config`, with the status `online` and the message of the last rollback.
-    fn new(config: PathBuf) -> Self {
+    /// The control of `config` on `shared`. Sets the message of the last rollback.
+    fn new(config: PathBuf, Shared { status, activity }: Shared) -> Self {
         let message = adapters::settings::rolled_back(&config);
+        status.send_modify(|status| status.message = message);
         Self {
-            status: watch::Sender::new(Status {
-                state: State::Online,
-                message,
-            }),
-            activity: Arc::new(Mutex::new(Activity::Idle)),
+            status,
+            activity,
             restart: Notify::new(),
             config,
         }
-    }
-
-    /// Changes the activity from `from` to `to` in one critical section. Gives whether the
-    /// activity was `from`.
-    fn change(&self, from: Activity, to: Activity) -> bool {
-        let Ok(mut activity) = self.activity.lock() else {
-            return false;
-        };
-        let changed = *activity == from;
-        if changed {
-            *activity = to;
-        }
-        changed
     }
 
     /// Writes the configuration file with `changes` after the checks of the start, and keeps the
@@ -800,12 +794,13 @@ impl Control for Controller {
     }
 
     fn save(&self, changes: BTreeMap<String, Value>) -> Result<(), Refusal> {
-        if !self.change(Activity::Idle, Activity::Restarting) {
+        let activity = &self.activity;
+        if !app::training::change(activity, Activity::Idle, Activity::Restarting) {
             return Err(Refusal::Busy);
         }
         let written = self.written(changes);
         if written.is_err() {
-            self.change(Activity::Restarting, Activity::Idle);
+            app::training::change(activity, Activity::Restarting, Activity::Idle);
         }
         written?;
         self.status.send_replace(Status {
@@ -1412,9 +1407,14 @@ type Started = (
     Arc<LiveModels>,
 );
 
-/// A log writer task, the review of its log, and the receiver of the error text of a failed
-/// `restore` of the training run.
-type Logged = (JoinHandle<()>, Reviewer, watch::Receiver<Option<String>>);
+/// A log writer task, the review of its log, the receiver of the error text of a failed
+/// `restore` of the training run, and the status and activity that the training trigger shares.
+type Logged = (
+    JoinHandle<()>,
+    Reviewer,
+    watch::Receiver<Option<String>>,
+    Shared,
+);
 
 /// The longest wait of [`run`] for the running tasks and the saves after the shutdown future
 /// completes.
@@ -1503,9 +1503,9 @@ async fn serve_until(
     started: Started,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<Ended> {
-    let (app, (pools_task, habits, (writer, review, mut stopped)), _, _) = started;
+    let (app, (pools_task, habits, (writer, review, mut stopped, shared)), _, _) = started;
     let (listener, tracker) = (TcpListener::bind(config.listen).await?, TaskTracker::new());
-    let control = Arc::new(Controller::new(file));
+    let control = Arc::new(Controller::new(file, shared));
     let web = serve_control(config, secrets, review, &control, &tracker).await?;
     let shutdown = until_stopped(control.until_restart(shutdown), &mut stopped);
     let served = adapters::wyoming::serve(listener, Arc::new(app), &tracker, shutdown).await;
@@ -1776,10 +1776,10 @@ async fn start_app(
 }
 
 /// The recorder of the utterances of `listener` on the log of `config`, its log writer task, the
-/// review of the log with the intent names of `catalog`, and the receiver of the error text of a
-/// failed `restore`. Starts the training trigger on the log with `reasoner`, `catalog`, the hot
-/// cache `cache`, the `RunPod` trainer `runpod`, the house `home` and the live models `models`,
-/// which checks each `train.check_interval_s`.
+/// review of the log with the intent names of `catalog`, the receiver of the error text of a
+/// failed `restore`, and the status and activity of the trigger. Starts the training trigger on
+/// the log with `reasoner`, `catalog`, the hot cache `cache`, the `RunPod` trainer `runpod`, the
+/// house `home` and the live models `models`, which checks each `train.check_interval_s`.
 ///
 /// # Errors
 ///
@@ -1796,6 +1796,7 @@ fn start_log(
     let (log, last_id) = open_log(config)?;
     let (recorded, (writer, review)) = recorder(listener, catalog, &log, last_id);
     let (reasoner, (stop, stopped)) = (Arc::clone(reasoner), watch::channel(None));
+    let shared = Shared::default();
     let trigger = trigger(
         config,
         reasoner,
@@ -1803,10 +1804,10 @@ fn start_log(
         catalog,
         cache,
         runpod,
-        (home, models, stop),
+        (home, models, stop, shared.clone()),
     )?;
     app::training::start_trigger(trigger, Duration::from_secs(config.train.check_interval_s));
-    Ok((recorded, (writer, review, stopped)))
+    Ok((recorded, (writer, review, stopped, shared)))
 }
 
 /// The log of `config` and its largest stored ID. Starts the daily prune of the log.
@@ -1846,8 +1847,8 @@ fn recorder(
 /// The training trigger of `config` with the backoff `train.failure_backoff_s`, the process
 /// trainer, the `RunPod` trainer `runpod`, the ONNX loader, the stores of `train.state` and
 /// `train.generated`, the system time, `reasoner`, `log`, `catalog`, the hot cache `cache`, the
-/// house `home`, the live models `models`, whose classifier the run swaps, and `stop`, which gets
-/// the error text of a failed `restore`.
+/// house `home`, the live models `models`, whose classifier the run swaps, `stop`, which gets
+/// the error text of a failed `restore`, and the status and activity of `shared`.
 ///
 /// # Errors
 ///
@@ -1859,10 +1860,11 @@ fn trigger(
     catalog: &Arc<Catalog>,
     cache: &watch::Receiver<StateCache>,
     runpod: Option<Arc<dyn Trainer>>,
-    (home, models, stop): (
+    (home, models, stop, shared): (
         Arc<dyn Home>,
         Arc<LiveModels>,
         watch::Sender<Option<String>>,
+        Shared,
     ),
 ) -> anyhow::Result<Arc<Trigger>> {
     let train = &config.train;
@@ -1882,8 +1884,10 @@ fn trigger(
         home,
         models,
         stop,
+        status: shared.status,
     };
-    Ok(Arc::new(Trigger::new(Arc::new(training), backoff(train)?)))
+    let trigger = Trigger::new(Arc::new(training), backoff(train)?, shared.activity);
+    Ok(Arc::new(trigger))
 }
 
 /// The failure backoff `train.failure_backoff_s` of `train`.
@@ -3560,9 +3564,9 @@ mod tests {
         let catalog = load_catalog(&config.intents)?;
         let pools = load_pools(&config.responses, &catalog)?;
         let home = Arc::new(FakeHome::default());
-        let (app, (pools_task, habits, (writer, review, _)), prerender, models) =
+        let (app, (pools_task, habits, (writer, review, _, shared)), prerender, models) =
             start_live_app(&config, &secrets, catalog, pools, home).await?;
-        let stores = (pools_task, habits, (writer, review, stopped));
+        let stores = (pools_task, habits, (writer, review, stopped, shared));
         Ok((config, secrets, (app, stores, prerender, models)))
     }
 
@@ -3730,7 +3734,7 @@ mod tests {
     fn controller(folder: &Path) -> anyhow::Result<Controller> {
         let config = folder.join("jarvis.toml");
         fs::write(&config, VALID)?;
-        Ok(Controller::new(config))
+        Ok(Controller::new(config, Shared::default()))
     }
 
     /// The changes that set `name` to `value`.
@@ -3959,7 +3963,8 @@ mod tests {
         fs::write(&rollback, "bind failed")?;
         let status = status_of(&config, web, |_: &str| Some("token".to_owned())).await?;
         assert_eq!(status["message"], "settings rolled back: bind failed");
-        let saved = Controller::new(config).save(change("dialog.timeout_s", json!(20)));
+        let saved =
+            Controller::new(config, Shared::default()).save(change("dialog.timeout_s", json!(20)));
         assert_eq!(saved, Ok(()));
         assert!(!rollback.exists(), "the save removes the reason");
         Ok(())

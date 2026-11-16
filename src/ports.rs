@@ -390,10 +390,11 @@ pub trait Review: Send + Sync {
 }
 
 /// What Jarvis does now.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum State {
     /// Jarvis answers requests.
+    #[default]
     Online,
     /// A local training run uses the GPU.
     Training,
@@ -404,7 +405,7 @@ pub enum State {
 }
 
 /// The status of Jarvis in the Jarvis tab.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Status {
     /// What Jarvis does now.
     pub state: State,
@@ -429,17 +430,20 @@ pub struct Setting {
 pub enum Refusal {
     /// The new file does not pass the checks of the start. The message names the field.
     Invalid(String),
-    /// Another save restarts Jarvis.
+    /// Another save restarts Jarvis, or a training run is active.
     Busy,
 }
 
 /// What Jarvis does besides requests. Each change checks the old value.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum Activity {
     /// Nothing.
+    #[default]
     Idle,
     /// A save restarts Jarvis.
     Restarting,
+    /// A training run is active.
+    Training,
 }
 
 /// The driving port that the web server calls to read and control Jarvis.
