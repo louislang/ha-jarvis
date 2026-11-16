@@ -454,7 +454,7 @@ AC-13.9-5 to AC-13.9-8, AC-13.9-10 and AC-13.9-11 move to sub-phase 13.9b as AC-
 - AC-13.10-3: When the process trainer returns an error and `[train.runpod]` is not set, the old classifier stays and the log names the local error.
 - AC-13.10-4: When `quint-connect` replays 100 traces of `training.qnt` from `initRunPod`, the run state, the change count and the accuracy of the active model match the model after each step.
 
-The mute switch parts of AC-13.10-6 and AC-13.10-9 move to sub-phase 13.10c as AC-13.10c-1 and AC-13.10c-2. AC-13.10-5 and AC-13.10-7 move to sub-phase 13.10d as AC-13.10d-1 and AC-13.10d-2. AC-13.10-6, AC-13.10-8 and AC-13.10-9 move to sub-phase 13.10e as AC-13.10e-1 to AC-13.10e-3. The `paused` part of AC-13.10-4 moves to sub-phase 13.10e as AC-13.10e-4.
+The mute switch parts of AC-13.10-6 and AC-13.10-9 move to sub-phase 13.10c as AC-13.10c-1 and AC-13.10c-2. AC-13.10-5 and AC-13.10-7 move to sub-phase 13.10d as AC-13.10d-1 and AC-13.10d-2. AC-13.10d-1 then moves to sub-phase 13.10f as AC-13.10f-1. AC-13.10-6, AC-13.10-8 and AC-13.10-9 move to sub-phase 13.10e as AC-13.10e-1 to AC-13.10e-3. The `paused` part of AC-13.10-4 moves to sub-phase 13.10e as AC-13.10e-4.
 
 **Proofs.**
 
@@ -505,12 +505,35 @@ The mute switch parts of AC-13.10-6 and AC-13.10-9 move to sub-phase 13.10c as A
 
 **Acceptance criteria.**
 
-- AC-13.10d-1 [GPU host]: After `LiveModels::release`, Jarvis has no GPU session, and the free GPU memory is `train.max_vram_gb` + 0.5 GB or more, so a local run can use the full GPU. After `restore`, Jarvis answers again, and all Phase 9.2 latency tests pass.
 - AC-13.10d-2: When `LiveModels::release` returns, no reference to the STT, TTS or classifier fakes exists, and `listen` and `handle` return an error. After `restore`, `handle` answers. When a load fails, `restore` returns the error.
+
+AC-13.10d-1 moves to sub-phase 13.10f as AC-13.10f-1.
 
 **Proofs.**
 
-- P-13.10d-1, P-13.10d-2. Evidence: test.
+- P-13.10d-2. Evidence: test.
+
+---
+
+### 13.10f GPU Release
+
+**Goal:** Measure the free GPU memory after a release and the latency after a restore on the GPU host. A local training run can then use the full GPU, and Jarvis answers as fast after the run.
+
+- **Implements:** G16, G18. **Depends on:** 13.10d.
+- **Files:** modify `src/lib.rs`, `src/testing/e2e.rs`.
+
+**Model.**
+
+- The start of the app also gives its `LiveModels`. The pipeline harness of `src/testing/e2e.rs` waits for the pre-render. Then on CUDA, it calls `release` and `restore`, and serves the app. Thus each GPU latency test runs after a pause.
+- The test of AC-13.10f-1 runs alone in a child process, as AC-6.2-5 does, because the other GPU tests change the memory of their process.
+
+**Acceptance criteria.**
+
+- AC-13.10f-1 [GPU host]: After `LiveModels::release`, Jarvis has no GPU session, and the free GPU memory is `train.max_vram_gb` + 0.5 GB or more, so a local run can use the full GPU. After `restore`, Jarvis answers again, and all Phase 9.2 latency tests pass.
+
+**Proofs.**
+
+- P-13.10f-1. Evidence: test.
 
 ---
 
@@ -518,7 +541,7 @@ The mute switch parts of AC-13.10-6 and AC-13.10-9 move to sub-phase 13.10c as A
 
 **Goal:** Mute the satellites and pause Jarvis for a local training run. A local run gets the full GPU of the GPU host, and nobody talks to a Jarvis that cannot answer.
 
-- **Implements:** G16, G19. **Depends on:** 13.10d.
+- **Implements:** G16, G19. **Depends on:** 13.10f.
 - **Files:** modify `src/app/training.rs`, `src/lib.rs`, `src/testing/fakes.rs`.
 - **Quint:** `training.qnt` (conformance with `paused`).
 
