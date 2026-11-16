@@ -91,8 +91,11 @@ epochs = 8
 batch_size = 8
 min_changes = 20
 holdout = 0.1
+timeout_min = 60
+max_vram_gb = 4.5 # PyTorch cap of a local run
 paraphrases = 50
 unknown_paraphrases = 300
+python = ".venv/bin/python"
 
 [log]
 database = "jarvis.db"
