@@ -62,6 +62,7 @@ flowchart LR
     crate --> crate_adapters_open_meteo
     crate --> crate_adapters_openai
     crate --> crate_adapters_plex
+    crate --> crate_adapters_process
     crate --> crate_adapters_sherpa
     crate --> crate_adapters_sqlite
     crate --> crate_adapters_supertonic
@@ -70,6 +71,7 @@ flowchart LR
     crate --> crate_app_plugins
     crate --> crate_app_review
     crate --> crate_app_speech
+    crate --> crate_app_training
     crate --> crate_domain_catalog
     crate --> crate_domain_habits
     crate --> crate_domain_model

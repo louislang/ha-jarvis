@@ -281,8 +281,8 @@ async fn stream_audio(
     }
 }
 
-/// The configuration of `device` (`01-architecture.md` section 9) with `pools.json` and
-/// `habits.json` in `folder`: `jarvis.toml` on CUDA, the configuration of a CPU machine on the
+/// The configuration of `device` (`01-architecture.md` section 9) with the data files in
+/// `folder`: `jarvis.toml` on CUDA, the configuration of a CPU machine on the
 /// CPU.
 ///
 /// # Errors
@@ -293,6 +293,8 @@ fn config(device: Device, folder: &Path) -> anyhow::Result<Config> {
     config.pools = folder.join("pools.json");
     config.habits.file = folder.join("habits.json");
     config.log.database = folder.join("jarvis.db");
+    config.train.state = folder.join("training.json");
+    config.train.generated = folder.join("generated.json");
     if device == Device::Cuda {
         return Ok(config);
     }

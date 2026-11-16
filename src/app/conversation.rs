@@ -100,8 +100,8 @@ pub struct Recorder {
     pub utterances: Arc<Utterances>,
     /// The sender to the log writer task.
     pub writer: UnboundedSender<Write>,
-    /// The run name of the System One model.
-    pub model: String,
+    /// The run name of the System One model, which a swap changes.
+    pub model: Arc<ArcSwap<String>>,
     /// The largest stored interaction ID at the start, or `None` without interactions.
     pub last_id: Option<u64>,
 }
@@ -297,7 +297,7 @@ impl Conversation {
             slots: tagged(&prediction.slots, &intent::normalize(&heard.transcript)),
             transcript: heard.transcript,
             model_context: heard.model_context,
-            model: self.recorder.model.clone(),
+            model: String::clone(&self.recorder.model.load()),
             top_labels: prediction.ranked.iter().take(3).cloned().collect(),
             action: action(prediction, call.as_ref()),
             decision: route,
@@ -2567,7 +2567,7 @@ mod tests {
         Recorder {
             utterances: Arc::new(Utterances::new(clock, 10)),
             writer: tokio::sync::mpsc::unbounded_channel().0,
-            model: "fixture".to_owned(),
+            model: Arc::new(ArcSwap::from_pointee("fixture".to_owned())),
             last_id: None,
         }
     }
@@ -2661,6 +2661,22 @@ mod tests {
         after.ok_or_else(|| anyhow::anyhow!("no call"))?.await?;
         let expected = lights_record(text, home.calls());
         assert_eq!(written(&log).await, [(expected, Some(audio))]);
+        Ok(())
+    }
+
+    /// AC-13.9d-2. A swap of `Training::run` stores the new run in the recorder.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9d_2_next_record_names_the_stored_run() -> anyhow::Result<()> {
+        let (log, conversation) = logging(&Arc::default(), Duration::ZERO);
+        let run = "20260101-000000".to_owned();
+        conversation.recorder.model.store(Arc::new(run.clone()));
+        let _ = conversation.handle(LIGHTS, on_satellite()).await?;
+        let models: Vec<String> = written(&log)
+            .await
+            .into_iter()
+            .map(|(record, _)| record.model)
+            .collect();
+        assert_eq!(models, [run]);
         Ok(())
     }
 

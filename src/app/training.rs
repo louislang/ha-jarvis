@@ -12,6 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use jiff::SignedDuration;
 use jiff::Timestamp;
 use rand::SeedableRng;
@@ -207,6 +208,8 @@ pub struct Training {
     pub loader: Arc<dyn ModelLoader>,
     /// The classifier of the conversation.
     pub classifier: Arc<CurrentClassifier>,
+    /// The run name of the classifier, which the recorder logs.
+    pub model: Arc<ArcSwap<String>>,
     /// The intents.
     pub catalog: Arc<Catalog>,
     /// The hot cache, which gives the area names.
@@ -264,6 +267,7 @@ impl Training {
         self.state.save(&TrainingState { current, last_time })?;
         if let Some(new) = new {
             self.classifier.0.store(Arc::new(new));
+            self.model.store(Arc::new(run_id.to_owned()));
             let keep = [run_id, previous.as_deref().unwrap_or(FIXTURE)];
             if let Err(error) = prune(&self.config.model.dir, keep) {
                 tracing::warn!("the delete of the old model folders failed: {error}");
@@ -504,7 +508,6 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use arc_swap::ArcSwap;
     use quint_connect::Driver;
     use quint_connect::State as ModelState;
     use quint_connect::Step;
@@ -673,6 +676,7 @@ mod tests {
             classifier: Arc::new(CurrentClassifier(ArcSwap::from_pointee(
                 Arc::<FakeClassifier>::default() as _,
             ))),
+            model: Arc::new(ArcSwap::from_pointee(FIXTURE.to_owned())),
             catalog: Arc::new(catalog()),
             cache: watch::channel(StateCache::load(fakes::house())).1,
             clock: Arc::new(FakeClock(Timestamp::UNIX_EPOCH)),
@@ -930,6 +934,17 @@ mod tests {
         drop(closed);
         task.await??;
         assert_eq!(harness.training.changes().await?, 1);
+        Ok(())
+    }
+
+    /// AC-13.9d-2. The conversation logs the run of `model` (its own AC-13.9d-2 test).
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9d_2_swap_stores_the_new_run() -> anyhow::Result<()> {
+        let (old, new) = (classifier(&wrong_slot()), classifier(&[]));
+        let harness = swap(&old);
+        script(&harness, &new, Ok(()));
+        harness.training.run().await?;
+        assert_eq!(**harness.training.model.load(), RUN);
         Ok(())
     }
 
