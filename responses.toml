@@ -109,6 +109,12 @@ responses = ["Previous song."]
 [pools.tv_off]
 responses = ["Turning off the TV."]
 
+[pools.start_training]
+responses = ["I will start training now."]
+
+[pools.training_busy]
+responses = ["Training is already running."]
+
 [pools.filler]
 responses = ["I will check on that for you.", "Let me look into that.", "One moment."]
 

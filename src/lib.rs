@@ -1777,11 +1777,12 @@ async fn start_app(
     ))
 }
 
-/// The recorder of the utterances of `listener` on the log of `config`, its log writer task, the
-/// review of the log with the intent names of `catalog`, and the receiver of the error text of a
-/// failed `restore`. Starts the training trigger on the log with `reasoner`, `catalog`, the hot
-/// cache `cache`, the `RunPod` trainer `runpod`, the house `home` and the live models `models`,
-/// which checks each `train.check_interval_s`. Also gives the trigger task and its [`Shared`].
+/// The recorder of the utterances of `listener` on the log of `config` with the training trigger,
+/// its log writer task, the review of the log with the intent names of `catalog`, and the receiver
+/// of the error text of a failed `restore`. Starts the training trigger on the log with
+/// `reasoner`, `catalog`, the hot cache `cache`, the `RunPod` trainer `runpod`, the house `home`
+/// and the live models `models`, which checks each `train.check_interval_s`. Also gives the
+/// trigger task and its [`Shared`].
 ///
 /// # Errors
 ///
@@ -1796,20 +1797,20 @@ fn start_log(
     (home, models): (Arc<dyn Home>, Arc<LiveModels>),
 ) -> anyhow::Result<(Recorder, Logged)> {
     let (log, last_id) = open_log(config)?;
-    let (recorded, (writer, review)) = recorder(listener, catalog, &log, last_id);
     let (reasoner, (stop, stopped)) = (Arc::clone(reasoner), watch::channel(None));
     let shared = Shared::default();
     let trigger = trigger(
         config,
         reasoner,
-        log,
+        &log,
         catalog,
         cache,
         runpod,
         (home, models, stop, shared.clone()),
     )?;
-    let interval = Duration::from_secs(config.train.check_interval_s);
-    let trigger = app::training::start_trigger(trigger, interval);
+    let (recorded, (writer, review)) = recorder(listener, catalog, &log, last_id, &trigger);
+    let trigger =
+        app::training::start_trigger(trigger, Duration::from_secs(config.train.check_interval_s));
     Ok((recorded, ((writer, trigger), review, stopped, shared)))
 }
 
@@ -1829,13 +1830,15 @@ fn open_log(config: &Config) -> anyhow::Result<(Arc<dyn InteractionLog>, Option<
     Ok((log, last_id))
 }
 
-/// The recorder of the utterances of `listener` and `log` with the largest stored ID `last_id`,
-/// its new log writer task, and the review of `log` with the intent names of `catalog`.
+/// The recorder of the utterances of `listener` and `log` with the largest stored ID `last_id`
+/// and `trigger`, its new log writer task, and the review of `log` with the intent names of
+/// `catalog`.
 fn recorder(
     listener: &Listener,
     catalog: &Catalog,
     log: &Arc<dyn InteractionLog>,
     last_id: Option<u64>,
+    trigger: &Arc<Trigger>,
 ) -> (Recorder, (JoinHandle<()>, Reviewer)) {
     let review = Reviewer::new(Arc::clone(log), catalog);
     let (writer, task) = app::conversation::start_writer(Arc::clone(log));
@@ -1843,6 +1846,7 @@ fn recorder(
         utterances: Arc::clone(listener.utterances()),
         writer,
         last_id,
+        trigger: Arc::clone(trigger),
     };
     (recorder, (task, review))
 }
@@ -1860,7 +1864,7 @@ fn recorder(
 fn trigger(
     config: &Config,
     reasoner: Arc<dyn Reasoner>,
-    log: Arc<dyn InteractionLog>,
+    log: &Arc<dyn InteractionLog>,
     catalog: &Arc<Catalog>,
     cache: &watch::Receiver<StateCache>,
     runpod: Option<Arc<dyn Trainer>>,
@@ -1876,7 +1880,7 @@ fn trigger(
         reasoner,
         generated: Arc::new(FileStore::try_new(train.generated.clone())?),
         state: Arc::new(FileStore::try_new(train.state.clone())?),
-        log,
+        log: Arc::clone(log),
         trainer: Arc::new(process_trainer(config)),
         runpod,
         loader: Arc::new(OnnxLoader),
@@ -2987,6 +2991,7 @@ mod tests {
             utterances,
             writer: tokio::sync::mpsc::unbounded_channel().0,
             last_id: None,
+            trigger: fakes::trigger(Path::new("unused")).0,
         }
     }
 

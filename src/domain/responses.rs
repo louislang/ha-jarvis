@@ -255,6 +255,7 @@ pub fn validate_pools(pools: &Pools, catalog: &Catalog) -> Result<(), PoolError>
     require(pools, "failure")?;
     require(pools, "ask_area")?;
     require(pools, "cancelled")?;
+    require(pools, "training_busy")?;
     check_pools(pools, catalog)
 }
 
@@ -523,14 +524,15 @@ pub open spec fn pooled(pools: Map<String, Pool>, catalog: Catalog, count: int) 
         ==> pools.contains_key(crate::domain::contracts::string_key(#[trigger] catalog.intents@[index].name@))
 }
 
-/// True when each intent of `catalog` has a pool, the `filler`, `failure`, `ask_area` and
-/// `cancelled` pools exist, and each pool has one or more responses.
+/// True when each intent of `catalog` has a pool, the `filler`, `failure`, `ask_area`,
+/// `cancelled` and `training_busy` pools exist, and each pool has one or more responses.
 pub open spec fn valid_pools(pools: Map<String, Pool>, catalog: Catalog) -> bool {
     &&& pooled(pools, catalog, catalog.intents@.len() as int)
     &&& pools.contains_key(crate::domain::contracts::string_key("filler"@))
     &&& pools.contains_key(crate::domain::contracts::string_key("failure"@))
     &&& pools.contains_key(crate::domain::contracts::string_key("ask_area"@))
     &&& pools.contains_key(crate::domain::contracts::string_key("cancelled"@))
+    &&& pools.contains_key(crate::domain::contracts::string_key("training_busy"@))
     &&& filled(pools)
 }
 

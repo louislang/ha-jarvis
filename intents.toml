@@ -310,3 +310,8 @@ verbs = ["Turn off"]
 service = "media_player.turn_off"
 target = "entity"
 select = [{ domain = "media_player", name = "tv" }]
+
+[[intent]]
+name = "start_training"
+kind = "train"
+examples = ["start training", "retrain yourself", "train your model", "start a new training run"]

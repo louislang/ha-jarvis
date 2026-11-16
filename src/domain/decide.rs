@@ -53,6 +53,13 @@ pub enum Decision {
         /// What the answer fills.
         pending: Pending,
     },
+    /// Start a training run and speak the reply, or speak `busy` when a run is active.
+    Train {
+        /// The reply when the run starts.
+        reply: Chosen,
+        /// The reply when a run is active.
+        busy: Chosen,
+    },
 }
 
 /// A selected response.
@@ -353,8 +360,8 @@ fn has_domain(entity_id: &str, domains: &[&str]) -> bool {
 }
 
 /// The decision for `prediction` of `request`: a System Two job for an `unknown`, uncertain or
-/// removed label, a `train` or a `prefetch`, else the decision of the command, the query or the
-/// fetch in its area.
+/// removed label or a `prefetch`, `Train` for a `train`, else the decision of the command, the
+/// query or the fetch in its area.
 #[verus_spec(decision =>
     requires
         responses::valid_pools(pools@, *catalog),
@@ -364,8 +371,8 @@ fn has_domain(entity_id: &str, domains: &[&str]) -> bool {
             && vstd::std_specs::cmp::ge_ensures::<f32>(prediction.ranked@[0].1, threshold, true),
         prediction.ranked@.len() > 0 && !cataloged(*catalog, prediction.ranked@[0].0@)
             ==> deferred(decision, request.transcript),
-        !(decision matches Decision::Defer { job: Job::Llm(_), .. }) ==> exists|index: int|
-            #[trigger] handled(*prediction, *catalog, threshold, index)
+        !(decision matches Decision::Defer { job: Job::Llm(_), .. }) && !(decision is Train)
+            ==> exists|index: int| #[trigger] handled(*prediction, *catalog, threshold, index)
             && placed(catalog.intents@[index], *prediction, *request, *cache, decision),
 )]
 #[must_use]
@@ -404,6 +411,9 @@ pub fn decide(
             }
             decision
         }
+        Some(index) if confident && matches!(catalog.intents[index].kind, Kind::Train) => {
+            train(&catalog.intents[index], pools, rng)
+        }
         _ => defer(request, pools, rng),
     }
 }
@@ -419,6 +429,7 @@ pub fn decide(
         responses::filled(pools@),
     ensures
         placed(*intent, *prediction, *request, *cache, decision),
+        !(decision is Train),
 )]
 fn act(
     intent: &Intent,
@@ -1066,6 +1077,23 @@ fn area_slot(slots: &[Slot]) -> Option<usize> {
         index += 1;
     }
     None
+}
+
+/// `Train` with a reply from the pool of `intent` and a reply from `training_busy`.
+#[verus_spec(decision =>
+    requires
+        pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
+        pools@.contains_key(crate::domain::contracts::string_key("training_busy"@)),
+        responses::filled(pools@),
+    ensures
+        decision matches Decision::Train { reply, busy }
+            && reply.pool@ == intent.name@ && busy.pool@ == "training_busy"@,
+)]
+fn train(intent: &Intent, pools: &Pools, rng: &mut StdRng) -> Decision {
+    Decision::Train {
+        reply: choose(pools, intent.name.as_str(), rng),
+        busy: choose(pools, "training_busy", rng),
+    }
 }
 
 /// A filler and a System Two job with the transcript of `request`.
