@@ -357,7 +357,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `addon/nginx.conf` | Add-on | The reverse proxy to Jarvis with the token header, and the down page. | 12.9g |
 | `addon/down.html` | Add-on | The static page "Jarvis is down", with no script. | 12.9g |
 | `src/testing/house.json` | Test | The reference house snapshot (section 11). | 2.1 |
-| `src/testing/fakes.rs` | Test | `#[cfg(test)]` only. A fake for each port, `FakeWyomingClient`, `speech(text)`. | 2.9 |
+| `src/testing/fakes.rs` | Test | `#[cfg(test)]` only. A fake for each port, `FakeWyomingClient`, `speech(text)`, a training run on fakes. | 2.9 |
 | `src/testing/e2e.rs` | Test | `#[cfg(test)]` only. Pipeline harness and end-to-end latency tests. | 9.1 |
 
 Jarvis also writes these data files: `habits.json`, `voices.json`, `jarvis.db`, `generated.json`, `training.json`, `pools.json` (use counts and generated responses), `learned.toml` (learned intents), the plugin request files in the folder `learn.plugin_requests`, the model folders in `models/system-one/`, and `jarvis.toml.bak`, `jarvis.toml.trying` and `jarvis.toml.rollback` (the backup, the trial start marker and the rollback reason of the settings form, sub-phases 12.9f and 12.9i). They are not source files, and Git ignores them. Edit `learned.toml` only while Jarvis is stopped. `jarvis.local.toml` is the configuration of a machine other than the GPU host (section 9). Git ignores it too.
