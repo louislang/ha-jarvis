@@ -2,17 +2,32 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
+use jiff::Timestamp;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::watch;
 use xxhash_rust::xxh3;
 
+use crate::Config;
 use crate::TrainConfig;
 use crate::domain::catalog;
 use crate::domain::catalog::Catalog;
+use crate::domain::feedback::Interaction;
 use crate::domain::intent;
+use crate::domain::state_cache::StateCache;
+use crate::domain::training;
+use crate::domain::training::Example;
+use crate::domain::training::Settings;
+use crate::domain::training::TrainingSet;
+use crate::ports::Clock;
+use crate::ports::InteractionLog;
 use crate::ports::Reasoner;
 use crate::ports::Store;
+use crate::ports::Trainer;
 
 /// The generated examples of `train.generated`.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -159,6 +174,108 @@ impl Checker<'_> {
     }
 }
 
+/// The ports and settings of a training run.
+pub struct Training {
+    /// System Two, which writes the generated examples.
+    pub reasoner: Arc<dyn Reasoner>,
+    /// The generated examples of `train.generated`.
+    pub generated: Arc<dyn Store<Generated>>,
+    /// The log with the marks.
+    pub log: Arc<dyn InteractionLog>,
+    /// The local trainer.
+    pub trainer: Arc<dyn Trainer>,
+    /// The intents.
+    pub catalog: Arc<Catalog>,
+    /// The hot cache, which gives the area names.
+    pub cache: watch::Receiver<StateCache>,
+    /// The time of the start of a run.
+    pub clock: Arc<dyn Clock>,
+    /// The configuration.
+    pub config: Config,
+}
+
+impl Training {
+    /// One run: trains on the examples that are not held out.
+    ///
+    /// # Errors
+    ///
+    /// A step fails, or the held-out set is empty.
+    pub async fn run(&self) -> anyhow::Result<()> {
+        let started = self.clock.now();
+        let set = self.training_set(started).await?;
+        let holdout = self.config.train.holdout;
+        let (held, upload): (Vec<Example>, Vec<Example>) = set
+            .examples
+            .into_iter()
+            .partition(|example| training::held_out(&example.text, holdout));
+        anyhow::ensure!(!held.is_empty(), "the held-out set is empty");
+        let upload = TrainingSet {
+            examples: upload,
+            ..set
+        };
+        let run_id = started.strftime("%Y%m%d-%H%M%S").to_string();
+        self.trainer.train(&run_id, &upload).await?;
+        Ok(())
+    }
+
+    /// The full training set of a run that starts at `started`, after a `refresh`.
+    async fn training_set(&self, started: Timestamp) -> anyhow::Result<TrainingSet> {
+        let (store, train) = (self.generated.as_ref(), &self.config.train);
+        let generated = store.load()?.unwrap_or_default();
+        let generated = refresh(&*self.reasoner, store, &self.catalog, generated, train).await?;
+        let marked = self.marked().await?;
+        let areas: Vec<String> = self
+            .cache
+            .borrow()
+            .areas
+            .iter()
+            .map(|area| area.name.clone())
+            .collect();
+        let mut rng = StdRng::seed_from_u64(started.as_second().unsigned_abs());
+        let settings = Settings {
+            base_model: train.base_model.clone(),
+            epochs: train.epochs,
+            batch_size: train.batch_size,
+        };
+        let catalog = generated_catalog(&self.catalog, generated);
+        let examples = training::seed_set(&catalog, &areas, &mut rng, settings.clone()).examples;
+        let set =
+            training::training_set(&self.catalog, examples, &marked, &areas, &mut rng, settings);
+        Ok(set)
+    }
+
+    /// The marked interactions with the first interaction of each marked dialog answer.
+    async fn marked(&self) -> anyhow::Result<Vec<Interaction>> {
+        let mut marked = self.log.marked().await?;
+        let links: BTreeSet<u64> = marked
+            .iter()
+            .filter_map(|interaction| interaction.link)
+            .collect();
+        for id in links {
+            if marked.iter().all(|interaction| interaction.id != id)
+                && let Some(first) = self.log.get(id).await?
+            {
+                marked.push(first);
+            }
+        }
+        Ok(marked)
+    }
+}
+
+/// A copy of `catalog` whose seeds are the examples of `generated`, so that `seed_set` labels
+/// them.
+fn generated_catalog(catalog: &Catalog, generated: Generated) -> Catalog {
+    let mut copy = catalog.clone();
+    for intent in &mut copy.intents {
+        let examples = generated.intents.get(&intent.name);
+        intent.examples = examples
+            .map(|found| found.examples.clone())
+            .unwrap_or_default();
+    }
+    copy.unknown_examples = generated.unknown.examples;
+    copy
+}
+
 /// The normalized texts of the seed examples of `catalog`.
 fn seed_texts(catalog: &Catalog) -> BTreeSet<String> {
     let intents = catalog.intents.iter().flat_map(|intent| &intent.examples);
@@ -180,9 +297,14 @@ mod tests {
 
     use std::slice;
 
-    use crate::Config;
+    use tempfile::TempDir;
+
+    use crate::testing::fakes;
+    use crate::testing::fakes::FakeClock;
+    use crate::testing::fakes::FakeLog;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
+    use crate::testing::fakes::FakeTrainer;
 
     /// The catalog of `intents.toml`.
     fn catalog() -> Catalog {
@@ -307,5 +429,61 @@ mod tests {
         let refreshed = refreshed(&reasoner, &catalog, Generated::default()).await;
 
         assert_eq!(refreshed.unknown.examples, ["what is the capital of peru"]);
+    }
+
+    /// A training run on `intents.toml` and the reference house with fakes, with the held-out
+    /// share `holdout`, and its trainer, which creates the model folders in `models`.
+    fn harness(holdout: f64, models: &TempDir) -> (Training, Arc<FakeTrainer>) {
+        let mut config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
+        config.train.holdout = holdout;
+        let dir = models.path().to_owned();
+        let trainer = Arc::new(FakeTrainer {
+            dir,
+            ..FakeTrainer::default()
+        });
+        let training = Training {
+            reasoner: Arc::new(FakeReasoner::default()),
+            generated: Arc::new(FakeStore::new(None)),
+            log: Arc::new(FakeLog::default()),
+            trainer: Arc::clone(&trainer) as _,
+            catalog: Arc::new(catalog()),
+            cache: watch::channel(StateCache::load(fakes::house())).1,
+            clock: Arc::new(FakeClock(Timestamp::UNIX_EPOCH)),
+            config,
+        };
+        (training, trainer)
+    }
+
+    /// AC-13.9-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9_4_upload_has_no_held_out_example() -> anyhow::Result<()> {
+        let models = tempfile::tempdir()?;
+        let (training, trainer) = harness(0.1, &models);
+        trainer
+            .results
+            .lock()
+            .expect("no test panics")
+            .push_back(Ok(()));
+        training.run().await?;
+        let calls = trainer.calls.lock().expect("no test panics");
+        let examples = &calls[0].1.examples;
+        let held = examples
+            .iter()
+            .filter(|example| training::held_out(&example.text, 0.1));
+        assert_eq!(held.count(), 0, "the upload has a held-out example");
+        assert!(!examples.is_empty(), "the upload is empty");
+        Ok(())
+    }
+
+    /// AC-13.9-13.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9_13_empty_held_out_set_stops_before_training() -> anyhow::Result<()> {
+        let models = tempfile::tempdir()?;
+        let (training, trainer) = harness(0.0, &models);
+        let error = training.run().await.expect_err("the run stops");
+        assert!(error.to_string().contains("held-out"), "{error}");
+        let calls = trainer.calls.lock().expect("no test panics");
+        assert!(calls.is_empty(), "the trainer has a call");
+        Ok(())
     }
 }

@@ -6,6 +6,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -63,6 +64,7 @@ use crate::domain::state::Event;
 use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
+use crate::domain::training::TrainingSet;
 use crate::ports::Assistant;
 use crate::ports::Change;
 use crate::ports::Classifier;
@@ -90,6 +92,7 @@ use crate::ports::Store;
 use crate::ports::SttStream;
 use crate::ports::TextToSpeech;
 use crate::ports::Tool;
+use crate::ports::Trainer;
 
 /// The reference house snapshot.
 #[must_use]
@@ -332,6 +335,35 @@ impl ModelLoader for FakeModelLoader {
     async fn load(&self, dir: &Path, _device: Device) -> anyhow::Result<Arc<dyn Classifier>> {
         let classifier = lock(&self.classifiers).pop_front();
         classifier.ok_or_else(|| anyhow::anyhow!("no scripted classifier for {}", dir.display()))
+    }
+}
+
+/// A `Trainer` that records each call and gives the scripted results in order, each after its
+/// gate opens. A success creates the model folder `<dir>/<run_id>/`.
+#[derive(Default)]
+pub struct FakeTrainer {
+    /// The folder of the model folders.
+    pub dir: PathBuf,
+    /// The results of the next calls in order: `Ok`, or the error text.
+    pub results: Mutex<VecDeque<Result<(), &'static str>>>,
+    /// The lock that each call takes after it records the call. A test holds it to block `train`.
+    pub gate: Arc<tokio::sync::Mutex<()>>,
+    /// The run ID and the set of each call, in order.
+    pub calls: Mutex<Vec<(String, TrainingSet)>>,
+}
+
+#[async_trait]
+impl Trainer for FakeTrainer {
+    async fn train(&self, run_id: &str, set: &TrainingSet) -> anyhow::Result<PathBuf> {
+        lock(&self.calls).push((run_id.to_owned(), set.clone()));
+        drop(self.gate.lock().await);
+        let result = lock(&self.results).pop_front();
+        result
+            .unwrap_or(Err("no scripted result"))
+            .map_err(anyhow::Error::msg)?;
+        let dir = self.dir.join(run_id);
+        std::fs::create_dir(&dir)?;
+        Ok(dir)
     }
 }
 
