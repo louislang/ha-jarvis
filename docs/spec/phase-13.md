@@ -499,7 +499,7 @@ The mute switch parts of AC-13.10-6 and AC-13.10-9 move to sub-phase 13.10c as A
 - The `Models` port has `release()` and `restore()`. `release` drops the model sessions and returns when no use of them is in progress. `restore` loads them again.
 - `LiveModels` in `src/lib.rs` implements `Models`. It keeps the sessions of the STT first and second pass, the System One model and TTS in one `tokio::sync::RwLock`. The `Classifier` wrapper of sub-phase 5.4 and new `SpeechToText` and `TextToSpeech` wrappers in `src/lib.rs` take a read guard with `try_read` for each use. A `Listening` session keeps its guard until it ends. When `try_read` fails, the use returns an error at once. `release` takes the write guard, so it waits for the uses in progress, and drops the sessions. `restore` loads them with the load function of `run` and releases the guard.
 - During the pause, `listen` fails, and the Wyoming adapter sends `error` (sub-phase 6.9). `handle` gets the error from `predict` and returns `Err` with a `failure` text (AC-5.3-5). Jarvis does not answer, and it keeps no request for later.
-- When `restore` fails, `run` returns the error, as when a load fails at startup (AC-5.4-3).
+- When `restore` fails, `run` returns the error, as when a load fails at startup (AC-5.4-3). Sub-phase 13.10g adds this.
 - The training run swaps the System One model through the `Classifier` wrapper.
 - `run` builds `LiveModels`. Nothing calls `release` in `run` before sub-phase 13.10e.
 
@@ -555,7 +555,7 @@ AC-13.10d-1 moves to sub-phase 13.10f as AC-13.10f-1.
   4. `Models::restore`, after a success or an error of the local `Trainer`.
   5. Call `switch.turn_off` for each switch that step 1 kept, also when `restore` failed. A failed call logs one `warn` event with the switch and the error.
   6. The RunPod fallback of sub-phase 13.10. Jarvis answers during the RunPod call, and the satellites are not muted.
-- When `restore` fails, the training task ends with the error after step 5 (sub-phase 13.10d).
+- When `restore` fails, the training run ends with the error after step 5, and it does not call the RunPod `Trainer`. Sub-phase 13.10g then stops Jarvis (sub-phase 13.10d).
 - `run` gives the training run the `Home` port and `LiveModels`.
 - The conformance driver compares `paused` with the release state of `FakeModels`. After a start action, it waits until the local `FakeTrainer` has the call.
 
@@ -575,11 +575,35 @@ AC-13.10d-1 moves to sub-phase 13.10f as AC-13.10f-1.
 
 ---
 
+### 13.10g Restore Failure
+
+**Goal:** Stop Jarvis when its models do not load again after a local training run. The service manager then starts Jarvis again, and a Jarvis without models does not stay up.
+
+- **Implements:** G16, G18. **Depends on:** 13.10e.
+- **Files:** modify `src/app/training.rs`, `src/lib.rs`.
+
+**Model.**
+
+- `Training` gets the sender of a `tokio::sync::watch` channel of `Option<String>`. When `restore` fails in step 3 of sub-phase 13.10e, the run sends the error text after step 5, then ends with the error.
+- `run` gives the sender to the training run. `serve_until` also completes when the receiver gets a text. Then `run` stops the server and waits as after a shutdown (`drain`), and returns an error with the text, as when a load fails at startup (AC-5.4-3).
+
+**Acceptance criteria.**
+
+- AC-13.10g-1: When `restore` of `FakeModels` fails, the receiver gets the error text after the unmute calls, and `FakeRunPodTrainer` records no call.
+- AC-13.10g-2: When the receiver gets a text, `serve_until` returns an error with that text, and the Wyoming port accepts no new connection.
+
+**Proofs.**
+
+- P-13.10g-1. Argument: the send is in the `Err` arm of `restore`, after the unmute calls of step 5, and the run returns before step 6.
+- P-13.10g-2. Evidence: test.
+
+---
+
 ### 13.10b Training Status
 
 **Goal:** Show `training` in the status of Jarvis during a local training run, and make a training run and a save of the settings exclude each other. You see the pause in the Jarvis tab and in `sensor.jarvis_status`, and a restart never stops a run.
 
-- **Implements:** G16, G24. **Depends on:** 13.10e.
+- **Implements:** G16, G24. **Depends on:** 13.10g.
 - **Files:** modify `src/ports.rs`, `src/app/training.rs`, `src/lib.rs`.
 
 **Model.**
