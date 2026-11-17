@@ -513,25 +513,42 @@ fn check_kind_templates(
     slots: &BTreeSet<String>,
 ) -> Result<(), ProposalError> {
     let target = proposal.target.unwrap_or_default();
-    // The pool variables of a command are those of a fetch without `response`.
-    let allowed = responses::pool_variables(slots.clone(), Kind::Command, target);
     match proposal.kind {
         LearnedKind::Command => {
+            let allowed = responses::pool_variables(slots.clone(), Kind::Command, target);
             for template in proposal.data.values() {
                 check_template(template.as_str(), &allowed, "data")?;
             }
         }
-        LearnedKind::Fetch => {
-            // The responses use only the pool variables, so the first variable outside `allowed`
-            // is `response` exactly when a response uses it.
-            for response in &proposal.responses {
-                match catalog::unknown_variable(response.as_str(), &allowed) {
-                    Ok(Some(variable)) if variable.as_str() == "response" => {}
-                    _ => return Err(ProposalError::Field("responses")),
-                }
-            }
-        }
+        LearnedKind::Fetch => check_uses_response(proposal, slots, target)?,
         _ => {}
+    }
+    Ok(())
+}
+
+/// Checks that each response of a fetch `proposal` with `slots` and `target` uses `response`.
+#[verus_verify]
+fn check_uses_response(
+    proposal: &LearnedIntent,
+    slots: &BTreeSet<String>,
+    target: Target,
+) -> Result<(), ProposalError> {
+    let mut others = BTreeSet::new();
+    let named = slots.iter();
+    for slot in named {
+        if slot.as_str() != "response" {
+            others.insert(slot.clone());
+        }
+    }
+    // The pool variables of a command are those of a fetch without `response`. The responses use
+    // only the pool variables, so the first variable outside `others` is `response` exactly when
+    // a response uses it.
+    let others = responses::pool_variables(others, Kind::Command, target);
+    for response in &proposal.responses {
+        match catalog::unknown_variable(response.as_str(), &others) {
+            Ok(Some(variable)) if variable.as_str() == "response" => {}
+            _ => return Err(ProposalError::Field("responses")),
+        }
     }
     Ok(())
 }
@@ -702,6 +719,13 @@ mod tests {
         check(changed, &[]).expect_err("the proposal is not valid")
     }
 
+    /// Asserts that `check` accepts a valid proposal of `kind` after `change`.
+    fn passes(kind: LearnedKind, change: Change) {
+        let mut changed = proposal(kind);
+        change(&mut changed);
+        assert_eq!(check(changed.clone(), &[]), Ok(changed));
+    }
+
     /// The error that names `name`.
     fn field(name: &'static str) -> ProposalError {
         ProposalError::Field(name)
@@ -830,9 +854,11 @@ mod tests {
     /// AC-14.2c-1.
     #[test]
     fn ac_14_2c_1_fetch_and_prefetch_fields_are_named() {
-        for kind in [LearnedKind::Fetch, LearnedKind::Prefetch] {
-            assert_eq!(check(proposal(kind), &[]), Ok(proposal(kind)));
-        }
+        passes(LearnedKind::Fetch, |_| {});
+        passes(LearnedKind::Prefetch, |_| {});
+        passes(LearnedKind::Fetch, |proposal| {
+            proposal.examples[0] = "good night [today](response)".to_owned();
+        });
         let fetch = |change: Change| refused(LearnedKind::Fetch, change);
         let prefetch = |change: Change| refused(LearnedKind::Prefetch, change);
         let service: Change = |proposal| proposal.service = Some("light.turn_on".to_owned());
