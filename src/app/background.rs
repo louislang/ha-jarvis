@@ -1,9 +1,11 @@
 //! Hot cache sync, response backfill, the request habit store, the learned intent check, the daily
 //! log prune and the hotword refresh.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::mem;
+use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -396,6 +398,8 @@ pub struct Learning {
     pub changes: mpsc::Sender<Change>,
     /// The time of the window.
     pub clock: Arc<dyn Clock>,
+    /// The request habits, which get the times of the clusters.
+    pub habits: Arc<Habits>,
 }
 
 impl Learning {
@@ -418,14 +422,52 @@ impl Learning {
         let saved = tokio::task::spawn_blocking(move || store.load()).await??;
         let mut learned = saved.unwrap_or_default().intents;
         let distance = self.config.cluster_distance;
+        let mut habits: BTreeMap<String, Vec<Timestamp>> = BTreeMap::new();
         for cluster in learn::clusters(&points, distance, self.config.min_cluster) {
-            if learn::covering(&cluster, &learned, distance).is_none() {
-                let entry = self.entry(cluster, &learned).await?;
-                self.save(entry.clone());
-                learned.push(entry);
+            if let Some((name, times)) = self.learn(cluster, &mut learned).await? {
+                habits.entry(name).or_default().extend(times);
             }
         }
+        self.record(habits);
         Ok(())
+    }
+
+    /// The name of the covering entry of `cluster` in `learned` with the times of the cluster,
+    /// or the same for the entry of a new proposal, which it saves and adds to `learned`. Gives
+    /// `None` when the entry gets no request habits.
+    ///
+    /// # Errors
+    ///
+    /// `propose` fails.
+    async fn learn(
+        &self,
+        cluster: Cluster,
+        learned: &mut Vec<LearnedIntent>,
+    ) -> anyhow::Result<Option<(String, Vec<Timestamp>)>> {
+        let distance = self.config.cluster_distance;
+        let times = cluster.times.clone();
+        if let Some(name) = learn::covering(&cluster, learned, distance) {
+            // `covering` borrows the name of the matched entry, and an invalid entry can reuse
+            // the name of another, so the match is by address.
+            let matched = |entry: &&LearnedIntent| ptr::eq(entry.name.as_str(), name);
+            let entry = learned.iter().find(matched);
+            return Ok(entry.and_then(|entry| habit(entry, times)));
+        }
+        let entry = self.entry(cluster, learned).await?;
+        self.save(entry.clone());
+        let found = habit(&entry, times);
+        learned.push(entry);
+        Ok(found)
+    }
+
+    /// Observes the times of each key of `habits` in time order, so that each day counts.
+    fn record(&self, habits: BTreeMap<String, Vec<Timestamp>>) {
+        for (name, mut times) in habits {
+            times.sort();
+            for time in times {
+                self.habits.observe(name.clone(), time);
+            }
+        }
     }
 
     /// The System Two requests of the window with their embeddings.
@@ -501,6 +543,16 @@ impl Learning {
         // Without the pools task, Jarvis stops, and the next start proposes the cluster again.
         let _ = self.changes.send(change);
     }
+}
+
+/// The name of `entry` with `times` when the entry is `pending`, `active` or `requested`. The
+/// name of a `none` or `rejected` entry can be invalid or never become an intent.
+fn habit(entry: &LearnedIntent, times: Vec<Timestamp>) -> Option<(String, Vec<Timestamp>)> {
+    use LearnedStatus::Active;
+    use LearnedStatus::Pending;
+    use LearnedStatus::Requested;
+    let counted = matches!(entry.status, Pending | Active | Requested);
+    counted.then(|| (entry.name.clone(), times))
 }
 
 /// Adds `entry` to the learned intents of `store`.
@@ -1387,6 +1439,9 @@ mod tests {
             );
             let config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
             let (store, (changes, receiver)) = (Arc::new(FakeStore::new(None)), mpsc::channel());
+            let cache = watch::channel(StateCache::load(house())).1;
+            let model = RequestHabits::default();
+            let habits = Arc::new(Habits::new(model, config.habits.half_life_days, cache));
             let learning = Learning {
                 config: config.learn,
                 log: Arc::clone(&log) as _,
@@ -1396,6 +1451,7 @@ mod tests {
                 store: Arc::clone(&store) as _,
                 changes,
                 clock: Arc::new(FakeClock(monday() + SignedDuration::from_hours(24))),
+                habits,
             };
             Self {
                 reasoner,
@@ -1675,5 +1731,101 @@ mod tests {
     #[quint_run(spec = "quint/learned.qnt", max_steps = 30, seed = "1")]
     fn ac_14_5d_1_conformance() -> impl Driver {
         LearnedDriver::new(BTreeMap::new(), BTreeMap::new())
+    }
+
+    /// The days after Monday and the second embedding values of five requests at 07:10 on
+    /// Monday, Tuesday and Wednesday along the axis [`X`].
+    const DAYS: [(i64, f32); 5] = [(0, 0.0), (0, 0.0), (1, 0.0), (1, 0.0), (2, 0.0)];
+
+    /// The habit model after each of `checks` checks with the learned entries `intents`, of a
+    /// log with a request at 07:10 on each day after Monday of `requests`, with the embedding
+    /// `[1, y, 0.01]` of its value `y`.
+    async fn calendar_habits(
+        intents: Vec<LearnedIntent>,
+        requests: &[(i64, f32)],
+        checks: usize,
+    ) -> anyhow::Result<Vec<RequestHabits>> {
+        let learner = Learner::empty();
+        learner.store.save(&Learned { intents })?;
+        for (index, (day, y)) in requests.iter().enumerate() {
+            let text = format!("what is on the calendar {index}");
+            learner
+                .log
+                .defer(&text, monday() + SignedDuration::from_hours(24 * day - 1));
+            learner
+                .reasoner
+                .script_embedding(&text, vec![1.0, *y, 0.01]);
+        }
+        let mut models = Vec::new();
+        for _ in 0..checks {
+            learner.learning.check().await;
+            models.push(learner.learning.habits.current().unwrap_or_default());
+        }
+        Ok(models)
+    }
+
+    /// AC-14.5e-1.
+    #[tokio::test]
+    async fn ac_14_5e_1_covered_cluster_records_its_usual_time() -> anyhow::Result<()> {
+        let models = calendar_habits(vec![calendar(LearnedStatus::Active, X)], &DAYS, 1).await?;
+        assert_eq!(usual(&models[0])?, vec![SEVEN]);
+        Ok(())
+    }
+
+    /// The bucket of the calendar requests.
+    const SEVEN: Bucket = Bucket {
+        day: DayType::Weekdays,
+        hour: 7,
+    };
+
+    /// The usual times of `family_calendar` in `model` on the Wednesday after `monday()`.
+    fn usual(model: &RequestHabits) -> anyhow::Result<Vec<Bucket>> {
+        let last = monday() + SignedDuration::from_hours(47);
+        let wednesday = TimeZone::get("America/Chicago")?.to_datetime(last).date();
+        Ok(model.usual_times("family_calendar", wednesday, 14.0, 2.0))
+    }
+
+    /// AC-14.5e-2.
+    #[tokio::test]
+    async fn ac_14_5e_2_same_times_do_not_change_the_model() -> anyhow::Result<()> {
+        let models = calendar_habits(vec![calendar(LearnedStatus::Active, X)], &DAYS, 2).await?;
+        assert_eq!(models[0], models[1]);
+        assert_ne!(models[0], RequestHabits::default());
+        Ok(())
+    }
+
+    /// The axis of the embeddings of the calendar requests.
+    const X: [f32; 3] = [1.0, 0.0, 0.0];
+
+    /// An entry `family_calendar` with `status` and `centroid`.
+    fn calendar(status: LearnedStatus, centroid: [f32; 3]) -> LearnedIntent {
+        let mut entry = proposal(LearnedKind::Command, None);
+        entry.name = "family_calendar".to_owned();
+        entry.status = status;
+        entry.centroid = centroid.to_vec();
+        entry
+    }
+
+    /// A cluster that a `none` entry covers records nothing under an earlier entry with the same
+    /// name.
+    #[tokio::test]
+    async fn covering_none_entry_with_a_reused_name_records_nothing() -> anyhow::Result<()> {
+        let active = calendar(LearnedStatus::Active, [0.0, 1.0, 0.0]);
+        let models =
+            calendar_habits(vec![active, calendar(LearnedStatus::None, X)], &DAYS, 1).await?;
+        assert_eq!(models[0], RequestHabits::default());
+        Ok(())
+    }
+
+    /// Two clusters that one entry covers count in time order: Monday and Wednesday in one,
+    /// Tuesday in the other.
+    #[tokio::test]
+    async fn clusters_of_one_entry_count_in_time_order() -> anyhow::Result<()> {
+        let mut requests = [(1, -0.2); 10];
+        requests[..5].copy_from_slice(&[(0, 0.2), (0, 0.2), (0, 0.2), (2, 0.2), (2, 0.2)]);
+        let entries = vec![calendar(LearnedStatus::Active, X)];
+        let models = calendar_habits(entries, &requests, 1).await?;
+        assert_eq!(usual(&models[0])?, vec![SEVEN]);
+        Ok(())
     }
 }

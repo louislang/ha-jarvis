@@ -1444,8 +1444,11 @@ type Tasks = (JoinHandle<()>, (JoinHandle<()>, JoinHandle<()>));
 /// The `RunPod` trainer of the training trigger and the plugin tools of the learned intent check.
 type Extras = (Option<Arc<dyn Trainer>>, Vec<Tool>);
 
-/// The [`Extras`] and the sender of the pools task of the learned intent check.
-type Checks = (Extras, mpsc::Sender<Change>);
+/// The sender of the pools task and the request habits of the learned intent check.
+type Learn = (mpsc::Sender<Change>, Arc<Habits>);
+
+/// The [`Extras`] and the [`Learn`] of the learned intent check.
+type Checks = (Extras, Learn);
 
 /// The longest wait of [`run`] for the running tasks and the saves after the shutdown future
 /// completes.
@@ -1816,7 +1819,7 @@ async fn start_app_with(
         home,
         &cache,
         &catalog,
-        (extras, task.changes.clone()),
+        (extras, (task.changes.clone(), habits.habits.clone())),
     )
     .await?;
     let prerender = start_prerender(&speech, &task.pools, &cache);
@@ -1847,7 +1850,7 @@ async fn start_app_with(
 /// of the error text of a failed `restore`. Starts the training trigger on the log with
 /// `reasoner`, `catalog`, the hot cache `cache`, the `RunPod` trainer of `checks`, the house
 /// `home` and the live models `models`, and the learned intent check of [`start_checks`] with the
-/// plugin tools and the pools task of `checks`. Also gives the two check tasks and the
+/// plugin tools, the pools task and the request habits of `checks`. Also gives the two check tasks and the
 /// [`Shared`] of the trigger.
 ///
 /// # Errors
@@ -1860,7 +1863,7 @@ fn start_log(
     catalog: &Arc<Catalog>,
     reasoner: &Arc<dyn Reasoner>,
     cache: &watch::Receiver<StateCache>,
-    ((runpod, tools), changes): Checks,
+    ((runpod, tools), learn): Checks,
     (home, models): (Arc<dyn Home>, Arc<LiveModels>),
 ) -> anyhow::Result<(Recorder, Logged)> {
     let (log, last_id) = open_log(config)?;
@@ -1876,13 +1879,13 @@ fn start_log(
         (home, models, stop, shared.clone()),
     )?;
     let (recorded, (writer, review)) = recorder(listener, catalog, &log, last_id, &trigger);
-    let checks = start_checks(config, trigger, log, (reasoner, catalog), (changes, tools))?;
+    let checks = start_checks(config, trigger, log, (reasoner, catalog), (learn, tools))?;
     Ok((recorded, ((writer, checks), review, stopped, shared)))
 }
 
 /// Starts the training trigger `trigger` each `train.check_interval_s`, and the learned intent
-/// check of `config` on `log` with `reasoner`, `catalog`, and the pools task and the plugin tools
-/// of `learn` each `learn.check_interval_s`. Gives both tasks.
+/// check of `config` on `log` with `reasoner`, `catalog`, the pools task and the request habits
+/// of `learn` and the plugin tools `tools` each `learn.check_interval_s`. Gives both tasks.
 ///
 /// # Errors
 ///
@@ -1892,7 +1895,7 @@ fn start_checks(
     trigger: Arc<Trigger>,
     log: Arc<dyn InteractionLog>,
     (reasoner, catalog): (&Arc<dyn Reasoner>, &Arc<Catalog>),
-    (changes, tools): (mpsc::Sender<Change>, Vec<Tool>),
+    ((changes, habits), tools): (Learn, Vec<Tool>),
 ) -> anyhow::Result<(JoinHandle<()>, JoinHandle<()>)> {
     let learning = Learning {
         config: config.learn.clone(),
@@ -1903,6 +1906,7 @@ fn start_checks(
         store: Arc::new(FileStore::try_new(config.learn.file.clone())?),
         changes,
         clock: Arc::new(SystemClock),
+        habits,
     };
     let learn = Duration::from_secs(config.learn.check_interval_s);
     let train = Duration::from_secs(config.train.check_interval_s);
