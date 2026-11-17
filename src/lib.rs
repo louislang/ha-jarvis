@@ -301,7 +301,7 @@ impl Config {
     }
 
     /// The name and the value of each timeout and interval.
-    fn durations(&self) -> [(&'static str, u64); 16] {
+    fn durations(&self) -> [(&'static str, u64); 17] {
         let (ha, asr, openai) = (&self.ha, &self.asr, &self.openai);
         [
             ("ha.request_timeout_ms", ha.request_timeout_ms),
@@ -320,6 +320,7 @@ impl Config {
             ("dialog.timeout_s", self.dialog.timeout_s),
             ("habits.save_interval_s", self.habits.save_interval_s),
             ("train.check_interval_s", self.train.check_interval_s),
+            ("learn.check_interval_s", self.learn.check_interval_s),
         ]
     }
 
@@ -2616,6 +2617,17 @@ mod tests {
         };
         assert_eq!(Config::parse(VALID)?, expected);
         Ok(())
+    }
+
+    /// A zero `learn.check_interval_s` is an error, so the check task never gets a zero interval.
+    #[test]
+    fn zero_learn_interval_names_field_and_range() {
+        let text = VALID.replace("check_interval_s = 3600", "check_interval_s = 0");
+        let error = parse_error(&text);
+        assert!(
+            error.contains("learn.check_interval_s") && error.contains("more than 0"),
+            "error for learn.check_interval_s = 0 has no field or range: {error}"
+        );
     }
 
     /// AC-14.5c-2.
