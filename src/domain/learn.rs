@@ -12,6 +12,7 @@ use vstd::prelude::*;
 use crate::domain::catalog;
 use crate::domain::catalog::Catalog;
 use crate::domain::catalog::Filter;
+use crate::domain::catalog::Intent;
 use crate::domain::catalog::Kind;
 use crate::domain::catalog::Target;
 use crate::domain::intent;
@@ -84,6 +85,8 @@ pub struct LearnedIntent {
     pub texts: Vec<String>,
     /// The path of the plugin request file.
     pub request_file: Option<String>,
+    /// The time of the activation.
+    pub activated: Option<Timestamp>,
 }
 
 /// Where a learned entry is in its lifecycle.
@@ -614,6 +617,50 @@ pub fn initial_status(proposal: &LearnedIntent) -> LearnedStatus {
     }
 }
 
+/// The catalog intent of an `active` entry with a response, except a `new_plugin` or `none` entry.
+#[verus_verify]
+#[must_use]
+pub fn intent(entry: LearnedIntent) -> Option<Intent> {
+    let kind = pool_kind(entry.kind)?;
+    if !matches!(entry.status, LearnedStatus::Active) || entry.responses.is_empty() {
+        return None;
+    }
+    Some(Intent {
+        name: entry.name,
+        kind,
+        examples: entry.examples,
+        verbs: Vec::new(),
+        needs_speaker: false,
+        optional: Vec::new(),
+        service: entry.service,
+        plugin: entry.plugin,
+        target: entry.target.unwrap_or_default(),
+        entity: entry.entity,
+        select: entry.select,
+        exclude: Vec::new(),
+        state: None,
+        data: entry.data,
+        search: false,
+        fresh_min: entry.fresh_min,
+    })
+}
+
+/// `catalog` with the intent of each entry of `learned` that `catalog` does not name, in order.
+#[verus_verify]
+#[must_use]
+pub fn live(catalog: Catalog, learned: Vec<LearnedIntent>) -> Catalog {
+    let mut live = catalog;
+    for entry in learned {
+        match intent(entry) {
+            Some(intent) if !intent_named(intent.name.as_str(), &live.intents) => {
+                live.intents.push(intent);
+            }
+            _ => {}
+        }
+    }
+    live
+}
+
 verus! {
 
 broadcast use crate::domain::contracts::axiom_string_obeys_cmp;
@@ -741,6 +788,7 @@ mod tests {
             status: LearnedStatus::None,
             texts: Vec::new(),
             request_file: None,
+            activated: None,
         }
     }
 

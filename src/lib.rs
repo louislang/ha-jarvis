@@ -66,6 +66,7 @@ use crate::adapters::runpod::RunPodTrainer;
 use crate::adapters::sherpa::SherpaStt;
 use crate::adapters::sqlite::SqliteLog;
 use crate::adapters::supertonic::SupertonicTts;
+use crate::app::background::Activation;
 use crate::app::background::Backfill;
 use crate::app::background::Habits;
 use crate::app::background::HabitsTask;
@@ -1442,14 +1443,20 @@ type Logged = (Tasks, Reviewer, watch::Receiver<Option<String>>, Shared);
 /// The log writer task, the training trigger task and the learned intent check task.
 type Tasks = (JoinHandle<()>, (JoinHandle<()>, JoinHandle<()>));
 
-/// The `RunPod` trainer of the training trigger and the plugin tools of the learned intent check.
-type Extras = (Option<Arc<dyn Trainer>>, Vec<Tool>);
+/// The `RunPod` trainer of the training trigger, and the tools and the live catalog of the check.
+type Extras = (Option<Arc<dyn Trainer>>, (Vec<Tool>, Arc<ArcSwap<Catalog>>));
 
 /// The sender of the pools task and the request habits of the learned intent check.
 type Learn = (mpsc::Sender<Change>, Arc<Habits>);
 
 /// The [`Extras`] and the [`Learn`] of the learned intent check.
 type Checks = (Extras, Learn);
+
+/// The [`Checks`] with the activation in place of the live catalog and the pools task.
+type Activated = (
+    (Option<Arc<dyn Trainer>>, Vec<Tool>),
+    (Activation, Arc<Habits>),
+);
 
 /// The training trigger task and the learned intent check task, and the review.
 type Checked = ((JoinHandle<()>, JoinHandle<()>), Reviewer);
@@ -1777,11 +1784,11 @@ fn registry(config: &Config, plugins: Vec<Arc<dyn Plugin>>) -> Arc<Plugins> {
 }
 
 /// The app of [`start_app_with`] with System Two on `reasoner` and the plugin registry `plugins`,
-/// and with the `RunPod` trainer `runpod` and the tools of `plugins`.
+/// and with the `RunPod` trainer `runpod`, the tools of `plugins` and [`learned`].
 ///
 /// # Errors
 ///
-/// [`start_app_with`] fails.
+/// [`learned`] or [`start_app_with`] fails.
 async fn start_app(
     config: &Config,
     catalog: Arc<Catalog>,
@@ -1793,7 +1800,8 @@ async fn start_app(
 ) -> anyhow::Result<Started> {
     let tools = plugins.tools();
     let system_two = system_two(config, Arc::clone(&reasoner), plugins);
-    let extras = (runpod, tools);
+    let (live, pools) = learned(config, &catalog, pools)?;
+    let extras = (runpod, (tools, live));
     start_app_with(config, catalog, pools, home, reasoner, system_two, extras).await
 }
 
@@ -1854,20 +1862,19 @@ async fn start_app_with(
 /// of the error text of a failed `restore`. Starts the training trigger on the log with
 /// `reasoner`, `catalog`, the hot cache `cache`, the `RunPod` trainer of `checks`, the house
 /// `home` and the live models `models`, and the learned intent check of [`start_checks`] with the
-/// plugin tools, the pools task and the request habits of `checks`. Also gives the two check tasks and the
+/// plugin tools, the activation and the request habits of `checks`. Also gives the two check tasks and the
 /// [`Shared`] of the trigger.
 ///
 /// # Errors
 ///
-/// The log cannot open, or a store path of `[train]` or `[learn]` is not a `.toml` or `.json`
-/// file.
+/// The log cannot open, or a store path of `[train]` is not a `.toml` or `.json` file.
 fn start_log(
     config: &Config,
     listener: &Listener,
     catalog: &Arc<Catalog>,
     reasoner: &Arc<dyn Reasoner>,
     cache: &watch::Receiver<StateCache>,
-    ((runpod, tools), learn): Checks,
+    ((runpod, tools), learn): Activated,
     (home, models): (Arc<dyn Home>, Arc<LiveModels>),
 ) -> anyhow::Result<(Recorder, Logged)> {
     let (log, last_id) = open_log(config)?;
@@ -1883,31 +1890,26 @@ fn start_log(
         (home, models, stop, shared.clone()),
     )?;
     let (recorded, writer) = recorder(listener, &log, last_id, &trigger);
-    let (checks, review) = start_checks(config, trigger, log, (reasoner, catalog), (learn, tools))?;
+    let (checks, review) = start_checks(config, trigger, log, (reasoner, catalog), (learn, tools));
     Ok((recorded, ((writer, checks), review, stopped, shared)))
 }
 
 /// Starts the training trigger `trigger` each `train.check_interval_s`, and the learned intent
-/// check of `config` on `log` with `reasoner`, `catalog`, the pools task and the request habits
+/// check of `config` on `log` with `reasoner`, `catalog`, the activation and the request habits
 /// of `learn` and the plugin tools `tools` each `learn.check_interval_s`. Gives both tasks, and the
 /// review of `log` with the intent names of `catalog` and the learned intents file of the check.
-///
-/// # Errors
-///
-/// `learn.file` is not a `.toml` or `.json` file.
 fn start_checks(
     config: &Config,
     trigger: Arc<Trigger>,
     log: Arc<dyn InteractionLog>,
     (reasoner, catalog): (&Arc<dyn Reasoner>, &Arc<Catalog>),
-    ((changes, habits), tools): (Learn, Vec<Tool>),
-) -> anyhow::Result<Checked> {
-    let store: Arc<dyn Store<Learned>> = Arc::new(FileStore::try_new(config.learn.file.clone())?);
+    ((activation, habits), tools): ((Activation, Arc<Habits>), Vec<Tool>),
+) -> Checked {
     let review = Reviewer::new(
         Arc::clone(&log),
         catalog,
-        Arc::clone(&store),
-        changes.clone(),
+        Arc::clone(&activation.store),
+        activation.changes.clone(),
     );
     let learning = Learning {
         config: config.learn.clone(),
@@ -1915,9 +1917,7 @@ fn start_checks(
         reasoner: Arc::clone(reasoner),
         catalog: Arc::clone(catalog),
         tools,
-        store,
-        changes,
-        clock: Arc::new(SystemClock),
+        activation,
         habits,
     };
     let learn = Duration::from_secs(config.learn.check_interval_s);
@@ -1926,7 +1926,7 @@ fn start_checks(
         app::training::start_trigger(trigger, train),
         app::background::start_learning(learning, learn),
     );
-    Ok((tasks, review))
+    (tasks, review)
 }
 
 /// The log of `config` and its largest stored ID. Starts the daily prune of the log.
@@ -2081,6 +2081,46 @@ fn start_stores(
     Ok((task, habits))
 }
 
+/// The live catalog of `catalog` and the entries of `learn.file` of `config`, and the source pools
+/// `pools` with the pool of each entry with an intent and a new name. Fails when the file or its
+/// store cannot load.
+fn learned(
+    config: &Config,
+    catalog: &Catalog,
+    mut pools: Pools,
+) -> anyhow::Result<(Arc<ArcSwap<Catalog>>, Pools)> {
+    let store = FileStore::try_new(config.learn.file.clone())?;
+    let entries = Store::<Learned>::load(&store)?.unwrap_or_default().intents;
+    let live = domain::learn::live(catalog.clone(), entries.clone());
+    for entry in entries {
+        if !pools.contains_key(&entry.name) && domain::learn::intent(entry.clone()).is_some() {
+            pools.insert(entry.name, app::background::pool(&entry.responses));
+        }
+    }
+    Ok((Arc::new(ArcSwap::from_pointee(live)), pools))
+}
+
+/// The speech use case on `tts`, and `checks` with the activation of `learn.file` of `config` with
+/// the speech use case, the hot cache `cache` and the system time. Fails when the path of
+/// `learn.file` is not a `.toml` or `.json` file.
+fn activation(
+    config: &Config,
+    ((runpod, (tools, catalog)), (changes, habits)): Checks,
+    tts: Arc<dyn TextToSpeech>,
+    cache: &watch::Receiver<StateCache>,
+) -> anyhow::Result<(Arc<Speech>, Activated)> {
+    let speech = Arc::new(Speech::new(tts));
+    let activation = Activation {
+        store: Arc::new(FileStore::try_new(config.learn.file.clone())?),
+        changes,
+        speech: Arc::clone(&speech),
+        cache: cache.clone(),
+        catalog,
+        clock: Arc::new(SystemClock),
+    };
+    Ok((speech, ((runpod, tools), (activation, habits))))
+}
+
 /// The backfill of `config` with `reasoner`, the pools task of `changes`, the pre-render of
 /// `speech`, `catalog` and the hot cache `cache`.
 fn backfill(
@@ -2115,12 +2155,12 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
 /// The live models of `config`, then the listener on their STT, which predicts with their System
 /// One model, sees the dialogs of `queues` and warms `reasoner`, the speech use case on their TTS,
 /// and the recorder of [`start_log`]. Starts the hotword refresh of the STT with `home`, `cache`
-/// and `catalog`, and the training trigger and the learned intent check with `checks`, `home` and
-/// the live models.
+/// and `catalog`, and the training trigger and the learned intent check with `checks`, `home`,
+/// the live models and the [`activation`].
 ///
 /// # Errors
 ///
-/// The training state, a model or the log cannot load.
+/// The training state, a model, the log or the store of `learn.file` cannot load.
 async fn load_models(
     config: &Config,
     reasoner: &Arc<dyn Reasoner>,
@@ -2132,7 +2172,8 @@ async fn load_models(
 ) -> anyhow::Result<(Arc<LiveModels>, Listener, Arc<Speech>, (Recorder, Logged))> {
     let models = Arc::new(LiveModels::try_new(load(config)).await?);
     let live = models.live();
-    let (stt, speech) = (Arc::clone(&live) as _, Arc::new(Speech::new(live)));
+    let stt = Arc::clone(&live) as _;
+    let (speech, checks) = activation(config, checks, live, cache)?;
     start_hotwords(config, &home, cache, catalog, Arc::clone(&stt));
     let classifier = Arc::clone(models.classifier()) as _;
     let listener = listener(config, stt, classifier, Arc::clone(reasoner), queues);
@@ -2381,6 +2422,7 @@ mod tests {
     use crate::app::conversation::Queues;
     use crate::domain::habits::Bucket;
     use crate::domain::habits::DayType;
+    use crate::domain::learn::LearnedStatus;
     use crate::domain::responses::Pool;
     use crate::domain::responses::Pools;
     use crate::domain::responses::Response;
@@ -2650,6 +2692,20 @@ mod tests {
         let learn = Config::parse(VALID)?.learn;
         assert_eq!(learn.file, PathBuf::from("learned.toml"));
         assert_eq!(learn.check_interval_s, 3600);
+        Ok(())
+    }
+
+    /// A `none` entry that reuses the name of an active entry adds nothing to its start pool.
+    #[test]
+    fn start_pool_has_only_the_active_entry() -> anyhow::Result<()> {
+        let (folder, mut config) = (tempfile::tempdir()?, Config::parse(VALID)?);
+        config.learn.file = folder.path().join("learned.toml");
+        let mut reused = fakes::learned("tell_joke", LearnedStatus::None);
+        reused.responses = vec!["Not a joke.".to_owned()];
+        let intents = vec![fakes::learned("tell_joke", LearnedStatus::Active), reused];
+        FileStore::try_new(config.learn.file.clone())?.save(&Learned { intents })?;
+        let (_, pools) = learned(&config, &load_catalog(&config.intents)?, Pools::new())?;
+        assert_eq!(pools["tell_joke"].responses[0].text, "Good night.");
         Ok(())
     }
 
