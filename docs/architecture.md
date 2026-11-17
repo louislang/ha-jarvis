@@ -37,6 +37,7 @@ flowchart LR
         crate_domain_feedback[feedback]
         crate_domain_habits[habits]
         crate_domain_intent[intent]
+        crate_domain_learn[learn]
         crate_domain_model[model]
         crate_domain_responses[responses]
         crate_domain_select[select]
@@ -221,6 +222,7 @@ flowchart LR
     crate_domain_intent --> crate_domain_contracts
     crate_domain_intent --> crate_domain_intent
     crate_domain_intent --> crate_domain_training
+    crate_domain_learn --> crate_domain_contracts
     crate_domain_model --> crate_domain_contracts
     crate_domain_model --> crate_domain_intent
     crate_domain_responses --> crate_domain_catalog

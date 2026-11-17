@@ -12,6 +12,7 @@ use std::str::pattern::Pattern;
 use std::sync::Arc;
 use std::time::Duration;
 
+use dbscan::Classification;
 use jiff::SignedDuration;
 use jiff::Timestamp;
 use jiff::civil::Date;
@@ -1152,6 +1153,42 @@ pub fn ex_duration_checked_div(duration: Duration, rhs: u32) -> (quotient: Optio
         },
 {
     duration.checked_div(rhs)
+}
+
+/// The Euclidean distance of `a` and `b`.
+pub uninterp spec fn euclidean<T>(a: Seq<T>, b: Seq<T>) -> f64;
+
+/// Gives the Euclidean distance of `a` and `b`. <https://docs.rs/dbscan/0.3/dbscan/fn.euclidean_distance.html>
+#[verifier::external_fn_specification]
+pub fn ex_euclidean_distance<T>(a: &[T], b: &[T]) -> (distance: f64)
+    where
+        f64: From<T>,
+        T: Copy,
+    ensures
+        distance == euclidean(a@, b@),
+{
+    dbscan::euclidean_distance(a, b)
+}
+
+/// The DBSCAN class of a point. <https://docs.rs/dbscan/0.3/dbscan/enum.Classification.html>
+#[verifier::external_type_specification]
+pub struct ExClassification(Classification);
+
+/// Gives the DBSCAN class of each point of `input` with the largest neighbour distance `eps` and
+/// the fewest cluster points `min_points`. <https://docs.rs/dbscan/0.3/dbscan/fn.cluster.html>
+#[verifier::external_fn_specification]
+pub fn ex_cluster<T>(eps: f64, min_points: usize, input: &Vec<Vec<T>>) -> Vec<Classification>
+    where
+        T: Copy,
+        f64: From<T>,
+{
+    dbscan::cluster(eps, min_points, input)
+}
+
+/// Gives the square root of `value`. <https://doc.rust-lang.org/std/primitive.f32.html#method.sqrt>
+#[verifier::external_fn_specification]
+pub fn ex_f32_sqrt(value: f32) -> f32 {
+    value.sqrt()
 }
 
 } // verus!

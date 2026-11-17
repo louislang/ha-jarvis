@@ -131,6 +131,7 @@ pub mod domain {
     pub mod feedback;
     pub mod habits;
     pub mod intent;
+    pub mod learn;
     pub mod model;
     pub mod responses;
     pub mod select;
@@ -214,6 +215,8 @@ pub struct Config {
     pub habits: HabitsConfig,
     /// Training.
     pub train: TrainConfig,
+    /// Learned intents.
+    pub learn: LearnConfig,
     /// The interaction log.
     pub log: LogConfig,
     /// The web server of the Jarvis tab.
@@ -645,6 +648,19 @@ pub struct RunPodConfig {
     pub poll_s: u64,
     /// The time after which a job is cancelled.
     pub timeout_min: u64,
+}
+
+/// The `[learn]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LearnConfig {
+    /// The days of System Two requests that the clusters use.
+    pub window_days: u64,
+    /// The fewest requests of a cluster.
+    pub min_cluster: usize,
+    /// The largest distance between two close requests and between a cluster and its learned
+    /// entry.
+    pub cluster_distance: f64,
 }
 
 /// The `[log]` section.
@@ -2499,6 +2515,11 @@ mod tests {
             dialog: expected_dialog(),
             habits: expected_habits(),
             train: expected_train(),
+            learn: LearnConfig {
+                window_days: 14,
+                min_cluster: 5,
+                cluster_distance: 0.3,
+            },
             log: expected_log(),
             web: expected_web(),
             mqtt: Some(expected_mqtt()),
