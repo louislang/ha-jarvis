@@ -10,9 +10,11 @@ use vstd::prelude::*;
 use crate::domain::catalog;
 use crate::domain::catalog::Catalog;
 use crate::domain::catalog::Filter;
+use crate::domain::catalog::Kind;
 use crate::domain::catalog::Target;
 use crate::domain::intent;
 use crate::domain::intent::Rejection;
+use crate::domain::responses;
 
 #[cfg(verus_only)]
 use crate::domain::contracts::euclidean;
@@ -286,9 +288,9 @@ pub fn validate_proposal(
         return Err(ProposalError::Field("examples"));
     }
     let slots = check_examples(&proposal.examples)?;
-    let mut allowed = variables(&slots);
-    allowed.insert("response".to_owned());
-    if !matches!(proposal.kind, LearnedKind::NewPlugin) {
+    if let Some(kind) = pool_kind(proposal.kind) {
+        let target = proposal.target.unwrap_or_default();
+        let allowed = responses::pool_variables(slots, kind, target);
         for response in &proposal.responses {
             check_template(response.as_str(), &allowed, "responses")?;
         }
@@ -394,14 +396,17 @@ fn check_examples(examples: &[String]) -> Result<BTreeSet<String>, ProposalError
     Ok(slots)
 }
 
-/// `slots` with the built-ins `area`, `entity` and `person`.
+/// The catalog kind whose pool rules the responses of a proposal of `kind` follow, or none when
+/// the responses get no check.
 #[verus_verify]
-fn variables(slots: &BTreeSet<String>) -> BTreeSet<String> {
-    let mut variables = slots.clone();
-    for name in &["area", "entity", "person"] {
-        variables.insert((*name).to_owned());
+fn pool_kind(kind: LearnedKind) -> Option<Kind> {
+    match kind {
+        LearnedKind::Command => Some(Kind::Command),
+        LearnedKind::Query => Some(Kind::Query),
+        LearnedKind::Fetch => Some(Kind::Fetch),
+        LearnedKind::Prefetch => Some(Kind::Prefetch),
+        LearnedKind::NewPlugin | LearnedKind::None => None,
     }
-    variables
 }
 
 /// Checks that `template` parses and uses only `allowed` variables. The error names `field`.
@@ -651,5 +656,18 @@ mod tests {
         let learned = [entry("good_night", [1.0, 0.0, 0.0])];
         let result = check(proposal(LearnedKind::None), &learned);
         assert_eq!(result, Err(ProposalError::Field("name")));
+    }
+
+    /// AC-14.2b-4.
+    #[test]
+    fn ac_14_2b_4_responses_use_pool_variables() {
+        let mut query = proposal(LearnedKind::Query);
+        query.target = Some(Target::Entities);
+        query.responses = vec!["{{ entities | length }} lights are on.".to_owned()];
+        assert_eq!(check(query.clone(), &[]), Ok(query));
+        let error = refused(LearnedKind::Command, |proposal| {
+            proposal.responses = vec!["It is {{ response }}.".to_owned()];
+        });
+        assert_eq!(error, field("responses"));
     }
 }
