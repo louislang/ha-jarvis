@@ -547,7 +547,7 @@ AC-14.10-1, AC-14.10-2, AC-14.10-9 and AC-14.10-11 move to sub-phase 14.10c as A
 **Goal:** Prefetch the answer of each fetch intent with a usual time through its plugin, and refresh it at the `fresh_min` of the intent while the window is open. "What is the weather like?" at the usual time then gets System One speed with no filler.
 
 - **Implements:** G1, G11. **Depends on:** 14.10e.
-- **Files:** modify `src/app/background.rs`, `src/app/conversation.rs`, `src/lib.rs`.
+- **Files:** modify `src/app/background.rs`, `src/app/conversation.rs`, `src/domain/decide.rs` (`data` and `context` become public), `src/testing/e2e.rs` (AC-14.10b-8), `README.md` (`CLAUDE.md` workflow item 15).
 
 **Model.**
 
