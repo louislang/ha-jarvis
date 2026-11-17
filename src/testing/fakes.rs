@@ -60,6 +60,7 @@ use crate::app::training::Trigger;
 use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::feedback;
+use crate::domain::feedback::Action;
 use crate::domain::feedback::Deferred;
 use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
@@ -502,7 +503,9 @@ type Reply = oneshot::Receiver<anyhow::Result<Option<Value>>>;
 
 /// A `Reasoner` that counts the `warm` calls, records each question, answers with the scripted
 /// steps, keeps the reply of each call, records the pool of each `generate` call and holds
-/// it until `release`, records the target of each `paraphrase` call and gives its scripted result.
+/// it until `release`, records the target of each `paraphrase` call and gives its scripted result,
+/// gives the scripted embedding of each text, and records the texts of each `propose` call and
+/// gives the scripted proposals in order.
 #[derive(Default)]
 pub(crate) struct FakeReasoner {
     /// The number of `warm` calls.
@@ -521,6 +524,12 @@ pub(crate) struct FakeReasoner {
     paraphrased: Mutex<Vec<String>>,
     /// The `paraphrase` result of each target: the examples or the error text. Else no examples.
     paraphrases: Mutex<BTreeMap<String, Result<Vec<String>, &'static str>>>,
+    /// The embedding of each text. `embed` fails for a text without one.
+    embeddings: Mutex<BTreeMap<String, Vec<f32>>>,
+    /// The texts of each `propose` call, in order.
+    proposed: Mutex<Vec<Vec<String>>>,
+    /// The next proposals, in order. `propose` fails without one.
+    proposals: Mutex<VecDeque<LearnedIntent>>,
 }
 
 impl FakeReasoner {
@@ -591,6 +600,22 @@ impl FakeReasoner {
     ) {
         lock(&self.paraphrases).insert(target.to_owned(), result);
     }
+
+    /// Makes `embed` give `embedding` for `text`.
+    pub(crate) fn script_embedding(&self, text: &str, embedding: Vec<f32>) {
+        lock(&self.embeddings).insert(text.to_owned(), embedding);
+    }
+
+    /// The texts of each `propose` call, in order.
+    #[must_use]
+    pub(crate) fn proposed(&self) -> Vec<Vec<String>> {
+        lock(&self.proposed).clone()
+    }
+
+    /// Makes the next `propose` call without an earlier scripted proposal give `proposal`.
+    pub(crate) fn script_proposal(&self, proposal: LearnedIntent) {
+        lock(&self.proposals).push_back(proposal);
+    }
 }
 
 /// A sender of a tool result whose receiver is kept in `replies`.
@@ -660,17 +685,22 @@ impl Reasoner for FakeReasoner {
         result.unwrap_or(Ok(Vec::new())).map_err(anyhow::Error::msg)
     }
 
-    async fn embed(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
-        anyhow::bail!("no embeddings")
+    async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let embeddings = lock(&self.embeddings);
+        let embedding = |text: &String| embeddings.get(text).cloned();
+        let found: Option<Vec<Vec<f32>>> = texts.iter().map(embedding).collect();
+        found.ok_or_else(|| anyhow::anyhow!("no embedding"))
     }
 
     async fn propose(
         &self,
-        _texts: &[String],
+        texts: &[String],
         _intents: &[String],
         _tools: &[Tool],
     ) -> anyhow::Result<LearnedIntent> {
-        anyhow::bail!("no proposal")
+        lock(&self.proposed).push(texts.to_vec());
+        let proposal = lock(&self.proposals).pop_front();
+        proposal.ok_or_else(|| anyhow::anyhow!("no proposal"))
     }
 }
 
@@ -934,6 +964,32 @@ impl FakeLog {
             .collect();
         kept.sort_by_key(|interaction| interaction.time);
         kept
+    }
+
+    /// Appends a spoken request with `text` at `time` that System Two answered.
+    pub(crate) fn defer(&self, text: &str, time: Timestamp) {
+        let mut interactions = lock(&self.interactions);
+        let interaction = Interaction {
+            id: interactions.len() as u64,
+            time,
+            satellite: Some("assist_satellite.office".to_owned()),
+            transcript: text.to_owned(),
+            model_context: String::new(),
+            model: String::new(),
+            top_labels: Vec::new(),
+            slots: Vec::new(),
+            action: Action {
+                intent: "unknown".to_owned(),
+                targets: Vec::new(),
+            },
+            decision: Route::Llm,
+            service_calls: Vec::new(),
+            responses: Vec::new(),
+            latency_ms: None,
+            link: None,
+            marks: Vec::new(),
+        };
+        interactions.push((interaction, None));
     }
 
     /// Applies `change` to the interaction `id`.

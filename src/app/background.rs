@@ -1,5 +1,5 @@
-//! Hot cache sync, response backfill, the request habit store, the daily log prune and the hotword
-//! refresh.
+//! Hot cache sync, response backfill, the request habit store, the learned intent check, the daily
+//! log prune and the hotword refresh.
 
 use std::collections::BTreeSet;
 use std::collections::HashSet;
@@ -11,6 +11,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use jiff::SignedDuration;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde::Deserialize;
@@ -19,10 +20,18 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::BackfillConfig;
+use crate::LearnConfig;
 use crate::app::conversation::Change;
 use crate::app::speech::Speech;
 use crate::domain::catalog::Catalog;
+use crate::domain::feedback::Deferred;
 use crate::domain::habits::RequestHabits;
+use crate::domain::learn;
+use crate::domain::learn::Cluster;
+use crate::domain::learn::Learned;
+use crate::domain::learn::LearnedIntent;
+use crate::domain::learn::LearnedStatus;
+use crate::domain::learn::Point;
 use crate::domain::responses;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Pools;
@@ -36,6 +45,7 @@ use crate::ports::InteractionLog;
 use crate::ports::Reasoner;
 use crate::ports::SpeechToText;
 use crate::ports::Store;
+use crate::ports::Tool;
 
 /// The wait before the first retry of a failed snapshot.
 const FIRST_RETRY: Duration = Duration::from_secs(1);
@@ -366,6 +376,143 @@ pub fn start_habits(
     HabitsTask { habits, stop, task }
 }
 
+/// The learned intent check: the clusters of the System Two requests of the log and the
+/// proposals of System Two for them, saved to the learned intents file through the pools task.
+pub struct Learning {
+    /// The `[learn]` section.
+    pub config: LearnConfig,
+    /// The log of the System Two requests.
+    pub log: Arc<dyn InteractionLog>,
+    /// System Two.
+    pub reasoner: Arc<dyn Reasoner>,
+    /// The intent catalog.
+    pub catalog: Arc<Catalog>,
+    /// The plugin tools.
+    pub tools: Vec<Tool>,
+    /// The learned intents file.
+    pub store: Arc<dyn Store<Learned>>,
+    /// The sender of the pools task, which writes the file.
+    pub changes: mpsc::Sender<Change>,
+    /// The time of the window.
+    pub clock: Arc<dyn Clock>,
+}
+
+impl Learning {
+    /// Saves an entry for each cluster of the System Two requests of the window that no learned
+    /// entry covers. Logs a failed check.
+    pub async fn check(&self) {
+        if let Err(error) = self.try_check().await {
+            tracing::warn!("the learned intent check failed: {error:#}");
+        }
+    }
+
+    /// The check of [`Learning::check`].
+    ///
+    /// # Errors
+    ///
+    /// `deferred`, `embed`, `propose` or the load of the file fails.
+    async fn try_check(&self) -> anyhow::Result<()> {
+        let points = self.points().await?;
+        let store = Arc::clone(&self.store);
+        let saved = tokio::task::spawn_blocking(move || store.load()).await??;
+        let mut learned = saved.unwrap_or_default().intents;
+        let distance = self.config.cluster_distance;
+        for cluster in learn::clusters(&points, distance, self.config.min_cluster) {
+            if learn::covering(&cluster, &learned, distance).is_none() {
+                let entry = self.entry(cluster, &learned).await?;
+                self.save(entry.clone());
+                learned.push(entry);
+            }
+        }
+        Ok(())
+    }
+
+    /// The System Two requests of the window with their embeddings.
+    ///
+    /// # Errors
+    ///
+    /// `deferred` or `embed` fails.
+    async fn points(&self) -> anyhow::Result<Vec<Point>> {
+        let window = SignedDuration::from_hours(24 * i64::try_from(self.config.window_days)?);
+        let requests = self.log.deferred(self.clock.now() - window).await?;
+        let texts: Vec<String> = requests
+            .iter()
+            .map(|request| request.text.clone())
+            .collect();
+        let embeddings = self.reasoner.embed(&texts).await?;
+        let point = |(request, embedding): (Deferred, Vec<f32>)| Point {
+            text: request.text,
+            time: request.time,
+            spoken: request.spoken,
+            embedding,
+        };
+        Ok(requests.into_iter().zip(embeddings).map(point).collect())
+    }
+
+    /// The entry of the proposal of System Two for `cluster`, with its `initial_status`, or with
+    /// `none` after a `warn` event when it is not valid.
+    ///
+    /// # Errors
+    ///
+    /// `propose` fails.
+    async fn entry(
+        &self,
+        cluster: Cluster,
+        learned: &[LearnedIntent],
+    ) -> anyhow::Result<LearnedIntent> {
+        let entries = learned.iter().map(|entry| entry.name.clone());
+        let catalog = self
+            .catalog
+            .intents
+            .iter()
+            .map(|intent| intent.name.clone());
+        let names: Vec<String> = catalog.chain(entries).collect();
+        let proposal = self
+            .reasoner
+            .propose(&cluster.texts, &names, &self.tools)
+            .await?;
+        let plugins: BTreeSet<String> = self.tools.iter().map(|tool| tool.name.clone()).collect();
+        let valid = learn::validate_proposal(proposal.clone(), &self.catalog, learned, &plugins);
+        let status = match valid {
+            Ok(valid) => learn::initial_status(&valid),
+            Err(error) => {
+                tracing::warn!("the proposal {} is not valid: {error:?}", proposal.name);
+                LearnedStatus::None
+            }
+        };
+        Ok(LearnedIntent {
+            status,
+            texts: cluster.texts,
+            centroid: cluster.centroid,
+            ..proposal
+        })
+    }
+
+    /// Sends the pools task a change that adds `entry` to the learned intents file.
+    fn save(&self, entry: LearnedIntent) {
+        let store = Arc::clone(&self.store);
+        let change: Change = Box::new(move |pools| {
+            if let Err(error) = add(store.as_ref(), entry) {
+                tracing::warn!("the learned intents file did not change: {error:#}");
+            }
+            pools
+        });
+        // Without the pools task, Jarvis stops, and the next start proposes the cluster again.
+        let _ = self.changes.send(change);
+    }
+}
+
+/// Adds `entry` to the learned intents of `store`.
+///
+/// # Errors
+///
+/// `store` cannot load or save.
+fn add(store: &dyn Store<Learned>, entry: LearnedIntent) -> anyhow::Result<()> {
+    let mut learned = store.load()?.unwrap_or_default();
+    learned.intents.push(entry);
+    store.save(&learned)
+}
+
 /// Prunes `log` at the `clock` time once a day, the first time one day after the start. Logs a
 /// failed prune.
 pub async fn prune(log: Arc<dyn InteractionLog>, clock: Arc<dyn Clock>) {
@@ -464,8 +611,8 @@ struct LibraryItem {
     name: String,
 }
 
-/// Tests of the sync, backfill, habit, prune and hotword use cases and the conformance to
-/// `cache_sync.qnt` and `backfill.qnt`.
+/// Tests of the sync, backfill, habit, learned intent, prune and hotword use cases and the
+/// conformance to `cache_sync.qnt` and `backfill.qnt`.
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -489,8 +636,11 @@ mod tests {
     use super::*;
     use crate::Config;
     use crate::app::conversation;
+    use crate::domain::catalog::Filter;
+    use crate::domain::catalog::Target;
     use crate::domain::habits::Bucket;
     use crate::domain::habits::DayType;
+    use crate::domain::learn::LearnedKind;
     use crate::domain::state::Snapshot;
     use crate::domain::state::State;
     use crate::testing::fakes::FakeClock;
@@ -1191,5 +1341,169 @@ mod tests {
     #[quint_run(spec = "quint/backfill.qnt", max_steps = 30, seed = "1")]
     fn ac_8_4_5_conformance() -> impl Driver {
         BackfillDriver::new()
+    }
+
+    /// The learned intent check of the tests, its file and the receiver of its changes.
+    struct Learner {
+        /// System Two.
+        reasoner: Arc<FakeReasoner>,
+        /// The check.
+        learning: Learning,
+        /// The learned intents file.
+        store: Arc<FakeStore<Learned>>,
+        /// The receiver of the changes, in place of the pools task.
+        changes: mpsc::Receiver<Change>,
+    }
+
+    impl Learner {
+        /// A check of the catalog of `intents.toml` and the `[learn]` of `jarvis.toml` on a log
+        /// with the requests of [`jokes`] in the hours after `monday()`, each with a close embedding,
+        /// one day before the clock.
+        fn new() -> Self {
+            let (reasoner, log) = (
+                Arc::new(FakeReasoner::default()),
+                Arc::new(FakeLog::default()),
+            );
+            for (hour, text) in (1_u8..).zip(jokes()) {
+                log.defer(&text, monday() + SignedDuration::from_hours(hour.into()));
+                reasoner.script_embedding(&text, vec![1.0, 0.0, 0.01 * f32::from(hour)]);
+            }
+            let config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
+            let (store, (changes, receiver)) = (Arc::new(FakeStore::new(None)), mpsc::channel());
+            let learning = Learning {
+                config: config.learn,
+                log,
+                reasoner: Arc::clone(&reasoner) as _,
+                catalog: Arc::new(catalog()),
+                tools: Vec::new(),
+                store: Arc::clone(&store) as _,
+                changes,
+                clock: Arc::new(FakeClock(monday() + SignedDuration::from_hours(24))),
+            };
+            Self {
+                reasoner,
+                learning,
+                store,
+                changes: receiver,
+            }
+        }
+
+        /// Runs one check with `proposal` as the next proposal, applies its changes and gives
+        /// the learned entries.
+        async fn check(&self, proposal: LearnedIntent) -> anyhow::Result<Vec<LearnedIntent>> {
+            self.reasoner.script_proposal(proposal);
+            self.learning.check().await;
+            for change in self.changes.try_iter() {
+                change(Pools::new());
+            }
+            Ok(self.store.load()?.unwrap_or_default().intents)
+        }
+    }
+
+    /// The texts of the cluster of the learned intent tests.
+    fn jokes() -> Vec<String> {
+        (1..=5).map(|n| format!("tell me joke {n}")).collect()
+    }
+
+    /// A valid proposal of `kind` with `service`.
+    fn proposal(kind: LearnedKind, service: Option<&str>) -> LearnedIntent {
+        let examples = ["tell me a joke", "say something funny", "make me laugh"];
+        LearnedIntent {
+            name: "tell_joke".to_owned(),
+            centroid: Vec::new(),
+            service: service.map(str::to_owned),
+            kind,
+            examples: examples.map(str::to_owned).to_vec(),
+            responses: vec!["I told the wifi a joke. It did not get it.".to_owned()],
+            plugin: None,
+            target: Some(Target::House),
+            entity: None,
+            select: vec![Filter {
+                domain: "scene".to_owned(),
+                name: None,
+                device_class: None,
+            }],
+            data: BTreeMap::new(),
+            question: None,
+            fresh_min: None,
+            needs: (kind == LearnedKind::NewPlugin).then(|| "jokes".to_owned()),
+            status: LearnedStatus::None,
+            texts: Vec::new(),
+            request_file: None,
+        }
+    }
+
+    /// The learned entries after one check that gets `proposal`.
+    async fn saved(proposal: LearnedIntent) -> anyhow::Result<Vec<LearnedIntent>> {
+        Learner::new().check(proposal).await
+    }
+
+    /// AC-14.5b-1.
+    #[tokio::test]
+    async fn ac_14_5b_1_uncovered_cluster_gets_one_proposal() -> anyhow::Result<()> {
+        let learner = Learner::new();
+        learner.check(proposal(LearnedKind::Command, None)).await?;
+        assert_eq!(learner.reasoner.proposed(), vec![jokes()]);
+        Ok(())
+    }
+
+    /// AC-14.5b-2.
+    #[tokio::test]
+    async fn ac_14_5b_2_proposal_without_service_is_active() -> anyhow::Result<()> {
+        let entries = saved(proposal(LearnedKind::Command, None)).await?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, LearnedStatus::Active);
+        assert_eq!(entries[0].texts, jokes());
+        assert_eq!(entries[0].centroid.len(), 3);
+        Ok(())
+    }
+
+    /// AC-14.5b-3.
+    #[tokio::test]
+    async fn ac_14_5b_3_proposal_with_service_is_pending() -> anyhow::Result<()> {
+        let entries = saved(proposal(LearnedKind::Command, Some("scene.turn_on"))).await?;
+        assert_eq!(entries[0].status, LearnedStatus::Pending);
+        Ok(())
+    }
+
+    /// AC-14.5b-4.
+    #[tokio::test]
+    async fn ac_14_5b_4_none_is_saved_and_not_proposed_again() -> anyhow::Result<()> {
+        let learner = Learner::new();
+        let entries = learner.check(proposal(LearnedKind::None, None)).await?;
+        assert_eq!(entries[0].status, LearnedStatus::None);
+        learner.check(proposal(LearnedKind::Command, None)).await?;
+        assert_eq!(learner.reasoner.proposed().len(), 1);
+        Ok(())
+    }
+
+    /// AC-14.5b-5.
+    #[tokio::test]
+    async fn ac_14_5b_5_invalid_proposal_is_logged_and_saved_as_none() -> anyhow::Result<()> {
+        let log = tempfile::NamedTempFile::new()?;
+        let _default = tracing::dispatcher::set_default(&log_dispatch(&log)?);
+        let mut invalid = proposal(LearnedKind::Command, None);
+        invalid.name = "unknown".to_owned();
+        let learner = Learner::new();
+        let entries = learner.check(invalid).await?;
+        assert_eq!(entries[0].status, LearnedStatus::None);
+        let text = fs::read_to_string(log.path())?;
+        assert!(
+            text.contains("the proposal unknown is not valid"),
+            "the log is {text:?}"
+        );
+        learner.check(proposal(LearnedKind::Command, None)).await?;
+        assert_eq!(learner.reasoner.proposed().len(), 1);
+        Ok(())
+    }
+
+    /// AC-14.5b-6.
+    #[tokio::test]
+    async fn ac_14_5b_6_new_plugin_is_requested() -> anyhow::Result<()> {
+        let entries = saved(proposal(LearnedKind::NewPlugin, None)).await?;
+        assert_eq!(entries[0].status, LearnedStatus::Requested);
+        assert_eq!(entries[0].needs.as_deref(), Some("jokes"));
+        assert_eq!(entries[0].request_file, None);
+        Ok(())
     }
 }

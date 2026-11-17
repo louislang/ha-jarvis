@@ -141,7 +141,9 @@ flowchart LR
     crate_app_background --> crate_app_conversation
     crate_app_background --> crate_app_speech
     crate_app_background --> crate_domain_catalog
+    crate_app_background --> crate_domain_feedback
     crate_app_background --> crate_domain_habits
+    crate_app_background --> crate_domain_learn
     crate_app_background --> crate_domain_responses
     crate_app_background --> crate_domain_speech
     crate_app_background --> crate_domain_state
