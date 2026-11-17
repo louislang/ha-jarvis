@@ -918,6 +918,15 @@ pub fn ex_char_is_ascii_digit(c: &char) -> (digit: bool)
     c.is_ascii_digit()
 }
 
+/// Checks if `c` is an ASCII lowercase character. <https://doc.rust-lang.org/std/primitive.char.html#method.is_ascii_lowercase>
+#[verifier::external_fn_specification]
+pub fn ex_char_is_ascii_lowercase(c: &char) -> (lower: bool)
+    ensures
+        lower == ('a' <= *c && *c <= 'z'),
+{
+    c.is_ascii_lowercase()
+}
+
 /// `c` with `A` to `Z` mapped to `a` to `z`. <https://doc.rust-lang.org/std/primitive.char.html#method.to_ascii_lowercase>
 pub open spec fn ascii_lowercase(c: char) -> char {
     if 'A' <= c && c <= 'Z' { ((c as u32 + 32) as u32) as char } else { c }
