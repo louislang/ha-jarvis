@@ -65,6 +65,8 @@ pub struct Intent {
     /// True when Jarvis plays the best Music Assistant match of the `media_id` of the call.
     #[serde(default)]
     pub search: bool,
+    /// How long the answer of a fetch or prefetch intent stays fresh, in minutes.
+    pub fresh_min: Option<u32>,
 }
 
 /// How Jarvis replies to an intent and acts on it.
@@ -132,6 +134,9 @@ pub enum CatalogError {
     Untagged(String),
     /// An example whose text is not normalized.
     NotNormal(String),
+    /// The fetch or prefetch intent with this name has no `fresh_min` of 1 or more, or the
+    /// intent of another kind with this name has one.
+    FreshMin(String),
 }
 
 /// Checks the example counts, the example markup, the intent names, the template variables and
@@ -173,7 +178,23 @@ fn check_intent(catalog: &Catalog, index: usize) -> Result<(), CatalogError> {
         return Err(CatalogError::TooFewExamples(intent.name.clone()));
     }
     check_examples(intent)?;
+    check_fresh(intent)?;
     check_name(catalog, index)
+}
+
+/// Checks that `intent` has a `fresh_min` of 1 or more if and only if it is a fetch or prefetch.
+#[verus_spec(result =>
+    ensures
+        result is Ok <==> fresh(*intent),
+)]
+fn check_fresh(intent: &Intent) -> Result<(), CatalogError> {
+    match (intent.kind, intent.fresh_min) {
+        (Kind::Fetch | Kind::Prefetch, None | Some(0))
+        | (Kind::Command | Kind::Query | Kind::Train, Some(_)) => {
+            Err(CatalogError::FreshMin(intent.name.clone()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Checks that each example of `intent` parses.
@@ -414,7 +435,18 @@ pub open spec fn valid_intent(catalog: Catalog, index: int) -> bool {
     let examples = catalog.intents@[index].examples@;
     &&& examples.len() >= catalog.min_examples
     &&& parsed(examples, examples.len() as int)
+    &&& fresh(catalog.intents@[index])
     &&& named_once(catalog.intents@, index)
+}
+
+/// True when `intent` has a `fresh_min` of 1 or more if it is a fetch or prefetch, and none
+/// otherwise.
+pub open spec fn fresh(intent: Intent) -> bool {
+    if intent.kind is Fetch || intent.kind is Prefetch {
+        intent.fresh_min matches Some(minutes) && minutes > 0
+    } else {
+        intent.fresh_min is None
+    }
 }
 
 /// True when the first `count` markup strings of `examples` parse.
@@ -676,6 +708,28 @@ mod tests {
             service.starts_with("lock.")
         });
         assert_eq!(locking, None, "no intent has a service in the lock domain");
+    }
+
+    /// AC-14.2-8.
+    #[test]
+    fn ac_14_2_8_wrong_fresh_min_names_intent() {
+        let result = validate(|intents| intents[5].fresh_min = None);
+        assert_eq!(result, Err(CatalogError::FreshMin("weather".to_owned())));
+        let result = validate(|intents| intents[0].fresh_min = Some(5));
+        assert_eq!(result, Err(CatalogError::FreshMin("lights_on".to_owned())));
+    }
+
+    /// AC-14.2-9.
+    #[test]
+    fn ac_14_2_9_intents_toml_has_fresh_min() {
+        let catalog = catalog();
+        let fresh_min = |name: &str| {
+            let intent = catalog.intents.iter().find(|intent| intent.name == name);
+            intent.and_then(|intent| intent.fresh_min)
+        };
+        assert_eq!(fresh_min("weather"), Some(30));
+        assert_eq!(fresh_min("new_shows"), Some(60));
+        assert_eq!(validate_catalog(&catalog), Ok(()));
     }
 
     /// AC-18.18-4.
