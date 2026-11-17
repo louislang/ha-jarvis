@@ -283,6 +283,11 @@ impl Config {
                 "{name} = {value} is out of range: it must be in [0, 1]"
             );
         }
+        let lead = self.learn.prefetch_lead_min;
+        anyhow::ensure!(
+            (1..=60).contains(&lead),
+            "learn.prefetch_lead_min = {lead} is out of range: it must be in [1, 60]"
+        );
         self.validate_relations()
     }
 
@@ -674,6 +679,8 @@ pub struct LearnConfig {
     pub file: PathBuf,
     /// The time between two learned intent checks.
     pub check_interval_s: u64,
+    /// The minutes before the hour of a usual time at which its prefetch window opens.
+    pub prefetch_lead_min: u64,
 }
 
 /// The `[log]` section.
@@ -2414,6 +2421,7 @@ mod tests {
     use crate::app::conversation::Queues;
     use crate::domain::habits::Bucket;
     use crate::domain::habits::DayType;
+    use crate::domain::learn;
     use crate::domain::learn::LearnedStatus;
     use crate::domain::responses::Pool;
     use crate::domain::responses::Pools;
@@ -2604,6 +2612,7 @@ mod tests {
             responses: 10,
             file: PathBuf::from("learned.toml"),
             check_interval_s: 3600,
+            prefetch_lead_min: 5,
         }
     }
 
@@ -2698,6 +2707,39 @@ mod tests {
         FileStore::try_new(config.learn.file.clone())?.save(&Learned { intents })?;
         let (_, pools) = learned(&config, &load_catalog(&config.intents)?, Pools::new())?;
         assert_eq!(pools["tell_joke"].responses[0].text, "Good night.");
+        Ok(())
+    }
+
+    /// AC-14.9-5.
+    #[test]
+    fn ac_14_9_5_prefetch_lead_is_1_to_60() -> anyhow::Result<()> {
+        let with_lead = |lead: u64| {
+            VALID.replace(
+                "prefetch_lead_min = 5",
+                &format!("prefetch_lead_min = {lead}"),
+            )
+        };
+        for lead in [0, 61] {
+            let error = parse_error(&with_lead(lead));
+            assert!(
+                error.contains("learn.prefetch_lead_min"),
+                "error for prefetch_lead_min = {lead} does not name it: {error}"
+            );
+        }
+        let lead = Config::parse(&with_lead(60))?.learn.prefetch_lead_min;
+        let usual = [Bucket {
+            day: DayType::Weekdays,
+            hour: 8,
+        }];
+        let zone = jiff::tz::TimeZone::get("America/Chicago")?;
+        // 2026-11-16 is a Monday.
+        for local in ["2026-11-16T07:00:00", "2026-11-16T08:59:59"] {
+            let now: jiff::Zoned = format!("{local}[America/Chicago]").parse()?;
+            assert!(
+                learn::in_window(&usual, now.timestamp(), &zone, lead),
+                "the window of weekdays 08:00 with a lead of 60 min is closed at {local}"
+            );
+        }
         Ok(())
     }
 
