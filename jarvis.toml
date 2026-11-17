@@ -46,6 +46,7 @@ warm_idle_s = 60
 max_output_tokens = 150      # answers
 bulk_max_output_tokens = 8000 # structured output: generate, paraphrase, propose
 max_tool_calls = 5
+embedding_model = "text-embedding-3-small"
 allowed_domains = ["light", "switch", "fan", "media_player", "climate", "calendar", "todo"]
 read_services = ["calendar.get_events", "todo.get_items"] # called with return_response = true
 
@@ -116,6 +117,7 @@ python = ".venv/bin/python"
 window_days = 14
 min_cluster = 5
 cluster_distance = 0.3
+responses = 10 # responses of each proposal
 
 [log]
 database = "jarvis.db"

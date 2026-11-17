@@ -64,6 +64,7 @@ use crate::domain::feedback::Deferred;
 use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
 use crate::domain::feedback::Route;
+use crate::domain::learn::LearnedIntent;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
@@ -657,6 +658,19 @@ impl Reasoner for FakeReasoner {
         lock(&self.paraphrased).push(target.to_owned());
         let result = lock(&self.paraphrases).get(target).cloned();
         result.unwrap_or(Ok(Vec::new())).map_err(anyhow::Error::msg)
+    }
+
+    async fn embed(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::bail!("no embeddings")
+    }
+
+    async fn propose(
+        &self,
+        _texts: &[String],
+        _intents: &[String],
+        _tools: &[Tool],
+    ) -> anyhow::Result<LearnedIntent> {
+        anyhow::bail!("no proposal")
     }
 }
 

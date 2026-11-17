@@ -23,6 +23,7 @@ use crate::domain::feedback::Deferred;
 use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
 use crate::domain::feedback::Spoken;
+use crate::domain::learn::LearnedIntent;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
@@ -140,6 +141,17 @@ pub trait Reasoner: Send + Sync {
         slots: &BTreeSet<String>,
         n: usize,
     ) -> anyhow::Result<Vec<String>>;
+
+    /// The embedding of each of `texts`, in order.
+    async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>>;
+
+    /// A learned intent for the requests `texts`, unlike `intents`, with the plugin tools `tools`.
+    async fn propose(
+        &self,
+        texts: &[String],
+        intents: &[String],
+        tools: &[Tool],
+    ) -> anyhow::Result<LearnedIntent>;
 }
 
 /// One step of a System Two answer.

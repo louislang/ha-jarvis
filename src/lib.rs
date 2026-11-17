@@ -500,6 +500,8 @@ pub struct OpenAiConfig {
     pub bulk_max_output_tokens: u32,
     /// The most tool calls of one answer.
     pub max_tool_calls: u32,
+    /// The model of each embeddings request.
+    pub embedding_model: String,
     /// The domains of the services and the targets that a System Two call can have.
     pub allowed_domains: Vec<String>,
     /// The services that a System Two call runs with `return_response`.
@@ -661,6 +663,8 @@ pub struct LearnConfig {
     /// The largest distance between two close requests and between a cluster and its learned
     /// entry.
     pub cluster_distance: f64,
+    /// The number of responses that a proposal has.
+    pub responses: usize,
 }
 
 /// The `[log]` section.
@@ -1707,6 +1711,7 @@ async fn start_live_app(
         &config.openai,
         &secrets.openai_key,
         tools,
+        config.learn.responses,
     )?);
     let runpod = runpod(config, secrets)?;
     let catalog = Arc::new(catalog);
@@ -2369,6 +2374,7 @@ mod tests {
             max_output_tokens: 150,
             bulk_max_output_tokens: 8000,
             max_tool_calls: 5,
+            embedding_model: "text-embedding-3-small".to_owned(),
             allowed_domains: [
                 "light",
                 "switch",
@@ -2464,6 +2470,16 @@ mod tests {
         }
     }
 
+    /// The `[learn]` section of `VALID`.
+    fn expected_learn() -> LearnConfig {
+        LearnConfig {
+            window_days: 14,
+            min_cluster: 5,
+            cluster_distance: 0.3,
+            responses: 10,
+        }
+    }
+
     /// The `[mqtt]` section of `VALID`.
     fn expected_mqtt() -> MqttConfig {
         MqttConfig {
@@ -2515,11 +2531,7 @@ mod tests {
             dialog: expected_dialog(),
             habits: expected_habits(),
             train: expected_train(),
-            learn: LearnConfig {
-                window_days: 14,
-                min_cluster: 5,
-                cluster_distance: 0.3,
-            },
+            learn: expected_learn(),
             log: expected_log(),
             web: expected_web(),
             mqtt: Some(expected_mqtt()),
