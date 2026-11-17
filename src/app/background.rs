@@ -33,6 +33,7 @@ use crate::domain::catalog::Intent;
 use crate::domain::catalog::Kind;
 use crate::domain::decide::PluginCall;
 use crate::domain::feedback::Deferred;
+use crate::domain::habits::Bucket;
 use crate::domain::habits::RequestHabits;
 use crate::domain::learn;
 use crate::domain::learn::Cluster;
@@ -52,6 +53,7 @@ use crate::domain::state_cache::StateCache;
 use crate::ports::Clock;
 use crate::ports::Home;
 use crate::ports::InteractionLog;
+use crate::ports::PluginRequests;
 use crate::ports::Reasoner;
 use crate::ports::SpeechToText;
 use crate::ports::Store;
@@ -307,6 +309,16 @@ impl Habits {
         }
     }
 
+    /// The usual times of `key` with `min_score` on the local date of `now`, or none without the
+    /// HA time zone or with a poisoned lock.
+    fn usual(&self, key: &str, now: Timestamp, min_score: f64) -> Vec<Bucket> {
+        let (Some(zone), Some(model)) = (self.zone(), self.current()) else {
+            return Vec::new();
+        };
+        let today = zone.to_datetime(now).date();
+        model.usual_times(key, today, self.half_life_days, min_score)
+    }
+
     /// A copy of the model, or `None` when the lock is poisoned.
     #[must_use]
     pub fn current(&self) -> Option<RequestHabits> {
@@ -397,15 +409,32 @@ pub struct Learning {
     pub activation: Activation,
     /// The request habits, which get the times of the clusters.
     pub habits: Arc<Habits>,
+    /// The plugin request files, or none when Jarvis writes no plugin requests.
+    pub requests: Option<Arc<dyn PluginRequests>>,
+    /// The least decayed score of a usual time.
+    pub min_score: f64,
 }
 
 impl Learning {
     /// Saves an entry for each cluster of the System Two requests of the window that no learned
-    /// entry covers. Logs a failed check.
+    /// entry covers. Logs a failed check. Then sends the pools task a change that writes the waiting
+    /// plugin requests. Without plugin request files, the entries wait.
     pub async fn check(&self) {
         if let Err(error) = self.try_check().await {
             tracing::warn!("the learned intent check failed: {error:#}");
         }
+        let Some(requests) = self.requests.clone() else {
+            return;
+        };
+        let (store, habits) = (Arc::clone(&self.activation.store), Arc::clone(&self.habits));
+        let (now, min_score) = (self.activation.clock.now(), self.min_score);
+        self.activation.send(Box::new(move |pools| {
+            let usual = |name: &str| habits.usual(name, now, min_score);
+            if let Err(error) = write_requests(store.as_ref(), requests.as_ref(), usual) {
+                tracing::warn!("the plugin requests were not saved: {error:#}");
+            }
+            pools
+        }));
     }
 
     /// The check of [`Learning::check`].
@@ -652,6 +681,34 @@ fn activated(store: &dyn Store<Learned>, name: &str, now: Timestamp) -> anyhow::
     store.save(&learned)
 }
 
+/// Writes the plugin request of each `requested` entry of `store` without `request_file`, with the
+/// `usual` times of its name, and saves each path. A failed write logs one `warn` event. Fails
+/// when `store` cannot load or save.
+fn write_requests(
+    store: &dyn Store<Learned>,
+    requests: &dyn PluginRequests,
+    usual: impl Fn(&str) -> Vec<Bucket>,
+) -> anyhow::Result<()> {
+    let mut learned = store.load()?.unwrap_or_default();
+    let mut written = false;
+    for entry in &mut learned.intents {
+        if entry.status != LearnedStatus::Requested || entry.request_file.is_some() {
+            continue;
+        }
+        match requests.write(&learn::plugin_request(entry, &usual(&entry.name))) {
+            Ok(path) => {
+                entry.request_file = Some(path.display().to_string());
+                written = true;
+            }
+            Err(error) => tracing::warn!("the plugin request {} failed: {error:#}", entry.name),
+        }
+    }
+    if written {
+        store.save(&learned)?;
+    }
+    Ok(())
+}
+
 /// Adds `entry` to the learned intents of `store`.
 ///
 /// # Errors
@@ -824,14 +881,10 @@ impl Prefetch {
 
     /// True when the refresh of the intent `name` with `fresh_min` is due at `now`.
     fn refresh_due(&self, name: &str, fresh_min: Option<u32>, now: Timestamp) -> bool {
-        let (Some(fresh_min), Some(zone), Some(model)) =
-            (fresh_min, self.habits.zone(), self.habits.current())
-        else {
+        let (Some(fresh_min), Some(zone)) = (fresh_min, self.habits.zone()) else {
             return false;
         };
-        let today = zone.to_datetime(now).date();
-        let (half_life_days, min_score) = (self.habits.half_life_days, self.min_score);
-        let usual = model.usual_times(name, today, half_life_days, min_score);
+        let usual = self.habits.usual(name, now, self.min_score);
         let attempt = lock(&self.attempts).get(name).copied();
         learn::refresh_due(&usual, attempt, now, &zone, self.lead_min, fresh_min)
     }
@@ -1053,6 +1106,7 @@ mod tests {
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeLog;
     use crate::testing::fakes::FakePlugin;
+    use crate::testing::fakes::FakePluginRequests;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeStt;
@@ -1770,6 +1824,8 @@ mod tests {
         tts: Arc<FakeTts>,
         /// The `get_weather` plugin of the prefetch tests.
         weather: Arc<FakePlugin>,
+        /// The plugin request files.
+        requests: Arc<FakePluginRequests>,
     }
 
     /// The activation of `store` on `changes`, `intents.toml`, `tts` and the reference house one
@@ -1811,7 +1867,7 @@ mod tests {
             );
             let config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
             let (store, (changes, receiver)) = (Arc::new(FakeStore::new(None)), mpsc::channel());
-            let tts = Arc::new(FakeTts::default());
+            let (tts, requests) = (Arc::default(), Arc::default());
             let half_life_days = config.habits.half_life_days;
             let (activation, habits) =
                 activation(Arc::clone(&store) as _, changes, &tts, half_life_days);
@@ -1823,6 +1879,8 @@ mod tests {
                 tools: Vec::new(),
                 activation,
                 habits,
+                requests: Some(Arc::clone(&requests) as _),
+                min_score: config.habits.min_score,
             };
             Self {
                 reasoner,
@@ -1833,6 +1891,7 @@ mod tests {
                 pools: Mutex::default(),
                 weather: Arc::new(FakePlugin::new("get_weather")),
                 tts,
+                requests,
             }
         }
 
@@ -1996,6 +2055,87 @@ mod tests {
         Ok(())
     }
 
+    /// The path of the plugin request file of `get_traffic`.
+    const TRAFFIC_FILE: &str = "plugin-requests/get_traffic.md";
+
+    /// A valid `new_plugin` proposal `get_traffic`.
+    fn traffic() -> LearnedIntent {
+        let mut traffic = proposal(LearnedKind::NewPlugin, None);
+        traffic.name = "get_traffic".to_owned();
+        traffic
+    }
+
+    impl Learner {
+        /// Queues the next plugin request write: it gives `path`, or fails without one.
+        fn script_request(&self, path: Option<&str>) {
+            let result = path.map(Into::into).ok_or("the write fails");
+            lock(&self.requests.results).push_back(result);
+        }
+
+        /// The names of the plugin requests of the write calls, in order.
+        fn requested(&self) -> Vec<String> {
+            let calls = lock(&self.requests.calls);
+            calls.iter().map(|request| request.name.clone()).collect()
+        }
+    }
+
+    /// AC-14.13-1.
+    #[tokio::test]
+    async fn ac_14_13_1_new_plugin_writes_one_request() -> anyhow::Result<()> {
+        let learner = Learner::new();
+        learner.script_request(Some(TRAFFIC_FILE));
+        let entries = learner.check(traffic()).await?;
+        assert_eq!(entries[0].status, LearnedStatus::Requested);
+        assert_eq!(learner.requested(), vec!["get_traffic"]);
+        let text = lock(&learner.requests.calls)[0].text.clone();
+        assert!(
+            text.starts_with("# Plugin request: get_traffic\n"),
+            "{text}"
+        );
+        Ok(())
+    }
+
+    /// AC-14.13-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_13_3_written_request_is_not_written_again() -> anyhow::Result<()> {
+        let learner = Learner::new();
+        learner.script_request(Some(TRAFFIC_FILE));
+        let entries = learner.check(traffic()).await?;
+        assert_eq!(entries[0].request_file.as_deref(), Some(TRAFFIC_FILE));
+        learner.learning.check().await;
+        let _task = start_learning(learner.learning.clone(), Duration::from_hours(1));
+        settle().await;
+        learner.saved()?;
+        assert_eq!(learner.requested(), vec!["get_traffic"]);
+        Ok(())
+    }
+
+    /// AC-14.13-4.
+    #[tokio::test]
+    async fn ac_14_13_4_failed_write_is_tried_at_the_next_check() -> anyhow::Result<()> {
+        let learner = Learner::new();
+        learner.script_request(None);
+        let entries = learner.check(traffic()).await?;
+        assert_eq!(entries[0].request_file, None);
+        learner.learning.check().await;
+        learner.saved()?;
+        assert_eq!(learner.requested(), vec!["get_traffic", "get_traffic"]);
+        Ok(())
+    }
+
+    /// AC-14.13-5.
+    #[tokio::test]
+    async fn ac_14_13_5_no_adapter_leaves_the_entry_waiting() -> anyhow::Result<()> {
+        let mut learner = Learner::new();
+        learner.learning.requests = None;
+        learner.script_request(Some(TRAFFIC_FILE));
+        let entries = learner.check(traffic()).await?;
+        assert_eq!(entries[0].status, LearnedStatus::Requested);
+        assert_eq!(entries[0].request_file, None);
+        assert_eq!(learner.requested(), Vec::<String>::new());
+        Ok(())
+    }
+
     /// The variant of a Quint sum type value.
     #[derive(Debug, Deserialize, PartialEq)]
     struct Tag {
@@ -2008,10 +2148,13 @@ mod tests {
     struct LearnedModel {
         /// The status of each cluster.
         status: BTreeMap<String, Tag>,
+        /// The plugin request files of each cluster.
+        requests: BTreeMap<String, usize>,
     }
 
     impl ModelState<LearnedDriver> for LearnedModel {
-        /// The status of the entry of each cluster, or `Absent` without an entry.
+        /// The status of the entry of each cluster, or `Absent` without an entry, and its written
+        /// plugin request: a write call and a saved `request_file`.
         fn from_driver(driver: &LearnedDriver) -> anyhow::Result<Self> {
             let entries = driver.learner.saved()?;
             let status = |cluster: &str| {
@@ -2019,8 +2162,16 @@ mod tests {
                 let tag = entry.map_or("Absent".to_owned(), |entry| format!("{:?}", entry.status));
                 (cluster.to_owned(), Tag { tag })
             };
+            let called = driver.learner.requested();
+            let requests = |cluster: &str| {
+                let entry = entries.iter().find(|entry| entry.name == cluster);
+                let saved = entry.is_some_and(|entry| entry.request_file.is_some());
+                let written = saved && called.iter().any(|name| name == cluster);
+                (cluster.to_owned(), usize::from(written))
+            };
             Ok(Self {
                 status: CLUSTERS.into_iter().map(status).collect(),
+                requests: CLUSTERS.into_iter().map(requests).collect(),
             })
         }
     }
@@ -2083,6 +2234,26 @@ mod tests {
             }
             self.learner.store.save(&learned)
         }
+
+        /// Runs one check whose plugin request write succeeds only for `cluster`. Fails when the
+        /// check writes other requests than those of the entries that wait.
+        fn request(&self, cluster: Option<&str>) -> anyhow::Result<()> {
+            let learned = self.learner.store.load()?.unwrap_or_default().intents;
+            let waiting = learned.into_iter().filter(|entry| {
+                entry.status == LearnedStatus::Requested && entry.request_file.is_none()
+            });
+            let waiting: Vec<String> = waiting.map(|entry| entry.name).collect();
+            for name in &waiting {
+                let path = (Some(name.as_str()) == cluster).then(|| format!("{name}.md"));
+                self.learner.script_request(path.as_deref());
+            }
+            let before = self.learner.requested().len();
+            self.runtime.block_on(self.learner.learning.check());
+            self.learner.saved()?;
+            let calls = self.learner.requested().split_off(before);
+            anyhow::ensure!(calls == waiting, "the check wrote {calls:?}");
+            Ok(())
+        }
     }
 
     impl Driver for LearnedDriver {
@@ -2096,9 +2267,8 @@ mod tests {
                 propose(c: String, suitable: bool) => self.propose(&c, suitable)?,
                 approve(c: String) => self.resolve(&c, LearnedStatus::Active)?,
                 reject(c: String) => self.resolve(&c, LearnedStatus::Rejected)?,
-                // Sub-phase 14.13 adds the plugin requests, which change no status.
-                writeRequest => {},
-                failRequest => {},
+                writeRequest(c: String) => self.request(Some(&c))?,
+                failRequest => self.request(None)?,
             })
         }
     }
@@ -2106,6 +2276,12 @@ mod tests {
     /// AC-14.5d-1. `quint_run` replays 100 traces by default.
     #[quint_run(spec = "quint/learned.qnt", max_steps = 30, seed = "1")]
     fn ac_14_5d_1_conformance() -> impl Driver {
+        LearnedDriver::new(BTreeMap::new(), BTreeMap::new())
+    }
+
+    /// AC-14.13-7. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/learned.qnt", max_steps = 30, seed = "1")]
+    fn ac_14_13_7_conformance() -> impl Driver {
         LearnedDriver::new(BTreeMap::new(), BTreeMap::new())
     }
 

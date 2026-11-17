@@ -18,6 +18,7 @@ use crate::domain::catalog::Kind;
 use crate::domain::catalog::Target;
 use crate::domain::habits;
 use crate::domain::habits::Bucket;
+use crate::domain::habits::DayType;
 use crate::domain::intent;
 use crate::domain::intent::Rejection;
 use crate::domain::responses;
@@ -636,6 +637,130 @@ pub fn initial_status(proposal: &LearnedIntent) -> LearnedStatus {
     }
 }
 
+/// The task of a plugin request after the intent name.
+#[verus_verify]
+#[expect(
+    clippy::redundant_static_lifetimes,
+    reason = "Verus makes a function of the constant, which needs the lifetime"
+)]
+pub const PLUGIN_TASK: &'static str = "` with `plugin` and `fresh_min` to `intents.toml` and its \
+pool to `responses.toml`. Write a plugin for this data in the pattern of phase 17: one `Plugin` \
+adapter, the change map row \"Add a plugin\" of `docs/spec/01-architecture.md` section 12, and tests \
+with a local mock server. Use a free data source without an API key when one exists. Use a source \
+with a key only after the owner agrees, so ask first. Then the PR names the environment variable \
+and the sign-up page. Open a normal PR.\n";
+
+/// The plugin request of `entry`: its texts, `usual`, its `needs` and the task for Claude.
+#[verus_spec(request =>
+    requires
+        forall|index: int| 0 <= index < usual@.len() ==> 0 <= #[trigger] usual@[index].hour <= 23,
+    ensures
+        request.name@ == entry.name@,
+        request.text@ == request_text(entry.name@, entry.texts@, usual@, entry.needs),
+)]
+#[must_use]
+pub fn plugin_request(entry: &LearnedIntent, usual: &[Bucket]) -> PluginRequest {
+    let mut text = "# Plugin request: ".to_owned();
+    text.push_str(entry.name.as_str());
+    text.push_str("\n\n## Requests\n\n");
+    push_lines(&mut text, &entry.texts);
+    text.push_str("\n## Usual times\n\n");
+    if usual.is_empty() {
+        text.push_str("none\n");
+    } else {
+        push_buckets(&mut text, usual);
+    }
+    text.push_str("\n## Data needed\n\n");
+    if let Some(needs) = &entry.needs {
+        text.push_str(needs.as_str());
+    }
+    text.push_str("\n\n## Task\n\nAdd the fetch intent `");
+    text.push_str(entry.name.as_str());
+    text.push_str(PLUGIN_TASK);
+    PluginRequest {
+        name: entry.name.clone(),
+        text,
+    }
+}
+
+/// Appends each text of `texts` to `text` on its own line.
+#[verus_spec(
+    ensures
+        final(text)@ == old(text)@ + lines(texts@),
+)]
+fn push_lines(text: &mut String, texts: &[String]) {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= texts@.len(),
+            text@ == old(text)@ + lines(texts@.take(index as int)),
+        decreases texts@.len() - index,
+    ))]
+    while index < texts.len() {
+        text.push_str(texts[index].as_str());
+        text.push('\n');
+        proof! {
+            assert(texts@.take(index + 1).drop_last() =~= texts@.take(index as int));
+            assert(text@ =~= old(text)@ + lines(texts@.take(index + 1)));
+        }
+        index += 1;
+    }
+    proof! {
+        assert(texts@.take(index as int) =~= texts@);
+    }
+}
+
+/// Appends the line of each bucket of `usual` to `text`.
+#[verus_spec(
+    requires
+        forall|index: int| 0 <= index < usual@.len() ==> 0 <= #[trigger] usual@[index].hour <= 23,
+    ensures
+        final(text)@ == old(text)@ + bucket_lines(usual@),
+)]
+fn push_buckets(text: &mut String, usual: &[Bucket]) {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= usual@.len(),
+            forall|seen: int| 0 <= seen < usual@.len() ==> 0 <= #[trigger] usual@[seen].hour <= 23,
+            text@ == old(text)@ + bucket_lines(usual@.take(index as int)),
+        decreases usual@.len() - index,
+    ))]
+    while index < usual.len() {
+        push_bucket(text, usual[index]);
+        proof! {
+            assert(usual@.take(index + 1).drop_last() =~= usual@.take(index as int));
+            assert(text@ =~= old(text)@ + bucket_lines(usual@.take(index + 1)));
+        }
+        index += 1;
+    }
+    proof! {
+        assert(usual@.take(index as int) =~= usual@);
+    }
+}
+
+/// Appends the line `<weekdays|weekends> <HH>:00` of `bucket` to `text`.
+#[verus_spec(
+    requires
+        0 <= bucket.hour <= 23,
+    ensures
+        final(text)@ == old(text)@ + bucket_line(bucket),
+)]
+fn push_bucket(text: &mut String, bucket: Bucket) {
+    text.push_str(match bucket.day {
+        DayType::Weekdays => "weekdays ",
+        DayType::Weekends => "weekends ",
+    });
+    #[expect(clippy::cast_sign_loss, reason = "a bucket hour is 0 to 23")]
+    let hour = bucket.hour as u8;
+    text.push((b'0' + hour / 10) as char);
+    text.push((b'0' + hour % 10) as char);
+    text.push_str(":00\n");
+    proof! {
+        assert(text@ =~= old(text)@ + bucket_line(bucket));
+    }
+}
+
 /// The catalog intent of an `active` entry with a response, except a `new_plugin` or `none` entry.
 #[verus_verify]
 #[must_use]
@@ -822,6 +947,43 @@ pub open spec fn kind_valid(proposal: LearnedIntent, plugins: Set<String>) -> bo
             && proposal.service is None && proposal.plugin is None && proposal.question is None,
         LearnedKind::None => true,
     }
+}
+
+/// The text of a plugin request for `name` with `texts`, `usual` and `needs`: the title line, then
+/// the parts with the texts, one line for each bucket of `usual` or `none`, `needs` and the task.
+pub open spec fn request_text(name: Seq<char>, texts: Seq<String>, usual: Seq<Bucket>, needs: Option<String>) -> Seq<char> {
+    "# Plugin request: "@ + name + "\n\n## Requests\n\n"@ + lines(texts)
+        + "\n## Usual times\n\n"@ + (if usual.len() == 0 { "none\n"@ } else { bucket_lines(usual) })
+        + "\n## Data needed\n\n"@ + (match needs { Some(needs) => needs@, None => Seq::empty() })
+        + "\n\n## Task\n\nAdd the fetch intent `"@ + name + PLUGIN_TASK@
+}
+
+/// Each text of `texts` on its own line.
+pub open spec fn lines(texts: Seq<String>) -> Seq<char>
+    decreases texts.len(),
+{
+    if texts.len() == 0 { Seq::empty() } else { lines(texts.drop_last()) + texts.last()@.push('\n') }
+}
+
+/// One line for each bucket of `usual`.
+pub open spec fn bucket_lines(usual: Seq<Bucket>) -> Seq<char>
+    decreases usual.len(),
+{
+    if usual.len() == 0 { Seq::empty() } else { bucket_lines(usual.drop_last()) + bucket_line(usual.last()) }
+}
+
+/// The line `<weekdays|weekends> <HH>:00` of `bucket`.
+pub open spec fn bucket_line(bucket: Bucket) -> Seq<char> {
+    let day = match bucket.day {
+        DayType::Weekdays => "weekdays "@,
+        DayType::Weekends => "weekends "@,
+    };
+    day + seq![digit_char(bucket.hour as int / 10), digit_char(bucket.hour as int % 10)] + ":00\n"@
+}
+
+/// The ASCII digit of `value`, from 0 to 9.
+pub open spec fn digit_char(value: int) -> char {
+    ((48 + value) as u8) as char
 }
 
 /// The times of the spoken points of `points`, in order.
@@ -1294,5 +1456,31 @@ mod tests {
             !fresh(answer, later, 5),
             "an answer older than 5 min is fresh"
         );
+    }
+
+    /// AC-14.13-2.
+    #[test]
+    fn ac_14_13_2_request_has_texts_usual_times_needs_and_task() {
+        let mut entry = proposal(LearnedKind::NewPlugin);
+        entry.name = "get_traffic".to_owned();
+        entry.texts = ["what's the traffic like", "how is the traffic to work"]
+            .map(str::to_owned)
+            .to_vec();
+        entry.needs = Some("current road traffic from home to work".to_owned());
+        let request = plugin_request(&entry, &[WEEKDAY_8]);
+        let start = "# Plugin request: get_traffic\n\n## Requests\n\nwhat's the traffic like\nhow \
+            is the traffic to work\n\n## Usual times\n\nweekdays 08:00\n\n## Data needed\n\ncurrent \
+            road traffic from home to work\n\n## Task\n\nAdd the fetch intent `get_traffic` with";
+        let key = "Use a source with a key only after the owner agrees, so ask first.";
+        assert_eq!(request.name, "get_traffic");
+        assert!(request.text.starts_with(start), "{}", request.text);
+        assert!(request.text.contains(key), "{}", request.text);
+    }
+
+    /// AC-14.13-6.
+    #[test]
+    fn ac_14_13_6_no_usual_time_gives_none() {
+        let text = plugin_request(&proposal(LearnedKind::NewPlugin), &[]).text;
+        assert!(text.contains("## Usual times\n\nnone\n"), "{text}");
     }
 }
