@@ -681,6 +681,8 @@ pub struct LearnConfig {
     pub check_interval_s: u64,
     /// The minutes before the hour of a usual time at which its prefetch window opens.
     pub prefetch_lead_min: u64,
+    /// The services that a prefetch can call. Any other call discards the prefetch.
+    pub prefetch_services: Vec<String>,
 }
 
 /// The `[log]` section.
@@ -2148,6 +2150,7 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
         timeout: Duration::from_millis(openai.timeout_ms),
         allowed_domains: openai.allowed_domains.clone(),
         read_services: openai.read_services.clone(),
+        prefetch_services: config.learn.prefetch_services.clone(),
     }
 }
 
@@ -2613,6 +2616,7 @@ mod tests {
             file: PathBuf::from("learned.toml"),
             check_interval_s: 3600,
             prefetch_lead_min: 5,
+            prefetch_services: vec!["calendar.get_events".to_owned()],
         }
     }
 

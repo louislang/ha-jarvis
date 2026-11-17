@@ -62,6 +62,7 @@ use crate::domain::responses::Response;
 use crate::domain::speech::Audio;
 use crate::domain::speech::Utterance;
 use crate::domain::state::AreaId;
+use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
 use crate::domain::training;
@@ -93,6 +94,8 @@ pub struct SystemTwo {
     pub allowed_domains: Vec<String>,
     /// The services that a call runs with `return_response`.
     pub read_services: Vec<String>,
+    /// The services that a prefetch can call.
+    pub prefetch_services: Vec<String>,
 }
 
 /// The parts of the log of the requests, and the training trigger, which trains on its marks.
@@ -1122,10 +1125,89 @@ impl Conversation {
     ///
     /// The HA configuration is not known, or the registry fails.
     async fn plugin(&self, call: &PluginCall) -> anyhow::Result<Value> {
+        self.two.plugins.fetch(call, &self.home()?).await
+    }
+
+    /// The HA configuration of the hot cache.
+    ///
+    /// # Errors
+    ///
+    /// The HA configuration is not known.
+    fn home(&self) -> anyhow::Result<HomeConfig> {
         use anyhow::Context as _;
         let home = self.queues.cache.borrow().config().cloned();
-        let home = home.context("no HA configuration")?;
-        self.two.plugins.fetch(call, &home).await
+        home.context("no HA configuration")
+    }
+
+    /// The text of the System Two answer to the prefetch question `text`, or `None` at a call of
+    /// a service that `prefetch_services` lacks, which does not run.
+    ///
+    /// # Errors
+    ///
+    /// The HA configuration or its time zone is not known, the answer fails, asks a question or
+    /// ends without `Done`, or no step comes within the timeout.
+    pub async fn prefetch(&self, text: &str) -> anyhow::Result<Option<String>> {
+        use anyhow::Context as _;
+        use futures::StreamExt;
+        let mut steps = self.two.reasoner.answer(&self.question(text, None)?);
+        let mut sentences = Vec::new();
+        loop {
+            let next = tokio::time::timeout(self.two.timeout, steps.next()).await;
+            let step = next.context("no step of the answer within the timeout")?;
+            let step = step.context("the answer ends without Done")??;
+            if let ControlFlow::Break(answer) = self.prefetch_step(step, &mut sentences).await? {
+                return Ok(answer);
+            }
+        }
+    }
+
+    /// Runs `step` of a prefetch answer as `prefetch` describes. A plugin call refreshes its
+    /// result. Breaks at `Done` with the text of `sentences`, or with `None` at a call of a
+    /// service that `prefetch_services` lacks.
+    ///
+    /// # Errors
+    ///
+    /// The answer asks a question.
+    async fn prefetch_step(
+        &self,
+        step: Step,
+        sentences: &mut Vec<String>,
+    ) -> anyhow::Result<ControlFlow<Option<String>>> {
+        // The sends fail only when the answer has ended, so their results are not needed.
+        match step {
+            Step::Sentence(sentence) => sentences.push(sentence),
+            Step::Call(call, reply) => {
+                if !self.prefetch_call(call, reply).await {
+                    return Ok(ControlFlow::Break(None));
+                }
+            }
+            Step::States(area, reply) => {
+                let _ = reply.send(self.states(&area));
+            }
+            Step::Plugin(call, reply) => {
+                let refreshed = async { self.two.plugins.refresh(&call, &self.home()?).await };
+                let _ = reply.send(refreshed.await.map(Some));
+            }
+            Step::Ask { .. } => anyhow::bail!("the prefetch answer asks a question"),
+            Step::Done => return Ok(ControlFlow::Break(Some(sentences.join(" ")))),
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Makes `call` and sends its result on `reply` when `prefetch_services` has its service.
+    /// False when it does not.
+    async fn prefetch_call(
+        &self,
+        call: ServiceCall,
+        reply: oneshot::Sender<anyhow::Result<Option<Value>>>,
+    ) -> bool {
+        let service = format!("{}.{}", call.domain, call.service);
+        let allowed = self.two.prefetch_services.contains(&service);
+        if allowed {
+            // The send fails only when the answer has ended, so the result is not needed.
+            let _ = reply.send(self.tool(call).await);
+        }
+        allowed
     }
 
     /// An answer of the pool `pool` rendered with the result of the plugin `call` as `response`.
@@ -1725,6 +1807,7 @@ mod tests {
                 timeout,
                 allowed_domains: ALLOWED.map(str::to_owned).to_vec(),
                 read_services: vec!["calendar.get_events".to_owned()],
+                prefetch_services: vec!["calendar.get_events".to_owned()],
             },
             Arc::new(habits),
             recorder(),
@@ -4079,6 +4162,88 @@ mod tests {
         conversation.catalog.store(Arc::new(live));
         let handled = conversation.handle("tell me a joke", on_satellite());
         assert_eq!(handled.await?.text, "Why did the fan stop?");
+        Ok(())
+    }
+
+    /// The prefetch answer to a question on `home`, when the reasoner gives `steps` and then
+    /// "Two events." and `Done`, with the plugin registry `plugins`.
+    async fn prefetched(
+        home: &Arc<FakeHome>,
+        mut steps: Vec<Scripted>,
+        plugins: Arc<Plugins>,
+    ) -> anyhow::Result<Option<String>> {
+        let reasoner = Arc::new(FakeReasoner::default());
+        steps.extend([Scripted::Sentence("Two events."), Scripted::Done]);
+        reasoner.script(steps);
+        let classifier = Arc::new(FakeClassifier::default());
+        let (_cache, _changes, mut conversation) = still_with(home, "idle", classifier, reasoner);
+        conversation.two.plugins = plugins;
+        conversation
+            .prefetch("What is on the calendar today?")
+            .await
+    }
+
+    /// AC-14.10-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10_5_write_call_discards_the_prefetch() -> anyhow::Result<()> {
+        let home = Arc::default();
+        let answer = prefetched(&home, vec![Scripted::Call(call())], registry(Vec::new())).await?;
+        assert_eq!(answer, None);
+        assert_eq!(home.calls(), []);
+        Ok(())
+    }
+
+    /// AC-14.10-8.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10_8_read_call_runs_with_its_response() -> anyhow::Result<()> {
+        let home = Arc::default();
+        let events = ServiceCall {
+            target: Vec::new(),
+            ..service("calendar", "get_events", "")
+        };
+        let steps = vec![Scripted::Call(events.clone())];
+        let answer = prefetched(&home, steps, registry(Vec::new())).await?;
+        let read = ServiceCall {
+            return_response: true,
+            ..events
+        };
+        assert_eq!(home.calls(), [read]);
+        assert_eq!(answer.as_deref(), Some("Two events."));
+        Ok(())
+    }
+
+    /// The test plugin with `results` scripted and its registry.
+    fn test_plugin(results: Vec<Value>) -> (Arc<FakePlugin>, Arc<Plugins>) {
+        let plugin = Arc::new(FakePlugin::new("get_test"));
+        for result in results {
+            plugin.script(Ok(result));
+        }
+        let plugins = registry(vec![Arc::clone(&plugin) as Arc<dyn Plugin>]);
+        (plugin, plugins)
+    }
+
+    /// AC-14.10-10.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10_10_plugin_step_fetches() -> anyhow::Result<()> {
+        let (home, (plugin, plugins)) = (Arc::default(), test_plugin(vec![json!({ "events": 2 })]));
+        let steps = vec![Scripted::Plugin(today("get_test"))];
+        let answer = prefetched(&home, steps, plugins).await?;
+        assert_eq!(plugin.fetches().len(), 1);
+        assert_eq!(home.calls(), []);
+        assert_eq!(answer.as_deref(), Some("Two events."));
+        Ok(())
+    }
+
+    /// AC-14.10-12.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10_12_plugin_step_skips_the_cache() -> anyhow::Result<()> {
+        let (plugin, plugins) = test_plugin(vec![json!(1), json!(2)]);
+        let (call, config) = (today("get_test"), house().config);
+        plugins.fetch(&call, &config).await?;
+        let steps = vec![Scripted::Plugin(call.clone())];
+        prefetched(&Arc::default(), steps, Arc::clone(&plugins)).await?;
+        assert_eq!(plugin.fetches().len(), 2, "the prefetch used the cache");
+        assert_eq!(plugins.fetch(&call, &config).await?, json!(2));
         Ok(())
     }
 }

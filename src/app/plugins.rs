@@ -64,14 +64,24 @@ impl Plugins {
     /// No plugin has the name of `call`, the plugin fails, or it gives no result within
     /// `plugins.timeout_ms`.
     pub async fn fetch(&self, call: &PluginCall, home: &HomeConfig) -> anyhow::Result<Value> {
+        if let Some(result) = self.cached(&key(call)?, self.clock.now()) {
+            return Ok(result);
+        }
+        self.refresh(call, home).await
+    }
+
+    /// A new result of `call` in the house with the HA configuration `home`. It replaces the
+    /// cached result of `call`.
+    ///
+    /// # Errors
+    ///
+    /// No plugin has the name of `call`, the plugin fails, or it gives no result within
+    /// `plugins.timeout_ms`.
+    pub async fn refresh(&self, call: &PluginCall, home: &HomeConfig) -> anyhow::Result<Value> {
         let Some(plugin) = self.by_name.get(&call.plugin) else {
             anyhow::bail!("no plugin has the tool {}", call.plugin);
         };
-        let key = (call.plugin.clone(), serde_json::to_string(&call.arguments)?);
-        let now = self.clock.now();
-        if let Some(result) = self.cached(&key, now) {
-            return Ok(result);
-        }
+        let (key, now) = (key(call)?, self.clock.now());
         let deadline = Duration::from_millis(self.config.timeout_ms);
         let result = tokio::time::timeout(deadline, plugin.fetch(&call.arguments, home))
             .await
@@ -92,6 +102,15 @@ impl Plugins {
     fn results(&self) -> MutexGuard<'_, HashMap<(String, String), (Timestamp, Value)>> {
         self.results.lock().expect("no lock holder panics")
     }
+}
+
+/// The cache key of `call`: its plugin name and its arguments text.
+///
+/// # Errors
+///
+/// The arguments do not serialize.
+fn key(call: &PluginCall) -> serde_json::Result<(String, String)> {
+    Ok((call.plugin.clone(), serde_json::to_string(&call.arguments)?))
 }
 
 #[cfg(test)]
