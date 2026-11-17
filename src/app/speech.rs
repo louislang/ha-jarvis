@@ -379,10 +379,25 @@ impl Speech {
     /// A template does not parse or render, or a synthesis fails.
     pub async fn prerender(&self, pools: &Pools, areas: &[String]) -> anyhow::Result<()> {
         for text in texts(pools, areas)? {
-            let audio = self.tts.synth(&text).await?;
-            self.cache.insert(text, Arc::new(audio));
+            self.render(&text).await?;
         }
         Ok(())
+    }
+
+    /// Synthesizes and caches `text`.
+    ///
+    /// # Errors
+    ///
+    /// The synthesis fails.
+    pub async fn render(&self, text: &str) -> anyhow::Result<()> {
+        let audio = self.tts.synth(text).await?;
+        self.cache.insert(text.to_owned(), Arc::new(audio));
+        Ok(())
+    }
+
+    /// Drops the cached audio of `text`.
+    pub fn forget(&self, text: &str) {
+        self.cache.remove(text);
     }
 }
 
