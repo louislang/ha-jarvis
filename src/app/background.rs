@@ -396,6 +396,8 @@ pub struct Learning {
     pub changes: mpsc::Sender<Change>,
     /// The time of the window.
     pub clock: Arc<dyn Clock>,
+    /// The request habits, which get the times of the clusters.
+    pub habits: Arc<Habits>,
 }
 
 impl Learning {
@@ -419,13 +421,51 @@ impl Learning {
         let mut learned = saved.unwrap_or_default().intents;
         let distance = self.config.cluster_distance;
         for cluster in learn::clusters(&points, distance, self.config.min_cluster) {
-            if learn::covering(&cluster, &learned, distance).is_none() {
-                let entry = self.entry(cluster, &learned).await?;
-                self.save(entry.clone());
-                learned.push(entry);
-            }
+            self.learn(cluster, &mut learned).await?;
         }
         Ok(())
+    }
+
+    /// Records the times of `cluster` under its covering entry of `learned`, or saves the entry
+    /// of a new proposal, adds it to `learned` and records the times under it.
+    ///
+    /// # Errors
+    ///
+    /// `propose` fails.
+    async fn learn(
+        &self,
+        cluster: Cluster,
+        learned: &mut Vec<LearnedIntent>,
+    ) -> anyhow::Result<()> {
+        let distance = self.config.cluster_distance;
+        let covered = learn::covering(&cluster, learned, distance).map(str::to_owned);
+        let times = cluster.times.clone();
+        if let Some(name) = covered {
+            if let Some(entry) = learned.iter().find(|entry| entry.name == name) {
+                self.record(entry, times);
+            }
+            return Ok(());
+        }
+        let entry = self.entry(cluster, learned).await?;
+        self.save(entry.clone());
+        self.record(&entry, times);
+        learned.push(entry);
+        Ok(())
+    }
+
+    /// Observes `times` in time order under the name of `entry` when it is `pending`, `active`
+    /// or `requested`. The name of a `none` or `rejected` entry can be invalid or never become
+    /// an intent.
+    fn record(&self, entry: &LearnedIntent, mut times: Vec<Timestamp>) {
+        use LearnedStatus::Active;
+        use LearnedStatus::Pending;
+        use LearnedStatus::Requested;
+        if matches!(entry.status, Pending | Active | Requested) {
+            times.sort();
+            for time in times {
+                self.habits.observe(entry.name.clone(), time);
+            }
+        }
     }
 
     /// The System Two requests of the window with their embeddings.
@@ -1387,6 +1427,9 @@ mod tests {
             );
             let config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
             let (store, (changes, receiver)) = (Arc::new(FakeStore::new(None)), mpsc::channel());
+            let cache = watch::channel(StateCache::load(house())).1;
+            let model = RequestHabits::default();
+            let habits = Arc::new(Habits::new(model, config.habits.half_life_days, cache));
             let learning = Learning {
                 config: config.learn,
                 log: Arc::clone(&log) as _,
@@ -1396,6 +1439,7 @@ mod tests {
                 store: Arc::clone(&store) as _,
                 changes,
                 clock: Arc::new(FakeClock(monday() + SignedDuration::from_hours(24))),
+                habits,
             };
             Self {
                 reasoner,
@@ -1675,5 +1719,57 @@ mod tests {
     #[quint_run(spec = "quint/learned.qnt", max_steps = 30, seed = "1")]
     fn ac_14_5d_1_conformance() -> impl Driver {
         LearnedDriver::new(BTreeMap::new(), BTreeMap::new())
+    }
+
+    /// The habit model after each of `checks` checks of a log whose cluster the active entry
+    /// `family_calendar` covers, with five requests at 07:10 on Monday, Tuesday and Wednesday.
+    async fn calendar_habits(checks: usize) -> anyhow::Result<Vec<RequestHabits>> {
+        let learner = Learner::empty();
+        let mut entry = proposal(LearnedKind::Command, None);
+        entry.name = "family_calendar".to_owned();
+        entry.status = LearnedStatus::Active;
+        entry.centroid = vec![1.0, 0.0, 0.0];
+        learner.store.save(&Learned {
+            intents: vec![entry],
+        })?;
+        for (index, day) in [0, 0, 1, 1, 2].into_iter().enumerate() {
+            let text = format!("what is on the calendar {index}");
+            learner
+                .log
+                .defer(&text, monday() + SignedDuration::from_hours(24 * day - 1));
+            learner
+                .reasoner
+                .script_embedding(&text, vec![1.0, 0.0, 0.01]);
+        }
+        let mut models = Vec::new();
+        for _ in 0..checks {
+            learner.learning.check().await;
+            models.push(learner.learning.habits.current().unwrap_or_default());
+        }
+        Ok(models)
+    }
+
+    /// AC-14.5e-1.
+    #[tokio::test]
+    async fn ac_14_5e_1_covered_cluster_records_its_usual_time() -> anyhow::Result<()> {
+        let models = calendar_habits(1).await?;
+        let last = monday() + SignedDuration::from_hours(47);
+        let wednesday = TimeZone::get("America/Chicago")?.to_datetime(last).date();
+        let usual = models[0].usual_times("family_calendar", wednesday, 14.0, 2.0);
+        let bucket = Bucket {
+            day: DayType::Weekdays,
+            hour: 7,
+        };
+        assert_eq!(usual, vec![bucket]);
+        Ok(())
+    }
+
+    /// AC-14.5e-2.
+    #[tokio::test]
+    async fn ac_14_5e_2_same_times_do_not_change_the_model() -> anyhow::Result<()> {
+        let models = calendar_habits(2).await?;
+        assert_eq!(models[0], models[1]);
+        assert_ne!(models[0], RequestHabits::default());
+        Ok(())
     }
 }
