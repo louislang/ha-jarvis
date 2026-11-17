@@ -389,8 +389,7 @@ pub struct Learning {
     pub catalog: Arc<Catalog>,
     /// The plugin tools.
     pub tools: Vec<Tool>,
-    /// The activation of the active entries, with the learned intents file, the pools task that
-    /// writes it and the time of the window.
+    /// The activation, with the learned intents file, its pools task and the time of the window.
     pub activation: Activation,
     /// The request habits, which get the times of the clusters.
     pub habits: Arc<Habits>,
@@ -588,12 +587,8 @@ impl Activation {
         }));
     }
 
-    /// Sends the pools task a change that adds the pool of `entry` when no pool has its name,
-    /// then pre-renders the pool for the areas of the hot cache.
-    ///
-    /// # Errors
-    ///
-    /// The pre-render fails.
+    /// Sends the pools task a change that adds the pool of `entry` when no pool has its name, then
+    /// pre-renders the pool for the areas of the hot cache. Fails when the pre-render fails.
     async fn add_pool(&self, entry: &LearnedIntent) -> anyhow::Result<()> {
         let (name, added) = (entry.name.clone(), pool(&entry.responses));
         let pools = Pools::from([(name.clone(), added.clone())]);
@@ -605,11 +600,7 @@ impl Activation {
         self.speech.prerender(&pools, &areas).await
     }
 
-    /// The learned intents file, or an empty file when it does not exist.
-    ///
-    /// # Errors
-    ///
-    /// The file cannot load.
+    /// The learned intents file, or an empty one when it does not exist. Fails when it cannot load.
     async fn load(&self) -> anyhow::Result<Learned> {
         let store = Arc::clone(&self.store);
         let saved = tokio::task::spawn_blocking(move || store.load()).await??;
@@ -643,11 +634,8 @@ pub fn pool(texts: &[String]) -> Pool {
     responses::merge(empty, texts, usize::MAX)
 }
 
-/// Sets `activated` of the entry `name` of `store` to `now` when it has none.
-///
-/// # Errors
-///
-/// `store` cannot load or save.
+/// Sets `activated` of the entry `name` of `store` to `now` when it has none. Fails when `store`
+/// cannot load or save.
 fn activated(store: &dyn Store<Learned>, name: &str, now: Timestamp) -> anyhow::Result<()> {
     let mut learned = store.load()?.unwrap_or_default();
     for entry in &mut learned.intents {
@@ -1531,9 +1519,8 @@ mod tests {
         tts: Arc<FakeTts>,
     }
 
-    /// The activation of `store` on `changes` and the catalog of `intents.toml`, with the
-    /// pre-render of `tts` for the areas of the reference house, one day after `monday()`, and
-    /// empty habits in the house with `half_life_days`.
+    /// The activation of `store` on `changes`, `intents.toml`, `tts` and the reference house one
+    /// day after `monday()`, and empty habits with `half_life_days`.
     fn activation(
         store: Arc<dyn Store<Learned>>,
         changes: mpsc::Sender<Change>,
@@ -1979,8 +1966,12 @@ mod tests {
         let pools = learned_pools(&learner)?;
         assert_eq!(texts(&pools["tell_joke"]), entry.responses);
         let synths = learner.tts.texts().len();
-        let speech = &learner.learning.activation.speech;
-        speech.speak(&entry.responses[0]).await?;
+        learner
+            .learning
+            .activation
+            .speech
+            .speak(&entry.responses[0])
+            .await?;
         assert_eq!(learner.tts.texts().len(), synths, "a response has no audio");
         Ok(())
     }

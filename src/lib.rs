@@ -2081,12 +2081,9 @@ fn start_stores(
     Ok((task, habits))
 }
 
-/// The catalog `catalog` with the intents of the active entries of `learn.file` of `config` as the
-/// live catalog, and the source pools `pools` with the pool of each of these intents.
-///
-/// # Errors
-///
-/// `learn.file` is not a `.toml` or `.json` file, or it cannot load.
+/// The live catalog of `catalog` and the entries of `learn.file` of `config`, and the source pools
+/// `pools` with the pool of each entry with an intent and a new name. Fails when the file or its
+/// store cannot load.
 fn learned(
     config: &Config,
     catalog: &Catalog,
@@ -2095,20 +2092,16 @@ fn learned(
     let store = FileStore::try_new(config.learn.file.clone())?;
     let entries = Store::<Learned>::load(&store)?.unwrap_or_default().intents;
     let live = domain::learn::live(catalog.clone(), entries.clone());
-    let added = &live.intents[catalog.intents.len()..];
     for entry in entries {
-        if added.iter().any(|intent| intent.name == entry.name) {
+        if !pools.contains_key(&entry.name) && domain::learn::intent(entry.clone()).is_some() {
             pools.insert(entry.name, app::background::pool(&entry.responses));
         }
     }
     Ok((Arc::new(ArcSwap::from_pointee(live)), pools))
 }
 
-/// The speech use case on `tts`, and `checks` with the activation of `learn.file` of `config`
-/// with the speech use case, the hot cache `cache` and the system time.
-///
-/// # Errors
-///
+/// The speech use case on `tts`, and `checks` with the activation of `learn.file` of `config` with
+/// the speech use case, the hot cache `cache` and the system time. Fails when the path of
 /// `learn.file` is not a `.toml` or `.json` file.
 fn activation(
     config: &Config,
@@ -2167,8 +2160,7 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
 ///
 /// # Errors
 ///
-/// The training state, a model or the log cannot load, or `learn.file` is not a `.toml` or
-/// `.json` file.
+/// The training state, a model, the log or the store of `learn.file` cannot load.
 async fn load_models(
     config: &Config,
     reasoner: &Arc<dyn Reasoner>,
@@ -2430,6 +2422,7 @@ mod tests {
     use crate::app::conversation::Queues;
     use crate::domain::habits::Bucket;
     use crate::domain::habits::DayType;
+    use crate::domain::learn::LearnedStatus;
     use crate::domain::responses::Pool;
     use crate::domain::responses::Pools;
     use crate::domain::responses::Response;
@@ -2699,6 +2692,20 @@ mod tests {
         let learn = Config::parse(VALID)?.learn;
         assert_eq!(learn.file, PathBuf::from("learned.toml"));
         assert_eq!(learn.check_interval_s, 3600);
+        Ok(())
+    }
+
+    /// A `none` entry that reuses the name of an active entry adds nothing to its start pool.
+    #[test]
+    fn start_pool_has_only_the_active_entry() -> anyhow::Result<()> {
+        let (folder, mut config) = (tempfile::tempdir()?, Config::parse(VALID)?);
+        config.learn.file = folder.path().join("learned.toml");
+        let mut reused = fakes::learned("tell_joke", LearnedStatus::None);
+        reused.responses = vec!["Not a joke.".to_owned()];
+        let intents = vec![fakes::learned("tell_joke", LearnedStatus::Active), reused];
+        FileStore::try_new(config.learn.file.clone())?.save(&Learned { intents })?;
+        let (_, pools) = learned(&config, &load_catalog(&config.intents)?, Pools::new())?;
+        assert_eq!(pools["tell_joke"].responses[0].text, "Good night.");
         Ok(())
     }
 
