@@ -35,6 +35,7 @@ use futures::channel::oneshot;
 use futures::future;
 use futures::stream;
 use futures::stream::BoxStream;
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde_json::Map;
@@ -329,6 +330,9 @@ struct ProposalFields {
     /// Not in a proposal: the plugin request adds it.
     #[serde(skip)]
     request_file: Option<String>,
+    /// Not in a proposal: the activation sets it.
+    #[serde(skip)]
+    activated: Option<Timestamp>,
 }
 
 /// One `data` entry of a proposal.
@@ -1772,6 +1776,7 @@ mod tests {
             status: LearnedStatus::None,
             texts: Vec::new(),
             request_file: None,
+            activated: None,
         };
         assert_eq!(result?, expected);
         assert_eq!(request["max_output_tokens"], 8000);

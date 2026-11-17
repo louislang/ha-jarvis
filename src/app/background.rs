@@ -12,6 +12,7 @@ use std::sync::MutexGuard;
 use std::sync::mpsc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use futures::StreamExt;
 use jiff::SignedDuration;
 use jiff::Timestamp;
@@ -205,11 +206,7 @@ impl Backfill {
     ///
     /// A synthesis fails.
     async fn prerender(&self, name: &str, new: &[String]) -> anyhow::Result<()> {
-        let empty = Pool {
-            responses: Vec::new(),
-            last: None,
-        };
-        let added = Pools::from([(name.to_owned(), responses::merge(empty, new, usize::MAX))]);
+        let added = Pools::from([(name.to_owned(), pool(new))]);
         let areas = area_names(&self.cache.borrow());
         self.speech.prerender(&added, &areas).await
     }
@@ -392,12 +389,9 @@ pub struct Learning {
     pub catalog: Arc<Catalog>,
     /// The plugin tools.
     pub tools: Vec<Tool>,
-    /// The learned intents file.
-    pub store: Arc<dyn Store<Learned>>,
-    /// The sender of the pools task, which writes the file.
-    pub changes: mpsc::Sender<Change>,
-    /// The time of the window.
-    pub clock: Arc<dyn Clock>,
+    /// The activation of the active entries, with the learned intents file, the pools task that
+    /// writes it and the time of the window.
+    pub activation: Activation,
     /// The request habits, which get the times of the clusters.
     pub habits: Arc<Habits>,
 }
@@ -418,9 +412,7 @@ impl Learning {
     /// `deferred`, `embed`, `propose` or the load of the file fails.
     async fn try_check(&self) -> anyhow::Result<()> {
         let points = self.points().await?;
-        let store = Arc::clone(&self.store);
-        let saved = tokio::task::spawn_blocking(move || store.load()).await??;
-        let mut learned = saved.unwrap_or_default().intents;
+        let mut learned = self.activation.load().await?.intents;
         let distance = self.config.cluster_distance;
         let mut habits: BTreeMap<String, Vec<Timestamp>> = BTreeMap::new();
         for cluster in learn::clusters(&points, distance, self.config.min_cluster) {
@@ -456,6 +448,9 @@ impl Learning {
         let entry = self.entry(cluster, learned).await?;
         self.save(entry.clone());
         let found = habit(&entry, times);
+        if entry.status == LearnedStatus::Active {
+            self.activation.activate(entry.clone()).await;
+        }
         learned.push(entry);
         Ok(found)
     }
@@ -477,7 +472,8 @@ impl Learning {
     /// `deferred` or `embed` fails.
     async fn points(&self) -> anyhow::Result<Vec<Point>> {
         let window = SignedDuration::from_hours(24 * i64::try_from(self.config.window_days)?);
-        let requests = self.log.deferred(self.clock.now() - window).await?;
+        let now = self.activation.clock.now();
+        let requests = self.log.deferred(now - window).await?;
         let texts: Vec<String> = requests
             .iter()
             .map(|request| request.text.clone())
@@ -533,14 +529,96 @@ impl Learning {
 
     /// Sends the pools task a change that adds `entry` to the learned intents file.
     fn save(&self, entry: LearnedIntent) {
-        let store = Arc::clone(&self.store);
+        let store = Arc::clone(&self.activation.store);
         let change: Change = Box::new(move |pools| {
             if let Err(error) = add(store.as_ref(), entry) {
                 tracing::warn!("the learned intents file did not change: {error:#}");
             }
             pools
         });
-        // Without the pools task, Jarvis stops, and the next start proposes the cluster again.
+        self.activation.send(change);
+    }
+}
+
+/// Gives active learned entries their pools, audio, live catalog intents and activation times.
+#[derive(Clone)]
+pub struct Activation {
+    /// The learned intents file.
+    pub store: Arc<dyn Store<Learned>>,
+    /// The sender of the pools task, which also writes the file.
+    pub changes: mpsc::Sender<Change>,
+    /// The pre-render of the pools.
+    pub speech: Arc<Speech>,
+    /// The hot cache, which has the area names of the pre-render.
+    pub cache: watch::Receiver<StateCache>,
+    /// The catalog of `intents.toml` and the active learned intents.
+    pub catalog: Arc<ArcSwap<Catalog>>,
+    /// The time of the activation.
+    pub clock: Arc<dyn Clock>,
+}
+
+impl Activation {
+    /// Activates each `active` entry of the file without `activated`.
+    pub async fn resume(&self) {
+        // The first check loads the file too, and logs a failed load.
+        let learned = self.load().await.unwrap_or_default().intents;
+        for entry in learned {
+            if entry.status == LearnedStatus::Active && entry.activated.is_none() {
+                self.activate(entry).await;
+            }
+        }
+    }
+
+    /// Adds and pre-renders the pool of `entry` when it has an intent, then adds the intent to the
+    /// live catalog and sets `activated`. A failed pre-render logs and leaves `activated` unset.
+    pub async fn activate(&self, entry: LearnedIntent) {
+        if learn::intent(entry.clone()).is_some()
+            && let Err(error) = self.add_pool(&entry).await
+        {
+            return tracing::warn!("the pre-render of {} failed: {error:#}", entry.name);
+        }
+        let (store, catalog) = (Arc::clone(&self.store), Arc::clone(&self.catalog));
+        let now = self.clock.now();
+        self.send(Box::new(move |pools| {
+            catalog.rcu(|current| learn::live(Catalog::clone(current), vec![entry.clone()]));
+            if let Err(error) = activated(store.as_ref(), &entry.name, now) {
+                tracing::warn!("the activation of {} was not saved: {error:#}", entry.name);
+            }
+            pools
+        }));
+    }
+
+    /// Sends the pools task a change that adds the pool of `entry` when no pool has its name,
+    /// then pre-renders the pool for the areas of the hot cache.
+    ///
+    /// # Errors
+    ///
+    /// The pre-render fails.
+    async fn add_pool(&self, entry: &LearnedIntent) -> anyhow::Result<()> {
+        let (name, added) = (entry.name.clone(), pool(&entry.responses));
+        let pools = Pools::from([(name.clone(), added.clone())]);
+        self.send(Box::new(move |mut current| {
+            current.entry(name).or_insert(added);
+            current
+        }));
+        let areas = area_names(&self.cache.borrow());
+        self.speech.prerender(&pools, &areas).await
+    }
+
+    /// The learned intents file, or an empty file when it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot load.
+    async fn load(&self) -> anyhow::Result<Learned> {
+        let store = Arc::clone(&self.store);
+        let saved = tokio::task::spawn_blocking(move || store.load()).await??;
+        Ok(saved.unwrap_or_default())
+    }
+
+    /// Sends `change` to the pools task.
+    fn send(&self, change: Change) {
+        // Without the pools task, Jarvis stops, and the next start checks and activates again.
         let _ = self.changes.send(change);
     }
 }
@@ -555,6 +633,31 @@ fn habit(entry: &LearnedIntent, times: Vec<Timestamp>) -> Option<(String, Vec<Ti
     counted.then(|| (entry.name.clone(), times))
 }
 
+/// The pool of the responses `texts`, with no uses.
+#[must_use]
+pub fn pool(texts: &[String]) -> Pool {
+    let empty = Pool {
+        responses: Vec::new(),
+        last: None,
+    };
+    responses::merge(empty, texts, usize::MAX)
+}
+
+/// Sets `activated` of the entry `name` of `store` to `now` when it has none.
+///
+/// # Errors
+///
+/// `store` cannot load or save.
+fn activated(store: &dyn Store<Learned>, name: &str, now: Timestamp) -> anyhow::Result<()> {
+    let mut learned = store.load()?.unwrap_or_default();
+    for entry in &mut learned.intents {
+        if entry.name == name {
+            entry.activated.get_or_insert(now);
+        }
+    }
+    store.save(&learned)
+}
+
 /// Adds `entry` to the learned intents of `store`.
 ///
 /// # Errors
@@ -566,10 +669,12 @@ fn add(store: &dyn Store<Learned>, entry: LearnedIntent) -> anyhow::Result<()> {
     store.save(&learned)
 }
 
-/// Starts a task that runs the check of `learning` at once and each `interval`.
+/// Starts a task that activates the active entries without `activated` of `learning`, then runs
+/// the check of `learning` at once and each `interval`.
 #[must_use]
 pub fn start_learning(learning: Learning, interval: Duration) -> JoinHandle<()> {
     tokio::spawn(async move {
+        learning.activation.resume().await;
         let mut ticks = tokio::time::interval(interval);
         loop {
             ticks.tick().await;
@@ -1420,6 +1525,33 @@ mod tests {
         store: Arc<FakeStore<Learned>>,
         /// The receiver of the changes, in place of the pools task.
         changes: mpsc::Receiver<Change>,
+        /// The pools after the changes.
+        pools: Mutex<Pools>,
+        /// The TTS of the pre-render.
+        tts: Arc<FakeTts>,
+    }
+
+    /// The activation of `store` on `changes` and the catalog of `intents.toml`, with the
+    /// pre-render of `tts` for the areas of the reference house, one day after `monday()`, and
+    /// empty habits in the house with `half_life_days`.
+    fn activation(
+        store: Arc<dyn Store<Learned>>,
+        changes: mpsc::Sender<Change>,
+        tts: &Arc<FakeTts>,
+        half_life_days: f64,
+    ) -> (Activation, Arc<Habits>) {
+        let cache = watch::channel(StateCache::load(house())).1;
+        let model = RequestHabits::default();
+        let habits = Arc::new(Habits::new(model, half_life_days, cache.clone()));
+        let activation = Activation {
+            store,
+            changes,
+            speech: Arc::new(Speech::new(Arc::clone(tts) as _)),
+            cache,
+            catalog: Arc::new(ArcSwap::from_pointee(catalog())),
+            clock: Arc::new(FakeClock(monday() + SignedDuration::from_hours(24))),
+        };
+        (activation, habits)
     }
 
     impl Learner {
@@ -1439,18 +1571,17 @@ mod tests {
             );
             let config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
             let (store, (changes, receiver)) = (Arc::new(FakeStore::new(None)), mpsc::channel());
-            let cache = watch::channel(StateCache::load(house())).1;
-            let model = RequestHabits::default();
-            let habits = Arc::new(Habits::new(model, config.habits.half_life_days, cache));
+            let tts = Arc::new(FakeTts::default());
+            let half_life_days = config.habits.half_life_days;
+            let (activation, habits) =
+                activation(Arc::clone(&store) as _, changes, &tts, half_life_days);
             let learning = Learning {
                 config: config.learn,
                 log: Arc::clone(&log) as _,
                 reasoner: Arc::clone(&reasoner) as _,
                 catalog: Arc::new(catalog()),
                 tools: Vec::new(),
-                store: Arc::clone(&store) as _,
-                changes,
-                clock: Arc::new(FakeClock(monday() + SignedDuration::from_hours(24))),
+                activation,
                 habits,
             };
             Self {
@@ -1459,6 +1590,8 @@ mod tests {
                 learning,
                 store,
                 changes: receiver,
+                pools: Mutex::default(),
+                tts,
             }
         }
 
@@ -1476,8 +1609,9 @@ mod tests {
 
         /// Applies the changes of the checks and gives the learned entries.
         fn saved(&self) -> anyhow::Result<Vec<LearnedIntent>> {
+            let mut pools = self.pools.lock().expect("no lock holder panics");
             for change in self.changes.try_iter() {
-                change(Pools::new());
+                *pools = change(mem::take(&mut *pools));
             }
             Ok(self.store.load()?.unwrap_or_default().intents)
         }
@@ -1521,6 +1655,7 @@ mod tests {
             status: LearnedStatus::None,
             texts: Vec::new(),
             request_file: None,
+            activated: None,
         }
     }
 
@@ -1826,6 +1961,63 @@ mod tests {
         let entries = vec![calendar(LearnedStatus::Active, X)];
         let models = calendar_habits(entries, &requests, 1).await?;
         assert_eq!(usual(&models[0])?, vec![SEVEN]);
+        Ok(())
+    }
+
+    /// The pools of `learner` after the changes of its checks.
+    fn learned_pools(learner: &Learner) -> anyhow::Result<Pools> {
+        learner.saved()?;
+        Ok(learner.pools.lock().expect("no lock holder panics").clone())
+    }
+
+    /// AC-14.7-1.
+    #[tokio::test]
+    async fn ac_14_7_1_active_entry_gets_its_pool_and_audio() -> anyhow::Result<()> {
+        let learner = Learner::new();
+        let entry = proposal(LearnedKind::Command, None);
+        learner.check(entry.clone()).await?;
+        let pools = learned_pools(&learner)?;
+        assert_eq!(texts(&pools["tell_joke"]), entry.responses);
+        let synths = learner.tts.texts().len();
+        let speech = &learner.learning.activation.speech;
+        speech.speak(&entry.responses[0]).await?;
+        assert_eq!(learner.tts.texts().len(), synths, "a response has no audio");
+        Ok(())
+    }
+
+    /// AC-14.7-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_7_3_backfill_adds_responses_to_a_learned_pool() -> anyhow::Result<()> {
+        let learner = Learner::new();
+        learner.check(proposal(LearnedKind::Command, None)).await?;
+        let (reasoner, changes) = (Arc::default(), learner.learning.activation.changes.clone());
+        let backfill = backfill(Arc::clone(&reasoner), changes, &learner.tts);
+        backfill.record_use("tell_joke".to_owned(), 0);
+        learner.saved()?;
+        settle().await;
+        reasoner.release("tell_joke", Ok(NEW.map(str::to_owned).to_vec()));
+        settle().await;
+        assert_eq!(texts(&learned_pools(&learner)?["tell_joke"])[1..], NEW);
+        Ok(())
+    }
+
+    /// AC-14.7-5. The start gives the source pools the saved pool of each active entry.
+    #[tokio::test]
+    async fn ac_14_7_5_restart_activates_once() -> anyhow::Result<()> {
+        let learner = Learner::empty();
+        let mut entry = proposal(LearnedKind::Command, None);
+        entry.status = LearnedStatus::Active;
+        learner.store.save(&Learned {
+            intents: vec![entry.clone()],
+        })?;
+        let mut started = pool(&entry.responses);
+        started.responses[0].uses = 3;
+        let source = Pools::from([("tell_joke".to_owned(), started)]);
+        *learner.pools.lock().expect("no lock holder panics") = source.clone();
+        learner.learning.activation.resume().await;
+        let entries = learner.saved()?;
+        assert_eq!(learned_pools(&learner)?, source);
+        assert!(entries[0].activated.is_some(), "{entries:?}");
         Ok(())
     }
 }
