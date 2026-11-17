@@ -450,39 +450,95 @@ AC-14.7-2, AC-14.7-4 and AC-14.7-6 move to sub-phase 14.7b as AC-14.7b-1 to AC-1
 
 ### 14.10 Prefetch Use Case
 
-**Goal:** Add the prefetch use case that implements `prefetch.qnt` for learned prefetch intents. A prefetch intent gets its answer from System Two before the usual time and again while the window is open, and the request in the window is answered at System One speed.
+**Goal:** Add the prefetch answer: System Two answers the question of a prefetch intent with only read calls, and a plugin call gets new data. The next sub-phases run it on a schedule and reply with it.
 
-- **Implements:** G1, G11, G14, G19. **Depends on:** 14.9.
-- **Files:** modify `src/app/background.rs`, `src/app/conversation.rs`, `src/app/speech.rs`, `src/app/plugins.rs`, `src/lib.rs`, `jarvis.toml`.
-- **Quint:** `prefetch.qnt` (conformance).
+- **Implements:** G11, G14. **Depends on:** 14.9.
+- **Files:** modify `src/app/conversation.rs`, `src/app/plugins.rs`, `src/testing/fakes.rs` (a `Done` step of `FakeReasoner`), `src/lib.rs`, `jarvis.toml`.
 
-**Model.** Each minute, for each active prefetch intent with `refresh_due`, set its attempt time and call `answer` with the intent `question`. The question has the area of the most recent interaction of the intent, so System Two gets its entities. A `Call` step with a service in `learn.prefetch_services` runs, and its result goes back to System Two. Any other `Call` step discards the prefetch and makes no call. A `Plugin` step runs through the plugin registry, because a plugin only reads data (decision 30). It uses `Plugins::refresh(call, home)`: `fetch` of sub-phase 17.1 without the cache read. `refresh` always calls the plugin, and its result replaces the cache entry. Thus a prefetched answer never has plugin data older than the prefetch, also when `plugins.cache_s` is longer than `fresh_min`. Only a stream that ends with `Done` and no error forms the answer, which is pre-rendered, stored with its time, and replaces the old answer. A failed prefetch keeps the old answer. Prefetch intents have no slots (sub-phase 14.2c), so the intent and the area of the question are the full cache key. When the intent is predicted, a fresh answer with the area of the request is the reply. Else the request goes to System Two. This sub-phase adds `learn.prefetch_services`.
+**Model.** `Conversation::prefetch(question)` calls `answer` with the question. A `Call` step with a service in `learn.prefetch_services` runs, and its result goes back to System Two. Any other `Call` step discards the prefetch and makes no call. A `Plugin` step runs through the plugin registry, because a plugin only reads data (decision 30). It uses `Plugins::refresh(call, home)`: `fetch` of sub-phase 17.1 without the cache read. `refresh` always calls the plugin, and its result replaces the cache entry. Thus a prefetched answer never has plugin data older than the prefetch, also when `plugins.cache_s` is longer than `fresh_min`. Only a stream that ends with `Done` and no error forms the answer: the text of its sentences. An error, a question or a stream that ends without `Done` fails the prefetch. This sub-phase adds `learn.prefetch_services`.
 
 **Acceptance criteria.**
 
-- AC-14.10-1: When `refresh_due` is true, `FakeReasoner` records one `answer` call with the intent question.
-- AC-14.10-2: When the prefetch completes, the audio cache has the answer audio.
-- AC-14.10-3: When the user asks within `fresh_min` of the answer, `handle` returns the prefetched answer and `FakeReasoner` records no new call.
-- AC-14.10-4: When the answer is not fresh, `handle` returns a filler and the request goes to System Two.
 - AC-14.10-5: When `FakeReasoner` gives a `Call` step for a service that is not in `prefetch_services` during a prefetch, Jarvis discards the answer and `FakeHome` records no call.
-- AC-14.10-6: When `quint-connect` replays 100 traces of `prefetch.qnt`, the stored answer, the prefetch times and the `FakeHome` calls match the model after each step.
-- AC-14.10-7 [GPU host]: A fresh prefetch answer has a response latency p95 of 300 ms or less in the Phase 9 harness.
 - AC-14.10-8: When `FakeReasoner` gives a `Call` step for `calendar.get_events`, which is in `prefetch_services`, `FakeHome` records the call with `return_response: true` (`openai.read_services`, sub-phase 7.5b) and the prefetch continues.
-- AC-14.10-9: When the prefetch stream ends with an error after one sentence, Jarvis stores no new answer, and the old answer stays.
 - AC-14.10-10: When `FakeReasoner` gives a `Plugin` step during a prefetch, `FakePlugin` records the fetch, `FakeHome` records no call, and the prefetch continues.
-- AC-14.10-11: When the window of weekdays 08:00 is open with `fresh_min = 30`, `FakeReasoner` records `answer` calls at 07:55, 08:25 and 08:55, and no call at 09:00 or later.
 - AC-14.10-12: When the registry cache has a result of the call from less than `cache_s` ago, a `Plugin` step during a prefetch still makes `FakePlugin` record a new fetch, and the next `fetch` of the call returns the new result.
-- AC-14.10-13: When the fresh answer has the area Kitchen and the request comes from the Office, `handle` returns a filler and the request goes to System Two.
+
+AC-14.10-1, AC-14.10-2, AC-14.10-9 and AC-14.10-11 move to sub-phase 14.10c as AC-14.10c-1 to AC-14.10c-4. AC-14.10-3, AC-14.10-4, AC-14.10-13 and AC-14.10-7 move to sub-phase 14.10d as AC-14.10d-1 to AC-14.10d-4. AC-14.10-6 moves to sub-phase 14.10e as AC-14.10e-1.
 
 **Proofs.**
 
-- P-14.10-3, P-14.10-4, P-14.10-13. Requires: `ServedAnswerIsFresh`. Argument: the reply branch is guarded by `fresh` (P-14.9-4) and by the equality of the stored area and the area of the request.
 - P-14.10-5. Requires: `NoCallFromPrefetch`. Argument: the `Call` arm of the prefetch consumer checks the service against `prefetch_services` before it calls `Home`. Any other service returns a discard.
-- P-14.10-9. Argument: only the `Done` arm without an error replaces the stored answer.
 - P-14.10-10. Argument: the `Plugin` arm of the prefetch consumer calls only `Plugins::refresh` and has no discard.
 - P-14.10-12. Argument: `refresh` has no cache read before the plugin call, and its `Ok` arm stores the result under the key of the call.
-- P-14.10-11. Requires: `PrefetchOnlyInWindow`, `NoEarlyRefresh`. Argument: the prefetch starts only under `refresh_due` (P-14.9-3).
-- P-14.10-1, P-14.10-2, P-14.10-6 to P-14.10-8. Evidence: test.
+- P-14.10-8. Evidence: test.
+
+---
+
+### 14.10c Prefetch Schedule
+
+**Goal:** Run the prefetch answer of sub-phase 14.10 for each learned prefetch intent before its usual time and again while the window is open, and keep the answer with its audio.
+
+- **Implements:** G11, G14. **Depends on:** 14.10.
+- **Files:** modify `src/app/background.rs`, `src/app/speech.rs`, `src/lib.rs`.
+
+**Model.** Each minute, for each active prefetch entry of `learn.file` with `refresh_due` (sub-phase 14.9), the prefetch task sets its attempt time and runs `Conversation::prefetch` with the entry `question`. The usual times are the `usual_times` of the request habits under the entry name with `habits.min_score`. An answer is pre-rendered, stored with its time, and replaces the old answer. A discard removes the stored answer (P-14.8-2). A failed prefetch keeps the old answer. The audio cache keeps only the audio of the stored answers, so it does not grow (sub-phase 6.3b). The app stops the task when it drops, because the task holds a sender of the pools task.
+
+**Acceptance criteria.**
+
+- AC-14.10c-1: When `refresh_due` is true, `FakeReasoner` records one `answer` call with the intent question.
+- AC-14.10c-2: When the prefetch completes, the audio cache has the answer audio.
+- AC-14.10c-3: When the prefetch stream ends with an error after one sentence, Jarvis stores no new answer, and the old answer stays.
+- AC-14.10c-4: When the window of weekdays 08:00 is open with `fresh_min = 30`, `FakeReasoner` records `answer` calls at 07:55, 08:25 and 08:55, and no call at 09:00 or later.
+
+**Proofs.**
+
+- P-14.10c-3. Argument: only the `Done` arm without an error replaces the stored answer.
+- P-14.10c-4. Requires: `PrefetchOnlyInWindow`, `NoEarlyRefresh`. Argument: the prefetch starts only under `refresh_due` (P-14.9-3).
+- P-14.10c-1, P-14.10c-2. Evidence: test.
+
+---
+
+### 14.10d Prefetch Replies
+
+**Goal:** Reply to a learned prefetch intent with its fresh stored answer of the same area. The request in the window then gets System One speed.
+
+- **Implements:** G1, G11. **Depends on:** 14.10c.
+- **Files:** modify `src/app/conversation.rs`, `src/app/background.rs`, `src/lib.rs`, `src/testing/e2e.rs`, `README.md` (prefetch, `CLAUDE.md` workflow item 15).
+
+**Model.** `handle` keeps the area of the most recent request that System One predicts as each prefetch intent. The prefetch question of the intent has this area, so System Two gets its entities, and the stored answer keeps it. Prefetch intents have no slots (sub-phase 14.2c), so the intent and the area of the question are the full cache key. When the intent is predicted, a fresh answer (`fresh` of sub-phase 14.9 with the `fresh_min` of the intent) with the area of the request is the reply. Else the request goes to System Two. The Phase 9 harness can start with request habits whose usual time is the current hour, so the prefetch runs at the start.
+
+**Acceptance criteria.**
+
+- AC-14.10d-1: When the user asks within `fresh_min` of the answer, `handle` returns the prefetched answer and `FakeReasoner` records no new call.
+- AC-14.10d-2: When the answer is not fresh, `handle` returns a filler and the request goes to System Two.
+- AC-14.10d-3: When the fresh answer has the area Kitchen and the request comes from the Office, `handle` returns a filler and the request goes to System Two.
+- AC-14.10d-4 [GPU host]: A fresh prefetch answer has a response latency p95 of 300 ms or less in the Phase 9 harness.
+
+**Proofs.**
+
+- P-14.10d-1 to P-14.10d-3. Requires: `ServedAnswerIsFresh`. Argument: the reply branch is guarded by `fresh` (P-14.9-4) and by the equality of the stored area and the area of the request.
+- P-14.10d-4. Evidence: test.
+
+---
+
+### 14.10e Prefetch Conformance
+
+**Goal:** Check the prefetch task and the prefetch replies against `prefetch.qnt`.
+
+- **Implements:** G19. **Depends on:** 14.10d.
+- **Files:** modify `src/app/background.rs`.
+- **Quint:** `prefetch.qnt` (conformance).
+
+**Model.** One model time unit is 30 min from 06:00 on a weekday. Thus the usual time is 08:00, `lead_min` is 30 and `fresh_min` is 60. `prefetch` runs one tick of the prefetch task. Its answer fails, so the stored answer does not change. `prefetchStep` runs one prefetch answer without the schedule: `Read` gives a `calendar.get_events` call and an error, `Write` gives a `light.turn_on` call, `Sentence` gives a sentence and `Done`, and `Fail` gives an error. `request` runs `handle` with the prediction of the prefetch intent.
+
+**Acceptance criteria.**
+
+- AC-14.10e-1: When `quint-connect` replays 100 traces of `prefetch.qnt`, the stored answer, the prefetch times and the `FakeHome` calls match the model after each step.
+
+**Proofs.**
+
+- P-14.10e-1. Evidence: test.
 
 ---
 
@@ -490,12 +546,12 @@ AC-14.7-2, AC-14.7-4 and AC-14.7-6 move to sub-phase 14.7b as AC-14.7b-1 to AC-1
 
 **Goal:** Prefetch the answer of each fetch intent with a usual time through its plugin, and refresh it at the `fresh_min` of the intent while the window is open. "What is the weather like?" at the usual time then gets System One speed with no filler.
 
-- **Implements:** G1, G11. **Depends on:** 14.10.
+- **Implements:** G1, G11. **Depends on:** 14.10e.
 - **Files:** modify `src/app/background.rs`, `src/app/conversation.rs`, `src/lib.rs`.
 
 **Model.**
 
-- The prefetch use case of sub-phase 14.10 also runs, each minute, each fetch intent of the live catalog with `refresh_due`. It sets the attempt time of the intent first.
+- The prefetch task of sub-phase 14.10c also runs, each minute, each fetch intent of the live catalog with `refresh_due`. It sets the attempt time of the intent first.
 - It renders the `data` of the intent with no slots, as in step 2 of sub-phase 17.4. A data value that needs a slot gives no prefetch for that intent.
 - It runs `Plugins::refresh` (sub-phase 14.10) with the rendered call and the `HomeConfig` of the hot cache. A plugin only reads data (decision 30), so the prefetch acts on nothing.
 - On success, it selects and renders one response of the intent pool with the result as `response` and the area of the most recent interaction of the intent, pre-renders it, and stores `{ call, area, text, time }` for the intent. `area` is the area of the render, or none. It replaces the old answer. An error keeps the old answer.
