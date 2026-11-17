@@ -29,6 +29,9 @@ use crate::app::conversation::Change;
 use crate::app::conversation::Conversation;
 use crate::app::speech::Speech;
 use crate::domain::catalog::Catalog;
+use crate::domain::catalog::Intent;
+use crate::domain::catalog::Kind;
+use crate::domain::decide::PluginCall;
 use crate::domain::feedback::Deferred;
 use crate::domain::habits::RequestHabits;
 use crate::domain::learn;
@@ -674,11 +677,13 @@ pub fn start_learning(learning: Learning, interval: Duration) -> JoinHandle<()> 
     })
 }
 
-/// A prefetched answer, the area of its question and its time.
+/// A prefetched answer, the plugin call of a fetch intent, the area of its question and its time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Answer {
     /// The text.
     pub text: String,
+    /// The plugin call of a fetch intent.
+    pub call: Option<PluginCall>,
     /// The area of the question.
     pub area: Option<AreaId>,
     /// The time when the answer was complete.
@@ -718,19 +723,21 @@ impl Answers {
         lock(&self.areas).get(name).cloned().flatten()
     }
 
-    /// The text of the stored answer of the intent `name` when it has `area` and is fresh at
-    /// `now` with `fresh_min`.
+    /// The text of the stored answer of the intent `name` when it has `call` and `area` and is
+    /// fresh at `now` with `fresh_min`.
     #[must_use]
     pub fn fresh(
         &self,
         name: &str,
+        call: Option<&PluginCall>,
         area: Option<&AreaId>,
         now: Timestamp,
         fresh_min: u32,
     ) -> Option<String> {
         let stored = lock(&self.stored);
         let answer = stored.get(name)?;
-        let fresh = answer.area.as_ref() == area && learn::fresh(answer.time, now, fresh_min);
+        let same = answer.call.as_ref() == call && answer.area.as_ref() == area;
+        let fresh = same && learn::fresh(answer.time, now, fresh_min);
         fresh.then(|| answer.text.clone())
     }
 }
@@ -775,9 +782,22 @@ impl Prefetch {
         }
     }
 
-    /// Prefetches the answer of each active prefetch entry of the learned intents file whose
-    /// refresh is due at the time before it. Sets its attempt time first. Logs a failed load.
+    /// Prefetches the answer of each fetch intent of the live catalog and active prefetch entry of
+    /// the learned intents file that is due at the time before it. Sets its attempt time first.
+    /// Logs a failed load.
     pub async fn tick(&self) {
+        let catalog = self.activation.catalog.load_full();
+        let fetches = catalog
+            .intents
+            .iter()
+            .filter(|intent| intent.kind == Kind::Fetch);
+        for intent in fetches {
+            let now = self.activation.clock.now();
+            if self.refresh_due(&intent.name, intent.fresh_min, now) {
+                lock(&self.attempts).insert(intent.name.clone(), now);
+                self.fetch(intent).await;
+            }
+        }
         let learned = match self.activation.load().await {
             Ok(learned) => learned.intents,
             Err(error) => return tracing::warn!("the learned intents did not load: {error:#}"),
@@ -793,19 +813,27 @@ impl Prefetch {
 
     /// The question of `entry` when it is an active prefetch entry whose refresh is due at `now`.
     fn due(&self, entry: &LearnedIntent, now: Timestamp) -> Option<String> {
-        let (LearnedStatus::Active, LearnedKind::Prefetch, Some(question), Some(fresh_min)) =
-            (entry.status, entry.kind, &entry.question, entry.fresh_min)
+        let (LearnedStatus::Active, LearnedKind::Prefetch, Some(question)) =
+            (entry.status, entry.kind, &entry.question)
         else {
             return None;
         };
-        let zone = self.habits.zone()?;
+        let due = self.refresh_due(&entry.name, entry.fresh_min, now);
+        due.then(|| question.clone())
+    }
+
+    /// True when the refresh of the intent `name` with `fresh_min` is due at `now`.
+    fn refresh_due(&self, name: &str, fresh_min: Option<u32>, now: Timestamp) -> bool {
+        let (Some(fresh_min), Some(zone), Some(model)) =
+            (fresh_min, self.habits.zone(), self.habits.current())
+        else {
+            return false;
+        };
         let today = zone.to_datetime(now).date();
         let (half_life_days, min_score) = (self.habits.half_life_days, self.min_score);
-        let model = self.habits.current()?;
-        let usual = model.usual_times(&entry.name, today, half_life_days, min_score);
-        let attempt = lock(&self.attempts).get(&entry.name).copied();
-        let due = learn::refresh_due(&usual, attempt, now, &zone, self.lead_min, fresh_min);
-        due.then(|| question.clone())
+        let usual = model.usual_times(name, today, half_life_days, min_score);
+        let attempt = lock(&self.attempts).get(name).copied();
+        learn::refresh_due(&usual, attempt, now, &zone, self.lead_min, fresh_min)
     }
 
     /// Stores the answer to the prefetch question `question` of the intent `name`, asked from the
@@ -818,17 +846,44 @@ impl Prefetch {
             other => other,
         };
         match answer {
-            Ok(answer) => self.store(name, answer, area),
+            Ok(answer) => self.store(name, answer, None, area),
             Err(error) => tracing::warn!("the prefetch of {name} failed: {error:#}"),
         }
     }
 
-    /// Stores `answer` of the intent `name` with `area` and the current time, or removes the
-    /// stored answer without `answer`. Drops the audio of a replaced or removed answer that no
+    /// Stores the reply of the fetch intent `intent` for the area of its most recent request
+    /// after its pre-render, as `store` does. A failure logs and keeps the stored answer.
+    async fn fetch(&self, intent: &Intent) {
+        let (name, area) = (&intent.name, self.answers.area(&intent.name));
+        let fetched = async {
+            let (call, text) = self.conversation.fetch_reply(intent, area.as_ref()).await?;
+            self.activation.speech.render(&text).await?;
+            anyhow::Ok((call, text))
+        }
+        .await;
+        match fetched {
+            Ok((call, text)) => self.store(name, Some(text), Some(call), area),
+            Err(error) => tracing::warn!("the prefetch of {name} failed: {error:#}"),
+        }
+    }
+
+    /// Stores `answer` of the intent `name` with `call`, `area` and the current time, or removes
+    /// the stored answer without `answer`. Drops the audio of a replaced or removed answer that no
     /// stored answer has.
-    fn store(&self, name: &str, answer: Option<String>, area: Option<AreaId>) {
+    fn store(
+        &self,
+        name: &str,
+        answer: Option<String>,
+        call: Option<PluginCall>,
+        area: Option<AreaId>,
+    ) {
         let time = self.activation.clock.now();
-        let answer = answer.map(|text| Answer { text, area, time });
+        let answer = answer.map(|text| Answer {
+            text,
+            call,
+            area,
+            time,
+        });
         if let Some(old) = self.answers.store(name, answer) {
             self.activation.speech.forget(&old);
         }
@@ -957,6 +1012,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::VecDeque;
     use std::fs;
+    use std::ops::RangeInclusive;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -968,6 +1024,7 @@ mod tests {
     use quint_connect::quint_run;
     use quint_connect::switch;
     use serde::Deserialize;
+    use serde_json::Value;
     use serde_json::json;
     use tokio::runtime::Runtime;
     use tokio::time::Instant;
@@ -995,6 +1052,7 @@ mod tests {
     use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeLog;
+    use crate::testing::fakes::FakePlugin;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeStt;
@@ -1710,6 +1768,8 @@ mod tests {
         pools: Mutex<Pools>,
         /// The TTS of the pre-render.
         tts: Arc<FakeTts>,
+        /// The `get_weather` plugin of the prefetch tests.
+        weather: Arc<FakePlugin>,
     }
 
     /// The activation of `store` on `changes`, `intents.toml`, `tts` and the reference house one
@@ -1771,6 +1831,7 @@ mod tests {
                 store,
                 changes: receiver,
                 pools: Mutex::default(),
+                weather: Arc::new(FakePlugin::new("get_weather")),
                 tts,
             }
         }
@@ -2289,10 +2350,11 @@ mod tests {
         learner.store.save(&Learned { intents })
     }
 
-    /// System Two of `config` on the reasoner of `learner` at `clock`, with no plugin.
+    /// System Two of `config` on the reasoner and the plugin of `learner` at `clock`.
     fn prefetch_two(config: &Config, learner: &Learner, clock: &Arc<SetClock>) -> SystemTwo {
         let reasoner = Arc::clone(&learner.reasoner) as _;
-        let mut two = crate::system_two(config, reasoner, crate::registry(config, Vec::new()));
+        let plugins = crate::registry(config, vec![Arc::clone(&learner.weather) as _]);
+        let mut two = crate::system_two(config, reasoner, plugins);
         two.clock = Arc::clone(clock) as _;
         two
     }
@@ -2610,5 +2672,114 @@ mod tests {
     #[quint_run(spec = "quint/prefetch.qnt", max_steps = 30, seed = "1")]
     fn ac_14_10e_1_conformance() -> impl Driver {
         PrefetchDriver::new()
+    }
+
+    /// The `weather` answer of [`forecast`].
+    const FORECAST: &str = "Today will be sunny, with a high of 72 degrees.";
+
+    /// A `get_weather` result.
+    fn forecast() -> Value {
+        json!({ "condition": "sunny", "high": 72 })
+    }
+
+    /// `minutes` after Saturday 08:55:23 after `thursday()`.
+    fn saturday(minutes: i64) -> Timestamp {
+        thursday() + SignedDuration::from_secs(((2 * 24 * 60 + 55 + minutes) * 60) + 23)
+    }
+
+    impl Prefetcher {
+        /// The prefetch of [`Prefetcher::new`] whose `weather` intent has `fresh_min`, the `when`
+        /// template `when` and a usual time on weekends at 09:00, and whose `get_weather` gives
+        /// `results` in order.
+        fn weather(fresh_min: u32, when: &str, results: Vec<anyhow::Result<Value>>) -> Self {
+            let prefetcher = Self::new(&[], 30).expect("the prefetch starts");
+            let learning = &prefetcher.learner.learning;
+            for day in [-9, -8, -2, -1] {
+                let time = monday() + SignedDuration::from_hours(24 * day + 1);
+                learning.habits.observe("weather".to_owned(), time);
+            }
+            let catalog = &learning.activation.catalog;
+            let mut changed = Catalog::clone(&catalog.load());
+            let mut intents = changed.intents.iter_mut();
+            let weather = intents
+                .find(|intent| intent.name == "weather")
+                .expect("intents.toml has it");
+            weather.fresh_min = Some(fresh_min);
+            weather.data = BTreeMap::from([("when".to_owned(), when.to_owned())]);
+            catalog.store(Arc::new(changed));
+            for result in results {
+                prefetcher.learner.weather.script(result);
+            }
+            prefetcher
+        }
+
+        /// The minutes after `saturday(0)` in `minutes` at which a tick fetches.
+        async fn fetches(&self, minutes: RangeInclusive<i64>) -> Vec<i64> {
+            let mut fetched = Vec::new();
+            for minute in minutes {
+                let before = self.learner.weather.fetches().len();
+                self.at(saturday(minute));
+                self.prefetch.tick().await;
+                if self.learner.weather.fetches().len() > before {
+                    fetched.push(minute);
+                }
+            }
+            fetched
+        }
+    }
+
+    /// AC-14.10b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10b_1_window_start_prefetches_the_weather() -> anyhow::Result<()> {
+        let prefetcher = Prefetcher::weather(30, "today", vec![Ok(forecast())]);
+        assert_eq!(prefetcher.fetches(0..=0).await, [0]);
+        let (data, _) = prefetcher.learner.weather.fetches().remove(0);
+        assert_eq!(Value::from(data), json!({ "when": "today" }));
+        let (speech, tts) = (
+            &prefetcher.prefetch.activation.speech,
+            &prefetcher.learner.tts,
+        );
+        let synths = tts.texts().len();
+        speech.speak(FORECAST).await?;
+        assert_eq!(tts.texts().len(), synths, "the answer has no audio");
+        Ok(())
+    }
+
+    /// AC-14.10b-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10b_3_open_window_refreshes_each_fresh_min() {
+        let results = vec![Ok(forecast()), Ok(forecast()), Ok(forecast())];
+        let prefetcher = Prefetcher::weather(30, "today", results);
+        assert_eq!(prefetcher.fetches(0..=95).await, [0, 30, 60]);
+    }
+
+    /// AC-14.10b-6.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10b_6_data_with_a_slot_gives_no_prefetch() {
+        let prefetcher = Prefetcher::weather(30, "{{ day }}", vec![Ok(forecast())]);
+        assert_eq!(prefetcher.fetches(0..=30).await, Vec::<i64>::new());
+    }
+
+    /// AC-14.10b-7.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10b_7_plugin_error_keeps_the_old_answer() {
+        let results = vec![
+            Ok(forecast()),
+            Err(anyhow::anyhow!("server down")),
+            Ok(forecast()),
+        ];
+        let prefetcher = Prefetcher::weather(30, "today", results);
+        assert_eq!(prefetcher.fetches(0..=59).await, [0, 30]);
+        let stored = lock(&prefetcher.prefetch.answers.stored).remove("weather");
+        let stored = stored.map(|answer| (answer.text, answer.time));
+        assert_eq!(stored, Some((FORECAST.to_owned(), saturday(0))));
+        assert_eq!(prefetcher.fetches(60..=60).await, [60]);
+    }
+
+    /// AC-14.10b-9. `jarvis.toml` has `plugins.cache_s = 300`.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10b_9_refresh_skips_the_registry_cache() {
+        let prefetcher = Prefetcher::weather(1, "today", vec![Ok(forecast()), Ok(forecast())]);
+        assert_eq!(prefetcher.fetches(0..=1).await, [0, 1]);
     }
 }

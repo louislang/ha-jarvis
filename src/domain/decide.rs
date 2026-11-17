@@ -782,7 +782,8 @@ fn selection(
     ensures
         data matches Some(data) ==> stringed(*intent, data),
 )]
-fn data(intent: &Intent, context: &Map<String, Value>) -> Option<Map<String, Value>> {
+#[must_use]
+pub fn data(intent: &Intent, context: &Map<String, Value>) -> Option<Map<String, Value>> {
     let mut data = Map::new();
     let entries = intent.data.iter();
     proof_decl! {
@@ -874,7 +875,8 @@ fn respond(
 
 /// The template context: the slots of `context` and the name of `area` in lowercase.
 #[verus_verify]
-fn context(
+#[must_use]
+pub fn context(
     mut context: Map<String, Value>,
     area: Option<&AreaId>,
     cache: &StateCache,
