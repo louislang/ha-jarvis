@@ -203,7 +203,7 @@ With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan c
 | `text2num` | Domain | Number words to digits in the template filter `number` (sub-phase 18.9). |
 | `strsim` | Domain, adapter tests | Fuzzy match of a spoken answer to a list of choices. Word edit distance for the second-pass word error rate (AC-6.7-3). |
 | `dashmap` | Application | Concurrent audio cache. |
-| `ndarray`, `linfa`, `linfa-clustering` | Domain | DBSCAN clusters of the embeddings of System Two requests. |
+| `dbscan` | Domain | DBSCAN clusters of the embeddings of System Two requests. Euclidean distance of two centroids. Not `linfa-clustering`: Verus then needs a specification of `DbscanParams<F: linfa::Float, ...>`, and so of `linfa::Float` with its 16 supertraits from six crates. |
 | `xxhash-rust` | Domain | Stable hash for the held-out split. |
 | `vstd` | Domain | Verus: `#[verus_spec]`, `#[verus_verify]`, `verus!`, spec types and the `vstd` specifications of `std`. A normal build erases the proof code. |
 | `serde`, `serde_json` | All | Data types and messages. |
