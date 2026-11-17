@@ -91,10 +91,10 @@
     border-radius: var(--ha-card-border-radius);
   }
   #interactions:empty::after { content: "No interactions."; color: var(--secondary-text-color); }
-  .transcript { margin: 0; font-size: 16px; font-weight: 500; }
+  .transcript, .name { margin: 0; font-size: 16px; font-weight: 500; }
   .meta { margin: 0 0 12px; color: var(--secondary-text-color); font-size: 12px; }
   audio { display: block; width: 100%; height: 40px; }
-  .responses { margin: 12px 0 0; padding: 0 0 0 12px; list-style: none; border-left: 2px solid var(--primary-color); }
+  .responses, .examples { margin: 12px 0 0; padding: 0 0 0 12px; list-style: none; border-left: 2px solid var(--primary-color); }
   .responses:empty { display: none; }
   .action {
     display: flex;
@@ -105,7 +105,7 @@
     padding: 8px 16px;
     border-top: 1px solid var(--divider-color);
   }
-  .intent { flex: 1; font-family: ui-monospace, monospace; font-size: 13px; color: var(--secondary-text-color); }
+  .intent, .service { flex: 1; font-family: ui-monospace, monospace; font-size: 13px; color: var(--secondary-text-color); }
   button {
     height: 40px;
     padding: 0 16px;
@@ -175,6 +175,7 @@
 </header>
 <main>
 <section id="review" role="tabpanel">
+  <div id="proposals"></div>
   <div class="toolbar">
     Show
     <select id="filter">
@@ -197,6 +198,17 @@
       <button class="mark-good" type="button">Good</button>
       <button class="mark-bad" type="button">Bad</button>
       <select class="correction"><option value="">Correct intent</option></select>
+    </div>
+  </article>
+</template>
+<template id="proposal">
+  <article>
+    <p class="name"></p>
+    <ul class="examples"></ul>
+    <div class="action">
+      <span class="service"></span>
+      <button class="approve" type="button">Approve</button>
+      <button class="reject" type="button">Reject</button>
     </div>
   </article>
 </template>
@@ -313,6 +325,32 @@
       list.textContent = `Jarvis did not answer: ${error.message}`;
       more.hidden = true;
     }
+  }
+
+  // A learned intent with a service waits for your approval.
+  function proposal(entry) {
+    const shown = document.getElementById('proposal').content.firstElementChild.cloneNode(true);
+    shown.querySelector('.name').textContent = entry.name;
+    shown.querySelector('.service').textContent = entry.service;
+    shown.querySelector('.examples').append(...entry.examples.map((example) =>
+      Object.assign(document.createElement('li'), { textContent: example })));
+    for (const [name, approve] of [['approve', true], ['reject', false]]) {
+      shown.querySelector(`.${name}`).addEventListener('click', async () => {
+        const response = await fetch(`api/proposals/${encodeURIComponent(entry.name)}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ approve }),
+        });
+        if (response.ok) shown.remove();
+        else alert(`The ${name} failed: ${response.status}`);
+      });
+    }
+    return shown;
+  }
+
+  async function loadProposals() {
+    const response = await fetch('api/proposals');
+    if (response.ok) document.getElementById('proposals').replaceChildren(...(await response.json()).map(proposal));
   }
 
   async function start() {
@@ -470,6 +508,7 @@
   loadSettings();
   showStatus();
   setInterval(showStatus, 5000);
+  loadProposals();
   start();
 </script>
 </body>

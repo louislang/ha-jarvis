@@ -65,7 +65,9 @@ use crate::domain::feedback::Deferred;
 use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
 use crate::domain::feedback::Route;
+use crate::domain::learn::Learned;
 use crate::domain::learn::LearnedIntent;
+use crate::domain::learn::LearnedStatus;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
@@ -103,6 +105,7 @@ use crate::ports::SttStream;
 use crate::ports::TextToSpeech;
 use crate::ports::Tool;
 use crate::ports::Trainer;
+use crate::ports::Unresolved;
 
 /// The reference house snapshot.
 #[must_use]
@@ -1088,6 +1091,8 @@ pub struct FakeReview {
     pub intents: Vec<String>,
     /// Each accepted mark, in order.
     pub marks: Mutex<Vec<Mark>>,
+    /// The learned intents file.
+    pub learned: Mutex<Learned>,
 }
 
 #[async_trait]
@@ -1114,6 +1119,30 @@ impl Review for FakeReview {
     fn intents(&self) -> Vec<String> {
         self.intents.clone()
     }
+
+    fn proposals(&self) -> anyhow::Result<Vec<LearnedIntent>> {
+        Ok(review::pending(lock(&self.learned).clone()))
+    }
+
+    async fn resolve(&self, name: &str, approve: bool) -> Result<(), Unresolved> {
+        review::resolve(&mut lock(&self.learned), name, approve)
+    }
+}
+
+/// The learned command entry `name` with `status`, the service `scene.turn_on`, one example and
+/// the centroid `[1, 0]`.
+///
+/// # Panics
+///
+/// The entry does not parse, which is a bug of the fake.
+#[must_use]
+pub fn learned(name: &str, status: LearnedStatus) -> LearnedIntent {
+    serde_json::from_value(json!({
+        "name": name, "centroid": [1.0, 0.0], "service": "scene.turn_on", "kind": "command",
+        "examples": ["good night"], "responses": ["Good night."], "select": [], "data": {},
+        "status": status, "texts": ["good night jarvis"],
+    }))
+    .expect("the entry is a learned intent")
 }
 
 /// A `Control` that gives a set status, has no settings and gives a set answer to each save.

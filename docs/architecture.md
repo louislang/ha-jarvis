@@ -76,6 +76,7 @@ flowchart LR
     crate --> crate_app_training
     crate --> crate_domain_catalog
     crate --> crate_domain_habits
+    crate --> crate_domain_learn
     crate --> crate_domain_model
     crate --> crate_domain_responses
     crate --> crate_domain_speech
@@ -132,6 +133,7 @@ flowchart LR
     crate_adapters_supertonic --> crate_domain_speech
     crate_adapters_supertonic --> crate_ports
     crate_adapters_web --> crate_domain_feedback
+    crate_adapters_web --> crate_domain_learn
     crate_adapters_web --> crate_domain_speech
     crate_adapters_web --> crate_ports
     crate_adapters_wyoming --> crate_domain_speech
@@ -172,9 +174,11 @@ flowchart LR
     crate_app_plugins --> crate_domain_decide
     crate_app_plugins --> crate_domain_state
     crate_app_plugins --> crate_ports
+    crate_app_review --> crate_app_conversation
     crate_app_review --> crate_app_review
     crate_app_review --> crate_domain_catalog
     crate_app_review --> crate_domain_feedback
+    crate_app_review --> crate_domain_learn
     crate_app_review --> crate_domain_speech
     crate_app_review --> crate_ports
     crate_app_speech --> crate_app_conversation

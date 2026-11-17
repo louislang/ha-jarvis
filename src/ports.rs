@@ -399,6 +399,31 @@ pub trait Review: Send + Sync {
 
     /// The names that a correction can have.
     fn intents(&self) -> Vec<String>;
+
+    /// The `pending` learned entries, in file order.
+    ///
+    /// # Errors
+    ///
+    /// The learned intents file cannot load.
+    fn proposals(&self) -> anyhow::Result<Vec<LearnedIntent>>;
+
+    /// Sets the `pending` learned entry `name` to `active` with `approve`, else to `rejected`.
+    ///
+    /// # Errors
+    ///
+    /// No `pending` entry has the name, or the file cannot load or save. The file does not
+    /// change.
+    async fn resolve(&self, name: &str, approve: bool) -> Result<(), Unresolved>;
+}
+
+/// Why a review does not resolve a learned entry.
+#[must_use]
+#[derive(Debug)]
+pub enum Unresolved {
+    /// No `pending` entry has the name.
+    NotPending,
+    /// The learned intents file cannot load or save, or the pools task stopped.
+    Failed(anyhow::Error),
 }
 
 /// What Jarvis does now.

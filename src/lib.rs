@@ -86,6 +86,7 @@ use crate::app::training::Training;
 use crate::app::training::Trigger;
 use crate::domain::catalog::Catalog;
 use crate::domain::habits::RequestHabits;
+use crate::domain::learn::Learned;
 use crate::domain::model::Prediction;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Pools;
@@ -1450,6 +1451,9 @@ type Learn = (mpsc::Sender<Change>, Arc<Habits>);
 /// The [`Extras`] and the [`Learn`] of the learned intent check.
 type Checks = (Extras, Learn);
 
+/// The training trigger task and the learned intent check task, and the review.
+type Checked = ((JoinHandle<()>, JoinHandle<()>), Reviewer);
+
 /// The longest wait of [`run`] for the running tasks and the saves after the shutdown future
 /// completes.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
@@ -1878,14 +1882,15 @@ fn start_log(
         runpod,
         (home, models, stop, shared.clone()),
     )?;
-    let (recorded, (writer, review)) = recorder(listener, catalog, &log, last_id, &trigger);
-    let checks = start_checks(config, trigger, log, (reasoner, catalog), (learn, tools))?;
+    let (recorded, writer) = recorder(listener, &log, last_id, &trigger);
+    let (checks, review) = start_checks(config, trigger, log, (reasoner, catalog), (learn, tools))?;
     Ok((recorded, ((writer, checks), review, stopped, shared)))
 }
 
 /// Starts the training trigger `trigger` each `train.check_interval_s`, and the learned intent
 /// check of `config` on `log` with `reasoner`, `catalog`, the pools task and the request habits
-/// of `learn` and the plugin tools `tools` each `learn.check_interval_s`. Gives both tasks.
+/// of `learn` and the plugin tools `tools` each `learn.check_interval_s`. Gives both tasks, and the
+/// review of `log` with the intent names of `catalog` and the learned intents file of the check.
 ///
 /// # Errors
 ///
@@ -1896,24 +1901,32 @@ fn start_checks(
     log: Arc<dyn InteractionLog>,
     (reasoner, catalog): (&Arc<dyn Reasoner>, &Arc<Catalog>),
     ((changes, habits), tools): (Learn, Vec<Tool>),
-) -> anyhow::Result<(JoinHandle<()>, JoinHandle<()>)> {
+) -> anyhow::Result<Checked> {
+    let store: Arc<dyn Store<Learned>> = Arc::new(FileStore::try_new(config.learn.file.clone())?);
+    let review = Reviewer::new(
+        Arc::clone(&log),
+        catalog,
+        Arc::clone(&store),
+        changes.clone(),
+    );
     let learning = Learning {
         config: config.learn.clone(),
         log,
         reasoner: Arc::clone(reasoner),
         catalog: Arc::clone(catalog),
         tools,
-        store: Arc::new(FileStore::try_new(config.learn.file.clone())?),
+        store,
         changes,
         clock: Arc::new(SystemClock),
         habits,
     };
     let learn = Duration::from_secs(config.learn.check_interval_s);
     let train = Duration::from_secs(config.train.check_interval_s);
-    Ok((
+    let tasks = (
         app::training::start_trigger(trigger, train),
         app::background::start_learning(learning, learn),
-    ))
+    );
+    Ok((tasks, review))
 }
 
 /// The log of `config` and its largest stored ID. Starts the daily prune of the log.
@@ -1933,16 +1946,13 @@ fn open_log(config: &Config) -> anyhow::Result<(Arc<dyn InteractionLog>, Option<
 }
 
 /// The recorder of the utterances of `listener` and `log` with the largest stored ID `last_id`
-/// and `trigger`, its new log writer task, and the review of `log` with the intent names of
-/// `catalog`.
+/// and `trigger`, and its new log writer task.
 fn recorder(
     listener: &Listener,
-    catalog: &Catalog,
     log: &Arc<dyn InteractionLog>,
     last_id: Option<u64>,
     trigger: &Arc<Trigger>,
-) -> (Recorder, (JoinHandle<()>, Reviewer)) {
-    let review = Reviewer::new(Arc::clone(log), catalog);
+) -> (Recorder, JoinHandle<()>) {
     let (writer, task) = app::conversation::start_writer(Arc::clone(log));
     let recorder = Recorder {
         utterances: Arc::clone(listener.utterances()),
@@ -1950,7 +1960,7 @@ fn recorder(
         last_id,
         trigger: Arc::clone(trigger),
     };
-    (recorder, (task, review))
+    (recorder, task)
 }
 
 /// The training trigger of `config` with the backoff `train.failure_backoff_s`, the process
