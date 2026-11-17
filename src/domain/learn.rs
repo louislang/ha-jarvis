@@ -5,6 +5,8 @@ use std::collections::BTreeSet;
 
 use dbscan::Classification;
 use jiff::Timestamp;
+use serde::Deserialize;
+use serde::Serialize;
 use vstd::prelude::*;
 
 use crate::domain::catalog;
@@ -46,8 +48,7 @@ pub struct Cluster {
 }
 
 /// An entry of the learned intents file, or a proposal of System Two.
-#[verus_verify]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct LearnedIntent {
     /// The intent name.
     pub name: String,
@@ -77,11 +78,41 @@ pub struct LearnedIntent {
     pub fresh_min: Option<u32>,
     /// The remote data that a new plugin must give, in one line.
     pub needs: Option<String>,
+    /// Where the entry is in its lifecycle.
+    pub status: LearnedStatus,
+    /// The texts of the cluster of the entry.
+    pub texts: Vec<String>,
+    /// The path of the plugin request file.
+    pub request_file: Option<String>,
+}
+
+/// Where a learned entry is in its lifecycle.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LearnedStatus {
+    /// Waits for your approval.
+    Pending,
+    /// An intent.
+    Active,
+    /// You rejected it.
+    Rejected,
+    /// Not an intent: the cluster is not suitable or the proposal is not valid.
+    #[default]
+    None,
+    /// Waits for a new plugin.
+    Requested,
+}
+
+/// The learned intents file.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct Learned {
+    /// The entries, in file order.
+    pub intents: Vec<LearnedIntent>,
 }
 
 /// The kind of a learned intent.
-#[verus_verify]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LearnedKind {
     /// Reply from the pool and call the optional service.
     Command,
@@ -563,9 +594,38 @@ pub fn needs_approval(intent: &LearnedIntent) -> bool {
     intent.service.is_some()
 }
 
+/// The status of the entry of the valid `proposal`.
+#[verus_spec(status =>
+    ensures
+        status == initial(proposal.kind, proposal.service is Some),
+)]
+#[must_use]
+pub fn initial_status(proposal: &LearnedIntent) -> LearnedStatus {
+    match proposal.kind {
+        LearnedKind::NewPlugin => LearnedStatus::Requested,
+        LearnedKind::None => LearnedStatus::None,
+        _ => {
+            if needs_approval(proposal) {
+                LearnedStatus::Pending
+            } else {
+                LearnedStatus::Active
+            }
+        }
+    }
+}
+
 verus! {
 
 broadcast use crate::domain::contracts::axiom_string_obeys_cmp;
+
+/// The status of a valid proposal of `kind`, with a service when `service`.
+pub open spec fn initial(kind: LearnedKind, service: bool) -> LearnedStatus {
+    match kind {
+        LearnedKind::NewPlugin => LearnedStatus::Requested,
+        LearnedKind::None => LearnedStatus::None,
+        _ => if service { LearnedStatus::Pending } else { LearnedStatus::Active },
+    }
+}
 
 /// True when `name` is not `unknown` and no intent of `intents` or entry of `learned` has it.
 pub open spec fn new_name(name: Seq<char>, intents: Seq<catalog::Intent>, learned: Seq<LearnedIntent>) -> bool {
@@ -678,6 +738,9 @@ mod tests {
             question: (kind == LearnedKind::Prefetch).then(|| "Is it bedtime?".to_owned()),
             fresh_min: timed.then_some(30),
             needs: (kind == LearnedKind::NewPlugin).then(|| "bedtime data".to_owned()),
+            status: LearnedStatus::None,
+            texts: Vec::new(),
+            request_file: None,
         }
     }
 
@@ -919,5 +982,47 @@ mod tests {
         let mut valid = proposal(LearnedKind::NewPlugin);
         valid.responses = vec!["Bedtime is in {{ response.minutes }} minutes.".to_owned()];
         assert_eq!(check(valid.clone(), &[]), Ok(valid));
+    }
+
+    /// The status of a proposal of `kind` with `service`.
+    fn status(kind: LearnedKind, service: Option<&str>) -> LearnedStatus {
+        let mut intent = proposal(kind);
+        intent.service = service.map(str::to_owned);
+        initial_status(&intent)
+    }
+
+    /// AC-14.5-10.
+    #[test]
+    fn ac_14_5_10_status_of_each_kind() {
+        let service = Some("scene.turn_on");
+        assert_eq!(
+            status(LearnedKind::NewPlugin, None),
+            LearnedStatus::Requested
+        );
+        assert_eq!(status(LearnedKind::None, service), LearnedStatus::None);
+        assert_eq!(
+            status(LearnedKind::Command, service),
+            LearnedStatus::Pending
+        );
+        assert_eq!(status(LearnedKind::Query, None), LearnedStatus::Active);
+    }
+
+    /// AC-14.5-11.
+    #[test]
+    fn ac_14_5_11_file_round_trips_as_toml() {
+        let mut first = proposal(LearnedKind::Command);
+        first.data.insert("transition".to_owned(), "2".to_owned());
+        first.centroid = vec![0.5, 0.25];
+        first.status = LearnedStatus::Active;
+        first.texts = vec!["good night jarvis".to_owned()];
+        let mut second = entry("get_traffic", [0.0, 1.0, 0.0]);
+        second.request_file = Some("plugin-requests/get_traffic.md".to_owned());
+        let learned = Learned {
+            intents: vec![first, second],
+        };
+        let text = toml::to_string_pretty(&learned).expect("the file serializes");
+        assert_eq!(text.matches("[[intents]]").count(), 2, "the file is {text}");
+        let read: Learned = toml::from_str(&text).expect("the file parses");
+        assert_eq!(read, learned);
     }
 }

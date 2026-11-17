@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 
 use minijinja::Environment;
 use serde::Deserialize;
+use serde::Serialize;
 use vstd::prelude::*;
 
 use crate::domain::intent;
@@ -86,7 +87,7 @@ pub enum Kind {
 }
 
 /// The entities that the service of an intent gets.
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Target {
     /// One entity.
@@ -99,7 +100,7 @@ pub enum Target {
 }
 
 /// An entity filter of `select`.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Filter {
     /// The entity domain, for example `light`.

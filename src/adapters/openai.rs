@@ -50,6 +50,7 @@ use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::learn::LearnedIntent;
 use crate::domain::learn::LearnedKind;
+use crate::domain::learn::LearnedStatus;
 use crate::domain::speech;
 use crate::domain::state::ServiceCall;
 use crate::ports;
@@ -319,6 +320,15 @@ struct ProposalFields {
     fresh_min: Option<u32>,
     /// The remote data that a new plugin must give.
     needs: Option<String>,
+    /// Not in a proposal: the check sets the status.
+    #[serde(skip)]
+    status: LearnedStatus,
+    /// Not in a proposal: the caller adds the cluster texts.
+    #[serde(skip)]
+    texts: Vec<String>,
+    /// Not in a proposal: the plugin request adds it.
+    #[serde(skip)]
+    request_file: Option<String>,
 }
 
 /// One `data` entry of a proposal.
@@ -1759,6 +1769,9 @@ mod tests {
             question: None,
             fresh_min: None,
             needs: None,
+            status: LearnedStatus::None,
+            texts: Vec::new(),
+            request_file: None,
         };
         assert_eq!(result?, expected);
         assert_eq!(request["max_output_tokens"], 8000);
