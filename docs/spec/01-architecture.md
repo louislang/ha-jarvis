@@ -208,7 +208,7 @@ With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan c
 | `vstd` | Domain | Verus: `#[verus_spec]`, `#[verus_verify]`, `verus!`, spec types and the `vstd` specifications of `std`. A normal build erases the proof code. |
 | `serde`, `serde_json` | All | Data types and messages. |
 | `tokio` | Application, adapters | Async runtime, TCP, timers, channels. |
-| `arc-swap` | Application, adapter, root | Atomic swap of the System One model and of the hotword text of the second pass. |
+| `arc-swap` | Application, adapter, root | Atomic swap of the System One model, of the live catalog and of the hotword text of the second pass. |
 | `tokio-util` | Adapter, root | `TaskTracker`: the connection tasks and the `after` work that a shutdown waits for. |
 | `anyhow` | All except domain | Error propagation. Domain functions return typed errors. |
 | `tracing`, `tracing-subscriber` | Application, adapters, root | Logs and latency spans. |
