@@ -986,8 +986,10 @@ mod tests {
     use crate::domain::habits::Bucket;
     use crate::domain::habits::DayType;
     use crate::domain::learn::LearnedKind;
+    use crate::domain::model::Prediction;
     use crate::domain::state::Snapshot;
     use crate::domain::state::State;
+    use crate::ports::Context;
     use crate::testing::fakes;
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
@@ -2216,28 +2218,32 @@ mod tests {
         monday() + SignedDuration::from_mins(3 * 24 * 60 - 10)
     }
 
-    /// A prefetch on the System Two, the TTS, the habits and the file of a check, and its clock.
+    /// A prefetch on the System Two, the TTS, the habits and the file of a check, its house, its
+    /// classifier and its clock.
     struct Prefetcher {
         /// The prefetch.
         prefetch: Prefetch,
         /// The check.
         learner: Learner,
+        /// The house.
+        home: Arc<FakeHome>,
+        /// The System One model.
+        classifier: Arc<FakeClassifier>,
         /// The time.
         clock: Arc<SetClock>,
     }
 
     impl Prefetcher {
-        /// The prefetch of [`prefetch_calendar`] of `names` with `jarvis.toml` at `thursday()`.
-        fn new(names: &[&str]) -> anyhow::Result<Self> {
+        /// The prefetch of [`prefetch_calendar`] of `names` with `fresh_min`, `jarvis.toml` and
+        /// `thursday()`.
+        fn new(names: &[&str], fresh_min: u32) -> anyhow::Result<Self> {
             let config = Config::parse(include_str!("../../jarvis.toml"))?;
             let learner = Learner::empty();
-            prefetch_calendar(&learner, names)?;
+            prefetch_calendar(&learner, names, fresh_min)?;
             let clock = Arc::new(SetClock(Mutex::new(thursday())));
-            let reasoner = Arc::clone(&learner.reasoner) as _;
-            let mut two =
-                crate::system_two(&config, reasoner, crate::registry(&config, Vec::new()));
-            two.clock = Arc::clone(&clock) as _;
-            let conversation = prefetch_conversation(&config, &learner, two);
+            let two = prefetch_two(&config, &learner, &clock);
+            let (home, classifier) = (Arc::default(), Arc::default());
+            let conversation = prefetch_conversation(&config, &learner, two, (&home, &classifier));
             let habits = Arc::clone(&learner.learning.habits);
             let mut activation = learner.learning.activation.clone();
             activation.clock = Arc::clone(&clock) as _;
@@ -2245,32 +2251,56 @@ mod tests {
             Ok(Self {
                 prefetch,
                 learner,
+                home,
+                classifier,
                 clock,
             })
         }
 
+        /// Sets the time to `time`.
+        fn at(&self, time: Timestamp) {
+            *lock(&self.clock.0) = time;
+        }
+
         /// Runs one tick at `minutes` after `thursday()` with the answer `steps`.
         async fn tick(&self, minutes: i64, steps: Vec<Scripted>) {
-            *lock(&self.clock.0) = thursday() + SignedDuration::from_mins(minutes);
+            self.at(thursday() + SignedDuration::from_mins(minutes));
             self.learner.reasoner.script(steps);
             self.prefetch.tick().await;
         }
     }
 
-    /// Saves an active prefetch entry of [`QUESTION`] for each of `names`, used weekdays at 08:00.
-    fn prefetch_calendar(learner: &Learner, names: &[&str]) -> anyhow::Result<()> {
+    /// Gives the file and the live catalog of `learner` an active prefetch entry of [`QUESTION`]
+    /// with `fresh_min` for each of `names`, used weekdays at 08:00.
+    fn prefetch_calendar(learner: &Learner, names: &[&str], fresh_min: u32) -> anyhow::Result<()> {
         let mut intents = Vec::new();
         for name in names {
             let mut entry = proposal(LearnedKind::Prefetch, None);
             (entry.name, entry.status) = ((*name).to_owned(), LearnedStatus::Active);
-            (entry.question, entry.fresh_min) = (Some(QUESTION.to_owned()), Some(30));
+            (entry.question, entry.fresh_min) = (Some(QUESTION.to_owned()), Some(fresh_min));
             for day in 0..3 {
                 let time = monday() + SignedDuration::from_hours(24 * day);
                 learner.learning.habits.observe((*name).to_owned(), time);
             }
             intents.push(entry);
         }
+        let live = learn::live(catalog(), intents.clone());
+        learner.learning.activation.catalog.store(Arc::new(live));
         learner.store.save(&Learned { intents })
+    }
+
+    /// System Two of `config` on the reasoner of `learner` at `clock`, with no plugin.
+    fn prefetch_two(config: &Config, learner: &Learner, clock: &Arc<SetClock>) -> SystemTwo {
+        let reasoner = Arc::clone(&learner.reasoner) as _;
+        let mut two = crate::system_two(config, reasoner, crate::registry(config, Vec::new()));
+        two.clock = Arc::clone(clock) as _;
+        two
+    }
+
+    /// The pools of `responses.toml` for the catalog of `intents.toml`.
+    fn response_pools() -> Arc<ArcSwap<Pools>> {
+        let pools = crate::load_pools("responses.toml".as_ref(), &catalog());
+        Arc::new(ArcSwap::from_pointee(pools.expect("the pools load")))
     }
 
     /// A recorder with a log writer that has ended, at `clock`.
@@ -2283,18 +2313,24 @@ mod tests {
         }
     }
 
-    /// A conversation of `config` on `FakeHome` and `two`, with the habits and the hot cache, the
-    /// live catalog and the pre-render of the activation of `learner`.
-    fn prefetch_conversation(config: &Config, learner: &Learner, two: SystemTwo) -> Conversation {
+    /// A conversation of `config` on `two` and the house and the classifier of `parts`, with the
+    /// habits and the hot cache, the live catalog and the pre-render of the activation of
+    /// `learner`.
+    fn prefetch_conversation(
+        config: &Config,
+        learner: &Learner,
+        two: SystemTwo,
+        (home, classifier): (&Arc<FakeHome>, &Arc<FakeClassifier>),
+    ) -> Conversation {
         let (activation, wait) = (&learner.learning.activation, Duration::from_secs(1));
-        let (home, cache) = (Arc::new(FakeHome::default()), activation.cache.clone());
+        let (home, cache) = (Arc::clone(home) as _, activation.cache.clone());
         let queues = Arc::new(Queues::new(home, cache, wait, wait, config.dialog.clone()));
-        let classifier = Arc::new(FakeClassifier::default());
+        let classifier = Arc::clone(classifier) as _;
         let classifier = Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), classifier));
         let recorder = ended_recorder(&two.clock);
         let backfill = crate::backfill(config, &two.reasoner, activation);
+        let pools = response_pools();
         let (catalog, threshold) = (Arc::clone(&activation.catalog), config.model.threshold);
-        let pools = Arc::new(ArcSwap::from_pointee(Pools::new()));
         let habits = Arc::clone(&learner.learning.habits);
         Conversation::new(
             pools, backfill, queues, classifier, catalog, threshold, two, habits, recorder,
@@ -2309,7 +2345,7 @@ mod tests {
     /// AC-14.10c-1.
     #[tokio::test(start_paused = true)]
     async fn ac_14_10c_1_due_refresh_asks_the_question() -> anyhow::Result<()> {
-        let prefetcher = Prefetcher::new(&[CALENDAR])?;
+        let prefetcher = Prefetcher::new(&[CALENDAR], 30)?;
         prefetcher.tick(0, said("Two events.")).await;
         assert_eq!(prefetcher.learner.reasoner.questions(), [QUESTION]);
         Ok(())
@@ -2318,7 +2354,7 @@ mod tests {
     /// AC-14.10c-2. A new answer also drops the audio of the old one.
     #[tokio::test(start_paused = true)]
     async fn ac_14_10c_2_answer_audio_is_cached() -> anyhow::Result<()> {
-        let prefetcher = Prefetcher::new(&[CALENDAR])?;
+        let prefetcher = Prefetcher::new(&[CALENDAR], 30)?;
         prefetcher.tick(0, said("Two events.")).await;
         let speech = &prefetcher.prefetch.activation.speech;
         let tts = &prefetcher.learner.tts;
@@ -2334,7 +2370,7 @@ mod tests {
     /// AC-14.10c-3.
     #[tokio::test(start_paused = true)]
     async fn ac_14_10c_3_error_keeps_the_old_answer() -> anyhow::Result<()> {
-        let prefetcher = Prefetcher::new(&[CALENDAR])?;
+        let prefetcher = Prefetcher::new(&[CALENDAR], 30)?;
         prefetcher.tick(0, said("Old.")).await;
         let steps = vec![Scripted::Sentence("New."), Scripted::Error("lost")];
         prefetcher.tick(30, steps).await;
@@ -2351,7 +2387,7 @@ mod tests {
     /// AC-14.10c-4.
     #[tokio::test(start_paused = true)]
     async fn ac_14_10c_4_window_gives_three_prefetches() -> anyhow::Result<()> {
-        let prefetcher = Prefetcher::new(&[CALENDAR])?;
+        let prefetcher = Prefetcher::new(&[CALENDAR], 30)?;
         let (mut asked, reasoner) = (Vec::new(), &prefetcher.learner.reasoner);
         for minutes in -10..=70 {
             let before = reasoner.questions().len();
@@ -2367,7 +2403,7 @@ mod tests {
     /// A tick from 08:59 skips its second intent when the first answer ends at 09:00.
     #[tokio::test(start_paused = true)]
     async fn each_intent_of_a_tick_reads_the_clock() -> anyhow::Result<()> {
-        let prefetcher = Prefetcher::new(&[CALENDAR, "school_calendar"])?;
+        let prefetcher = Prefetcher::new(&[CALENDAR, "school_calendar"], 30)?;
         let late = async {
             tokio::time::sleep(Duration::from_secs(1)).await;
             *lock(&prefetcher.clock.0) = thursday() + SignedDuration::from_hours(1);
@@ -2381,7 +2417,7 @@ mod tests {
     /// A refresh keeps old audio that `school_calendar` still stores or that a pool has.
     #[tokio::test(start_paused = true)]
     async fn refresh_keeps_audio_in_use() -> anyhow::Result<()> {
-        let prefetcher = Prefetcher::new(&[CALENDAR, "school_calendar"])?;
+        let prefetcher = Prefetcher::new(&[CALENDAR, "school_calendar"], 30)?;
         let speech = &prefetcher.prefetch.activation.speech;
         let tts = &prefetcher.learner.tts;
         let pools = Pools::from([("hello".to_owned(), pool(&["Hello.".to_owned()]))]);
@@ -2397,5 +2433,182 @@ mod tests {
         speech.speak("Hello.").await?;
         assert_eq!(tts.texts().len(), synths, "the audio in use stays");
         Ok(())
+    }
+
+    /// The model state of `prefetch.qnt` that the conformance test compares.
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
+    struct PrefetchModel {
+        /// The model time of the stored answer.
+        answer: Stored,
+        /// The model times of the prefetches.
+        fetches: Vec<i64>,
+        /// The HA calls that act on the house.
+        write_calls: usize,
+        /// The HA calls that only read.
+        read_calls: usize,
+        /// The model times of each served request and of its answer.
+        served: Vec<(i64, i64)>,
+    }
+
+    /// A Quint `Option[int]`.
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(tag = "tag", content = "value")]
+    enum Stored {
+        /// A value.
+        Some(i64),
+        /// No value, with the empty tuple of Quint.
+        None(Vec<i64>),
+    }
+
+    impl ModelState<PrefetchDriver> for PrefetchModel {
+        /// The stored answer and the calls of the house, with the prefetches and the served
+        /// requests that the driver saw.
+        fn from_driver(driver: &PrefetchDriver) -> anyhow::Result<Self> {
+            let stored = lock(&driver.prefetcher.prefetch.answers.stored);
+            let answer = stored.get(CALENDAR).map(|answer| unit(answer.time));
+            let calls = driver.prefetcher.home.calls();
+            let read_calls = calls.iter().filter(|call| call.return_response).count();
+            Ok(Self {
+                answer: answer.map_or(Stored::None(Vec::new()), Stored::Some),
+                fetches: driver.fetches.clone(),
+                write_calls: calls.len() - read_calls,
+                read_calls,
+                served: driver.served.clone(),
+            })
+        }
+    }
+
+    /// The model time 0 of `prefetch.qnt`: 06:00 on `thursday()`.
+    fn origin() -> Timestamp {
+        thursday() - SignedDuration::from_hours(2)
+    }
+
+    /// The model time of `time`: one unit each 30 min after [`origin`].
+    fn unit(time: Timestamp) -> i64 {
+        time.duration_since(origin()).as_mins() / 30
+    }
+
+    /// The request of the conformance test.
+    const ASKED: &str = "what is on the calendar";
+
+    /// The answer of a `Sentence` step.
+    const ANSWERED: &str = "Two events.";
+
+    /// Replays `prefetch.qnt` against the prefetch and `handle`, with `fresh_min = 60`, a lead of
+    /// 30 min and requests with no device.
+    struct PrefetchDriver {
+        /// The paused runtime of the prefetches and the requests.
+        runtime: Runtime,
+        /// The prefetch, its conversation and its fakes.
+        prefetcher: Prefetcher,
+        /// The model time.
+        now: i64,
+        /// The model times of the ticks with an `answer` call.
+        fetches: Vec<i64>,
+        /// The model times of each request with the stored answer as its reply, and of the answer.
+        served: Vec<(i64, i64)>,
+    }
+
+    impl PrefetchDriver {
+        /// A driver at model time 0, with a classifier that gives the intent to each request.
+        fn new() -> Self {
+            let mut runtime = tokio::runtime::Builder::new_current_thread();
+            let runtime = runtime.enable_time().start_paused(true).build();
+            let mut prefetcher = Prefetcher::new(&[CALENDAR], 60).expect("the prefetch starts");
+            prefetcher.prefetch.lead_min = 30;
+            for _ in 0..30 {
+                let ranked = vec![(CALENDAR.to_owned(), 0.9)];
+                let slots = Vec::new();
+                prefetcher.classifier.script(Prediction { ranked, slots });
+            }
+            prefetcher.at(origin());
+            Self {
+                runtime: runtime.expect("the runtime builds"),
+                prefetcher,
+                now: 0,
+                fetches: Vec::new(),
+                served: Vec::new(),
+            }
+        }
+
+        /// Advances the time by one unit.
+        fn tick(&mut self) {
+            self.now += 1;
+            let time = origin() + SignedDuration::from_mins(30 * self.now);
+            self.prefetcher.at(time);
+        }
+
+        /// Runs one tick of the prefetch task, whose answer fails.
+        fn prefetch(&mut self) {
+            let reasoner = &self.prefetcher.learner.reasoner;
+            let before = reasoner.questions().len();
+            self.runtime.block_on(self.prefetcher.prefetch.tick());
+            if reasoner.questions().len() > before {
+                self.fetches.push(self.now);
+            }
+        }
+
+        /// Runs one prefetch answer of the model step `step` without the schedule.
+        fn answer(&mut self, step: &str) -> anyhow::Result<()> {
+            let read = untargeted("calendar.get_events");
+            let steps = match step {
+                "Read" => vec![Scripted::Call(read), Scripted::Error("lost")],
+                "Write" => vec![Scripted::Call(untargeted("light.turn_on"))],
+                "Sentence" => said(ANSWERED),
+                "Fail" => vec![Scripted::Error("lost")],
+                _ => anyhow::bail!("unknown step {step}"),
+            };
+            self.prefetcher.learner.reasoner.script(steps);
+            let run = self.prefetcher.prefetch.run(CALENDAR, QUESTION);
+            self.runtime.block_on(run);
+            Ok(())
+        }
+
+        /// Runs `handle` for a request with no device, and keeps it as served when the reply is
+        /// the stored answer.
+        fn request(&mut self) -> anyhow::Result<()> {
+            let conversation = &self.prefetcher.prefetch.conversation;
+            let handled = self
+                .runtime
+                .block_on(conversation.handle(ASKED, Context::default()))?;
+            let stored = lock(&self.prefetcher.prefetch.answers.stored);
+            if let Some(answer) = stored.get(CALENDAR).filter(|_| handled.text == ANSWERED) {
+                self.served.push((self.now, unit(answer.time)));
+            }
+            Ok(())
+        }
+    }
+
+    /// A call of `service` with no target.
+    fn untargeted(service: &str) -> ServiceCall {
+        let (domain, service) = service.split_once('.').expect("a domain and a service");
+        ServiceCall {
+            domain: domain.to_owned(),
+            service: service.to_owned(),
+            target: Vec::new(),
+            data: serde_json::Map::new(),
+            return_response: false,
+        }
+    }
+
+    impl Driver for PrefetchDriver {
+        type State = PrefetchModel;
+
+        fn step(&mut self, step: &Step) -> anyhow::Result<()> {
+            switch!(step {
+                init => *self = Self::new(),
+                tick => self.tick(),
+                prefetch => self.prefetch(),
+                prefetchStep(s: Tag) => self.answer(&s.tag)?,
+                request => self.request()?,
+            })
+        }
+    }
+
+    /// AC-14.10e-1. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/prefetch.qnt", max_steps = 30, seed = "1")]
+    fn ac_14_10e_1_conformance() -> impl Driver {
+        PrefetchDriver::new()
     }
 }
