@@ -497,6 +497,8 @@ pub(crate) enum Scripted {
     Ask(&'static str),
     /// An error with this text.
     Error(&'static str),
+    /// The end of the answer.
+    Done,
     /// A wait of this time before the next step.
     Wait(Duration),
 }
@@ -641,6 +643,7 @@ async fn answered(step: Scripted, replies: Arc<Mutex<Vec<Reply>>>) -> Option<any
             call_id: text.to_owned(),
         })),
         Scripted::Error(text) => Some(Err(anyhow::anyhow!(text))),
+        Scripted::Done => Some(Ok(Step::Done)),
         Scripted::Wait(time) => {
             tokio::time::sleep(time).await;
             None

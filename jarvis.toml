@@ -121,6 +121,7 @@ responses = 10 # responses of each proposal
 file = "learned.toml"
 check_interval_s = 3600
 prefetch_lead_min = 5 # minutes before the usual hour
+prefetch_services = ["calendar.get_events"] # read-only services that a prefetch can call
 
 [log]
 database = "jarvis.db"
