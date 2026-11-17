@@ -61,7 +61,7 @@ AC-14.2-1 to AC-14.2-3 move to sub-phase 14.2b as AC-14.2b-1 to AC-14.2b-3. AC-1
 **Goal:** Add `validate_proposal` with the checks that all kinds of proposal share. A proposal is used only when its name, examples and responses are well formed.
 
 - **Implements:** G14. **Depends on:** 14.2.
-- **Files:** modify `src/domain/learn.rs`.
+- **Files:** modify `src/domain/learn.rs`, `src/domain/responses.rs`.
 
 **Model.** `LearnedIntent` gets the other fields of a proposal (sub-phase 14.4): `kind`, `examples`, `responses`, `plugin`, `target`, `entity`, `select`, `data`, `question`, `fresh_min` and `needs`. `kind` is `command`, `query`, `fetch`, `prefetch`, `new_plugin` or `none`. A proposal is a `LearnedIntent`.
 
@@ -69,7 +69,8 @@ AC-14.2-1 to AC-14.2-3 move to sub-phase 14.2b as AC-14.2b-1 to AC-14.2b-3. AC-1
 
 - The name is snake case (ASCII lowercase letters, digits and `_`, with a letter first), is not `unknown`, and is not the name of a catalog intent or of an entry of `learned`.
 - There are `min_examples` examples or more, and each passes `validate_example` (sub-phase 13.5) with the slots of all the examples and no seeds.
-- Each response parses and uses only the slots of the examples and the built-ins `area`, `entity`, `person` and `response` (`unknown_variable`, sub-phase 3.2). The responses of a `new_plugin` proposal are not checked, because the author of the plugin writes the pool (sub-phase 14.13).
+- Each response parses and uses only the pool variables of the proposal (`unknown_variable`, sub-phase 3.2). These are the variables that a pool of a catalog intent with the same kind and target gets (sub-phase 4.2): the slots of the examples, `area`, `entity` when `target` is `entity` or absent, `entities` for a query with another target, and `response` for a fetch. A proposal does not act for the speaker, so it does not get `person`. One function of `src/domain/responses.rs` gives these variables to the pool check of sub-phase 4.2 and to this check.
+- The responses of a `new_plugin` or `none` proposal are not checked. The author of the plugin writes the pool of a `new_plugin` entry (sub-phase 14.13), and a `none` entry has no pool.
 
 The checks run in the order above, and the first failure is the error. The error names the field that fails. An example that fails `validate_example` gives its rejection.
 
@@ -78,11 +79,12 @@ The checks run in the order above, and the first failure is the error. The error
 - AC-14.2b-1: When a proposal has fewer than `min_examples` examples, `validate_proposal` returns an error.
 - AC-14.2b-2: When a proposal example has a markup error, `validate_proposal` returns an error.
 - AC-14.2b-3: When a proposal name equals an existing intent name or `unknown`, `validate_proposal` returns an error.
+- AC-14.2b-4: When a list query proposal (`target = entities`) has a response that uses `entities`, `validate_proposal` returns `Ok`. When a response uses a variable that is not a pool variable of the proposal, it returns an error that names `responses`.
 
 **Proofs.**
 
 - P-14.2b-1, P-14.2b-3. Ensures: `validate_proposal` returns `Ok` only when the example count is `min_examples` or more and the name is new and not `unknown`. Argument: `validate_proposal` is a conjunction of checks that returns the first failure. The name check compares the name with each name of the catalog and of `learned`.
-- P-14.2b-2. Argument: the example check uses `validate_example` (P-13.5-5). The tests are the evidence of the snake case, text and template checks (the `minijinja` crate).
+- P-14.2b-2, P-14.2b-4. Argument: the example check uses `validate_example` (P-13.5-5). The tests are the evidence of the snake case, text and template checks (the `minijinja` crate).
 
 ---
 
@@ -95,7 +97,7 @@ The checks run in the order above, and the first failure is the error. The error
 
 **Model.** After the checks of sub-phase 14.2b, the kind decides the other fields:
 
-- `command`: `target` and `select` (or `entity`) are present. `service` is optional. The data templates use only the slots and the built-ins.
+- `command`: `target` and `select` (or `entity`) are present. `service` is optional. The data templates use only the pool variables of the proposal (sub-phase 14.2b).
 - `query`: `select` is present, and `service` is absent.
 - `fetch`: `plugin` is one of `plugins`, `service` is absent, `fresh_min` is 1 or more, and each response uses `response` (decision 30).
 - `prefetch`: `question` is present, `service` is absent, `fresh_min` is 1 or more, and the examples have no slots.
