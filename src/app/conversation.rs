@@ -27,12 +27,14 @@ use tokio::task::JoinHandle;
 use crate::CurrentClassifier;
 use crate::DialogConfig;
 use crate::RunClassifier;
+use crate::app::background::Answers;
 use crate::app::background::Backfill;
 use crate::app::background::Habits;
 use crate::app::plugins::Plugins;
 use crate::app::speech::Utterances;
 use crate::app::training::Trigger;
 use crate::domain::catalog::Catalog;
+use crate::domain::catalog::Kind;
 use crate::domain::decide;
 use crate::domain::decide::AskCall;
 use crate::domain::decide::Chosen;
@@ -96,6 +98,8 @@ pub struct SystemTwo {
     pub read_services: Vec<String>,
     /// The services that a prefetch can call.
     pub prefetch_services: Vec<String>,
+    /// The prefetched answers and the areas of the requests of the prefetch intents.
+    pub answers: Arc<Answers>,
 }
 
 /// The parts of the log of the requests, and the training trigger, which trains on its marks.
@@ -595,8 +599,17 @@ impl Conversation {
         (Some(id.clone()), area.map(|area| area.name.clone()))
     }
 
-    /// The decision for `prediction` of `request` in the current hot cache and pools.
+    /// The decision for `prediction` of `request` in the current hot cache and pools, or a reply
+    /// with the fresh prefetched answer of `prefetched`.
     fn decide(&self, prediction: &Prediction, request: &Request) -> Decision {
+        if let Some(text) = self.prefetched(prediction, request) {
+            let reply = Chosen {
+                text,
+                pool: String::new(),
+                index: 0,
+            };
+            return Decision::Reply { reply, call: None };
+        }
         let (cache, pools) = (self.queues.cache.borrow(), self.pools.load());
         let rng = &mut self.rng.lock().expect("no lock holder panics");
         let catalog = &self.catalog.load();
@@ -609,6 +622,23 @@ impl Conversation {
             self.threshold,
             rng,
         )
+    }
+
+    /// The text of the fresh prefetched answer with the area of `request`, when the top intent of
+    /// `prediction` is a prefetch intent at or above the threshold. Keeps that area as the area of
+    /// the most recent request of the intent.
+    fn prefetched(&self, prediction: &Prediction, request: &Request) -> Option<String> {
+        let (label, probability) = prediction.ranked.first()?;
+        let catalog = self.catalog.load();
+        let intent = catalog
+            .intents
+            .iter()
+            .find(|intent| &intent.name == label)?;
+        let prefetch = intent.kind == Kind::Prefetch && *probability >= self.threshold;
+        let fresh_min = intent.fresh_min.filter(|_| prefetch)?;
+        let answers = &self.two.answers;
+        answers.heard(label, request.area.clone());
+        answers.fresh(label, request.area.as_ref(), request.now, fresh_min)
     }
 
     /// The dispatch of `decision` of `heard` from `area` on its satellite. Without a satellite, the
@@ -1139,17 +1169,27 @@ impl Conversation {
         home.context("no HA configuration")
     }
 
-    /// The text of the System Two answer to the prefetch question `text`, or `None` at a call of
+    /// The prefetched answers and the areas of the requests of the prefetch intents.
+    #[must_use]
+    pub fn answers(&self) -> Arc<Answers> {
+        Arc::clone(&self.two.answers)
+    }
+
+    /// The text of the System Two answer to the prefetch question `text` from `area`, or `None` at a call of
     /// a service that `prefetch_services` lacks, which does not run.
     ///
     /// # Errors
     ///
     /// The HA configuration or its time zone is not known, the answer fails, asks a question or
     /// ends without `Done`, or no step comes within the timeout.
-    pub async fn prefetch(&self, text: &str) -> anyhow::Result<Option<String>> {
+    pub async fn prefetch(
+        &self,
+        text: &str,
+        area: Option<&AreaId>,
+    ) -> anyhow::Result<Option<String>> {
         use anyhow::Context as _;
         use futures::StreamExt;
-        let mut steps = self.two.reasoner.answer(&self.question(text, None)?);
+        let mut steps = self.two.reasoner.answer(&self.question(text, area)?);
         let mut sentences = Vec::new();
         loop {
             let next = tokio::time::timeout(self.two.timeout, steps.next()).await;
@@ -1711,6 +1751,7 @@ mod tests {
     use crate::domain::habits::DayType;
     use crate::domain::habits::RequestHabits;
     use crate::domain::learn;
+    use crate::domain::learn::LearnedKind;
     use crate::domain::learn::LearnedStatus;
     use crate::domain::model::Slot;
     use crate::domain::responses::Pool;
@@ -1808,6 +1849,7 @@ mod tests {
                 allowed_domains: ALLOWED.map(str::to_owned).to_vec(),
                 read_services: vec!["calendar.get_events".to_owned()],
                 prefetch_services: vec!["calendar.get_events".to_owned()],
+                answers: Arc::default(),
             },
             Arc::new(habits),
             recorder(),
@@ -4179,7 +4221,7 @@ mod tests {
         let (_cache, _changes, mut conversation) = still_with(home, "idle", classifier, reasoner);
         conversation.two.plugins = plugins;
         conversation
-            .prefetch("What is on the calendar today?")
+            .prefetch("What is on the calendar today?", None)
             .await
     }
 
@@ -4245,5 +4287,82 @@ mod tests {
         assert_eq!(plugin.fetches().len(), 2, "the prefetch used the cache");
         assert_eq!(plugins.fetch(&call, &config).await?, json!(2));
         Ok(())
+    }
+
+    /// The prefetch intent of the reply tests.
+    const CALENDAR: &str = "family_calendar";
+
+    /// The device of the office satellite.
+    const OFFICE: &str = "1c8aff5b3943869c175c09b3c12f63d4";
+
+    /// A conversation in which the classifier gives the active prefetch intent `family_calendar`
+    /// with `fresh_min = 30`, whose stored answer "Two events." of the area `area` is `minutes`
+    /// old at the request. Gives its reasoner.
+    fn prefetched_conversation(minutes: i64, area: &str) -> (Conversation, Arc<FakeReasoner>) {
+        let reasoner = Arc::new(FakeReasoner::default());
+        let (_cache, _changes, conversation) = still_with(
+            &Arc::default(),
+            "idle",
+            scripted(&[CALENDAR]),
+            Arc::clone(&reasoner),
+        );
+        let mut entry = fakes::learned(CALENDAR, LearnedStatus::Active);
+        (entry.kind, entry.service, entry.fresh_min) = (LearnedKind::Prefetch, None, Some(30));
+        let catalog = Catalog::clone(&conversation.catalog.load());
+        conversation
+            .catalog
+            .store(Arc::new(learn::live(catalog, vec![entry])));
+        let answer = background::Answer {
+            text: "Two events.".to_owned(),
+            area: Some(AreaId(area.to_owned())),
+            time: Timestamp::UNIX_EPOCH - jiff::SignedDuration::from_mins(minutes),
+        };
+        let _ = conversation.two.answers.store(CALENDAR, Some(answer));
+        (conversation, reasoner)
+    }
+
+    /// The context of the satellite of the tests with the device `device`.
+    fn from_device(device: &str) -> Context {
+        Context {
+            device_id: Some(device.to_owned()),
+            ..on_satellite()
+        }
+    }
+
+    /// AC-14.10d-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10d_1_fresh_answer_is_the_reply() -> anyhow::Result<()> {
+        let (conversation, reasoner) = prefetched_conversation(30, "kitchen");
+        let handled = conversation
+            .handle("what is on the calendar", from_device(KITCHEN))
+            .await?;
+        assert_eq!(handled.text, "Two events.");
+        assert!(handled.after.is_none(), "the reply has work");
+        assert_eq!(reasoner.questions(), Vec::<String>::new());
+        Ok(())
+    }
+
+    /// Asserts that the request from `device` with the stored answer of [`prefetched_conversation`]
+    /// gets a filler and goes to System Two.
+    async fn deferred(minutes: i64, device: &str) -> anyhow::Result<()> {
+        let (conversation, reasoner) = prefetched_conversation(minutes, "kitchen");
+        let text = "what is on the calendar";
+        let handled = conversation.handle(text, from_device(device)).await?;
+        assert_eq!(handled.text, "One moment.");
+        handled.after.expect("System Two work").await?;
+        assert_eq!(reasoner.questions(), [text]);
+        Ok(())
+    }
+
+    /// AC-14.10d-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10d_2_old_answer_goes_to_system_two() -> anyhow::Result<()> {
+        deferred(31, KITCHEN).await
+    }
+
+    /// AC-14.10d-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10d_3_answer_of_another_area_goes_to_system_two() -> anyhow::Result<()> {
+        deferred(10, OFFICE).await
     }
 }

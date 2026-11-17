@@ -2184,6 +2184,7 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
         allowed_domains: openai.allowed_domains.clone(),
         read_services: openai.read_services.clone(),
         prefetch_services: config.learn.prefetch_services.clone(),
+        answers: Arc::default(),
     }
 }
 
