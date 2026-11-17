@@ -378,6 +378,7 @@ pub fn start_habits(
 
 /// The learned intent check: the clusters of the System Two requests of the log and the
 /// proposals of System Two for them, saved to the learned intents file through the pools task.
+#[derive(Clone)]
 pub struct Learning {
     /// The `[learn]` section.
     pub config: LearnConfig,
@@ -511,6 +512,18 @@ fn add(store: &dyn Store<Learned>, entry: LearnedIntent) -> anyhow::Result<()> {
     let mut learned = store.load()?.unwrap_or_default();
     learned.intents.push(entry);
     store.save(&learned)
+}
+
+/// Starts a task that runs the check of `learning` at once and each `interval`.
+#[must_use]
+pub fn start_learning(learning: Learning, interval: Duration) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(interval);
+        loop {
+            ticks.tick().await;
+            learning.check().await;
+        }
+    })
 }
 
 /// Prunes `log` at the `clock` time once a day, the first time one day after the start. Logs a
@@ -1347,6 +1360,8 @@ mod tests {
     struct Learner {
         /// System Two.
         reasoner: Arc<FakeReasoner>,
+        /// The log of the check.
+        log: Arc<FakeLog>,
         /// The check.
         learning: Learning,
         /// The learned intents file.
@@ -1364,15 +1379,11 @@ mod tests {
                 Arc::new(FakeReasoner::default()),
                 Arc::new(FakeLog::default()),
             );
-            for (hour, text) in (1_u8..).zip(jokes()) {
-                log.defer(&text, monday() + SignedDuration::from_hours(hour.into()));
-                reasoner.script_embedding(&text, vec![1.0, 0.0, 0.01 * f32::from(hour)]);
-            }
             let config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
             let (store, (changes, receiver)) = (Arc::new(FakeStore::new(None)), mpsc::channel());
             let learning = Learning {
                 config: config.learn,
-                log,
+                log: Arc::clone(&log) as _,
                 reasoner: Arc::clone(&reasoner) as _,
                 catalog: Arc::new(catalog()),
                 tools: Vec::new(),
@@ -1380,12 +1391,35 @@ mod tests {
                 changes,
                 clock: Arc::new(FakeClock(monday() + SignedDuration::from_hours(24))),
             };
-            Self {
+            let learner = Self {
                 reasoner,
+                log,
                 learning,
                 store,
                 changes: receiver,
+            };
+            learner.defer(&jokes(), 0);
+            learner
+        }
+
+        /// Adds the requests `texts` in the hours after `monday()`, with embeddings close to the
+        /// unit vector of the dimension `axis`.
+        fn defer(&self, texts: &[String], axis: usize) {
+            for (hour, text) in (1_u8..).zip(texts) {
+                self.log
+                    .defer(text, monday() + SignedDuration::from_hours(hour.into()));
+                let mut embedding = vec![0.0, 0.0, 0.01 * f32::from(hour)];
+                embedding[axis] = 1.0;
+                self.reasoner.script_embedding(text, embedding);
             }
+        }
+
+        /// Applies the changes of the checks and gives the learned entries.
+        fn saved(&self) -> anyhow::Result<Vec<LearnedIntent>> {
+            for change in self.changes.try_iter() {
+                change(Pools::new());
+            }
+            Ok(self.store.load()?.unwrap_or_default().intents)
         }
 
         /// Runs one check with `proposal` as the next proposal, applies its changes and gives
@@ -1393,10 +1427,7 @@ mod tests {
         async fn check(&self, proposal: LearnedIntent) -> anyhow::Result<Vec<LearnedIntent>> {
             self.reasoner.script_proposal(proposal);
             self.learning.check().await;
-            for change in self.changes.try_iter() {
-                change(Pools::new());
-            }
-            Ok(self.store.load()?.unwrap_or_default().intents)
+            self.saved()
         }
     }
 
@@ -1504,6 +1535,28 @@ mod tests {
         assert_eq!(entries[0].status, LearnedStatus::Requested);
         assert_eq!(entries[0].needs.as_deref(), Some("jokes"));
         assert_eq!(entries[0].request_file, None);
+        Ok(())
+    }
+
+    /// AC-14.5c-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_5c_1_task_checks_at_once_and_each_interval() -> anyhow::Result<()> {
+        let learner = Learner::new();
+        learner
+            .reasoner
+            .script_proposal(proposal(LearnedKind::Command, None));
+        let mut greeting = proposal(LearnedKind::Command, None);
+        greeting.name = "say_hello".to_owned();
+        learner.reasoner.script_proposal(greeting);
+        let interval = Duration::from_secs(learner.learning.config.check_interval_s);
+        let _task = start_learning(learner.learning.clone(), interval);
+        settle().await;
+        assert_eq!(learner.reasoner.proposed(), vec![jokes()]);
+        learner.saved()?;
+        let greetings: Vec<String> = (1..=5).map(|n| format!("hello there {n}")).collect();
+        learner.defer(&greetings, 1);
+        tokio::time::sleep(interval).await;
+        assert_eq!(learner.reasoner.proposed(), vec![jokes(), greetings]);
         Ok(())
     }
 }

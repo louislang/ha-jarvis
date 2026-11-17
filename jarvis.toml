@@ -118,6 +118,8 @@ window_days = 14
 min_cluster = 5
 cluster_distance = 0.3
 responses = 10 # responses of each proposal
+file = "learned.toml"
+check_interval_s = 3600
 
 [log]
 database = "jarvis.db"
