@@ -49,6 +49,7 @@ kind = "fetch"
 examples = ["what is the weather like", "will it rain today", "what is the forecast"]
 plugin = "get_weather"
 data = { when = "today" }
+fresh_min = 30
 
 [[intent]]
 name = "windows_query"
@@ -257,6 +258,7 @@ name = "new_shows"
 kind = "fetch"
 examples = ["are there any new shows", "what is new on plex", "is there anything new to watch", "what shows can i continue"]
 plugin = "get_new_shows"
+fresh_min = 60
 
 [[intent]]
 name = "lights_off"

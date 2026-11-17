@@ -41,6 +41,8 @@ pub struct LearnedIntent {
     pub name: String,
     /// The centroid of the cluster of the entry.
     pub centroid: Vec<f32>,
+    /// The HA service, for example `scene.turn_on`.
+    pub service: Option<String>,
 }
 
 /// The DBSCAN clusters of `points` on their L2-normalized embeddings. Noise points are in no
@@ -201,6 +203,16 @@ pub fn covering<'learned>(
     None
 }
 
+/// True when `intent` calls an HA service, so it waits for approval.
+#[verus_spec(approval =>
+    ensures
+        approval == intent.service is Some,
+)]
+#[must_use]
+pub fn needs_approval(intent: &LearnedIntent) -> bool {
+    intent.service.is_some()
+}
+
 verus! {
 
 /// The times of the spoken points of `points`, in order.
@@ -291,10 +303,12 @@ mod tests {
             LearnedIntent {
                 name: "weather".to_owned(),
                 centroid: vec![0.0, 1.0, 0.0],
+                service: None,
             },
             LearnedIntent {
                 name: "tell_joke".to_owned(),
                 centroid: vec![1.0, 0.0, 0.0],
+                service: None,
             },
         ];
         let found = covering(&cluster_at([0.99, 0.1, 0.0]), &learned, DISTANCE);
@@ -307,6 +321,7 @@ mod tests {
         let learned = [LearnedIntent {
             name: "weather".to_owned(),
             centroid: vec![0.0, 1.0, 0.0],
+            service: None,
         }];
         let found = covering(&cluster_at([1.0, 0.0, 0.0]), &learned, DISTANCE);
         assert_eq!(found, None);
@@ -323,5 +338,24 @@ mod tests {
             .to_vec();
         assert_eq!(found.len(), 1, "one cluster: {found:?}");
         assert_eq!(found[0].times, times);
+    }
+
+    /// AC-14.2-4.
+    #[test]
+    fn ac_14_2_4_service_needs_approval() {
+        let mut intent = LearnedIntent {
+            name: "good_night".to_owned(),
+            centroid: Vec::new(),
+            service: Some("scene.turn_on".to_owned()),
+        };
+        assert!(
+            needs_approval(&intent),
+            "an intent with a service needs approval"
+        );
+        intent.service = None;
+        assert!(
+            !needs_approval(&intent),
+            "an intent without a service is active at once"
+        );
     }
 }
