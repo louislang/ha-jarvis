@@ -374,7 +374,7 @@ This sub-phase is merged. The fix PR `Fix: Remove Blocked Decisions` removes the
 - AC-12.7-1: When `mark` runs, `FakeLog` records the mark and the feedback model contains it.
 - AC-12.7-2: When the mark value is `None`, the feedback model no longer has the earlier mark.
 - AC-12.7-3: When the correction is not an intent name, `mark` returns an error and changes nothing.
-- AC-12.7-4: When `intents` runs, it returns the catalog intent names and `unknown`. Sub-phase 14.7 adds the active learned intent names.
+- AC-12.7-4: When `intents` runs, it returns the catalog intent names and `unknown`. Sub-phase 14.7b adds the active learned intent names.
 
 **Proofs.**
 

@@ -329,25 +329,54 @@ AC-14.5-1 to AC-14.5-5 and AC-14.5-9 move to sub-phase 14.5b as AC-14.5b-1 to AC
 
 ### 14.7 Activation
 
-**Goal:** When a learned intent becomes active, add its pool and audio, count one change and add it to the next training set. After the next training run, the request gets System One speed.
+**Goal:** When a learned intent becomes active, save its pool, pre-render it, add it to the live catalog and record the time of the activation. The learned intent then has a pool and audio, and its activation counts once.
 
-- **Implements:** G1, G14, G16. **Depends on:** 14.6.
-- **Files:** modify `src/app/background.rs`, `src/app/speech.rs`, `src/app/training.rs`.
+- **Implements:** G14, G16. **Depends on:** 14.6.
+- **Files:** modify `src/domain/learn.rs`, `src/adapters/openai.rs` (`activated` is not in a proposal), `src/app/background.rs`, `src/lib.rs`.
 
-**Model.** On activation, in this order: save the pool through the pools task, pre-render it, add the intent to the live catalog (an `ArcSwap<Catalog>` of `intents.toml` and the active learned intents), then set and save `activated := now` (so `changes` counts it once, sub-phase 14.11). Each step before `activated` is idempotent. At startup, each `active` entry without `activated` runs activation again. Thus a crash never adds a duplicate. `Review::intents` now also returns the active learned intent names. The request habits of the entry already have its name as their key (sub-phase 14.5e), so activation does not change them.
+**Model.**
+
+- `LearnedIntent` gets `activated`: the time of the activation, or none.
+- `intent(entry) -> Option<Intent>`: the catalog intent of an `active` entry, with its name, kind, examples, service, plugin, target (`entity` when absent), entity, select, data and `fresh_min`. An entry of the kind `new_plugin` or `none`, or with no responses, gives none, because `decide` selects from a pool that is not empty (sub-phase 4.1).
+- `live(catalog, learned) -> Catalog`: `catalog` and, in file order, the intent of each entry of `learned` whose name is not in `catalog`.
+- The pool of an entry has its responses with no uses.
+- The live catalog is an `ArcSwap<Catalog>`. Activation of an entry, in this order: when the entry has an intent, send the pools task (sub-phase 4.8) a change that adds the pool when no pool has its name, and pre-render the pool (sub-phase 6.3b) for the areas of the hot cache. Then send a change that sets the live catalog to `live(live catalog, [entry])`, and sets and saves `activated := now` (so `changes` counts it once, sub-phase 14.11). Each step before `activated` is idempotent. Thus a crash never adds a duplicate.
+- The learned intent check (sub-phase 14.5b) activates each `active` entry that it saves. Before its first check, the check task (sub-phase 14.5c) activates each `active` entry without `activated`.
+- At start, `run` loads `learn.file`. The live catalog starts as `live(catalog, learned)`, and the source pools (sub-phase 4.8) get the pool of each intent that `live` adds. Thus a learned pool keeps its use counts and generated responses after a restart.
+- The request habits of the entry already have its name as their key (sub-phase 14.5e), so activation does not change them.
 
 **Acceptance criteria.**
 
 - AC-14.7-1: When an entry becomes `active`, the saved pools have its pool and the audio cache has its responses.
-- AC-14.7-2: When `FakeClassifier` gives `tell_joke` 0.9 after a training run, `handle` replies from the `tell_joke` pool.
 - AC-14.7-3: When a static intent pool has fewer than `min_fresh` unused responses, the Phase 8 backfill adds responses.
-- AC-14.7-4 [GPU host]: In the Phase 9 harness with `FakeClassifier` that gives `tell_joke`, the response latency p95 is 300 ms or less.
 - AC-14.7-5: When Jarvis restarts with an `active` entry without `activated`, the pool exists once and `activated` is set.
-- AC-14.7-6: When an entry becomes `active`, `intents` returns its name.
+
+AC-14.7-2, AC-14.7-4 and AC-14.7-6 move to sub-phase 14.7b as AC-14.7b-1 to AC-14.7b-3.
 
 **Proofs.**
 
-- P-14.7-1 to P-14.7-6. Evidence: test.
+- P-14.7-1, P-14.7-3, P-14.7-5. Evidence: test.
+
+---
+
+### 14.7b Live Catalog
+
+**Goal:** Decide, backfill and review with the live catalog, and activate an approved entry. After the next training run, the request gets System One speed.
+
+- **Implements:** G1, G14. **Depends on:** 14.7.
+- **Files:** modify `src/app/conversation.rs`, `src/app/background.rs`, `src/app/review.rs`, `src/lib.rs`, `src/testing/e2e.rs`, `README.md` (learned intents, `CLAUDE.md` workflow item 15).
+
+**Model.** `handle` decides with the live catalog of sub-phase 14.7. The backfill uses it too, so the new responses of a learned pool can use `area`, as the responses of a catalog pool can. When `Review::resolve` approves an entry, the review activates it (sub-phase 14.7). `Review::intents` returns the labels of the live catalog, so it now also returns the active learned intent names, and a correction can name them. The Phase 9 harness can start with an active learned entry in `learn.file` and swap in a classifier, as a training run does.
+
+**Acceptance criteria.**
+
+- AC-14.7b-1: When `FakeClassifier` gives `tell_joke` 0.9 after a training run, `handle` replies from the `tell_joke` pool.
+- AC-14.7b-2 [GPU host]: In the Phase 9 harness with `FakeClassifier` that gives `tell_joke`, the response latency p95 is 300 ms or less.
+- AC-14.7b-3: When an entry becomes `active`, `intents` returns its name.
+
+**Proofs.**
+
+- P-14.7b-1 to P-14.7b-3. Evidence: test.
 
 ---
 
@@ -355,7 +384,7 @@ AC-14.5-1 to AC-14.5-5 and AC-14.5-9 move to sub-phase 14.5b as AC-14.5b-1 to AC
 
 **Goal:** Add `quint/prefetch.qnt`, the model of answers fetched before the usual time and refreshed while its window is open. Prove that a prefetch never acts on the house, that it fetches only inside the window and not more often than the freshness interval, and that Jarvis serves only fresh answers.
 
-- **Implements:** G11, G14, G19. **Depends on:** 14.7.
+- **Implements:** G11, G14, G19. **Depends on:** 14.7b.
 - **Files:** create `quint/prefetch.qnt`.
 - **Quint:** `prefetch.qnt`.
 
