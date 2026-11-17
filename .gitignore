@@ -13,5 +13,6 @@
 /training.json
 /pools.json
 /learned.toml
+/plugin-requests/
 __pycache__/
 /train/.coverage

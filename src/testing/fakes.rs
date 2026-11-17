@@ -68,6 +68,7 @@ use crate::domain::feedback::Route;
 use crate::domain::learn::Learned;
 use crate::domain::learn::LearnedIntent;
 use crate::domain::learn::LearnedStatus;
+use crate::domain::learn::PluginRequest;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
@@ -93,6 +94,7 @@ use crate::ports::Models;
 use crate::ports::Page;
 use crate::ports::Partial;
 use crate::ports::Plugin;
+use crate::ports::PluginRequests;
 use crate::ports::Reasoner;
 use crate::ports::Refusal;
 use crate::ports::Review;
@@ -380,6 +382,25 @@ impl Trainer for FakeTrainer {
         let dir = self.dir.join(run_id);
         std::fs::create_dir(&dir)?;
         Ok(dir)
+    }
+}
+
+/// A `PluginRequests` that records each request and gives the scripted results in order.
+#[derive(Default)]
+pub struct FakePluginRequests {
+    /// The results of the next calls in order: the path, or the error text.
+    pub results: Mutex<VecDeque<Result<PathBuf, &'static str>>>,
+    /// The request of each call, in order.
+    pub calls: Mutex<Vec<PluginRequest>>,
+}
+
+impl PluginRequests for FakePluginRequests {
+    fn write(&self, request: &PluginRequest) -> anyhow::Result<PathBuf> {
+        lock(&self.calls).push(request.clone());
+        let result = lock(&self.results).pop_front();
+        result
+            .unwrap_or(Err("no scripted result"))
+            .map_err(anyhow::Error::msg)
     }
 }
 

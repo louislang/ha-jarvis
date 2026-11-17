@@ -115,6 +115,16 @@ pub enum LearnedStatus {
     Requested,
 }
 
+/// A request to Claude for a new plugin.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PluginRequest {
+    /// The name of the learned entry, which is the file name.
+    pub name: String,
+    /// The Markdown text.
+    pub text: String,
+}
+
 /// The learned intents file.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Learned {

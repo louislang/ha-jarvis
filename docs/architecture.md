@@ -85,6 +85,7 @@ flowchart LR
     crate --> crate_domain_training
     crate --> crate_ports
     crate_adapters_files --> crate_adapters_files
+    crate_adapters_files --> crate_domain_learn
     crate_adapters_files --> crate_ports
     crate_adapters_ha --> crate
     crate_adapters_ha --> crate_adapters_ha
