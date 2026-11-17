@@ -10,16 +10,14 @@ use crate::graph::Edge;
 use crate::graph::Graph;
 
 /// The crates of the domain list of `01-architecture.md` section 7, and `std`.
-const DOMAIN_CRATES: [&str; 13] = [
+const DOMAIN_CRATES: [&str; 11] = [
     "std",
     "minijinja",
     "rand",
     "jiff",
     "text2num",
     "strsim",
-    "ndarray",
-    "linfa",
-    "linfa_clustering",
+    "dbscan",
     "xxhash_rust",
     "vstd",
     "serde",

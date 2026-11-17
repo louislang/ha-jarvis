@@ -112,6 +112,11 @@ python = ".venv/bin/python"
 # poll_s = 30
 # timeout_min = 60
 
+[learn]
+window_days = 14
+min_cluster = 5
+cluster_distance = 0.3
+
 [log]
 database = "jarvis.db"
 audio_days = 30
