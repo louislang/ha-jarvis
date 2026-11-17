@@ -1,6 +1,7 @@
 //! Hot cache sync, response backfill, the request habit store, the learned intent check, the daily
 //! log prune and the hotword refresh.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::mem;
@@ -421,14 +422,19 @@ impl Learning {
         let saved = tokio::task::spawn_blocking(move || store.load()).await??;
         let mut learned = saved.unwrap_or_default().intents;
         let distance = self.config.cluster_distance;
+        let mut habits: BTreeMap<String, Vec<Timestamp>> = BTreeMap::new();
         for cluster in learn::clusters(&points, distance, self.config.min_cluster) {
-            self.learn(cluster, &mut learned).await?;
+            if let Some((name, times)) = self.learn(cluster, &mut learned).await? {
+                habits.entry(name).or_default().extend(times);
+            }
         }
+        self.record(habits);
         Ok(())
     }
 
-    /// Records the times of `cluster` under its covering entry of `learned`, or saves the entry
-    /// of a new proposal, adds it to `learned` and records the times under it.
+    /// The name of the covering entry of `cluster` in `learned` with the times of the cluster,
+    /// or the same for the entry of a new proposal, which it saves and adds to `learned`. Gives
+    /// `None` when the entry gets no request habits.
     ///
     /// # Errors
     ///
@@ -437,36 +443,29 @@ impl Learning {
         &self,
         cluster: Cluster,
         learned: &mut Vec<LearnedIntent>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Option<(String, Vec<Timestamp>)>> {
         let distance = self.config.cluster_distance;
         let times = cluster.times.clone();
         if let Some(name) = learn::covering(&cluster, learned, distance) {
             // `covering` borrows the name of the matched entry, and an invalid entry can reuse
             // the name of another, so the match is by address.
             let matched = |entry: &&LearnedIntent| ptr::eq(entry.name.as_str(), name);
-            if let Some(entry) = learned.iter().find(matched) {
-                self.record(entry, times);
-            }
-            return Ok(());
+            let entry = learned.iter().find(matched);
+            return Ok(entry.and_then(|entry| habit(entry, times)));
         }
         let entry = self.entry(cluster, learned).await?;
         self.save(entry.clone());
-        self.record(&entry, times);
+        let found = habit(&entry, times);
         learned.push(entry);
-        Ok(())
+        Ok(found)
     }
 
-    /// Observes `times` in time order under the name of `entry` when it is `pending`, `active`
-    /// or `requested`. The name of a `none` or `rejected` entry can be invalid or never become
-    /// an intent.
-    fn record(&self, entry: &LearnedIntent, mut times: Vec<Timestamp>) {
-        use LearnedStatus::Active;
-        use LearnedStatus::Pending;
-        use LearnedStatus::Requested;
-        if matches!(entry.status, Pending | Active | Requested) {
+    /// Observes the times of each key of `habits` in time order, so that each day counts.
+    fn record(&self, habits: BTreeMap<String, Vec<Timestamp>>) {
+        for (name, mut times) in habits {
             times.sort();
             for time in times {
-                self.habits.observe(entry.name.clone(), time);
+                self.habits.observe(name.clone(), time);
             }
         }
     }
@@ -544,6 +543,16 @@ impl Learning {
         // Without the pools task, Jarvis stops, and the next start proposes the cluster again.
         let _ = self.changes.send(change);
     }
+}
+
+/// The name of `entry` with `times` when the entry is `pending`, `active` or `requested`. The
+/// name of a `none` or `rejected` entry can be invalid or never become an intent.
+fn habit(entry: &LearnedIntent, times: Vec<Timestamp>) -> Option<(String, Vec<Timestamp>)> {
+    use LearnedStatus::Active;
+    use LearnedStatus::Pending;
+    use LearnedStatus::Requested;
+    let counted = matches!(entry.status, Pending | Active | Requested);
+    counted.then(|| (entry.name.clone(), times))
 }
 
 /// Adds `entry` to the learned intents of `store`.
@@ -1724,22 +1733,28 @@ mod tests {
         LearnedDriver::new(BTreeMap::new(), BTreeMap::new())
     }
 
+    /// The days after Monday and the second embedding values of five requests at 07:10 on
+    /// Monday, Tuesday and Wednesday along the axis [`X`].
+    const DAYS: [(i64, f32); 5] = [(0, 0.0), (0, 0.0), (1, 0.0), (1, 0.0), (2, 0.0)];
+
     /// The habit model after each of `checks` checks with the learned entries `intents`, of a
-    /// log with five requests at 07:10 on Monday, Tuesday and Wednesday along the axis [`X`].
+    /// log with a request at 07:10 on each day after Monday of `requests`, with the embedding
+    /// `[1, y, 0.01]` of its value `y`.
     async fn calendar_habits(
         intents: Vec<LearnedIntent>,
+        requests: &[(i64, f32)],
         checks: usize,
     ) -> anyhow::Result<Vec<RequestHabits>> {
         let learner = Learner::empty();
         learner.store.save(&Learned { intents })?;
-        for (index, day) in [0, 0, 1, 1, 2].into_iter().enumerate() {
+        for (index, (day, y)) in requests.iter().enumerate() {
             let text = format!("what is on the calendar {index}");
             learner
                 .log
                 .defer(&text, monday() + SignedDuration::from_hours(24 * day - 1));
             learner
                 .reasoner
-                .script_embedding(&text, vec![1.0, 0.0, 0.01]);
+                .script_embedding(&text, vec![1.0, *y, 0.01]);
         }
         let mut models = Vec::new();
         for _ in 0..checks {
@@ -1752,22 +1767,28 @@ mod tests {
     /// AC-14.5e-1.
     #[tokio::test]
     async fn ac_14_5e_1_covered_cluster_records_its_usual_time() -> anyhow::Result<()> {
-        let models = calendar_habits(vec![calendar(LearnedStatus::Active, X)], 1).await?;
+        let models = calendar_habits(vec![calendar(LearnedStatus::Active, X)], &DAYS, 1).await?;
+        assert_eq!(usual(&models[0])?, vec![SEVEN]);
+        Ok(())
+    }
+
+    /// The bucket of the calendar requests.
+    const SEVEN: Bucket = Bucket {
+        day: DayType::Weekdays,
+        hour: 7,
+    };
+
+    /// The usual times of `family_calendar` in `model` on the Wednesday after `monday()`.
+    fn usual(model: &RequestHabits) -> anyhow::Result<Vec<Bucket>> {
         let last = monday() + SignedDuration::from_hours(47);
         let wednesday = TimeZone::get("America/Chicago")?.to_datetime(last).date();
-        let usual = models[0].usual_times("family_calendar", wednesday, 14.0, 2.0);
-        let bucket = Bucket {
-            day: DayType::Weekdays,
-            hour: 7,
-        };
-        assert_eq!(usual, vec![bucket]);
-        Ok(())
+        Ok(model.usual_times("family_calendar", wednesday, 14.0, 2.0))
     }
 
     /// AC-14.5e-2.
     #[tokio::test]
     async fn ac_14_5e_2_same_times_do_not_change_the_model() -> anyhow::Result<()> {
-        let models = calendar_habits(vec![calendar(LearnedStatus::Active, X)], 2).await?;
+        let models = calendar_habits(vec![calendar(LearnedStatus::Active, X)], &DAYS, 2).await?;
         assert_eq!(models[0], models[1]);
         assert_ne!(models[0], RequestHabits::default());
         Ok(())
@@ -1790,8 +1811,21 @@ mod tests {
     #[tokio::test]
     async fn covering_none_entry_with_a_reused_name_records_nothing() -> anyhow::Result<()> {
         let active = calendar(LearnedStatus::Active, [0.0, 1.0, 0.0]);
-        let models = calendar_habits(vec![active, calendar(LearnedStatus::None, X)], 1).await?;
+        let models =
+            calendar_habits(vec![active, calendar(LearnedStatus::None, X)], &DAYS, 1).await?;
         assert_eq!(models[0], RequestHabits::default());
+        Ok(())
+    }
+
+    /// Two clusters that one entry covers count in time order: Monday and Wednesday in one,
+    /// Tuesday in the other.
+    #[tokio::test]
+    async fn clusters_of_one_entry_count_in_time_order() -> anyhow::Result<()> {
+        let mut requests = [(1, -0.2); 10];
+        requests[..5].copy_from_slice(&[(0, 0.2), (0, 0.2), (0, 0.2), (2, 0.2), (2, 0.2)]);
+        let entries = vec![calendar(LearnedStatus::Active, X)];
+        let models = calendar_habits(entries, &requests, 1).await?;
+        assert_eq!(usual(&models[0])?, vec![SEVEN]);
         Ok(())
     }
 }
