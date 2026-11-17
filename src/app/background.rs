@@ -107,8 +107,9 @@ pub struct Backfill {
     changes: mpsc::Sender<Change>,
     /// The pre-render of the new responses.
     speech: Arc<Speech>,
-    /// The intent catalog. Only an intent pool can use `area`.
-    catalog: Arc<Catalog>,
+    /// The catalog of `intents.toml` and the active learned intents. Only an intent pool can use
+    /// `area`.
+    catalog: Arc<ArcSwap<Catalog>>,
     /// The hot cache, which has the area names of the pre-render.
     cache: watch::Receiver<StateCache>,
     /// The pools with a backfill in progress.
@@ -124,7 +125,7 @@ impl Backfill {
         reasoner: Arc<dyn Reasoner>,
         changes: mpsc::Sender<Change>,
         speech: Arc<Speech>,
-        catalog: Arc<Catalog>,
+        catalog: Arc<ArcSwap<Catalog>>,
         cache: watch::Receiver<StateCache>,
     ) -> Self {
         Self {
@@ -213,11 +214,8 @@ impl Backfill {
 
     /// The variables that the responses of the pool `name` can use: `area` for an intent pool.
     fn variables(&self, name: &str) -> BTreeSet<String> {
-        let intent = self
-            .catalog
-            .intents
-            .iter()
-            .any(|intent| intent.name == name);
+        let catalog = self.catalog.load();
+        let intent = catalog.intents.iter().any(|intent| intent.name == name);
         BTreeSet::from_iter(intent.then(|| "area".to_owned()))
     }
 
@@ -1392,7 +1390,7 @@ mod tests {
         config.backfill.max_pool = usize::MAX;
         let speech = Arc::new(Speech::new(Arc::clone(tts) as _));
         let cache = watch::channel(StateCache::load(house())).1;
-        let catalog = Arc::new(catalog());
+        let catalog = Arc::new(ArcSwap::from_pointee(catalog()));
         let backfill = Backfill::new(config.backfill, reasoner, changes, speech, catalog, cache);
         Arc::new(backfill)
     }
