@@ -93,7 +93,7 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
 
 **Model.**
 
-- A request key is a name: the intent name of a request that System One acts on. Sub-phase 14.5 adds the name of a learned entry for a cluster of System Two requests.
+- A request key is a name: the intent name of a request that System One acts on. Sub-phase 14.5e adds the name of a learned entry for a cluster of System Two requests.
 - `RequestHabits` maps each pair of key and bucket to a `Strength { score, last }`. `last` is the local date of the last day that counted. `Bucket` and `DayType` derive `Eq` and `Ord` for the map key: weekdays before weekends, then the hour.
 - `decayed(score, last, today, half_life_days) = score * 0.5^(days(last, today) / half_life_days)`. `days` is the number of calendar days from `last` to `today`.
 - `observe(self, key, time, zone, half_life_days) -> Self`. `b = bucket(time, zone)`, and `d` is the local date of `time` in `zone`:
@@ -157,7 +157,7 @@ This sub-phase is merged. Request habits do not use HA state changes, so sub-pha
 - After `decide`, `handle` observes the intent of the decision at the `Clock` time when all of these are true:
   - The context has a `satellite_id`. Thus only a spoken request counts. Text from the HA UI does not.
   - Routing processes the text as a new request (steps 3 and 6 of sub-phase 10.5). An answer to a dialog is not a request.
-  - The decision is not `Defer` with `Job::Llm`. Sub-phase 14.5 counts the requests that System Two answers.
+  - The decision is not `Defer` with `Job::Llm`. Sub-phase 14.5e counts the requests that System Two answers.
 - A request that asks for the area counts once, with its intent. The answer that fills the area does not count.
 - An HA state change or an automation never reaches `handle`, so it never counts.
 - `src/app/background.rs` keeps the model behind one `std::sync::Mutex`, which `handle` and the habit task (sub-phase 11.4b) share. No code holds the lock across an `await`. A poisoned lock logs one `warn` event, and the request does not count.
