@@ -58,6 +58,10 @@ use crate::domain::habits::DayType;
 use crate::domain::habits::Entry;
 use crate::domain::habits::RequestHabits;
 use crate::domain::intent::Span;
+use crate::domain::learn::Learned;
+use crate::domain::learn::LearnedIntent;
+use crate::domain::learn::LearnedKind;
+use crate::domain::learn::LearnedStatus;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Response;
 use crate::domain::state::Area;
@@ -197,6 +201,22 @@ pub struct ExTarget(Target);
 /// An entity filter of `select`.
 #[verifier::external_type_specification]
 pub struct ExFilter(Filter);
+
+/// An entry of the learned intents file, or a proposal of System Two.
+#[verifier::external_type_specification]
+pub struct ExLearnedIntent(LearnedIntent);
+
+/// The kind of a learned intent.
+#[verifier::external_type_specification]
+pub struct ExLearnedKind(LearnedKind);
+
+/// Where a learned entry is in its lifecycle.
+#[verifier::external_type_specification]
+pub struct ExLearnedStatus(LearnedStatus);
+
+/// The learned intents file.
+#[verifier::external_type_specification]
+pub struct ExLearned(Learned);
 
 /// One slot value in the text of an example.
 #[verifier::external_type_specification]
