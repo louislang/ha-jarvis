@@ -634,14 +634,14 @@ pub fn pool(texts: &[String]) -> Pool {
     responses::merge(empty, texts, usize::MAX)
 }
 
-/// Sets `activated` of the entry `name` of `store` to `now` when it has none. Fails when `store`
-/// cannot load or save.
+/// Sets `activated` of the first `active` entry `name` of `store` to `now` when it has none.
+/// Fails when `store` cannot load or save.
 fn activated(store: &dyn Store<Learned>, name: &str, now: Timestamp) -> anyhow::Result<()> {
     let mut learned = store.load()?.unwrap_or_default();
-    for entry in &mut learned.intents {
-        if entry.name == name {
-            entry.activated.get_or_insert(now);
-        }
+    let mut entries = learned.intents.iter_mut();
+    let active = entries.find(|entry| entry.name == name && entry.status == LearnedStatus::Active);
+    if let Some(entry) = active {
+        entry.activated.get_or_insert(now);
     }
     store.save(&learned)
 }
@@ -1992,14 +1992,15 @@ mod tests {
         Ok(())
     }
 
-    /// AC-14.7-5. The start gives the source pools the saved pool of each active entry.
+    /// AC-14.7-5. The start gives the source pools the saved pool of each active entry. A later
+    /// `none` entry with the same name is not activated.
     #[tokio::test]
     async fn ac_14_7_5_restart_activates_once() -> anyhow::Result<()> {
         let learner = Learner::empty();
         let mut entry = proposal(LearnedKind::Command, None);
         entry.status = LearnedStatus::Active;
         learner.store.save(&Learned {
-            intents: vec![entry.clone()],
+            intents: vec![entry.clone(), proposal(LearnedKind::Command, None)],
         })?;
         let mut started = pool(&entry.responses);
         started.responses[0].uses = 3;
@@ -2009,6 +2010,7 @@ mod tests {
         let entries = learner.saved()?;
         assert_eq!(learned_pools(&learner)?, source);
         assert!(entries[0].activated.is_some(), "{entries:?}");
+        assert_eq!(entries[1].activated, None);
         Ok(())
     }
 }
