@@ -25,10 +25,13 @@ use xxhash_rust::xxh3;
 use crate::Config;
 use crate::CurrentClassifier;
 use crate::TrainConfig;
+use crate::app::background;
 use crate::domain::catalog;
 use crate::domain::catalog::Catalog;
 use crate::domain::feedback::Interaction;
 use crate::domain::intent;
+use crate::domain::learn;
+use crate::domain::learn::Learned;
 use crate::domain::state::EntityId;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache;
@@ -218,8 +221,10 @@ pub struct Training {
     pub loader: Arc<dyn ModelLoader>,
     /// The classifier of the conversation.
     pub classifier: Arc<CurrentClassifier>,
-    /// The intents.
+    /// The intents of `intents.toml`.
     pub catalog: Arc<Catalog>,
+    /// The learned intents file, whose active entries join the intents.
+    pub learned: Arc<dyn Store<Learned>>,
     /// The hot cache, which gives the area names.
     pub cache: watch::Receiver<StateCache>,
     /// The time of the start of a run.
@@ -387,40 +392,47 @@ impl Training {
         Ok(accepted)
     }
 
-    /// The number of action marks after the start of the last run.
+    /// The number of action marks and learned intent activations after the start of the last run.
     ///
     /// # Errors
     ///
-    /// The state or the log cannot be read.
+    /// The state, the learned intents file or the log cannot be read.
     pub async fn changes(&self) -> anyhow::Result<usize> {
         let state = self.state.load()?.unwrap_or_default();
-        Ok(training::changes(&state, &self.log.marked().await?))
+        let learned = self.learned.load()?.unwrap_or_default().intents;
+        let marked = self.log.marked().await?;
+        Ok(training::changes(&state, &marked, &learned))
     }
 
-    /// The full training set of a run that starts at `started`, after a `refresh`.
+    /// The full training set of a run that starts at `started` on the intents and the active
+    /// learned intents, after a `refresh`.
     async fn training_set(&self, started: Timestamp) -> anyhow::Result<TrainingSet> {
         let (store, train) = (self.generated.as_ref(), &self.config.train);
+        let catalog = self.live()?;
         let generated = store.load()?.unwrap_or_default();
-        let generated = refresh(&*self.reasoner, store, &self.catalog, generated, train).await?;
+        let generated = refresh(&*self.reasoner, store, &catalog, generated, train).await?;
         let marked = self.marked().await?;
-        let areas: Vec<String> = self
-            .cache
-            .borrow()
-            .areas
-            .iter()
-            .map(|area| area.name.clone())
-            .collect();
+        let areas = background::area_names(&self.cache.borrow());
         let mut rng = StdRng::seed_from_u64(started.as_second().unsigned_abs());
         let settings = Settings {
             base_model: train.base_model.clone(),
             epochs: train.epochs,
             batch_size: train.batch_size,
         };
-        let catalog = generated_catalog(&self.catalog, generated);
-        let examples = training::seed_set(&catalog, &areas, &mut rng, settings.clone()).examples;
-        let set =
-            training::training_set(&self.catalog, examples, &marked, &areas, &mut rng, settings);
+        let copy = generated_catalog(&catalog, generated);
+        let examples = training::seed_set(&copy, &areas, &mut rng, settings.clone()).examples;
+        let set = training::training_set(&catalog, examples, &marked, &areas, &mut rng, settings);
         Ok(set)
+    }
+
+    /// The intents with the active learned intents.
+    ///
+    /// # Errors
+    ///
+    /// The learned intents file cannot be read.
+    fn live(&self) -> anyhow::Result<Catalog> {
+        let learned = self.learned.load()?.unwrap_or_default().intents;
+        Ok(learn::live(Catalog::clone(&self.catalog), learned))
     }
 
     /// The marked interactions with the first interaction of each marked dialog answer.
@@ -639,8 +651,11 @@ mod tests {
 
     use crate::Controller;
     use crate::Shared;
+    use crate::domain::learn::LearnedIntent;
+    use crate::domain::learn::LearnedStatus;
     use crate::domain::model::Prediction;
     use crate::domain::model::Slot;
+    use crate::domain::training::Label;
     use crate::ports::Control;
     use crate::ports::Refusal;
     use crate::testing::fakes;
@@ -810,6 +825,139 @@ mod tests {
         assert!(error.to_string().contains("held-out"), "{error}");
         let calls = trainer.calls.lock().expect("no test panics");
         assert!(calls.is_empty(), "the trainer has a call");
+        Ok(())
+    }
+
+    /// The examples of [`joke`], two with the new slot `topic`.
+    const JOKES: [&str; 4] = [
+        "tell me a joke about [cats](topic)",
+        "tell me a [dog](topic) joke",
+        "make me laugh",
+        "say something funny",
+    ];
+
+    /// The active learned entry `tell_joke` with the examples `JOKES`.
+    fn joke() -> LearnedIntent {
+        let mut entry = fakes::learned("tell_joke", LearnedStatus::Active);
+        entry.examples = JOKES.map(str::to_owned).to_vec();
+        entry
+    }
+
+    /// The learned intents file with `entry`.
+    fn file(entry: LearnedIntent) -> Learned {
+        Learned {
+            intents: vec![entry],
+        }
+    }
+
+    /// A run of [`fakes::training`] with the learned intents file of [`joke`], and its fakes.
+    struct Jokes {
+        /// The run.
+        training: Training,
+        /// The local trainer, which has no scripted result.
+        trainer: Arc<FakeTrainer>,
+        /// System Two, which writes the generated examples.
+        reasoner: Arc<FakeReasoner>,
+        /// The generated examples.
+        generated: Arc<FakeStore<Generated>>,
+        /// The learned intents file.
+        learned: Arc<FakeStore<Learned>>,
+        /// The model folder.
+        _models: TempDir,
+    }
+
+    /// The run of [`Jokes`].
+    fn jokes() -> Jokes {
+        let models = tempfile::tempdir().expect("a temporary folder");
+        let (training, trainer) = fakes::training(0.1, models.path());
+        let reasoner = Arc::<FakeReasoner>::default();
+        let generated = Arc::new(FakeStore::new(None));
+        let learned = Arc::new(FakeStore::new(Some(file(joke()))));
+        let training = Training {
+            reasoner: Arc::clone(&reasoner) as _,
+            generated: Arc::clone(&generated) as _,
+            learned: Arc::clone(&learned) as _,
+            ..training
+        };
+        Jokes {
+            training,
+            trainer,
+            reasoner,
+            generated,
+            learned,
+            _models: models,
+        }
+    }
+
+    impl Jokes {
+        /// The generated examples after one run, which stops at the trainer.
+        async fn run(&self) -> Generated {
+            let _stopped = self.training.run().await;
+            let stored = self.generated.load().expect("the fake store loads");
+            stored.unwrap_or_default()
+        }
+    }
+
+    /// The texts of `JOKES` that are not held out at the share 0.1.
+    fn unheld_jokes() -> Vec<String> {
+        let parsed = JOKES.map(|markup| intent::parse_example(markup).expect("valid markup"));
+        let texts = parsed.map(|example| example.text);
+        let unheld: Vec<String> = texts
+            .into_iter()
+            .filter(|text| !training::held_out(text, 0.1))
+            .collect();
+        assert!(!unheld.is_empty(), "every example is held out");
+        unheld
+    }
+
+    /// AC-14.11-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_11_1_active_learned_intent_joins_the_training_set() {
+        let jokes = jokes();
+        jokes.run().await;
+        let calls = jokes.trainer.calls.lock().expect("no test panics");
+        let set = &calls[0].1;
+        assert!(
+            set.labels.contains(&"tell_joke".to_owned()),
+            "{:?}",
+            set.labels
+        );
+        assert!(set.tags.contains(&"B-topic".to_owned()), "{:?}", set.tags);
+        let label = Label::Intent("tell_joke".to_owned());
+        let examples = set.examples.iter().filter(|example| example.label == label);
+        let texts: Vec<String> = examples.map(|example| example.text.clone()).collect();
+        assert_eq!(texts, unheld_jokes());
+    }
+
+    /// AC-14.11-2.
+    #[tokio::test]
+    async fn ac_14_11_2_activation_adds_one_change() -> anyhow::Result<()> {
+        let jokes = jokes();
+        let before = jokes.training.changes().await?;
+        let mut activated = joke();
+        activated.activated = Some(Timestamp::from_second(60)?);
+        jokes.learned.save(&file(activated))?;
+        assert_eq!(jokes.training.changes().await?, before + 1);
+        Ok(())
+    }
+
+    /// AC-14.11-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_11_3_refresh_follows_the_active_learned_intents() -> anyhow::Result<()> {
+        let jokes = jokes();
+        let funny = vec!["tell me a funny [cats](topic) story".to_owned()];
+        jokes.reasoner.script_paraphrase("tell_joke", Ok(funny));
+        jokes.run().await;
+        let stored = jokes.run().await;
+        let targets = jokes.reasoner.paraphrased();
+        let calls = targets.iter().filter(|target| *target == "tell_joke");
+        assert_eq!(calls.count(), 1, "{targets:?}");
+        assert!(stored.intents.contains_key("tell_joke"), "{stored:?}");
+        let mut rejected = joke();
+        rejected.status = LearnedStatus::Rejected;
+        jokes.learned.save(&file(rejected))?;
+        let stored = jokes.run().await;
+        assert!(!stored.intents.contains_key("tell_joke"), "{stored:?}");
         Ok(())
     }
 

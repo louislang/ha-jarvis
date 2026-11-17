@@ -192,10 +192,12 @@ flowchart LR
     crate_app_speech --> crate_domain_training
     crate_app_speech --> crate_ports
     crate_app_training --> crate
+    crate_app_training --> crate_app_background
     crate_app_training --> crate_app_training
     crate_app_training --> crate_domain_catalog
     crate_app_training --> crate_domain_feedback
     crate_app_training --> crate_domain_intent
+    crate_app_training --> crate_domain_learn
     crate_app_training --> crate_domain_state
     crate_app_training --> crate_domain_state_cache
     crate_app_training --> crate_domain_training
@@ -263,6 +265,7 @@ flowchart LR
     crate_domain_training --> crate_domain_contracts
     crate_domain_training --> crate_domain_feedback
     crate_domain_training --> crate_domain_intent
+    crate_domain_training --> crate_domain_learn
     crate_domain_training --> crate_domain_model
     crate_ports --> crate
     crate_ports --> crate_domain_decide

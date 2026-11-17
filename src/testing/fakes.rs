@@ -406,6 +406,7 @@ pub fn training(holdout: f64, models: &Path) -> (Training, Arc<FakeTrainer>) {
             Arc::<FakeClassifier>::default(),
         )),
         catalog: Arc::new(catalog),
+        learned: Arc::new(FakeStore::new(None)),
         cache: watch::channel(StateCache::load(house())).1,
         clock: Arc::new(FakeClock(Timestamp::UNIX_EPOCH)),
         config: training_config(holdout, models),
