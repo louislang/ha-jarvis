@@ -30,6 +30,7 @@ use tokio::net::TcpListener;
 use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
 use crate::domain::feedback::Value;
+use crate::domain::learn::LearnedIntent;
 use crate::domain::speech::Audio;
 use crate::ports::Clock;
 use crate::ports::Control;
@@ -39,6 +40,7 @@ use crate::ports::Refusal;
 use crate::ports::Review;
 use crate::ports::Setting;
 use crate::ports::Status;
+use crate::ports::Unresolved;
 
 /// The page of the Jarvis tab.
 const PAGE: &str = include_str!("review.html");
@@ -98,6 +100,13 @@ struct MarkBody {
     correction: Option<String>,
 }
 
+/// The body of `POST api/proposals/{name}`.
+#[derive(Deserialize)]
+struct ResolveBody {
+    /// Approves the entry, else rejects it.
+    approve: bool,
+}
+
 /// Serves the routes of `web` on `listener` until `shutdown` completes, then waits for the open
 /// requests.
 ///
@@ -123,6 +132,8 @@ fn router(web: Web) -> Router {
         .route("/interactions/{id}/audio", routing::get(audio))
         .route("/interactions/{id}/mark", routing::post(mark))
         .route("/intents", routing::get(intents))
+        .route("/proposals", routing::get(proposals))
+        .route("/proposals/{name}", routing::post(resolve))
         .route("/status", routing::get(status))
         .route("/settings", routing::get(settings).post(save))
         .layer(middleware::from_fn_with_state(Arc::clone(&web), authorize));
@@ -231,6 +242,26 @@ async fn intents(State(web): State<Arc<Web>>) -> Json<Vec<String>> {
     Json(web.review.intents())
 }
 
+/// The `pending` learned entries.
+async fn proposals(State(web): State<Arc<Web>>) -> Result<Json<Vec<LearnedIntent>>, StatusCode> {
+    let proposals = web.review.proposals().map_err(|error| failed(&error))?;
+    Ok(Json(proposals))
+}
+
+/// Approves or rejects the learned entry `name` with `body`. Gives 409 when no `pending` entry
+/// has the name.
+async fn resolve(
+    State(web): State<Arc<Web>>,
+    Path(name): Path<String>,
+    Json(body): Json<ResolveBody>,
+) -> StatusCode {
+    match web.review.resolve(&name, body.approve).await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(Unresolved::NotPending) => StatusCode::CONFLICT,
+        Err(Unresolved::Failed(error)) => failed(&error),
+    }
+}
+
 /// The status of Jarvis.
 async fn status(State(web): State<Arc<Web>>) -> Json<Status> {
     Json(web.control.status())
@@ -258,8 +289,13 @@ async fn save(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use crate::domain::learn::Learned;
+    use crate::domain::learn::LearnedStatus;
     use crate::ports;
+    use crate::testing::fakes;
     use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeControl;
     use crate::testing::fakes::FakeReview;
@@ -324,6 +360,21 @@ mod tests {
         let url = format!("{}{path}", start(Arc::new(review()?), ONLINE).await?);
         let request = reqwest::Client::new().get(url).bearer_auth(TOKEN);
         Ok(request.send().await?)
+    }
+
+    /// The learned entries of a `FakeReview`, one for each status, each named after its status.
+    fn proposing() -> Learned {
+        let statuses = [
+            LearnedStatus::Pending,
+            LearnedStatus::Active,
+            LearnedStatus::Rejected,
+            LearnedStatus::None,
+            LearnedStatus::Requested,
+        ];
+        let named = |status| fakes::learned(&format!("{status:?}").to_lowercase(), status);
+        Learned {
+            intents: statuses.map(named).to_vec(),
+        }
     }
 
     /// The status of a mark request with `body` on the interaction 1, and the marks of `review`.
@@ -536,6 +587,70 @@ mod tests {
             r#"id="settings-error""#,
         ] {
             assert!(html.contains(element), "the page has no {element}");
+        }
+        Ok(())
+    }
+
+    /// AC-14.6-1.
+    #[tokio::test]
+    async fn ac_14_6_1_proposals_are_the_pending_entries() -> anyhow::Result<()> {
+        let review = FakeReview {
+            learned: Mutex::new(proposing()),
+            ..FakeReview::default()
+        };
+        let url = format!("{}proposals", start(Arc::new(review), ONLINE).await?);
+        let request = reqwest::Client::new().get(url).bearer_auth(TOKEN);
+        let proposals: Vec<LearnedIntent> = request.send().await?.json().await?;
+        assert_eq!(
+            proposals,
+            [fakes::learned("pending", LearnedStatus::Pending)]
+        );
+        Ok(())
+    }
+
+    /// AC-14.6-4.
+    #[tokio::test]
+    async fn ac_14_6_4_entry_that_is_not_pending_gives_409() -> anyhow::Result<()> {
+        let review = Arc::new(FakeReview {
+            learned: Mutex::new(proposing()),
+            ..FakeReview::default()
+        });
+        let url = start(Arc::clone(&review), ONLINE).await?;
+        let post = |name: &str, approve: bool| {
+            let request = reqwest::Client::new().post(format!("{url}proposals/{name}"));
+            request
+                .bearer_auth(TOKEN)
+                .json(&json!({ "approve": approve }))
+                .send()
+        };
+        for name in ["active", "rejected", "none", "requested", "absent"] {
+            for approve in [true, false] {
+                let status = post(name, approve).await?.status();
+                assert_eq!(status, StatusCode::CONFLICT, "{name} {approve}");
+            }
+        }
+        let learned = review.learned.lock().expect("no test panicked").clone();
+        assert_eq!(learned, proposing());
+        Ok(())
+    }
+
+    /// AC-14.6-5.
+    #[tokio::test]
+    async fn ac_14_6_5_page_has_the_proposal_template() -> anyhow::Result<()> {
+        let api = start(Arc::new(review()?), ONLINE).await?;
+        let html = reqwest::get(api.trim_end_matches("api/")).await?;
+        let html = html.text().await?;
+        let (_, template) = html
+            .split_once(r#"<template id="proposal">"#)
+            .expect("the page has template#proposal");
+        let (template, _) = template.split_once("</template>").expect("it ends");
+        for element in [
+            r#"class="examples""#,
+            r#"class="service""#,
+            r#"<button class="approve""#,
+            r#"<button class="reject""#,
+        ] {
+            assert!(template.contains(element), "the template has no {element}");
         }
         Ok(())
     }

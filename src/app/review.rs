@@ -1,36 +1,96 @@
-//! The review use case: the logged interactions, their audio and their marks.
+//! The review use case: the logged interactions, their audio and their marks, and the pending
+//! learned entries.
 
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use async_trait::async_trait;
+use futures::channel::oneshot;
 
+use crate::app::conversation::Change;
 use crate::domain::catalog;
 use crate::domain::catalog::Catalog;
 use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
+use crate::domain::learn::Learned;
+use crate::domain::learn::LearnedIntent;
+use crate::domain::learn::LearnedStatus;
 use crate::domain::speech::Audio;
 use crate::ports::Filter;
 use crate::ports::InteractionLog;
 use crate::ports::Page;
 use crate::ports::Review;
+use crate::ports::Store;
+use crate::ports::Unresolved;
 
-/// The review of the logged interactions. A mark reaches the log.
+/// The review of the logged interactions and the learned entries. A mark reaches the log, and a
+/// resolve reaches the learned intents file through the pools task.
 pub struct Reviewer {
     /// The log of the interactions.
     log: Arc<dyn InteractionLog>,
     /// The names that a correction can have: `unknown` and the intent names.
     names: Vec<String>,
+    /// The learned intents file.
+    learned: Arc<dyn Store<Learned>>,
+    /// The sender of the pools task, which writes the file.
+    changes: mpsc::Sender<Change>,
 }
 
 impl Reviewer {
-    /// The review of `log` with the intent names of `catalog`.
+    /// The review of `log` with the intent names of `catalog`, and of the learned intents file
+    /// `learned`, which the pools task of `changes` writes.
     #[must_use]
-    pub fn new(log: Arc<dyn InteractionLog>, catalog: &Catalog) -> Self {
+    pub fn new(
+        log: Arc<dyn InteractionLog>,
+        catalog: &Catalog,
+        learned: Arc<dyn Store<Learned>>,
+        changes: mpsc::Sender<Change>,
+    ) -> Self {
         Self {
             log,
             names: catalog::labels(catalog),
+            learned,
+            changes,
         }
     }
+}
+
+/// The `pending` entries of `learned`, in file order.
+#[must_use]
+pub fn pending(learned: Learned) -> Vec<LearnedIntent> {
+    let mut intents = learned.intents;
+    intents.retain(|entry| entry.status == LearnedStatus::Pending);
+    intents
+}
+
+/// Sets the `pending` entry `name` of `learned` to `active` with `approve`, else to `rejected`.
+///
+/// # Errors
+///
+/// No `pending` entry has the name. `learned` does not change.
+pub fn resolve(learned: &mut Learned, name: &str, approve: bool) -> Result<(), Unresolved> {
+    let mut entries = learned.intents.iter_mut();
+    let entry = entries
+        .find(|entry| entry.name == name)
+        .ok_or(Unresolved::NotPending)?;
+    entry.status = match (entry.status, approve) {
+        (LearnedStatus::Pending, true) => LearnedStatus::Active,
+        (LearnedStatus::Pending, false) => LearnedStatus::Rejected,
+        _ => return Err(Unresolved::NotPending),
+    };
+    Ok(())
+}
+
+/// Resolves the entry `name` of `store` with `approve` and saves the file.
+///
+/// # Errors
+///
+/// [`resolve`] fails, or `store` cannot load or save.
+fn resolve_saved(store: &dyn Store<Learned>, name: &str, approve: bool) -> Result<(), Unresolved> {
+    let loaded = store.load().map_err(Unresolved::Failed)?;
+    let mut learned = loaded.unwrap_or_default();
+    resolve(&mut learned, name, approve)?;
+    store.save(&learned).map_err(Unresolved::Failed)
 }
 
 /// Checks that the correction of `mark`, if any, is one of `names`.
@@ -69,11 +129,29 @@ impl Review for Reviewer {
     fn intents(&self) -> Vec<String> {
         self.names.clone()
     }
+
+    fn proposals(&self) -> anyhow::Result<Vec<LearnedIntent>> {
+        Ok(pending(self.learned.load()?.unwrap_or_default()))
+    }
+
+    async fn resolve(&self, name: &str, approve: bool) -> Result<(), Unresolved> {
+        let (sender, receiver) = oneshot::channel();
+        let (store, name) = (Arc::clone(&self.learned), name.to_owned());
+        let change: Change = Box::new(move |pools| {
+            // The web request can end before the change runs.
+            let _ = sender.send(resolve_saved(store.as_ref(), &name, approve));
+            pools
+        });
+        let stopped = || Unresolved::Failed(anyhow::anyhow!("the pools task stopped"));
+        self.changes.send(change).map_err(|_| stopped())?;
+        receiver.await.map_err(|_| stopped())?
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::thread;
 
     use jiff::Timestamp;
 
@@ -81,7 +159,12 @@ mod tests {
     use crate::domain::feedback::Action;
     use crate::domain::feedback::Route;
     use crate::domain::feedback::Value;
+    use crate::domain::learn;
+    use crate::domain::learn::Cluster;
+    use crate::domain::responses::Pools;
+    use crate::testing::fakes;
     use crate::testing::fakes::FakeLog;
+    use crate::testing::fakes::FakeStore;
 
     /// The target of the action of each interaction.
     const OFFICE: &str = "media_player.office";
@@ -127,8 +210,28 @@ mod tests {
             interactions: Mutex::new(logged),
             ..FakeLog::default()
         });
-        let review = Reviewer::new(Arc::clone(&log) as Arc<dyn InteractionLog>, &catalog());
+        let (learned, changes) = (Arc::new(FakeStore::new(None)), mpsc::channel().0);
+        let review = Reviewer::new(Arc::clone(&log) as _, &catalog(), learned, changes);
         (review, log)
+    }
+
+    /// The learned entries and the proposals of a review after the resolve of its `pending` entry
+    /// `good_night` with `approve`. A thread runs each change in place of the pools task.
+    async fn resolved(approve: bool) -> anyhow::Result<(Learned, Vec<LearnedIntent>)> {
+        let intents = vec![fakes::learned("good_night", LearnedStatus::Pending)];
+        let store = Arc::new(FakeStore::new(Some(Learned { intents })));
+        let (changes, receiver) = mpsc::channel::<Change>();
+        thread::spawn(move || {
+            for change in receiver {
+                change(Pools::new());
+            }
+        });
+        let log = Arc::new(FakeLog::default());
+        let review = Reviewer::new(log, &catalog(), Arc::clone(&store) as _, changes);
+        assert_eq!(review.proposals()?.len(), 1, "good_night is pending");
+        let result = review.resolve("good_night", approve).await;
+        assert!(result.is_ok(), "the resolve gave {result:?}");
+        Ok((store.load()?.unwrap_or_default(), review.proposals()?))
     }
 
     /// The mark `value` with `correction` on the dialog answer.
@@ -198,5 +301,31 @@ mod tests {
         intents.sort();
         expected.sort();
         assert_eq!(intents, expected);
+    }
+
+    /// AC-14.6-2.
+    #[tokio::test]
+    async fn ac_14_6_2_approve_makes_the_entry_active() -> anyhow::Result<()> {
+        let (learned, proposals) = resolved(true).await?;
+        assert_eq!(learned.intents[0].status, LearnedStatus::Active);
+        assert_eq!(proposals, []);
+        Ok(())
+    }
+
+    /// AC-14.6-3. The rejected entry keeps its centroid, so `covering` names it at the next
+    /// check (P-14.5b-4).
+    #[tokio::test]
+    async fn ac_14_6_3_reject_makes_the_entry_rejected_and_covering() -> anyhow::Result<()> {
+        let (learned, proposals) = resolved(false).await?;
+        assert_eq!(learned.intents[0].status, LearnedStatus::Rejected);
+        assert_eq!(proposals, []);
+        let cluster = Cluster {
+            texts: vec!["night night".to_owned()],
+            times: Vec::new(),
+            centroid: vec![1.0, 0.0],
+        };
+        let covering = learn::covering(&cluster, &learned.intents, 0.1);
+        assert_eq!(covering, Some("good_night"));
+        Ok(())
     }
 }
