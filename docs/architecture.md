@@ -100,7 +100,9 @@ flowchart LR
     crate_adapters_open_meteo --> crate_ports
     crate_adapters_openai --> crate
     crate_adapters_openai --> crate_adapters_openai
+    crate_adapters_openai --> crate_domain_catalog
     crate_adapters_openai --> crate_domain_decide
+    crate_adapters_openai --> crate_domain_learn
     crate_adapters_openai --> crate_domain_speech
     crate_adapters_openai --> crate_domain_state
     crate_adapters_openai --> crate_ports
@@ -255,6 +257,7 @@ flowchart LR
     crate_ports --> crate
     crate_ports --> crate_domain_decide
     crate_ports --> crate_domain_feedback
+    crate_ports --> crate_domain_learn
     crate_ports --> crate_domain_model
     crate_ports --> crate_domain_speech
     crate_ports --> crate_domain_state

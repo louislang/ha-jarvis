@@ -9,6 +9,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
+use async_openai::types::embeddings::CreateEmbeddingRequestArgs;
 use async_openai::types::responses::CreateResponse;
 use async_openai::types::responses::CreateResponseArgs;
 use async_openai::types::responses::FunctionTool;
@@ -35,15 +36,20 @@ use futures::future;
 use futures::stream;
 use futures::stream::BoxStream;
 use serde::Deserialize;
+use serde::Deserializer;
 use serde_json::Map;
 use serde_json::Value;
 use serde_json::json;
 use tokio::time::Instant;
 
 use crate::OpenAiConfig;
+use crate::domain::catalog::Filter;
+use crate::domain::catalog::Target;
 use crate::domain::decide::EntityState;
 use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
+use crate::domain::learn::LearnedIntent;
+use crate::domain::learn::LearnedKind;
 use crate::domain::speech;
 use crate::domain::state::ServiceCall;
 use crate::ports;
@@ -150,6 +156,52 @@ fn paraphrase_prompt(
     )
 }
 
+/// The rule of the `propose` input for requests that no plugin tool can answer.
+const NEW_PLUGIN_RULE: &str = "If the requests need remote data that no plugin tool gives, kind \
+     is new_plugin, needs states that data in one line, and name is the name of the future fetch \
+     intent, for example get_traffic.";
+
+/// The `propose` input: one new intent with `responses` responses for the requests `texts`, with
+/// a name unlike each of `intents`, and the plugin tools `tools`.
+fn propose_prompt(
+    texts: &[String],
+    intents: &[String],
+    tools: &[ports::Tool],
+    responses: usize,
+) -> String {
+    let texts: Vec<String> = texts.iter().map(|text| format!("- {text}\n")).collect();
+    let tools: Vec<String> = tools
+        .iter()
+        .map(|tool| format!("- {}: {}\n", tool.name, tool.description))
+        .collect();
+    format!(
+        "Propose one new intent of the voice assistant Jarvis for these requests. The name is \
+         snake case and differs from these intent names: {}. kind is command (reply and call the \
+         HA service), query (reply with the states of the selected entities), fetch (call the \
+         plugin tool plugin with the arguments data), prefetch (ask question before the usual \
+         time and reply with its answer), new_plugin, or none when the requests are not suitable \
+         for an intent. fresh_min is the minutes that the answer of a fetch or prefetch stays \
+         fresh. Write the examples in [value](slot) markup, with only lowercase letters, digits, \
+         apostrophes and single spaces, and write {responses} responses to speak aloud. \
+         {NEW_PLUGIN_RULE}\nRequests:\n{}Plugin tools:\n{}",
+        intents.join(", "),
+        texts.concat(),
+        tools.concat()
+    )
+}
+
+/// The strict JSON schema of an object with the properties `properties`, each required.
+fn object(properties: &Value) -> Value {
+    let keys = properties.as_object().into_iter().flat_map(Map::keys);
+    let required: Vec<String> = keys.cloned().collect();
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    })
+}
+
 /// The structured output format `{ "<key>": [string] }`.
 fn strings_format(key: &str) -> ResponseFormatJsonSchema {
     ResponseFormatJsonSchema {
@@ -163,6 +215,118 @@ fn strings_format(key: &str) -> ResponseFormatJsonSchema {
         }),
         strict: Some(true),
     }
+}
+
+/// The structured output format of a proposal. `data` is a list of `{ key, value }` pairs,
+/// because a strict schema names each property of an object.
+fn proposal_format() -> ResponseFormatJsonSchema {
+    let text = json!({"type": "string"});
+    let optional = json!({"type": ["string", "null"]});
+    let strings = json!({"type": "array", "items": text});
+    let filter = object(&json!({"domain": text, "name": optional, "device_class": optional}));
+    let pair = object(&json!({"key": text, "value": text}));
+    let schema = object(&json!({
+        "name": text,
+        "kind": {"type": "string", "enum": ["command", "query", "fetch", "prefetch", "new_plugin", "none"]},
+        "examples": strings,
+        "responses": strings,
+        "service": optional,
+        "plugin": optional,
+        "target": {"type": ["string", "null"], "enum": ["entity", "entities", "house", null]},
+        "select": {"type": "array", "items": filter},
+        "data": {"type": "array", "items": pair},
+        "question": optional,
+        "fresh_min": {"type": ["integer", "null"]},
+        "needs": optional,
+    }));
+    ResponseFormatJsonSchema {
+        description: None,
+        name: "proposal".to_owned(),
+        schema,
+        strict: Some(true),
+    }
+}
+
+/// The proposal names of `LearnedKind`.
+#[derive(Deserialize)]
+#[serde(remote = "LearnedKind", rename_all = "snake_case")]
+enum KindName {
+    /// `command`.
+    Command,
+    /// `query`.
+    Query,
+    /// `fetch`.
+    Fetch,
+    /// `prefetch`.
+    Prefetch,
+    /// `new_plugin`.
+    NewPlugin,
+    /// `none`.
+    None,
+}
+
+/// The proposal fields of `LearnedIntent`.
+#[derive(Deserialize)]
+#[serde(remote = "LearnedIntent", deny_unknown_fields)]
+struct ProposalFields {
+    /// The intent name.
+    name: String,
+    /// Not in a proposal: the caller adds the cluster centroid.
+    #[serde(skip)]
+    centroid: Vec<f32>,
+    /// The HA service.
+    service: Option<String>,
+    /// How Jarvis replies and acts.
+    #[serde(with = "KindName")]
+    kind: LearnedKind,
+    /// The examples in `[value](slot)` markup.
+    examples: Vec<String>,
+    /// The response templates.
+    responses: Vec<String>,
+    /// The tool name of the plugin of a fetch.
+    plugin: Option<String>,
+    /// The entities that the service gets.
+    target: Option<Target>,
+    /// Not in a proposal: a proposal uses `select`.
+    #[serde(skip)]
+    entity: Option<String>,
+    /// The entity filters.
+    select: Vec<Filter>,
+    /// The service data or plugin argument templates.
+    #[serde(deserialize_with = "pairs")]
+    data: BTreeMap<String, String>,
+    /// The question that a prefetch asks System Two.
+    question: Option<String>,
+    /// How long the answer of a fetch or prefetch stays fresh, in minutes.
+    fresh_min: Option<u32>,
+    /// The remote data that a new plugin must give.
+    needs: Option<String>,
+}
+
+/// The structured output of `propose`.
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct Proposed(#[serde(with = "ProposalFields")] LearnedIntent);
+
+/// One `data` entry of a proposal.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Pair {
+    /// The data key.
+    key: String,
+    /// The template.
+    value: String,
+}
+
+/// The map of the `{ key, value }` pairs of `deserializer`.
+///
+/// # Errors
+///
+/// The input is not a list of pairs.
+fn pairs<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error> {
+    let pairs: Vec<Pair> = Vec::deserialize(deserializer)?;
+    let entries = pairs.into_iter().map(|pair| (pair.key, pair.value));
+    Ok(entries.collect())
 }
 
 /// The `call_service` tool: one HA service call, with a description that names the
@@ -467,6 +631,10 @@ pub struct OpenAiReasoner {
     max_output_tokens: u32,
     /// The output token limit of a structured output.
     bulk_max_output_tokens: u32,
+    /// The model of each embeddings request.
+    embedding_model: String,
+    /// The number of responses of a proposal.
+    responses: usize,
     /// The most tool calls of one answer.
     max_tool_calls: u32,
     /// The services that a call runs with `return_response`.
@@ -480,7 +648,8 @@ pub struct OpenAiReasoner {
 }
 
 impl OpenAiReasoner {
-    /// A reasoner of `config` with the `OpenAI` API key `key` and the plugin tools `plugins`.
+    /// A reasoner of `config` with the `OpenAI` API key `key`, the plugin tools `plugins` and
+    /// `responses` responses for each proposal.
     ///
     /// # Errors
     ///
@@ -489,11 +658,14 @@ impl OpenAiReasoner {
         config: &OpenAiConfig,
         key: &str,
         plugins: Vec<ports::Tool>,
+        responses: usize,
     ) -> anyhow::Result<Self> {
-        Self::try_with_api(config, OpenAIConfig::new().with_api_key(key), plugins)
+        let api = OpenAIConfig::new().with_api_key(key);
+        Self::try_with_api(config, api, plugins, responses)
     }
 
-    /// A reasoner of `config` on the API of `api` with the plugin tools `plugins`.
+    /// A reasoner of `config` on the API of `api` with the plugin tools `plugins` and `responses`
+    /// responses for each proposal.
     ///
     /// # Errors
     ///
@@ -502,6 +674,7 @@ impl OpenAiReasoner {
         config: &OpenAiConfig,
         api: OpenAIConfig,
         plugins: Vec<ports::Tool>,
+        responses: usize,
     ) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .pool_idle_timeout(None)
@@ -512,6 +685,8 @@ impl OpenAiReasoner {
             model: config.model.clone(),
             max_output_tokens: config.max_output_tokens,
             bulk_max_output_tokens: config.bulk_max_output_tokens,
+            embedding_model: config.embedding_model.clone(),
+            responses,
             max_tool_calls: config.max_tool_calls,
             read_services: config.read_services.clone(),
             plugins,
@@ -554,21 +729,34 @@ impl OpenAiReasoner {
         Ok(true)
     }
 
+    /// The output text of the structured output `format` of the input `prompt`.
+    ///
+    /// # Errors
+    ///
+    /// The request fails, or the response has no text.
+    async fn structured(
+        &self,
+        format: ResponseFormatJsonSchema,
+        prompt: String,
+    ) -> anyhow::Result<String> {
+        let request = CreateResponseArgs::default()
+            .model(&self.model)
+            .input(prompt)
+            .text(format)
+            .max_output_tokens(self.bulk_max_output_tokens)
+            .build()?;
+        self.record_when_idle(Duration::ZERO)?;
+        let response = self.create(request).await?;
+        response.output_text().context("the response has no text")
+    }
+
     /// The strings of the structured output `{ "<key>": [string] }` of the input `prompt`.
     ///
     /// # Errors
     ///
     /// The request fails, or the output does not fit the format.
     async fn strings(&self, key: &str, prompt: String) -> anyhow::Result<Vec<String>> {
-        let request = CreateResponseArgs::default()
-            .model(&self.model)
-            .input(prompt)
-            .text(strings_format(key))
-            .max_output_tokens(self.bulk_max_output_tokens)
-            .build()?;
-        self.record_when_idle(Duration::ZERO)?;
-        let response = self.create(request).await?;
-        let text = response.output_text().context("the response has no text")?;
+        let text = self.structured(strings_format(key), prompt).await?;
         let mut object: Map<String, Value> = serde_json::from_str(&text)?;
         let strings = object.remove(key).context("the output has no strings")?;
         anyhow::ensure!(object.is_empty(), "the output has other fields: {object:?}");
@@ -672,6 +860,29 @@ impl Reasoner for OpenAiReasoner {
         let prompt = paraphrase_prompt(target, seeds, slots, n);
         self.strings("examples", prompt).await
     }
+
+    async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let request = CreateEmbeddingRequestArgs::default()
+            .model(&self.embedding_model)
+            .input(texts.to_vec())
+            .build()?;
+        self.record_when_idle(Duration::ZERO)?;
+        let response = self.client.embeddings().create(request).await?;
+        let vectors = response.data.into_iter().map(|item| item.embedding);
+        Ok(vectors.collect())
+    }
+
+    async fn propose(
+        &self,
+        texts: &[String],
+        intents: &[String],
+        tools: &[ports::Tool],
+    ) -> anyhow::Result<LearnedIntent> {
+        let prompt = propose_prompt(texts, intents, tools, self.responses);
+        let text = self.structured(proposal_format(), prompt).await?;
+        let proposal: Proposed = serde_json::from_str(&text)?;
+        Ok(proposal.0)
+    }
 }
 
 #[cfg(test)]
@@ -728,12 +939,14 @@ mod tests {
             .respond_with(template)
             .mount(&server)
             .await;
-        let config = Config::parse(include_str!("../../jarvis.toml"))?.openai;
+        let config = Config::parse(include_str!("../../jarvis.toml"))?;
         let api = OpenAIConfig::new()
             .with_api_key("key")
             .with_api_base(server.uri());
         let tools = vec![FakePlugin::new(PLUGIN).tool()];
-        Ok((server, OpenAiReasoner::try_with_api(&config, api, tools)?))
+        let responses = config.learn.responses;
+        let reasoner = OpenAiReasoner::try_with_api(&config.openai, api, tools, responses)?;
+        Ok((server, reasoner))
     }
 
     /// The number of requests that `server` received.
@@ -1495,6 +1708,116 @@ mod tests {
         for wanted in ["lights_on", "fan_on", "turn on the fan", "match none"] {
             assert!(prompt.contains(wanted), "{wanted:?} is not in {prompt:?}");
         }
+        Ok(())
+    }
+
+    /// A valid `command` proposal of the structured output.
+    const PROPOSAL: &str = r#"{"name": "movie_mode", "kind": "command",
+        "examples": ["start movie mode"], "responses": ["Enjoy the film."],
+        "service": "scene.turn_on", "plugin": null, "target": "entity",
+        "select": [{"domain": "scene", "name": "movie", "device_class": null}],
+        "data": [{"key": "transition", "value": "2"}], "question": null, "fresh_min": null,
+        "needs": null}"#;
+
+    /// The result of `propose` when a mock `OpenAI` server replies with the output text `text`,
+    /// and the body of the request.
+    async fn proposed(text: &str) -> anyhow::Result<(anyhow::Result<LearnedIntent>, Value)> {
+        let (server, reasoner) = structured("completed", text).await?;
+        let texts = ["movie time".to_owned()];
+        let result = reasoner.propose(&texts, &[], &[]).await;
+        let requests = server.received_requests().await.context("no requests")?;
+        Ok((result, requests[0].body_json()?))
+    }
+
+    /// AC-14.4-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_4_1_valid_proposal_is_returned() -> anyhow::Result<()> {
+        let (result, request) = proposed(PROPOSAL).await?;
+        let expected = LearnedIntent {
+            name: "movie_mode".to_owned(),
+            centroid: Vec::new(),
+            service: Some("scene.turn_on".to_owned()),
+            kind: LearnedKind::Command,
+            examples: vec!["start movie mode".to_owned()],
+            responses: vec!["Enjoy the film.".to_owned()],
+            plugin: None,
+            target: Some(Target::Entity),
+            entity: None,
+            select: vec![Filter {
+                domain: "scene".to_owned(),
+                name: Some("movie".to_owned()),
+                device_class: None,
+            }],
+            data: BTreeMap::from([("transition".to_owned(), "2".to_owned())]),
+            question: None,
+            fresh_min: None,
+            needs: None,
+        };
+        assert_eq!(result?, expected);
+        assert_eq!(request["max_output_tokens"], 8000);
+        assert_eq!(request["text"]["format"]["name"], "proposal");
+        Ok(())
+    }
+
+    /// AC-14.4-2.
+    #[test]
+    fn ac_14_4_2_prompt_has_texts_intents_tools_and_rule() {
+        use crate::ports::Plugin;
+        let texts = ["traffic to work".to_owned(), "commute time".to_owned()];
+        let intents = ["lights_on".to_owned(), "weather".to_owned()];
+        let tools = [FakePlugin::new(PLUGIN).tool()];
+        let prompt = propose_prompt(&texts, &intents, &tools, 10);
+        let wanted = texts.iter().chain(&intents).map(String::as_str);
+        let rule = [PLUGIN, &tools[0].description, NEW_PLUGIN_RULE, "10"];
+        let wanted = wanted.chain(rule);
+        for wanted in wanted {
+            assert!(prompt.contains(wanted), "{wanted:?} is not in {prompt:?}");
+        }
+    }
+
+    /// AC-14.4-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_4_3_reply_off_the_schema_is_an_error() -> anyhow::Result<()> {
+        let replies = [
+            PROPOSAL.replace("\"command\"", "\"dance\""),
+            PROPOSAL.replace("\"name\": \"movie_mode\", ", ""),
+            PROPOSAL.replace("[{\"key\": \"transition\", \"value\": \"2\"}]", "{}"),
+            PROPOSAL.replace("\"needs\": null", "\"needs\": null, \"colour\": 1"),
+        ];
+        for text in replies {
+            let (result, _request) = proposed(&text).await?;
+            assert!(result.is_err(), "the result of {text} is {result:?}");
+        }
+        Ok(())
+    }
+
+    /// Makes `server` answer each embeddings request with two vectors.
+    async fn mount_embeddings(server: &MockServer) {
+        let item = |index: u32| json!({"object": "embedding", "index": index, "embedding": [0.5]});
+        let body = json!({
+            "object": "list",
+            "model": "text-embedding-3-small",
+            "data": [item(0), item(1)],
+            "usage": {"prompt_tokens": 4, "total_tokens": 4},
+        });
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    /// AC-14.4-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_4_4_embed_sends_one_request_and_gives_two_vectors() -> anyhow::Result<()> {
+        let (server, reasoner) = mock("completed").await?;
+        mount_embeddings(&server).await;
+        let vectors = reasoner.embed(&["a".to_owned(), "b".to_owned()]).await?;
+        assert_eq!(vectors, [[0.5], [0.5]]);
+        let requests = server.received_requests().await.context("no requests")?;
+        assert_eq!(requests.len(), 1);
+        let request: Value = requests[0].body_json()?;
+        assert_eq!(request["model"], "text-embedding-3-small");
         Ok(())
     }
 }
