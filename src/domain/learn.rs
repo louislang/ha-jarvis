@@ -275,13 +275,14 @@ pub fn covering<'learned>(
 #[verus_spec(result =>
     ensures
         result is Ok ==> proposal.examples@.len() >= catalog.min_examples
-            && new_name(proposal.name@, catalog.intents@, learned@),
+            && new_name(proposal.name@, catalog.intents@, learned@)
+            && kind_valid(proposal, plugins@),
 )]
 pub fn validate_proposal(
     proposal: LearnedIntent,
     catalog: &Catalog,
     learned: &[LearnedIntent],
-    _plugins: &BTreeSet<String>,
+    plugins: &BTreeSet<String>,
 ) -> Result<LearnedIntent, ProposalError> {
     check_name(proposal.name.as_str(), catalog, learned)?;
     if proposal.examples.len() < catalog.min_examples {
@@ -290,11 +291,13 @@ pub fn validate_proposal(
     let slots = check_examples(&proposal.examples)?;
     if let Some(kind) = pool_kind(proposal.kind) {
         let target = proposal.target.unwrap_or_default();
-        let allowed = responses::pool_variables(slots, kind, target);
+        let allowed = responses::pool_variables(slots.clone(), kind, target);
         for response in &proposal.responses {
             check_template(response.as_str(), &allowed, "responses")?;
         }
     }
+    check_kind(&proposal, plugins, !slots.is_empty())?;
+    check_kind_templates(&proposal, &slots)?;
     Ok(proposal)
 }
 
@@ -422,6 +425,117 @@ fn check_template(
     }
 }
 
+/// Checks the fields of the kind of `proposal`. `slotted` is true when its examples have a slot.
+#[verus_spec(result =>
+    ensures
+        result is Ok <==> kind_valid(*proposal, plugins@) && !(proposal.kind is Prefetch && slotted),
+)]
+fn check_kind(
+    proposal: &LearnedIntent,
+    plugins: &BTreeSet<String>,
+    slotted: bool,
+) -> Result<(), ProposalError> {
+    match proposal.kind {
+        LearnedKind::Command => {
+            require(proposal.target.is_some(), "target")?;
+            require(
+                !proposal.select.is_empty() || proposal.entity.is_some(),
+                "select",
+            )
+        }
+        LearnedKind::Query => {
+            require(!proposal.select.is_empty(), "select")?;
+            require(proposal.service.is_none(), "service")
+        }
+        LearnedKind::Fetch | LearnedKind::Prefetch => check_timed(proposal, plugins, slotted),
+        LearnedKind::NewPlugin => check_new_plugin(proposal),
+        LearnedKind::None => Ok(()),
+    }
+}
+
+/// Checks the fields of a `fetch` or `prefetch` proposal. `slotted` is true when its examples have
+/// a slot.
+#[verus_spec(result =>
+    requires
+        proposal.kind is Fetch || proposal.kind is Prefetch,
+    ensures
+        result is Ok <==> kind_valid(*proposal, plugins@) && !(proposal.kind is Prefetch && slotted),
+)]
+fn check_timed(
+    proposal: &LearnedIntent,
+    plugins: &BTreeSet<String>,
+    slotted: bool,
+) -> Result<(), ProposalError> {
+    let prefetch = matches!(proposal.kind, LearnedKind::Prefetch);
+    if prefetch {
+        require(proposal.question.is_some(), "question")?;
+    } else {
+        let listed = matches!(&proposal.plugin, Some(plugin) if plugins.contains(plugin));
+        require(listed, "plugin")?;
+    }
+    require(proposal.service.is_none(), "service")?;
+    let fresh = matches!(proposal.fresh_min, Some(minutes) if minutes > 0);
+    require(fresh, "fresh_min")?;
+    require(!(prefetch && slotted), "examples")
+}
+
+/// Checks that a `new_plugin` proposal has `needs` and no service, plugin or question.
+#[verus_spec(result =>
+    ensures
+        result is Ok <==> (proposal.needs matches Some(needs) && needs@.len() > 0)
+            && proposal.service is None && proposal.plugin is None && proposal.question is None,
+)]
+fn check_new_plugin(proposal: &LearnedIntent) -> Result<(), ProposalError> {
+    let needs = matches!(&proposal.needs, Some(needs) if !needs.is_empty());
+    require(needs, "needs")?;
+    require(proposal.service.is_none(), "service")?;
+    require(proposal.plugin.is_none(), "plugin")?;
+    require(proposal.question.is_none(), "question")
+}
+
+/// `Ok` when `valid`, else the error that names `field`.
+#[verus_spec(result =>
+    ensures
+        result is Ok <==> valid,
+)]
+fn require(valid: bool, field: &'static str) -> Result<(), ProposalError> {
+    if valid {
+        Ok(())
+    } else {
+        Err(ProposalError::Field(field))
+    }
+}
+
+/// Checks the data templates of a command, and that each response of a fetch uses `response`.
+#[verus_verify]
+fn check_kind_templates(
+    proposal: &LearnedIntent,
+    slots: &BTreeSet<String>,
+) -> Result<(), ProposalError> {
+    let target = proposal.target.unwrap_or_default();
+    // The pool variables of a command are those of a fetch without `response`.
+    let allowed = responses::pool_variables(slots.clone(), Kind::Command, target);
+    match proposal.kind {
+        LearnedKind::Command => {
+            for template in proposal.data.values() {
+                check_template(template.as_str(), &allowed, "data")?;
+            }
+        }
+        LearnedKind::Fetch => {
+            // The responses use only the pool variables, so the first variable outside `allowed`
+            // is `response` exactly when a response uses it.
+            for response in &proposal.responses {
+                match catalog::unknown_variable(response.as_str(), &allowed) {
+                    Ok(Some(variable)) if variable.as_str() == "response" => {}
+                    _ => return Err(ProposalError::Field("responses")),
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// True when `intent` calls an HA service, so it waits for approval.
 #[verus_spec(approval =>
     ensures
@@ -441,6 +555,27 @@ pub open spec fn new_name(name: Seq<char>, intents: Seq<catalog::Intent>, learne
     &&& name != "unknown"@
     &&& forall|index: int| 0 <= index < intents.len() ==> #[trigger] intents[index].name@ != name
     &&& forall|index: int| 0 <= index < learned.len() ==> #[trigger] learned[index].name@ != name
+}
+
+/// True when `minutes` is 1 or more.
+pub open spec fn fresh(minutes: Option<u32>) -> bool {
+    minutes matches Some(value) && value > 0
+}
+
+/// True when the fields of the kind of `proposal` pass, except the slot check of a prefetch.
+pub open spec fn kind_valid(proposal: LearnedIntent, plugins: Set<String>) -> bool {
+    match proposal.kind {
+        LearnedKind::Command => proposal.target is Some
+            && (proposal.select@.len() > 0 || proposal.entity is Some),
+        LearnedKind::Query => proposal.select@.len() > 0 && proposal.service is None,
+        LearnedKind::Fetch => (proposal.plugin matches Some(plugin) && plugins.contains(plugin))
+            && proposal.service is None && fresh(proposal.fresh_min),
+        LearnedKind::Prefetch => proposal.question is Some && proposal.service is None
+            && fresh(proposal.fresh_min),
+        LearnedKind::NewPlugin => (proposal.needs matches Some(needs) && needs@.len() > 0)
+            && proposal.service is None && proposal.plugin is None && proposal.question is None,
+        LearnedKind::None => true,
+    }
 }
 
 /// The times of the spoken points of `points`, in order.
@@ -498,8 +633,17 @@ mod tests {
         points.collect()
     }
 
-    /// A proposal of `kind` with valid names, examples and responses and no other fields.
+    /// A valid proposal of `kind` without a service.
     fn proposal(kind: LearnedKind) -> LearnedIntent {
+        let fetch = kind == LearnedKind::Fetch;
+        let timed = fetch || kind == LearnedKind::Prefetch;
+        let command = kind == LearnedKind::Command;
+        let selected = command || kind == LearnedKind::Query;
+        let response = if fetch {
+            "It is {{ response.text }}."
+        } else {
+            "Good night."
+        };
         LearnedIntent {
             name: "good_night".to_owned(),
             centroid: Vec::new(),
@@ -508,15 +652,24 @@ mod tests {
             examples: ["good night", "night night", "time for bed"]
                 .map(str::to_owned)
                 .to_vec(),
-            responses: vec!["Good night.".to_owned()],
-            plugin: None,
-            target: None,
+            responses: vec![response.to_owned()],
+            plugin: fetch.then(|| "get_weather".to_owned()),
+            target: command.then_some(Target::House),
             entity: None,
-            select: Vec::new(),
+            select: selected.then(scenes).into_iter().collect(),
             data: BTreeMap::new(),
-            question: None,
-            fresh_min: None,
-            needs: None,
+            question: (kind == LearnedKind::Prefetch).then(|| "Is it bedtime?".to_owned()),
+            fresh_min: timed.then_some(30),
+            needs: (kind == LearnedKind::NewPlugin).then(|| "bedtime data".to_owned()),
+        }
+    }
+
+    /// The entity filter of the scenes.
+    fn scenes() -> Filter {
+        Filter {
+            domain: "scene".to_owned(),
+            name: None,
+            device_class: None,
         }
     }
 
@@ -538,6 +691,9 @@ mod tests {
         let plugins = BTreeSet::from(["get_weather".to_owned()]);
         validate_proposal(proposal, &catalog, learned, &plugins)
     }
+
+    /// A change of a proposal.
+    type Change = fn(&mut LearnedIntent);
 
     /// The error of `check` after `change` modifies a valid proposal of `kind`.
     fn refused(kind: LearnedKind, change: impl FnOnce(&mut LearnedIntent)) -> ProposalError {
@@ -669,5 +825,73 @@ mod tests {
             proposal.responses = vec!["It is {{ response }}.".to_owned()];
         });
         assert_eq!(error, field("responses"));
+    }
+
+    /// AC-14.2c-1.
+    #[test]
+    fn ac_14_2c_1_fetch_and_prefetch_fields_are_named() {
+        for kind in [LearnedKind::Fetch, LearnedKind::Prefetch] {
+            assert_eq!(check(proposal(kind), &[]), Ok(proposal(kind)));
+        }
+        let fetch = |change: Change| refused(LearnedKind::Fetch, change);
+        let prefetch = |change: Change| refused(LearnedKind::Prefetch, change);
+        let service: Change = |proposal| proposal.service = Some("light.turn_on".to_owned());
+        let traffic: Change = |proposal| proposal.plugin = Some("get_traffic".to_owned());
+        let slot: Change = |proposal| proposal.examples[0] = "night [kitchen](area)".to_owned();
+        assert_eq!(fetch(|proposal| proposal.plugin = None), field("plugin"));
+        assert_eq!(fetch(traffic), field("plugin"));
+        assert_eq!(fetch(service), field("service"));
+        assert_eq!(prefetch(service), field("service"));
+        assert_eq!(
+            prefetch(|proposal| proposal.question = None),
+            field("question")
+        );
+        assert_eq!(prefetch(slot), field("examples"));
+    }
+
+    /// AC-14.2c-2.
+    #[test]
+    fn ac_14_2c_2_command_without_target_is_an_error() {
+        let command = proposal(LearnedKind::Command);
+        assert_eq!(check(command.clone(), &[]), Ok(command));
+        let error = refused(LearnedKind::Command, |proposal| proposal.target = None);
+        assert_eq!(error, field("target"));
+    }
+
+    /// AC-14.2c-3.
+    #[test]
+    fn ac_14_2c_3_missing_fresh_min_is_named() {
+        for kind in [LearnedKind::Fetch, LearnedKind::Prefetch] {
+            for fresh_min in [None, Some(0)] {
+                let error = refused(kind, |proposal| proposal.fresh_min = fresh_min);
+                assert_eq!(error, field("fresh_min"), "{kind:?} {fresh_min:?}");
+            }
+        }
+    }
+
+    /// AC-14.2c-4.
+    #[test]
+    fn ac_14_2c_4_new_plugin_fields_are_named() {
+        let new_plugin = |change: Change| refused(LearnedKind::NewPlugin, change);
+        assert_eq!(new_plugin(|proposal| proposal.needs = None), field("needs"));
+        assert_eq!(
+            new_plugin(|proposal| proposal.needs = Some(String::new())),
+            field("needs")
+        );
+        assert_eq!(
+            new_plugin(|proposal| proposal.service = Some("x".to_owned())),
+            field("service")
+        );
+        assert_eq!(
+            new_plugin(|proposal| proposal.plugin = Some("x".to_owned())),
+            field("plugin")
+        );
+        assert_eq!(
+            new_plugin(|proposal| proposal.question = Some("x".to_owned())),
+            field("question")
+        );
+        let mut valid = proposal(LearnedKind::NewPlugin);
+        valid.responses = vec!["Bedtime is in {{ response.minutes }} minutes.".to_owned()];
+        assert_eq!(check(valid.clone(), &[]), Ok(valid));
     }
 }
