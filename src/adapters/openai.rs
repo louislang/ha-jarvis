@@ -161,13 +161,8 @@ const NEW_PLUGIN_RULE: &str = "If the requests need remote data that no plugin t
      is new_plugin, needs states that data in one line, and name is the name of the future fetch \
      intent, for example get_traffic.";
 
-/// The `propose` input: one new intent with `responses` responses for `texts`, unlike `intents`.
-fn propose_prompt(
-    texts: &[String],
-    intents: &[String],
-    tools: &[ports::Tool],
-    responses: usize,
-) -> String {
+/// The `propose` input: one new intent with `n` responses for `texts`, unlike `intents`.
+fn propose_prompt(texts: &[String], intents: &[String], tools: &[ports::Tool], n: usize) -> String {
     let texts: Vec<String> = texts.iter().map(|text| format!("- {text}\n")).collect();
     let line = |tool: &ports::Tool| format!("- {}: {}\n", tool.name, tool.description);
     let tools: Vec<String> = tools.iter().map(line).collect();
@@ -179,7 +174,7 @@ fn propose_prompt(
          time and reply with its answer), new_plugin, or none when the requests are not suitable \
          for an intent. fresh_min is the minutes that the answer of a fetch or prefetch stays \
          fresh. Write the examples in [value](slot) markup, with only lowercase letters, digits, \
-         apostrophes and single spaces, and write {responses} responses to speak aloud. \
+         apostrophes and single spaces, and write {n} responses to speak aloud. \
          {NEW_PLUGIN_RULE}\nRequests:\n{}Plugin tools:\n{}",
         intents.join(", "),
         texts.concat(),
@@ -199,17 +194,38 @@ fn object(properties: &Value) -> Value {
     })
 }
 
-/// True when `value` and its nested values have the required properties and arrays of `schema`.
-fn fits(schema: &Value, value: &Value) -> bool {
-    let items = |item| fits(&schema["items"], item);
+/// The JSON schema type of `value`.
+fn type_name(value: &Value) -> &'static str {
     match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) if number.is_f64() => "number",
+        Value::Number(_) => "integer",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// True when `schema` allows the type and, with an `enum`, the value of `value`.
+fn allowed(schema: &Value, value: &Value) -> bool {
+    let name = Value::from(type_name(value));
+    let (types, values) = (&schema["type"], &schema["enum"]);
+    let of_type = *types == name || types.as_array().is_some_and(|list| list.contains(&name));
+    of_type && values.as_array().is_none_or(|list| list.contains(value))
+}
+
+/// True when `value` and its nested values have the types, enums and required keys of `schema`.
+fn fits(schema: &Value, value: &Value) -> bool {
+    match value {
+        _ if !allowed(schema, value) => false,
         Value::Object(object) => {
             let required = schema["required"].as_array().into_iter().flatten();
             let schemas = &schema["properties"];
             let has = |key| matches!(object.get(key), Some(item) if fits(&schemas[key], item));
             required.filter_map(Value::as_str).all(has)
         }
-        Value::Array(list) => schema["type"] == "array" && list.iter().all(items),
+        Value::Array(list) => list.iter().all(|item| fits(&schema["items"], item)),
         _ => true,
     }
 }
@@ -229,24 +245,20 @@ fn strings_format(key: &str) -> ResponseFormatJsonSchema {
     }
 }
 
-/// The structured output format of a proposal. `data` is a list of `{ key, value }` pairs,
-/// because a strict schema names each property of an object.
+/// The proposal format. `data` is a list of `{ key, value }` pairs: a strict schema names each key.
 fn proposal_format() -> ResponseFormatJsonSchema {
     let text = json!({"type": "string"});
     let optional = json!({"type": ["string", "null"]});
-    let strings = json!({"type": "array", "items": text});
-    let filter = object(&json!({"domain": text, "name": optional, "device_class": optional}));
-    let pair = object(&json!({"key": text, "value": text}));
     let schema = object(&json!({
         "name": text,
         "kind": {"type": "string", "enum": ["command", "query", "fetch", "prefetch", "new_plugin", "none"]},
-        "examples": strings,
-        "responses": strings,
+        "examples": {"type": "array", "items": text},
+        "responses": {"type": "array", "items": text},
         "service": optional,
         "plugin": optional,
         "target": {"type": ["string", "null"], "enum": ["entity", "entities", "house", null]},
-        "select": {"type": "array", "items": filter},
-        "data": {"type": "array", "items": pair},
+        "select": {"type": "array", "items": object(&json!({"domain": text, "name": optional, "device_class": optional}))},
+        "data": {"type": "array", "items": object(&json!({"key": text, "value": text}))},
         "question": optional,
         "fresh_min": {"type": ["integer", "null"]},
         "needs": optional,
@@ -259,22 +271,16 @@ fn proposal_format() -> ResponseFormatJsonSchema {
     }
 }
 
-/// The proposal names of `LearnedKind`.
-#[derive(Deserialize)]
-#[serde(remote = "LearnedKind", rename_all = "snake_case")]
-enum KindName {
-    /// `command`.
-    Command,
-    /// `query`.
-    Query,
-    /// `fetch`.
-    Fetch,
-    /// `prefetch`.
-    Prefetch,
-    /// `new_plugin`.
-    NewPlugin,
-    /// `none`.
-    None,
+/// The `LearnedKind` of the proposal kind name of `deserializer`. `fits` refuses other names.
+fn kind<'de, D: Deserializer<'de>>(deserializer: D) -> Result<LearnedKind, D::Error> {
+    Ok(match String::deserialize(deserializer)?.as_str() {
+        "command" => LearnedKind::Command,
+        "query" => LearnedKind::Query,
+        "fetch" => LearnedKind::Fetch,
+        "prefetch" => LearnedKind::Prefetch,
+        "new_plugin" => LearnedKind::NewPlugin,
+        _ => LearnedKind::None,
+    })
 }
 
 /// The proposal fields of `LearnedIntent`.
@@ -289,7 +295,7 @@ struct ProposalFields {
     /// The HA service.
     service: Option<String>,
     /// How Jarvis replies and acts.
-    #[serde(with = "KindName")]
+    #[serde(deserialize_with = "kind")]
     kind: LearnedKind,
     /// The examples in `[value](slot)` markup.
     examples: Vec<String>,
@@ -314,10 +320,6 @@ struct ProposalFields {
     /// The remote data that a new plugin must give.
     needs: Option<String>,
 }
-
-/// The structured output of `propose`.
-#[derive(Deserialize)]
-struct Proposed(#[serde(with = "ProposalFields")] LearnedIntent);
 
 /// One `data` entry of a proposal.
 #[derive(Deserialize)]
@@ -889,8 +891,7 @@ impl Reasoner for OpenAiReasoner {
     ) -> anyhow::Result<LearnedIntent> {
         let prompt = propose_prompt(texts, intents, tools, self.responses);
         let output = self.structured(proposal_format(), prompt).await?;
-        let proposal: Proposed = serde_json::from_value(output)?;
-        Ok(proposal.0)
+        Ok(ProposalFields::deserialize(output)?)
     }
 }
 
@@ -1722,10 +1723,9 @@ mod tests {
 
     /// A valid `command` proposal of the structured output.
     const PROPOSAL: &str = r#"{"name": "movie_mode", "kind": "command", "service": "scene.turn_on",
-        "examples": ["start movie mode"], "responses": ["Enjoy the film."], "plugin": null,
+        "examples": ["start movie mode"], "responses": ["Enjoy."], "plugin": null, "needs": null,
         "target": "entity", "select": [{"domain": "scene", "name": "movie", "device_class": null}],
-        "data": [{"key": "transition", "value": "2"}], "question": null, "fresh_min": null,
-        "needs": null}"#;
+        "data": [{"key": "transition", "value": "2"}], "question": null, "fresh_min": null}"#;
 
     /// The result of `propose` when a mock `OpenAI` server replies with the output text `text`,
     /// and the body of the request.
@@ -1746,7 +1746,7 @@ mod tests {
             service: Some("scene.turn_on".to_owned()),
             kind: LearnedKind::Command,
             examples: vec!["start movie mode".to_owned()],
-            responses: vec!["Enjoy the film.".to_owned()],
+            responses: vec!["Enjoy.".to_owned()],
             plugin: None,
             target: Some(Target::Entity),
             entity: None,
@@ -1793,6 +1793,8 @@ mod tests {
             PROPOSAL.replace(", \"device_class\": null", ""),
             PROPOSAL.replace("\"data\": [", "\"data\": [[\"transition\", \"2\"], "),
             PROPOSAL.replace("\"select\": [", "\"select\": [[\"x\", null, null], "),
+            PROPOSAL.replace("\"command\"", "{\"command\": null}"),
+            PROPOSAL.replace("\"target\": \"entity\"", "\"target\": {\"entity\": null}"),
         ];
         for text in replies {
             let (result, _request) = proposed(&text).await?;
