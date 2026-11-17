@@ -324,17 +324,27 @@ fn variables(name: &str, catalog: &Catalog) -> BTreeSet<String> {
         return variables;
     };
     catalog::insert_slots(intent, &mut variables);
-    variables.insert("area".to_owned());
-    if intent.target == Target::Entity {
-        variables.insert("entity".to_owned());
-    } else if intent.kind == Kind::Query {
-        variables.insert("entities".to_owned());
-    }
-    if intent.kind == Kind::Fetch {
-        variables.insert("response".to_owned());
-    }
+    let mut variables = pool_variables(variables, intent.kind, intent.target);
     if intent.needs_speaker {
         variables.insert("person".to_owned());
+    }
+    variables
+}
+
+/// `slots` with the built-ins of a pool of an intent of `kind` and `target`: `area`, `entity` or
+/// the `entities` of a list query, and the `response` of a fetch.
+#[verus_verify]
+#[must_use]
+pub fn pool_variables(slots: BTreeSet<String>, kind: Kind, target: Target) -> BTreeSet<String> {
+    let mut variables = slots;
+    variables.insert("area".to_owned());
+    if target == Target::Entity {
+        variables.insert("entity".to_owned());
+    } else if kind == Kind::Query {
+        variables.insert("entities".to_owned());
+    }
+    if kind == Kind::Fetch {
+        variables.insert("response".to_owned());
     }
     variables
 }

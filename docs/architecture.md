@@ -222,7 +222,10 @@ flowchart LR
     crate_domain_intent --> crate_domain_contracts
     crate_domain_intent --> crate_domain_intent
     crate_domain_intent --> crate_domain_training
+    crate_domain_learn --> crate_domain_catalog
     crate_domain_learn --> crate_domain_contracts
+    crate_domain_learn --> crate_domain_intent
+    crate_domain_learn --> crate_domain_responses
     crate_domain_model --> crate_domain_contracts
     crate_domain_model --> crate_domain_intent
     crate_domain_responses --> crate_domain_catalog
