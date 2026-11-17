@@ -506,7 +506,7 @@ AC-14.10-1, AC-14.10-2, AC-14.10-9 and AC-14.10-11 move to sub-phase 14.10c as A
 - **Implements:** G1, G11. **Depends on:** 14.10c.
 - **Files:** modify `src/app/conversation.rs`, `src/app/background.rs`, `src/lib.rs`, `src/testing/e2e.rs`, `README.md` (prefetch, `CLAUDE.md` workflow item 15).
 
-**Model.** `handle` keeps the area of the most recent request that System One predicts as each prefetch intent. The prefetch question of the intent has this area, so System Two gets its entities, and the stored answer keeps it. Prefetch intents have no slots (sub-phase 14.2c), so the intent and the area of the question are the full cache key. When the intent is predicted, a fresh answer (`fresh` of sub-phase 14.9 with the `fresh_min` of the intent) with the area of the request is the reply. Else the request goes to System Two. The Phase 9 harness can start with request habits whose usual time is the current hour, so the prefetch runs at the start.
+**Model.** `handle` keeps the area of the most recent request that System One predicts as each prefetch intent. The prefetch question of the intent has this area, so System Two gets its entities, and the stored answer keeps it. Prefetch intents have no slots (sub-phase 14.2c), so the intent and the area of the question are the full cache key. When the intent is predicted, a fresh answer (`fresh` of sub-phase 14.9 with the `fresh_min` of the intent) with the area of the request is the reply. Else the request goes to System Two. The Phase 9 harness can start with a pre-rendered stored answer, with the area of the harness device and the current time.
 
 **Acceptance criteria.**
 
