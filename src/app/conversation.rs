@@ -150,8 +150,8 @@ pub struct Conversation {
     rng: Arc<Mutex<StdRng>>,
     /// The System One model.
     classifier: Arc<CurrentClassifier>,
-    /// The intent catalog.
-    catalog: Arc<Catalog>,
+    /// The catalog of `intents.toml` and the active learned intents.
+    catalog: Arc<ArcSwap<Catalog>>,
     /// The least top probability that System One acts on.
     threshold: f32,
     /// System Two.
@@ -181,7 +181,7 @@ impl Conversation {
         backfill: Arc<Backfill>,
         queues: Arc<Queues>,
         classifier: Arc<CurrentClassifier>,
-        catalog: Arc<Catalog>,
+        catalog: Arc<ArcSwap<Catalog>>,
         threshold: f32,
         two: SystemTwo,
         habits: Arc<Habits>,
@@ -596,7 +596,7 @@ impl Conversation {
     fn decide(&self, prediction: &Prediction, request: &Request) -> Decision {
         let (cache, pools) = (self.queues.cache.borrow(), self.pools.load());
         let rng = &mut self.rng.lock().expect("no lock holder panics");
-        let catalog = &self.catalog;
+        let catalog = &self.catalog.load();
         decide::decide(
             prediction,
             request,
@@ -706,7 +706,8 @@ impl Conversation {
         call: Option<ServiceCall>,
         request: Option<Origin>,
     ) -> (Chosen, Option<Work>) {
-        let mut intents = self.catalog.intents.iter();
+        let catalog = self.catalog.load();
+        let mut intents = catalog.intents.iter();
         let search = intents.any(|intent| intent.search && intent.name == reply.pool);
         (reply, call.map(|call| self.after(call, search, request)))
     }
@@ -1621,11 +1622,14 @@ mod tests {
     use tracing::instrument::WithSubscriber;
 
     use super::*;
+    use crate::app::background;
     use crate::app::speech::Speech;
     use crate::app::training::FIXTURE;
     use crate::domain::habits::Bucket;
     use crate::domain::habits::DayType;
     use crate::domain::habits::RequestHabits;
+    use crate::domain::learn;
+    use crate::domain::learn::LearnedStatus;
     use crate::domain::model::Slot;
     use crate::domain::responses::Pool;
     use crate::domain::state::ServiceCall;
@@ -1680,11 +1684,16 @@ mod tests {
     ) -> Arc<Backfill> {
         let mut config = crate::Config::parse(include_str!("../../jarvis.toml")).expect("valid");
         config.backfill.max_pool = max_pool;
-        let catalog = toml::from_str(include_str!("../../intents.toml")).expect("it is a catalog");
         let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
-        let (catalog, cache) = (Arc::new(catalog), queues.cache.clone());
+        let (catalog, cache) = (intents(), queues.cache.clone());
         let backfill = Backfill::new(config.backfill, reasoner, changes, speech, catalog, cache);
         Arc::new(backfill)
+    }
+
+    /// The catalog of `intents.toml` as a live catalog.
+    fn intents() -> Arc<ArcSwap<Catalog>> {
+        let catalog = toml::from_str(include_str!("../../intents.toml")).expect("it is a catalog");
+        Arc::new(ArcSwap::from_pointee(catalog))
     }
 
     /// A conversation with `pools`, `queues`, `classifier` and `reasoner`, the backfill of
@@ -1698,7 +1707,6 @@ mod tests {
         classifier: Arc<dyn Classifier>,
         reasoner: Arc<FakeReasoner>,
     ) -> Conversation {
-        let catalog = toml::from_str(include_str!("../../intents.toml")).expect("it is a catalog");
         let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
         let backfill = backfill(changes, Arc::clone(&reasoner), &queues, max_pool);
         let habits = Habits::new(RequestHabits::default(), 14.0, queues.cache.clone());
@@ -1708,7 +1716,7 @@ mod tests {
             backfill,
             queues,
             Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), classifier)),
-            Arc::new(catalog),
+            intents(),
             0.6,
             SystemTwo {
                 reasoner,
@@ -4056,5 +4064,21 @@ mod tests {
     #[quint_run(spec = "quint/dialog.qnt", max_steps = 30, seed = "1")]
     fn ac_10_5b_2_conformance() -> impl Driver {
         JobDriver::new()
+    }
+
+    /// AC-14.7b-1. The test adds `tell_joke` as its activation does.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_7b_1_learned_intent_replies_from_its_pool() -> anyhow::Result<()> {
+        let (_clock, conversation) = at(MONDAY, &["tell_joke"]);
+        let mut entry = fakes::learned("tell_joke", LearnedStatus::Active);
+        (entry.service, entry.responses) = (None, vec!["Why did the fan stop?".to_owned()]);
+        let mut pools = Pools::clone(&conversation.pools.load());
+        pools.insert("tell_joke".to_owned(), background::pool(&entry.responses));
+        conversation.pools.store(Arc::new(pools));
+        let live = learn::live(Catalog::clone(&conversation.catalog.load()), vec![entry]);
+        conversation.catalog.store(Arc::new(live));
+        let handled = conversation.handle("tell me a joke", on_satellite());
+        assert_eq!(handled.await?.text, "Why did the fan stop?");
+        Ok(())
     }
 }

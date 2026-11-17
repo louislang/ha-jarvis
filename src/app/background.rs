@@ -107,8 +107,8 @@ pub struct Backfill {
     changes: mpsc::Sender<Change>,
     /// The pre-render of the new responses.
     speech: Arc<Speech>,
-    /// The intent catalog. Only an intent pool can use `area`.
-    catalog: Arc<Catalog>,
+    /// The live catalog. Only an intent pool can use `area`.
+    catalog: Arc<ArcSwap<Catalog>>,
     /// The hot cache, which has the area names of the pre-render.
     cache: watch::Receiver<StateCache>,
     /// The pools with a backfill in progress.
@@ -124,7 +124,7 @@ impl Backfill {
         reasoner: Arc<dyn Reasoner>,
         changes: mpsc::Sender<Change>,
         speech: Arc<Speech>,
-        catalog: Arc<Catalog>,
+        catalog: Arc<ArcSwap<Catalog>>,
         cache: watch::Receiver<StateCache>,
     ) -> Self {
         Self {
@@ -213,11 +213,8 @@ impl Backfill {
 
     /// The variables that the responses of the pool `name` can use: `area` for an intent pool.
     fn variables(&self, name: &str) -> BTreeSet<String> {
-        let intent = self
-            .catalog
-            .intents
-            .iter()
-            .any(|intent| intent.name == name);
+        let catalog = self.catalog.load();
+        let intent = catalog.intents.iter().any(|intent| intent.name == name);
         BTreeSet::from_iter(intent.then(|| "area".to_owned()))
     }
 
@@ -571,9 +568,7 @@ impl Activation {
     /// Adds and pre-renders the pool of `entry` when it has an intent, then adds the intent to the
     /// live catalog and sets `activated`. A failed pre-render logs and leaves `activated` unset.
     pub async fn activate(&self, entry: LearnedIntent) {
-        if learn::intent(entry.clone()).is_some()
-            && let Err(error) = self.add_pool(&entry).await
-        {
+        if let Err(error) = self.add_pool(&entry).await {
             return tracing::warn!("the pre-render of {} failed: {error:#}", entry.name);
         }
         let (store, catalog) = (Arc::clone(&self.store), Arc::clone(&self.catalog));
@@ -587,9 +582,13 @@ impl Activation {
         }));
     }
 
-    /// Sends the pools task a change that adds the pool of `entry` when no pool has its name, then
-    /// pre-renders the pool for the areas of the hot cache. Fails when the pre-render fails.
-    async fn add_pool(&self, entry: &LearnedIntent) -> anyhow::Result<()> {
+    /// When `entry` has an intent, sends the pools task a change that adds its pool when no pool
+    /// has its name, then pre-renders the pool for the areas of the hot cache. Fails when the
+    /// pre-render fails.
+    pub(crate) async fn add_pool(&self, entry: &LearnedIntent) -> anyhow::Result<()> {
+        if learn::intent(entry.clone()).is_none() {
+            return Ok(());
+        }
         let (name, added) = (entry.name.clone(), pool(&entry.responses));
         let pools = Pools::from([(name.clone(), added.clone())]);
         self.send(Box::new(move |mut current| {
@@ -1392,7 +1391,7 @@ mod tests {
         config.backfill.max_pool = usize::MAX;
         let speech = Arc::new(Speech::new(Arc::clone(tts) as _));
         let cache = watch::channel(StateCache::load(house())).1;
-        let catalog = Arc::new(catalog());
+        let catalog = Arc::new(ArcSwap::from_pointee(catalog()));
         let backfill = Backfill::new(config.backfill, reasoner, changes, speech, catalog, cache);
         Arc::new(backfill)
     }

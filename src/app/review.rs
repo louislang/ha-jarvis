@@ -2,14 +2,13 @@
 //! learned entries.
 
 use std::sync::Arc;
-use std::sync::mpsc;
 
 use async_trait::async_trait;
 use futures::channel::oneshot;
 
+use crate::app::background::Activation;
 use crate::app::conversation::Change;
 use crate::domain::catalog;
-use crate::domain::catalog::Catalog;
 use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
 use crate::domain::learn::Learned;
@@ -28,30 +27,47 @@ use crate::ports::Unresolved;
 pub struct Reviewer {
     /// The log of the interactions.
     log: Arc<dyn InteractionLog>,
-    /// The names that a correction can have: `unknown` and the intent names.
-    names: Vec<String>,
-    /// The learned intents file.
-    learned: Arc<dyn Store<Learned>>,
-    /// The sender of the pools task, which writes the file.
-    changes: mpsc::Sender<Change>,
+    /// The activation, with the learned intents file, its pools task and the live catalog.
+    activation: Activation,
 }
 
 impl Reviewer {
-    /// The review of `log` with the intent names of `catalog`, and of the learned intents file
-    /// `learned`, which the pools task of `changes` writes.
+    /// The review of `log` and of the learned intents file of `activation`.
     #[must_use]
-    pub fn new(
-        log: Arc<dyn InteractionLog>,
-        catalog: &Catalog,
-        learned: Arc<dyn Store<Learned>>,
-        changes: mpsc::Sender<Change>,
-    ) -> Self {
-        Self {
-            log,
-            names: catalog::labels(catalog),
-            learned,
-            changes,
+    pub fn new(log: Arc<dyn InteractionLog>, activation: Activation) -> Self {
+        Self { log, activation }
+    }
+
+    /// The result of `task` on the learned intents file, run by the pools task in order. Fails when
+    /// the pools task stopped.
+    async fn run<T: Send + 'static>(
+        &self,
+        task: impl FnOnce(&dyn Store<Learned>) -> T + Send + 'static,
+    ) -> Result<T, Unresolved> {
+        let (sender, receiver) = oneshot::channel();
+        let store = Arc::clone(&self.activation.store);
+        let change: Change = Box::new(move |pools| {
+            // The web request can end before the change runs.
+            let _ = sender.send(task(store.as_ref()));
+            pools
+        });
+        let stopped = || Unresolved::Failed(anyhow::anyhow!("the pools task stopped"));
+        let changes = &self.activation.changes;
+        changes.send(change).map_err(|_| stopped())?;
+        receiver.await.map_err(|_| stopped())
+    }
+
+    /// With `approve`, the `pending` entry `name` as `active`, after the pre-render of its pool. A
+    /// failed pre-render fails before the save, so the entry stays `pending` for another approve.
+    async fn prepared(&self, name: &str, approve: bool) -> Result<Vec<LearnedIntent>, Unresolved> {
+        let mut pending = self.proposals().map_err(Unresolved::Failed)?;
+        pending.retain(|entry| approve && entry.name == name);
+        for entry in &mut pending {
+            entry.status = LearnedStatus::Active;
+            let added = self.activation.add_pool(entry).await;
+            added.map_err(Unresolved::Failed)?;
         }
+        Ok(pending)
     }
 }
 
@@ -118,7 +134,7 @@ impl Review for Reviewer {
     }
 
     async fn mark(&self, mark: Mark) -> anyhow::Result<()> {
-        check(&mark, &self.names)?;
+        check(&mark, &self.intents())?;
         let id = mark.interaction;
         if self.log.get(id).await?.is_none() {
             anyhow::bail!("no interaction has the ID {id}");
@@ -127,44 +143,51 @@ impl Review for Reviewer {
     }
 
     fn intents(&self) -> Vec<String> {
-        self.names.clone()
+        catalog::labels(&self.activation.catalog.load())
     }
 
     fn proposals(&self) -> anyhow::Result<Vec<LearnedIntent>> {
-        Ok(pending(self.learned.load()?.unwrap_or_default()))
+        Ok(pending(self.activation.store.load()?.unwrap_or_default()))
     }
 
     async fn resolve(&self, name: &str, approve: bool) -> Result<(), Unresolved> {
-        let (sender, receiver) = oneshot::channel();
-        let (store, name) = (Arc::clone(&self.learned), name.to_owned());
-        let change: Change = Box::new(move |pools| {
-            // The web request can end before the change runs.
-            let _ = sender.send(resolve_saved(store.as_ref(), &name, approve));
-            pools
-        });
-        let stopped = || Unresolved::Failed(anyhow::anyhow!("the pools task stopped"));
-        self.changes.send(change).map_err(|_| stopped())?;
-        receiver.await.map_err(|_| stopped())?
+        let approved = self.prepared(name, approve).await?;
+        let name = name.to_owned();
+        self.run(move |store| resolve_saved(store, &name, approve))
+            .await??;
+        for entry in approved {
+            self.activation.activate(entry).await;
+        }
+        // After the activation changes, `intents` has the approved entry.
+        self.run(|_| ()).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::mpsc;
     use std::thread;
 
+    use arc_swap::ArcSwap;
     use jiff::Timestamp;
+    use tokio::sync::watch;
 
     use super::*;
+    use crate::app::speech::Speech;
+    use crate::domain::catalog::Catalog;
     use crate::domain::feedback::Action;
     use crate::domain::feedback::Route;
     use crate::domain::feedback::Value;
     use crate::domain::learn;
     use crate::domain::learn::Cluster;
     use crate::domain::responses::Pools;
+    use crate::domain::state_cache::StateCache;
     use crate::testing::fakes;
+    use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeLog;
     use crate::testing::fakes::FakeStore;
+    use crate::testing::fakes::FakeTts;
 
     /// The target of the action of each interaction.
     const OFFICE: &str = "media_player.office";
@@ -199,6 +222,19 @@ mod tests {
         toml::from_str(include_str!("../../intents.toml")).expect("intents.toml is a catalog")
     }
 
+    /// The activation of `store` on `changes` with the catalog of `intents.toml`, `FakeTts` and
+    /// the reference house.
+    fn activation(store: Arc<dyn Store<Learned>>, changes: mpsc::Sender<Change>) -> Activation {
+        Activation {
+            store,
+            changes,
+            speech: Arc::new(Speech::new(Arc::new(FakeTts::default()))),
+            cache: watch::channel(StateCache::load(fakes::house())).1,
+            catalog: Arc::new(ArcSwap::from_pointee(catalog())),
+            clock: Arc::new(FakeClock(Timestamp::UNIX_EPOCH)),
+        }
+    }
+
     /// The review of a log with the request "turn on the tv" (1) and its dialog answer "the
     /// office" (2), and the log.
     fn review() -> (Reviewer, Arc<FakeLog>) {
@@ -211,14 +247,14 @@ mod tests {
             ..FakeLog::default()
         });
         let (learned, changes) = (Arc::new(FakeStore::new(None)), mpsc::channel().0);
-        let review = Reviewer::new(Arc::clone(&log) as _, &catalog(), learned, changes);
+        let review = Reviewer::new(Arc::clone(&log) as _, activation(learned, changes));
         (review, log)
     }
 
-    /// The learned entries and the proposals of a review after the resolve of its `pending` entry
-    /// `good_night` with `approve`. A thread runs each change in place of the pools task.
-    async fn resolved(approve: bool) -> anyhow::Result<(Learned, Vec<LearnedIntent>)> {
-        let intents = vec![fakes::learned("good_night", LearnedStatus::Pending)];
+    /// The review of a file with the entry `entry`, and the file. A thread runs each change in
+    /// place of the pools task.
+    fn reviewing(entry: LearnedIntent) -> (Reviewer, Arc<FakeStore<Learned>>) {
+        let intents = vec![entry];
         let store = Arc::new(FakeStore::new(Some(Learned { intents })));
         let (changes, receiver) = mpsc::channel::<Change>();
         thread::spawn(move || {
@@ -227,11 +263,19 @@ mod tests {
             }
         });
         let log = Arc::new(FakeLog::default());
-        let review = Reviewer::new(log, &catalog(), Arc::clone(&store) as _, changes);
+        let review = Reviewer::new(log, activation(Arc::clone(&store) as _, changes));
+        (review, store)
+    }
+
+    /// The learned entries, the proposals and the intents of a review after the resolve of its
+    /// `pending` entry `good_night` with `approve`.
+    async fn resolved(approve: bool) -> anyhow::Result<(Learned, Vec<LearnedIntent>, Vec<String>)> {
+        let (review, store) = reviewing(fakes::learned("good_night", LearnedStatus::Pending));
         assert_eq!(review.proposals()?.len(), 1, "good_night is pending");
         let result = review.resolve("good_night", approve).await;
         assert!(result.is_ok(), "the resolve gave {result:?}");
-        Ok((store.load()?.unwrap_or_default(), review.proposals()?))
+        let learned = store.load()?.unwrap_or_default();
+        Ok((learned, review.proposals()?, review.intents()))
     }
 
     /// The mark `value` with `correction` on the dialog answer.
@@ -306,7 +350,7 @@ mod tests {
     /// AC-14.6-2.
     #[tokio::test]
     async fn ac_14_6_2_approve_makes_the_entry_active() -> anyhow::Result<()> {
-        let (learned, proposals) = resolved(true).await?;
+        let (learned, proposals, _) = resolved(true).await?;
         assert_eq!(learned.intents[0].status, LearnedStatus::Active);
         assert_eq!(proposals, []);
         Ok(())
@@ -316,7 +360,7 @@ mod tests {
     /// check (P-14.5b-4).
     #[tokio::test]
     async fn ac_14_6_3_reject_makes_the_entry_rejected_and_covering() -> anyhow::Result<()> {
-        let (learned, proposals) = resolved(false).await?;
+        let (learned, proposals, _) = resolved(false).await?;
         assert_eq!(learned.intents[0].status, LearnedStatus::Rejected);
         assert_eq!(proposals, []);
         let cluster = Cluster {
@@ -326,6 +370,26 @@ mod tests {
         };
         let covering = learn::covering(&cluster, &learned.intents, 0.1);
         assert_eq!(covering, Some("good_night"));
+        Ok(())
+    }
+
+    /// AC-14.7b-3.
+    #[tokio::test]
+    async fn ac_14_7b_3_approved_entry_is_an_intent() -> anyhow::Result<()> {
+        let (_, _, intents) = resolved(true).await?;
+        assert!(intents.contains(&"good_night".to_owned()), "{intents:?}");
+        Ok(())
+    }
+
+    /// An approve whose pre-render fails gives an error, and the entry stays `pending`.
+    #[tokio::test]
+    async fn failed_activation_keeps_the_entry_pending() -> anyhow::Result<()> {
+        let mut entry = fakes::learned("good_night", LearnedStatus::Pending);
+        entry.responses = vec!["{{ broken".to_owned()];
+        let (review, _) = reviewing(entry);
+        let result = review.resolve("good_night", true).await;
+        assert!(result.is_err(), "the resolve gave {result:?}");
+        assert_eq!(review.proposals()?.len(), 1, "good_night is pending");
         Ok(())
     }
 }

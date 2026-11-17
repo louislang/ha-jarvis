@@ -1824,7 +1824,7 @@ async fn start_app_with(
     extras: Extras,
 ) -> anyhow::Result<Started> {
     let (cache, queues, task, habits) = start_tasks(&home, config, pools)?;
-    let (models, listener, speech, (recorder, logged)) = load_models(
+    let (models, listener, activation, (recorder, logged)) = load_models(
         config,
         &reasoner,
         &queues,
@@ -1834,22 +1834,22 @@ async fn start_app_with(
         (extras, (task.changes.clone(), habits.habits.clone())),
     )
     .await?;
-    let prerender = start_prerender(&speech, &task.pools, &cache);
+    let prerender = start_prerender(&activation.speech, &task.pools, &cache);
     Ok((
         App {
             conversation: Conversation::new(
                 task.pools,
-                backfill(config, &reasoner, task.changes, &speech, &catalog, cache),
+                backfill(config, &reasoner, &activation),
                 queues,
                 Arc::clone(models.classifier()),
-                catalog,
+                Arc::clone(&activation.catalog),
                 config.model.threshold,
                 system_two,
                 habits.habits.clone(),
                 recorder,
             ),
             listener,
-            speech,
+            speech: activation.speech,
         },
         (task.task, habits, logged),
         prerender,
@@ -1858,7 +1858,7 @@ async fn start_app_with(
 }
 
 /// The recorder of the utterances of `listener` on the log of `config` with the training trigger,
-/// its log writer task, the review of the log with the intent names of `catalog`, and the receiver
+/// its log writer task, the review of the log with the activation of `checks`, and the receiver
 /// of the error text of a failed `restore`. Starts the training trigger on the log with
 /// `reasoner`, `catalog`, the hot cache `cache`, the `RunPod` trainer of `checks`, the house
 /// `home` and the live models `models`, and the learned intent check of [`start_checks`] with the
@@ -1897,7 +1897,7 @@ fn start_log(
 /// Starts the training trigger `trigger` each `train.check_interval_s`, and the learned intent
 /// check of `config` on `log` with `reasoner`, `catalog`, the activation and the request habits
 /// of `learn` and the plugin tools `tools` each `learn.check_interval_s`. Gives both tasks, and the
-/// review of `log` with the intent names of `catalog` and the learned intents file of the check.
+/// review of `log` with the activation of the check.
 fn start_checks(
     config: &Config,
     trigger: Arc<Trigger>,
@@ -1905,12 +1905,7 @@ fn start_checks(
     (reasoner, catalog): (&Arc<dyn Reasoner>, &Arc<Catalog>),
     ((activation, habits), tools): ((Activation, Arc<Habits>), Vec<Tool>),
 ) -> Checked {
-    let review = Reviewer::new(
-        Arc::clone(&log),
-        catalog,
-        Arc::clone(&activation.store),
-        activation.changes.clone(),
-    );
+    let review = Reviewer::new(Arc::clone(&log), activation.clone());
     let learning = Learning {
         config: config.learn.clone(),
         log,
@@ -2100,39 +2095,36 @@ fn learned(
     Ok((Arc::new(ArcSwap::from_pointee(live)), pools))
 }
 
-/// The speech use case on `tts`, and `checks` with the activation of `learn.file` of `config` with
-/// the speech use case, the hot cache `cache` and the system time. Fails when the path of
+/// The activation, alone and in `checks`, of `learn.file` of `config` with the speech use case on
+/// `tts`, the hot cache `cache` and the system time. Fails when the path of
 /// `learn.file` is not a `.toml` or `.json` file.
 fn activation(
     config: &Config,
     ((runpod, (tools, catalog)), (changes, habits)): Checks,
     tts: Arc<dyn TextToSpeech>,
     cache: &watch::Receiver<StateCache>,
-) -> anyhow::Result<(Arc<Speech>, Activated)> {
-    let speech = Arc::new(Speech::new(tts));
+) -> anyhow::Result<(Activation, Activated)> {
     let activation = Activation {
         store: Arc::new(FileStore::try_new(config.learn.file.clone())?),
         changes,
-        speech: Arc::clone(&speech),
+        speech: Arc::new(Speech::new(tts)),
         cache: cache.clone(),
         catalog,
         clock: Arc::new(SystemClock),
     };
-    Ok((speech, ((runpod, tools), (activation, habits))))
+    Ok((activation.clone(), ((runpod, tools), (activation, habits))))
 }
 
-/// The backfill of `config` with `reasoner`, the pools task of `changes`, the pre-render of
-/// `speech`, `catalog` and the hot cache `cache`.
+/// The backfill of `config` with `reasoner`, and the pools task, the pre-render, the live catalog
+/// and the hot cache of `activation`.
 fn backfill(
     config: &Config,
     reasoner: &Arc<dyn Reasoner>,
-    changes: mpsc::Sender<Change>,
-    speech: &Arc<Speech>,
-    catalog: &Arc<Catalog>,
-    cache: watch::Receiver<StateCache>,
+    activation: &Activation,
 ) -> Arc<Backfill> {
-    let (reasoner, speech) = (Arc::clone(reasoner), Arc::clone(speech));
-    let (backfill, catalog) = (config.backfill.clone(), Arc::clone(catalog));
+    let (reasoner, speech) = (Arc::clone(reasoner), Arc::clone(&activation.speech));
+    let (changes, catalog) = (activation.changes.clone(), Arc::clone(&activation.catalog));
+    let (backfill, cache) = (config.backfill.clone(), activation.cache.clone());
     Arc::new(Backfill::new(
         backfill, reasoner, changes, speech, catalog, cache,
     ))
@@ -2153,7 +2145,7 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
 }
 
 /// The live models of `config`, then the listener on their STT, which predicts with their System
-/// One model, sees the dialogs of `queues` and warms `reasoner`, the speech use case on their TTS,
+/// One model, sees the dialogs of `queues` and warms `reasoner`, the [`activation`] on their TTS,
 /// and the recorder of [`start_log`]. Starts the hotword refresh of the STT with `home`, `cache`
 /// and `catalog`, and the training trigger and the learned intent check with `checks`, `home`,
 /// the live models and the [`activation`].
@@ -2169,11 +2161,11 @@ async fn load_models(
     cache: &watch::Receiver<StateCache>,
     catalog: &Arc<Catalog>,
     checks: Checks,
-) -> anyhow::Result<(Arc<LiveModels>, Listener, Arc<Speech>, (Recorder, Logged))> {
+) -> anyhow::Result<(Arc<LiveModels>, Listener, Activation, (Recorder, Logged))> {
     let models = Arc::new(LiveModels::try_new(load(config)).await?);
     let live = models.live();
     let stt = Arc::clone(&live) as _;
-    let (speech, checks) = activation(config, checks, live, cache)?;
+    let (activation, checks) = activation(config, checks, live, cache)?;
     start_hotwords(config, &home, cache, catalog, Arc::clone(&stt));
     let classifier = Arc::clone(models.classifier()) as _;
     let listener = listener(config, stt, classifier, Arc::clone(reasoner), queues);
@@ -2186,7 +2178,7 @@ async fn load_models(
         checks,
         (home, Arc::clone(&models)),
     )?;
-    Ok((models, listener, speech, recorded))
+    Ok((models, listener, activation, recorded))
 }
 
 /// The load of [`load_sessions`] of `config`.
@@ -3169,22 +3161,40 @@ mod tests {
         utterances: Arc<Utterances>,
     ) -> anyhow::Result<Conversation> {
         let task = app::conversation::start_pools(pools(&catalog), Arc::new(FakeStore::new(None)))?;
-        let (catalog, cache) = (Arc::new(catalog), watch::channel(StateCache::default()).1);
+        let cache = watch::channel(StateCache::default()).1;
         let habits = Habits::new(RequestHabits::default(), 14.0, cache.clone());
         let reasoner: Arc<dyn Reasoner> = Arc::new(FakeReasoner::default());
-        let backfill = backfill(config, &reasoner, task.changes, speech, &catalog, cache);
+        let activation = activation_of(task.changes, speech, cache, catalog);
+        let backfill = backfill(config, &reasoner, &activation);
         let (queues, threshold) = (queues(config), config.model.threshold);
         Ok(Conversation::new(
             task.pools,
             backfill,
             queues,
             Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), classifier)),
-            catalog,
+            Arc::clone(&activation.catalog),
             threshold,
             two(config),
             Arc::new(habits),
             recorder(utterances),
         ))
+    }
+
+    /// An activation on `changes`, `speech`, `cache` and `catalog`, with an empty file.
+    fn activation_of(
+        changes: std::sync::mpsc::Sender<Change>,
+        speech: &Arc<Speech>,
+        cache: watch::Receiver<StateCache>,
+        catalog: Catalog,
+    ) -> Activation {
+        Activation {
+            store: Arc::new(FakeStore::new(None)),
+            changes,
+            speech: Arc::clone(speech),
+            cache,
+            catalog: Arc::new(ArcSwap::from_pointee(catalog)),
+            clock: Arc::new(FakeClock(Timestamp::UNIX_EPOCH)),
+        }
     }
 
     /// A recorder of `utterances` with no stored interactions and a log writer that has ended.
