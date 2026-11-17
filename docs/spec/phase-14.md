@@ -178,49 +178,92 @@ The checks of each kind run in the order above, the template checks last. The fi
 
 ---
 
-### 14.5 Learned Intent Lifecycle
+### 14.5 Learned Intent File
 
-**Goal:** Add the learned intent use case that implements `learned.qnt`: find uncovered clusters, ask for a proposal, validate it and save it to `learned.toml` with its status. New intents appear without manual work, and device control waits for approval.
+**Goal:** Add the status of a learned entry, the format of `learned.toml` and the status of a valid proposal. The check of sub-phase 14.5b can then save each entry with its lifecycle status, and no entry with a service becomes active without approval.
 
 - **Implements:** G14, G19. **Depends on:** 14.4.
-- **Files:** modify `src/domain/learn.rs`, `src/domain/catalog.rs`, `src/app/background.rs`, `src/adapters/openai.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `jarvis.toml`, `README.md` (learned intents, `CLAUDE.md` workflow item 15).
+- **Files:** modify `src/domain/learn.rs`, `src/domain/catalog.rs` (serde on `Target` and `Filter`), `src/adapters/openai.rs` (the new fields are not in a proposal).
 
-**Model.** Each `learn.check_interval_s`, the check reads `deferred(now - window_days)` (sub-phase 12.5b), calls `embed` on their texts, computes `clusters` and skips the clusters that `covering` names. For each other cluster, it calls `propose` with the cluster texts, the names of the catalog intents and of the learned entries, and the plugin tools. Then it calls `validate_proposal` with the tool names. A valid proposal gets the status `initial_status(proposal)`. An invalid proposal logs one `warn` event with the error and gets `status = none`, so the next check does not ask again. Each entry has the cluster `texts` and `centroid`. An error of `deferred`, `embed` or `propose` logs one `warn` event and ends the check. The next check tries again. This sub-phase adds `learn.file` and `learn.check_interval_s`.
+**Model.**
 
 - `LearnedIntent` gets `status` (`pending`, `active`, `rejected`, `none` or `requested`), `texts` (the cluster texts) and `request_file` (the path of the plugin request file, sub-phase 14.13). `propose` (sub-phase 14.4) gives `status = none`, no texts and no `request_file`.
-- `initial_status(proposal) -> LearnedStatus` in `src/domain/learn.rs`: `requested` if the kind is `new_plugin` (sub-phase 14.13), `none` if the kind is `none`, else `pending` if `needs_approval`, else `active`.
-- `learned.toml` has one `[[intents]]` table for each entry, in file order (`Learned { intents }`). A missing file is an empty list. `LearnedIntent`, `LearnedKind`, `LearnedStatus`, `Target` and `Filter` derive the serde traits.
-- The pools task (sub-phase 4.8) owns the `learned.toml` writes too. For each entry, the check sends one change to the pools task. The change loads `learned.toml`, adds the entry, saves the file and returns the pools unchanged. A failed load or save logs one `warn` event. The check also adds each entry to its own list of entries, so the name check of `validate_proposal` for a later cluster of the same check sees it.
+- `initial_status(proposal) -> LearnedStatus`: `requested` if the kind is `new_plugin` (sub-phase 14.13), `none` if the kind is `none`, else `pending` if `needs_approval`, else `active`.
+- `learned.toml` has one `[[intents]]` table for each entry, in file order (`Learned { intents }`). A missing file is an empty list. `LearnedIntent`, `LearnedKind`, `LearnedStatus`, `Learned`, `Target` and `Filter` derive the serde traits.
 
 **Acceptance criteria.**
 
-- AC-14.5-1: When `FakeLog` has a cluster that is not covered, `FakeReasoner` records one `propose` call with the cluster texts.
-- AC-14.5-2: When the proposal has no service, `learned.toml` has an `active` entry.
-- AC-14.5-3: When the proposal has a service, `learned.toml` has a `pending` entry.
-- AC-14.5-4: When the proposal is `none`, `learned.toml` has a `none` entry, and the next check does not propose that cluster.
-- AC-14.5-5: When the proposal is not valid, Jarvis logs the error and saves a `none` entry, and the next check does not propose that cluster.
-- AC-14.5-9: When the proposal is a valid `new_plugin`, `learned.toml` has a `requested` entry with `needs` and no `request_file`.
+- AC-14.5-10: When the proposal is `new_plugin`, `initial_status` returns `requested`. When it is `none`, it returns `none`. For another kind, it returns `pending` with a service and `active` without one.
+- AC-14.5-11: When a `Learned` with two entries is written as TOML and read again, the result is equal to it, and the text has one `[[intents]]` table for each entry.
 
-AC-14.5-6 moves to sub-phase 14.5b as AC-14.5b-1. AC-14.5-7 and AC-14.5-8 move to sub-phase 14.5c as AC-14.5c-1 and AC-14.5c-2.
+AC-14.5-1 to AC-14.5-5 and AC-14.5-9 move to sub-phase 14.5b as AC-14.5b-1 to AC-14.5b-6. AC-14.5-6 moves to sub-phase 14.5d as AC-14.5d-1. AC-14.5-7 and AC-14.5-8 move to sub-phase 14.5e as AC-14.5e-1 and AC-14.5e-2.
 
 **Proofs.**
 
-- P-14.5-2, P-14.5-3, P-14.5-9. Ensures: `initial_status(p)` is `requested` if `p.kind` is `new_plugin`, `none` if `p.kind` is `none`, else `pending` if `p` has a service, else `active`. Thus no entry with a service becomes `active` without approval (`ServiceNeedsApproval`). Argument: `initial_status` is one `match` on the kind, and the other arm is `if needs_approval { pending } else { active }` (P-14.2-4).
-- P-14.5-4. Requires: `NoReproposal`. Argument: the saved entry has the cluster centroid, so `covering` names it at the next check (P-14.1-3).
-- P-14.5-5. Requires: `NoReproposal`. Argument: the `Err` branch of `validate_proposal` saves the `none` entry with the centroid, so `covering` names it at the next check.
-- P-14.5-1. Evidence: test.
+- P-14.5-10. Ensures: `initial_status(p)` is `requested` if `p.kind` is `new_plugin`, `none` if `p.kind` is `none`, else `pending` if `p` has a service, else `active`. Thus no entry with a service gets `active` from a proposal (`ServiceNeedsApproval`). Argument: `initial_status` is one `match` on the kind, and the other arm is `if needs_approval { pending } else { active }` (P-14.2-4).
+- P-14.5-11. Evidence: test (the `serde` and `toml` crates).
 
 ---
 
-### 14.5b Learned Intent Conformance
+### 14.5b Learned Intent Check
+
+**Goal:** Add the learned intent check that implements `propose` of `learned.qnt`: find uncovered clusters, ask for a proposal, validate it and save it to `learned.toml` with its status. New intents appear without manual work, and device control waits for approval.
+
+- **Implements:** G14, G19. **Depends on:** 14.5.
+- **Files:** modify `src/app/background.rs`, `src/testing/fakes.rs`.
+
+**Model.** The check reads `deferred(now - window_days)` (sub-phase 12.5b), calls `embed` on their texts, computes `clusters` and skips the clusters that `covering` names. For each other cluster, it calls `propose` with the cluster texts, the names of the catalog intents and of the learned entries, and the plugin tools. Then it calls `validate_proposal` with the tool names. A valid proposal gets the status `initial_status(proposal)` (sub-phase 14.5). An invalid proposal logs one `warn` event with the error and gets `status = none`, so the next check does not ask again. Each entry has the cluster `texts` and `centroid`. An error of `deferred`, `embed` or `propose` logs one `warn` event and ends the check. The next check tries again.
+
+- The pools task (sub-phase 4.8) owns the `learned.toml` writes too. For each entry, the check sends one change to the pools task. The change loads `learned.toml`, adds the entry, saves the file and returns the pools unchanged. A failed load or save logs one `warn` event. The check also adds each entry to its own list of entries, so the name check of `validate_proposal` for a later cluster of the same check sees it.
+- `FakeReasoner` gives the scripted embedding of each text, records the texts of each `propose` call and gives the scripted proposals in order. `FakeLog::defer` adds a spoken request that System Two answered.
+
+**Acceptance criteria.**
+
+- AC-14.5b-1: When `FakeLog` has a cluster that is not covered, `FakeReasoner` records one `propose` call with the cluster texts.
+- AC-14.5b-2: When the proposal has no service, `learned.toml` has an `active` entry.
+- AC-14.5b-3: When the proposal has a service, `learned.toml` has a `pending` entry.
+- AC-14.5b-4: When the proposal is `none`, `learned.toml` has a `none` entry, and the next check does not propose that cluster.
+- AC-14.5b-5: When the proposal is not valid, Jarvis logs the error and saves a `none` entry, and the next check does not propose that cluster.
+- AC-14.5b-6: When the proposal is a valid `new_plugin`, `learned.toml` has a `requested` entry with `needs` and no `request_file`.
+
+**Proofs.**
+
+- P-14.5b-2, P-14.5b-3, P-14.5b-6. Requires: `ServiceNeedsApproval`. Argument: the status of a valid proposal is `initial_status` (P-14.5-10).
+- P-14.5b-4. Requires: `NoReproposal`. Argument: the saved entry has the cluster centroid, so `covering` names it at the next check (P-14.1-3).
+- P-14.5b-5. Requires: `NoReproposal`. Argument: the `Err` branch of `validate_proposal` saves the `none` entry with the centroid, so `covering` names it at the next check.
+- P-14.5b-1. Evidence: test.
+
+---
+
+### 14.5c Learned Intent Start
+
+**Goal:** Start the learned intent check with Jarvis and stop it at shutdown. Jarvis looks for new learned intents each `learn.check_interval_s`.
+
+- **Implements:** G14. **Depends on:** 14.5b.
+- **Files:** modify `src/app/background.rs`, `src/lib.rs`, `jarvis.toml`, `README.md` (learned intents, `CLAUDE.md` workflow item 15).
+
+**Model.** `start_learning(learning, interval)` starts a task that runs the check of sub-phase 14.5b at once and each `interval`. `run` starts it next to the training trigger, with the interaction log, System Two, the catalog, the plugin tools, the file store of `learn.file`, the pools task and the system clock. The task holds a sender of the pools task, so the shutdown aborts it together with the training trigger task, before it waits for the pools task. `start_app` keeps its parameters. This sub-phase adds `learn.file` and `learn.check_interval_s`.
+
+**Acceptance criteria.**
+
+- AC-14.5c-1: When the check task starts with a cluster that is not covered, `FakeReasoner` records one `propose` call before virtual time advances, and a second one after `learn.check_interval_s`.
+- AC-14.5c-2: When `jarvis.toml` is loaded, `learn.file` is `learned.toml` and `learn.check_interval_s` is 3600.
+
+**Proofs.**
+
+- P-14.5c-1, P-14.5c-2. Evidence: test.
+
+---
+
+### 14.5d Learned Intent Conformance
 
 **Goal:** Replay the traces of `learned.qnt` against the learned intent check. The statuses that Jarvis saves follow the lifecycle that the model proves.
 
-- **Implements:** G19. **Depends on:** 14.5.
+- **Implements:** G19. **Depends on:** 14.5c.
 - **Files:** modify `src/app/background.rs`.
 - **Quint:** `learned.qnt` (conformance).
 
-**Model.** The driver is in the test block of `src/app/background.rs`. It replays the actions of `learned.qnt` against the check of sub-phase 14.5, with `FakeLog`, `FakeReasoner` and a `learned.toml` in a temporary folder:
+**Model.** The driver is in the test block of `src/app/background.rs`. It replays the actions of `learned.qnt` against the check of sub-phase 14.5b, with `FakeLog`, `FakeReasoner` and a `learned.toml` in a temporary folder:
 
 - `init` takes `HAS_SERVICE` and `NEEDS_PLUGIN` from the nondet picks of `init`.
 - `propose(c, suitable)` adds `min_cluster` close requests of `c` to `FakeLog`, gives `FakeReasoner` one proposal with the name `c`, and runs one check. The proposal is `none` when `suitable` is false. Else it is a valid `new_plugin` with `NEEDS_PLUGIN[c]`, else a valid command with a service with `HAS_SERVICE[c]`, else a valid command without a service. The requests of the earlier clusters stay in `FakeLog`, so each check also skips the covered clusters.
@@ -230,32 +273,32 @@ AC-14.5-6 moves to sub-phase 14.5b as AC-14.5b-1. AC-14.5-7 and AC-14.5-8 move t
 
 **Acceptance criteria.**
 
-- AC-14.5b-1: When `quint-connect` replays 100 traces of `learned.qnt`, the statuses in `learned.toml` match the model after each step.
+- AC-14.5d-1: When `quint-connect` replays 100 traces of `learned.qnt`, the statuses in `learned.toml` match the model after each step.
 
 **Proofs.**
 
-- P-14.5b-1. Evidence: test.
+- P-14.5d-1. Evidence: test.
 
 ---
 
-### 14.5c Cluster Request Habits
+### 14.5e Cluster Request Habits
 
 **Goal:** Record the request habits of the requests that System Two answers. A learned entry has its usual times before it becomes an intent.
 
-- **Implements:** G11, G14. **Depends on:** 14.5b.
+- **Implements:** G11, G14. **Depends on:** 14.5d.
 - **Files:** modify `src/app/background.rs`, `src/lib.rs`.
 
-**Model.** The check of sub-phase 14.5 also records the request habits of System Two requests (sub-phase 11.4 counts only the requests that System One acts on). The request key of a cluster is the name of its covering entry, or the name of the entry that this check saves for it. When that entry is `pending`, `active` or `requested`, the check observes each time of the cluster under that key, in time order (sub-phase 11.3). A `none` or `rejected` entry records nothing, because its name can be invalid or never become an intent. Each day counts once for each key and bucket, so the next check, which sees the same times again, changes nothing. When the entry later becomes an intent with the same name, the requests that System One acts on continue the same key.
+**Model.** The check of sub-phase 14.5b also records the request habits of System Two requests (sub-phase 11.4 counts only the requests that System One acts on). The request key of a cluster is the name of its covering entry, or the name of the entry that this check saves for it. When that entry is `pending`, `active` or `requested`, the check observes each time of the cluster under that key, in time order (sub-phase 11.3). A `none` or `rejected` entry records nothing, because its name can be invalid or never become an intent. Each day counts once for each key and bucket, so the next check, which sees the same times again, changes nothing. When the entry later becomes an intent with the same name, the requests that System One acts on continue the same key.
 
 **Acceptance criteria.**
 
-- AC-14.5c-1: When a cluster that the entry `family_calendar` covers has requests at 07:10 on Monday, Tuesday and Wednesday, `usual_times` of `family_calendar` returns `[(weekdays, 7)]` after the check.
-- AC-14.5c-2: When the next check finds the same cluster with the same times, the habit model does not change.
+- AC-14.5e-1: When a cluster that the entry `family_calendar` covers has requests at 07:10 on Monday, Tuesday and Wednesday, `usual_times` of `family_calendar` returns `[(weekdays, 7)]` after the check.
+- AC-14.5e-2: When the next check finds the same cluster with the same times, the habit model does not change.
 
 **Proofs.**
 
-- P-14.5c-2. Argument: each time of the cluster has a date on or before the `last` of its key and bucket, so each `observe` returns the model unchanged (P-11.3-2).
-- P-14.5c-1. Evidence: test.
+- P-14.5e-2. Argument: each time of the cluster has a date on or before the `last` of its key and bucket, so each `observe` returns the model unchanged (P-11.3-2).
+- P-14.5e-1. Evidence: test.
 
 ---
 
@@ -263,7 +306,7 @@ AC-14.5-6 moves to sub-phase 14.5b as AC-14.5b-1. AC-14.5-7 and AC-14.5-8 move t
 
 **Goal:** Add the pending proposals to the `Review` port, the web API and the page of the Jarvis tab, with approve and reject. You decide which device-control intents Jarvis may learn.
 
-- **Implements:** G14. **Depends on:** 14.5c.
+- **Implements:** G14. **Depends on:** 14.5e.
 - **Files:** modify `src/ports.rs`, `src/app/review.rs`, `src/adapters/web.rs`, `src/adapters/review.html`, `src/testing/fakes.rs`.
 
 **Model.** `Review::proposals() -> Vec<LearnedIntent>` (status `pending`). `Review::resolve(name, approve)`: `pending` to `active` or `rejected`. Any other status gives an error. API: `GET api/proposals`, `POST api/proposals/{name}` with `{ "approve": true | false }`.
@@ -291,7 +334,7 @@ AC-14.5-6 moves to sub-phase 14.5b as AC-14.5b-1. AC-14.5-7 and AC-14.5-8 move t
 - **Implements:** G1, G14, G16. **Depends on:** 14.6.
 - **Files:** modify `src/app/background.rs`, `src/app/speech.rs`, `src/app/training.rs`.
 
-**Model.** On activation, in this order: save the pool through the pools task, pre-render it, add the intent to the live catalog (an `ArcSwap<Catalog>` of `intents.toml` and the active learned intents), then set and save `activated := now` (so `changes` counts it once, sub-phase 14.11). Each step before `activated` is idempotent. At startup, each `active` entry without `activated` runs activation again. Thus a crash never adds a duplicate. `Review::intents` now also returns the active learned intent names. The request habits of the entry already have its name as their key (sub-phase 14.5c), so activation does not change them.
+**Model.** On activation, in this order: save the pool through the pools task, pre-render it, add the intent to the live catalog (an `ArcSwap<Catalog>` of `intents.toml` and the active learned intents), then set and save `activated := now` (so `changes` counts it once, sub-phase 14.11). Each step before `activated` is idempotent. At startup, each `active` entry without `activated` runs activation again. Thus a crash never adds a duplicate. `Review::intents` now also returns the active learned intent names. The request habits of the entry already have its name as their key (sub-phase 14.5e), so activation does not change them.
 
 **Acceptance criteria.**
 
@@ -519,7 +562,7 @@ AC-14.5-6 moves to sub-phase 14.5b as AC-14.5b-1. AC-14.5-7 and AC-14.5-8 move t
 
 **Model.**
 
-- Sub-phase 14.5 saves a valid `new_plugin` proposal with `status = requested` and no `request_file`. The request habits of the cluster have the entry name as their key (sub-phase 14.5c).
+- Sub-phase 14.5b saves a valid `new_plugin` proposal with `status = requested` and no `request_file`. The request habits of the cluster have the entry name as their key (sub-phase 14.5e).
 - After each check and at startup, for each `requested` entry without `request_file`, the use case builds `plugin_request(entry, usual)` with the usual times of the entry name, calls `PluginRequests::write`, and saves `request_file := path` in the entry. An error logs one `warn` event, and the next check tries again. Without a `PluginRequests` adapter, the entries wait. When you set `learn.plugin_requests` later, the next start writes them.
 - `plugin_request(entry, usual) -> PluginRequest` is a pure function:
   - `name` is the entry name.
