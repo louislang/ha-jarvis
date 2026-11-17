@@ -46,7 +46,7 @@ This phase makes System Two teach System One. Jarvis clusters frequent requests 
 - AC-14.2-8: When a `fetch` intent of the catalog has no `fresh_min`, or a `command` intent has one, `validate_catalog` returns an error that names the intent and `fresh_min`.
 - AC-14.2-9: When `intents.toml` is loaded, `weather` has `fresh_min = 30`, `new_shows` has `fresh_min = 60`, and the catalog is valid.
 
-AC-14.2-1 to AC-14.2-3, AC-14.2-5 to AC-14.2-7 and AC-14.2-10 move to sub-phase 14.2b as AC-14.2b-1 to AC-14.2b-7.
+AC-14.2-1 to AC-14.2-3 move to sub-phase 14.2b as AC-14.2b-1 to AC-14.2b-3. AC-14.2-5 to AC-14.2-7 and AC-14.2-10 move to sub-phase 14.2c as AC-14.2c-1 to AC-14.2c-4.
 
 **Proofs.**
 
@@ -58,21 +58,18 @@ AC-14.2-1 to AC-14.2-3, AC-14.2-5 to AC-14.2-7 and AC-14.2-10 move to sub-phase 
 
 ### 14.2b Proposal Validation
 
-**Goal:** Add `validate_proposal`. A proposal is used only when it is well formed.
+**Goal:** Add `validate_proposal` with the checks that all kinds of proposal share. A proposal is used only when its name, examples and responses are well formed.
 
 - **Implements:** G14. **Depends on:** 14.2.
 - **Files:** modify `src/domain/learn.rs`.
 
 **Model.** `LearnedIntent` gets the other fields of a proposal (sub-phase 14.4): `kind`, `examples`, `responses`, `plugin`, `target`, `entity`, `select`, `data`, `question`, `fresh_min` and `needs`. `kind` is `command`, `query`, `fetch`, `prefetch`, `new_plugin` or `none`. A proposal is a `LearnedIntent`.
 
-`validate_proposal(proposal, catalog, learned, plugins) -> Result<LearnedIntent>` returns the proposal when it is valid. `plugins` are the tool names of the plugin registry (sub-phase 17.1). The name is snake case (ASCII lowercase letters, digits and `_`, with a letter first), is not `unknown`, and is not the name of a catalog intent or of an entry of `learned`. There are `min_examples` examples or more, and each passes `validate_example` (sub-phase 13.5) with the slots of all the examples and no seeds. Each response parses and uses only the slots of the examples and the built-ins `area`, `entity`, `person` and `response` (`unknown_variable`, sub-phase 3.2). The kind decides the other fields:
+`validate_proposal(proposal, catalog, learned, plugins) -> Result<LearnedIntent>` returns the proposal when it is valid. `plugins` are the tool names of the plugin registry (sub-phase 17.1). Sub-phase 14.2c uses them. The checks:
 
-- `command`: `target` and `select` (or `entity`) are present. `service` is optional. The data templates use only the slots and the built-ins.
-- `query`: `select` is present, and `service` is absent.
-- `fetch`: `plugin` is one of `plugins`, `service` is absent, `fresh_min` is 1 or more, and each response uses `response` (decision 30).
-- `prefetch`: `question` is present, `service` is absent, `fresh_min` is 1 or more, and the examples have no slots.
-- `new_plugin`: `needs` is present and not empty, and `service`, `plugin` and `question` are absent. The responses are not checked, because the author of the plugin writes the pool (sub-phase 14.13).
-- `none`: no other check. The entry only marks the cluster as not suitable.
+- The name is snake case (ASCII lowercase letters, digits and `_`, with a letter first), is not `unknown`, and is not the name of a catalog intent or of an entry of `learned`.
+- There are `min_examples` examples or more, and each passes `validate_example` (sub-phase 13.5) with the slots of all the examples and no seeds.
+- Each response parses and uses only the slots of the examples and the built-ins `area`, `entity`, `person` and `response` (`unknown_variable`, sub-phase 3.2). The responses of a `new_plugin` proposal are not checked, because the author of the plugin writes the pool (sub-phase 14.13).
 
 The checks run in the order above, and the first failure is the error. The error names the field that fails. An example that fails `validate_example` gives its rejection.
 
@@ -81,14 +78,42 @@ The checks run in the order above, and the first failure is the error. The error
 - AC-14.2b-1: When a proposal has fewer than `min_examples` examples, `validate_proposal` returns an error.
 - AC-14.2b-2: When a proposal example has a markup error, `validate_proposal` returns an error.
 - AC-14.2b-3: When a proposal name equals an existing intent name or `unknown`, `validate_proposal` returns an error.
-- AC-14.2b-4: When a `fetch` proposal has no `plugin`, a `plugin` that is not in `plugins` or a `service`, or a `prefetch` proposal has a `service`, no `question` or a slot, `validate_proposal` returns an error that names the field.
-- AC-14.2b-5: When a `command` proposal has no `target`, `validate_proposal` returns an error.
-- AC-14.2b-6: When a `fetch` or `prefetch` proposal has no `fresh_min` or `fresh_min = 0`, `validate_proposal` returns an error that names `fresh_min`.
-- AC-14.2b-7: When a `new_plugin` proposal has no `needs`, an empty `needs`, a `service`, a `plugin` or a `question`, `validate_proposal` returns an error that names the field. With `needs` and none of the others, it returns `Ok`, also when a response uses `response`.
 
 **Proofs.**
 
-- P-14.2b-1 to P-14.2b-7. Ensures: `validate_proposal` returns `Ok` only when the name, the example count and the checks of its kind pass. The kind checks return `Ok` if and only if the fields of the kind pass, and else the first failure with the field. Argument: `validate_proposal` is a conjunction of checks that returns the first failure. The kind checks are one `match` on `kind`. The markup, text and template checks use `validate_example` (P-13.5-3 to P-13.5-7) and `unknown_variable` (the `minijinja` crate), so the tests are their evidence.
+- P-14.2b-1, P-14.2b-3. Ensures: `validate_proposal` returns `Ok` only when the example count is `min_examples` or more and the name is new and not `unknown`. Argument: `validate_proposal` is a conjunction of checks that returns the first failure. The name check compares the name with each name of the catalog and of `learned`.
+- P-14.2b-2. Argument: the example check uses `validate_example` (P-13.5-5). The tests are the evidence of the snake case, text and template checks (the `minijinja` crate).
+
+---
+
+### 14.2c Proposal Kinds
+
+**Goal:** Add the checks of each proposal kind to `validate_proposal`. A proposal has the fields that its kind needs, and no proposal can make a data source or a prefetch call an HA service.
+
+- **Implements:** G14. **Depends on:** 14.2b.
+- **Files:** modify `src/domain/learn.rs`.
+
+**Model.** After the checks of sub-phase 14.2b, the kind decides the other fields:
+
+- `command`: `target` and `select` (or `entity`) are present. `service` is optional. The data templates use only the slots and the built-ins.
+- `query`: `select` is present, and `service` is absent.
+- `fetch`: `plugin` is one of `plugins`, `service` is absent, `fresh_min` is 1 or more, and each response uses `response` (decision 30).
+- `prefetch`: `question` is present, `service` is absent, `fresh_min` is 1 or more, and the examples have no slots.
+- `new_plugin`: `needs` is present and not empty, and `service`, `plugin` and `question` are absent.
+- `none`: no other check. The entry only marks the cluster as not suitable.
+
+The checks of each kind run in the order above, the template checks last. The first failure is the error, and it names the field that fails.
+
+**Acceptance criteria.**
+
+- AC-14.2c-1: When a `fetch` proposal has no `plugin`, a `plugin` that is not in `plugins` or a `service`, or a `prefetch` proposal has a `service`, no `question` or a slot, `validate_proposal` returns an error that names the field.
+- AC-14.2c-2: When a `command` proposal has no `target`, `validate_proposal` returns an error.
+- AC-14.2c-3: When a `fetch` or `prefetch` proposal has no `fresh_min` or `fresh_min = 0`, `validate_proposal` returns an error that names `fresh_min`.
+- AC-14.2c-4: When a `new_plugin` proposal has no `needs`, an empty `needs`, a `service`, a `plugin` or a `question`, `validate_proposal` returns an error that names the field. With `needs` and none of the others, it returns `Ok`, also when a response uses `response`.
+
+**Proofs.**
+
+- P-14.2c-1 to P-14.2c-4. Ensures: `validate_proposal` returns `Ok` only when the checks of its kind pass. The kind checks return `Ok` if and only if the fields of the kind pass, and else the first failure with the field. Argument: the kind checks are one `match` on `kind`, and each arm is a conjunction of checks that returns the first failure. The template checks use `unknown_variable` (the `minijinja` crate), so the tests are their evidence.
 
 ---
 
@@ -96,7 +121,7 @@ The checks run in the order above, and the first failure is the error. The error
 
 **Goal:** Add `quint/learned.qnt`, the model of the proposal lifecycle. Prove that no intent with a service becomes active without approval, that a cluster is proposed only once, that each activation counts as exactly one change, and that a cluster gets at most one plugin request.
 
-- **Implements:** G14, G16, G19. **Depends on:** 14.2b.
+- **Implements:** G14, G16, G19. **Depends on:** 14.2c.
 - **Files:** create `quint/learned.qnt`.
 - **Quint:** `learned.qnt`.
 
@@ -310,7 +335,7 @@ The check also records the request habits of System Two requests (sub-phase 11.4
 - **Files:** modify `src/app/background.rs`, `src/app/conversation.rs`, `src/app/speech.rs`, `src/app/plugins.rs`, `src/lib.rs`, `jarvis.toml`.
 - **Quint:** `prefetch.qnt` (conformance).
 
-**Model.** Each minute, for each active prefetch intent with `refresh_due`, set its attempt time and call `answer` with the intent `question`. The question has the area of the most recent interaction of the intent, so System Two gets its entities. A `Call` step with a service in `learn.prefetch_services` runs, and its result goes back to System Two. Any other `Call` step discards the prefetch and makes no call. A `Plugin` step runs through the plugin registry, because a plugin only reads data (decision 30). It uses `Plugins::refresh(call, home)`: `fetch` of sub-phase 17.1 without the cache read. `refresh` always calls the plugin, and its result replaces the cache entry. Thus a prefetched answer never has plugin data older than the prefetch, also when `plugins.cache_s` is longer than `fresh_min`. Only a stream that ends with `Done` and no error forms the answer, which is pre-rendered, stored with its time, and replaces the old answer. A failed prefetch keeps the old answer. Prefetch intents have no slots (sub-phase 14.2b), so the intent and the area of the question are the full cache key. When the intent is predicted, a fresh answer with the area of the request is the reply. Else the request goes to System Two. This sub-phase adds `learn.prefetch_services`.
+**Model.** Each minute, for each active prefetch intent with `refresh_due`, set its attempt time and call `answer` with the intent `question`. The question has the area of the most recent interaction of the intent, so System Two gets its entities. A `Call` step with a service in `learn.prefetch_services` runs, and its result goes back to System Two. Any other `Call` step discards the prefetch and makes no call. A `Plugin` step runs through the plugin registry, because a plugin only reads data (decision 30). It uses `Plugins::refresh(call, home)`: `fetch` of sub-phase 17.1 without the cache read. `refresh` always calls the plugin, and its result replaces the cache entry. Thus a prefetched answer never has plugin data older than the prefetch, also when `plugins.cache_s` is longer than `fresh_min`. Only a stream that ends with `Done` and no error forms the answer, which is pre-rendered, stored with its time, and replaces the old answer. A failed prefetch keeps the old answer. Prefetch intents have no slots (sub-phase 14.2c), so the intent and the area of the question are the full cache key. When the intent is predicted, a fresh answer with the area of the request is the reply. Else the request goes to System Two. This sub-phase adds `learn.prefetch_services`.
 
 **Acceptance criteria.**
 
