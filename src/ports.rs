@@ -145,8 +145,7 @@ pub trait Reasoner: Send + Sync {
     /// The embedding of each of `texts`, in order.
     async fn embed(&self, texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>>;
 
-    /// A learned intent for the cluster of the requests `texts`, with a name unlike each of
-    /// `intents`, that can fetch with one of the plugin tools `tools`.
+    /// A learned intent for the requests `texts`, unlike `intents`, with the plugin tools `tools`.
     async fn propose(
         &self,
         texts: &[String],

@@ -161,8 +161,7 @@ const NEW_PLUGIN_RULE: &str = "If the requests need remote data that no plugin t
      is new_plugin, needs states that data in one line, and name is the name of the future fetch \
      intent, for example get_traffic.";
 
-/// The `propose` input: one new intent with `responses` responses for the requests `texts`, with
-/// a name unlike each of `intents`, and the plugin tools `tools`.
+/// The `propose` input: one new intent with `responses` responses for `texts`, unlike `intents`.
 fn propose_prompt(
     texts: &[String],
     intents: &[String],
@@ -170,10 +169,8 @@ fn propose_prompt(
     responses: usize,
 ) -> String {
     let texts: Vec<String> = texts.iter().map(|text| format!("- {text}\n")).collect();
-    let tools: Vec<String> = tools
-        .iter()
-        .map(|tool| format!("- {}: {}\n", tool.name, tool.description))
-        .collect();
+    let line = |tool: &ports::Tool| format!("- {}: {}\n", tool.name, tool.description);
+    let tools: Vec<String> = tools.iter().map(line).collect();
     format!(
         "Propose one new intent of the voice assistant Jarvis for these requests. The name is \
          snake case and differs from these intent names: {}. kind is command (reply and call the \
@@ -200,6 +197,20 @@ fn object(properties: &Value) -> Value {
         "required": required,
         "additionalProperties": false,
     })
+}
+
+/// True when `value` and its nested values have each required property of `schema`.
+fn complete(schema: &Value, value: &Value) -> bool {
+    match value {
+        Value::Object(object) => {
+            let required = schema["required"].as_array().into_iter().flatten();
+            let schemas = &schema["properties"];
+            let has = |key| matches!(object.get(key), Some(item) if complete(&schemas[key], item));
+            required.filter_map(Value::as_str).all(has)
+        }
+        Value::Array(items) => items.iter().all(|item| complete(&schema["items"], item)),
+        _ => true,
+    }
 }
 
 /// The structured output format `{ "<key>": [string] }`.
@@ -319,10 +330,6 @@ struct Pair {
 }
 
 /// The map of the `{ key, value }` pairs of `deserializer`.
-///
-/// # Errors
-///
-/// The input is not a list of pairs.
 fn pairs<'de, D: Deserializer<'de>>(deserializer: D) -> Result<BTreeMap<String, String>, D::Error> {
     let pairs: Vec<Pair> = Vec::deserialize(deserializer)?;
     let entries = pairs.into_iter().map(|pair| (pair.key, pair.value));
@@ -648,8 +655,7 @@ pub struct OpenAiReasoner {
 }
 
 impl OpenAiReasoner {
-    /// A reasoner of `config` with the `OpenAI` API key `key`, the plugin tools `plugins` and
-    /// `responses` responses for each proposal.
+    /// A reasoner of `config` with the API key `key`, the tools `plugins` and proposal `responses`.
     ///
     /// # Errors
     ///
@@ -664,8 +670,7 @@ impl OpenAiReasoner {
         Self::try_with_api(config, api, plugins, responses)
     }
 
-    /// A reasoner of `config` on the API of `api` with the plugin tools `plugins` and `responses`
-    /// responses for each proposal.
+    /// A reasoner of `config` on the API `api`, the tools `plugins` and proposal `responses`.
     ///
     /// # Errors
     ///
@@ -729,16 +734,17 @@ impl OpenAiReasoner {
         Ok(true)
     }
 
-    /// The output text of the structured output `format` of the input `prompt`.
+    /// The structured output `format` of the input `prompt`.
     ///
     /// # Errors
     ///
-    /// The request fails, or the response has no text.
+    /// The request fails, or the output is not JSON or misses a property of the schema.
     async fn structured(
         &self,
         format: ResponseFormatJsonSchema,
         prompt: String,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<Value> {
+        let schema = format.schema.clone();
         let request = CreateResponseArgs::default()
             .model(&self.model)
             .input(prompt)
@@ -747,7 +753,10 @@ impl OpenAiReasoner {
             .build()?;
         self.record_when_idle(Duration::ZERO)?;
         let response = self.create(request).await?;
-        response.output_text().context("the response has no text")
+        let text = response.output_text().context("the response has no text")?;
+        let value: Value = serde_json::from_str(&text)?;
+        anyhow::ensure!(complete(&schema, &value), "the output misses a property");
+        Ok(value)
     }
 
     /// The strings of the structured output `{ "<key>": [string] }` of the input `prompt`.
@@ -756,8 +765,8 @@ impl OpenAiReasoner {
     ///
     /// The request fails, or the output does not fit the format.
     async fn strings(&self, key: &str, prompt: String) -> anyhow::Result<Vec<String>> {
-        let text = self.structured(strings_format(key), prompt).await?;
-        let mut object: Map<String, Value> = serde_json::from_str(&text)?;
+        let output = self.structured(strings_format(key), prompt).await?;
+        let mut object: Map<String, Value> = serde_json::from_value(output)?;
         let strings = object.remove(key).context("the output has no strings")?;
         anyhow::ensure!(object.is_empty(), "the output has other fields: {object:?}");
         Ok(serde_json::from_value(strings)?)
@@ -879,8 +888,8 @@ impl Reasoner for OpenAiReasoner {
         tools: &[ports::Tool],
     ) -> anyhow::Result<LearnedIntent> {
         let prompt = propose_prompt(texts, intents, tools, self.responses);
-        let text = self.structured(proposal_format(), prompt).await?;
-        let proposal: Proposed = serde_json::from_str(&text)?;
+        let output = self.structured(proposal_format(), prompt).await?;
+        let proposal: Proposed = serde_json::from_value(output)?;
         Ok(proposal.0)
     }
 }
@@ -1723,8 +1732,7 @@ mod tests {
     /// and the body of the request.
     async fn proposed(text: &str) -> anyhow::Result<(anyhow::Result<LearnedIntent>, Value)> {
         let (server, reasoner) = structured("completed", text).await?;
-        let texts = ["movie time".to_owned()];
-        let result = reasoner.propose(&texts, &[], &[]).await;
+        let result = reasoner.propose(&["movie time".to_owned()], &[], &[]).await;
         let requests = server.received_requests().await.context("no requests")?;
         Ok((result, requests[0].body_json()?))
     }
@@ -1768,8 +1776,7 @@ mod tests {
         let tools = [FakePlugin::new(PLUGIN).tool()];
         let prompt = propose_prompt(&texts, &intents, &tools, 10);
         let wanted = texts.iter().chain(&intents).map(String::as_str);
-        let rule = [PLUGIN, &tools[0].description, NEW_PLUGIN_RULE, "10"];
-        let wanted = wanted.chain(rule);
+        let wanted = wanted.chain([PLUGIN, &tools[0].description, NEW_PLUGIN_RULE, "10"]);
         for wanted in wanted {
             assert!(prompt.contains(wanted), "{wanted:?} is not in {prompt:?}");
         }
@@ -1783,6 +1790,8 @@ mod tests {
             PROPOSAL.replace("\"name\": \"movie_mode\", ", ""),
             PROPOSAL.replace("[{\"key\": \"transition\", \"value\": \"2\"}]", "{}"),
             PROPOSAL.replace("\"needs\": null", "\"needs\": null, \"colour\": 1"),
+            PROPOSAL.replace("\"question\": null, ", ""),
+            PROPOSAL.replace(", \"device_class\": null", ""),
         ];
         for text in replies {
             let (result, _request) = proposed(&text).await?;
@@ -1791,27 +1800,22 @@ mod tests {
         Ok(())
     }
 
-    /// Makes `server` answer each embeddings request with two vectors.
-    async fn mount_embeddings(server: &MockServer) {
-        let item = |index: u32| json!({"object": "embedding", "index": index, "embedding": [0.5]});
-        let body = json!({
-            "object": "list",
-            "model": "text-embedding-3-small",
-            "data": [item(0), item(1)],
-            "usage": {"prompt_tokens": 4, "total_tokens": 4},
-        });
-        Mock::given(matchers::method("POST"))
-            .and(matchers::path("/embeddings"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(body))
-            .mount(server)
-            .await;
-    }
+    /// An embeddings response with two vectors.
+    const EMBEDDINGS: &str = r#"{"object": "list", "model": "text-embedding-3-small",
+        "data": [{"object": "embedding", "index": 0, "embedding": [0.5]},
+        {"object": "embedding", "index": 1, "embedding": [0.5]}],
+        "usage": {"prompt_tokens": 4, "total_tokens": 4}}"#;
 
     /// AC-14.4-4.
     #[tokio::test(start_paused = true)]
     async fn ac_14_4_4_embed_sends_one_request_and_gives_two_vectors() -> anyhow::Result<()> {
         let (server, reasoner) = mock("completed").await?;
-        mount_embeddings(&server).await;
+        let embeddings = ResponseTemplate::new(200).set_body_raw(EMBEDDINGS, "application/json");
+        Mock::given(matchers::method("POST"))
+            .and(matchers::path("/embeddings"))
+            .respond_with(embeddings)
+            .mount(&server)
+            .await;
         let vectors = reasoner.embed(&["a".to_owned(), "b".to_owned()]).await?;
         assert_eq!(vectors, [[0.5], [0.5]]);
         let requests = server.received_requests().await.context("no requests")?;
