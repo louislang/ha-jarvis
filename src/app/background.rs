@@ -1371,10 +1371,16 @@ mod tests {
     }
 
     impl Learner {
-        /// A check of the catalog of `intents.toml` and the `[learn]` of `jarvis.toml` on a log
-        /// with the requests of [`jokes`] in the hours after `monday()`, each with a close embedding,
-        /// one day before the clock.
+        /// The check of [`Learner::empty`] on a log with the requests of [`jokes`].
         fn new() -> Self {
+            let learner = Self::empty();
+            learner.defer(&jokes(), 0);
+            learner
+        }
+
+        /// A check of the catalog of `intents.toml` and the `[learn]` of `jarvis.toml` on an
+        /// empty log, one day after `monday()`.
+        fn empty() -> Self {
             let (reasoner, log) = (
                 Arc::new(FakeReasoner::default()),
                 Arc::new(FakeLog::default()),
@@ -1391,15 +1397,13 @@ mod tests {
                 changes,
                 clock: Arc::new(FakeClock(monday() + SignedDuration::from_hours(24))),
             };
-            let learner = Self {
+            Self {
                 reasoner,
                 log,
                 learning,
                 store,
                 changes: receiver,
-            };
-            learner.defer(&jokes(), 0);
-            learner
+            }
         }
 
         /// Adds the requests `texts` in the hours after `monday()`, with embeddings close to the
@@ -1558,5 +1562,118 @@ mod tests {
         tokio::time::sleep(interval).await;
         assert_eq!(learner.reasoner.proposed(), vec![jokes(), greetings]);
         Ok(())
+    }
+
+    /// The variant of a Quint sum type value.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Tag {
+        /// The variant name.
+        tag: String,
+    }
+
+    /// The model state of `learned.qnt` that the conformance test compares.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct LearnedModel {
+        /// The status of each cluster.
+        status: BTreeMap<String, Tag>,
+    }
+
+    impl ModelState<LearnedDriver> for LearnedModel {
+        /// The status of the entry of each cluster, or `Absent` without an entry.
+        fn from_driver(driver: &LearnedDriver) -> anyhow::Result<Self> {
+            let entries = driver.learner.saved()?;
+            let status = |cluster: &str| {
+                let entry = entries.iter().find(|entry| entry.name == cluster);
+                let tag = entry.map_or("Absent".to_owned(), |entry| format!("{:?}", entry.status));
+                (cluster.to_owned(), Tag { tag })
+            };
+            Ok(Self {
+                status: CLUSTERS.into_iter().map(status).collect(),
+            })
+        }
+    }
+
+    /// The clusters of `learned.qnt`, in the order of their embedding axes.
+    const CLUSTERS: [&str; 2] = ["c1", "c2"];
+
+    /// Replays `learned.qnt` against the learned intent check, with an entry named after each
+    /// cluster.
+    struct LearnedDriver {
+        /// The runtime of the checks.
+        runtime: Runtime,
+        /// The check, its log, System Two and its file.
+        learner: Learner,
+        /// `HAS_SERVICE` of the model.
+        service: BTreeMap<String, bool>,
+        /// `NEEDS_PLUGIN` of the model.
+        plugin: BTreeMap<String, bool>,
+    }
+
+    impl LearnedDriver {
+        /// A driver with an empty log and file and the constants `service` and `plugin`.
+        fn new(service: BTreeMap<String, bool>, plugin: BTreeMap<String, bool>) -> Self {
+            let mut runtime = tokio::runtime::Builder::new_current_thread();
+            let runtime = runtime.enable_time().start_paused(true).build();
+            Self {
+                runtime: runtime.expect("the runtime builds"),
+                learner: Learner::empty(),
+                service,
+                plugin,
+            }
+        }
+
+        /// Adds the requests of `cluster` and runs one check with its proposal: `none` when not
+        /// `suitable`, else a `new_plugin`, a command with a service or a command without one.
+        fn propose(&self, cluster: &str, suitable: bool) -> anyhow::Result<()> {
+            let axis = CLUSTERS.iter().position(|name| *name == cluster);
+            let axis = axis.ok_or_else(|| anyhow::anyhow!("no cluster {cluster}"))?;
+            let texts: Vec<String> = (1..=5).map(|n| format!("{cluster} request {n}")).collect();
+            self.learner.defer(&texts, axis);
+            let kind = match (suitable, self.plugin[cluster]) {
+                (false, _) => LearnedKind::None,
+                (true, true) => LearnedKind::NewPlugin,
+                (true, false) => LearnedKind::Command,
+            };
+            let service = self.service[cluster].then_some("scene.turn_on");
+            let mut proposal = proposal(kind, service.filter(|_| kind == LearnedKind::Command));
+            proposal.name = cluster.to_owned();
+            self.runtime.block_on(self.learner.check(proposal))?;
+            Ok(())
+        }
+
+        /// Sets the status of the entry of `cluster` as the review of sub-phase 14.6 does.
+        fn resolve(&self, cluster: &str, status: LearnedStatus) -> anyhow::Result<()> {
+            let mut learned = self.learner.store.load()?.unwrap_or_default();
+            for entry in &mut learned.intents {
+                if entry.name == cluster {
+                    entry.status = status;
+                }
+            }
+            self.learner.store.save(&learned)
+        }
+    }
+
+    impl Driver for LearnedDriver {
+        type State = LearnedModel;
+
+        fn step(&mut self, step: &Step) -> anyhow::Result<()> {
+            switch!(step {
+                init(service: BTreeMap<String, bool>, plugin: BTreeMap<String, bool>) => {
+                    *self = Self::new(service, plugin);
+                },
+                propose(c: String, suitable: bool) => self.propose(&c, suitable)?,
+                approve(c: String) => self.resolve(&c, LearnedStatus::Active)?,
+                reject(c: String) => self.resolve(&c, LearnedStatus::Rejected)?,
+                // Sub-phase 14.13 adds the plugin requests, which change no status.
+                writeRequest => {},
+                failRequest => {},
+            })
+        }
+    }
+
+    /// AC-14.5d-1. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/learned.qnt", max_steps = 30, seed = "1")]
+    fn ac_14_5d_1_conformance() -> impl Driver {
+        LearnedDriver::new(BTreeMap::new(), BTreeMap::new())
     }
 }
