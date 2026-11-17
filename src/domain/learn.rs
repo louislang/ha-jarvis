@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 
 use dbscan::Classification;
 use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use serde::Deserialize;
 use serde::Serialize;
 use vstd::prelude::*;
@@ -15,12 +16,20 @@ use crate::domain::catalog::Filter;
 use crate::domain::catalog::Intent;
 use crate::domain::catalog::Kind;
 use crate::domain::catalog::Target;
+use crate::domain::habits;
+use crate::domain::habits::Bucket;
 use crate::domain::intent;
 use crate::domain::intent::Rejection;
 use crate::domain::responses;
 
 #[cfg(verus_only)]
 use crate::domain::contracts::euclidean;
+#[cfg(verus_only)]
+use crate::domain::contracts::nanosecond;
+#[cfg(verus_only)]
+use crate::domain::contracts::timestamp_at;
+#[cfg(verus_only)]
+use crate::domain::habits::bucket_at;
 
 /// One request that System Two answered, with the embedding of its text.
 #[verus_verify]
@@ -661,9 +670,84 @@ pub fn live(catalog: Catalog, learned: Vec<LearnedIntent>) -> Catalog {
     live
 }
 
+/// The nanoseconds of one minute.
+#[verus_verify]
+pub const MINUTE_NANOS: i128 = 60_000_000_000;
+
+/// True when `now` is in the window of a time of `usual`: from `lead_min` before its hour to the
+/// end of the hour.
+#[verus_spec(open =>
+    ensures
+        open == windowed(usual, now, *zone, lead_min),
+)]
+#[must_use]
+pub fn in_window(usual: &[Bucket], now: Timestamp, zone: &TimeZone, lead_min: u64) -> bool {
+    if usual.contains(&habits::bucket(now, zone)) {
+        return true;
+    }
+    let Some(sum) = after(now, lead_min) else {
+        return false;
+    };
+    match Timestamp::from_nanosecond(sum) {
+        Ok(later) => usual.contains(&habits::bucket(later, zone)),
+        Err(_) => false,
+    }
+}
+
+/// True when `now` is in the window of a time of `usual`, and no prefetch was made or the last
+/// one, at `attempt`, is `fresh_min` or more ago.
+#[verus_spec(due =>
+    ensures
+        due == (windowed(usual, now, *zone, lead_min) && waited(attempt, now, fresh_min)),
+)]
+#[must_use]
+pub fn refresh_due(
+    usual: &[Bucket],
+    attempt: Option<Timestamp>,
+    now: Timestamp,
+    zone: &TimeZone,
+    lead_min: u64,
+    fresh_min: u32,
+) -> bool {
+    in_window(usual, now, zone, lead_min)
+        && match attempt {
+            Some(last) => {
+                matches!(after(last, u64::from(fresh_min)), Some(due) if now.as_nanosecond() >= due)
+            }
+            None => true,
+        }
+}
+
+/// True when the answer of `answer_time` is `fresh_min` or less old at `now`.
+#[verus_spec(found =>
+    ensures
+        found == (nanosecond(now) - nanosecond(answer_time) <= fresh_min * MINUTE_NANOS),
+)]
+#[must_use]
+pub fn fresh(answer_time: Timestamp, now: Timestamp, fresh_min: u32) -> bool {
+    match after(answer_time, u64::from(fresh_min)) {
+        Some(end) => now.as_nanosecond() <= end,
+        None => true,
+    }
+}
+
+/// The nanosecond of `time` plus `minutes`, or `None` when it overflows.
+#[verus_spec(found =>
+    ensures
+        found == shifted(time, minutes),
+)]
+fn after(time: Timestamp, minutes: u64) -> Option<i128> {
+    time.as_nanosecond()
+        .checked_add(i128::from(minutes) * MINUTE_NANOS)
+}
+
 verus! {
 
-broadcast use crate::domain::contracts::axiom_string_obeys_cmp;
+broadcast use {
+    crate::domain::contracts::axiom_string_obeys_cmp,
+    crate::domain::contracts::axiom_bucket_obeys_cmp,
+    vstd::laws_cmp::group_laws_cmp,
+};
 
 /// The status of a valid proposal of `kind`, with a service when `service`.
 pub open spec fn initial(kind: LearnedKind, service: bool) -> LearnedStatus {
@@ -681,8 +765,36 @@ pub open spec fn new_name(name: Seq<char>, intents: Seq<catalog::Intent>, learne
     &&& forall|index: int| 0 <= index < learned.len() ==> #[trigger] learned[index].name@ != name
 }
 
+/// The nanosecond of `time` plus `minutes`, or `None` above `i128::MAX`.
+pub open spec fn shifted(time: Timestamp, minutes: u64) -> Option<i128> {
+    let sum = nanosecond(time) + minutes * MINUTE_NANOS;
+    if sum <= i128::MAX { Some(sum as i128) } else { None }
+}
+
+/// `time` plus `minutes`, or `None` after the last instant.
+pub open spec fn plus(time: Timestamp, minutes: u64) -> Option<Timestamp> {
+    match shifted(time, minutes) {
+        Some(sum) => timestamp_at(sum),
+        None => None,
+    }
+}
+
+/// True when `usual` has the bucket of `now` or of `now` plus `lead_min` in `zone`.
+pub open spec fn windowed(usual: &[Bucket], now: Timestamp, zone: TimeZone, lead_min: u64) -> bool {
+    usual.contains(&bucket_at(now, zone))
+        || (plus(now, lead_min) matches Some(later) && usual.contains(&bucket_at(later, zone)))
+}
+
+/// True when `attempt` is none or `fresh_min` or more before `now`.
+pub open spec fn waited(attempt: Option<Timestamp>, now: Timestamp, fresh_min: u32) -> bool {
+    match attempt {
+        Some(last) => nanosecond(now) - nanosecond(last) >= fresh_min * MINUTE_NANOS,
+        None => true,
+    }
+}
+
 /// True when `minutes` is 1 or more.
-pub open spec fn fresh(minutes: Option<u32>) -> bool {
+pub open spec fn has_fresh_min(minutes: Option<u32>) -> bool {
     minutes matches Some(value) && value > 0
 }
 
@@ -693,9 +805,9 @@ pub open spec fn kind_valid(proposal: LearnedIntent, plugins: Set<String>) -> bo
             && (proposal.select@.len() > 0 || proposal.entity is Some),
         LearnedKind::Query => proposal.select@.len() > 0 && proposal.service is None,
         LearnedKind::Fetch => (proposal.plugin matches Some(plugin) && plugins.contains(plugin))
-            && proposal.service is None && fresh(proposal.fresh_min),
+            && proposal.service is None && has_fresh_min(proposal.fresh_min),
         LearnedKind::Prefetch => proposal.question is Some && proposal.service is None
-            && fresh(proposal.fresh_min),
+            && has_fresh_min(proposal.fresh_min),
         LearnedKind::NewPlugin => (proposal.needs matches Some(needs) && needs@.len() > 0)
             && proposal.service is None && proposal.plugin is None && proposal.question is None,
         LearnedKind::None => true,
@@ -734,6 +846,7 @@ pub open spec fn first_near(learned: Seq<LearnedIntent>, centroid: Seq<f32>, dis
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::habits::DayType;
 
     /// The default `learn.cluster_distance`.
     const DISTANCE: f64 = 0.3;
@@ -1072,5 +1185,104 @@ mod tests {
         assert_eq!(text.matches("[[intents]]").count(), 2, "the file is {text}");
         let read: Learned = toml::from_str(&text).expect("the file parses");
         assert_eq!(read, learned);
+    }
+
+    /// The lead of the prefetch window in the tests, in minutes.
+    const LEAD_MIN: u64 = 5;
+
+    /// The usual time weekdays 08:00.
+    const WEEKDAY_8: Bucket = Bucket {
+        day: DayType::Weekdays,
+        hour: 8,
+    };
+
+    /// The time zone of the reference house.
+    fn chicago() -> TimeZone {
+        TimeZone::get("America/Chicago").expect("the time zone database has Chicago")
+    }
+
+    /// The instant of the local date and time `local` in Chicago.
+    fn chicago_at(local: &str) -> Timestamp {
+        let zoned: jiff::Zoned = format!("{local}[America/Chicago]")
+            .parse()
+            .expect("a zoned time");
+        zoned.timestamp()
+    }
+
+    /// AC-14.9-1.
+    #[test]
+    fn ac_14_9_1_window_is_lead_before_to_end_of_hour() {
+        // 2026-11-16 is a Monday, 2026-11-14 a Saturday.
+        let cases = [
+            ("2026-11-16T07:55:00", true),
+            ("2026-11-16T08:59:59", true),
+            ("2026-11-16T07:54:59", false),
+            ("2026-11-16T09:00:00", false),
+            ("2026-11-14T07:55:00", false),
+        ];
+        for (local, open) in cases {
+            let found = in_window(&[WEEKDAY_8], chicago_at(local), &chicago(), LEAD_MIN);
+            assert_eq!(found, open, "in_window of weekdays 08:00 at {local}");
+        }
+    }
+
+    /// AC-14.9-2.
+    #[test]
+    fn ac_14_9_2_window_of_midnight_starts_on_sunday() {
+        let midnight = Bucket {
+            day: DayType::Weekdays,
+            hour: 0,
+        };
+        // 2026-11-15 is a Sunday.
+        let now = chicago_at("2026-11-15T23:55:00");
+        assert!(
+            in_window(&[midnight], now, &chicago(), LEAD_MIN),
+            "the window of weekdays 00:00 is closed at Sunday 23:55"
+        );
+    }
+
+    /// AC-14.9-3.
+    #[test]
+    fn ac_14_9_3_refresh_waits_fresh_min_after_attempt() {
+        let due = |attempt: Option<&str>, local: &str| {
+            let attempt = attempt.map(chicago_at);
+            refresh_due(
+                &[WEEKDAY_8],
+                attempt,
+                chicago_at(local),
+                &chicago(),
+                LEAD_MIN,
+                5,
+            )
+        };
+        assert!(
+            due(None, "2026-11-16T07:55:00"),
+            "no refresh at the window start without a prefetch"
+        );
+        let attempt = Some("2026-11-16T07:55:23");
+        assert!(
+            !due(attempt, "2026-11-16T07:59:23"),
+            "a refresh 4 min after the prefetch"
+        );
+        assert!(
+            due(attempt, "2026-11-16T08:00:23"),
+            "no refresh 5 min after the prefetch"
+        );
+    }
+
+    /// AC-14.9-4.
+    #[test]
+    fn ac_14_9_4_answer_is_fresh_to_fresh_min() {
+        let answer = chicago_at("2026-11-16T07:55:23");
+        let limit = answer + jiff::SignedDuration::from_mins(5);
+        assert!(
+            fresh(answer, limit, 5),
+            "an answer of exactly 5 min is stale"
+        );
+        let later = limit + jiff::SignedDuration::from_nanos(1);
+        assert!(
+            !fresh(answer, later, 5),
+            "an answer older than 5 min is fresh"
+        );
     }
 }

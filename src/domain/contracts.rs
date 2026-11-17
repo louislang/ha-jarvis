@@ -510,6 +510,21 @@ pub fn ex_timestamp_as_nanosecond(timestamp: Timestamp) -> (result: i128)
     Timestamp::as_nanosecond(timestamp)
 }
 
+/// The instant `nanosecond` nanoseconds from the Unix epoch, or `None` when it is out of range.
+pub uninterp spec fn timestamp_at(nanosecond: i128) -> Option<Timestamp>;
+
+/// Gives the instant `nanosecond` nanoseconds from the Unix epoch, or an error when it is out of range. <https://docs.rs/jiff/0.2/jiff/struct.Timestamp.html#method.from_nanosecond>
+#[verifier::external_fn_specification]
+pub fn ex_timestamp_from_nanosecond(nanosecond: i128) -> (result: Result<Timestamp, jiff::Error>)
+    ensures
+        match result {
+            Ok(found) => timestamp_at(nanosecond) == Some(found),
+            Err(_) => timestamp_at(nanosecond) is None,
+        },
+{
+    Timestamp::from_nanosecond(nanosecond)
+}
+
 /// A time zone. <https://docs.rs/jiff/0.2/jiff/tz/struct.TimeZone.html>
 #[verifier::external_type_specification]
 #[verifier::external_body]

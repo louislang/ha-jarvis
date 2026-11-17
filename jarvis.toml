@@ -120,6 +120,7 @@ cluster_distance = 0.3
 responses = 10 # responses of each proposal
 file = "learned.toml"
 check_interval_s = 3600
+prefetch_lead_min = 5 # minutes before the usual hour
 
 [log]
 database = "jarvis.db"
