@@ -4,6 +4,7 @@
 use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::mem;
+use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -438,10 +439,12 @@ impl Learning {
         learned: &mut Vec<LearnedIntent>,
     ) -> anyhow::Result<()> {
         let distance = self.config.cluster_distance;
-        let covered = learn::covering(&cluster, learned, distance).map(str::to_owned);
         let times = cluster.times.clone();
-        if let Some(name) = covered {
-            if let Some(entry) = learned.iter().find(|entry| entry.name == name) {
+        if let Some(name) = learn::covering(&cluster, learned, distance) {
+            // `covering` borrows the name of the matched entry, and an invalid entry can reuse
+            // the name of another, so the match is by address.
+            let matched = |entry: &&LearnedIntent| ptr::eq(entry.name.as_str(), name);
+            if let Some(entry) = learned.iter().find(matched) {
                 self.record(entry, times);
             }
             return Ok(());
@@ -1721,17 +1724,14 @@ mod tests {
         LearnedDriver::new(BTreeMap::new(), BTreeMap::new())
     }
 
-    /// The habit model after each of `checks` checks of a log whose cluster the active entry
-    /// `family_calendar` covers, with five requests at 07:10 on Monday, Tuesday and Wednesday.
-    async fn calendar_habits(checks: usize) -> anyhow::Result<Vec<RequestHabits>> {
+    /// The habit model after each of `checks` checks with the learned entries `intents`, of a
+    /// log with five requests at 07:10 on Monday, Tuesday and Wednesday along the axis [`X`].
+    async fn calendar_habits(
+        intents: Vec<LearnedIntent>,
+        checks: usize,
+    ) -> anyhow::Result<Vec<RequestHabits>> {
         let learner = Learner::empty();
-        let mut entry = proposal(LearnedKind::Command, None);
-        entry.name = "family_calendar".to_owned();
-        entry.status = LearnedStatus::Active;
-        entry.centroid = vec![1.0, 0.0, 0.0];
-        learner.store.save(&Learned {
-            intents: vec![entry],
-        })?;
+        learner.store.save(&Learned { intents })?;
         for (index, day) in [0, 0, 1, 1, 2].into_iter().enumerate() {
             let text = format!("what is on the calendar {index}");
             learner
@@ -1752,7 +1752,7 @@ mod tests {
     /// AC-14.5e-1.
     #[tokio::test]
     async fn ac_14_5e_1_covered_cluster_records_its_usual_time() -> anyhow::Result<()> {
-        let models = calendar_habits(1).await?;
+        let models = calendar_habits(vec![calendar(LearnedStatus::Active, X)], 1).await?;
         let last = monday() + SignedDuration::from_hours(47);
         let wednesday = TimeZone::get("America/Chicago")?.to_datetime(last).date();
         let usual = models[0].usual_times("family_calendar", wednesday, 14.0, 2.0);
@@ -1767,9 +1767,31 @@ mod tests {
     /// AC-14.5e-2.
     #[tokio::test]
     async fn ac_14_5e_2_same_times_do_not_change_the_model() -> anyhow::Result<()> {
-        let models = calendar_habits(2).await?;
+        let models = calendar_habits(vec![calendar(LearnedStatus::Active, X)], 2).await?;
         assert_eq!(models[0], models[1]);
         assert_ne!(models[0], RequestHabits::default());
+        Ok(())
+    }
+
+    /// The axis of the embeddings of the calendar requests.
+    const X: [f32; 3] = [1.0, 0.0, 0.0];
+
+    /// An entry `family_calendar` with `status` and `centroid`.
+    fn calendar(status: LearnedStatus, centroid: [f32; 3]) -> LearnedIntent {
+        let mut entry = proposal(LearnedKind::Command, None);
+        entry.name = "family_calendar".to_owned();
+        entry.status = status;
+        entry.centroid = centroid.to_vec();
+        entry
+    }
+
+    /// A cluster that a `none` entry covers records nothing under an earlier entry with the same
+    /// name.
+    #[tokio::test]
+    async fn covering_none_entry_with_a_reused_name_records_nothing() -> anyhow::Result<()> {
+        let active = calendar(LearnedStatus::Active, [0.0, 1.0, 0.0]);
+        let models = calendar_habits(vec![active, calendar(LearnedStatus::None, X)], 1).await?;
+        assert_eq!(models[0], RequestHabits::default());
         Ok(())
     }
 }
