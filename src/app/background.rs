@@ -23,6 +23,7 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::BackfillConfig;
+use crate::Config;
 use crate::LearnConfig;
 use crate::app::conversation::Change;
 use crate::app::conversation::Conversation;
@@ -63,9 +64,6 @@ const PRUNE_INTERVAL: Duration = Duration::from_hours(24);
 
 /// The time between two hotword refreshes.
 const HOTWORDS_REFRESH: Duration = Duration::from_hours(1);
-
-/// The time between two prefetch checks.
-const PREFETCH_INTERVAL: Duration = Duration::from_mins(1);
 
 /// The media types of the library names that are hotwords, in the order of their calls.
 const LIBRARY_TYPES: [&str; 3] = ["playlist", "artist", "album"];
@@ -703,37 +701,36 @@ pub struct Prefetch {
 }
 
 impl Prefetch {
-    /// The prefetch of the answers of `conversation` for the entries of the file of
-    /// `activation`, pre-rendered with its speech at its time, in the windows of the usual times
-    /// of `habits` with `min_score` and `lead_min`.
+    /// The prefetch of `conversation` for the entries of the file of `activation`, in the windows
+    /// of the usual times of `habits` with `habits.min_score` and `learn.prefetch_lead_min` of
+    /// `config`.
     #[must_use]
     pub fn new(
         conversation: Conversation,
         activation: Activation,
         habits: Arc<Habits>,
-        min_score: f64,
-        lead_min: u64,
+        config: &Config,
     ) -> Self {
         Self {
             conversation,
             activation,
             habits,
-            min_score,
-            lead_min,
+            min_score: config.habits.min_score,
+            lead_min: config.learn.prefetch_lead_min,
             attempts: Mutex::default(),
             answers: Mutex::default(),
         }
     }
 
     /// Prefetches the answer of each active prefetch entry of the learned intents file whose
-    /// refresh is due. Sets its attempt time first. Logs a failed load.
+    /// refresh is due at the time before it. Sets its attempt time first. Logs a failed load.
     pub async fn tick(&self) {
         let learned = match self.activation.load().await {
             Ok(learned) => learned.intents,
             Err(error) => return tracing::warn!("the learned intents did not load: {error:#}"),
         };
-        let now = self.activation.clock.now();
         for entry in learned {
+            let now = self.activation.clock.now();
             if let Some(question) = self.due(&entry, now) {
                 lock(&self.attempts).insert(entry.name.clone(), now);
                 self.run(&entry.name, &question).await;
@@ -773,7 +770,7 @@ impl Prefetch {
     }
 
     /// Stores `answer` of the intent `name` with the current time, or removes the stored answer
-    /// without `answer`. Drops the audio of a replaced or removed answer.
+    /// without `answer`. Drops the audio of a replaced or removed answer that no stored answer has.
     fn store(&self, name: &str, answer: Option<String>) {
         let time = self.activation.clock.now();
         let mut answers = lock(&self.answers);
@@ -781,8 +778,8 @@ impl Prefetch {
             Some(text) => answers.insert(name.to_owned(), Answer { text, time }),
             None => answers.remove(name),
         };
-        let current = answers.get(name).map(|answer| answer.text.as_str());
-        if let Some(old) = old.filter(|old| Some(old.text.as_str()) != current) {
+        let stored = |old: &Answer| answers.values().any(|answer| answer.text == old.text);
+        if let Some(old) = old.filter(|old| !stored(old)) {
             self.activation.speech.forget(&old.text);
         }
     }
@@ -792,7 +789,7 @@ impl Prefetch {
 #[must_use]
 pub fn start_prefetch(prefetch: Prefetch) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticks = tokio::time::interval(PREFETCH_INTERVAL);
+        let mut ticks = tokio::time::interval(Duration::from_mins(1));
         loop {
             ticks.tick().await;
             prefetch.tick().await;
@@ -910,7 +907,6 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::VecDeque;
     use std::fs;
-    use std::path::Path;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -2181,11 +2177,11 @@ mod tests {
     }
 
     impl Prefetcher {
-        /// The prefetch of [`prefetch_calendar`] with `jarvis.toml` at `thursday()`.
-        fn new() -> anyhow::Result<Self> {
+        /// The prefetch of [`prefetch_calendar`] of `names` with `jarvis.toml` at `thursday()`.
+        fn new(names: &[&str]) -> anyhow::Result<Self> {
             let config = Config::parse(include_str!("../../jarvis.toml"))?;
             let learner = Learner::empty();
-            prefetch_calendar(&learner)?;
+            prefetch_calendar(&learner, names)?;
             let clock = Arc::new(SetClock(Mutex::new(thursday())));
             let reasoner = Arc::clone(&learner.reasoner) as _;
             let mut two =
@@ -2195,8 +2191,7 @@ mod tests {
             let habits = Arc::clone(&learner.learning.habits);
             let mut activation = learner.learning.activation.clone();
             activation.clock = Arc::clone(&clock) as _;
-            let (min_score, lead_min) = (config.habits.min_score, config.learn.prefetch_lead_min);
-            let prefetch = Prefetch::new(conversation, activation, habits, min_score, lead_min);
+            let prefetch = Prefetch::new(conversation, activation, habits, &config);
             Ok(Self {
                 prefetch,
                 learner,
@@ -2204,8 +2199,7 @@ mod tests {
             })
         }
 
-        /// Sets the time to `minutes` after `thursday()` and runs one tick with the answer
-        /// `steps`.
+        /// Runs one tick at `minutes` after `thursday()` with the answer `steps`.
         async fn tick(&self, minutes: i64, steps: Vec<Scripted>) {
             *lock(&self.clock.0) = thursday() + SignedDuration::from_mins(minutes);
             self.learner.reasoner.script(steps);
@@ -2213,19 +2207,20 @@ mod tests {
         }
     }
 
-    /// Gives the file of `learner` the active prefetch entry `family_calendar` with
-    /// `fresh_min = 30`, and its habits a usual time of it on weekdays at 08:00.
-    fn prefetch_calendar(learner: &Learner) -> anyhow::Result<()> {
-        let mut entry = proposal(LearnedKind::Prefetch, None);
-        (entry.name, entry.status) = (CALENDAR.to_owned(), LearnedStatus::Active);
-        (entry.question, entry.fresh_min) = (Some(QUESTION.to_owned()), Some(30));
-        for day in 0..3 {
-            let time = monday() + SignedDuration::from_hours(24 * day);
-            learner.learning.habits.observe(CALENDAR.to_owned(), time);
+    /// Saves an active prefetch entry of [`QUESTION`] for each of `names`, used weekdays at 08:00.
+    fn prefetch_calendar(learner: &Learner, names: &[&str]) -> anyhow::Result<()> {
+        let mut intents = Vec::new();
+        for name in names {
+            let mut entry = proposal(LearnedKind::Prefetch, None);
+            (entry.name, entry.status) = ((*name).to_owned(), LearnedStatus::Active);
+            (entry.question, entry.fresh_min) = (Some(QUESTION.to_owned()), Some(30));
+            for day in 0..3 {
+                let time = monday() + SignedDuration::from_hours(24 * day);
+                learner.learning.habits.observe((*name).to_owned(), time);
+            }
+            intents.push(entry);
         }
-        learner.store.save(&Learned {
-            intents: vec![entry],
-        })
+        learner.store.save(&Learned { intents })
     }
 
     /// A recorder with a log writer that has ended, at `clock`.
@@ -2234,7 +2229,7 @@ mod tests {
             utterances: Arc::new(Utterances::new(Arc::clone(clock), 10)),
             writer: tokio::sync::mpsc::unbounded_channel().0,
             last_id: None,
-            trigger: fakes::trigger(Path::new("unused")).0,
+            trigger: fakes::trigger("unused".as_ref()).0,
         }
     }
 
@@ -2264,7 +2259,7 @@ mod tests {
     /// AC-14.10c-1.
     #[tokio::test(start_paused = true)]
     async fn ac_14_10c_1_due_refresh_asks_the_question() -> anyhow::Result<()> {
-        let prefetcher = Prefetcher::new()?;
+        let prefetcher = Prefetcher::new(&[CALENDAR])?;
         prefetcher.tick(0, said("Two events.")).await;
         assert_eq!(prefetcher.learner.reasoner.questions(), [QUESTION]);
         Ok(())
@@ -2273,12 +2268,10 @@ mod tests {
     /// AC-14.10c-2. A new answer also drops the audio of the old one.
     #[tokio::test(start_paused = true)]
     async fn ac_14_10c_2_answer_audio_is_cached() -> anyhow::Result<()> {
-        let prefetcher = Prefetcher::new()?;
+        let prefetcher = Prefetcher::new(&[CALENDAR])?;
         prefetcher.tick(0, said("Two events.")).await;
-        let (speech, tts) = (
-            &prefetcher.prefetch.activation.speech,
-            &prefetcher.learner.tts,
-        );
+        let speech = &prefetcher.prefetch.activation.speech;
+        let tts = &prefetcher.learner.tts;
         let synths = tts.texts().len();
         speech.speak("Two events.").await?;
         assert_eq!(tts.texts().len(), synths, "the answer has no audio");
@@ -2291,7 +2284,7 @@ mod tests {
     /// AC-14.10c-3.
     #[tokio::test(start_paused = true)]
     async fn ac_14_10c_3_error_keeps_the_old_answer() -> anyhow::Result<()> {
-        let prefetcher = Prefetcher::new()?;
+        let prefetcher = Prefetcher::new(&[CALENDAR])?;
         prefetcher.tick(0, said("Old.")).await;
         let steps = vec![Scripted::Sentence("New."), Scripted::Error("lost")];
         prefetcher.tick(30, steps).await;
@@ -2306,7 +2299,7 @@ mod tests {
     /// AC-14.10c-4.
     #[tokio::test(start_paused = true)]
     async fn ac_14_10c_4_window_gives_three_prefetches() -> anyhow::Result<()> {
-        let prefetcher = Prefetcher::new()?;
+        let prefetcher = Prefetcher::new(&[CALENDAR])?;
         let (mut asked, reasoner) = (Vec::new(), &prefetcher.learner.reasoner);
         for minutes in -10..=70 {
             let before = reasoner.questions().len();
@@ -2316,6 +2309,41 @@ mod tests {
             }
         }
         assert_eq!(asked, [-5, 25, 55]);
+        Ok(())
+    }
+
+    /// A tick from 08:59 skips its second intent when the first answer ends at 09:00.
+    #[tokio::test(start_paused = true)]
+    async fn each_intent_of_a_tick_reads_the_clock() -> anyhow::Result<()> {
+        let prefetcher = Prefetcher::new(&[CALENDAR, "school_calendar"])?;
+        let late = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            *lock(&prefetcher.clock.0) = thursday() + SignedDuration::from_hours(1);
+        };
+        let slow = vec![Scripted::Wait(Duration::from_secs(2)), Scripted::Done];
+        tokio::join!(prefetcher.tick(59, slow), late);
+        assert_eq!(prefetcher.learner.reasoner.questions(), [QUESTION]);
+        Ok(())
+    }
+
+    /// A refresh keeps old audio that `school_calendar` still stores or that a pool has.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_keeps_audio_in_use() -> anyhow::Result<()> {
+        let prefetcher = Prefetcher::new(&[CALENDAR, "school_calendar"])?;
+        let speech = &prefetcher.prefetch.activation.speech;
+        let tts = &prefetcher.learner.tts;
+        let pools = Pools::from([("hello".to_owned(), pool(&["Hello.".to_owned()]))]);
+        speech.prerender(&pools, &[]).await?;
+        prefetcher.learner.reasoner.script(said("Two events."));
+        prefetcher.tick(-5, said("Two events.")).await;
+        for (minutes, text) in [(25, "Hello."), (55, "Three events.")] {
+            prefetcher.learner.reasoner.script(said(text));
+            prefetcher.tick(minutes, Vec::new()).await;
+        }
+        let synths = tts.texts().len();
+        speech.speak("Two events.").await?;
+        speech.speak("Hello.").await?;
+        assert_eq!(tts.texts().len(), synths, "the audio in use stays");
         Ok(())
     }
 }

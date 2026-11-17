@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use dashmap::DashSet;
 use jiff::Timestamp;
 use serde_json::Map;
 use serde_json::Value;
@@ -347,6 +348,8 @@ pub struct Speech {
     tts: Arc<dyn TextToSpeech>,
     /// The audio of each pre-rendered text.
     cache: DashMap<String, Arc<Audio>>,
+    /// The pre-rendered pool texts, whose audio `forget` keeps.
+    pooled: DashSet<String>,
 }
 
 impl Speech {
@@ -356,6 +359,7 @@ impl Speech {
         Self {
             tts,
             cache: DashMap::new(),
+            pooled: DashSet::new(),
         }
     }
 
@@ -380,6 +384,7 @@ impl Speech {
     pub async fn prerender(&self, pools: &Pools, areas: &[String]) -> anyhow::Result<()> {
         for text in texts(pools, areas)? {
             self.render(&text).await?;
+            self.pooled.insert(text);
         }
         Ok(())
     }
@@ -395,9 +400,10 @@ impl Speech {
         Ok(())
     }
 
-    /// Drops the cached audio of `text`.
+    /// Drops the cached audio of `text` unless it is a pre-rendered pool text.
     pub fn forget(&self, text: &str) {
-        self.cache.remove(text);
+        self.cache
+            .remove_if(text, |_, _| !self.pooled.contains(text));
     }
 }
 

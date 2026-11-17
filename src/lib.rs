@@ -877,7 +877,7 @@ pub struct App {
     /// The `speak` use case.
     speech: Arc<Speech>,
     /// The prefetch task. It holds a sender of the pools task, so it stops when the app drops.
-    _prefetch: AbortOnDropHandle<()>,
+    _prefetch: Option<AbortOnDropHandle<()>>,
 }
 
 #[async_trait]
@@ -1448,6 +1448,12 @@ type Started = (
     Arc<LiveModels>,
 );
 
+/// The pools task, the queues, the habit task and the reasoner of an app.
+type Parts = (PoolsTask, Arc<Queues>, HabitsTask, Arc<dyn Reasoner>);
+
+/// The live models, the listener, the activation, the recorder and the log of an app.
+type Loaded = (Arc<LiveModels>, Listener, Activation, (Recorder, Logged));
+
 /// A log writer task, the review of its log, and the receiver of the error text of a failed
 /// `restore` of the training run. Also the training trigger task, the learned intent check task
 /// and the [`Shared`] of the trigger.
@@ -1848,59 +1854,49 @@ async fn start_app_with(
     )
     .await?;
     let prerender = start_prerender(&activation.speech, &task.pools, &cache);
-    let (parts, two) = ((task.pools, queues, recorder), (&reasoner, system_two));
-    let conversation = conversation(config, parts, two, &models, (&activation, &habits));
-    Ok((
-        prefetching(config, conversation, listener, activation, &habits),
+    let parts = (task, queues, habits, reasoner);
+    let loaded = (models, listener, activation, (recorder, logged));
+    Ok(started(config, parts, system_two, loaded, prerender))
+}
+
+/// The app of `config`, `parts`, `system_two`, `loaded` and `prerender`. Starts its prefetch.
+fn started(
+    config: &Config,
+    (task, queues, habits, reasoner): Parts,
+    system_two: SystemTwo,
+    (models, listener, activation, (recorder, logged)): Loaded,
+    prerender: JoinHandle<()>,
+) -> Started {
+    let mut started = (
+        App {
+            conversation: Conversation::new(
+                task.pools,
+                backfill(config, &reasoner, &activation),
+                queues,
+                Arc::clone(models.classifier()),
+                Arc::clone(&activation.catalog),
+                config.model.threshold,
+                system_two,
+                habits.habits.clone(),
+                recorder,
+            ),
+            listener,
+            speech: Arc::clone(&activation.speech),
+            _prefetch: None,
+        },
         (task.task, habits, logged),
         prerender,
         models,
-    ))
-}
-
-/// The conversation of `config` with the pools, the queues and the recorder of `parts`, the
-/// backfill of `reasoner`, `system_two`, the System One model of `models`, the live catalog of
-/// `activation` and the request habits of `habits`.
-fn conversation(
-    config: &Config,
-    (pools, queues, recorder): (Arc<ArcSwap<Pools>>, Arc<Queues>, Recorder),
-    (reasoner, system_two): (&Arc<dyn Reasoner>, SystemTwo),
-    models: &LiveModels,
-    (activation, habits): (&Activation, &HabitsTask),
-) -> Conversation {
-    Conversation::new(
-        pools,
-        backfill(config, reasoner, activation),
-        queues,
-        Arc::clone(models.classifier()),
-        Arc::clone(&activation.catalog),
-        config.model.threshold,
-        system_two,
-        habits.habits.clone(),
-        recorder,
-    )
-}
-
-/// The app of `conversation`, `listener` and the speech of `activation`. Starts the prefetch of
-/// `conversation` with `activation` and `habits` in the windows of `habits.min_score` and
-/// `learn.prefetch_lead_min` of `config`.
-fn prefetching(
-    config: &Config,
-    conversation: Conversation,
-    listener: Listener,
-    activation: Activation,
-    habits: &HabitsTask,
-) -> App {
-    let (min_score, lead_min) = (config.habits.min_score, config.learn.prefetch_lead_min);
-    let (prefetched, speech) = (conversation.clone(), Arc::clone(&activation.speech));
-    let habits = Arc::clone(&habits.habits);
-    let prefetch = Prefetch::new(prefetched, activation, habits, min_score, lead_min);
-    App {
-        conversation,
-        listener,
-        speech,
-        _prefetch: AbortOnDropHandle::new(app::background::start_prefetch(prefetch)),
-    }
+    );
+    let conversation = started.0.conversation.clone();
+    let habits = Arc::clone(&started.1.1.habits);
+    let prefetch = Prefetch::new(conversation, activation, habits, config);
+    let task = AbortOnDropHandle::new(app::background::start_prefetch(prefetch));
+    started.0 = App {
+        _prefetch: Some(task),
+        ..started.0
+    };
+    started
 }
 
 /// The recorder of the utterances of `listener` on the log of `config` with the training trigger,
@@ -3305,7 +3301,7 @@ mod tests {
             conversation: conversation(&config, catalog, classifier, &speech, utterances)?,
             listener,
             speech,
-            _prefetch: AbortOnDropHandle::new(tokio::spawn(future::pending())),
+            _prefetch: None,
         })
     }
 
