@@ -1808,8 +1808,7 @@ async fn start_app(
 /// The app of `config`, `catalog` and the source pools `pools` on `home`, `reasoner` and
 /// `system_two`, its pools task and habit task, its pre-render task and its live models. Starts
 /// the sync, the pools task and the habit task, loads the live models, and starts the training
-/// trigger and the learned intent check with `extras`. Then starts the pre-render. The
-/// conversation and its backfill use the live catalog of `extras`.
+/// trigger and the learned intent check with `extras`. Then starts the pre-render.
 ///
 /// # Errors
 ///
@@ -2096,12 +2095,8 @@ fn learned(
     Ok((Arc::new(ArcSwap::from_pointee(live)), pools))
 }
 
-/// The activation of `learn.file` of `config` with the speech use case on `tts`, the hot cache
-/// `cache`, the system time and the pools task and the live catalog of `checks`, alone and in
-/// `checks`.
-///
-/// # Errors
-///
+/// The activation, alone and in `checks`, of `learn.file` of `config` with the speech use case on
+/// `tts`, the hot cache `cache` and the system time. Fails when the path of
 /// `learn.file` is not a `.toml` or `.json` file.
 fn activation(
     config: &Config,
@@ -2150,10 +2145,10 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
 }
 
 /// The live models of `config`, then the listener on their STT, which predicts with their System
-/// One model, sees the dialogs of `queues` and warms `reasoner`, the [`activation`] with the
-/// speech use case on their TTS, and the recorder of [`start_log`]. Starts the hotword refresh of the STT with `home`, `cache`
+/// One model, sees the dialogs of `queues` and warms `reasoner`, the [`activation`] on their TTS,
+/// and the recorder of [`start_log`]. Starts the hotword refresh of the STT with `home`, `cache`
 /// and `catalog`, and the training trigger and the learned intent check with `checks`, `home`,
-/// the live models and the activation.
+/// the live models and the [`activation`].
 ///
 /// # Errors
 ///

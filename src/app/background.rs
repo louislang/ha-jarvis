@@ -107,8 +107,7 @@ pub struct Backfill {
     changes: mpsc::Sender<Change>,
     /// The pre-render of the new responses.
     speech: Arc<Speech>,
-    /// The catalog of `intents.toml` and the active learned intents. Only an intent pool can use
-    /// `area`.
+    /// The live catalog. Only an intent pool can use `area`.
     catalog: Arc<ArcSwap<Catalog>>,
     /// The hot cache, which has the area names of the pre-render.
     cache: watch::Receiver<StateCache>,
@@ -569,9 +568,7 @@ impl Activation {
     /// Adds and pre-renders the pool of `entry` when it has an intent, then adds the intent to the
     /// live catalog and sets `activated`. A failed pre-render logs and leaves `activated` unset.
     pub async fn activate(&self, entry: LearnedIntent) {
-        if learn::intent(entry.clone()).is_some()
-            && let Err(error) = self.add_pool(&entry).await
-        {
+        if let Err(error) = self.add_pool(&entry).await {
             return tracing::warn!("the pre-render of {} failed: {error:#}", entry.name);
         }
         let (store, catalog) = (Arc::clone(&self.store), Arc::clone(&self.catalog));
@@ -585,9 +582,13 @@ impl Activation {
         }));
     }
 
-    /// Sends the pools task a change that adds the pool of `entry` when no pool has its name, then
-    /// pre-renders the pool for the areas of the hot cache. Fails when the pre-render fails.
-    async fn add_pool(&self, entry: &LearnedIntent) -> anyhow::Result<()> {
+    /// When `entry` has an intent, sends the pools task a change that adds its pool when no pool
+    /// has its name, then pre-renders the pool for the areas of the hot cache. Fails when the
+    /// pre-render fails.
+    pub(crate) async fn add_pool(&self, entry: &LearnedIntent) -> anyhow::Result<()> {
+        if learn::intent(entry.clone()).is_none() {
+            return Ok(());
+        }
         let (name, added) = (entry.name.clone(), pool(&entry.responses));
         let pools = Pools::from([(name.clone(), added.clone())]);
         self.send(Box::new(move |mut current| {

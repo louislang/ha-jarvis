@@ -109,10 +109,7 @@ impl Pipeline {
     }
 
     /// [`Pipeline::start`] with the learned intents and the swapped-in classifier of `trained`.
-    ///
-    /// # Errors
-    ///
-    /// A file or a model cannot load, or the server cannot bind.
+    /// Fails as [`Pipeline::start`] does.
     pub(crate) async fn start_with(
         device: Device,
         trained: Option<(Learned, Arc<dyn Classifier>)>,
@@ -232,11 +229,7 @@ impl Pipeline {
     }
 }
 
-/// Saves `learned` to `learn.file` of `config` and gives `classifier`.
-///
-/// # Errors
-///
-/// The save fails.
+/// Saves `learned` to `learn.file` of `config` and gives `classifier`. Fails when the save fails.
 fn learn(
     config: &Config,
     (learned, classifier): (Learned, Arc<dyn Classifier>),
@@ -245,11 +238,8 @@ fn learn(
     Ok(classifier)
 }
 
-/// The app of `config` on `home`, `reasoner` and a `get_weather` plugin with no result.
-///
-/// # Errors
-///
-/// A file or a model cannot load.
+/// The app of `config` on `home`, `reasoner` and a `get_weather` plugin with no result. Fails when
+/// a file or a model cannot load.
 async fn start_app(
     config: &Config,
     home: Arc<dyn Home>,
@@ -724,8 +714,7 @@ mod tests {
         };
         let pipeline = Pipeline::start_with(Device::Cuda, Some((learned, classifier))).await?;
         let p95 = p95(&pipeline, "tell me a joke", &[joke.to_owned()]).await?;
-        let limit = Duration::from_millis(300);
-        assert!(p95 <= limit, "p95 {p95:?}, limit {limit:?}");
+        assert!(p95 <= Duration::from_millis(300), "p95 {p95:?}");
         Ok(())
     }
 }

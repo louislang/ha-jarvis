@@ -38,11 +38,8 @@ impl Reviewer {
         Self { log, activation }
     }
 
-    /// The result of `task` on the learned intents file, run by the pools task in order.
-    ///
-    /// # Errors
-    ///
-    /// The pools task stopped.
+    /// The result of `task` on the learned intents file, run by the pools task in order. Fails when
+    /// the pools task stopped.
     async fn run<T: Send + 'static>(
         &self,
         task: impl FnOnce(&dyn Store<Learned>) -> T + Send + 'static,
@@ -55,11 +52,22 @@ impl Reviewer {
             pools
         });
         let stopped = || Unresolved::Failed(anyhow::anyhow!("the pools task stopped"));
-        self.activation
-            .changes
-            .send(change)
-            .map_err(|_| stopped())?;
+        let changes = &self.activation.changes;
+        changes.send(change).map_err(|_| stopped())?;
         receiver.await.map_err(|_| stopped())
+    }
+
+    /// With `approve`, the `pending` entry `name` as `active`, after the pre-render of its pool. A
+    /// failed pre-render fails before the save, so the entry stays `pending` for another approve.
+    async fn prepared(&self, name: &str, approve: bool) -> Result<Vec<LearnedIntent>, Unresolved> {
+        let mut pending = self.proposals().map_err(Unresolved::Failed)?;
+        pending.retain(|entry| approve && entry.name == name);
+        for entry in &mut pending {
+            entry.status = LearnedStatus::Active;
+            let added = self.activation.add_pool(entry).await;
+            added.map_err(Unresolved::Failed)?;
+        }
+        Ok(pending)
     }
 }
 
@@ -89,24 +97,16 @@ pub fn resolve(learned: &mut Learned, name: &str, approve: bool) -> Result<(), U
     Ok(())
 }
 
-/// Resolves the entry `name` of `store` with `approve`, saves the file and gives the entry.
+/// Resolves the entry `name` of `store` with `approve` and saves the file.
 ///
 /// # Errors
 ///
 /// [`resolve`] fails, or `store` cannot load or save.
-fn resolve_saved(
-    store: &dyn Store<Learned>,
-    name: &str,
-    approve: bool,
-) -> Result<LearnedIntent, Unresolved> {
+fn resolve_saved(store: &dyn Store<Learned>, name: &str, approve: bool) -> Result<(), Unresolved> {
     let loaded = store.load().map_err(Unresolved::Failed)?;
     let mut learned = loaded.unwrap_or_default();
     resolve(&mut learned, name, approve)?;
-    store.save(&learned).map_err(Unresolved::Failed)?;
-    let mut entries = learned.intents.into_iter();
-    entries
-        .find(|entry| entry.name == name)
-        .ok_or(Unresolved::NotPending)
+    store.save(&learned).map_err(Unresolved::Failed)
 }
 
 /// Checks that the correction of `mark`, if any, is one of `names`.
@@ -151,16 +151,15 @@ impl Review for Reviewer {
     }
 
     async fn resolve(&self, name: &str, approve: bool) -> Result<(), Unresolved> {
+        let approved = self.prepared(name, approve).await?;
         let name = name.to_owned();
-        let entry = self
-            .run(move |store| resolve_saved(store, &name, approve))
+        self.run(move |store| resolve_saved(store, &name, approve))
             .await??;
-        if approve {
+        for entry in approved {
             self.activation.activate(entry).await;
-            // After the activation changes, `intents` has the entry.
-            self.run(|_| ()).await?;
         }
-        Ok(())
+        // After the activation changes, `intents` has the approved entry.
+        self.run(|_| ()).await
     }
 }
 
@@ -252,11 +251,10 @@ mod tests {
         (review, log)
     }
 
-    /// The learned entries, the proposals and the intents of a review after the resolve of its
-    /// `pending` entry `good_night` with `approve`. A thread runs each change in place of the pools
-    /// task.
-    async fn resolved(approve: bool) -> anyhow::Result<(Learned, Vec<LearnedIntent>, Vec<String>)> {
-        let intents = vec![fakes::learned("good_night", LearnedStatus::Pending)];
+    /// The review of a file with the entry `entry`, and the file. A thread runs each change in
+    /// place of the pools task.
+    fn reviewing(entry: LearnedIntent) -> (Reviewer, Arc<FakeStore<Learned>>) {
+        let intents = vec![entry];
         let store = Arc::new(FakeStore::new(Some(Learned { intents })));
         let (changes, receiver) = mpsc::channel::<Change>();
         thread::spawn(move || {
@@ -266,6 +264,13 @@ mod tests {
         });
         let log = Arc::new(FakeLog::default());
         let review = Reviewer::new(log, activation(Arc::clone(&store) as _, changes));
+        (review, store)
+    }
+
+    /// The learned entries, the proposals and the intents of a review after the resolve of its
+    /// `pending` entry `good_night` with `approve`.
+    async fn resolved(approve: bool) -> anyhow::Result<(Learned, Vec<LearnedIntent>, Vec<String>)> {
+        let (review, store) = reviewing(fakes::learned("good_night", LearnedStatus::Pending));
         assert_eq!(review.proposals()?.len(), 1, "good_night is pending");
         let result = review.resolve("good_night", approve).await;
         assert!(result.is_ok(), "the resolve gave {result:?}");
@@ -373,6 +378,18 @@ mod tests {
     async fn ac_14_7b_3_approved_entry_is_an_intent() -> anyhow::Result<()> {
         let (_, _, intents) = resolved(true).await?;
         assert!(intents.contains(&"good_night".to_owned()), "{intents:?}");
+        Ok(())
+    }
+
+    /// An approve whose pre-render fails gives an error, and the entry stays `pending`.
+    #[tokio::test]
+    async fn failed_activation_keeps_the_entry_pending() -> anyhow::Result<()> {
+        let mut entry = fakes::learned("good_night", LearnedStatus::Pending);
+        entry.responses = vec!["{{ broken".to_owned()];
+        let (review, _) = reviewing(entry);
+        let result = review.resolve("good_night", true).await;
+        assert!(result.is_err(), "the resolve gave {result:?}");
+        assert_eq!(review.proposals()?.len(), 1, "good_night is pending");
         Ok(())
     }
 }

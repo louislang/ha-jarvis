@@ -4069,28 +4069,16 @@ mod tests {
     /// AC-14.7b-1. The test adds `tell_joke` as its activation does.
     #[tokio::test(start_paused = true)]
     async fn ac_14_7b_1_learned_intent_replies_from_its_pool() -> anyhow::Result<()> {
-        let (_cache, _changes, conversation) = still_with(
-            &Arc::default(),
-            "idle",
-            scripted(&["tell_joke"]),
-            Arc::default(),
-        );
+        let (_clock, conversation) = at(MONDAY, &["tell_joke"]);
         let mut entry = fakes::learned("tell_joke", LearnedStatus::Active);
         (entry.service, entry.responses) = (None, vec!["Why did the fan stop?".to_owned()]);
-        let pool = background::pool(&entry.responses);
-        let catalog = Catalog::clone(&conversation.catalog.load());
-        conversation
-            .catalog
-            .store(Arc::new(learn::live(catalog, vec![entry])));
-        conversation.pools.rcu(|pools| {
-            let mut pools = Pools::clone(pools);
-            pools.insert("tell_joke".to_owned(), pool.clone());
-            pools
-        });
-        let handled = conversation
-            .handle("tell me a joke", on_satellite())
-            .await?;
-        assert_eq!(handled.text, "Why did the fan stop?");
+        let mut pools = Pools::clone(&conversation.pools.load());
+        pools.insert("tell_joke".to_owned(), background::pool(&entry.responses));
+        conversation.pools.store(Arc::new(pools));
+        let live = learn::live(Catalog::clone(&conversation.catalog.load()), vec![entry]);
+        conversation.catalog.store(Arc::new(live));
+        let handled = conversation.handle("tell me a joke", on_satellite());
+        assert_eq!(handled.await?.text, "Why did the fan stop?");
         Ok(())
     }
 }
