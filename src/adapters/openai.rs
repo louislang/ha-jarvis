@@ -199,16 +199,17 @@ fn object(properties: &Value) -> Value {
     })
 }
 
-/// True when `value` and its nested values have each required property of `schema`.
-fn complete(schema: &Value, value: &Value) -> bool {
+/// True when `value` and its nested values have the required properties and arrays of `schema`.
+fn fits(schema: &Value, value: &Value) -> bool {
+    let items = |item| fits(&schema["items"], item);
     match value {
         Value::Object(object) => {
             let required = schema["required"].as_array().into_iter().flatten();
             let schemas = &schema["properties"];
-            let has = |key| matches!(object.get(key), Some(item) if complete(&schemas[key], item));
+            let has = |key| matches!(object.get(key), Some(item) if fits(&schemas[key], item));
             required.filter_map(Value::as_str).all(has)
         }
-        Value::Array(items) => items.iter().all(|item| complete(&schema["items"], item)),
+        Value::Array(list) => schema["type"] == "array" && list.iter().all(items),
         _ => true,
     }
 }
@@ -316,7 +317,6 @@ struct ProposalFields {
 
 /// The structured output of `propose`.
 #[derive(Deserialize)]
-#[serde(transparent)]
 struct Proposed(#[serde(with = "ProposalFields")] LearnedIntent);
 
 /// One `data` entry of a proposal.
@@ -738,7 +738,7 @@ impl OpenAiReasoner {
     ///
     /// # Errors
     ///
-    /// The request fails, or the output is not JSON or misses a property of the schema.
+    /// The request fails, or the output is not JSON or does not fit the schema.
     async fn structured(
         &self,
         format: ResponseFormatJsonSchema,
@@ -755,7 +755,7 @@ impl OpenAiReasoner {
         let response = self.create(request).await?;
         let text = response.output_text().context("the response has no text")?;
         let value: Value = serde_json::from_str(&text)?;
-        anyhow::ensure!(complete(&schema, &value), "the output misses a property");
+        anyhow::ensure!(fits(&schema, &value), "the output does not fit the schema");
         Ok(value)
     }
 
@@ -1721,10 +1721,9 @@ mod tests {
     }
 
     /// A valid `command` proposal of the structured output.
-    const PROPOSAL: &str = r#"{"name": "movie_mode", "kind": "command",
-        "examples": ["start movie mode"], "responses": ["Enjoy the film."],
-        "service": "scene.turn_on", "plugin": null, "target": "entity",
-        "select": [{"domain": "scene", "name": "movie", "device_class": null}],
+    const PROPOSAL: &str = r#"{"name": "movie_mode", "kind": "command", "service": "scene.turn_on",
+        "examples": ["start movie mode"], "responses": ["Enjoy the film."], "plugin": null,
+        "target": "entity", "select": [{"domain": "scene", "name": "movie", "device_class": null}],
         "data": [{"key": "transition", "value": "2"}], "question": null, "fresh_min": null,
         "needs": null}"#;
 
@@ -1792,6 +1791,8 @@ mod tests {
             PROPOSAL.replace("\"needs\": null", "\"needs\": null, \"colour\": 1"),
             PROPOSAL.replace("\"question\": null, ", ""),
             PROPOSAL.replace(", \"device_class\": null", ""),
+            PROPOSAL.replace("\"data\": [", "\"data\": [[\"transition\", \"2\"], "),
+            PROPOSAL.replace("\"select\": [", "\"select\": [[\"x\", null, null], "),
         ];
         for text in replies {
             let (result, _request) = proposed(&text).await?;
@@ -1801,19 +1802,17 @@ mod tests {
     }
 
     /// An embeddings response with two vectors.
-    const EMBEDDINGS: &str = r#"{"object": "list", "model": "text-embedding-3-small",
-        "data": [{"object": "embedding", "index": 0, "embedding": [0.5]},
-        {"object": "embedding", "index": 1, "embedding": [0.5]}],
-        "usage": {"prompt_tokens": 4, "total_tokens": 4}}"#;
+    const EMBEDDINGS: &str = r#"{"object": "list", "model": "text-embedding-3-small", "data": [
+        {"object": "embedding", "index": 0, "embedding": [0.5]}, {"object": "embedding",
+        "index": 1, "embedding": [0.5]}], "usage": {"prompt_tokens": 4, "total_tokens": 4}}"#;
 
     /// AC-14.4-4.
     #[tokio::test(start_paused = true)]
     async fn ac_14_4_4_embed_sends_one_request_and_gives_two_vectors() -> anyhow::Result<()> {
         let (server, reasoner) = mock("completed").await?;
-        let embeddings = ResponseTemplate::new(200).set_body_raw(EMBEDDINGS, "application/json");
         Mock::given(matchers::method("POST"))
             .and(matchers::path("/embeddings"))
-            .respond_with(embeddings)
+            .respond_with(ResponseTemplate::new(200).set_body_raw(EMBEDDINGS, "application/json"))
             .mount(&server)
             .await;
         let vectors = reasoner.embed(&["a".to_owned(), "b".to_owned()]).await?;
