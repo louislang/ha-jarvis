@@ -246,7 +246,7 @@ AC-14.5-1 to AC-14.5-5 and AC-14.5-9 move to sub-phase 14.5b as AC-14.5b-1 to AC
 
 **Acceptance criteria.**
 
-- AC-14.5c-1: When the check task starts with a cluster that is not covered, `FakeReasoner` records one `propose` call before virtual time advances, and a second one after `learn.check_interval_s`.
+- AC-14.5c-1: When the check task starts with a cluster that is not covered, `FakeReasoner` records one `propose` call before virtual time advances. When a second cluster that is not covered is added and virtual time advances by `learn.check_interval_s`, `FakeReasoner` records a second `propose` call with the texts of the second cluster only.
 - AC-14.5c-2: When `jarvis.toml` is loaded, `learn.file` is `learned.toml` and `learn.check_interval_s` is 3600.
 
 **Proofs.**
