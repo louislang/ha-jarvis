@@ -507,7 +507,8 @@ fn step(cache: &StateCache, tracker: &Tracker, area: &AreaId, least: Option<f64>
     found
 }
 
-/// The distance of `tracker` when its area sensor shows `area` and its distance sensor a number.
+/// The distance of `tracker` when its area sensor shows `area` and its distance sensor a finite
+/// number that is not negative.
 #[verus_spec(taken =>
     ensures
         reading(*cache, *tracker, *area, taken),
@@ -521,7 +522,12 @@ fn distance_in(cache: &StateCache, tracker: &Tracker, area: &AreaId) -> Option<f
         return None;
     }
     let distance = cache.states.get(tracker.distance_sensor.0.as_str())?;
-    f64::from_str(distance.state.as_str()).ok()
+    let value = f64::from_str(distance.state.as_str()).ok()?;
+    if value.is_finite() && value >= 0.0 {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 verus! {
@@ -691,13 +697,17 @@ pub open spec fn number(cache: StateCache, id: Seq<char>) -> Option<f64> {
 }
 
 /// True when `taken` is the number of the distance sensor of `tracker` when its area sensor names
-/// `area`, else `None`. Also `None` when the area sensor names another area too.
+/// `area` and the number is finite and not negative, else `None`. Also `None` when the area sensor
+/// names another area too.
 pub open spec fn reading(cache: StateCache, tracker: Tracker, area: AreaId, taken: Option<f64>) -> bool {
     let distance = number(cache, tracker.distance_sensor.0@);
     match taken {
-        Some(value) => shows_matching(cache, tracker.area_sensor.0@, area, true) && distance == Some(value),
+        Some(value) => shows_matching(cache, tracker.area_sensor.0@, area, true) && distance == Some(value)
+            && crate::domain::contracts::finite(value) && vstd::std_specs::cmp::ge_ensures::<f64>(value, 0.0f64, true),
         None => distance is None || !shows_matching(cache, tracker.area_sensor.0@, area, true)
-            || shows_matching(cache, tracker.area_sensor.0@, area, false),
+            || shows_matching(cache, tracker.area_sensor.0@, area, false)
+            || (distance matches Some(value) && (!crate::domain::contracts::finite(value)
+                || vstd::std_specs::cmp::ge_ensures::<f64>(value, 0.0f64, false))),
     }
 }
 
@@ -1049,6 +1059,20 @@ mod tests {
             ("unavailable", "0"),
             ("Office", "unavailable"),
             ("Office", "1"),
+        ];
+        assert_near(&readings, 0.5);
+    }
+
+    /// A distance that is NaN, infinite or negative does not count, so it cannot give a proximity
+    /// outside 0 to 1.
+    #[test]
+    fn distance_that_is_not_finite_or_is_negative_is_ignored() {
+        let readings = [
+            ("Office", "NaN"),
+            ("Office", "1"),
+            ("Office", "-0.5"),
+            ("Office", "-1"),
+            ("Office", "inf"),
         ];
         assert_near(&readings, 0.5);
     }

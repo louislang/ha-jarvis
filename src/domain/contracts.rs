@@ -525,6 +525,18 @@ pub fn ex_f64_from_str(text: &str) -> (result: Result<f64, ParseFloatError>)
     <f64 as FromStr>::from_str(text)
 }
 
+/// True when `value` is neither infinite nor NaN.
+pub uninterp spec fn finite(value: f64) -> bool;
+
+/// Gives whether `value` is neither infinite nor NaN. <https://doc.rust-lang.org/std/primitive.f64.html#method.is_finite>
+#[verifier::external_fn_specification]
+pub fn ex_f64_is_finite(value: f64) -> (result: bool)
+    ensures
+        result == finite(value),
+{
+    value.is_finite()
+}
+
 /// Parses `text` into a value of the type `F`. <https://doc.rust-lang.org/std/primitive.str.html#method.parse>
 #[verifier::external_fn_specification]
 pub fn ex_str_parse<F: FromStr>(text: &str) -> Result<F, F::Err> {
