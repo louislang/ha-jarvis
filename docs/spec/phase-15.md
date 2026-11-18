@@ -4,33 +4,53 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 ---
 
-### 15.1 Discovery
+### 15.1 Tracker Discovery
 
-**Goal:** Find each person's trackers and each satellite's presence sensors from the HA registries, with optional overrides in `jarvis.toml`. Speaker identification needs no manual entity list.
+**Goal:** Find the trackers of each person from the HA registries, with an optional override in `jarvis.toml`. Speaker identification needs no manual tracker list.
 
 - **Implements:** G12. **Depends on:** 14.13.
-- **Files:** create `src/domain/speaker.rs`. Modify `src/domain/state.rs`, `src/domain/state_cache.rs`, `src/lib.rs`, `jarvis.toml`.
+- **Files:** create `src/domain/speaker.rs`. Modify `src/lib.rs`, `jarvis.toml`.
 
 **Model.**
 
-- `trackers(cache, person) -> Vec<Tracker { area_sensor, distance_sensor }>`: from the `device_trackers` attribute of the `person` entity. For each tracker device: the sensor whose state is an area name, and the sensor with the unit `m`. `[[people]].trackers` replaces discovery when set.
-- `presence_sensors(cache, satellite_device) -> Vec<EntityId>`: the `binary_sensor` entities on the satellite device with device class `occupancy`, `presence` or `motion`. `[[satellites]].presence` replaces discovery when set.
-- This sub-phase adds `[[people]]` and the optional `[[satellites]]`.
+- `trackers(cache, person, configured) -> Vec<Tracker { area_sensor, distance_sensor }>`: `configured` when it is `Some`. Else from the `device_trackers` attribute of the `person` entity. For each tracker device: the sensor whose state is an area name, and the sensor with the unit `m`. A device without both sensors gives no tracker. `configured` is `[[people]].trackers`.
+- This sub-phase adds `[[people]]` (`person` and the optional `trackers`).
 
 **Acceptance criteria.**
 
 - AC-15.1-1: When `person.alex` has `device_trackers = [device_tracker.alex_watch]`, `trackers` returns the area and distance sensors on the watch device.
 - AC-15.1-2: When a sensor on the tracker device has the unit `m`, `trackers` uses it as the distance sensor.
 - AC-15.1-3: When `[[people]].trackers` is set, `trackers` returns it and does not use discovery.
-- AC-15.1-4: When the satellite device has a `binary_sensor` with device class `occupancy`, `presence_sensors` returns it.
-- AC-15.1-5: When a `binary_sensor` on the satellite device has no device class, `presence_sensors` does not return it.
-- AC-15.1-6: When `[[satellites]].presence` is set, `presence_sensors` returns it and does not use discovery.
 
 **Proofs.**
 
-- P-15.1-3, P-15.1-6. Ensures: with an override, the result is the override. Argument: both functions return the override first when it is `Some`.
-- P-15.1-4, P-15.1-5. Ensures: a `binary_sensor` of the satellite device is a presence sensor if and only if its device class is `occupancy`, `presence` or `motion`. Argument: the discovery filter requires a device class in the set of three. `None` is not in the set.
+- P-15.1-3. Ensures: with an override, the result is the override. Argument: `trackers` returns the override first when it is `Some`.
 - P-15.1-1, P-15.1-2. Ensures: each tracker has the sensor of its device whose state is an area name and the sensor with the unit `m`. Argument: the tracker filter selects sensors on the same device by the two stated predicates.
+
+---
+
+### 15.1b Presence Sensor Discovery
+
+**Goal:** Find the presence sensors of each satellite from the HA registries, with an optional override in `jarvis.toml`. Speaker identification needs no manual sensor list.
+
+- **Implements:** G12. **Depends on:** 15.1.
+- **Files:** modify `src/domain/speaker.rs`, `src/lib.rs`, `jarvis.toml`.
+
+**Model.**
+
+- `presence_sensors(cache, satellite_device, configured) -> Vec<EntityId>`: `configured` when it is `Some`. Else the `binary_sensor` entities on the satellite device with device class `occupancy`, `presence` or `motion`. `configured` is the `presence` list of the `[[satellites]]` entry of the satellite.
+- This sub-phase adds the optional `[[satellites]]` (`satellite` and `presence`).
+
+**Acceptance criteria.**
+
+- AC-15.1b-1: When the satellite device has a `binary_sensor` with device class `occupancy`, `presence_sensors` returns it.
+- AC-15.1b-2: When a `binary_sensor` on the satellite device has no device class, `presence_sensors` does not return it.
+- AC-15.1b-3: When `[[satellites]].presence` is set, `presence_sensors` returns it and does not use discovery.
+
+**Proofs.**
+
+- P-15.1b-3. Ensures: with an override, the result is the override. Argument: `presence_sensors` returns the override first when it is `Some`.
+- P-15.1b-1, P-15.1b-2. Ensures: a `binary_sensor` of the satellite device is a presence sensor if and only if its device class is `occupancy`, `presence` or `motion`. Argument: the discovery filter requires a device class in the set of three. `None` is not in the set.
 
 ---
 
@@ -38,7 +58,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Goal:** Read who is home, whether the satellite's room is occupied, and how close each person's phone or watch is to the satellite. Log a discovery report at startup, so you can check what Jarvis found.
 
-- **Implements:** G12. **Depends on:** 15.1.
+- **Implements:** G12. **Depends on:** 15.1b.
 - **Files:** modify `src/domain/speaker.rs`, `src/lib.rs`.
 
 **Model.**
