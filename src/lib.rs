@@ -350,7 +350,7 @@ impl Config {
     }
 
     /// The name and the value of each count and limit.
-    fn counts(&self) -> [(&'static str, u64); 11] {
+    fn counts(&self) -> [(&'static str, u64); 12] {
         let (openai, backfill, train) = (&self.openai, &self.backfill, &self.train);
         [
             ("tts.num_steps", u64::from(self.tts.num_steps)),
@@ -370,6 +370,7 @@ impl Config {
             ("dialog.max_turns", u64::from(self.dialog.max_turns)),
             ("train.epochs", train.epochs as u64),
             ("train.batch_size", train.batch_size as u64),
+            ("speaker.max_samples", self.speaker.max_samples as u64),
         ]
     }
 
@@ -749,6 +750,12 @@ pub struct MqttConfig {
 pub struct SpeakerConfig {
     /// The speaker embedding model file.
     pub model: PathBuf,
+    /// The voice store file.
+    pub voices: PathBuf,
+    /// The voice similarity of the same person.
+    pub voice_threshold: f32,
+    /// The samples that each profile keeps.
+    pub max_samples: usize,
 }
 
 /// The `Clock` of the system time.
@@ -2745,6 +2752,9 @@ mod tests {
     fn expected_speaker() -> SpeakerConfig {
         SpeakerConfig {
             model: PathBuf::from("models/wespeaker_en_voxceleb_CAM++.onnx"),
+            voices: PathBuf::from("voices.json"),
+            voice_threshold: 0.6,
+            max_samples: 20,
         }
     }
 
@@ -2818,6 +2828,17 @@ mod tests {
         assert!(
             error.contains("learn.check_interval_s") && error.contains("more than 0"),
             "error for learn.check_interval_s = 0 has no field or range: {error}"
+        );
+    }
+
+    /// A zero `speaker.max_samples` is an error, so `enroll` never empties a profile.
+    #[test]
+    fn zero_max_samples_names_field_and_range() {
+        let text = VALID.replace("max_samples = 20", "max_samples = 0");
+        let error = parse_error(&text);
+        assert!(
+            error.contains("speaker.max_samples") && error.contains("more than 0"),
+            "error for speaker.max_samples = 0 has no field or range: {error}"
         );
     }
 

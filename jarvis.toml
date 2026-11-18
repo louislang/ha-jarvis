@@ -144,6 +144,9 @@ password_env = "MQTT_PASSWORD"
 
 [speaker]
 model = "models/wespeaker_en_voxceleb_CAM++.onnx"
+voices = "voices.json"
+voice_threshold = 0.6 # voice similarity
+max_samples = 20
 
 # Optional. The people are the `person` entities of HA. An entry only replaces the discovered
 # trackers of one person.
