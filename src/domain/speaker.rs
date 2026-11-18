@@ -1,4 +1,4 @@
-//! Speaker identification: discovery of the person trackers.
+//! Speaker identification: discovery of the person trackers and the satellite presence sensors.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -160,6 +160,52 @@ fn is_distance_sensor(cache: &StateCache, entity: &Entity, device: &str) -> bool
                 if unit.as_str() == Some("m")))
 }
 
+/// The presence sensors of the satellite device `device`: `configured` when set, else its
+/// `binary_sensor` entities with the device class `occupancy`, `presence` or `motion`.
+#[verus_spec(found =>
+    ensures
+        configured matches Some(set) ==> found == set,
+        configured is None ==> presence_list(*cache, device@, found@, cache.entities@.len() as int),
+)]
+#[must_use]
+pub fn presence_sensors(
+    cache: &StateCache,
+    device: &str,
+    configured: Option<Vec<EntityId>>,
+) -> Vec<EntityId> {
+    if let Some(set) = configured {
+        return set;
+    }
+    let mut found = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= cache.entities@.len(),
+            presence_list(*cache, device@, found@, index as int),
+        decreases cache.entities@.len() - index,
+    ))]
+    while index < cache.entities.len() {
+        let entity = &cache.entities[index];
+        if is_presence(cache, entity, device) {
+            found.push(EntityId(entity.entity_id.0.clone()));
+        }
+        index += 1;
+    }
+    found
+}
+
+/// True when `entity` is a `binary_sensor` on `device` with the device class `occupancy`,
+/// `presence` or `motion`.
+#[verus_spec(found =>
+    ensures
+        found == presence(*cache, *entity, device@),
+)]
+fn is_presence(cache: &StateCache, entity: &Entity, device: &str) -> bool {
+    is_on(entity, "binary_sensor", device)
+        && matches!(cache.device_class(entity.entity_id.0.as_str()), Some(class)
+            if class == "occupancy" || class == "presence" || class == "motion")
+}
+
 verus! {
 
 broadcast use {
@@ -167,6 +213,7 @@ broadcast use {
     crate::domain::contracts::axiom_arc_str_borrow,
     crate::domain::contracts::axiom_arc_str_contains_borrowed_key,
     crate::domain::contracts::axiom_arc_str_maps_borrowed_key,
+    vstd::seq_lib::lemma_seq_contains_after_push,
 };
 
 /// True when `entity` is in `domain` on the device `device`.
@@ -213,6 +260,29 @@ pub open spec fn tracked(cache: StateCache, tracker: Tracker) -> bool {
     exists|device: Seq<char>| #[trigger] paired(cache, tracker, device)
 }
 
+/// True when `entity` is a `binary_sensor` on `device` with the device class `occupancy`,
+/// `presence` or `motion`.
+pub open spec fn presence(cache: StateCache, entity: Entity, device: Seq<char>) -> bool {
+    &&& on(entity, "binary_sensor"@, device)
+    &&& crate::domain::state_cache::device_class(cache, entity.entity_id.0@) matches Some(class)
+        && (class == "occupancy"@ || class == "presence"@ || class == "motion"@)
+}
+
+/// True when `id` is the ID of a presence sensor on `device` among the first `count` entities.
+pub open spec fn presence_among(cache: StateCache, device: Seq<char>, id: EntityId, count: int) -> bool {
+    exists|index: int| 0 <= index < count
+        && id == (#[trigger] cache.entities@[index]).entity_id && presence(cache, cache.entities@[index], device)
+}
+
+/// True when `found` lists exactly the presence sensors on `device` among the first `count`
+/// entities.
+pub open spec fn presence_list(cache: StateCache, device: Seq<char>, found: Seq<EntityId>, count: int) -> bool {
+    &&& forall|position: int| 0 <= position < found.len()
+        ==> presence_among(cache, device, #[trigger] found[position], count)
+    &&& forall|index: int| 0 <= index < count && presence(cache, #[trigger] cache.entities@[index], device)
+        ==> found.contains(cache.entities@[index].entity_id)
+}
+
 } // verus!
 
 /// Tests of discovery.
@@ -223,6 +293,12 @@ mod tests {
     use super::*;
     use crate::domain::state::Snapshot;
     use crate::testing::fakes::house;
+
+    /// The device of the Office satellite.
+    const OFFICE: &str = "1c8aff5b3943869c175c09b3c12f63d4";
+
+    /// The added `binary_sensor` on the Office satellite device.
+    const ADDED: &str = "binary_sensor.office_satellite";
 
     /// The entity ID `id`.
     fn id(id: &str) -> EntityId {
@@ -264,6 +340,20 @@ mod tests {
         trackers(&StateCache::load(snapshot), &id("person.alex"), configured)
     }
 
+    /// The presence sensors of the Office satellite when `ADDED` has the device class `class`, and
+    /// `configured` is the override.
+    fn office(class: &str, configured: Option<Vec<EntityId>>) -> Vec<EntityId> {
+        let mut snapshot = house();
+        add(
+            &mut snapshot,
+            ADDED,
+            OFFICE,
+            "on",
+            json!({ "device_class": class }),
+        );
+        presence_sensors(&StateCache::load(snapshot), OFFICE, configured)
+    }
+
     /// The tracker with the sensors `area` and `distance`.
     fn tracker(area: &str, distance: &str) -> Tracker {
         Tracker {
@@ -296,5 +386,30 @@ mod tests {
         )];
         let found = alex("sensor.alex_watch_distance", Some(configured.clone()));
         assert_eq!(found, configured);
+    }
+
+    /// AC-15.1b-1.
+    #[test]
+    fn ac_15_1b_1_occupancy_sensor_is_a_presence_sensor() {
+        assert_eq!(office("occupancy", None), [id(ADDED)]);
+    }
+
+    /// AC-15.1b-2.
+    #[test]
+    fn ac_15_1b_2_sensor_without_device_class_is_not_a_presence_sensor() {
+        let house = StateCache::load(house());
+        assert!(
+            house
+                .device_class("binary_sensor.office_presence")
+                .is_none()
+        );
+        assert_eq!(office("motion", None), [id(ADDED)]);
+    }
+
+    /// AC-15.1b-3.
+    #[test]
+    fn ac_15_1b_3_configured_presence_replaces_discovery() {
+        let configured = vec![id("binary_sensor.office_presence")];
+        assert_eq!(office("occupancy", Some(configured.clone())), configured);
     }
 }
