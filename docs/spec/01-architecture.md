@@ -199,7 +199,7 @@ With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan c
 
 | Crate | Layer | Use |
 |---|---|---|
-| `minijinja` | Domain | Response and service data templates. |
+| `minijinja` (feature `json`) | Domain | Response and service data templates. `tojson` writes a Plex title into a `plex://` content ID. |
 | `rand` | Domain | Response selection and context samples. |
 | `jiff` | Domain | Time zones, buckets and calendar dates. |
 | `text2num` | Domain | Number words to digits in the template filter `number` (sub-phase 18.9). |
@@ -596,7 +596,7 @@ service = "media_player.play_media"
 target = "entity"
 select = [{ domain = "media_player", name = "tv" }]
 title = "show"
-data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "shuffle": 1}' }
+data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": {{ show | tojson }}, "shuffle": 1}' }
 
 [[intent]]
 name = "temperature_query"

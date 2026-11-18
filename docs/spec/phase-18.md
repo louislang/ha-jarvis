@@ -256,7 +256,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 Two fix PRs add the title match below. As one PR, the fix changes about 590 lines, which is more than the limit of 400 (`02-rules.md` section 7.1, rule 8). Thus it has two parts, and the second part is on the first:
 
 - `Fix: Plex Title List` (about 310 lines) adds the `MediaLibrary` port, `Plex::titles`, `FakeLibrary`, the title refresh `start_titles`, its start in `run`, and the shared title list of the conversation use case. It modifies `src/ports.rs`, `src/adapters/plex.rs`, `src/app/background.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs` and `src/lib.rs`. Its criteria are AC-18.9-12 to AC-18.9-14.
-- `Fix: Match Plex Titles` (about 280 lines) adds `Intent.title`, the title match before `decide` and the pool `not_in_library`. It modifies `src/app/conversation.rs`, `src/domain/catalog.rs`, `src/domain/learn.rs` (`title: None` in a learned intent), `src/domain/responses.rs`, `intents.toml`, `responses.toml` and `README.md`. Its criteria are AC-18.9-5 to AC-18.9-11 and AC-18.9-15.
+- `Fix: Match Plex Titles` (about 300 lines) adds `Intent.title`, the title match before `decide`, the pool `not_in_library` and the JSON title in the content IDs. It modifies `src/app/conversation.rs`, `src/domain/catalog.rs`, `src/domain/learn.rs` (`title: None` in a learned intent), `src/domain/responses.rs`, `intents.toml`, `responses.toml`, `Cargo.toml` (the `minijinja` feature `json`) and `README.md`. Its criteria are AC-18.9-5 to AC-18.9-11, AC-18.9-15 and AC-18.9-16.
 
 - In the field test on 2026-11-17 on the Living Room satellite, "play vision quest on the tv" gave `tv_show` with `show = vision quest`. HA refused the call: "No episode results in 'TV Shows' for {'show_name': 'vision quest'}". The Plex title is "VisionQuest". "Turn on the matrix on the tv" gave `tv_show` with `show = the matrix`, but "The Matrix" is a movie, so HA refused the call too. Jarvis said "Playing vision quest." and then the `failure` answer.
 - `MediaLibrary` is a new driven port with one method: `titles() -> anyhow::Result<Vec<Title>>`. `Title { name, kind }` is in `src/ports.rs`. `kind` is the type of the Plex section of the title: `movie` or `show`. `Plex` (sub-phase 18.11) implements the port:
@@ -272,6 +272,7 @@ Two fix PRs add the title match below. As one PR, the fix changes about 590 line
   4. With no match, the decision is `Reply` from the new pool `not_in_library`, with no call.
   5. When the kind of the match is the `title` of the intent, the slot gets the name of the match.
   6. Else the top label becomes the first intent of the catalog whose `title` is the kind of the match, with the same probability. The old title slot is removed, and the slot with the name of the kind gets the name of the match. Thus a movie plays with `play_movie`, and a show plays with `tv_show`. When no intent has that kind, the decision is the `not_in_library` reply.
+- A Plex title can have a `"` or a `\`. The normalized transcript had no such character, but the matched title has it, and a quoted `"{{ show }}"` in a `plex://` content ID then gives JSON that is not valid. Thus each content ID of `tv_show`, `play_movie`, `continue_show` and `play_episode` writes the title with the `minijinja` filter `tojson` and no quotes around it, for example `"show_name": {{ show | tojson }}`. `tojson` gives the same text for a title without such characters, so AC-18.9-1 to AC-18.9-3 do not change. `tojson` needs the `minijinja` feature `json`.
 - The title list is in memory, so the match makes no network call before the reply. The reply then names the Plex title, for example "Playing VisionQuest.". The record of the request keeps the prediction of the model, and it gets the call of the retitled decision.
 - `validate_pools` (sub-phase 4.2) also checks that the pool `not_in_library` exists. `responses.toml` gets it: "That is not in the Plex library." and "I could not find that on Plex."
 - The call keeps the library name of its intent (`Movies` or `TV Shows`). A title of another movie or show section, for example a second movie library, also matches, and HA then does not find it in the library of the intent. A title that Plex added after the last refresh is missing for up to one hour, and Jarvis gives the `not_in_library` reply.
@@ -296,6 +297,7 @@ The tests of AC-18.9-5 to AC-18.9-11 use this title list, unless the criterion g
 - AC-18.9-13: When the mock returns status 401, a body without `MediaContainer`, or an item without `title`, `titles` returns an error.
 - AC-18.9-14: When `start_titles` runs with `FakeLibrary`, the shared list has the titles of the first call at once. After one hour of virtual time, it has the titles of the second call. When the second call fails, the list keeps the titles of the first call.
 - AC-18.9-15: When the pool `not_in_library` is missing, `validate_pools` returns an error that names it.
+- AC-18.9-16: When the title list has only the show `Paw Patrol "Live"` and the intent is `tv_show` with `show = paw patrol live`, the `media_content_id` is `plex://` and a JSON object whose `show_name` is `Paw Patrol "Live"`.
 
 **Proofs.**
 
@@ -305,6 +307,7 @@ The tests of AC-18.9-5 to AC-18.9-11 use this title list, unless the criterion g
 - P-18.9-11. Argument: the use case retitles only a clear prediction with a title slot and a list that is not empty. Else `decide` gets the prediction of the model and acts as before (P-18.9-1, sub-phase 4.5).
 - P-18.9-14. Argument: the task replaces the list only after a call succeeds.
 - P-18.9-15 (AC-18.9-15). Ensures: `validate_pools` gives `Ok` only when the pools have `not_in_library`. Argument: `validate_pools` requires the pool as it requires `ask_area`, and the spec function of valid pools gets the same key.
+- P-18.9-16. Argument: `compact` of the title and of the spoken title are both "pawpatrollive", and the template writes the title through `tojson`. Its JSON escaping comes from `minijinja` (`02-rules.md` section 5, rule 5).
 - P-18.9-12, P-18.9-13. Evidence: test.
 
 ---
