@@ -67,6 +67,30 @@ pub struct Signals {
     pub occupied: Option<bool>,
 }
 
+/// The signal that identified the speaker.
+#[verus_verify]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Source {
+    /// The only person at home.
+    Presence,
+    /// A tracker of the person near the satellite.
+    Proximity,
+    /// The voice, with no near tracker.
+    Voice,
+}
+
+/// The identified speaker of a request.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Speaker {
+    /// The `person` entity.
+    pub person: EntityId,
+    /// 1.0 from presence, else the score of the speaker.
+    pub confidence: f64,
+    /// The signal that identified the speaker.
+    pub source: Source,
+}
+
 /// The proximity and the voice similarity of one person.
 #[verus_verify]
 #[derive(Clone, Debug, PartialEq)]
@@ -680,6 +704,172 @@ fn person_signals(
     }
 }
 
+/// The speaker of `signals`: the only person at home, else the candidate whose proximity plus
+/// voice similarity is more than `threshold` and more than each other score plus `margin`.
+/// Proximity counts 0 when the room is not occupied. A candidate with a proximity of
+/// `enroll_threshold` or more has the source `Proximity`, else `Voice`.
+#[verus_spec(found =>
+    ensures
+        signals.home matches Some(home) ==> (home@.len() == 1 ==> present(found)
+            && found.unwrap().person.0@ == home@[0].0@ && found.unwrap().confidence == 1.0f64),
+        signals.home is None ==> !present(found),
+        by_score(*signals, found, threshold, margin),
+)]
+#[must_use]
+pub fn identify(
+    signals: &Signals,
+    threshold: f64,
+    margin: f64,
+    enroll_threshold: f64,
+) -> Option<Speaker> {
+    match &signals.home {
+        Some(home) if home.len() == 1 => {
+            return Some(Speaker {
+                person: EntityId(home[0].0.clone()),
+                confidence: 1.0,
+                source: Source::Presence,
+            });
+        }
+        _ => {}
+    }
+    let (top, top_score) = best(signals)?;
+    let above = top_score > threshold;
+    if !(above && leads(signals, top, top_score, margin)) {
+        return None;
+    }
+    proof! {
+        assert(chosen(*signals, top as int, threshold, margin));
+    }
+    let signal = &signals.people[top];
+    let source = if counted_proximity(signal, signals.occupied) >= enroll_threshold {
+        Source::Proximity
+    } else {
+        Source::Voice
+    };
+    Some(Speaker {
+        person: EntityId(signal.entity.0.clone()),
+        confidence: top_score,
+        source,
+    })
+}
+
+/// The first candidate of `signals` with the top score, and that score.
+#[verus_spec(found =>
+    ensures
+        found matches Some((index, value)) ==> candidate(*signals, index as int)
+            && scored(signals.people@[index as int], signals.occupied, value),
+)]
+fn best(signals: &Signals) -> Option<(usize, f64)> {
+    let mut found: Option<(usize, f64)> = None;
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= signals.people@.len(),
+            found matches Some((chosen, value)) ==> candidate(*signals, chosen as int)
+                && scored(signals.people@[chosen as int], signals.occupied, value),
+        decreases signals.people@.len() - index,
+    ))]
+    while index < signals.people.len() {
+        if is_candidate(signals, index) {
+            let value = score(&signals.people[index], signals.occupied);
+            let higher = match found {
+                Some((_, top)) => value > top,
+                None => true,
+            };
+            if higher {
+                found = Some((index, value));
+            }
+        }
+        index += 1;
+    }
+    found
+}
+
+/// True when `top_score` is more than the score plus `margin` of each candidate of `signals`
+/// other than `top`.
+#[verus_spec(found =>
+    ensures
+        found ==> forall|other: int| other != top && #[trigger] candidate(*signals, other)
+            ==> beaten(*signals, other, top_score, margin),
+)]
+fn leads(signals: &Signals, top: usize, top_score: f64, margin: f64) -> bool {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= signals.people@.len(),
+            forall|other: int| 0 <= other < index && other != top && #[trigger] candidate(*signals, other)
+                ==> beaten(*signals, other, top_score, margin),
+        decreases signals.people@.len() - index,
+    ))]
+    while index < signals.people.len() {
+        if index != top && is_candidate(signals, index) {
+            let sum = score(&signals.people[index], signals.occupied) + margin;
+            let ahead = top_score > sum;
+            if !ahead {
+                return false;
+            }
+        }
+        index += 1;
+    }
+    true
+}
+
+/// True when the person at `index` of `signals` is a candidate.
+#[verus_spec(found =>
+    requires
+        index < signals.people@.len(),
+    ensures
+        found == candidate(*signals, index as int),
+)]
+fn is_candidate(signals: &Signals, index: usize) -> bool {
+    let Some(home) = &signals.home else {
+        return true;
+    };
+    let id = signals.people[index].entity.0.as_str();
+    let mut position = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            position <= home@.len(),
+            signals.home == Some(*home),
+            index < signals.people@.len(),
+            id@ == signals.people@[index as int].entity.0@,
+            forall|seen: int| 0 <= seen < position ==> (#[trigger] home@[seen]).0@ != id@,
+        decreases home@.len() - position,
+    ))]
+    while position < home.len() {
+        if home[position].0.as_str() == id {
+            proof! {
+                assert(listed(home@, signals.people@[index as int].entity.0@));
+            }
+            return true;
+        }
+        position += 1;
+    }
+    false
+}
+
+/// The counted proximity plus the voice similarity of `signal`.
+#[verus_spec(found =>
+    ensures
+        scored(*signal, occupied, found),
+)]
+fn score(signal: &PersonSignals, occupied: Option<bool>) -> f64 {
+    counted_proximity(signal, occupied) + f64::from(signal.voice)
+}
+
+/// The proximity of `signal`, or 0 when the room is not occupied.
+#[verus_spec(found =>
+    ensures
+        found == counted(*signal, occupied),
+)]
+fn counted_proximity(signal: &PersonSignals, occupied: Option<bool>) -> f64 {
+    if matches!(occupied, Some(false)) {
+        0.0
+    } else {
+        signal.proximity
+    }
+}
+
 /// The entity IDs of `found`.
 #[verus_spec(ids =>
     ensures
@@ -1047,6 +1237,61 @@ pub open spec fn near(cache: StateCache, overrides: Seq<PersonTrackers>, person:
 pub open spec fn reads(cache: StateCache, overrides: Seq<PersonTrackers>, area: Option<&AreaId>, voice: Option<&BTreeMap<String, f32>>, signal: PersonSignals) -> bool {
     &&& near(cache, overrides, signal.entity.0@, area, signal.proximity)
     &&& signal.voice == heard(voice, signal.entity.0@)
+}
+
+/// True when `found` is a speaker with the source `Presence`.
+pub open spec fn present(found: Option<Speaker>) -> bool {
+    found matches Some(speaker) && speaker.source == Source::Presence
+}
+
+/// True when `found` is `None`, has the source `Presence`, or is the person of a candidate of
+/// `signals` that `chosen` accepts.
+pub open spec fn by_score(signals: Signals, found: Option<Speaker>, threshold: f64, margin: f64) -> bool {
+    match found {
+        Some(speaker) => speaker.source == Source::Presence || exists|index: int|
+            #[trigger] chosen(signals, index, threshold, margin)
+            && speaker.person.0@ == signals.people@[index].entity.0@,
+        None => true,
+    }
+}
+
+/// True when `id` is one of `ids`.
+pub open spec fn listed(ids: Seq<EntityId>, id: Seq<char>) -> bool {
+    exists|index: int| 0 <= index < ids.len() && (#[trigger] ids[index]).0@ == id
+}
+
+/// True when the person at `index` of `signals` is a candidate: at home, or any person when
+/// presence is not known.
+pub open spec fn candidate(signals: Signals, index: int) -> bool {
+    &&& 0 <= index < signals.people@.len()
+    &&& signals.home matches Some(home) ==> listed(home@, signals.people@[index].entity.0@)
+}
+
+/// The proximity of `signal` that counts: 0 when the room is not occupied.
+pub open spec fn counted(signal: PersonSignals, occupied: Option<bool>) -> f64 {
+    if occupied == Some(false) { 0.0f64 } else { signal.proximity }
+}
+
+/// True when `score` is the counted proximity plus the voice similarity of `signal`.
+pub open spec fn scored(signal: PersonSignals, occupied: Option<bool>, score: f64) -> bool {
+    vstd::std_specs::ops::add_ensures::<f64>(counted(signal, occupied), crate::domain::contracts::widened(signal.voice), score)
+}
+
+/// True when the score of the person at `index` of `signals` plus `margin` is less than `score`.
+pub open spec fn beaten(signals: Signals, index: int, score: f64, margin: f64) -> bool {
+    exists|other: f64, sum: f64| #[trigger] scored(signals.people@[index], signals.occupied, other)
+        && #[trigger] vstd::std_specs::ops::add_ensures::<f64>(other, margin, sum)
+        && vstd::std_specs::cmp::gt_ensures::<f64>(score, sum, true)
+}
+
+/// True when the candidate at `index` of `signals` has a score more than `threshold` and more
+/// than each other candidate score plus `margin`.
+pub open spec fn chosen(signals: Signals, index: int, threshold: f64, margin: f64) -> bool {
+    &&& candidate(signals, index)
+    &&& exists|score: f64| #[trigger] scored(signals.people@[index], signals.occupied, score)
+        && vstd::std_specs::cmp::gt_ensures::<f64>(score, threshold, true)
+        && forall|other: int| other != index && #[trigger] candidate(signals, other)
+            ==> beaten(signals, other, score, margin)
 }
 
 /// The similarity of `person` in `voice`, or 0.
@@ -1450,5 +1695,83 @@ mod tests {
             ("person.sam".to_owned(), 0.0),
         ];
         assert_eq!(found, expected);
+    }
+
+    /// The signals of `person.alex` and `person.sam`, each with its proximity and voice
+    /// similarity, with `home` and `occupied`.
+    fn scene(
+        home: Option<&[&str]>,
+        occupied: Option<bool>,
+        alex: (f64, f32),
+        sam: (f64, f32),
+    ) -> Signals {
+        let person = |entity: &str, (proximity, voice): (f64, f32)| PersonSignals {
+            entity: id(entity),
+            proximity,
+            voice,
+        };
+        Signals {
+            home: home.map(|home| home.iter().map(|entity| id(entity)).collect()),
+            people: vec![person("person.alex", alex), person("person.sam", sam)],
+            occupied,
+        }
+    }
+
+    /// The speaker and source of `signals` with the thresholds of `jarvis.toml`.
+    fn speaker_of(signals: &Signals) -> Option<(String, Source)> {
+        let found = identify(signals, 0.6, 0.15, 0.5)?;
+        Some((found.person.0, found.source))
+    }
+
+    /// Both people at home.
+    const BOTH: Option<&[&str]> = Some(&["person.alex", "person.sam"]);
+
+    /// AC-15.6c-1.
+    #[test]
+    fn ac_15_6c_1_only_person_at_home_is_the_speaker() {
+        let signals = scene(Some(&["person.alex"]), None, (0.0, 0.0), (0.0, 0.0));
+        let expected = Speaker {
+            person: id("person.alex"),
+            confidence: 1.0,
+            source: Source::Presence,
+        };
+        assert_eq!(identify(&signals, 0.6, 0.15, 0.5), Some(expected));
+    }
+
+    /// AC-15.6c-2.
+    #[test]
+    fn ac_15_6c_2_watch_in_the_area_identifies_its_owner() {
+        let signals = scene(BOTH, Some(true), (0.8, 0.0), (0.0, 0.0));
+        let expected = ("person.alex".to_owned(), Source::Proximity);
+        assert_eq!(speaker_of(&signals), Some(expected));
+    }
+
+    /// AC-15.6c-3.
+    #[test]
+    fn ac_15_6c_3_empty_room_gives_proximity_no_weight() {
+        let signals = scene(BOTH, Some(false), (1.0, 0.0), (0.0, 0.0));
+        assert_eq!(speaker_of(&signals), None);
+    }
+
+    /// AC-15.6c-4.
+    #[test]
+    fn ac_15_6c_4_voice_identifies_the_speaker() {
+        let signals = scene(BOTH, None, (0.0, 0.9), (0.0, 0.1));
+        let expected = ("person.alex".to_owned(), Source::Voice);
+        assert_eq!(speaker_of(&signals), Some(expected));
+    }
+
+    /// AC-15.6c-5.
+    #[test]
+    fn ac_15_6c_5_close_scores_give_no_speaker() {
+        let signals = scene(BOTH, None, (0.0, 0.9), (0.0, 0.8));
+        assert_eq!(speaker_of(&signals), None);
+    }
+
+    /// AC-15.6c-6.
+    #[test]
+    fn ac_15_6c_6_unknown_presence_identifies_no_one() {
+        let signals = scene(None, None, (0.0, 0.0), (0.0, 0.0));
+        assert_eq!(speaker_of(&signals), None);
     }
 }

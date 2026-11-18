@@ -756,6 +756,12 @@ pub struct SpeakerConfig {
     pub voice_threshold: f32,
     /// The samples that each profile keeps.
     pub max_samples: usize,
+    /// The combined score of proximity and voice that identifies a speaker.
+    pub threshold: f64,
+    /// The lead of the top score over each other score.
+    pub margin: f64,
+    /// The proximity that gives the source `Proximity`.
+    pub enroll_threshold: f64,
 }
 
 /// The `Clock` of the system time.
@@ -2756,6 +2762,9 @@ mod tests {
             voices: PathBuf::from("voices.json"),
             voice_threshold: 0.6,
             max_samples: 20,
+            threshold: 0.6,
+            margin: 0.15,
+            enroll_threshold: 0.5,
         }
     }
 

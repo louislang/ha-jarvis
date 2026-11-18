@@ -1181,6 +1181,18 @@ pub axiom fn axiom_total_order_f64_is_total()
         total(total_order_f64()),
 ;
 
+/// The `f64` with the value of the `f32` `value`.
+pub uninterp spec fn widened(value: f32) -> f64;
+
+/// Converts `value` to `f64` without loss. <https://doc.rust-lang.org/std/primitive.f64.html#impl-From%3Cf32%3E-for-f64>
+#[verifier::external_fn_specification]
+pub fn ex_f64_from_f32(value: f32) -> (wide: f64)
+    ensures
+        wide == widened(value),
+{
+    <f64 as From<f32>>::from(value)
+}
+
 /// The Jaro-Winkler similarity of `a` and `b`.
 pub uninterp spec fn jaro_winkler(a: Seq<char>, b: Seq<char>) -> f64;
 
