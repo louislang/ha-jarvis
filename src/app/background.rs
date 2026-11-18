@@ -23,8 +23,10 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::BackfillConfig;
+use crate::Config;
 use crate::LearnConfig;
 use crate::app::conversation::Change;
+use crate::app::conversation::Conversation;
 use crate::app::speech::Speech;
 use crate::domain::catalog::Catalog;
 use crate::domain::feedback::Deferred;
@@ -33,6 +35,7 @@ use crate::domain::learn;
 use crate::domain::learn::Cluster;
 use crate::domain::learn::Learned;
 use crate::domain::learn::LearnedIntent;
+use crate::domain::learn::LearnedKind;
 use crate::domain::learn::LearnedStatus;
 use crate::domain::learn::Point;
 use crate::domain::responses;
@@ -670,6 +673,135 @@ pub fn start_learning(learning: Learning, interval: Duration) -> JoinHandle<()> 
     })
 }
 
+/// A prefetched answer and its time.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Answer {
+    /// The text.
+    pub text: String,
+    /// The time when the answer was complete.
+    pub time: Timestamp,
+}
+
+/// The prefetch of the answers of the active prefetch intents.
+pub struct Prefetch {
+    /// System Two, which answers the questions.
+    conversation: Conversation,
+    /// The learned intents file, the pre-render and the time.
+    activation: Activation,
+    /// The request habits, which give the usual times and the HA time zone.
+    habits: Arc<Habits>,
+    /// The least decayed score of a usual time.
+    min_score: f64,
+    /// The minutes of the window before the hour of a usual time.
+    lead_min: u64,
+    /// The time of the last prefetch of each intent.
+    attempts: Mutex<BTreeMap<String, Timestamp>>,
+    /// The stored answer of each intent.
+    answers: Mutex<BTreeMap<String, Answer>>,
+}
+
+impl Prefetch {
+    /// The prefetch of `conversation` for the entries of the file of `activation`, in the windows
+    /// of the usual times of `habits` with `habits.min_score` and `learn.prefetch_lead_min` of
+    /// `config`.
+    #[must_use]
+    pub fn new(
+        conversation: Conversation,
+        activation: Activation,
+        habits: Arc<Habits>,
+        config: &Config,
+    ) -> Self {
+        Self {
+            conversation,
+            activation,
+            habits,
+            min_score: config.habits.min_score,
+            lead_min: config.learn.prefetch_lead_min,
+            attempts: Mutex::default(),
+            answers: Mutex::default(),
+        }
+    }
+
+    /// Prefetches the answer of each active prefetch entry of the learned intents file whose
+    /// refresh is due at the time before it. Sets its attempt time first. Logs a failed load.
+    pub async fn tick(&self) {
+        let learned = match self.activation.load().await {
+            Ok(learned) => learned.intents,
+            Err(error) => return tracing::warn!("the learned intents did not load: {error:#}"),
+        };
+        for entry in learned {
+            let now = self.activation.clock.now();
+            if let Some(question) = self.due(&entry, now) {
+                lock(&self.attempts).insert(entry.name.clone(), now);
+                self.run(&entry.name, &question).await;
+            }
+        }
+    }
+
+    /// The question of `entry` when it is an active prefetch entry whose refresh is due at `now`.
+    fn due(&self, entry: &LearnedIntent, now: Timestamp) -> Option<String> {
+        let (LearnedStatus::Active, LearnedKind::Prefetch, Some(question), Some(fresh_min)) =
+            (entry.status, entry.kind, &entry.question, entry.fresh_min)
+        else {
+            return None;
+        };
+        let zone = self.habits.zone()?;
+        let today = zone.to_datetime(now).date();
+        let (half_life_days, min_score) = (self.habits.half_life_days, self.min_score);
+        let model = self.habits.current()?;
+        let usual = model.usual_times(&entry.name, today, half_life_days, min_score);
+        let attempt = lock(&self.attempts).get(&entry.name).copied();
+        let due = learn::refresh_due(&usual, attempt, now, &zone, self.lead_min, fresh_min);
+        due.then(|| question.clone())
+    }
+
+    /// Stores the answer to the prefetch question `question` of the intent `name` after its
+    /// pre-render, as `store` does. A failed answer or pre-render logs and keeps the stored answer.
+    async fn run(&self, name: &str, question: &str) {
+        let speech = &self.activation.speech;
+        let answer = match self.conversation.prefetch(question).await {
+            Ok(Some(text)) => speech.render(&text).await.map(|()| Some(text)),
+            other => other,
+        };
+        match answer {
+            Ok(answer) => self.store(name, answer),
+            Err(error) => tracing::warn!("the prefetch of {name} failed: {error:#}"),
+        }
+    }
+
+    /// Stores `answer` of the intent `name` with the current time, or removes the stored answer
+    /// without `answer`. Drops the audio of a replaced or removed answer that no stored answer has.
+    fn store(&self, name: &str, answer: Option<String>) {
+        let time = self.activation.clock.now();
+        let mut answers = lock(&self.answers);
+        let old = match answer {
+            Some(text) => answers.insert(name.to_owned(), Answer { text, time }),
+            None => answers.remove(name),
+        };
+        let stored = |old: &Answer| answers.values().any(|answer| answer.text == old.text);
+        if let Some(old) = old.filter(|old| !stored(old)) {
+            self.activation.speech.forget(&old.text);
+        }
+    }
+}
+
+/// Starts a task that runs the `tick` of `prefetch` at once and each minute.
+#[must_use]
+pub fn start_prefetch(prefetch: Prefetch) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(Duration::from_mins(1));
+        loop {
+            ticks.tick().await;
+            prefetch.tick().await;
+        }
+    })
+}
+
+/// The value of `mutex`.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().expect("no lock holder panics")
+}
+
 /// Prunes `log` at the `clock` time once a day, the first time one day after the start. Logs a
 /// failed prune.
 pub async fn prune(log: Arc<dyn InteractionLog>, clock: Arc<dyn Clock>) {
@@ -792,7 +924,13 @@ mod tests {
 
     use super::*;
     use crate::Config;
+    use crate::CurrentClassifier;
     use crate::app::conversation;
+    use crate::app::conversation::Queues;
+    use crate::app::conversation::Recorder;
+    use crate::app::conversation::SystemTwo;
+    use crate::app::speech::Utterances;
+    use crate::app::training::FIXTURE;
     use crate::domain::catalog::Filter;
     use crate::domain::catalog::Target;
     use crate::domain::habits::Bucket;
@@ -800,6 +938,8 @@ mod tests {
     use crate::domain::learn::LearnedKind;
     use crate::domain::state::Snapshot;
     use crate::domain::state::State;
+    use crate::testing::fakes;
+    use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeLog;
@@ -807,6 +947,8 @@ mod tests {
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeStt;
     use crate::testing::fakes::FakeTts;
+    use crate::testing::fakes::Scripted;
+    use crate::testing::fakes::SetClock;
     use crate::testing::fakes::house;
     use crate::testing::fakes::log_dispatch;
 
@@ -2010,6 +2152,198 @@ mod tests {
         assert_eq!(learned_pools(&learner)?, source);
         assert!(entries[0].activated.is_some(), "{entries:?}");
         assert_eq!(entries[1].activated, None);
+        Ok(())
+    }
+
+    /// The question of the prefetch tests.
+    const QUESTION: &str = "What is on the family calendar today?";
+
+    /// The intent of the prefetch tests.
+    const CALENDAR: &str = "family_calendar";
+
+    /// Thursday 08:00 after `monday()`.
+    fn thursday() -> Timestamp {
+        monday() + SignedDuration::from_mins(3 * 24 * 60 - 10)
+    }
+
+    /// A prefetch on the System Two, the TTS, the habits and the file of a check, and its clock.
+    struct Prefetcher {
+        /// The prefetch.
+        prefetch: Prefetch,
+        /// The check.
+        learner: Learner,
+        /// The time.
+        clock: Arc<SetClock>,
+    }
+
+    impl Prefetcher {
+        /// The prefetch of [`prefetch_calendar`] of `names` with `jarvis.toml` at `thursday()`.
+        fn new(names: &[&str]) -> anyhow::Result<Self> {
+            let config = Config::parse(include_str!("../../jarvis.toml"))?;
+            let learner = Learner::empty();
+            prefetch_calendar(&learner, names)?;
+            let clock = Arc::new(SetClock(Mutex::new(thursday())));
+            let reasoner = Arc::clone(&learner.reasoner) as _;
+            let mut two =
+                crate::system_two(&config, reasoner, crate::registry(&config, Vec::new()));
+            two.clock = Arc::clone(&clock) as _;
+            let conversation = prefetch_conversation(&config, &learner, two);
+            let habits = Arc::clone(&learner.learning.habits);
+            let mut activation = learner.learning.activation.clone();
+            activation.clock = Arc::clone(&clock) as _;
+            let prefetch = Prefetch::new(conversation, activation, habits, &config);
+            Ok(Self {
+                prefetch,
+                learner,
+                clock,
+            })
+        }
+
+        /// Runs one tick at `minutes` after `thursday()` with the answer `steps`.
+        async fn tick(&self, minutes: i64, steps: Vec<Scripted>) {
+            *lock(&self.clock.0) = thursday() + SignedDuration::from_mins(minutes);
+            self.learner.reasoner.script(steps);
+            self.prefetch.tick().await;
+        }
+    }
+
+    /// Saves an active prefetch entry of [`QUESTION`] for each of `names`, used weekdays at 08:00.
+    fn prefetch_calendar(learner: &Learner, names: &[&str]) -> anyhow::Result<()> {
+        let mut intents = Vec::new();
+        for name in names {
+            let mut entry = proposal(LearnedKind::Prefetch, None);
+            (entry.name, entry.status) = ((*name).to_owned(), LearnedStatus::Active);
+            (entry.question, entry.fresh_min) = (Some(QUESTION.to_owned()), Some(30));
+            for day in 0..3 {
+                let time = monday() + SignedDuration::from_hours(24 * day);
+                learner.learning.habits.observe((*name).to_owned(), time);
+            }
+            intents.push(entry);
+        }
+        learner.store.save(&Learned { intents })
+    }
+
+    /// A recorder with a log writer that has ended, at `clock`.
+    fn ended_recorder(clock: &Arc<dyn Clock>) -> Recorder {
+        Recorder {
+            utterances: Arc::new(Utterances::new(Arc::clone(clock), 10)),
+            writer: tokio::sync::mpsc::unbounded_channel().0,
+            last_id: None,
+            trigger: fakes::trigger("unused".as_ref()).0,
+        }
+    }
+
+    /// A conversation of `config` on `FakeHome` and `two`, with the habits and the hot cache, the
+    /// live catalog and the pre-render of the activation of `learner`.
+    fn prefetch_conversation(config: &Config, learner: &Learner, two: SystemTwo) -> Conversation {
+        let (activation, wait) = (&learner.learning.activation, Duration::from_secs(1));
+        let (home, cache) = (Arc::new(FakeHome::default()), activation.cache.clone());
+        let queues = Arc::new(Queues::new(home, cache, wait, wait, config.dialog.clone()));
+        let classifier = Arc::new(FakeClassifier::default());
+        let classifier = Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), classifier));
+        let recorder = ended_recorder(&two.clock);
+        let backfill = crate::backfill(config, &two.reasoner, activation);
+        let (catalog, threshold) = (Arc::clone(&activation.catalog), config.model.threshold);
+        let pools = Arc::new(ArcSwap::from_pointee(Pools::new()));
+        let habits = Arc::clone(&learner.learning.habits);
+        Conversation::new(
+            pools, backfill, queues, classifier, catalog, threshold, two, habits, recorder,
+        )
+    }
+
+    /// The answer `sentence`.
+    fn said(sentence: &'static str) -> Vec<Scripted> {
+        vec![Scripted::Sentence(sentence), Scripted::Done]
+    }
+
+    /// AC-14.10c-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10c_1_due_refresh_asks_the_question() -> anyhow::Result<()> {
+        let prefetcher = Prefetcher::new(&[CALENDAR])?;
+        prefetcher.tick(0, said("Two events.")).await;
+        assert_eq!(prefetcher.learner.reasoner.questions(), [QUESTION]);
+        Ok(())
+    }
+
+    /// AC-14.10c-2. A new answer also drops the audio of the old one.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10c_2_answer_audio_is_cached() -> anyhow::Result<()> {
+        let prefetcher = Prefetcher::new(&[CALENDAR])?;
+        prefetcher.tick(0, said("Two events.")).await;
+        let speech = &prefetcher.prefetch.activation.speech;
+        let tts = &prefetcher.learner.tts;
+        let synths = tts.texts().len();
+        speech.speak("Two events.").await?;
+        assert_eq!(tts.texts().len(), synths, "the answer has no audio");
+        prefetcher.tick(30, said("Three events.")).await;
+        speech.speak("Two events.").await?;
+        assert_eq!(tts.texts().len(), synths + 2, "the old audio stays");
+        Ok(())
+    }
+
+    /// AC-14.10c-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10c_3_error_keeps_the_old_answer() -> anyhow::Result<()> {
+        let prefetcher = Prefetcher::new(&[CALENDAR])?;
+        prefetcher.tick(0, said("Old.")).await;
+        let steps = vec![Scripted::Sentence("New."), Scripted::Error("lost")];
+        prefetcher.tick(30, steps).await;
+        let answer = lock(&prefetcher.prefetch.answers).get(CALENDAR).cloned();
+        assert_eq!(
+            answer.map(|answer| (answer.text, answer.time)),
+            Some(("Old.".to_owned(), thursday()))
+        );
+        Ok(())
+    }
+
+    /// AC-14.10c-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10c_4_window_gives_three_prefetches() -> anyhow::Result<()> {
+        let prefetcher = Prefetcher::new(&[CALENDAR])?;
+        let (mut asked, reasoner) = (Vec::new(), &prefetcher.learner.reasoner);
+        for minutes in -10..=70 {
+            let before = reasoner.questions().len();
+            prefetcher.tick(minutes, Vec::new()).await;
+            if reasoner.questions().len() > before {
+                asked.push(minutes);
+            }
+        }
+        assert_eq!(asked, [-5, 25, 55]);
+        Ok(())
+    }
+
+    /// A tick from 08:59 skips its second intent when the first answer ends at 09:00.
+    #[tokio::test(start_paused = true)]
+    async fn each_intent_of_a_tick_reads_the_clock() -> anyhow::Result<()> {
+        let prefetcher = Prefetcher::new(&[CALENDAR, "school_calendar"])?;
+        let late = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            *lock(&prefetcher.clock.0) = thursday() + SignedDuration::from_hours(1);
+        };
+        let slow = vec![Scripted::Wait(Duration::from_secs(2)), Scripted::Done];
+        tokio::join!(prefetcher.tick(59, slow), late);
+        assert_eq!(prefetcher.learner.reasoner.questions(), [QUESTION]);
+        Ok(())
+    }
+
+    /// A refresh keeps old audio that `school_calendar` still stores or that a pool has.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_keeps_audio_in_use() -> anyhow::Result<()> {
+        let prefetcher = Prefetcher::new(&[CALENDAR, "school_calendar"])?;
+        let speech = &prefetcher.prefetch.activation.speech;
+        let tts = &prefetcher.learner.tts;
+        let pools = Pools::from([("hello".to_owned(), pool(&["Hello.".to_owned()]))]);
+        speech.prerender(&pools, &[]).await?;
+        prefetcher.learner.reasoner.script(said("Two events."));
+        prefetcher.tick(-5, said("Two events.")).await;
+        for (minutes, text) in [(25, "Hello."), (55, "Three events.")] {
+            prefetcher.learner.reasoner.script(said(text));
+            prefetcher.tick(minutes, Vec::new()).await;
+        }
+        let synths = tts.texts().len();
+        speech.speak("Two events.").await?;
+        speech.speak("Hello.").await?;
+        assert_eq!(tts.texts().len(), synths, "the audio in use stays");
         Ok(())
     }
 }

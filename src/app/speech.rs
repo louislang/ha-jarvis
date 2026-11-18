@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
+use dashmap::DashSet;
 use jiff::Timestamp;
 use serde_json::Map;
 use serde_json::Value;
@@ -347,6 +348,8 @@ pub struct Speech {
     tts: Arc<dyn TextToSpeech>,
     /// The audio of each pre-rendered text.
     cache: DashMap<String, Arc<Audio>>,
+    /// The pre-rendered pool texts, whose audio `forget` keeps.
+    pooled: DashSet<String>,
 }
 
 impl Speech {
@@ -356,6 +359,7 @@ impl Speech {
         Self {
             tts,
             cache: DashMap::new(),
+            pooled: DashSet::new(),
         }
     }
 
@@ -379,10 +383,27 @@ impl Speech {
     /// A template does not parse or render, or a synthesis fails.
     pub async fn prerender(&self, pools: &Pools, areas: &[String]) -> anyhow::Result<()> {
         for text in texts(pools, areas)? {
-            let audio = self.tts.synth(&text).await?;
-            self.cache.insert(text, Arc::new(audio));
+            self.render(&text).await?;
+            self.pooled.insert(text);
         }
         Ok(())
+    }
+
+    /// Synthesizes and caches `text`.
+    ///
+    /// # Errors
+    ///
+    /// The synthesis fails.
+    pub async fn render(&self, text: &str) -> anyhow::Result<()> {
+        let audio = self.tts.synth(text).await?;
+        self.cache.insert(text.to_owned(), Arc::new(audio));
+        Ok(())
+    }
+
+    /// Drops the cached audio of `text` unless it is a pre-rendered pool text.
+    pub fn forget(&self, text: &str) {
+        self.cache
+            .remove_if(text, |_, _| !self.pooled.contains(text));
     }
 }
 

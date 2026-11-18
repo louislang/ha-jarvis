@@ -50,6 +50,7 @@ use tokio::sync::RwLock;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio_util::task::AbortOnDropHandle;
 use tokio_util::task::TaskTracker;
 use tracing::Subscriber;
 use tracing_subscriber::EnvFilter;
@@ -71,6 +72,7 @@ use crate::app::background::Backfill;
 use crate::app::background::Habits;
 use crate::app::background::HabitsTask;
 use crate::app::background::Learning;
+use crate::app::background::Prefetch;
 use crate::app::conversation::Change;
 use crate::app::conversation::Conversation;
 use crate::app::conversation::PoolsTask;
@@ -874,6 +876,8 @@ pub struct App {
     listener: Listener,
     /// The `speak` use case.
     speech: Arc<Speech>,
+    /// The prefetch task. It holds a sender of the pools task, so it stops when the app drops.
+    _prefetch: Option<AbortOnDropHandle<()>>,
 }
 
 #[async_trait]
@@ -1444,6 +1448,12 @@ type Started = (
     Arc<LiveModels>,
 );
 
+/// The pools task, the queues, the habit task and the reasoner of an app.
+type Parts = (PoolsTask, Arc<Queues>, HabitsTask, Arc<dyn Reasoner>);
+
+/// The live models, the listener, the activation, the recorder and the log of an app.
+type Loaded = (Arc<LiveModels>, Listener, Activation, (Recorder, Logged));
+
 /// A log writer task, the review of its log, and the receiver of the error text of a failed
 /// `restore` of the training run. Also the training trigger task, the learned intent check task
 /// and the [`Shared`] of the trigger.
@@ -1844,7 +1854,20 @@ async fn start_app_with(
     )
     .await?;
     let prerender = start_prerender(&activation.speech, &task.pools, &cache);
-    Ok((
+    let parts = (task, queues, habits, reasoner);
+    let loaded = (models, listener, activation, (recorder, logged));
+    Ok(started(config, parts, system_two, loaded, prerender))
+}
+
+/// The app of `config`, `parts`, `system_two`, `loaded` and `prerender`. Starts its prefetch.
+fn started(
+    config: &Config,
+    (task, queues, habits, reasoner): Parts,
+    system_two: SystemTwo,
+    (models, listener, activation, (recorder, logged)): Loaded,
+    prerender: JoinHandle<()>,
+) -> Started {
+    let mut started = (
         App {
             conversation: Conversation::new(
                 task.pools,
@@ -1858,12 +1881,22 @@ async fn start_app_with(
                 recorder,
             ),
             listener,
-            speech: activation.speech,
+            speech: Arc::clone(&activation.speech),
+            _prefetch: None,
         },
         (task.task, habits, logged),
         prerender,
         models,
-    ))
+    );
+    let conversation = started.0.conversation.clone();
+    let habits = Arc::clone(&started.1.1.habits);
+    let prefetch = Prefetch::new(conversation, activation, habits, config);
+    let task = AbortOnDropHandle::new(app::background::start_prefetch(prefetch));
+    started.0 = App {
+        _prefetch: Some(task),
+        ..started.0
+    };
+    started
 }
 
 /// The recorder of the utterances of `listener` on the log of `config` with the training trigger,
@@ -3268,6 +3301,7 @@ mod tests {
             conversation: conversation(&config, catalog, classifier, &speech, utterances)?,
             listener,
             speech,
+            _prefetch: None,
         })
     }
 
