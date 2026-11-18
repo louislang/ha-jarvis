@@ -95,10 +95,10 @@ use crate::domain::model::Prediction;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Pools;
 use crate::domain::responses::Response;
-use crate::domain::speaker::Tracker;
+use crate::domain::speaker::PersonTrackers;
+use crate::domain::speaker::Satellite;
 use crate::domain::speech::Audio;
 use crate::domain::speech::CommitPolicy;
-use crate::domain::state::EntityId;
 use crate::domain::state::Snapshot;
 use crate::domain::state_cache::StateCache;
 use crate::domain::training::Settings;
@@ -237,10 +237,10 @@ pub struct Config {
     pub mqtt: Option<MqttConfig>,
     /// The tracker overrides of the people. The people are the `person` entities of HA.
     #[serde(default)]
-    pub people: Vec<PersonConfig>,
+    pub people: Vec<PersonTrackers>,
     /// The satellites whose presence sensors replace discovery.
     #[serde(default)]
-    pub satellites: Vec<SatelliteConfig>,
+    pub satellites: Vec<Satellite>,
 }
 
 impl Config {
@@ -737,26 +737,6 @@ pub struct MqttConfig {
     pub username_env: String,
     /// The environment variable with the password.
     pub password_env: String,
-}
-
-/// A `[[people]]` entry: the trackers that replace discovery for one person.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct PersonConfig {
-    /// The `person` entity.
-    pub person: EntityId,
-    /// The trackers that replace discovery.
-    pub trackers: Vec<Tracker>,
-}
-
-/// A `[[satellites]]` entry.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
-pub struct SatelliteConfig {
-    /// The `assist_satellite` entity.
-    pub satellite: EntityId,
-    /// The presence sensors that replace discovery.
-    pub presence: Vec<EntityId>,
 }
 
 /// The `Clock` of the system time.
@@ -1905,6 +1885,7 @@ async fn start_app_with(
     )
     .await?;
     let prerender = start_prerender(&activation.speech, &task.pools, &cache);
+    start_report(config, &cache);
     let parts = (task, queues, habits, reasoner);
     let loaded = (models, listener, activation, (recorder, logged));
     Ok(started(config, parts, system_two, loaded, prerender))
@@ -2359,6 +2340,22 @@ fn start_prerender(
             tracing::warn!("the pre-render failed: {error:#}");
         }
     })
+}
+
+/// Starts a task that logs the discovery report of the first snapshot in `cache`, with the
+/// overrides of `config`.
+fn start_report(config: &Config, cache: &watch::Receiver<StateCache>) {
+    let (people, satellites) = (config.people.clone(), config.satellites.clone());
+    let mut cache = cache.clone();
+    tokio::spawn(async move {
+        if cache.changed().await.is_err() {
+            return;
+        }
+        let report = domain::speaker::discovery_report(&cache.borrow(), &people, &satellites);
+        for line in report {
+            tracing::info!("discovery: {line}");
+        }
+    });
 }
 
 /// Sets a panic hook that, after the default hook, exits with `adapters::settings::panic_code`
