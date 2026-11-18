@@ -24,6 +24,7 @@ use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
 use crate::domain::feedback::Spoken;
 use crate::domain::learn::LearnedIntent;
+use crate::domain::learn::PluginRequest;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
 use crate::domain::state::Event;
@@ -320,6 +321,16 @@ pub trait Models: Send + Sync {
 pub trait Clock: Send + Sync {
     /// The time now.
     fn now(&self) -> Timestamp;
+}
+
+/// Requests for new plugins, for Claude.
+pub trait PluginRequests: Send + Sync {
+    /// Writes `request` and gives the path of its file.
+    ///
+    /// # Errors
+    ///
+    /// The file cannot be written. The error names the path.
+    fn write(&self, request: &PluginRequest) -> anyhow::Result<PathBuf>;
 }
 
 /// A change to a logged interaction.

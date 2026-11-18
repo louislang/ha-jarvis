@@ -57,6 +57,7 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::MakeWriter;
 
 use crate::adapters::files::FileStore;
+use crate::adapters::files::RequestFiles;
 use crate::adapters::ha::HaHome;
 use crate::adapters::onnx::OnnxLoader;
 use crate::adapters::open_meteo::OpenMeteo;
@@ -115,6 +116,7 @@ use crate::ports::ModelLoader;
 use crate::ports::Models;
 use crate::ports::Partial;
 use crate::ports::Plugin;
+use crate::ports::PluginRequests;
 use crate::ports::Reasoner;
 use crate::ports::Refusal;
 use crate::ports::Setting;
@@ -685,6 +687,8 @@ pub struct LearnConfig {
     pub prefetch_lead_min: u64,
     /// The services that a prefetch can call. Any other call discards the prefetch.
     pub prefetch_services: Vec<String>,
+    /// The folder of the plugin requests. Without it, Jarvis writes no plugin requests.
+    pub plugin_requests: Option<PathBuf>,
 }
 
 /// The `[log]` section.
@@ -1778,6 +1782,13 @@ fn runpod(config: &Config, secrets: &Secrets) -> anyhow::Result<Option<Arc<dyn T
     Ok(Some(Arc::new(trainer)))
 }
 
+/// The plugin request files in `learn.plugin_requests`, when it is set.
+#[must_use]
+pub fn plugin_requests(learn: &LearnConfig) -> Option<Arc<dyn PluginRequests>> {
+    let folder = learn.plugin_requests.clone()?;
+    Some(Arc::new(RequestFiles::new(folder)))
+}
+
 /// The plugins of `config`: the Open-Meteo weather plugin, and the Plex plugin with the token of
 /// `secrets` when `[plugins.plex]` is set.
 ///
@@ -2652,6 +2663,7 @@ mod tests {
             check_interval_s: 3600,
             prefetch_lead_min: 5,
             prefetch_services: vec!["calendar.get_events".to_owned()],
+            plugin_requests: Some(PathBuf::from("plugin-requests")),
         }
     }
 
@@ -3213,6 +3225,23 @@ mod tests {
     fn ac_17_3b_1_registry_has_weather() -> anyhow::Result<()> {
         let names = tool_names(VALID)?;
         assert!(names.contains(&"get_weather".to_owned()), "{names:?}");
+        Ok(())
+    }
+
+    /// AC-14.12-5.
+    #[test]
+    fn ac_14_12_5_no_folder_makes_no_plugin_requests() -> anyhow::Result<()> {
+        let line = "plugin_requests = \"plugin-requests\"\n";
+        assert!(
+            VALID.contains(line),
+            "jarvis.toml has no learn.plugin_requests"
+        );
+        assert!(plugin_requests(&Config::parse(VALID)?.learn).is_some());
+        let config = Config::parse(&VALID.replace(line, ""))?;
+        assert!(
+            plugin_requests(&config.learn).is_none(),
+            "plugin requests without a folder"
+        );
         Ok(())
     }
 

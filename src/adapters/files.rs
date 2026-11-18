@@ -1,4 +1,4 @@
-//! `Store<T>` with TOML or JSON files and atomic write.
+//! `Store<T>` with TOML or JSON files and atomic write, and `PluginRequests` with Markdown files.
 
 use std::ffi::OsStr;
 use std::fs;
@@ -14,6 +14,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tempfile::NamedTempFile;
 
+use crate::domain::learn::PluginRequest;
+use crate::ports::PluginRequests;
 use crate::ports::Store;
 
 /// The file format, from the file extension.
@@ -81,18 +83,54 @@ impl<T: Serialize + DeserializeOwned> Store<T> for FileStore {
     }
 
     fn save(&self, value: &T) -> anyhow::Result<()> {
-        // A rename is atomic only inside one file system, so the temporary file is in the
-        // folder of the target.
-        let folder = self.path.parent().unwrap_or(Path::new(""));
-        let mut file = NamedTempFile::new_in(folder)?;
-        self.write(file.as_file_mut(), value)?;
-        file.as_file().sync_all()?;
-        file.persist(&self.path)?;
-        Ok(())
+        replace(&self.path, |file| self.write(file, value))
     }
 }
 
-/// Tests of `FileStore`.
+/// Replaces the file `path` with a temporary file that `write` fills, so a reader never sees a
+/// part of the file.
+///
+/// # Errors
+///
+/// `write` fails, or the temporary file cannot be created, synced or renamed.
+fn replace(path: &Path, write: impl FnOnce(&mut File) -> anyhow::Result<()>) -> anyhow::Result<()> {
+    // A rename is atomic only inside one file system, so the temporary file is in the folder of
+    // the target.
+    let folder = path.parent().unwrap_or(Path::new(""));
+    let mut file = NamedTempFile::new_in(folder)?;
+    write(file.as_file_mut())?;
+    file.as_file().sync_all()?;
+    file.persist(path)?;
+    Ok(())
+}
+
+/// Plugin request files in one folder.
+#[derive(Clone, Debug)]
+pub struct RequestFiles {
+    /// The folder.
+    folder: PathBuf,
+}
+
+impl RequestFiles {
+    /// The plugin requests in `folder`.
+    #[must_use]
+    pub fn new(folder: PathBuf) -> Self {
+        Self { folder }
+    }
+}
+
+impl PluginRequests for RequestFiles {
+    fn write(&self, request: &PluginRequest) -> anyhow::Result<PathBuf> {
+        let path = self.folder.join(format!("{}.md", request.name));
+        let context = || format!("cannot write {}", path.display());
+        fs::create_dir_all(&self.folder).with_context(context)?;
+        let text = request.text.as_bytes();
+        replace(&path, |file| Ok(file.write_all(text)?)).with_context(context)?;
+        Ok(path)
+    }
+}
+
+/// Tests of `FileStore` and `RequestFiles`.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +214,71 @@ mod tests {
             .to_string();
         assert!(
             error.contains(&path.display().to_string()),
+            "error has no path: {error}"
+        );
+        Ok(())
+    }
+
+    /// The request `name` with the text `text`.
+    fn request(name: &str, text: &str) -> PluginRequest {
+        PluginRequest {
+            name: name.to_owned(),
+            text: text.to_owned(),
+        }
+    }
+
+    /// AC-14.12-1.
+    #[test]
+    fn ac_14_12_1_write_gives_the_file_of_the_name() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let path = RequestFiles::new(folder.path().to_owned())
+            .write(&request("get_traffic", "# Plugin request: get_traffic\n"))?;
+        assert_eq!(path, folder.path().join("get_traffic.md"));
+        assert_eq!(
+            fs::read_to_string(&path)?,
+            "# Plugin request: get_traffic\n"
+        );
+        Ok(())
+    }
+
+    /// AC-14.12-2.
+    #[test]
+    fn ac_14_12_2_write_makes_the_folder() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir()?;
+        let folder = parent.path().join("plugin-requests");
+        let path = RequestFiles::new(folder.clone()).write(&request("get_traffic", "text"))?;
+        assert_eq!(fs::read_to_string(path)?, "text");
+        assert!(folder.is_dir(), "no folder {}", folder.display());
+        Ok(())
+    }
+
+    /// AC-14.12-3.
+    #[test]
+    fn ac_14_12_3_second_write_replaces_the_file() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let requests = RequestFiles::new(folder.path().to_owned());
+        requests.write(&request("get_traffic", "first"))?;
+        let path = requests.write(&request("get_traffic", "second"))?;
+        let files: io::Result<Vec<PathBuf>> = fs::read_dir(folder.path())?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect();
+        assert_eq!(files?, std::slice::from_ref(&path));
+        assert_eq!(fs::read_to_string(path)?, "second");
+        Ok(())
+    }
+
+    /// AC-14.12-4.
+    #[test]
+    fn ac_14_12_4_folder_that_is_a_file_names_path() -> anyhow::Result<()> {
+        let parent = tempfile::tempdir()?;
+        let folder = parent.path().join("plugin-requests");
+        fs::write(&folder, "")?;
+        let error = RequestFiles::new(folder.clone())
+            .write(&request("get_traffic", "text"))
+            .expect_err("the folder is a file")
+            .to_string();
+        assert!(
+            error.contains(&folder.display().to_string()),
             "error has no path: {error}"
         );
         Ok(())
