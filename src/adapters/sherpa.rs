@@ -368,6 +368,9 @@ impl VoiceEmbedder for SherpaEmbedder {
 pub struct Voices {
     /// The voice sample of each interaction ID.
     pub samples: BTreeMap<u64, Sample>,
+    /// The last pick of each interaction ID: a `person` entity ID, or `None` for no person.
+    #[serde(default)]
+    pub picks: BTreeMap<u64, Option<String>>,
 }
 
 /// The voice sample of one request.
@@ -407,25 +410,54 @@ impl SherpaVoices {
     fn voices(&self) -> MutexGuard<'_, Voices> {
         self.voices.lock().expect("no lock holder panics")
     }
+
+    /// Adds the sample of the interaction `id` to the profile of `person`, then trims that
+    /// profile to `max_samples`.
+    fn add(&self, voices: &mut Voices, person: &EntityId, id: u64, embedding: &[f32]) {
+        let sample = Sample {
+            person: person.0.clone(),
+            embedding: embedding.to_vec(),
+        };
+        voices.samples.insert(id, sample);
+        trim(&mut voices.samples, &person.0, self.max_samples);
+    }
+
+    /// Saves `changed` to the store, then puts it in place of `voices`.
+    fn save(&self, mut voices: MutexGuard<'_, Voices>, changed: Voices) -> anyhow::Result<()> {
+        self.store.save(&changed)?;
+        *voices = changed;
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl VoiceProfiles for SherpaVoices {
     async fn enroll(&self, person: &EntityId, id: u64, embedding: &[f32]) -> anyhow::Result<()> {
-        let mut voices = self.voices();
-        if voices.samples.contains_key(&id) {
+        let voices = self.voices();
+        if voices.samples.contains_key(&id) || voices.picks.contains_key(&id) {
             return Ok(());
         }
         let mut changed = voices.clone();
-        let sample = Sample {
-            person: person.0.clone(),
-            embedding: embedding.to_vec(),
-        };
-        changed.samples.insert(id, sample);
-        trim(&mut changed.samples, &person.0, self.max_samples);
-        self.store.save(&changed)?;
-        *voices = changed;
-        Ok(())
+        self.add(&mut changed, person, id, embedding);
+        self.save(voices, changed)
+    }
+
+    async fn assign(
+        &self,
+        id: u64,
+        person: Option<&EntityId>,
+        embedding: &[f32],
+    ) -> anyhow::Result<()> {
+        let voices = self.voices();
+        let mut changed = voices.clone();
+        changed
+            .picks
+            .insert(id, person.map(|person| person.0.clone()));
+        changed.samples.remove(&id);
+        if let Some(person) = person {
+            self.add(&mut changed, person, id, embedding);
+        }
+        self.save(voices, changed)
     }
 
     async fn similarities(&self, embedding: &[f32]) -> anyhow::Result<BTreeMap<String, f32>> {
@@ -1440,7 +1472,10 @@ mod tests {
             (1, sample("person.ali", &[1.0, 0.0])),
             (2, sample("person.louis", &[0.0, 1.0])),
         ]);
-        let store = Arc::new(FakeStore::new(Some(Voices { samples })));
+        let store = Arc::new(FakeStore::new(Some(Voices {
+            samples,
+            ..Voices::default()
+        })));
         let similarities = voices(&store, 20)?.similarities(&[1.0, 0.0]).await?;
         let people: Vec<&str> = similarities.keys().map(String::as_str).collect();
         assert_eq!(people, ["person.ali", "person.louis"]);
@@ -1459,7 +1494,10 @@ mod tests {
             (2, sample("person.sam", &[0.0, 1.0])),
             (3, sample("person.alex", &[1.0, 0.1])),
         ]);
-        let store = Arc::new(FakeStore::new(Some(Voices { samples })));
+        let store = Arc::new(FakeStore::new(Some(Voices {
+            samples,
+            ..Voices::default()
+        })));
         let alex = EntityId("person.alex".to_owned());
         assert_eq!(voices(&store, 20)?.sample_count(&alex), 2);
         Ok(())
@@ -1477,6 +1515,88 @@ mod tests {
         let saves = store.saves();
         assert_eq!(saves.len(), 1, "{saves:?}");
         assert_eq!(saves[0].samples[&1], sample("person.ali", &[1.0, 0.0]));
+        Ok(())
+    }
+
+    /// The `person.sam` entity.
+    fn sam() -> EntityId {
+        EntityId("person.sam".to_owned())
+    }
+
+    /// The voices with `max_samples` and the samples of `person` at `ids`, and their store.
+    fn profile(
+        person: &str,
+        ids: &[u64],
+        max_samples: usize,
+    ) -> anyhow::Result<(Arc<FakeStore<Voices>>, SherpaVoices)> {
+        let samples = ids.iter().map(|&id| (id, sample(person, &[1.0, 0.0])));
+        let saved = Voices {
+            samples: samples.collect(),
+            ..Voices::default()
+        };
+        let store = Arc::new(FakeStore::new(Some(saved)));
+        let voices = voices(&store, max_samples)?;
+        Ok((store, voices))
+    }
+
+    /// The last voices that `store` saved.
+    fn last_save(store: &FakeStore<Voices>) -> anyhow::Result<Voices> {
+        store.saves().pop().context("no save")
+    }
+
+    /// AC-15.8-1.
+    #[tokio::test]
+    async fn ac_15_8_1_assign_moves_the_sample() -> anyhow::Result<()> {
+        let (store, voices) = profile("person.alex", &[1], 20)?;
+        voices.assign(1, Some(&sam()), &[0.0, 1.0]).await?;
+        let samples = last_save(&store)?.samples;
+        assert_eq!(
+            samples,
+            BTreeMap::from([(1, sample("person.sam", &[0.0, 1.0]))])
+        );
+        Ok(())
+    }
+
+    /// AC-15.8-2.
+    #[tokio::test]
+    async fn ac_15_8_2_assign_none_removes_the_sample() -> anyhow::Result<()> {
+        let (store, voices) = profile("person.alex", &[1], 20)?;
+        voices.assign(1, None, &[1.0, 0.0]).await?;
+        let saved = last_save(&store)?;
+        assert!(saved.samples.is_empty(), "{saved:?}");
+        Ok(())
+    }
+
+    /// AC-15.8-3.
+    #[tokio::test]
+    async fn ac_15_8_3_enroll_after_assign_none_adds_no_sample() -> anyhow::Result<()> {
+        let (_store, voices) = profile("person.alex", &[], 20)?;
+        voices.assign(1, None, &[1.0, 0.0]).await?;
+        voices.enroll(&ali(), 1, &[1.0, 0.0]).await?;
+        assert_eq!(voices.sample_count(&ali()), 0);
+        Ok(())
+    }
+
+    /// AC-15.8-4.
+    #[tokio::test]
+    async fn ac_15_8_4_assign_keeps_the_newest_max_samples() -> anyhow::Result<()> {
+        let (store, voices) = profile("person.sam", &[1, 2], 2)?;
+        voices.assign(3, Some(&sam()), &[1.0, 0.0]).await?;
+        let ids: Vec<u64> = last_save(&store)?.samples.into_keys().collect();
+        assert_eq!(ids, [2, 3]);
+        Ok(())
+    }
+
+    /// AC-15.8-5.
+    #[tokio::test]
+    async fn ac_15_8_5_trimmed_pick_still_wins_over_enroll() -> anyhow::Result<()> {
+        let (store, voices) = profile("person.sam", &[2, 3], 2)?;
+        voices.assign(1, Some(&sam()), &[1.0, 0.0]).await?;
+        voices.enroll(&ali(), 1, &[1.0, 0.0]).await?;
+        let saves = store.saves();
+        assert_eq!(saves.len(), 1, "{saves:?}");
+        assert!(!saves[0].samples.contains_key(&1), "{saves:?}");
+        assert_eq!(saves[0].picks[&1].as_deref(), Some("person.sam"));
         Ok(())
     }
 }

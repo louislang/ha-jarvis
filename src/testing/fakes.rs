@@ -880,6 +880,15 @@ impl VoiceProfiles for FakeVoiceProfiles {
         Ok(())
     }
 
+    async fn assign(
+        &self,
+        _id: u64,
+        _person: Option<&EntityId>,
+        _embedding: &[f32],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     async fn similarities(&self, _embedding: &[f32]) -> anyhow::Result<BTreeMap<String, f32>> {
         Ok(self.similarities.clone())
     }
