@@ -1,10 +1,11 @@
 //! Speaker identification: discovery of the person trackers and the satellite presence sensors,
-//! and the people and presence signals.
+//! and the people, presence and proximity signals.
 
 use serde::Deserialize;
 use serde_json::Value;
 use vstd::prelude::*;
 
+use crate::domain::state::AreaId;
 use crate::domain::state::Entity;
 use crate::domain::state::EntityId;
 use crate::domain::state::State;
@@ -454,6 +455,75 @@ fn push_tracker(line: &mut String, tracker: &Tracker) {
     line.push_str(tracker.distance_sensor.0.as_str());
 }
 
+/// The proximity of the nearest available tracker of `trackers` in `area`: `1 / (1 + distance)`,
+/// or 0 when no available tracker is in `area`.
+#[verus_spec(found =>
+    ensures
+        proximate(*cache, trackers@, *area, found),
+)]
+#[must_use]
+pub fn proximity(cache: &StateCache, trackers: &[Tracker], area: &AreaId) -> f64 {
+    let mut least: Option<f64> = None;
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= trackers@.len(),
+            nearest(*cache, trackers@.take(index as int), *area, least),
+        decreases trackers@.len() - index,
+    ))]
+    while index < trackers.len() {
+        least = step(cache, &trackers[index], area, least);
+        proof! {
+            assert(trackers@.take(index + 1).drop_last() =~= trackers@.take(index as int));
+            assert(trackers@.take(index + 1).last() == trackers@[index as int]);
+        }
+        index += 1;
+    }
+    proof! {
+        assert(trackers@.take(index as int) =~= trackers@);
+    }
+    match least {
+        Some(distance) => 1.0 / (1.0 + distance),
+        None => 0.0,
+    }
+}
+
+/// `least` after `tracker`: the distance of `tracker` in `area` when it is less than `least` or
+/// `least` is `None`, else `least`.
+#[verus_spec(found =>
+    ensures
+        advanced(*cache, *tracker, *area, least, found),
+)]
+fn step(cache: &StateCache, tracker: &Tracker, area: &AreaId, least: Option<f64>) -> Option<f64> {
+    let taken = distance_in(cache, tracker, area);
+    let found = match (taken, least) {
+        (Some(distance), Some(before)) => Some(if distance < before { distance } else { before }),
+        (Some(distance), None) => Some(distance),
+        (None, _) => least,
+    };
+    proof! {
+        assert(stepped(*cache, *tracker, *area, least, taken, found));
+    }
+    found
+}
+
+/// The distance of `tracker` when its area sensor shows `area` and its distance sensor a number.
+#[verus_spec(taken =>
+    ensures
+        reading(*cache, *tracker, *area, taken),
+)]
+fn distance_in(cache: &StateCache, tracker: &Tracker, area: &AreaId) -> Option<f64> {
+    use std::str::FromStr;
+
+    let shown = cache.states.get(tracker.area_sensor.0.as_str())?;
+    if !matches!(cache.area_by_name(shown.state.as_str()), Some(found) if found.0.as_str() == area.0.as_str())
+    {
+        return None;
+    }
+    let distance = cache.states.get(tracker.distance_sensor.0.as_str())?;
+    f64::from_str(distance.state.as_str()).ok()
+}
+
 verus! {
 
 broadcast use {
@@ -604,6 +674,73 @@ pub open spec fn occupancy(cache: StateCache, sensors: Seq<EntityId>, found: Opt
 pub open spec fn sensed(cache: StateCache, device: Seq<char>, found: Option<bool>) -> bool {
     exists|sensors: Seq<EntityId>| presence_list(cache, device, sensors, cache.entities@.len() as int)
         && #[trigger] occupancy(cache, sensors, found)
+}
+
+/// True when the state of `id` names an area whose ID is `area` when `same` is true, else another.
+pub open spec fn shows_matching(cache: StateCache, id: Seq<char>, area: AreaId, same: bool) -> bool {
+    let key = crate::domain::contracts::str_key(id);
+    cache.states@.contains_key(key) && exists|index: int| 0 <= index < cache.areas@.len()
+        && ((#[trigger] cache.areas@[index]).area_id.0@ == area.0@) == same
+        && crate::domain::state_cache::named(cache.areas@[index], crate::domain::contracts::lowercase(cache.states@[key].state@))
+}
+
+/// The number that the state of `id` shows, or `None`.
+pub open spec fn number(cache: StateCache, id: Seq<char>) -> Option<f64> {
+    let key = crate::domain::contracts::str_key(id);
+    if cache.states@.contains_key(key) { crate::domain::contracts::decimal(cache.states@[key].state@) } else { None }
+}
+
+/// True when `taken` is the number of the distance sensor of `tracker` when its area sensor names
+/// `area`, else `None`. Also `None` when the area sensor names another area too.
+pub open spec fn reading(cache: StateCache, tracker: Tracker, area: AreaId, taken: Option<f64>) -> bool {
+    let distance = number(cache, tracker.distance_sensor.0@);
+    match taken {
+        Some(value) => shows_matching(cache, tracker.area_sensor.0@, area, true) && distance == Some(value),
+        None => distance is None || !shows_matching(cache, tracker.area_sensor.0@, area, true)
+            || shows_matching(cache, tracker.area_sensor.0@, area, false),
+    }
+}
+
+/// True when `least` follows `before` after `proximity` takes `taken` from `tracker`.
+pub open spec fn stepped(cache: StateCache, tracker: Tracker, area: AreaId, before: Option<f64>, taken: Option<f64>, least: Option<f64>) -> bool {
+    &&& reading(cache, tracker, area, taken)
+    &&& match (taken, before) {
+        (Some(distance), Some(nearer)) => exists|closer: bool| #[trigger] vstd::std_specs::cmp::lt_ensures::<f64>(distance, nearer, closer)
+            && least == Some(if closer { distance } else { nearer }),
+        (Some(distance), None) => least == Some(distance),
+        (None, _) => least == before,
+    }
+}
+
+/// True when `least` follows `before` after `proximity` takes a distance from `tracker`.
+pub open spec fn advanced(cache: StateCache, tracker: Tracker, area: AreaId, before: Option<f64>, least: Option<f64>) -> bool {
+    exists|taken: Option<f64>| #[trigger] stepped(cache, tracker, area, before, taken, least)
+}
+
+/// True when `least` is the result of the comparisons of `proximity` over `trackers`.
+pub open spec fn nearest(cache: StateCache, trackers: Seq<Tracker>, area: AreaId, least: Option<f64>) -> bool
+    decreases trackers.len(),
+{
+    if trackers.len() == 0 {
+        least is None
+    } else {
+        exists|before: Option<f64>| #[trigger] advanced(cache, trackers.last(), area, before, least)
+            && nearest(cache, trackers.drop_last(), area, before)
+    }
+}
+
+/// True when `found` is `1 / (1 + distance)`.
+pub open spec fn reciprocal(distance: f64, found: f64) -> bool {
+    exists|sum: f64| #[trigger] vstd::std_specs::ops::add_ensures::<f64>(1.0f64, distance, sum)
+        && vstd::std_specs::ops::div_ensures::<f64>(1.0f64, sum, found)
+}
+
+/// True when `found` is `1 / (1 + distance)` of the nearest tracker of `trackers` in `area`, or 0.
+pub open spec fn proximate(cache: StateCache, trackers: Seq<Tracker>, area: AreaId, found: f64) -> bool {
+    exists|least: Option<f64>| #[trigger] nearest(cache, trackers, area, least) && match least {
+        Some(distance) => reciprocal(distance, found),
+        None => found == 0.0f64,
+    }
 }
 
 } // verus!
@@ -849,5 +986,70 @@ mod tests {
         let report = discovery_report(&StateCache::load(snapshot), &[], &[]);
         let line = "person.ali: device_tracker.watch(untracked)".to_owned();
         assert!(report.contains(&line), "report {report:?} without {line}");
+    }
+
+    /// Asserts that the proximity to the Office of the trackers whose area and distance sensors
+    /// show `readings` is `expected`.
+    fn assert_near(readings: &[(&str, &str)], expected: f64) {
+        let mut snapshot = house();
+        let mut trackers = Vec::new();
+        let numbered = readings.iter().enumerate();
+        for (index, (area, distance)) in numbered {
+            let found = tracker(
+                &format!("sensor.area_{index}"),
+                &format!("sensor.distance_{index}"),
+            );
+            add(
+                &mut snapshot,
+                &found.area_sensor.0,
+                "watch",
+                area,
+                json!({}),
+            );
+            let meters = json!({ "unit_of_measurement": "m" });
+            add(
+                &mut snapshot,
+                &found.distance_sensor.0,
+                "watch",
+                distance,
+                meters,
+            );
+            trackers.push(found);
+        }
+        let office = AreaId("office".to_owned());
+        let found = proximity(&StateCache::load(snapshot), &trackers, &office);
+        assert!(
+            (found - expected).abs() < 1e-12,
+            "proximity {found}, not {expected}"
+        );
+    }
+
+    /// AC-15.2c-1.
+    #[test]
+    fn ac_15_2c_1_one_meter_gives_one_half() {
+        assert_near(&[("Office", "1")], 0.5);
+    }
+
+    /// AC-15.2c-2.
+    #[test]
+    fn ac_15_2c_2_no_tracker_in_the_area_gives_zero() {
+        assert_near(&[("Kitchen", "1")], 0.0);
+    }
+
+    /// AC-15.2c-3.
+    #[test]
+    fn ac_15_2c_3_nearer_tracker_counts() {
+        assert_near(&[("Office", "3"), ("Office", "1"), ("Office", "2")], 0.5);
+    }
+
+    /// AC-15.2c-4.
+    #[test]
+    fn ac_15_2c_4_unavailable_tracker_is_ignored() {
+        let readings = [
+            ("unavailable", "0"),
+            ("Office", "unavailable"),
+            ("Office", "1"),
+        ];
+        assert_near(&readings, 0.5);
     }
 }
