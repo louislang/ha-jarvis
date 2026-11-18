@@ -22,6 +22,26 @@ pub struct Tracker {
     pub distance_sensor: EntityId,
 }
 
+/// A `[[people]]` entry: the trackers that replace discovery for one person.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PersonTrackers {
+    /// The `person` entity.
+    pub person: EntityId,
+    /// The trackers that replace discovery.
+    pub trackers: Vec<Tracker>,
+}
+
+/// A `[[satellites]]` entry: the presence sensors that replace discovery for one satellite.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Satellite {
+    /// The `assist_satellite` entity.
+    pub satellite: EntityId,
+    /// The presence sensors that replace discovery.
+    pub presence: Vec<EntityId>,
+}
+
 /// A person of the house: a `person` entity of HA.
 #[verus_verify]
 #[derive(Clone, Debug, PartialEq)]
@@ -345,6 +365,93 @@ pub fn occupied(
         assert(occupancy(*cache, sensors@, found));
     }
     found
+}
+
+/// The discovery report: one line for each `assist_satellite` entity of `cache` with its presence
+/// sensors, then one line for each person with their trackers. `overrides` and `satellites`
+/// replace discovery.
+#[verus_verify]
+#[must_use]
+pub fn discovery_report(
+    cache: &StateCache,
+    overrides: &[PersonTrackers],
+    satellites: &[Satellite],
+) -> Vec<String> {
+    let mut report = Vec::new();
+    for entity in cache.entities.iter() {
+        if StateCache::in_domain(entity.entity_id.0.as_str(), "assist_satellite") {
+            report.push(satellite_line(cache, entity, satellites));
+        }
+    }
+    let everyone = people(cache);
+    for person in &everyone {
+        report.push(person_line(cache, &person.entity, overrides));
+    }
+    report
+}
+
+/// The ID of the satellite `entity`, `:` and its presence sensors.
+#[verus_verify]
+fn satellite_line(cache: &StateCache, entity: &Entity, satellites: &[Satellite]) -> String {
+    let mut line = entity.entity_id.0.clone();
+    line.push(':');
+    for entry in satellites {
+        if entry.satellite.0.as_str() == entity.entity_id.0.as_str() {
+            push_ids(&mut line, &entry.presence);
+            return line;
+        }
+    }
+    if let Some(device) = &entity.device_id {
+        push_ids(&mut line, &presence_sensors(cache, device.as_str(), None));
+    }
+    line
+}
+
+/// Appends a space and the ID of each of `ids` to `line`.
+#[verus_verify]
+fn push_ids(line: &mut String, ids: &[EntityId]) {
+    for id in ids {
+        line.push(' ');
+        line.push_str(id.0.as_str());
+    }
+}
+
+/// `person`, `:` and its trackers: the override when it has one, else the discovered ones with
+/// each device tracker without both sensors as `(untracked)`.
+#[verus_verify]
+fn person_line(cache: &StateCache, person: &EntityId, overrides: &[PersonTrackers]) -> String {
+    let mut line = person.0.clone();
+    line.push(':');
+    for entry in overrides {
+        if entry.person.0.as_str() == person.0.as_str() {
+            for tracker in &entry.trackers {
+                push_tracker(&mut line, tracker);
+            }
+            return line;
+        }
+    }
+    let Some(listed) = device_trackers(cache, person.0.as_str()) else {
+        return line;
+    };
+    for item in listed {
+        if let Some(tracker) = tracker_of(cache, item) {
+            push_tracker(&mut line, &tracker);
+        } else if let Some(id) = item.as_str() {
+            line.push(' ');
+            line.push_str(id);
+            line.push_str("(untracked)");
+        }
+    }
+    line
+}
+
+/// Appends a space, the area sensor, `/` and the distance sensor of `tracker` to `line`.
+#[verus_verify]
+fn push_tracker(line: &mut String, tracker: &Tracker) {
+    line.push(' ');
+    line.push_str(tracker.area_sensor.0.as_str());
+    line.push('/');
+    line.push_str(tracker.distance_sensor.0.as_str());
 }
 
 verus! {
@@ -687,5 +794,60 @@ mod tests {
         assert_eq!(occupied(&house, OFFICE, None), None);
         let configured = vec![id("binary_sensor.office_presence")];
         assert_eq!(occupied(&house, OFFICE, Some(configured)), Some(true));
+    }
+
+    /// Gives `person` in `snapshot` the watch `device_tracker.watch`, whose area sensor shows
+    /// `area` and whose distance sensor shows 1.2 m.
+    fn watch(snapshot: &mut Snapshot, person: &str, area: &str) {
+        let found = snapshot
+            .states
+            .iter_mut()
+            .find(|state| state.entity_id == person);
+        let state = found.expect("a person of the house");
+        let listed = json!(["device_tracker.watch"]);
+        state
+            .attributes
+            .insert("device_trackers".to_owned(), listed);
+        add(snapshot, "device_tracker.watch", "watch", "home", json!({}));
+        add(snapshot, "sensor.watch_area", "watch", area, json!({}));
+        let meters = json!({ "unit_of_measurement": "m" });
+        add(snapshot, "sensor.watch_distance", "watch", "1.2", meters);
+    }
+
+    /// AC-15.2b-1.
+    #[test]
+    fn ac_15_2b_1_report_names_satellites_and_people() {
+        let mut snapshot = house();
+        let occupancy = json!({ "device_class": "occupancy" });
+        add(&mut snapshot, ADDED, OFFICE, "on", occupancy);
+        watch(&mut snapshot, "person.ali", "Office");
+        let overrides = [PersonTrackers {
+            person: id("person.louis"),
+            trackers: vec![tracker("sensor.louis_area", "sensor.louis_distance")],
+        }];
+        let satellites = [Satellite {
+            satellite: id("assist_satellite.carson_bedroom"),
+            presence: vec![id("binary_sensor.bedroom_presence")],
+        }];
+        let report = discovery_report(&StateCache::load(snapshot), &overrides, &satellites);
+        let expected = [
+            "assist_satellite.carson_bedroom: binary_sensor.bedroom_presence",
+            "assist_satellite.carson_kitchen:",
+            "assist_satellite.carson_living_room:",
+            "assist_satellite.carson_office: binary_sensor.office_satellite",
+            "person.ali: sensor.watch_area/sensor.watch_distance",
+            "person.louis: sensor.louis_area/sensor.louis_distance",
+        ];
+        assert_eq!(report, expected);
+    }
+
+    /// AC-15.2b-2.
+    #[test]
+    fn ac_15_2b_2_report_names_a_device_tracker_without_an_area() {
+        let mut snapshot = house();
+        watch(&mut snapshot, "person.ali", "not_home");
+        let report = discovery_report(&StateCache::load(snapshot), &[], &[]);
+        let line = "person.ali: device_tracker.watch(untracked)".to_owned();
+        assert!(report.contains(&line), "report {report:?} without {line}");
     }
 }

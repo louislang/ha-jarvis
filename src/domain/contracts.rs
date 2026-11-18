@@ -64,6 +64,8 @@ use crate::domain::learn::LearnedKind;
 use crate::domain::learn::LearnedStatus;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Response;
+use crate::domain::speaker::PersonTrackers;
+use crate::domain::speaker::Satellite;
 use crate::domain::speaker::Tracker;
 use crate::domain::state::Area;
 use crate::domain::state::AreaId;
@@ -166,6 +168,14 @@ pub struct ExUnitSystem(UnitSystem);
 /// The area and distance sensors of a phone or watch.
 #[verifier::external_type_specification]
 pub struct ExTracker(Tracker);
+
+/// A `[[people]]` entry: the trackers that replace discovery for one person.
+#[verifier::external_type_specification]
+pub struct ExPersonTrackers(PersonTrackers);
+
+/// A `[[satellites]]` entry: the presence sensors that replace discovery for one satellite.
+#[verifier::external_type_specification]
+pub struct ExSatellite(Satellite);
 
 /// The intent catalog of `intents.toml`.
 #[verifier::external_type_specification]
