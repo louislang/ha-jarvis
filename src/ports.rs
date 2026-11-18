@@ -291,6 +291,26 @@ pub trait Plugin: Send + Sync {
     ) -> anyhow::Result<Value>;
 }
 
+/// One title of a media library.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Title {
+    /// The name in the library.
+    pub name: String,
+    /// The type of its section: `movie` or `show`.
+    pub kind: String,
+}
+
+/// The movie and show titles of a media library.
+#[async_trait]
+pub trait MediaLibrary: Send + Sync {
+    /// Each movie and show title, in library order.
+    ///
+    /// # Errors
+    ///
+    /// A request fails or a reply does not parse.
+    async fn titles(&self) -> anyhow::Result<Vec<Title>>;
+}
+
 /// Trains System One models.
 #[async_trait]
 pub trait Trainer: Send + Sync {

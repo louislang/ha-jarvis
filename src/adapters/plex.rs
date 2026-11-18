@@ -1,4 +1,4 @@
-//! `Plugin` `get_new_shows` with the Plex server API.
+//! `Plugin` `get_new_shows` and `MediaLibrary` with the Plex server API.
 
 use std::sync::Arc;
 
@@ -13,7 +13,9 @@ use serde_json::json;
 use crate::PlexConfig;
 use crate::domain::state::HomeConfig;
 use crate::ports::Clock;
+use crate::ports::MediaLibrary;
 use crate::ports::Plugin;
+use crate::ports::Title;
 use crate::ports::Tool;
 
 /// The time before now in which an added item is new.
@@ -28,6 +30,9 @@ const ADDED: [(&str, &str); 3] = [
 
 /// The show name field of each kept type of the On Deck items.
 const ON_DECK: [(&str, &str); 1] = [("episode", "grandparentTitle")];
+
+/// The section types whose items are titles.
+const TITLE_KINDS: [&str; 2] = ["movie", "show"];
 
 /// The new shows and the shows to continue of a Plex server.
 pub struct Plex {
@@ -106,6 +111,64 @@ impl Plugin for Plex {
     }
 }
 
+#[async_trait]
+impl MediaLibrary for Plex {
+    async fn titles(&self) -> anyhow::Result<Vec<Title>> {
+        let sections = self.library("sections").await?;
+        let mut titles = Vec::new();
+        for section in items(&sections, "Directory")? {
+            titles.extend(self.section_titles(section).await?);
+        }
+        Ok(titles)
+    }
+}
+
+impl Plex {
+    /// The titles of the Plex section `section`, none when its type is not a title kind.
+    ///
+    /// # Errors
+    ///
+    /// The section has no `type` or `key`, the request fails, or an item has no `title`.
+    async fn section_titles(&self, section: &Value) -> anyhow::Result<Vec<Title>> {
+        let kind = section["type"].as_str();
+        let kind = kind.with_context(|| format!("no type: {section}"))?;
+        if !TITLE_KINDS.contains(&kind) {
+            return Ok(Vec::new());
+        }
+        let key = section["key"].as_str();
+        let key = key.with_context(|| format!("no key: {section}"))?;
+        let all = self.library(&format!("sections/{key}/all")).await?;
+        let items = items(&all, "Metadata")?.iter();
+        items.map(|item| title(item, kind)).collect()
+    }
+}
+
+/// The title of the Plex item `item` with `kind`.
+///
+/// # Errors
+///
+/// `item` has no `title`.
+fn title(item: &Value, kind: &str) -> anyhow::Result<Title> {
+    let name = item["title"].as_str();
+    let name = name.with_context(|| format!("no title: {item}"))?;
+    Ok(Title {
+        name: name.to_owned(),
+        kind: kind.to_owned(),
+    })
+}
+
+/// The items of the list `field` of the `MediaContainer` of the Plex reply `body`.
+///
+/// # Errors
+///
+/// `body` has no `MediaContainer`.
+fn items<'body>(body: &'body Value, field: &str) -> anyhow::Result<&'body [Value]> {
+    let container = body.get("MediaContainer").context("no MediaContainer")?;
+    // Plex leaves out an empty list.
+    let items = container.get(field).and_then(Value::as_array);
+    Ok(items.map_or(&[][..], Vec::as_slice))
+}
+
 /// The shows of the Plex reply `recent` added in the day before `now`, and the shows of the
 /// Plex reply `on_deck`.
 ///
@@ -134,11 +197,8 @@ fn names(
     fields: &[(&str, &str)],
     keep: impl Fn(&Value) -> anyhow::Result<bool>,
 ) -> anyhow::Result<Vec<String>> {
-    let container = body.get("MediaContainer").context("no MediaContainer")?;
-    // Plex leaves out an empty `Metadata`.
-    let items = container.get("Metadata").and_then(Value::as_array);
     let mut names: Vec<String> = Vec::new();
-    for item in items.map_or(&[][..], Vec::as_slice) {
+    for item in items(body, "Metadata")? {
         let Some((_, field)) = fields.iter().find(|(kind, _)| item["type"] == *kind) else {
             continue;
         };
@@ -206,18 +266,11 @@ mod tests {
         Plex::try_new(&config, "secret", clock)
     }
 
-    /// The result of `fetch` from a mock server that answers `status` with `recent` and
-    /// `on_deck`, and the requests of the mock.
-    async fn fetched(
-        status: u16,
-        recent: Value,
-        on_deck: Value,
-    ) -> anyhow::Result<(anyhow::Result<Value>, Vec<Request>)> {
+    /// A mock server that answers a GET of each path of `bodies` with both headers with `status`
+    /// and its body.
+    async fn server(status: u16, bodies: Vec<(String, Value)>) -> MockServer {
         let server = MockServer::start().await;
-        for (path, body) in [
-            ("/library/recentlyAdded", recent),
-            ("/library/onDeck", on_deck),
-        ] {
+        for (path, body) in bodies {
             Mock::given(matchers::method("GET"))
                 .and(matchers::path(path))
                 .and(matchers::header("X-Plex-Token", "secret"))
@@ -226,10 +279,104 @@ mod tests {
                 .mount(&server)
                 .await;
         }
+        server
+    }
+
+    /// The result of `fetch` from a mock server that answers `status` with `recent` and
+    /// `on_deck`, and the requests of the mock.
+    async fn fetched(
+        status: u16,
+        recent: Value,
+        on_deck: Value,
+    ) -> anyhow::Result<(anyhow::Result<Value>, Vec<Request>)> {
+        let paths = ["/library/recentlyAdded", "/library/onDeck"].map(str::to_owned);
+        let server = server(status, paths.into_iter().zip([recent, on_deck]).collect()).await;
         let result = plex(&server.uri())?
             .fetch(&Map::new(), &fakes::house().config)
             .await;
         Ok((result, server.received_requests().await.unwrap_or_default()))
+    }
+
+    /// The result of `titles` from a mock server that answers `status` with `sections` and the
+    /// bodies of `all` for their paths, and the requests of the mock.
+    async fn listed(
+        status: u16,
+        sections: Value,
+        all: Vec<(String, Value)>,
+    ) -> anyhow::Result<(anyhow::Result<Vec<Title>>, Vec<Request>)> {
+        let bodies = [("/library/sections".to_owned(), sections)]
+            .into_iter()
+            .chain(all);
+        let server = server(status, bodies.collect()).await;
+        let result = plex(&server.uri())?.titles().await;
+        Ok((result, server.received_requests().await.unwrap_or_default()))
+    }
+
+    /// The sections of AC-18.9-12.
+    fn sections() -> Value {
+        let kinds = [("1", "movie"), ("2", "show"), ("3", "artist")];
+        let sections = kinds.map(|(key, kind)| json!({ "key": key, "type": kind, "title": key }));
+        json!({ "MediaContainer": { "Directory": sections } })
+    }
+
+    /// The path of the items of section `key` and a reply with an item for each of `titles`.
+    fn section(key: &str, titles: &[&str]) -> (String, Value) {
+        let items: Vec<Value> = titles
+            .iter()
+            .map(|title| json!({ "title": title }))
+            .collect();
+        (format!("/library/sections/{key}/all"), container(&items))
+    }
+
+    /// The items of the sections of AC-18.9-12.
+    fn sections_all() -> Vec<(String, Value)> {
+        let movies = section("1", &["The Matrix", "Fargo"]);
+        vec![
+            movies,
+            section("2", &["VisionQuest"]),
+            section("3", &["Radiohead"]),
+        ]
+    }
+
+    /// AC-18.9-12. The mocks answer only a GET with both headers.
+    #[tokio::test]
+    async fn ac_18_9_12_titles_of_movie_and_show_sections() -> anyhow::Result<()> {
+        let (result, requests) = listed(200, sections(), sections_all()).await?;
+        let paths: Vec<&str> = requests.iter().map(|request| request.url.path()).collect();
+        let expected = [
+            "/library/sections",
+            "/library/sections/1/all",
+            "/library/sections/2/all",
+        ];
+        assert_eq!(paths, expected);
+        let titles = [
+            ("The Matrix", "movie"),
+            ("Fargo", "movie"),
+            ("VisionQuest", "show"),
+        ];
+        let titles = titles.map(|(name, kind)| fakes::title(name, kind));
+        assert_eq!(result?, titles);
+        Ok(())
+    }
+
+    /// AC-18.9-13.
+    #[tokio::test]
+    async fn ac_18_9_13_bad_titles_reply() -> anyhow::Result<()> {
+        let nameless = (
+            String::from("/library/sections/1/all"),
+            container(&[json!({})]),
+        );
+        let nameless = vec![nameless, section("2", &[])];
+        let replies = [
+            (401, sections(), sections_all()),
+            (200, json!({}), sections_all()),
+            (200, sections(), nameless),
+        ];
+        for (status, sections, all) in replies {
+            let result = listed(status, sections, all).await?.0;
+            assert!(result.is_err(), "{result:?}");
+        }
+        Ok(())
     }
 
     /// AC-18.11-1.

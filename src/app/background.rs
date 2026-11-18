@@ -53,10 +53,12 @@ use crate::domain::state_cache::StateCache;
 use crate::ports::Clock;
 use crate::ports::Home;
 use crate::ports::InteractionLog;
+use crate::ports::MediaLibrary;
 use crate::ports::PluginRequests;
 use crate::ports::Reasoner;
 use crate::ports::SpeechToText;
 use crate::ports::Store;
+use crate::ports::Title;
 use crate::ports::Tool;
 
 /// The wait before the first retry of a failed snapshot.
@@ -70,6 +72,9 @@ const PRUNE_INTERVAL: Duration = Duration::from_hours(24);
 
 /// The time between two hotword refreshes.
 const HOTWORDS_REFRESH: Duration = Duration::from_hours(1);
+
+/// The time between two refreshes of the media library titles.
+const TITLES_REFRESH: Duration = Duration::from_hours(1);
 
 /// The media types of the library names that are hotwords, in the order of their calls.
 const LIBRARY_TYPES: [&str; 3] = ["playlist", "artist", "album"];
@@ -991,6 +996,24 @@ pub fn start_hotwords(
     });
 }
 
+/// Starts a task that puts the titles of `library` into `titles` at once and each
+/// [`TITLES_REFRESH`]. Logs the number of titles, or a failed call, which keeps the list.
+pub fn start_titles(library: Arc<dyn MediaLibrary>, titles: Arc<ArcSwap<Vec<Title>>>) {
+    tokio::spawn(async move {
+        let mut refresh = tokio::time::interval(TITLES_REFRESH);
+        loop {
+            refresh.tick().await;
+            match library.titles().await {
+                Ok(found) => {
+                    tracing::info!("the media library has {} titles", found.len());
+                    titles.store(Arc::new(found));
+                }
+                Err(error) => tracing::warn!("the media library call failed: {error:#}"),
+            }
+        }
+    });
+}
+
 /// Gives `stt` the hotwords of the hot cache `cache` and `catalog`, with the playlist, artist and
 /// album names of the Music Assistant library on `home`. Logs a failed library call and the
 /// number of hotwords.
@@ -1104,6 +1127,7 @@ mod tests {
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
+    use crate::testing::fakes::FakeLibrary;
     use crate::testing::fakes::FakeLog;
     use crate::testing::fakes::FakePlugin;
     use crate::testing::fakes::FakePluginRequests;
@@ -1548,6 +1572,28 @@ mod tests {
         let lists = lists();
         assert_eq!(lists.len(), 2);
         assert!(lists[1].contains(&"Study Fan".to_owned()), "{lists:?}");
+    }
+
+    /// AC-18.9-14.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_9_14_titles_at_once_then_each_hour() {
+        let first = vec![fakes::title("Bluey", "show")];
+        let second = vec![fakes::title("Fargo", "movie")];
+        let scripted = [Ok(first.clone()), Ok(second.clone()), Err("down")];
+        let library = Arc::new(FakeLibrary::default());
+        *library.results.lock().expect("no lock holder panics") = scripted.into();
+        let titles = Arc::new(ArcSwap::from_pointee(Vec::new()));
+        start_titles(library, Arc::clone(&titles));
+        settle().await;
+        assert_eq!(*titles.load_full(), first);
+        tokio::time::sleep(TITLES_REFRESH).await;
+        assert_eq!(*titles.load_full(), second);
+        tokio::time::sleep(TITLES_REFRESH).await;
+        assert_eq!(
+            *titles.load_full(),
+            second,
+            "a failed call changed the list"
+        );
     }
 
     /// The model state that the conformance test compares.
