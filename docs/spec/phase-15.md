@@ -184,7 +184,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 **Goal:** Compute the voice embedding in the background when an utterance commits, and attach the speaker to the interaction. Voice identification adds no time to the transcript.
 
 - **Implements:** G12, G15. **Depends on:** 15.3b.
-- **Files:** modify `src/app/speech.rs`, `src/app/conversation.rs`.
+- **Files:** modify `src/app/speech.rs`, `src/app/conversation.rs`, `src/lib.rs`, `src/testing/e2e.rs`.
 
 **Model.** At commit, the speech use case spawns `embed(audio)` in a blocking task and stores the future with the utterance. The conversation use case gets it with the utterance that `handle` correlates (sub-phases 12.1b and 12.6). Sub-phase 15.6 uses it to identify the speaker, and sub-phase 15.6b stores it with the interaction.
 
