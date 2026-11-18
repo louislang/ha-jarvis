@@ -65,6 +65,7 @@ use crate::adapters::openai::OpenAiReasoner;
 use crate::adapters::plex::Plex;
 use crate::adapters::process::ProcessTrainer;
 use crate::adapters::runpod::RunPodTrainer;
+use crate::adapters::sherpa::SherpaEmbedder;
 use crate::adapters::sherpa::SherpaStt;
 use crate::adapters::sqlite::SqliteLog;
 use crate::adapters::supertonic::SupertonicTts;
@@ -131,6 +132,7 @@ use crate::ports::SttStream;
 use crate::ports::TextToSpeech;
 use crate::ports::Tool;
 use crate::ports::Trainer;
+use crate::ports::VoiceEmbedder;
 
 /// Pure rules.
 pub mod domain {
@@ -235,6 +237,8 @@ pub struct Config {
     pub web: WebConfig,
     /// The MQTT broker of the status entity. Without it, Jarvis publishes no status.
     pub mqtt: Option<MqttConfig>,
+    /// Speaker identification.
+    pub speaker: SpeakerConfig,
     /// The tracker overrides of the people. The people are the `person` entities of HA.
     #[serde(default)]
     pub people: Vec<PersonTrackers>,
@@ -739,6 +743,14 @@ pub struct MqttConfig {
     pub password_env: String,
 }
 
+/// The `[speaker]` section.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SpeakerConfig {
+    /// The speaker embedding model file.
+    pub model: PathBuf,
+}
+
 /// The `Clock` of the system time.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
@@ -984,12 +996,14 @@ impl Classifier for CurrentClassifier {
     }
 }
 
-/// The STT and TTS sessions of [`LiveModels`].
+/// The STT, TTS and voice embedder sessions of [`LiveModels`].
 pub struct Sessions {
     /// Both STT passes.
     pub stt: Arc<dyn SpeechToText>,
     /// The TTS.
     pub tts: Arc<dyn TextToSpeech>,
+    /// The voice embedder.
+    pub voice: Arc<dyn VoiceEmbedder>,
 }
 
 /// Loads the sessions and the System One model of the current run.
@@ -1078,6 +1092,12 @@ impl SpeechToText for Live {
     }
 }
 
+impl VoiceEmbedder for Live {
+    fn embed(&self, audio: &Audio) -> anyhow::Result<Vec<f32>> {
+        self.read()?.voice.embed(audio)
+    }
+}
+
 #[async_trait]
 impl TextToSpeech for Live {
     async fn synth(&self, text: &str) -> anyhow::Result<Audio> {
@@ -1128,7 +1148,8 @@ impl SttStream for LiveStream {
     }
 }
 
-/// The model sessions of Jarvis: both STT passes, TTS and the System One model.
+/// The model sessions of Jarvis: both STT passes, TTS, the voice embedder and the System One
+/// model.
 pub struct LiveModels {
     /// The STT and TTS sessions, with no System One model.
     live: Live,
@@ -1167,7 +1188,7 @@ impl LiveModels {
         &self.classifier
     }
 
-    /// Both STT passes and the TTS.
+    /// Both STT passes, the TTS and the voice embedder.
     #[must_use]
     pub fn live(&self) -> Arc<Live> {
         Arc::new(self.live.clone())
@@ -2266,7 +2287,7 @@ fn load(config: &Config) -> Load {
     Box::new(move || Box::pin(load_sessions(config.clone())))
 }
 
-/// The STT and TTS sessions of `config`, loaded on a blocking thread, and the System One model of
+/// The STT, TTS and voice embedder sessions of `config`, loaded on a blocking thread, and the System One model of
 /// [`load_classifier`].
 ///
 /// # Errors
@@ -2274,11 +2295,15 @@ fn load(config: &Config) -> Load {
 /// The training state or a model cannot load.
 async fn load_sessions(config: Config) -> anyhow::Result<(Sessions, RunClassifier)> {
     let model = load_classifier(&config).await?;
-    let (asr, tts, device) = (config.asr, config.tts, config.device);
-    let stt = tokio::task::spawn_blocking(move || SherpaStt::try_new(&asr, device)).await??;
-    let tts = tokio::task::spawn_blocking(move || SupertonicTts::try_new(&tts, device)).await??;
-    let (stt, tts) = (Arc::new(stt), Arc::new(tts));
-    Ok((Sessions { stt, tts }, model))
+    let sessions = tokio::task::spawn_blocking(move || {
+        let device = config.device;
+        anyhow::Ok(Sessions {
+            stt: Arc::new(SherpaStt::try_new(&config.asr, device)?),
+            tts: Arc::new(SupertonicTts::try_new(&config.tts, device)?),
+            voice: Arc::new(SherpaEmbedder::try_new(&config.speaker, device)?),
+        })
+    });
+    Ok((sessions.await??, model))
 }
 
 /// The System One model of the run that `train.state` of `config` names, else of the fixture.
@@ -2527,6 +2552,7 @@ mod tests {
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeStt;
     use crate::testing::fakes::FakeTts;
+    use crate::testing::fakes::FakeVoiceEmbedder;
     use crate::testing::fakes::FakeWyomingClient;
     use crate::testing::fakes::MqttSubscriber;
 
@@ -2715,6 +2741,13 @@ mod tests {
         }
     }
 
+    /// The `[speaker]` section of `VALID`.
+    fn expected_speaker() -> SpeakerConfig {
+        SpeakerConfig {
+            model: PathBuf::from("models/wespeaker_en_voxceleb_CAM++.onnx"),
+        }
+    }
+
     /// AC-1.1-1.
     #[test]
     fn ac_1_1_1_parse_returns_each_value() -> anyhow::Result<()> {
@@ -2761,6 +2794,7 @@ mod tests {
             log: expected_log(),
             web: expected_web(),
             mqtt: Some(expected_mqtt()),
+            speaker: expected_speaker(),
             people: Vec::new(),
             satellites: Vec::new(),
         };
@@ -3651,26 +3685,28 @@ mod tests {
         })
     }
 
-    /// A new `FakeStt`, `FakeTts` and `FakeClassifier` that gives `unknown` once, so `handle`
-    /// answers with a filler. Keeps weak references to them in `loaded`.
+    /// A new `FakeStt`, `FakeTts`, `FakeClassifier` that gives `unknown` once, so `handle`
+    /// answers with a filler, and `FakeVoiceEmbedder`. Keeps weak references to them in `loaded`.
     fn fake_sessions(loaded: &Loaded) -> (Sessions, RunClassifier) {
         let (stt, tts) = (Arc::new(FakeStt::default()), Arc::new(FakeTts::default()));
+        let voice = Arc::new(FakeVoiceEmbedder);
         let classifier = Arc::new(FakeClassifier::default());
         classifier.script(Prediction {
             ranked: vec![("unknown".to_owned(), 0.9)],
             slots: Vec::new(),
         });
-        let fakes: [Weak<dyn Any + Send + Sync>; 3] = [
+        let fakes: [Weak<dyn Any + Send + Sync>; 4] = [
             Arc::downgrade(&stt) as _,
             Arc::downgrade(&tts) as _,
             Arc::downgrade(&classifier) as _,
+            Arc::downgrade(&voice) as _,
         ];
         loaded.lock().expect("no panic").extend(fakes);
         let model = RunClassifier {
             run: FIXTURE.to_owned(),
             classifier,
         };
-        (Sessions { stt, tts }, model)
+        (Sessions { stt, tts, voice }, model)
     }
 
     /// The number of fakes of `loaded` that still have a reference.
@@ -3705,6 +3741,32 @@ mod tests {
         Ok(())
     }
 
+    /// AC-15.3-8.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_3_8_release_drops_the_voice_embedder_until_restore() -> anyhow::Result<()> {
+        let (loaded, fails): (Loaded, Arc<AtomicBool>) = Default::default();
+        let models = LiveModels::try_new(fake_load(&loaded, &fails)).await?;
+        let live = models.live();
+        let audio = Audio {
+            samples: vec![0; 16_000],
+            rate: 16_000,
+        };
+        models.release().await;
+        let voice = loaded.lock().expect("no panic")[3].clone();
+        assert_eq!(
+            voice.strong_count(),
+            0,
+            "references to the fake after release"
+        );
+        assert!(live.embed(&audio).is_err(), "embed works after release");
+        models.restore().await?;
+        assert!(
+            !live.embed(&audio)?.is_empty(),
+            "no embedding after restore"
+        );
+        Ok(())
+    }
+
     /// After a release and a restore, the new second pass has the hotwords of the last
     /// `set_hotwords`, also of one during the pause.
     #[tokio::test(start_paused = true)]
@@ -3717,7 +3779,7 @@ mod tests {
         let words = vec!["radiohead".to_owned()];
         live.set_hotwords(&words);
         models.restore().await?;
-        let stt = loaded.lock().expect("no panic")[3].upgrade();
+        let stt = loaded.lock().expect("no panic")[4].upgrade();
         let stt = stt.context("the new second pass")?.downcast::<FakeStt>();
         let stt = stt.map_err(|_| anyhow::anyhow!("the fake is not a FakeStt"))?;
         assert_eq!(*stt.hotwords.lock().expect("no panic"), [words]);
@@ -4518,6 +4580,24 @@ mod tests {
         assert!(
             memory[3] - memory[2] > memory[2] - memory[1],
             "GPU memory in MiB at the start and after each load: {memory:?}"
+        );
+        Ok(())
+    }
+
+    /// AC-15.3-7. sherpa-onnx falls back to the CPU with only a log line, so the GPU memory of
+    /// this process shows that the voice embedder loads on CUDA.
+    #[test]
+    #[ignore = "GPU host"]
+    fn ac_15_3_7_cuda_runs_the_voice_embedder() -> anyhow::Result<()> {
+        if !alone("tests::ac_15_3_7_cuda_runs_the_voice_embedder")? {
+            return Ok(());
+        }
+        let start = gpu_memory()?;
+        let _voice = SherpaEmbedder::try_new(&Config::parse(VALID)?.speaker, Device::Cuda)?;
+        let end = gpu_memory()?;
+        assert!(
+            start < end,
+            "GPU memory in MiB: {start} before and {end} after the voice embedder"
         );
         Ok(())
     }

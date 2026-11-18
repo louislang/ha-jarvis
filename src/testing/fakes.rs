@@ -110,6 +110,7 @@ use crate::ports::Title;
 use crate::ports::Tool;
 use crate::ports::Trainer;
 use crate::ports::Unresolved;
+use crate::ports::VoiceEmbedder;
 
 /// The reference house snapshot.
 #[must_use]
@@ -846,6 +847,15 @@ impl TextToSpeech for FakeTts {
             samples: Vec::new(),
             rate: 16_000,
         })
+    }
+}
+
+/// A `VoiceEmbedder` that gives one fixed embedding.
+pub(crate) struct FakeVoiceEmbedder;
+
+impl VoiceEmbedder for FakeVoiceEmbedder {
+    fn embed(&self, _audio: &Audio) -> anyhow::Result<Vec<f32>> {
+        Ok(vec![1.0])
     }
 }
 

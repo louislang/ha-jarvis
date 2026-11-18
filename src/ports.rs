@@ -249,6 +249,16 @@ pub trait TextToSpeech: Send + Sync {
     async fn synth(&self, text: &str) -> anyhow::Result<Audio>;
 }
 
+/// Voice embeddings of speech.
+pub trait VoiceEmbedder: Send + Sync {
+    /// The voice embedding of `audio`. It blocks while it computes.
+    ///
+    /// # Errors
+    ///
+    /// The audio is too short, or the model gives no embedding.
+    fn embed(&self, audio: &Audio) -> anyhow::Result<Vec<f32>>;
+}
+
 /// A value that survives a restart.
 pub trait Store<T>: Send + Sync {
     /// The saved value, or `None` when no value is saved.

@@ -40,6 +40,12 @@ nemotron_sums := """
     a35eac38a22ebceb04d230ed7afe0d68f446ba6914a036b97f14fece95967e23  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/joiner.int8.onnx
     dc0b4584ab2e4ddbf888425c076c61b736e7356a015250db7d307e6f1a8188ff  sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25/tokens.txt"""
 silero_sums := "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6  silero_vad.onnx"
+speaker_sums := "c46fad10b5f81e1aa4a60c162714208577093655076c5450f8c469e522ec54ef  wespeaker_en_voxceleb_CAM++.onnx"
+# The multi-speaker voice of the speaker tests.
+test_voice_sums := """
+    10dc268f3e371696d721486123e2705a9fc1faa113491979fde4d88dba1f1b1c  vits-piper-en_US-libritts_r-medium.tar.bz2
+    8cce84cee4060bc3c2194bf95d33253c48dc8ff15e197b3b7a00b334ee0017f4  vits-piper-en_US-libritts_r-medium/en_US-libritts_r-medium.onnx
+    620e1aecf1a68fea3ba5850d137b0138fa2037c9b372dad13b95a2a215d0849a  vits-piper-en_US-libritts_r-medium/tokens.txt"""
 # The SHA-256 of each file of `gpu-models`, one list for each archive.
 cuda_sums := "2aa541a65c1e7d921a053283419b70b30c1f6ae0a0f52f64b947ebe88c5f2a77  sherpa-onnx-v2.0.1-cuda-12.x-cudnn-9.x-onnxruntime1.28.2-linux-x64-gpu.tar.bz2"
 parakeet_sums := """
@@ -75,10 +81,10 @@ cov:
     {{ cpu_runtime }} cargo llvm-cov --workspace --release --fail-under-lines 80.01
 
 # Download the CPU libraries and models.
-models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/tts-models" supertonic_sums) (fetch supertonic_fp32 vector_estimator_sums) (fetch supertonic_fp32 vocoder_sums) (fetch sherpa_onnx + "/asr-models" silero_sums) (fetch sherpa_onnx + "/asr-models" parakeet_sums)
+models: (fetch sherpa_onnx + "/v2.0.1" cpu_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/tts-models" supertonic_sums) (fetch supertonic_fp32 vector_estimator_sums) (fetch supertonic_fp32 vocoder_sums) (fetch sherpa_onnx + "/asr-models" silero_sums) (fetch sherpa_onnx + "/asr-models" parakeet_sums) (fetch sherpa_onnx + "/speaker-recongition-models" speaker_sums) (fetch sherpa_onnx + "/tts-models" test_voice_sums)
 
 # Download the GPU models and the CUDA libraries, and copy the fp16 files next to the int8 files of the same model.
-gpu-models: cuda-libraries (fetch sherpa_onnx + "/asr-models" parakeet_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (copy-fp16 nemotron_fp16_sums "nemotron-160ms-" "sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25") (copy-fp16 parakeet_fp16_sums "parakeet-unified-" "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming")
+gpu-models: cuda-libraries (fetch sherpa_onnx + "/asr-models" parakeet_sums) (fetch sherpa_onnx + "/asr-models" nemotron_sums) (fetch sherpa_onnx + "/speaker-recongition-models" speaker_sums) (copy-fp16 nemotron_fp16_sums "nemotron-160ms-" "sherpa-onnx-nemotron-speech-streaming-en-0.6b-160ms-int8-2026-04-25") (copy-fp16 parakeet_fp16_sums "parakeet-unified-" "sherpa-onnx-nemo-parakeet-unified-en-0.6b-int8-non-streaming")
 
 # Download the CUDA libraries.
 cuda-libraries: (fetch sherpa_onnx + "/v2.0.1" cuda_sums)

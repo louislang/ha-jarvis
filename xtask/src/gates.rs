@@ -2183,6 +2183,13 @@ fn ac_18_17_1_models_writes_second_pass_folder() {
     assert_fetched("parakeet_sums");
 }
 
+/// After `just models`, the speaker model and the test voice folder exist and each file of their sums has its SHA-256.
+#[test]
+fn ac_15_3_1_models_writes_speaker_model_and_test_voice() {
+    assert_fetched("speaker_sums");
+    assert_fetched("test_voice_sums");
+}
+
 /// `repository.yaml` names the add-on repository and gives its URL.
 #[test]
 fn ac_12_9g_1_repository_names_addon_repository() {
