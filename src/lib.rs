@@ -2001,11 +2001,11 @@ fn recorder(
 }
 
 /// The training trigger of `config` with the backoff `train.failure_backoff_s`, the process
-/// trainer, the `RunPod` trainer `runpod`, the ONNX loader, the stores of `train.state` and
-/// `train.generated`, the system time, `reasoner`, `log`, `catalog`, the hot cache `cache`, the
-/// house `home`, the live models `models`, whose classifier the run swaps, and `stop`, which gets
-/// the error text of a failed `restore`. The run and the trigger use the status and the activity
-/// of `shared`.
+/// trainer, the `RunPod` trainer `runpod`, the ONNX loader, the stores of `train.state`,
+/// `train.generated` and `learn.file`, the system time, `reasoner`, `log`, `catalog`, the hot
+/// cache `cache`, the house `home`, the live models `models`, whose classifier the run swaps, and
+/// `stop`, which gets the error text of a failed `restore`. The run and the trigger use the status
+/// and the activity of `shared`.
 ///
 /// # Errors
 ///
@@ -2035,6 +2035,7 @@ fn trigger(
         loader: Arc::new(OnnxLoader),
         classifier: Arc::clone(models.classifier()),
         catalog: Arc::clone(catalog),
+        learned: Arc::new(FileStore::try_new(config.learn.file.clone())?),
         cache: cache.clone(),
         clock: Arc::new(SystemClock),
         config: config.clone(),

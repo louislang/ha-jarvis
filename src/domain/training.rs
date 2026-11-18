@@ -17,6 +17,7 @@ use crate::domain::feedback::Tagged;
 use crate::domain::feedback::Value;
 use crate::domain::intent;
 use crate::domain::intent::Span;
+use crate::domain::learn::LearnedIntent;
 use crate::domain::model::Prediction;
 use crate::domain::model::Slot;
 
@@ -887,13 +888,17 @@ pub struct TrainingState {
     pub last_time: Timestamp,
 }
 
-/// The number of action marks of `marked` with a mark time after the last run of `state`.
+/// The number of action marks of `marked` with a mark time after the last run of `state`, plus
+/// the number of entries of `learned` activated after it.
 #[verus_spec(count =>
+    requires
+        marked@.len() + learned@.len() <= usize::MAX,
     ensures
-        count == changed(marked@, crate::domain::contracts::nanosecond(state.last_time), marked@.len() as int),
+        count == changed(marked@, crate::domain::contracts::nanosecond(state.last_time), marked@.len() as int)
+            + activated(learned@, crate::domain::contracts::nanosecond(state.last_time), learned@.len() as int),
 )]
 #[must_use]
-pub fn changes(state: &TrainingState, marked: &[Interaction]) -> usize {
+pub fn changes(state: &TrainingState, marked: &[Interaction], learned: &[LearnedIntent]) -> usize {
     let after = state.last_time.as_nanosecond();
     let (mut count, mut index) = (0, 0);
     #[cfg_attr(verus_only, verus_spec(
@@ -905,6 +910,31 @@ pub fn changes(state: &TrainingState, marked: &[Interaction]) -> usize {
     ))]
     while index < marked.len() {
         if matches!(marked[index].marks.first(), Some(mark) if mark.time.as_nanosecond() > after) {
+            count += 1;
+        }
+        index += 1;
+    }
+    count + activations(learned, after)
+}
+
+/// The number of entries of `learned` activated after the nanosecond `after`.
+#[verus_spec(count =>
+    ensures
+        count <= learned@.len(),
+        count == activated(learned@, after, learned@.len() as int),
+)]
+fn activations(learned: &[LearnedIntent], after: i128) -> usize {
+    let (mut count, mut index) = (0, 0);
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= learned@.len(),
+            count <= index,
+            count == activated(learned@, after, index as int),
+        decreases learned@.len() - index,
+    ))]
+    while index < learned.len() {
+        let time = learned[index].activated;
+        if matches!(time, Some(time) if time.as_nanosecond() > after) {
             count += 1;
         }
         index += 1;
@@ -1168,6 +1198,19 @@ pub open spec fn changed(marked: Seq<Interaction>, after: i128, count: int) -> i
         let marks = marked[count - 1].marks@;
         let new = if marks.len() > 0 && crate::domain::contracts::nanosecond(marks[0].time) > after { 1int } else { 0int };
         changed(marked, after, count - 1) + new
+    }
+}
+
+/// The number of the first `count` entries of `learned` activated after the nanosecond `after`.
+pub open spec fn activated(learned: Seq<LearnedIntent>, after: i128, count: int) -> int
+    decreases count,
+{
+    if count <= 0 {
+        0
+    } else {
+        let new = if learned[count - 1].activated matches Some(time)
+            && crate::domain::contracts::nanosecond(time) > after { 1int } else { 0int };
+        activated(learned, after, count - 1) + new
     }
 }
 
@@ -1458,7 +1501,7 @@ mod tests {
         for interaction in &mut marks[..3] {
             interaction.marks[0].time = "2026-11-15T06:00:00Z".parse().expect("a timestamp");
         }
-        assert_eq!(changes(&state, &marks), 20);
+        assert_eq!(changes(&state, &marks, &[]), 20);
     }
 
     /// AC-13.3-2.
