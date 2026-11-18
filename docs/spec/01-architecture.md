@@ -66,19 +66,19 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | Port | Side | Methods (final form) | Adapter |
 |---|---|---|---|
 | `Assistant` | Driving | `info`, `listen` (gives a `Listening` session: `push`, `finish`), `handle`, `speak` | Implemented by `App` in `src/lib.rs`. Called by `adapters/wyoming.rs`. |
-| `Review` | Driving | `list`, `audio`, `mark`, `intents`, `proposals`, `resolve` | Implemented by `app/review.rs`. Called by `adapters/web.rs`. |
+| `Review` | Driving | `list`, `audio`, `mark`, `intents`, `proposals`, `resolve`, `people`, `assign` | Implemented by `app/review.rs`. Called by `adapters/web.rs`. |
 | `Control` | Driving | `status`, `settings`, `save` | Implemented in `src/lib.rs`. Called by `adapters/web.rs`. |
 | `Home` | Driven | `snapshot`, `events`, `call`, `announce`, `ask` | `adapters/ha.rs` |
 | `SpeechToText` | Driven | `stream` (first pass: gives `accept`, `partial`, `reset`), `transcribe` (second pass), `set_hotwords` | `adapters/sherpa.rs` |
 | `TextToSpeech` | Driven | `synth` | `adapters/supertonic.rs` |
 | `VoiceEmbedder` | Driven | `embed` | `adapters/sherpa.rs` |
-| `VoiceProfiles` | Driven | `enroll`, `similarities` | `adapters/sherpa.rs` |
+| `VoiceProfiles` | Driven | `enroll`, `assign`, `similarities` | `adapters/sherpa.rs` |
 | `Classifier` | Driven | `predict` | `adapters/onnx.rs` |
 | `ModelLoader` | Driven | `load` (gives a `Classifier` for a model folder) | `adapters/onnx.rs` |
 | `Trainer` | Driven | `train` (gives a model folder for a training set) | `adapters/process.rs` (local GPU) and `adapters/runpod.rs` (fallback) |
 | `Reasoner` | Driven | `warm`, `answer` (gives steps: sentence, call, plugin, ask, done), `generate`, `paraphrase`, `embed`, `propose` | `adapters/openai.rs` |
 | `Plugin` | Driven | `tool`, `fetch` | One adapter for each remote API: `adapters/open_meteo.rs` (weather), `adapters/plex.rs` (new shows) |
-| `InteractionLog` | Driven | `append`, `update`, `list`, `get`, `audio`, `mark`, `marked`, `deferred`, `prune` | `adapters/sqlite.rs` |
+| `InteractionLog` | Driven | `append`, `update`, `list`, `get`, `audio`, `embedding`, `mark`, `marked`, `deferred`, `prune` | `adapters/sqlite.rs` |
 | `Store<T>` | Driven | `load`, `save` | `adapters/files.rs` (TOML or JSON from the file extension) |
 | `Clock` | Driven | `now` | `SystemClock` in `src/lib.rs` |
 | `Models` | Driven | `release`, `restore` | `LiveModels` in `src/lib.rs` |
@@ -141,7 +141,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 1. **Early commit.** HA reads the STT result while it sends audio. HA accepts the first `Transcript` event and stops the stream. Thus Jarvis decides the end of speech itself. It does not wait for the HA voice activity detection. (Source: `homeassistant/components/wyoming/stt.py`.)
 2. **Speculative prediction.** The speech use case runs the System One model on each changed partial transcript. The audio stream has no satellite ID, so this prediction uses an empty context. When the top intent is not `unknown`, its probability is `model.commit_threshold` or more, and no `media`, `movie` or `show` slot value ends the transcript, Jarvis uses a short silence threshold (`early_commit_ms`). Other transcripts use a longer threshold (`endpoint_ms`). Such a name can continue, for example "play hip" of "play hip hop" (sub-phase 6.8). Silence is the time since the voice end, which a Silero VAD in the first-pass adapter finds. On the GPU host, `vad_threshold = 0.65` gives a lower latency than 0.5. 0.7 cut quiet word endings ("office lights on" gave "Office lights"), so 0.65 is the highest tested value that keeps them (sub-phase 9.2). In a VAD speech segment, the silence is 0, so the wait of the VAD for the segment end cannot commit early. After the segment end, the silence counts each accepted sample (sub-phase 9.1b). Thus decoder delay does not add to the wait, and silence before speech does not commit.
 3. **Reply first, act after.** Jarvis returns `Handled` before the HA service call completes. The service call runs in the background.
-4. **Pre-rendered audio.** Jarvis synthesizes at startup each pool response whose only variable is `area`. A TTS request for such a response is a memory read. Other responses synthesize at request time and are not cached.
+4. **Pre-rendered audio.** Jarvis synthesizes at startup each pool response whose only variables are `area` and `address`, for each area and each form of address (sub-phase 15.9). A TTS request for such a response is a memory read. Other responses synthesize at request time and are not cached.
 5. **Filler, then announce.** For external data and for System Two, Jarvis returns a filler in `Handled`. Then Jarvis speaks the answer with `assist_satellite.announce` on the same satellite. When an announce or a question starts, HA cancels the running pipeline of the satellite. HA returns the result only after the satellite plays the audio. (Source: `homeassistant/components/assist_satellite/entity.py`, `homeassistant/components/esphome/assist_satellite.py`.) Thus each satellite has one queue of announces and questions. An item starts when the hot cache shows the satellite entity `idle`, which is after the filler ends. A new request on a satellite stops the older deferred jobs of that satellite. HA caches TTS audio by text, so the time of a `synthesize` event does not show when the filler plays.
 6. **Area from context.** HA sends `device_id` and `satellite_id` in the `Transcript` context. Jarvis finds the area of the device in the hot cache. (Source: `homeassistant/components/wyoming/conversation.py`.)
 7. **One templating engine.** `minijinja` renders the response text and the service call data. All pools and intents use the same syntax.
@@ -152,15 +152,15 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 12. **Train locally first, with the full GPU.** The process adapter runs `train/train.py` on the GPU of the GPU host. A local run and live Jarvis never share the GPU. Jarvis does not announce a run. Before a local run, Jarvis mutes the microphones of the satellites that are not muted, stops answering and releases its model sessions. After the run, with success or an error, Jarvis loads them again, unmutes only the microphones that it muted, and answers again. Then it measures the new model (decision 13). When the local run fails (for example, CUDA out of memory), the training use case sends the same training set to the RunPod adapter. A RunPod run does not pause Jarvis or mute the satellites. Jarvis predicts with the ONNX model through `ort`. The Python script, the inline script of the page of the Jarvis tab and the files of the Jarvis add-on (decision 33) are the only non-Rust code. The training set file is the contract between Jarvis and the Python script.
 13. **Accept only an equal or better model.** Jarvis assigns each example to the held-out set by a stable hash of its text. Jarvis measures the old model and the new model on the same held-out set. Jarvis keeps the new model only when its intent accuracy and its slot accuracy are both equal or higher.
 14. **Training trigger.** Jarvis counts changes since the last training run. At `train.min_changes`, Jarvis starts a run. A voice request starts a run at any count. Only one run occurs at a time. After each run, accepted or rejected, the count starts again from 0.
-15. **Speaker identification is not on the critical path.** Jarvis calculates the voice embedding in the background after commit. Only intents with `needs_speaker = true` wait for the result.
-16. **Passive voice enrollment.** When presence or proximity identifies the speaker with high confidence, Jarvis adds the voice embedding to the profile of that person. No enrollment step is necessary.
+15. **Speaker identification is not on the critical path.** Jarvis calculates the voice embedding in the background after commit. No reply waits for it: the reply identifies the speaker from presence and proximity only (sub-phase 15.9).
+16. **Passive voice enrollment.** When presence or proximity identifies the speaker with high confidence, Jarvis adds the voice embedding to the profile of that person. No enrollment step is necessary. Each sample has the interaction ID of its request. When you pick the speaker of a request in the Jarvis tab, the pick moves the sample, and a passive enrollment never replaces it (sub-phases 15.8 and 15.8b).
 17. **Ask through `start_conversation`.** The HA Wyoming conversation agent does not set `continue_conversation`. Thus `Handled` cannot open the microphone again. To ask a question, Jarvis returns `Handled` with empty text. Then, when the satellite is idle (decision 5), Jarvis calls `assist_satellite.start_conversation` with the question and `preannounce = false`. The satellite speaks the question and listens. (Source: `homeassistant/components/wyoming/conversation.py`.)
 18. **Dialogs by satellite.** `start_conversation` starts a new pipeline run with a new `conversation_id`. Thus Jarvis keys each dialog by `satellite_id`. When the context has no `satellite_id` (for example, text from the HA UI), Jarvis keys the dialog by `conversation_id` and puts the question in `Handled`. A dialog closes on completion, on cancel, after `dialog.max_turns` questions, or `dialog.timeout_s` after the last question.
 19. **System Two asks with a tool.** The OpenAI request has an `ask_user` tool. When the model calls it, Jarvis asks the question and keeps the dialog open. The next turn sends the answer as the `function_call_output` of that call, with `previous_response_id`.
 20. **System Two teaches System One.** Jarvis clusters the OpenAI embeddings of recent requests that System Two answered: `unknown` requests, requests under `model.threshold` and requests that System One cannot act on. For each large cluster, System Two writes a proposal for a new intent: name, kind, examples, responses and an optional service. Jarvis validates it and saves it to `learned.toml`. The next training run adds it to the model, so System One handles these requests.
 21. **Device control needs approval.** A proposal with a `service` waits for your approval in the Jarvis tab. Other proposals become active immediately.
 22. **Prefetch has no side effects.** A prefetch answer must not change the house. A `Call` step during a prefetch runs only when its service is in `learn.prefetch_services` (read-only services such as `calendar.get_events`). Any other `Call` discards that prefetch. A `Plugin` step always runs, because a plugin only reads data (decision 30). A `States` step also always runs, because it only reads the hot cache (sub-phase 7.6).
-23. **Discovery from HA.** Jarvis reads the HA registries in the hot cache. Each `person` entity lists its `device_trackers`. The sensors on the same device as a tracker give its area and distance (for example from Bermuda with the satellites as Bluetooth proxies). The `binary_sensor` entities with device class `occupancy`, `presence` or `motion` on the satellite device are its presence sensors. Configuration can override discovery. In the reference house (section 11) the presence sensors have no device class. Set their device class to `occupancy` in HA, or list them in `[[satellites]]`.
+23. **Discovery from HA.** Jarvis reads the HA registries in the hot cache. The people of the house are the `person` entities of HA, so `jarvis.toml` lists no people. Each `person` entity lists its `device_trackers`. The sensors on the same device as a tracker give its area and distance (for example from Bermuda with the satellites as Bluetooth proxies). The `binary_sensor` entities with device class `occupancy`, `presence` or `motion` on the satellite device are its presence sensors. Configuration can override discovery. In the reference house (section 11) the presence sensors have no device class. Set their device class to `occupancy` in HA, or list them in `[[satellites]]`.
 24. **Audio correlation.** HA sends the audio (`asr`) and the transcript (`handle`) on different connections with no shared ID. The speech use case keeps each committed utterance (text, audio, time) for `log.correlate_s`. For a voice request (a context with a `satellite_id`), the conversation use case finds the one utterance with the same normalized text and removes it. An ambiguous match gives no audio. Speaker identification uses the same correlation.
 25. **Logging is not on the critical path.** Jarvis writes the interaction after it returns `Handled`. Later announces and questions update the same record.
 26. **Feedback rules.** No mark changes a decision or a response. Marks are labeled training data in the log: the next training run of System One learns from the action marks and their corrections (phase 13).
@@ -517,7 +517,6 @@ password_env = "MQTT_PASSWORD"
 [speaker]
 model = "models/wespeaker_en_voxceleb_CAM++.onnx"
 voices = "voices.json"
-wait_ms = 100
 voice_threshold = 0.6   # voice similarity
 threshold = 0.6         # combined score of proximity and voice
 margin = 0.15
@@ -526,11 +525,15 @@ min_enroll_ms = 1500
 min_profile = 5
 max_samples = 20
 
-[[people]]
-person = "person.alex"
-calendar = "calendar.alex"
-# Optional. Discovery finds the trackers when this is not set.
+# Optional. The people are the `person` entities of HA. An entry only replaces the discovered trackers.
+# [[people]]
+# person = "person.alex"
 # trackers = [{ area = "sensor.alex_watch_area", distance = "sensor.alex_watch_distance" }]
+
+# Optional. The form of address of each person, for `{{ address }}` in responses.
+# The settings of the Jarvis tab set it.
+# [address]
+# "person.ali" = "Lady Lang"
 
 # Optional. Discovery finds the presence sensors when this is not set.
 # [[satellites]]
@@ -607,21 +610,6 @@ data = { when = "today" }
 fresh_min = 30
 
 [[intent]]
-name = "calendar_add"
-kind = "command"
-needs_speaker = true
-examples = [
-  "add [dentist](summary) to my calendar for [monday](day)",
-  "put [soccer practice](summary) on my calendar [tomorrow](day)",
-  "add [call mom](summary) to my calendar",
-]
-optional = ["day"]
-service = "calendar.create_event"
-target = "entity"
-entity = "{{ person.calendar }}"
-data = { summary = "{{ summary }}", start_date = "{{ next_date(day, 0) }}", end_date = "{{ next_date(day, 1) }}" }
-
-[[intent]]
 name = "start_training"
 kind = "train"
 examples = ["start training", "retrain yourself", "train your model", "start a new training run"]
@@ -640,16 +628,15 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 - `verbs` are the command verbs of the intent, with a capital first letter, for example "Resume". The second pass prefers them (decision 34). Short verbs that are in most requests, for example "Play" and "Stop", are not verbs of the list.
 - `fresh_min` is how long the answer of a fetch or prefetch intent stays fresh, in minutes, for example 5 for traffic and 30 for the weather. Each fetch and prefetch intent has it, and no other kind has it. Before a usual time of the intent (phase 11), Jarvis prefetches the answer. Then it refreshes the answer each `fresh_min` until the window ends (sub-phases 14.9 to 14.10b).
 - `search = true` makes Jarvis search Music Assistant for the `media_id` of the call and play the best match (sub-phase 18.13b). An artist match starts with one track of the artist (sub-phase 18.14). Only `play_music` has it.
+- `needs_speaker = true` gives the pool the `person` variable (sub-phase 4.2). No intent sets it, because sub-phase 15.7 is removed.
 - The area is the area slot. If no slot, it is the satellite area. The area slot matches an area name or alias without case sensitivity. For a command, an area slot that matches no area can name a Music Assistant speaker group (sub-phase 18.15).
 - `target = "entities"` uses all matching entities in the area.
 - `target = "entity"` uses `entity`, or the matching entity in the area with the lowest entity ID. `target` is `entity` when it is absent.
 - `target = "house"` uses all matching entities of the house, in any area. A query with it needs no area.
 - A list query is a query with `target = "entities"` or `target = "house"`. `state` is the state that it keeps, for example `on`. Its pool gets `entities`: the state, the attributes and the name of each selected entity with that state. An empty selection gives `Defer`. An empty `entities` list does not (sub-phase 18.1).
-- When System One knows the intent but cannot act, the result is `Defer`: Jarvis speaks a filler, makes no call, and System Two answers the request (sub-phase 4.5). Examples: an empty selection, a missing slot, a missing `person`, or a template that does not render.
+- When System One knows the intent but cannot act, the result is `Defer`: Jarvis speaks a filler, makes no call, and System Two answers the request (sub-phase 4.5). Examples: an empty selection, a missing slot, or a template that does not render.
 - When the area has no matching entity and the house has exactly one, Jarvis uses that entity. Example: one thermostat for the house.
-- `needs_speaker = true` makes the `person` variable available. Jarvis waits up to `speaker.wait_ms` for it.
-- `next_date(day, plus_days)` returns the ISO date of the next `day` plus `plus_days`. An empty `day` means today. A `day` that is not a day name, `today` or `tomorrow` gives an error.
-- Template variables are the built-ins `area` (the area name in lowercase), `entity`, `person` and `response`, and the slots of the intent.
+- Template variables are the built-ins `area` (the area name in lowercase), `entity`, `address` and `response`, and the slots of the intent.
 - A slot that the prediction does not have is missing, unless the intent lists it in `optional`. A missing optional slot is an empty string. Another missing slot gives `Defer`. Phase 10 makes Jarvis ask for a missing `area`. Before Phase 10, a missing `area` gives `Defer`.
 - A data value that is one `{{ expression }}` keeps the type of the expression result. One `{{ expression }}` starts with `{{`, ends with `}}`, and has no other `}}`. Other data values render as strings.
 
@@ -679,9 +666,6 @@ responses = [
 [pools.failure]
 responses = ["Sorry, I could not do that."]
 
-[pools.calendar_add]
-responses = ["I added {{ summary }} to your calendar, {{ person.name }}."]
-
 [pools.start_training]
 responses = ["I will start training now."]
 
@@ -697,7 +681,7 @@ responses = ["Okay, never mind."]
 
 The pool `ask_area` holds the questions for a missing area. A pool that is not an intent pool uses no template variable.
 
-Template variables of an intent pool: `area` (area name), slot names, `entity` (state, attributes, name), `entities` (a list of `entity` objects), `response` (the plugin result of a fetch), `person` (name and the fields of its `[[people]]` entry). `entity` exists only for `target = "entity"`, `entities` only for a list query, `response` only for `kind = "fetch"`, and `person` only for `needs_speaker = true`.
+Template variables of an intent pool: `area` (area name), slot names, `entity` (state, attributes, name), `entities` (a list of `entity` objects), `response` (the plugin result of a fetch), `address` (the form of address of the speaker, sub-phase 15.9). A response with `address` is a candidate only when the speaker has a form of address. `entity` exists only for `target = "entity"`, `entities` only for a list query, and `response` only for `kind = "fetch"`.
 
 Training set file (the contract between Jarvis and `train/train.py`):
 
@@ -813,5 +797,5 @@ Each model has state variables, actions and named invariants. `02-rules.md` sect
 | `training.qnt` | Training | `domain/training.rs`, `app/training.rs` | `OneRun`, `SwapNeverWorse`, `CountResetsAfterRun`, `FailureKeepsModel`, `FallbackOnce`, `PauseOnlyLocal` |
 | `learned.qnt` | Learned intents | `domain/learn.rs`, `app/background.rs` | `ServiceNeedsApproval`, `NoReproposal`, `ActivationCountsOnce`, `OneRequestPerCluster` |
 | `prefetch.qnt` | Prefetch | `domain/learn.rs`, `app/background.rs` | `NoCallFromPrefetch`, `ServedAnswerIsFresh`, `PrefetchOnlyInWindow`, `NoEarlyRefresh` |
-| `speaker.qnt` | Speaker identification | `domain/speaker.rs` | `SpeakerIsCandidate`, `NoVoiceOnlyEnrollment` |
+| `speaker.qnt` | Speaker identification and voice assignment | `domain/speaker.rs`, `app/review.rs` | `SpeakerIsCandidate`, `NoVoiceOnlyEnrollment`, `PickWins` |
 | `jarvis.qnt` | System | All use cases | `OneHandledPerRequest`, `ReplyBeforeCall`, `FillerBeforeAnswer`, `ModelSwapAtomic`, `NoTalkOver` |

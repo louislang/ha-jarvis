@@ -67,7 +67,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
   1. Each intent has `min_examples` examples or more.
   2. Each example parses (`parse_example`).
   3. Names are unique, and no name is `unknown`.
-- The first `intents.toml` has `lights_on`, `fan_on`, `climate_down`, `tv_show`, `temperature_query` and `weather` from `01-architecture.md` section 9. Phase 18 adds the query and media intents. Sub-phases 13.11 and 15.7 add `start_training` and `calendar_add`.
+- The first `intents.toml` has `lights_on`, `fan_on`, `climate_down`, `tv_show`, `temperature_query` and `weather` from `01-architecture.md` section 9. Phase 18 adds the query and media intents. Sub-phase 13.11 adds `start_training`.
 
 **Acceptance criteria.**
 
