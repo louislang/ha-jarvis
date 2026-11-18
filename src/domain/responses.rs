@@ -256,6 +256,7 @@ pub fn validate_pools(pools: &Pools, catalog: &Catalog) -> Result<(), PoolError>
     require(pools, "ask_area")?;
     require(pools, "cancelled")?;
     require(pools, "training_busy")?;
+    require(pools, "not_in_library")?;
     check_pools(pools, catalog)
 }
 
@@ -535,7 +536,8 @@ pub open spec fn pooled(pools: Map<String, Pool>, catalog: Catalog, count: int) 
 }
 
 /// True when each intent of `catalog` has a pool, the `filler`, `failure`, `ask_area`,
-/// `cancelled` and `training_busy` pools exist, and each pool has one or more responses.
+/// `cancelled`, `training_busy` and `not_in_library` pools exist, and each pool has one or more
+/// responses.
 pub open spec fn valid_pools(pools: Map<String, Pool>, catalog: Catalog) -> bool {
     &&& pooled(pools, catalog, catalog.intents@.len() as int)
     &&& pools.contains_key(crate::domain::contracts::string_key("filler"@))
@@ -543,6 +545,7 @@ pub open spec fn valid_pools(pools: Map<String, Pool>, catalog: Catalog) -> bool
     &&& pools.contains_key(crate::domain::contracts::string_key("ask_area"@))
     &&& pools.contains_key(crate::domain::contracts::string_key("cancelled"@))
     &&& pools.contains_key(crate::domain::contracts::string_key("training_busy"@))
+    &&& pools.contains_key(crate::domain::contracts::string_key("not_in_library"@))
     &&& filled(pools)
 }
 
@@ -921,6 +924,13 @@ mod tests {
     fn ac_10_5c_3_missing_cancelled_names_it() {
         let result = validate(|pools, _| _ = pools.remove("cancelled"));
         assert_eq!(result, Err(PoolError::Missing("cancelled".to_owned())));
+    }
+
+    /// AC-18.9-15.
+    #[test]
+    fn ac_18_9_15_missing_not_in_library_names_it() {
+        let result = validate(|pools, _| _ = pools.remove("not_in_library"));
+        assert_eq!(result, Err(PoolError::Missing("not_in_library".to_owned())));
     }
 
     /// The result of `validate_pools` when the pool `pool` is `template` and `temperature_query`

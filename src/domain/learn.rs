@@ -785,6 +785,7 @@ pub fn intent(entry: LearnedIntent) -> Option<Intent> {
         state: None,
         data: entry.data,
         search: false,
+        title: None,
         fresh_min: entry.fresh_min,
     })
 }

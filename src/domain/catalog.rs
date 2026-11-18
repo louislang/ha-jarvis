@@ -66,6 +66,8 @@ pub struct Intent {
     /// True when Jarvis plays the best Music Assistant match of the `media_id` of the call.
     #[serde(default)]
     pub search: bool,
+    /// The slot that holds a Plex title, which is also the kind of the title: `show` or `movie`.
+    pub title: Option<String>,
     /// How long the answer of a fetch or prefetch intent stays fresh, in minutes.
     pub fresh_min: Option<u32>,
 }

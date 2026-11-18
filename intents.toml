@@ -35,7 +35,8 @@ examples = ["put the tv on [the office](show)", "play [bluey](show) on the tv", 
 service = "media_player.play_media"
 target = "entity"
 select = [{ domain = "media_player", name = "tv" }]
-data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "shuffle": 1}' }
+title = "show"
+data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": {{ show | tojson }}, "shuffle": 1}' }
 
 [[intent]]
 name = "temperature_query"
@@ -205,7 +206,8 @@ examples = ["put on [the matrix](movie)", "play the movie [inception](movie)", "
 service = "media_player.play_media"
 target = "entity"
 select = [{ domain = "media_player", name = "tv" }]
-data = { media_content_type = "movie", media_content_id = 'plex://{"library_name": "Movies", "title": "{{ movie }}"}' }
+title = "movie"
+data = { media_content_type = "movie", media_content_id = 'plex://{"library_name": "Movies", "title": {{ movie | tojson }}}' }
 
 [[intent]]
 name = "continue_show"
@@ -215,7 +217,8 @@ verbs = ["Continue", "Keep watching"]
 service = "media_player.play_media"
 target = "entity"
 select = [{ domain = "media_player", name = "tv" }]
-data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "resume": 1}' }
+title = "show"
+data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": {{ show | tojson }}, "resume": 1}' }
 
 [[intent]]
 name = "play_episode"
@@ -224,7 +227,8 @@ examples = ["play season [two](season) episode [five](episode) of [the office](s
 service = "media_player.play_media"
 target = "entity"
 select = [{ domain = "media_player", name = "tv" }]
-data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "season_number": {{ season | number }}, "episode_number": {{ episode | number }}}' }
+title = "show"
+data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": {{ show | tojson }}, "season_number": {{ season | number }}, "episode_number": {{ episode | number }}}' }
 
 [[intent]]
 name = "tv_pause"
