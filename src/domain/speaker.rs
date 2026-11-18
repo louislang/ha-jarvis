@@ -1,4 +1,5 @@
-//! Speaker identification: discovery of the person trackers and the satellite presence sensors.
+//! Speaker identification: discovery of the person trackers and the satellite presence sensors,
+//! and the people and presence signals.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -6,6 +7,7 @@ use vstd::prelude::*;
 
 use crate::domain::state::Entity;
 use crate::domain::state::EntityId;
+use crate::domain::state::State;
 use crate::domain::state_cache::StateCache;
 
 /// The area and distance sensors of a phone or watch.
@@ -18,6 +20,16 @@ pub struct Tracker {
     /// The sensor of the distance to the nearest satellite, in m.
     #[serde(rename = "distance")]
     pub distance_sensor: EntityId,
+}
+
+/// A person of the house: a `person` entity of HA.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Person {
+    /// The `person` entity.
+    pub entity: EntityId,
+    /// The `friendly_name` attribute, else the entity ID.
+    pub name: String,
 }
 
 /// The trackers of `person`: `configured` when set, else the area and distance sensors of each
@@ -206,6 +218,135 @@ fn is_presence(cache: &StateCache, entity: &Entity, device: &str) -> bool {
             if class == "occupancy" || class == "presence" || class == "motion")
 }
 
+/// The people of the house: the `person` entities of `cache`, in entity ID order.
+#[verus_spec(found =>
+    ensures
+        people_in(*cache, found@, None),
+)]
+#[must_use]
+pub fn people(cache: &StateCache) -> Vec<Person> {
+    persons_with(cache, None)
+}
+
+/// The people of the house whose state is `home`, in entity ID order.
+#[verus_spec(found =>
+    ensures
+        people_in(*cache, found@, Some("home"@)),
+)]
+#[must_use]
+pub fn home(cache: &StateCache) -> Vec<Person> {
+    persons_with(cache, Some("home"))
+}
+
+/// The `person` entities of `cache` in entity ID order, with the state `wanted` when it is `Some`.
+#[verus_spec(found =>
+    ensures
+        people_in(*cache, found@, crate::domain::state_cache::optional(wanted)),
+)]
+fn persons_with(cache: &StateCache, wanted: Option<&str>) -> Vec<Person> {
+    let mut found = Vec::new();
+    let entries = cache.states.iter();
+    proof_decl! {
+        let ghost all = vstd::std_specs::iter::IteratorSpec::remaining(&entries);
+    }
+    #[cfg_attr(verus_only, verus_spec(entry_iter =>
+        invariant
+            entry_iter.seq() == all,
+            ordered(cache.states@, all),
+            named(found@) == persons(all.take(entry_iter.index()), crate::domain::state_cache::optional(wanted)),
+    ))]
+    for (_, state) in entries {
+        proof! {
+            assert(all.take(entry_iter.index() + 1).drop_last() =~= all.take(entry_iter.index()));
+        }
+        if keeps(state, wanted) {
+            found.push(person_of(state));
+        }
+        proof! {
+            assert(named(found@) =~= persons(all.take(entry_iter.index() + 1), crate::domain::state_cache::optional(wanted)));
+        }
+    }
+    proof! {
+        assert(all.take(all.len() as int) =~= all);
+    }
+    found
+}
+
+/// True when `state` is a `person` entity, with the state `wanted` when it is `Some`.
+#[verus_spec(found =>
+    ensures
+        found == kept(*state, crate::domain::state_cache::optional(wanted)),
+)]
+fn keeps(state: &State, wanted: Option<&str>) -> bool {
+    StateCache::in_domain(state.entity_id.as_str(), "person")
+        && match wanted {
+            Some(value) => state.state.as_str() == value,
+            None => true,
+        }
+}
+
+/// The person of the `person` state `state`, with its `friendly_name` text, else its entity ID.
+#[verus_spec(found =>
+    ensures
+        found.entity.0@ == state.entity_id@,
+        found.name@ == name_of(*state),
+)]
+fn person_of(state: &State) -> Person {
+    let name = match state.attributes.get("friendly_name") {
+        Some(value) => match value.as_str() {
+            Some(text) => text.to_owned(),
+            None => state.entity_id.clone(),
+        },
+        None => state.entity_id.clone(),
+    };
+    Person {
+        entity: EntityId(state.entity_id.clone()),
+        name,
+    }
+}
+
+/// True when the state of `id` is `value`.
+#[verus_spec(found =>
+    ensures
+        found == shows(*cache, id.0@, value@),
+)]
+fn has_state(cache: &StateCache, id: &EntityId, value: &str) -> bool {
+    matches!(cache.states.get(id.0.as_str()), Some(state) if state.state.as_str() == value)
+}
+
+/// Whether the room of the satellite device `device` is occupied: `None` without a presence
+/// sensor, else true when one presence sensor is `on`. `configured` is as in `presence_sensors`.
+#[verus_spec(found =>
+    ensures
+        configured matches Some(set) ==> occupancy(*cache, set@, found),
+        configured is None ==> sensed(*cache, device@, found),
+)]
+#[must_use]
+pub fn occupied(
+    cache: &StateCache,
+    device: &str,
+    configured: Option<Vec<EntityId>>,
+) -> Option<bool> {
+    let sensors = presence_sensors(cache, device, configured);
+    let mut on = false;
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= sensors@.len(),
+            on == on_among(*cache, sensors@, index as int),
+        decreases sensors@.len() - index,
+    ))]
+    while index < sensors.len() {
+        on = on || has_state(cache, &sensors[index], "on");
+        index += 1;
+    }
+    let found = if sensors.is_empty() { None } else { Some(on) };
+    proof! {
+        assert(occupancy(*cache, sensors@, found));
+    }
+    found
+}
+
 verus! {
 
 broadcast use {
@@ -281,6 +422,81 @@ pub open spec fn presence_list(cache: StateCache, device: Seq<char>, found: Seq<
         ==> presence_among(cache, device, #[trigger] found[position], count)
     &&& forall|index: int| 0 <= index < count && presence(cache, #[trigger] cache.entities@[index], device)
         ==> found.contains(cache.entities@[index].entity_id)
+}
+
+/// True when the state of `id` in `cache` is `value`.
+pub open spec fn shows(cache: StateCache, id: Seq<char>, value: Seq<char>) -> bool {
+    let key = crate::domain::contracts::str_key(id);
+    cache.states@.contains_key(key) && cache.states@[key].state@ == value
+}
+
+/// The `friendly_name` attribute of `state` when it is text, else its entity ID.
+pub open spec fn name_of(state: State) -> Seq<char> {
+    match crate::domain::contracts::attribute(state.attributes, "friendly_name") {
+        Some(value) => match crate::domain::contracts::text(value) {
+            Some(text) => text,
+            None => state.entity_id@,
+        },
+        None => state.entity_id@,
+    }
+}
+
+/// True when `state` is a `person` entity, with the state `wanted` when it is `Some`.
+pub open spec fn kept(state: State, wanted: Option<Seq<char>>) -> bool {
+    &&& crate::domain::state_cache::in_domain(state.entity_id@, "person"@)
+    &&& wanted matches Some(value) ==> state.state@ == value
+}
+
+/// The entity ID and the name of each state of `all` that `kept` keeps, in order.
+pub open spec fn persons(all: Seq<(&std::sync::Arc<str>, &std::sync::Arc<State>)>, wanted: Option<Seq<char>>) -> Seq<(Seq<char>, Seq<char>)>
+    decreases all.len(),
+{
+    if all.len() == 0 {
+        Seq::empty()
+    } else if kept(**all.last().1, wanted) {
+        persons(all.drop_last(), wanted).push((all.last().1.entity_id@, name_of(**all.last().1)))
+    } else {
+        persons(all.drop_last(), wanted)
+    }
+}
+
+/// True when `all` holds each entry of `states` once, in increasing key order.
+pub open spec fn ordered(states: Map<std::sync::Arc<str>, std::sync::Arc<State>>, all: Seq<(&std::sync::Arc<str>, &std::sync::Arc<State>)>) -> bool {
+    &&& forall|index: int| 0 <= index < all.len()
+        ==> #[trigger] states.contains_key(*all[index].0) && states[*all[index].0] == *all[index].1
+    &&& forall|key: std::sync::Arc<str>| #[trigger] states.contains_key(key) ==> all.contains((&key, &states[key]))
+    &&& vstd::std_specs::btree::increasing_seq(all.map_values(|entry: (&std::sync::Arc<str>, &std::sync::Arc<State>)| *entry.0))
+}
+
+/// The entity ID and the name of each person of `found`.
+pub open spec fn named(found: Seq<Person>) -> Seq<(Seq<char>, Seq<char>)> {
+    found.map_values(|person: Person| (person.entity.0@, person.name@))
+}
+
+/// True when `found` is the entity ID and the name of each `person` state of `cache` with the
+/// state `wanted` when it is `Some`, in entity ID order.
+pub open spec fn people_in(cache: StateCache, found: Seq<Person>, wanted: Option<Seq<char>>) -> bool {
+    exists|all: Seq<(&std::sync::Arc<str>, &std::sync::Arc<State>)>| #[trigger] ordered(cache.states@, all)
+        && named(found) == persons(all, wanted)
+}
+
+/// True when one of the first `count` sensors of `sensors` is `on`.
+pub open spec fn on_among(cache: StateCache, sensors: Seq<EntityId>, count: int) -> bool {
+    exists|index: int| 0 <= index < count && shows(cache, (#[trigger] sensors[index]).0@, "on"@)
+}
+
+/// True when `found` is `None` for no sensors, else whether one of `sensors` is `on`.
+pub open spec fn occupancy(cache: StateCache, sensors: Seq<EntityId>, found: Option<bool>) -> bool {
+    match found {
+        None => sensors.len() == 0,
+        Some(on) => sensors.len() > 0 && on == on_among(cache, sensors, sensors.len() as int),
+    }
+}
+
+/// True when `found` is the occupancy of the discovered presence sensors on `device`.
+pub open spec fn sensed(cache: StateCache, device: Seq<char>, found: Option<bool>) -> bool {
+    exists|sensors: Seq<EntityId>| presence_list(cache, device, sensors, cache.entities@.len() as int)
+        && #[trigger] occupancy(cache, sensors, found)
 }
 
 } // verus!
@@ -411,5 +627,65 @@ mod tests {
     fn ac_15_1b_3_configured_presence_replaces_discovery() {
         let configured = vec![id("binary_sensor.office_presence")];
         assert_eq!(office("occupancy", Some(configured.clone())), configured);
+    }
+
+    /// The cache of the house with the `person` entities of `persons` (entity ID, state and
+    /// attributes) instead of its own.
+    fn household(persons: Vec<(&str, &str, Value)>) -> StateCache {
+        let mut snapshot = house();
+        snapshot
+            .states
+            .retain(|state| !state.entity_id.starts_with("person."));
+        for (person, value, attributes) in persons {
+            add(&mut snapshot, person, "phone", value, attributes);
+        }
+        StateCache::load(snapshot)
+    }
+
+    /// The person `entity` with the name `name`.
+    fn person(entity: &str, name: &str) -> Person {
+        Person {
+            entity: id(entity),
+            name: name.to_owned(),
+        }
+    }
+
+    /// AC-15.2-1.
+    #[test]
+    fn ac_15_2_1_home_returns_the_people_at_home() {
+        let cache = household(vec![
+            ("person.alex", "home", json!({ "friendly_name": "Alex" })),
+            ("person.sam", "not_home", json!({ "friendly_name": "Sam" })),
+            ("person.kim", "home", json!({ "friendly_name": "Kim" })),
+        ]);
+        let expected = [person("person.alex", "Alex"), person("person.kim", "Kim")];
+        assert_eq!(home(&cache), expected);
+    }
+
+    /// AC-15.2-7.
+    #[test]
+    fn ac_15_2_7_people_are_the_person_entities() {
+        let cache = household(vec![
+            ("person.sam", "not_home", json!({ "friendly_name": "Sam" })),
+            ("person.alex", "home", json!({ "friendly_name": "Alex" })),
+        ]);
+        let expected = [person("person.alex", "Alex"), person("person.sam", "Sam")];
+        assert_eq!(people(&cache), expected);
+    }
+
+    /// AC-15.2-8.
+    #[test]
+    fn ac_15_2_8_person_without_friendly_name_has_its_entity_id() {
+        let cache = household(vec![("person.alex", "home", json!({}))]);
+        assert_eq!(people(&cache), [person("person.alex", "person.alex")]);
+    }
+
+    /// AC-15.2-2.
+    #[test]
+    fn ac_15_2_2_no_presence_sensor_gives_no_occupancy() {
+        let house = StateCache::load(house());
+        assert_eq!(occupied(&house, OFFICE, None), None);
+        let configured = vec![id("binary_sensor.office_presence")];
+        assert_eq!(occupied(&house, OFFICE, Some(configured)), Some(true));
     }
 }
