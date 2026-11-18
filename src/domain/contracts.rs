@@ -64,6 +64,7 @@ use crate::domain::learn::LearnedKind;
 use crate::domain::learn::LearnedStatus;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Response;
+use crate::domain::speaker::Tracker;
 use crate::domain::state::Area;
 use crate::domain::state::AreaId;
 use crate::domain::state::Context;
@@ -161,6 +162,10 @@ pub struct ExHomeConfig(HomeConfig);
 /// The units of the HA configuration that Jarvis uses.
 #[verifier::external_type_specification]
 pub struct ExUnitSystem(UnitSystem);
+
+/// The area and distance sensors of a phone or watch.
+#[verifier::external_type_specification]
+pub struct ExTracker(Tracker);
 
 /// The intent catalog of `intents.toml`.
 #[verifier::external_type_specification]

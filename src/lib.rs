@@ -95,8 +95,10 @@ use crate::domain::model::Prediction;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Pools;
 use crate::domain::responses::Response;
+use crate::domain::speaker::Tracker;
 use crate::domain::speech::Audio;
 use crate::domain::speech::CommitPolicy;
+use crate::domain::state::EntityId;
 use crate::domain::state::Snapshot;
 use crate::domain::state_cache::StateCache;
 use crate::domain::training::Settings;
@@ -144,6 +146,7 @@ pub mod domain {
     pub mod model;
     pub mod responses;
     pub mod select;
+    pub mod speaker;
     pub mod speech;
     pub mod state;
     pub mod state_cache;
@@ -232,6 +235,9 @@ pub struct Config {
     pub web: WebConfig,
     /// The MQTT broker of the status entity. Without it, Jarvis publishes no status.
     pub mqtt: Option<MqttConfig>,
+    /// The tracker overrides of the people. The people are the `person` entities of HA.
+    #[serde(default)]
+    pub people: Vec<PersonConfig>,
 }
 
 impl Config {
@@ -728,6 +734,16 @@ pub struct MqttConfig {
     pub username_env: String,
     /// The environment variable with the password.
     pub password_env: String,
+}
+
+/// A `[[people]]` entry: the trackers that replace discovery for one person.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct PersonConfig {
+    /// The `person` entity.
+    pub person: EntityId,
+    /// The trackers that replace discovery.
+    pub trackers: Vec<Tracker>,
 }
 
 /// The `Clock` of the system time.
@@ -2735,8 +2751,17 @@ mod tests {
             log: expected_log(),
             web: expected_web(),
             mqtt: Some(expected_mqtt()),
+            people: Vec::new(),
         };
         assert_eq!(Config::parse(VALID)?, expected);
+        Ok(())
+    }
+
+    /// AC-15.1-4.
+    #[test]
+    fn ac_15_1_4_config_without_people_has_no_overrides() -> anyhow::Result<()> {
+        assert!(!VALID.contains("\n[[people]]"));
+        assert_eq!(Config::parse(VALID)?.people, []);
         Ok(())
     }
 
