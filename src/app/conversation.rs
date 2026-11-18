@@ -77,6 +77,7 @@ use crate::ports::InteractionLog;
 use crate::ports::Reasoner;
 use crate::ports::Step;
 use crate::ports::Store;
+use crate::ports::Title;
 use crate::ports::Work;
 
 /// One change to the pools, applied by the pools task.
@@ -170,6 +171,8 @@ pub struct Conversation {
     recorder: Recorder,
     /// The ID of the next interaction.
     next_id: Arc<AtomicU64>,
+    /// The movie and show titles of the media library, empty until the first refresh.
+    titles: Arc<ArcSwap<Vec<Title>>>,
 }
 
 impl Conversation {
@@ -213,6 +216,7 @@ impl Conversation {
             habits,
             recorder,
             next_id,
+            titles: Arc::new(ArcSwap::from_pointee(Vec::new())),
         }
     }
 
@@ -1201,6 +1205,12 @@ impl Conversation {
     #[must_use]
     pub fn answers(&self) -> Arc<Answers> {
         Arc::clone(&self.two.answers)
+    }
+
+    /// The title list of the media library, which the title refresh replaces.
+    #[must_use]
+    pub fn titles(&self) -> Arc<ArcSwap<Vec<Title>>> {
+        Arc::clone(&self.titles)
     }
 
     /// The plugin call of the fetch intent `intent` with its `data` for `area` and no slots, and a

@@ -89,6 +89,7 @@ use crate::ports::Home;
 use crate::ports::Info;
 use crate::ports::InteractionLog;
 use crate::ports::Listening;
+use crate::ports::MediaLibrary;
 use crate::ports::ModelLoader;
 use crate::ports::Models;
 use crate::ports::Page;
@@ -105,6 +106,7 @@ use crate::ports::Step;
 use crate::ports::Store;
 use crate::ports::SttStream;
 use crate::ports::TextToSpeech;
+use crate::ports::Title;
 use crate::ports::Tool;
 use crate::ports::Trainer;
 use crate::ports::Unresolved;
@@ -790,6 +792,32 @@ impl Plugin for FakePlugin {
             Some(result) => result,
             None => futures::future::pending().await,
         }
+    }
+}
+
+/// A `MediaLibrary` that gives the scripted title lists in order, then an error.
+#[derive(Default)]
+pub(crate) struct FakeLibrary {
+    /// The results of the next calls in order: the titles, or the error text.
+    pub(crate) results: Mutex<VecDeque<Result<Vec<Title>, &'static str>>>,
+}
+
+/// The title `name` of `kind`.
+#[must_use]
+pub(crate) fn title(name: &str, kind: &str) -> Title {
+    Title {
+        name: name.to_owned(),
+        kind: kind.to_owned(),
+    }
+}
+
+#[async_trait]
+impl MediaLibrary for FakeLibrary {
+    async fn titles(&self) -> anyhow::Result<Vec<Title>> {
+        let result = lock(&self.results).pop_front();
+        result
+            .unwrap_or(Err("no scripted titles"))
+            .map_err(anyhow::Error::msg)
     }
 }
 

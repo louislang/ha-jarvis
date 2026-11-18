@@ -112,6 +112,7 @@ use crate::ports::Home;
 use crate::ports::Info;
 use crate::ports::InteractionLog;
 use crate::ports::Listening;
+use crate::ports::MediaLibrary;
 use crate::ports::ModelLoader;
 use crate::ports::Models;
 use crate::ports::Partial;
@@ -1475,6 +1476,9 @@ type Learn = (mpsc::Sender<Change>, Arc<Habits>);
 /// The [`Extras`] and the [`Learn`] of the learned intent check.
 type Checks = (Extras, Learn);
 
+/// The plugins of a configuration and its media library, if any.
+type Sources = (Vec<Arc<dyn Plugin>>, Option<Arc<dyn MediaLibrary>>);
+
 /// The [`Checks`] with the activation in place of the live catalog and the pools task.
 type Activated = (
     (Option<Arc<dyn Trainer>>, Vec<Tool>),
@@ -1742,8 +1746,9 @@ where
 
 /// The app of `config`, `catalog` and the source pools `pools` on `home`, the plugin registry of
 /// `config`, the reasoner of `config` with the tools of that registry and the `OpenAI` API key
-/// of `secrets`, and the `RunPod` trainer of [`runpod`]. Gives the app, its pools task and habit
-/// task, its pre-render task and its live models.
+/// of `secrets`, and the `RunPod` trainer of [`runpod`]. Starts the title refresh of the media
+/// library of [`plugins`]. Gives the app, its pools task and habit task, its pre-render task and
+/// its live models.
 ///
 /// # Errors
 ///
@@ -1756,7 +1761,8 @@ async fn start_live_app(
     pools: Pools,
     home: Arc<dyn Home>,
 ) -> anyhow::Result<Started> {
-    let plugins = registry(config, plugins(config, secrets)?);
+    let (plugins, library) = plugins(config, secrets)?;
+    let plugins = registry(config, plugins);
     let tools = plugins.tools();
     let reasoner = Arc::new(OpenAiReasoner::try_new(
         &config.openai,
@@ -1766,7 +1772,11 @@ async fn start_live_app(
     )?);
     let runpod = runpod(config, secrets)?;
     let catalog = Arc::new(catalog);
-    start_app(config, catalog, pools, home, reasoner, plugins, runpod).await
+    let started = start_app(config, catalog, pools, home, reasoner, plugins, runpod).await?;
+    if let Some(library) = library {
+        app::background::start_titles(library, started.0.conversation.titles());
+    }
+    Ok(started)
 }
 
 /// The `RunPod` trainer of `[train.runpod]` of `config` with the keys of `secrets`, when it is set.
@@ -1789,18 +1799,20 @@ fn plugin_requests(learn: &LearnConfig) -> Option<Arc<dyn PluginRequests>> {
 }
 
 /// The plugins of `config`: the Open-Meteo weather plugin, and the Plex plugin with the token of
-/// `secrets` when `[plugins.plex]` is set.
+/// `secrets` when `[plugins.plex]` is set. Also the Plex plugin as the media library.
 ///
 /// # Errors
 ///
 /// An HTTP client cannot be built.
-fn plugins(config: &Config, secrets: &Secrets) -> anyhow::Result<Vec<Arc<dyn Plugin>>> {
+fn plugins(config: &Config, secrets: &Secrets) -> anyhow::Result<Sources> {
     let mut plugins: Vec<Arc<dyn Plugin>> =
         vec![Arc::new(OpenMeteo::try_new(&config.plugins.weather)?)];
-    if let (Some(plex), Some(token)) = (&config.plugins.plex, &secrets.plex_token) {
-        plugins.push(Arc::new(Plex::try_new(plex, token, Arc::new(SystemClock))?));
-    }
-    Ok(plugins)
+    let (Some(plex), Some(token)) = (&config.plugins.plex, &secrets.plex_token) else {
+        return Ok((plugins, None));
+    };
+    let plex = Arc::new(Plex::try_new(plex, token, Arc::new(SystemClock))?);
+    plugins.push(Arc::clone(&plex) as _);
+    Ok((plugins, Some(plex)))
 }
 
 /// The registry of `plugins` with the `[plugins]` of `config` and the system time.
@@ -3217,7 +3229,7 @@ mod tests {
     fn tool_names(text: &str) -> anyhow::Result<Vec<String>> {
         let config = Config::parse(text)?;
         let secrets = Secrets::resolve(&config, |_| Some("token".to_owned()))?;
-        let tools = registry(&config, plugins(&config, &secrets)?).tools();
+        let tools = registry(&config, plugins(&config, &secrets)?.0).tools();
         Ok(tools.into_iter().map(|tool| tool.name).collect())
     }
 
