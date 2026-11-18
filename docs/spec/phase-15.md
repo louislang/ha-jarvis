@@ -122,7 +122,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 - **Implements:** G12. **Depends on:** 15.2b.
 - **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `justfile`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `VoiceEmbedder::embed(audio) -> Result<Vec<f32>>` with `SpeakerEmbeddingExtractor`. `VoiceProfiles::enroll(person, id, embedding)` and `similarities(embedding) -> Map<person, f32>` with `SpeakerEmbeddingManager`, saved to `speaker.voices`. `id` is the interaction ID of the request (sub-phase 12.6). The store keys each sample by its interaction ID, so one request gives at most one sample. `enroll` with an interaction ID that the store has does not change the store. A profile keeps the samples of the newest `max_samples` interaction IDs. Sub-phase 15.8 adds `assign`. `just models` also downloads the speaker model and the multi-speaker test voice `vits-piper-en_US-libritts_r-medium`. This sub-phase adds `[speaker]` (`model`, `voices`, `max_samples`, `voice_threshold`). `voice_threshold` is a voice similarity. Sub-phase 15.6 adds `threshold`, which is a combined score. `LiveModels` (sub-phase 13.10d) also keeps the voice embedder session, so the training pause releases it and loads it again.
+**Model.** `VoiceEmbedder::embed(audio) -> Result<Vec<f32>>` with `SpeakerEmbeddingExtractor`. `VoiceProfiles::enroll(person, id, embedding)` and `similarities(embedding) -> Map<person, f32>` with `SpeakerEmbeddingManager`, saved to `speaker.voices`. `id` is the interaction ID of the request (sub-phase 12.6). The store keys each sample by its interaction ID, so one request gives at most one sample. `enroll` with an interaction ID that the store has does not change the store. A profile keeps the samples of the newest `max_samples` interaction IDs: after each change, the store removes the samples of the person with the oldest IDs until `max_samples` are left. Sub-phase 15.8 adds `assign` and the pick record. `just models` also downloads the speaker model and the multi-speaker test voice `vits-piper-en_US-libritts_r-medium`. This sub-phase adds `[speaker]` (`model`, `voices`, `max_samples`, `voice_threshold`). `voice_threshold` is a voice similarity. Sub-phase 15.6 adds `threshold`, which is a combined score. `LiveModels` (sub-phase 13.10d) also keeps the voice embedder session, so the training pause releases it and loads it again.
 
 **Acceptance criteria.**
 
@@ -139,7 +139,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 **Proofs.**
 
 - P-15.3-4. Argument: `enroll` adds the sample, and then removes the samples of the person with the oldest interaction IDs until `max_samples` are left.
-- P-15.3-9. Argument: `enroll` returns before any change when the store has an entry for the interaction ID.
+- P-15.3-9. Argument: `enroll` returns before any change when the store has a sample of the interaction ID, or (from sub-phase 15.8) a pick of it.
 - P-15.3-1 to P-15.3-3, P-15.3-5 to P-15.3-8. Evidence: test.
 
 ---
@@ -176,21 +176,22 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Model.**
 
-- Constants: `PEOPLE = Set("alex", "sam")`.
+- Constants: `PEOPLE = Set("alex", "sam")`, `MAX_SAMPLES = 2`.
 - State: `home: Option[Set[PERSON]]` (`None` when presence is not known), `occupied: Option[bool]`, `proximity: PERSON -> int`, `voice: PERSON -> int`, `result: Option[PERSON]`, `source: Presence | Proximity | Voice | NoSource`, `utterance: int` (the interaction ID of the current request), `samples: int -> (PERSON, source)` (the stored samples by interaction ID).
-- Actions: `setSignals(...)` (a new request: `utterance += 1`), `identify` (rules 1 to 4 of sub-phase 15.6), `enroll` (rule 5). `enroll` is enabled only when `samples` has no entry for `utterance`.
+- Actions: `setSignals(...)` (a new request: `utterance += 1`), `identify` (rules 1 to 4 of sub-phase 15.6), `enroll` (rule 5). `enroll` is enabled only when `samples` has no entry for `utterance`. After it adds the sample, `enroll` trims the person: it removes the samples of that person with the lowest IDs until `MAX_SAMPLES` are left, as the store of sub-phase 15.3 does.
 - Invariants:
   - `SpeakerIsCandidate`: `result = Some(p)` implies `p` is in `home`, or `home = None`.
   - `NoVoiceOnlyEnrollment`: no value in `samples` has source `Voice`.
+  - `ProfilesBounded`: each person has at most `MAX_SAMPLES` samples in `samples`.
 
 **Acceptance criteria.**
 
 - AC-15.5-1 [Quint]: `quint typecheck` passes.
-- AC-15.5-2 [Quint]: Both invariants hold in simulation and to 10 steps in `quint verify`.
+- AC-15.5-2 [Quint]: The three invariants hold in simulation and to 10 steps in `quint verify`.
 
 **Proofs.**
 
-- P-15.5-2. `SpeakerIsCandidate`: `identify` chooses only from the candidate set, which is `home` when presence is known (rule 1). `NoVoiceOnlyEnrollment`: `enroll` is enabled only when `source` is `Presence` or `Proximity`.
+- P-15.5-2. `SpeakerIsCandidate`: `identify` chooses only from the candidate set, which is `home` when presence is known (rule 1). `NoVoiceOnlyEnrollment`: `enroll` is enabled only when `source` is `Presence` or `Proximity`. `ProfilesBounded`: only `enroll` adds a sample, and it trims the person to `MAX_SAMPLES` in the same step.
 - P-15.5-1. Evidence: model check.
 
 ---
@@ -283,7 +284,7 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 - **Implements:** G12. **Depends on:** 15.6b.
 - **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`.
 
-**Model.** `assign(id, person: Option<EntityId>, embedding)`. With `Some(person)`, the store keeps the sample of `id` in the profile of `person` and in no other profile. With `None`, the sample of `id` is in no profile, and the store keeps an empty entry for `id`. Thus a later `enroll` with `id` changes nothing (P-15.3-9), and a pick always wins over passive enrollment. A profile still keeps the samples of the newest `max_samples` interaction IDs.
+**Model.** `assign(id, person: Option<EntityId>, embedding)`. The store keeps a pick record apart from the samples: the last pick of each interaction ID, a person or none. `assign` sets the pick of `id` and removes the sample of `id` from each profile. With `Some(person)`, it adds the sample to the profile of `person` and then trims that profile to the newest `max_samples` interaction IDs (sub-phase 15.3), so the trim can remove the new sample at once. With `None`, it adds no sample. A later `enroll` with `id` changes nothing, because `id` has a pick (P-15.3-9). Thus a pick always wins over passive enrollment, also after a trim.
 
 **Acceptance criteria.**
 
@@ -291,11 +292,12 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 - AC-15.8-2: When `assign(id, None)` runs, the sample of `id` is in no profile.
 - AC-15.8-3: When `assign(id, None)` runs and then `enroll` runs with the same ID, the sample of `id` is in no profile.
 - AC-15.8-4: When the profile of `person.sam` has `max_samples` samples and `assign` adds a newer one, the profile keeps the newest `max_samples`.
+- AC-15.8-5: When the profile of `person.sam` has `max_samples` newer samples and `assign(id, Some(person.sam))` runs for an older interaction, the sample of `id` is in no profile, the pick of `id` is `person.sam`, and a later `enroll` with `id` changes nothing.
 
 **Proofs.**
 
 - P-15.8-1, P-15.8-2. Argument: the store keys each sample by its interaction ID, so one ID has one entry, and `assign` replaces the entry of `id`.
-- P-15.8-3. Argument: `assign` with `None` leaves an empty entry for `id`, and `enroll` does not change an ID that has an entry (P-15.3-9).
+- P-15.8-3, P-15.8-5. Argument: `assign` always sets the pick of `id`, the trim removes samples but never picks, and `enroll` does not change an ID that has a pick (P-15.3-9).
 - P-15.8-4. Argument: `assign` uses the same trim as `enroll` (P-15.3-4).
 
 ---
@@ -313,8 +315,8 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 - `Source` gets `Assigned`.
 - `Review::people() -> Vec<Person>`: `people` of the hot cache (sub-phase 15.2).
 - `Review::assign(id, person: Option<EntityId>)`: checks that `person` is `None` or the entity of one of `people()`, and gets the embedding with `embedding(id)` (sub-phase 15.6b). Then it calls `VoiceProfiles::assign` and sends the log update `Speaker { speaker: person, source: Assigned, embedding: None }`. A person that is not in `people()` gives an error, and no embedding gives `NotFound`. Both checks run before the writes.
-- `speaker.qnt`: a value of `samples` gets an optional person. The new state `picked: int -> Option[PERSON]` holds the last pick of each interaction ID. The new action `assign(id, p)` sets `samples[id] = (p, Assigned)` and `picked[id] = p`. The new invariant `PickWins`: for each ID in `picked`, `samples[id] = (picked[id], Assigned)`. `NoVoiceOnlyEnrollment` still holds.
-- The conformance driver of sub-phase 15.6 maps `assign` to `Review::assign` and compares the entries of `FakeVoiceProfiles` with `samples`.
+- `speaker.qnt`: the new state `picks: int -> Option[PERSON]` is the pick record. The new action `assign(id, p)` sets `picks[id] = p`, removes `id` from `samples`, and with `p = Some(person)` adds `samples[id] = (person, Assigned)` and trims `person` as `enroll` does. `enroll` is also disabled when `picks` has `utterance`. The new invariant `PickWins`: for each ID in `picks`, a sample of that ID has the person of the pick and the source `Assigned`, and a pick of none has no sample. `NoVoiceOnlyEnrollment` and `ProfilesBounded` still hold.
+- The conformance driver of sub-phase 15.6 maps `assign` to `Review::assign`. After each step, it compares the samples of `FakeVoiceProfiles` with `samples` and its pick record with `picks`.
 
 **Acceptance criteria.**
 
@@ -323,13 +325,13 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 - AC-15.8b-3: When `assign(id, None)` runs, the interaction record has no speaker and the source `Assigned`.
 - AC-15.8b-4: When the person is not a `person` entity of the hot cache, `assign` returns an error, and `FakeVoiceProfiles` and `FakeLog` record no change.
 - AC-15.8b-5: When the interaction has no embedding, `assign` returns `NotFound`.
-- AC-15.8b-6 [Quint]: `PickWins` and `NoVoiceOnlyEnrollment` hold in simulation and to 10 steps in `quint verify`.
-- AC-15.8b-7: When `quint-connect` replays 100 traces of `speaker.qnt` with `assign`, the entries of `FakeVoiceProfiles` match `samples` after each step.
+- AC-15.8b-6 [Quint]: `PickWins`, `NoVoiceOnlyEnrollment` and `ProfilesBounded` hold in simulation and to 10 steps in `quint verify`.
+- AC-15.8b-7: When `quint-connect` replays 100 traces of `speaker.qnt` with `assign`, the samples and the pick record of `FakeVoiceProfiles` match `samples` and `picks` after each step.
 
 **Proofs.**
 
 - P-15.8b-4, P-15.8b-5. Argument: the use case checks the person and the embedding before both writes and returns on failure.
-- P-15.8b-6. `PickWins`: `assign` sets the entry of `id` and its pick together, and `enroll` is enabled only for an ID with no entry, so no later action changes a picked entry. `NoVoiceOnlyEnrollment`: `assign` sets the source `Assigned`, not `Voice`. Evidence: model check.
+- P-15.8b-6. `PickWins`: `assign` sets the pick of `id` and the sample of `id` in the same step. A later trim can only remove that sample, and `enroll` is disabled for an ID in `picks`, so no action adds a sample of a picked ID with another person or source. `NoVoiceOnlyEnrollment`: `assign` sets the source `Assigned`, not `Voice`. `ProfilesBounded`: `assign` trims the person in the same step as it adds the sample. Evidence: model check.
 - P-15.8b-1 to P-15.8b-3, P-15.8b-7. Evidence: test.
 
 ---
@@ -373,7 +375,7 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 
 - This sub-phase adds the optional table `[address]` to `jarvis.toml`. A key is a `person` entity ID, and its value is the form of address, a free text. Example: `"person.ali" = "Lady Lang"`. An empty value is the same as no value. Sub-phase 15.9b sets it from the Jarvis tab.
 - `address` is a template variable of each catalog intent pool: the form of address of the speaker. A proposal does not act for the speaker, so it does not get `address` (sub-phase 14.2b).
-- Pool selection (sub-phase 4.1) gets `address: Option<&str>`. A response whose template uses `address` is a candidate only when `address` is `Some` and not empty. Else selection uses only the responses without `address`.
+- Pool selection (sub-phase 4.1) gets `address: Option<&str>`. A response whose template uses `address` is eligible only when `address` is `Some` and not empty. Else only the responses without `address` are eligible. The rule of sub-phase 4.1 then applies to the eligible responses: with two or more eligible responses, `last` is not allowed. With one eligible response, selection gives it, also when it is `last`.
 - Pool validation (sub-phase 4.2): a pool with a response that uses `address` must also have a response without `address`. Else the error names the pool. Thus selection always has a candidate.
 - The reply does not wait for the voice embedding. `handle` calls `identify` with no embedding, so only presence and proximity identify the speaker. Without an embedding, the voice similarity of each person is 0.
 - `prerender` (sub-phase 6.3b) also synthesizes each template whose variables are in `{area, address}`, for each area and each non-empty value of `[address]`. A change of `[address]` restarts Jarvis (sub-phase 12.9f), so the pre-render has the new values.
@@ -388,12 +390,14 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 - AC-15.9-4: When each response of a pool uses `address`, validation returns an error that names the pool.
 - AC-15.9-5: When `prerender` runs with `"person.ali" = "Lady Lang"`, the audio cache has each `address` template for each area name with `Lady Lang`.
 - AC-15.9-6: When `handle` chooses a reply, it does not wait for the embedding, and it calls `identify` with no embedding.
+- AC-15.9-7: When no speaker is identified and the pool has one response without `address` and one with it, two requests in a row both reply with the response without `address`.
 
 **Proofs.**
 
 - P-15.9-2, P-15.9-3. Ensures: the chosen response uses `address` only when `address` is `Some` and not empty. Argument: selection filters the candidates by this predicate before it chooses.
 - P-15.9-4. Ensures: validation fails for a pool if and only if the pool has responses and each of them uses `address`. Argument: the check looks for one response without `address`.
 - P-15.9-6. Argument: the `identify` call of the reply passes `None` for the embedding, and `handle` does not await the embedding future.
+- P-15.9-7. Requires: the pool has a response without `address` (P-15.9-4). Ensures: with one eligible response, selection gives it. Argument: the exclusion of `last` applies only to two or more eligible responses, so the one eligible response is the only candidate (P-4.1-5 on the eligible responses).
 - P-15.9-1, P-15.9-5. Evidence: test.
 
 ---

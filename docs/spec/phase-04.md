@@ -14,7 +14,7 @@ This phase selects responses, selects entities and decides the action from a pre
 **Model.**
 
 - `Pools: Map<pool name, Pool>`. `Pool { responses: Vec<Response { text, uses }>, last: Option<usize> }`.
-- `select(pool, rng) -> usize`: if the pool has two or more responses, the allowed responses exclude `last`. The candidates are the allowed responses with the lowest `uses`. The result is a random candidate.
+- `select(pool, rng) -> usize`: if the pool has two or more responses, the allowed responses exclude `last`. The candidates are the allowed responses with the lowest `uses`. The result is a random candidate. Sub-phase 15.9 applies this rule to the eligible responses of the form of address, so it counts only those.
 - `record_use(pools, name, index) -> Pools`: `uses += 1` for that response, and `last := index`.
 
 **Acceptance criteria.**

@@ -797,5 +797,5 @@ Each model has state variables, actions and named invariants. `02-rules.md` sect
 | `training.qnt` | Training | `domain/training.rs`, `app/training.rs` | `OneRun`, `SwapNeverWorse`, `CountResetsAfterRun`, `FailureKeepsModel`, `FallbackOnce`, `PauseOnlyLocal` |
 | `learned.qnt` | Learned intents | `domain/learn.rs`, `app/background.rs` | `ServiceNeedsApproval`, `NoReproposal`, `ActivationCountsOnce`, `OneRequestPerCluster` |
 | `prefetch.qnt` | Prefetch | `domain/learn.rs`, `app/background.rs` | `NoCallFromPrefetch`, `ServedAnswerIsFresh`, `PrefetchOnlyInWindow`, `NoEarlyRefresh` |
-| `speaker.qnt` | Speaker identification and voice assignment | `domain/speaker.rs`, `app/review.rs` | `SpeakerIsCandidate`, `NoVoiceOnlyEnrollment`, `PickWins` |
+| `speaker.qnt` | Speaker identification and voice assignment | `domain/speaker.rs`, `app/review.rs` | `SpeakerIsCandidate`, `NoVoiceOnlyEnrollment`, `ProfilesBounded`, `PickWins` |
 | `jarvis.qnt` | System | All use cases | `OneHandledPerRequest`, `ReplyBeforeCall`, `FillerBeforeAnswer`, `ModelSwapAtomic`, `NoTalkOver` |
