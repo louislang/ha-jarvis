@@ -1783,8 +1783,7 @@ fn runpod(config: &Config, secrets: &Secrets) -> anyhow::Result<Option<Arc<dyn T
 }
 
 /// The plugin request files in `learn.plugin_requests`, when it is set.
-#[must_use]
-pub fn plugin_requests(learn: &LearnConfig) -> Option<Arc<dyn PluginRequests>> {
+fn plugin_requests(learn: &LearnConfig) -> Option<Arc<dyn PluginRequests>> {
     let folder = learn.plugin_requests.clone()?;
     Some(Arc::new(RequestFiles::new(folder)))
 }
@@ -1967,6 +1966,8 @@ fn start_checks(
         tools,
         activation,
         habits,
+        requests: plugin_requests(&config.learn),
+        min_score: config.habits.min_score,
     };
     let learn = Duration::from_secs(config.learn.check_interval_s);
     let train = Duration::from_secs(config.train.check_interval_s);
