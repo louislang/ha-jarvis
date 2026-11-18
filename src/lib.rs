@@ -749,6 +749,12 @@ pub struct MqttConfig {
 pub struct SpeakerConfig {
     /// The speaker embedding model file.
     pub model: PathBuf,
+    /// The voice store file.
+    pub voices: PathBuf,
+    /// The voice similarity of the same person.
+    pub voice_threshold: f32,
+    /// The samples that each profile keeps.
+    pub max_samples: usize,
 }
 
 /// The `Clock` of the system time.
@@ -2745,6 +2751,9 @@ mod tests {
     fn expected_speaker() -> SpeakerConfig {
         SpeakerConfig {
             model: PathBuf::from("models/wespeaker_en_voxceleb_CAM++.onnx"),
+            voices: PathBuf::from("voices.json"),
+            voice_threshold: 0.6,
+            max_samples: 20,
         }
     }
 

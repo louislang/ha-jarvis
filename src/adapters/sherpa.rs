@@ -1,13 +1,19 @@
-//! `SpeechToText` and `VoiceEmbedder` with sherpa-onnx.
+//! `SpeechToText`, `VoiceEmbedder` and `VoiceProfiles` with sherpa-onnx.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::ops::RangeInclusive;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::time::Duration;
 
 use anyhow::Context;
 use arc_swap::ArcSwap;
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde::Serialize;
 use sherpa_onnx::OfflineModelConfig;
 use sherpa_onnx::OfflineRecognizer;
 use sherpa_onnx::OfflineRecognizerConfig;
@@ -20,6 +26,7 @@ use sherpa_onnx::OnlineTransducerModelConfig;
 use sherpa_onnx::SileroVadModelConfig;
 use sherpa_onnx::SpeakerEmbeddingExtractor;
 use sherpa_onnx::SpeakerEmbeddingExtractorConfig;
+use sherpa_onnx::SpeakerEmbeddingManager;
 use sherpa_onnx::VadModelConfig;
 use sherpa_onnx::VoiceActivityDetector;
 use tempfile::NamedTempFile;
@@ -28,10 +35,13 @@ use crate::AsrConfig;
 use crate::Device;
 use crate::SpeakerConfig;
 use crate::domain::speech::Audio;
+use crate::domain::state::EntityId;
 use crate::ports::Partial;
 use crate::ports::SpeechToText;
+use crate::ports::Store;
 use crate::ports::SttStream;
 use crate::ports::VoiceEmbedder;
+use crate::ports::VoiceProfiles;
 
 /// The sample rate of the first pass in Hz.
 const RATE: u16 = 16_000;
@@ -350,6 +360,104 @@ impl VoiceEmbedder for SherpaEmbedder {
     }
 }
 
+/// The content of the voice store.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct Voices {
+    /// The voice sample of each interaction ID.
+    pub samples: BTreeMap<u64, Sample>,
+}
+
+/// The voice sample of one request.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct Sample {
+    /// The `person` entity ID.
+    pub person: String,
+    /// The voice embedding.
+    pub embedding: Vec<f32>,
+}
+
+/// A `VoiceProfiles` with the speaker embedding manager and a voice store.
+pub struct SherpaVoices {
+    /// The samples of the store.
+    voices: Mutex<Voices>,
+    /// The voice store.
+    store: Arc<dyn Store<Voices>>,
+    /// The samples that each profile keeps.
+    max_samples: usize,
+}
+
+impl SherpaVoices {
+    /// The profiles of `store`, each with the `max_samples` of `config`.
+    ///
+    /// # Errors
+    ///
+    /// The store cannot load.
+    pub fn try_new(config: &SpeakerConfig, store: Arc<dyn Store<Voices>>) -> anyhow::Result<Self> {
+        Ok(Self {
+            voices: Mutex::new(store.load()?.unwrap_or_default()),
+            store,
+            max_samples: config.max_samples,
+        })
+    }
+
+    /// The samples of the store.
+    fn voices(&self) -> MutexGuard<'_, Voices> {
+        self.voices.lock().expect("no lock holder panics")
+    }
+}
+
+#[async_trait]
+impl VoiceProfiles for SherpaVoices {
+    async fn enroll(&self, person: &EntityId, id: u64, embedding: &[f32]) -> anyhow::Result<()> {
+        let mut voices = self.voices();
+        if voices.samples.contains_key(&id) {
+            return Ok(());
+        }
+        let mut changed = voices.clone();
+        let sample = Sample {
+            person: person.0.clone(),
+            embedding: embedding.to_vec(),
+        };
+        changed.samples.insert(id, sample);
+        trim(&mut changed.samples, &person.0, self.max_samples);
+        self.store.save(&changed)?;
+        *voices = changed;
+        Ok(())
+    }
+
+    async fn similarities(&self, embedding: &[f32]) -> anyhow::Result<BTreeMap<String, f32>> {
+        let manager = SpeakerEmbeddingManager::create(i32::try_from(embedding.len())?)
+            .context("no speaker embedding manager")?;
+        let mut profiles: BTreeMap<String, Vec<Vec<f32>>> = BTreeMap::new();
+        for sample in self.voices().samples.values() {
+            let profile = profiles.entry(sample.person.clone()).or_default();
+            profile.push(sample.embedding.clone());
+        }
+        for (person, embeddings) in &profiles {
+            let added = manager.add_list(person, embeddings);
+            anyhow::ensure!(added, "a sample of {person} has another length");
+        }
+        let matches = manager.get_best_matches(embedding, f32::MIN, manager.num_speakers());
+        Ok(matches
+            .into_iter()
+            .map(|found| (found.name, found.score))
+            .collect())
+    }
+}
+
+/// Removes the samples of `person` with the oldest interaction IDs until `max_samples` are left.
+fn trim(samples: &mut BTreeMap<u64, Sample>, person: &str, max_samples: usize) {
+    let ids: Vec<u64> = samples
+        .iter()
+        .filter(|(_, sample)| sample.person == person)
+        .map(|(&id, _)| id)
+        .collect();
+    let excess = ids.len().saturating_sub(max_samples);
+    for id in ids.iter().take(excess) {
+        samples.remove(id);
+    }
+}
+
 /// `text` with its numbers as words.
 fn number_words(text: &str) -> String {
     let words: Vec<String> = text.split_whitespace().map(colon_time).collect();
@@ -545,11 +653,18 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
+    use sherpa_onnx::GenerationConfig;
+    use sherpa_onnx::OfflineTts;
+    use sherpa_onnx::OfflineTtsConfig;
+    use sherpa_onnx::OfflineTtsModelConfig;
+    use sherpa_onnx::OfflineTtsVitsModelConfig;
+
     use super::*;
     use crate::Config;
     use crate::domain::intent;
     use crate::domain::speech;
     use crate::testing::fakes;
+    use crate::testing::fakes::FakeStore;
 
     /// The request of the STT tests.
     const REQUEST: &str = "turn on the kitchen lights";
@@ -1142,6 +1257,172 @@ mod tests {
         let samples = dentist(30).await?;
         let (p95, times) = p95(embed, &samples, &[samples.as_slice(); 20])?;
         assert!(p95 < Duration::from_millis(80), "p95 {p95:?} of {times:?}");
+        Ok(())
+    }
+
+    /// The folder of the multi-speaker test voice.
+    const TEST_VOICE: &str = "models/vits-piper-en_US-libritts_r-medium";
+
+    /// The IPA of "turn on the kitchen lights". The sherpa-onnx 2 VITS takes phonemes, not text.
+    const KITCHEN: &str = "tˈɜːn ɑːn ðə kˈɪtʃən lˈaɪts.";
+
+    /// The IPA of "what is the weather like today".
+    const WEATHER: &str = "wʌt ɪz ðə wˈɛðɚ lˈaɪk tədˈeɪ?";
+
+    /// The test voice. The C API replaces a noise scale of 0 with the default, and the smallest
+    /// positive scale removes the noise, so the audio is the same in each run.
+    fn test_voice() -> anyhow::Result<OfflineTts> {
+        let vits = OfflineTtsVitsModelConfig {
+            model: Some(format!("{TEST_VOICE}/en_US-libritts_r-medium.onnx")),
+            tokens: Some(format!("{TEST_VOICE}/tokens.txt")),
+            noise_scale: f32::MIN_POSITIVE,
+            noise_scale_w: f32::MIN_POSITIVE,
+            ..OfflineTtsVitsModelConfig::default()
+        };
+        let model = OfflineTtsModelConfig {
+            vits,
+            ..OfflineTtsModelConfig::default()
+        };
+        let config = OfflineTtsConfig {
+            model,
+            ..OfflineTtsConfig::default()
+        };
+        OfflineTts::create(&config).context("cannot load the test voice")
+    }
+
+    /// The voice embedding of `phonemes` from the test voice speaker `sid` of `tts`.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the test voice gives samples in [-1, 1]"
+    )]
+    fn spoken(tts: &OfflineTts, sid: i32, phonemes: &str) -> anyhow::Result<Vec<f32>> {
+        let codepoints: Result<Vec<i32>, _> = phonemes
+            .chars()
+            .map(|c| i32::try_from(u32::from(c)))
+            .collect();
+        let generation = GenerationConfig {
+            sid,
+            phoneme_codepoints: Some(vec![codepoints?]),
+            ..GenerationConfig::default()
+        };
+        let audio = tts
+            .generate_with_config("", &generation, None::<fn(&[f32], f32) -> bool>)
+            .context("the test voice gives no audio")?;
+        let scale = f32::from(i16::MAX);
+        let samples = audio
+            .samples()
+            .iter()
+            .map(|&sample| (sample * scale) as i16)
+            .collect();
+        let rate = u32::try_from(audio.sample_rate())?;
+        let embedder = SherpaEmbedder::try_new(&config()?.speaker, Device::Cpu)?;
+        embedder.embed(&Audio { samples, rate })
+    }
+
+    /// The `person.ali` entity.
+    fn ali() -> EntityId {
+        EntityId("person.ali".to_owned())
+    }
+
+    /// The similarity to `person.ali` of the test voice speaker `sid` with `WEATHER`, when the
+    /// profile of `person.ali` has speaker 0 with `KITCHEN`.
+    async fn similarity(sid: i32) -> anyhow::Result<f32> {
+        let tts = test_voice()?;
+        let voices = SherpaVoices::try_new(&config()?.speaker, Arc::new(FakeStore::new(None)))?;
+        voices.enroll(&ali(), 1, &spoken(&tts, 0, KITCHEN)?).await?;
+        let similarities = voices.similarities(&spoken(&tts, sid, WEATHER)?).await?;
+        similarities
+            .get("person.ali")
+            .copied()
+            .context("no similarity")
+    }
+
+    /// AC-15.3b-1.
+    #[tokio::test]
+    async fn ac_15_3b_1_one_speaker_is_above_the_voice_threshold() -> anyhow::Result<()> {
+        let (similarity, threshold) = (similarity(0).await?, config()?.speaker.voice_threshold);
+        assert!(
+            similarity > threshold,
+            "similarity {similarity}, threshold {threshold}"
+        );
+        Ok(())
+    }
+
+    /// AC-15.3b-2.
+    #[tokio::test]
+    async fn ac_15_3b_2_two_speakers_are_below_the_voice_threshold() -> anyhow::Result<()> {
+        let (similarity, threshold) = (similarity(900).await?, config()?.speaker.voice_threshold);
+        assert!(
+            similarity < threshold,
+            "similarity {similarity}, threshold {threshold}"
+        );
+        Ok(())
+    }
+
+    /// The sample of `person` with `embedding`.
+    fn sample(person: &str, embedding: &[f32]) -> Sample {
+        Sample {
+            person: person.to_owned(),
+            embedding: embedding.to_vec(),
+        }
+    }
+
+    /// The voices of `store` with `max_samples`.
+    fn voices(store: &Arc<FakeStore<Voices>>, max_samples: usize) -> anyhow::Result<SherpaVoices> {
+        let speaker = SpeakerConfig {
+            max_samples,
+            ..config()?.speaker
+        };
+        SherpaVoices::try_new(&speaker, Arc::clone(store) as _)
+    }
+
+    /// AC-15.3b-3.
+    #[tokio::test]
+    async fn ac_15_3b_3_profile_keeps_the_newest_max_samples() -> anyhow::Result<()> {
+        let store = Arc::new(FakeStore::new(None));
+        let voices = voices(&store, 2)?;
+        voices
+            .enroll(&EntityId("person.louis".to_owned()), 0, &[0.0, 1.0])
+            .await?;
+        for id in [3, 1, 2] {
+            voices.enroll(&ali(), id, &[1.0, 0.0]).await?;
+        }
+        let saved = store.saves().pop().context("no save")?;
+        let ids: Vec<u64> = saved.samples.into_keys().collect();
+        assert_eq!(ids, [0, 2, 3]);
+        Ok(())
+    }
+
+    /// AC-15.3b-4.
+    #[tokio::test]
+    async fn ac_15_3b_4_start_loads_all_profiles() -> anyhow::Result<()> {
+        let samples = BTreeMap::from([
+            (1, sample("person.ali", &[1.0, 0.0])),
+            (2, sample("person.louis", &[0.0, 1.0])),
+        ]);
+        let store = Arc::new(FakeStore::new(Some(Voices { samples })));
+        let similarities = voices(&store, 20)?.similarities(&[1.0, 0.0]).await?;
+        let people: Vec<&str> = similarities.keys().map(String::as_str).collect();
+        assert_eq!(people, ["person.ali", "person.louis"]);
+        assert!(
+            similarities["person.ali"] > similarities["person.louis"],
+            "{similarities:?}"
+        );
+        Ok(())
+    }
+
+    /// AC-15.3b-5.
+    #[tokio::test]
+    async fn ac_15_3b_5_known_interaction_id_changes_nothing() -> anyhow::Result<()> {
+        let store = Arc::new(FakeStore::new(None));
+        let voices = voices(&store, 20)?;
+        voices.enroll(&ali(), 1, &[1.0, 0.0]).await?;
+        voices
+            .enroll(&EntityId("person.louis".to_owned()), 1, &[0.0, 1.0])
+            .await?;
+        let saves = store.saves();
+        assert_eq!(saves.len(), 1, "{saves:?}");
+        assert_eq!(saves[0].samples[&1], sample("person.ali", &[1.0, 0.0]));
         Ok(())
     }
 }

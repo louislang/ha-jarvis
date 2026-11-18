@@ -27,6 +27,7 @@ use crate::domain::learn::LearnedIntent;
 use crate::domain::learn::PluginRequest;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
+use crate::domain::state::EntityId;
 use crate::domain::state::Event;
 use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
@@ -257,6 +258,25 @@ pub trait VoiceEmbedder: Send + Sync {
     ///
     /// The audio is too short, or the model gives no embedding.
     fn embed(&self, audio: &Audio) -> anyhow::Result<Vec<f32>>;
+}
+
+/// The voice profiles of the people.
+#[async_trait]
+pub trait VoiceProfiles: Send + Sync {
+    /// Adds `embedding` as the voice sample of the interaction `id` to the profile of `person`.
+    /// An `id` that has a sample changes nothing.
+    ///
+    /// # Errors
+    ///
+    /// The store cannot save.
+    async fn enroll(&self, person: &EntityId, id: u64, embedding: &[f32]) -> anyhow::Result<()>;
+
+    /// The voice similarity of `embedding` to each profile, by `person` entity ID.
+    ///
+    /// # Errors
+    ///
+    /// A sample has another length than `embedding`.
+    async fn similarities(&self, embedding: &[f32]) -> anyhow::Result<BTreeMap<String, f32>>;
 }
 
 /// A value that survives a restart.
