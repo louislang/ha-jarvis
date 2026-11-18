@@ -5,6 +5,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use vstd::prelude::*;
 
+use crate::domain::speaker::Source;
+use crate::domain::state::EntityId;
 use crate::domain::state::ServiceCall;
 
 /// A rating.
@@ -109,6 +111,10 @@ pub struct Interaction {
     pub link: Option<u64>,
     /// The marks, at most one.
     pub marks: Vec<Mark>,
+    /// The `person` entity of the speaker, or `None` when no speaker is known.
+    pub speaker: Option<EntityId>,
+    /// The signal that identified the speaker.
+    pub source: Option<Source>,
 }
 
 /// A request that System Two answered.

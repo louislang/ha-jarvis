@@ -26,6 +26,7 @@ use crate::domain::feedback::Spoken;
 use crate::domain::learn::LearnedIntent;
 use crate::domain::learn::PluginRequest;
 use crate::domain::model::Prediction;
+use crate::domain::speaker::Source;
 use crate::domain::speech::Audio;
 use crate::domain::state::EntityId;
 use crate::domain::state::Event;
@@ -396,6 +397,15 @@ pub trait PluginRequests: Send + Sync {
 pub enum Change {
     /// Adds a later announce or question to the responses.
     Response(Spoken),
+    /// Sets the speaker and the source, and stores the voice embedding.
+    Speaker {
+        /// The `person` entity of the speaker, or `None` when no speaker is known.
+        speaker: Option<EntityId>,
+        /// The signal that identified the speaker.
+        source: Option<Source>,
+        /// The voice embedding of the request, or `None` to keep the stored one.
+        embedding: Option<Vec<f32>>,
+    },
 }
 
 /// The interactions that `list` keeps.
@@ -433,6 +443,9 @@ pub trait InteractionLog: Send + Sync {
 
     /// The audio of the interaction `id`, or `None` when it has none.
     async fn audio(&self, id: u64) -> anyhow::Result<Option<Audio>>;
+
+    /// The voice embedding of the interaction `id`, or `None` when it has none.
+    async fn embedding(&self, id: u64) -> anyhow::Result<Option<Vec<f32>>>;
 
     /// Stores `mark` instead of the earlier mark of its interaction and target. A `None` value
     /// removes the earlier mark.

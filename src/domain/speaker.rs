@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use vstd::prelude::*;
 
@@ -68,8 +69,7 @@ pub struct Signals {
 }
 
 /// The signal that identified the speaker.
-#[verus_verify]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 pub enum Source {
     /// The only person at home.
     Presence,

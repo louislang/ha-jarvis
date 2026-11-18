@@ -69,6 +69,7 @@ use crate::domain::speaker;
 use crate::domain::speaker::PersonTrackers;
 use crate::domain::speaker::Satellite;
 use crate::domain::speaker::Signals;
+use crate::domain::speaker::Speaker;
 use crate::domain::speech::Audio;
 use crate::domain::state::AreaId;
 use crate::domain::state::EntityId;
@@ -327,13 +328,7 @@ impl Conversation {
             call,
             response,
         } = decided;
-        let (audio, voice_end, voice) = heard.utterance.map_or((None, None, None), |committed| {
-            (
-                Some(committed.utterance.audio),
-                committed.utterance.voice_end,
-                Some((committed.embedding, committed.voiced_ms)),
-            )
-        });
+        let (audio, voice_end, voice) = voice_parts(heard.utterance);
         let interaction = Interaction {
             id: heard.id,
             time: heard.time,
@@ -350,6 +345,8 @@ impl Conversation {
             latency_ms: latency_ms(voice_end, self.two.clock.now()),
             link: heard.link,
             marks: Vec::new(),
+            speaker: None,
+            source: None,
         };
         // A send fails only after the writer ended, at shutdown.
         let write = Write::Append(Box::new(interaction), audio);
@@ -358,12 +355,13 @@ impl Conversation {
     }
 
     /// Spawns the speaker identification of the voice request `id` from the satellite and the
-    /// device of `origin` with `voice`, and its enroll by rule 5.
+    /// device of `origin` with `voice`, its `Speaker` log update and its enroll by rule 5.
     fn identify_speaker(&self, id: u64, origin: Origins, voice: Voice) {
         let speakers = Arc::clone(&self.recorder.speakers);
         let cache = self.queues.cache.clone();
+        let writer = self.recorder.writer.clone();
         tokio::spawn(async move {
-            if let Err(error) = enroll_voice(&speakers, &cache, id, origin, voice).await {
+            if let Err(error) = enroll_voice(&speakers, &cache, &writer, id, origin, voice).await {
                 tracing::info!("no voice enroll for {id}: {error:#}");
             }
         });
@@ -1526,7 +1524,8 @@ struct Decided {
 }
 
 /// Awaits the embedding of `voice`, identifies the speaker of the request `id` from `origin` in
-/// `cache` with the profiles of `speakers`, and enrolls the embedding when rule 5 allows it.
+/// `cache` with the profiles of `speakers`, sends the speaker with the embedding to the log
+/// `writer`, and enrolls the embedding when rule 5 allows it.
 ///
 /// # Errors
 ///
@@ -1534,6 +1533,7 @@ struct Decided {
 async fn enroll_voice(
     speakers: &Speakers,
     cache: &watch::Receiver<StateCache>,
+    writer: &UnboundedSender<Write>,
     id: u64,
     origin: Origins,
     (embedding, voiced_ms): Voice,
@@ -1541,7 +1541,14 @@ async fn enroll_voice(
     let embedding = embedding.await??;
     let similarities = speakers.voices.similarities(&embedding).await?;
     let signals = speakers.signals(&cache.borrow(), origin, &similarities);
-    if let Some(person) = speakers.enrollee(&signals, voiced_ms) {
+    let found = speakers.identify(&signals);
+    // A send fails only after the writer ended, at shutdown.
+    let _ = writer.send(Write::Update(
+        id,
+        speaker_change(found.as_ref(), &embedding),
+    ));
+    let enrollee = found.and_then(|found| speakers.enrollee(&signals, found, voiced_ms));
+    if let Some(person) = enrollee {
         speakers.voices.enroll(&person, id, &embedding).await?;
     }
     Ok(())
@@ -1573,11 +1580,16 @@ impl Speakers {
         )
     }
 
-    /// The speaker of `signals` when rule 5 enrolls a voice of `voiced_ms`.
-    fn enrollee(&self, signals: &Signals, voiced_ms: u64) -> Option<EntityId> {
+    /// The speaker of `signals` by rules 2 to 4.
+    fn identify(&self, signals: &Signals) -> Option<Speaker> {
         let config = &self.config;
         let (threshold, margin) = (config.threshold, config.margin);
-        let found = speaker::identify(signals, threshold, margin, config.enroll_threshold)?;
+        speaker::identify(signals, threshold, margin, config.enroll_threshold)
+    }
+
+    /// The person of `found` when rule 5 enrolls a voice of `voiced_ms` with `signals`.
+    fn enrollee(&self, signals: &Signals, found: Speaker, voiced_ms: u64) -> Option<EntityId> {
+        let config = &self.config;
         let samples = self.voices.sample_count(&found.person);
         let enrolls = speaker::enrolls(
             signals,
@@ -1589,6 +1601,26 @@ impl Speakers {
             config.voice_threshold,
         );
         enrolls.then_some(found.person)
+    }
+}
+
+/// The audio, the voice end, and the embedding task with the voiced time of `utterance`.
+fn voice_parts(utterance: Option<Committed>) -> (Option<Audio>, Option<Timestamp>, Option<Voice>) {
+    utterance.map_or((None, None, None), |committed| {
+        (
+            Some(committed.utterance.audio),
+            committed.utterance.voice_end,
+            Some((committed.embedding, committed.voiced_ms)),
+        )
+    })
+}
+
+/// The `Speaker` log change of the identified speaker `found` with `embedding`.
+fn speaker_change(found: Option<&Speaker>, embedding: &[f32]) -> crate::ports::Change {
+    crate::ports::Change::Speaker {
+        speaker: found.map(|found| found.person.clone()),
+        source: found.map(|found| found.source),
+        embedding: Some(embedding.to_vec()),
     }
 }
 
@@ -2023,6 +2055,7 @@ mod tests {
     use crate::domain::learn::LearnedStatus;
     use crate::domain::model::Slot;
     use crate::domain::responses::Pool;
+    use crate::domain::speaker::Source;
     use crate::domain::state::ServiceCall;
     use crate::domain::state::State;
     use crate::ports::Classifier;
@@ -3057,16 +3090,18 @@ mod tests {
         audio
     }
 
-    /// The enrolls of `voices` after a voice request of `LIGHTS` with 2 s of audio and the voiced
+    /// The log and `voices` after a voice request of `LIGHTS` with 2 s of audio and the voiced
     /// time `voiced_ms`, when `person.louis` is in the state `louis` and `person.ali` is home.
-    async fn enrolls_of(
+    async fn voice_request(
         louis: &str,
         voices: FakeVoiceProfiles,
         voiced_ms: u64,
-    ) -> anyhow::Result<Vec<(String, u64)>> {
+    ) -> anyhow::Result<(Arc<FakeLog>, Arc<FakeVoiceProfiles>)> {
         let voices = Arc::new(voices);
         let (cache, _changes, mut conversation) =
             still_with(&Arc::default(), "idle", lights(), Arc::default());
+        let log = Arc::<FakeLog>::default();
+        conversation.recorder.writer = start_writer(Arc::clone(&log) as _).0;
         cache.send_modify(|cache| {
             let state = cache
                 .states
@@ -3078,8 +3113,41 @@ mod tests {
         hear_voiced(&conversation, vec![0; 32_000], voiced_ms);
         let _handled = conversation.handle(LIGHTS, on_satellite()).await?;
         tokio::time::sleep(Duration::from_millis(1)).await;
+        Ok((log, voices))
+    }
+
+    /// The enrolls of `voices` after the [`voice_request`] with `louis` and `voiced_ms`.
+    async fn enrolls_of(
+        louis: &str,
+        voices: FakeVoiceProfiles,
+        voiced_ms: u64,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        let (_log, voices) = voice_request(louis, voices, voiced_ms).await?;
         let enrolls = voices.enrolls.lock().expect("no lock holder panics");
         Ok(enrolls.clone())
+    }
+
+    /// AC-15.6b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_6b_1_record_has_the_speaker() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let (log, _voices) = voice_request("not_home", FakeVoiceProfiles::default(), 2000).await?;
+        let record = log.get(0).await?.context("no record")?;
+        let ali = Some(EntityId("person.ali".to_owned()));
+        assert_eq!(
+            (record.speaker, record.source),
+            (ali, Some(Source::Presence))
+        );
+        Ok(())
+    }
+
+    /// AC-15.6b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_6b_2_no_speaker_keeps_the_embedding() -> anyhow::Result<()> {
+        let (log, _voices) = voice_request("home", FakeVoiceProfiles::default(), 2000).await?;
+        assert_eq!(log.embedding(0).await?, Some(vec![1.0]));
+        Ok(())
     }
 
     /// Profiles with the similarities `similarities` and 5 samples of `person.ali`.
@@ -3174,6 +3242,8 @@ mod tests {
             latency_ms: Some(200),
             link: None,
             marks: Vec::new(),
+            speaker: None,
+            source: None,
         }
     }
 
