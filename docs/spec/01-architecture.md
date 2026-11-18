@@ -55,6 +55,7 @@ Dependency rules:
                                    │   │ dialog habits feedback │ │                     adapters/plex.rs ─▶ Plex
                                    │   │ learn speaker speech   │ │   Models ─────────▶ LiveModels (lib.rs)
                                    │   └────────────────────────┘ │   PluginRequests ─▶ adapters/files.rs
+                                   │                              │   MediaLibrary ───▶ adapters/plex.rs ─▶ Plex
                                    │                              │   Status ─────────▶ adapters/mqtt.rs (no port) ─▶ MQTT broker
                                    └──────────────────────────────┘
 ```
@@ -83,6 +84,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | `Clock` | Driven | `now` | `SystemClock` in `src/lib.rs` |
 | `Models` | Driven | `release`, `restore` | `LiveModels` in `src/lib.rs` |
 | `PluginRequests` | Driven | `write` | `adapters/files.rs` |
+| `MediaLibrary` | Driven | `titles` | `adapters/plex.rs` |
 
 Tests in the application layer use the fakes in `src/testing/fakes.rs`. Adapter tests use local servers (`wiremock`, a fake HA WebSocket server), in-memory object stores or real models.
 
@@ -167,7 +169,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 27. **One ONNX Runtime, GPU or CPU.** `sherpa-onnx` (feature `shared`) and `ort` (feature `load-dynamic`) load the same ONNX Runtime 1.28.2 shared library from sherpa-onnx 2.0.1. On the GPU host, it is the CUDA 12 and cuDNN 9 build from the sherpa-onnx `linux-x64-gpu` release. On other machines, it is the CPU build. Thus the two crates cannot conflict, and `device` selects the CUDA or the CPU execution provider for all models.
 28. **Two-pass STT.** The first pass streams, so Jarvis knows the words while the user speaks. It uses NVIDIA Nemotron Speech Streaming EN 0.6B with 160 ms chunks on the GPU host. The first pass gives the last word only after the VAD ends the segment and flushes the model (sub-phase 6.6c). The VAD ends the segment `vad_min_silence_ms` after the voice end, and an early commit comes `early_commit_ms` after the voice end (sub-phase 9.1b). `vad_min_silence_ms < early_commit_ms` (sub-phase 2.2), so the flush comes before an early commit. At commit, the second pass decodes the whole utterance with NVIDIA Parakeet Unified EN 0.6B in offline mode. The second pass has full context, so it is more accurate. The second pass adds zeros to each utterance up to 4 s, or up to `max_utterance_ms` for a longer utterance, so each decode has one of two input lengths (sub-phase 6.7). On the Open ASR Leaderboard sets, the average word error rate goes from 7.67% to 5.91%, and on LibriSpeech test-clean from 2.56% to 1.63%. HA receives the second-pass text on the GPU host. Both models are official sherpa-onnx exports. The GPU host runs fp16 conversions of them (sub-phase 6.6c). Cloud streaming APIs take about 250 ms to 300 ms to give the final text, so they cannot meet G1. CPU machines use the same first pass and have no second pass.
 29. **Blocking work off the async workers.** STT decoding, the second pass, `predict`, TTS synthesis, voice embedding and SQLite calls run in `tokio::task::spawn_blocking`. The async workers only move bytes and wait. Thus a decode for one satellite does not delay `handle` for another.
-30. **Remote data through plugins.** Data from a remote server, for example a weather forecast, reaches Jarvis only through a `Plugin` adapter. Jarvis code builds the request and parses the reply into a typed result. Thus the result is the same for the same reply, and no model sees a raw API call. System Two gets each plugin as its own tool, for example `get_weather(when)`. A System One fetch intent names a plugin. The plugin registry keeps each result for `plugins.cache_s`. A plugin only reads data, so it has no `allowed_domains` check. System Two still calls HA services directly, within `openai.allowed_domains` (sub-phase 7.5). The weather plugin uses Open-Meteo, which needs no API key, with the location of the HA configuration. The Plex plugin reads the recently added items and the On Deck list of the Plex server with a token (phase 18). A new plugin uses a free data source without an API key when one exists. A source with a key needs your approval first, and the PR of the plugin then names the environment variable and the sign-up page.
+30. **Remote data through plugins.** Data from a remote server, for example a weather forecast, reaches Jarvis only through a `Plugin` adapter. The only exception is the list of Plex titles: the Plex adapter also implements the `MediaLibrary` port, and Jarvis matches a spoken title against the list before it plays it (sub-phase 18.9). Jarvis code builds the request and parses the reply into a typed result. Thus the result is the same for the same reply, and no model sees a raw API call. System Two gets each plugin as its own tool, for example `get_weather(when)`. A System One fetch intent names a plugin. The plugin registry keeps each result for `plugins.cache_s`. A plugin only reads data, so it has no `allowed_domains` check. System Two still calls HA services directly, within `openai.allowed_domains` (sub-phase 7.5). The weather plugin uses Open-Meteo, which needs no API key, with the location of the HA configuration. The Plex plugin reads the recently added items and the On Deck list of the Plex server with a token (phase 18). A new plugin uses a free data source without an API key when one exists. A source with a key needs your approval first, and the PR of the plugin then names the environment variable and the sign-up page.
 31. **Fixed TTS input lengths.** ONNX Runtime keeps the cuDNN state of a `Conv` node only for its last input shape, so each new reply length added about 230 ms to the TTS on the GPU host. Jarvis runs the four Supertonic-3 graphs itself through `ort`, with the fp32 vector estimator and vocoder. It adds zeros and masks to each input up to one of two lengths: 64 text ids and 64 latent frames, or 160 text ids and 192 latent frames. Each length has its own set of sessions, so a change of length builds no new plans. A longer input keeps its length (sub-phases 9.3 and 9.3b).
 32. **Plugin requests through a local folder.** When System Two finds that a cluster needs remote data that no plugin gives, Jarvis does not guess an answer source. It writes one Markdown file for the cluster into the folder `learn.plugin_requests` through the `PluginRequests` port: the example requests, the usual times, the data needed and the task (sub-phase 14.13). The file name is the name of the future fetch intent. Claude watches the folder and writes a normal code PR with the plugin, the fetch intent and its `fresh_min`, and the tests. CI, the Codex review and your review gate it as any other PR, and the next release puts it on the GPU host. How Claude watches the folder is outside Jarvis (field log of sub-phase 14.13). Without `learn.plugin_requests`, Jarvis writes no plugin requests. Thus Jarvis needs no remote service and no token for this.
 
@@ -208,7 +210,7 @@ With `vad_threshold = 0.65`, the GPU host measures a p95 of 213 ms for the fan c
 | `vstd` | Domain | Verus: `#[verus_spec]`, `#[verus_verify]`, `verus!`, spec types and the `vstd` specifications of `std`. A normal build erases the proof code. |
 | `serde`, `serde_json` | All | Data types and messages. |
 | `tokio` | Application, adapters | Async runtime, TCP, timers, channels. |
-| `arc-swap` | Application, adapter, root | Atomic swap of the System One model, of the live catalog and of the hotword text of the second pass. |
+| `arc-swap` | Application, adapter, root | Atomic swap of the System One model, of the live catalog, of the hotword text of the second pass and of the Plex titles. |
 | `tokio-util` | Adapter, root | `TaskTracker`: the connection tasks and the `after` work that a shutdown waits for. |
 | `anyhow` | All except domain | Error propagation. Domain functions return typed errors. |
 | `tracing`, `tracing-subscriber` | Application, adapters, root | Logs and latency spans. |
@@ -327,7 +329,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/domain/feedback.rs` | Domain | Interactions and marks. | 12.3 |
 | `src/domain/learn.rs` | Domain | Clusters, proposal validation, approval rule, prefetch schedule and freshness. | 14.1 |
 | `src/domain/speaker.rs` | Domain | Discovery, presence, proximity and identification. | 15.1 |
-| `src/app/background.rs` | Application | Hot cache sync, request habit store, backfill, learned intents, prefetch, hotword refresh. | 2.9 |
+| `src/app/background.rs` | Application | Hot cache sync, request habit store, backfill, learned intents, prefetch, hotword refresh, Plex title refresh. | 2.9 |
 | `src/app/conversation.rs` | Application | `handle` use case, dispatch, deferred jobs, dialog map. | 4.8 |
 | `src/app/speech.rs` | Application | `listen` and `speak` use cases, audio cache, pre-render. | 6.3b |
 | `src/app/review.rs` | Application | `Review` use case. | 12.7 |
@@ -348,7 +350,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/adapters/process.rs` | Adapter | `Trainer` that runs `train/train.py` as a local process. | 13.7 |
 | `src/adapters/runpod.rs` | Adapter | `Trainer` with the RunPod REST API and network volume (fallback). | 13.8b |
 | `src/adapters/open_meteo.rs` | Adapter | `Plugin` `get_weather` with the Open-Meteo forecast API. | 17.3 |
-| `src/adapters/plex.rs` | Adapter | `Plugin` `get_new_shows` with the Plex server API. | 18.11 |
+| `src/adapters/plex.rs` | Adapter | `Plugin` `get_new_shows` and `MediaLibrary` with the Plex server API. | 18.11 |
 | `repository.yaml` | Add-on | Makes the repository an HA add-on repository. | 12.9g |
 | `addon/config.yaml` | Add-on | The add-on configuration: ingress, panel, options `url` and `token`. | 12.9g |
 | `addon/build.yaml` | Add-on | The fixed base image of each architecture. | 12.9g |
@@ -593,6 +595,7 @@ examples = ["put the tv on [the office](show)", "play [bluey](show) on the tv", 
 service = "media_player.play_media"
 target = "entity"
 select = [{ domain = "media_player", name = "tv" }]
+title = "show"
 data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "shuffle": 1}' }
 
 [[intent]]
@@ -627,6 +630,7 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 - `plugin` is the tool name of the plugin of a fetch intent, for example `get_weather`.
 - `verbs` are the command verbs of the intent, with a capital first letter, for example "Resume". The second pass prefers them (decision 34). Short verbs that are in most requests, for example "Play" and "Stop", are not verbs of the list.
 - `fresh_min` is how long the answer of a fetch or prefetch intent stays fresh, in minutes, for example 5 for traffic and 30 for the weather. Each fetch and prefetch intent has it, and no other kind has it. Before a usual time of the intent (phase 11), Jarvis prefetches the answer. Then it refreshes the answer each `fresh_min` until the window ends (sub-phases 14.9 to 14.10b).
+- `title` names the slot that holds a Plex title, and its value is the kind of the title: `show` or `movie`. Before the decision, Jarvis matches the slot value against the Plex titles. A title of the other kind plays with the first intent of that kind (sub-phase 18.9).
 - `search = true` makes Jarvis search Music Assistant for the `media_id` of the call and play the best match (sub-phase 18.13b). An artist match starts with one track of the artist (sub-phase 18.14). Only `play_music` has it.
 - `needs_speaker = true` gives the pool the `person` variable (sub-phase 4.2). No intent sets it, because sub-phase 15.7 is removed.
 - The area is the area slot. If no slot, it is the satellite area. The area slot matches an area name or alias without case sensitivity. For a command, an area slot that matches no area can name a Music Assistant speaker group (sub-phase 18.15).
@@ -677,6 +681,9 @@ responses = ["Which room?"]
 
 [pools.cancelled]
 responses = ["Okay, never mind."]
+
+[pools.not_in_library]
+responses = ["That is not in the Plex library."]
 ```
 
 The pool `ask_area` holds the questions for a missing area. A pool that is not an intent pool uses no template variable.
