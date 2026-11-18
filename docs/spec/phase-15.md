@@ -332,13 +332,13 @@ This sub-phase implements rule 1 and reads the signals:
 **Goal:** Identify the speaker of each voice request when its embedding completes, and enroll the voice by rule 5 of sub-phase 15.6. Jarvis knows who is speaking without an enrollment step.
 
 - **Implements:** G12, G19. **Depends on:** 15.6d.
-- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/app/conversation.rs`, `src/app/background.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `README.md`.
+- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/app/speech.rs`, `src/app/conversation.rs`, `src/app/background.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `README.md`.
 
 **Model.**
 
 - `VoiceProfiles::sample_count(person) -> usize`: the number of samples in the profile of `person`.
 - `FakeVoiceProfiles` gives fixed similarities and sample counts, and records each `enroll` with its person and interaction ID. A test of `src/app/background.rs` builds the conversation use case, so it gets the fake too.
-- After `handle` sends the append (sub-phase 12.6), it spawns a task for a voice request with an utterance. The task awaits the embedding (sub-phase 15.4). With an embedding, it gets `similarities`, reads `signals` from the hot cache for the device and the area of the satellite, and calls `identify`. When `identify` gives a speaker and `enrolls` is true, the task calls `enroll(person, id, embedding)` with the interaction ID. The voice length is the length of the utterance audio. An embedding error or a port error gives no enroll and a log line. The reply does not wait for the task.
+- After `handle` sends the append (sub-phase 12.6), it spawns a task for a voice request with an utterance. The task awaits the embedding (sub-phase 15.4). With an embedding, it gets `similarities`, reads `signals` from the hot cache for the device and the area of the satellite, and calls `identify`. When `identify` gives a speaker and `enrolls` is true, the task calls `enroll(person, id, embedding)` with the interaction ID. The voice length is the voiced time of the utterance: the speech session counts the chunks that the VAD decides as voiced (sub-phase 6.4), and `Utterances::append` keeps that count in milliseconds with the utterance. The trailing silence before the commit is not voice, so it does not count. An embedding error or a port error gives no enroll and a log line. The reply does not wait for the task.
 - `run` builds `SherpaVoices` with a `FileStore` of `speaker.voices`.
 - `README.md` describes passive voice enrollment and the voice store.
 
@@ -347,7 +347,7 @@ This sub-phase implements rule 1 and reads the signals:
 - AC-15.6e-1: When `identify` returns confidence 1.0 from presence, `FakeVoiceProfiles` records an enroll for that person with the interaction ID.
 - AC-15.6e-2: When the identification comes from voice alone, `FakeVoiceProfiles` records no enroll.
 - AC-15.6e-3: When the person has `min_profile` samples and the voice similarity to that person is less than `voice_threshold`, or higher to another person, `FakeVoiceProfiles` records no enroll.
-- AC-15.6e-4: When the utterance has less than `min_enroll_ms` of voice, `FakeVoiceProfiles` records no enroll.
+- AC-15.6e-4: When the utterance has less than `min_enroll_ms` of voice, `FakeVoiceProfiles` records no enroll. This holds also when the audio with its trailing silence is longer than `min_enroll_ms`.
 - AC-15.6e-5: When the voice store has two samples of `person.alex`, `sample_count(person.alex)` of `SherpaVoices` returns 2.
 
 **Proofs.**
