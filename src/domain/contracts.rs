@@ -5,6 +5,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::convert::Infallible;
 use std::hash::Hash;
+use std::num::ParseFloatError;
 use std::num::ParseIntError;
 use std::slice::SliceIndex;
 use std::str::FromStr;
@@ -506,6 +507,35 @@ pub trait ExFromStr: Sized {
 #[verifier::external_type_specification]
 #[verifier::external_body]
 pub struct ExParseIntError(ParseIntError);
+
+/// An error of float parsing. <https://doc.rust-lang.org/std/num/struct.ParseFloatError.html>
+#[verifier::external_type_specification]
+#[verifier::external_body]
+pub struct ExParseFloatError(ParseFloatError);
+
+/// The value of the decimal number `text`, or `None` when `text` is not a number.
+pub uninterp spec fn decimal(text: Seq<char>) -> Option<f64>;
+
+/// Parses the decimal number `text`. <https://doc.rust-lang.org/std/primitive.f64.html#impl-FromStr-for-f64>
+#[verifier::external_fn_specification]
+pub fn ex_f64_from_str(text: &str) -> (result: Result<f64, ParseFloatError>)
+    ensures
+        decimal(text@) == result.ok(),
+{
+    <f64 as FromStr>::from_str(text)
+}
+
+/// True when `value` is neither infinite nor NaN.
+pub uninterp spec fn finite(value: f64) -> bool;
+
+/// Gives whether `value` is neither infinite nor NaN. <https://doc.rust-lang.org/std/primitive.f64.html#method.is_finite>
+#[verifier::external_fn_specification]
+pub fn ex_f64_is_finite(value: f64) -> (result: bool)
+    ensures
+        result == finite(value),
+{
+    value.is_finite()
+}
 
 /// Parses `text` into a value of the type `F`. <https://doc.rust-lang.org/std/primitive.str.html#method.parse>
 #[verifier::external_fn_specification]
