@@ -1,6 +1,7 @@
 //! The `listen` and `speak` use cases, the committed utterances, the audio cache and the
 //! pre-render of the pool responses.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::mem;
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use dashmap::DashSet;
 use jiff::Timestamp;
 use serde_json::Map;
 use serde_json::Value;
+use tokio::task::JoinHandle;
 
 use crate::app::conversation::Queues;
 use crate::domain::catalog;
@@ -32,6 +34,7 @@ use crate::ports::Reasoner;
 use crate::ports::SpeechToText;
 use crate::ports::SttStream;
 use crate::ports::TextToSpeech;
+use crate::ports::VoiceEmbedder;
 
 /// The number of samples in one millisecond of 16 kHz audio.
 const SAMPLES_PER_MS: u64 = 16;
@@ -40,10 +43,33 @@ const SAMPLES_PER_MS: u64 = 16;
 /// one commits only at `endpoint_ms`.
 const NAME_SLOTS: [&str; 3] = ["media", "movie", "show"];
 
+/// The blocking task of the voice embedding of an utterance. It gives an error when the
+/// embedder fails.
+pub type Embedding = JoinHandle<anyhow::Result<Vec<f32>>>;
+
+/// A committed utterance and the task of its voice embedding.
+pub struct Committed {
+    /// The utterance.
+    pub utterance: Utterance,
+    /// The task of its voice embedding.
+    pub embedding: Embedding,
+}
+
+/// The kept utterances and their embedding tasks.
+#[derive(Default)]
+struct Kept {
+    /// The utterances in commit order.
+    utterances: Vec<Utterance>,
+    /// The embedding task of each utterance by its time and text. Two utterances with the same
+    /// time and text share one entry, but `correlate` never gives either: both match, or both
+    /// expired.
+    embeddings: BTreeMap<(Timestamp, String), Embedding>,
+}
+
 /// The committed utterances of the last `log.correlate_s`, which a request finds by its text.
 pub struct Utterances {
-    /// The utterances in commit order.
-    kept: Mutex<Vec<Utterance>>,
+    /// The utterances and their embedding tasks.
+    kept: Mutex<Kept>,
     /// The time of each append and correlate.
     clock: Arc<dyn Clock>,
     /// The time that an utterance stays: `log.correlate_s`.
@@ -55,51 +81,76 @@ impl Utterances {
     #[must_use]
     pub fn new(clock: Arc<dyn Clock>, window_s: u64) -> Self {
         Self {
-            kept: Mutex::new(Vec::new()),
+            kept: Mutex::new(Kept::default()),
             clock,
             window_s,
         }
     }
 
-    /// Drops the expired utterances, then keeps `text`, `audio` and `voice_end` at the time now.
-    pub fn append(&self, text: String, audio: Audio, voice_end: Option<Timestamp>) {
+    /// Drops the expired utterances, then keeps `text`, `audio`, `voice_end` and `embedding` at
+    /// the time now.
+    pub fn append(
+        &self,
+        text: String,
+        audio: Audio,
+        voice_end: Option<Timestamp>,
+        embedding: Embedding,
+    ) {
         self.change(|kept, time| {
-            let mut kept = speech::expire(kept, time, self.window_s);
-            kept.push(Utterance {
+            let mut utterances =
+                speech::expire(mem::take(&mut kept.utterances), time, self.window_s);
+            kept.embeddings.insert((time, text.clone()), embedding);
+            utterances.push(Utterance {
                 text,
                 audio,
                 time,
                 voice_end,
             });
-            (kept, ())
+            kept.utterances = utterances;
         });
     }
 
     /// Drops the expired utterances, then removes and gives the one with the normalized text of
-    /// `text`. `None` when none or more than one has it.
+    /// `text`, with its embedding task. `None` when none or more than one has it.
     #[must_use]
-    pub fn correlate(&self, text: &str) -> Option<Utterance> {
-        self.change(|kept, now| speech::correlate(kept, text, now, self.window_s))
-            .flatten()
+    pub fn correlate(&self, text: &str) -> Option<Committed> {
+        self.change(|kept, now| {
+            let utterances = mem::take(&mut kept.utterances);
+            let (rest, found) = speech::correlate(utterances, text, now, self.window_s);
+            kept.utterances = rest;
+            let utterance = found?;
+            let key = (utterance.time, utterance.text.clone());
+            let embedding = kept.embeddings.remove(&key)?;
+            Some(Committed {
+                utterance,
+                embedding,
+            })
+        })
+        .flatten()
     }
 
-    /// Replaces the utterances with the first result of `change` of the utterances and the time
-    /// now, and gives the second. `None` when an earlier change panicked.
-    fn change<T>(
-        &self,
-        change: impl FnOnce(Vec<Utterance>, Timestamp) -> (Vec<Utterance>, T),
-    ) -> Option<T> {
+    /// Gives the result of `change` of the utterances and the time now, then drops the embedding
+    /// tasks of the utterances that are no longer kept. `None` when an earlier change panicked.
+    fn change<T>(&self, change: impl FnOnce(&mut Kept, Timestamp) -> T) -> Option<T> {
         let now = self.clock.now();
         let mut kept = self.kept.lock().ok()?;
-        let (rest, result) = change(mem::take(&mut *kept), now);
-        *kept = rest;
+        let result = change(&mut kept, now);
+        let Kept {
+            utterances,
+            embeddings,
+        } = &mut *kept;
+        embeddings.retain(|(time, text), _| {
+            utterances
+                .iter()
+                .any(|utterance| utterance.time == *time && utterance.text == *text)
+        });
         Some(result)
     }
 }
 
 /// Starts listen sessions that warm System Two, predict on each changed first-pass partial,
 /// commit by the policy, early for an answer to an open dialog, and give the second-pass
-/// transcript, which it keeps with its audio.
+/// transcript, which it keeps with its audio and the task of its voice embedding.
 pub struct Listener {
     /// The two passes of each session.
     stt: Arc<dyn SpeechToText>,
@@ -117,16 +168,19 @@ pub struct Listener {
     clock: Arc<dyn Clock>,
     /// The committed utterances.
     utterances: Arc<Utterances>,
+    /// The voice embedding of each committed utterance.
+    voice: Arc<dyn VoiceEmbedder>,
 }
 
 impl Listener {
     /// Listens with `stt` and `classifier`, warms `reasoner`, and commits by `policy` and
     /// `threshold`, or early for an answer to a dialog of `queues` that is open at the time of
-    /// `clock`. Keeps each transcript in `utterances`.
+    /// `clock`. Keeps each transcript in `utterances` with its embedding by `voice`.
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
-        reason = "the session connects both passes, the prediction, the dialogs and the utterances"
+        reason = "the session connects both passes, the prediction, the dialogs, the utterances \
+                  and the voice"
     )]
     pub fn new(
         stt: Arc<dyn SpeechToText>,
@@ -137,6 +191,7 @@ impl Listener {
         queues: Arc<Queues>,
         clock: Arc<dyn Clock>,
         utterances: Arc<Utterances>,
+        voice: Arc<dyn VoiceEmbedder>,
     ) -> Self {
         Self {
             stt,
@@ -147,6 +202,7 @@ impl Listener {
             queues,
             clock,
             utterances,
+            voice,
         }
     }
 
@@ -179,6 +235,7 @@ impl Listener {
             queues: Arc::clone(&self.queues),
             clock: Arc::clone(&self.clock),
             utterances: Arc::clone(&self.utterances),
+            voice: Arc::clone(&self.voice),
             text: String::new(),
             confident: false,
             samples: Vec::new(),
@@ -205,6 +262,8 @@ struct Session {
     clock: Arc<dyn Clock>,
     /// The committed utterances, which keep the transcript.
     utterances: Arc<Utterances>,
+    /// The voice embedding of the utterance.
+    voice: Arc<dyn VoiceEmbedder>,
     /// The text of the last changed, non-empty partial.
     text: String,
     /// True when `text` answers an open dialog or its prediction is a confident command.
@@ -254,8 +313,7 @@ impl Session {
     }
 
     /// The second-pass text of the pushed samples, else the first-pass text. A second-pass error
-    /// gives the first-pass text. Logs the text, its pass and the audio length, and keeps the text
-    /// with the samples in the utterances.
+    /// gives the first-pass text. Logs the text, its pass and the audio length, and keeps it.
     ///
     /// # Errors
     ///
@@ -278,12 +336,21 @@ impl Session {
             audio_ms = self.audio_ms(),
             "transcript"
         );
+        self.keep(text.clone(), voice_end);
+        Ok(text)
+    }
+
+    /// Keeps `text` with the pushed samples, `voice_end` and a blocking task of their voice
+    /// embedding in the utterances.
+    fn keep(&self, text: String, voice_end: Option<Timestamp>) {
         let audio = Audio {
             samples: self.samples.clone(),
             rate: 16_000,
         };
-        self.utterances.append(text.clone(), audio, voice_end);
-        Ok(text)
+        let (voice, sound) = (Arc::clone(&self.voice), audio.clone());
+        // Spawned and not awaited, so the embedding adds no time to the transcript.
+        let embedding = tokio::task::spawn_blocking(move || voice.embed(&sound));
+        self.utterances.append(text, audio, voice_end, embedding);
     }
 }
 
@@ -434,6 +501,8 @@ fn texts(pools: &Pools, areas: &[String]) -> anyhow::Result<BTreeSet<String>> {
 mod tests {
     use std::fs;
 
+    use anyhow::Context;
+
     use tracing::instrument::WithSubscriber;
 
     use jiff::Timestamp;
@@ -455,6 +524,7 @@ mod tests {
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStt;
     use crate::testing::fakes::FakeTts;
+    use crate::testing::fakes::FakeVoiceEmbedder;
     use crate::testing::fakes::SetClock;
     use crate::testing::fakes::log_dispatch;
 
@@ -505,13 +575,14 @@ mod tests {
         Arc::new(queues)
     }
 
-    /// A listener on `stt`, `classifier` and the dialogs of `queues` at the Unix epoch, that warms
-    /// `reasoner`.
+    /// A listener on `stt`, `classifier`, `voice` and the dialogs of `queues` at the Unix epoch,
+    /// that warms `reasoner`.
     fn listener(
         stt: FakeStt,
         classifier: &Arc<FakeClassifier>,
         reasoner: &Arc<FakeReasoner>,
         queues: Arc<Queues>,
+        voice: Arc<dyn VoiceEmbedder>,
     ) -> Listener {
         let classifier = Arc::clone(classifier) as Arc<dyn Classifier>;
         let reasoner = Arc::clone(reasoner) as Arc<dyn Reasoner>;
@@ -526,20 +597,27 @@ mod tests {
             queues,
             clock,
             utterances,
+            voice,
         )
     }
 
     /// The texts of the utterances of `utterances`, in order.
     fn texts(utterances: &Utterances) -> Vec<String> {
         let kept = utterances.kept.lock().expect("no panic with the lock");
-        kept.iter()
+        kept.utterances
+            .iter()
             .map(|utterance| utterance.text.clone())
             .collect()
     }
 
+    /// An embedding task that gives an empty embedding.
+    fn empty() -> Embedding {
+        tokio::spawn(async { Ok(Vec::new()) })
+    }
+
     /// AC-12.1b-1.
-    #[test]
-    fn ac_12_1b_1_append_and_correlate_drop_expired_utterances() -> anyhow::Result<()> {
+    #[tokio::test(start_paused = true)]
+    async fn ac_12_1b_1_append_and_correlate_drop_expired_utterances() -> anyhow::Result<()> {
         let clock = Arc::new(SetClock(Mutex::new(Timestamp::UNIX_EPOCH)));
         let utterances = Utterances::new(clock.clone(), 10);
         let set = |second: i64| -> anyhow::Result<()> {
@@ -550,12 +628,17 @@ mod tests {
             samples: vec![1],
             rate: 16_000,
         };
-        utterances.append("turn on the lights".to_owned(), audio.clone(), None);
+        utterances.append(
+            "turn on the lights".to_owned(),
+            audio.clone(),
+            None,
+            empty(),
+        );
         set(11)?;
-        utterances.append("turn off the fan".to_owned(), audio, None);
+        utterances.append("turn off the fan".to_owned(), audio, None, empty());
         assert_eq!(texts(&utterances), ["turn off the fan"], "after an append");
         set(22)?;
-        assert_eq!(utterances.correlate("pause the music"), None);
+        assert!(utterances.correlate("pause the music").is_none());
         assert_eq!(
             texts(&utterances),
             Vec::<String>::new(),
@@ -584,7 +667,8 @@ mod tests {
         for prediction in predictions {
             classifier.script(prediction);
         }
-        let listener = listener(stt, &classifier, &Arc::default(), queues);
+        let voice = Arc::new(FakeVoiceEmbedder);
+        let listener = listener(stt, &classifier, &Arc::default(), queues, voice);
         Ok((listener.listen()?, classifier))
     }
 
@@ -593,7 +677,14 @@ mod tests {
     async fn ac_7_1_4_listen_warms_the_reasoner_once() -> anyhow::Result<()> {
         let reasoner = Arc::new(FakeReasoner::default());
         let queues = dialogs(Vec::new(), Timestamp::UNIX_EPOCH);
-        let listener = listener(FakeStt::default(), &Arc::default(), &reasoner, queues);
+        let voice = Arc::new(FakeVoiceEmbedder);
+        let listener = listener(
+            FakeStt::default(),
+            &Arc::default(),
+            &reasoner,
+            queues,
+            voice,
+        );
         let _session = listener.listen()?;
         tokio::task::yield_now().await;
         assert_eq!(reasoner.warms(), 1);
@@ -687,6 +778,40 @@ mod tests {
         let (mut session, _) = session(stt, vec![prediction("lights_on", 0.95)])?;
         session.push(vec![0; 320]).await?;
         session.push(vec![0; 320]).await
+    }
+
+    /// A `VoiceEmbedder` that gives `[2.0]` after its receiver gets a message.
+    struct GatedEmbedder(Mutex<std::sync::mpsc::Receiver<()>>);
+
+    impl VoiceEmbedder for GatedEmbedder {
+        fn embed(&self, _audio: &Audio) -> anyhow::Result<Vec<f32>> {
+            let gate = self.0.lock().expect("no lock holder panics");
+            gate.recv()?;
+            Ok(vec![2.0])
+        }
+    }
+
+    /// AC-15.4-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_4_1_commit_returns_the_transcript_before_the_embedding() -> anyhow::Result<()> {
+        let (release, gate) = std::sync::mpsc::channel();
+        let stt = FakeStt {
+            partials: vec![partial(TEXT, Some(0), 700)],
+            ..FakeStt::default()
+        };
+        let (queues, voice) = (
+            dialogs(Vec::new(), Timestamp::UNIX_EPOCH),
+            Arc::new(GatedEmbedder(Mutex::new(gate))),
+        );
+        let listener = listener(stt, &Arc::default(), &Arc::default(), queues, voice);
+        let transcript = listener.listen()?.push(vec![0; 320]).await?;
+        assert_eq!(transcript, Some(TEXT.to_owned()));
+        let committed = listener.utterances().correlate(TEXT);
+        let embedding = committed.context("no utterance")?.embedding;
+        assert!(!embedding.is_finished(), "the embedding completed first");
+        release.send(())?;
+        assert_eq!(embedding.await??, [2.0]);
+        Ok(())
     }
 
     /// AC-6.8b-1.

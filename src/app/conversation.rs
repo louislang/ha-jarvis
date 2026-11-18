@@ -31,6 +31,7 @@ use crate::app::background::Answers;
 use crate::app::background::Backfill;
 use crate::app::background::Habits;
 use crate::app::plugins::Plugins;
+use crate::app::speech::Committed;
 use crate::app::speech::Utterances;
 use crate::app::training::Trigger;
 use crate::domain::catalog::Catalog;
@@ -63,7 +64,6 @@ use crate::domain::responses;
 use crate::domain::responses::Pools;
 use crate::domain::responses::Response;
 use crate::domain::speech::Audio;
-use crate::domain::speech::Utterance;
 use crate::domain::state::AreaId;
 use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
@@ -302,8 +302,11 @@ impl Conversation {
             call,
             response,
         } = decided;
-        let (audio, voice_end) = heard.utterance.map_or((None, None), |utterance| {
-            (Some(utterance.audio), utterance.voice_end)
+        let (audio, voice_end) = heard.utterance.map_or((None, None), |committed| {
+            (
+                Some(committed.utterance.audio),
+                committed.utterance.voice_end,
+            )
         });
         let interaction = Interaction {
             id: heard.id,
@@ -1434,8 +1437,8 @@ struct Heard {
     model_context: String,
     /// The System One model at the time of the request. It predicts, and the record names its run.
     model: Arc<RunClassifier>,
-    /// The utterance of a voice request.
-    utterance: Option<Utterance>,
+    /// The utterance of a voice request, with the task of its voice embedding.
+    utterance: Option<Committed>,
     /// The ID of the first interaction of the dialog, for a dialog answer.
     link: Option<u64>,
 }
@@ -1922,6 +1925,7 @@ mod tests {
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeTrainer;
     use crate::testing::fakes::FakeTts;
+    use crate::testing::fakes::FakeVoiceEmbedder;
     use crate::testing::fakes::Scripted;
     use crate::testing::fakes::SetClock;
     use crate::testing::fakes::house;
@@ -2912,14 +2916,31 @@ mod tests {
     }
 
     /// Keeps an utterance of `LIGHTS` in `conversation`, whose voice ended 200 ms before the time
-    /// of the tests. Gives its audio.
+    /// of the tests, with its `FakeVoiceEmbedder` embedding. Gives its audio.
     fn hear(conversation: &Conversation) -> Audio {
+        use crate::ports::VoiceEmbedder as _;
+
         let voice_end = Timestamp::UNIX_EPOCH - Duration::from_millis(200);
         let (samples, rate) = (vec![1, 2, 3], 16_000);
         let audio = Audio { samples, rate };
+        let sound = audio.clone();
+        let embedding = tokio::task::spawn_blocking(move || FakeVoiceEmbedder.embed(&sound));
         let utterances = &conversation.recorder.utterances;
-        utterances.append(LIGHTS.to_owned(), audio.clone(), Some(voice_end));
+        utterances.append(LIGHTS.to_owned(), audio.clone(), Some(voice_end), embedding);
         audio
+    }
+
+    /// AC-15.4-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_4_2_correlate_gives_the_embedding() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let (_log, conversation) = logging(&Arc::default(), Duration::ZERO);
+        hear(&conversation);
+        let heard = conversation.hear(LIGHTS, &on_satellite(), None, Timestamp::UNIX_EPOCH);
+        let committed = heard.utterance.context("no utterance")?;
+        assert_eq!(committed.embedding.await??, [1.0]);
+        Ok(())
     }
 
     /// The interactions of `log` with their audio after the writer runs.

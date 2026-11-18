@@ -30,6 +30,7 @@ use crate::adapters::files::FileStore;
 use crate::adapters::sherpa;
 use crate::adapters::wyoming;
 use crate::app::background::Answer;
+use crate::app::speech::Utterances;
 use crate::domain::learn::Learned;
 use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
@@ -95,6 +96,8 @@ pub(crate) struct Pipeline {
     pace: Option<Duration>,
     /// The connection tasks and the work after their replies.
     tracker: TaskTracker,
+    /// The committed utterances of the app.
+    utterances: Arc<Utterances>,
     /// The folder of `pools.json`.
     _folder: TempDir,
 }
@@ -125,7 +128,7 @@ impl Pipeline {
         let classifier = trained.map(|trained| learn(&config, trained)).transpose()?;
         let started =
             start_app(&config, Arc::clone(&home) as _, Arc::clone(&reasoner) as _).await?;
-        let (address, tracker) = serve(&config, started, (classifier, answer)).await?;
+        let (address, tracker, utterances) = serve(&config, started, (classifier, answer)).await?;
         Ok(Self {
             address,
             home,
@@ -133,6 +136,7 @@ impl Pipeline {
             asr: config.asr,
             pace: (device == Device::Cuda).then_some(Duration::from_millis(20)),
             tracker,
+            utterances,
             _folder: folder,
         })
     }
@@ -260,7 +264,7 @@ async fn start_app(
 }
 
 /// Waits for `started` as [`ready`] does with `trained`, and serves it on a local port. Gives the
-/// address and the tracker of the connection tasks.
+/// address, the tracker of the connection tasks and the committed utterances.
 ///
 /// # Errors
 ///
@@ -269,13 +273,14 @@ async fn serve(
     config: &Config,
     started: Started,
     trained: Trained<'_>,
-) -> anyhow::Result<(SocketAddr, TaskTracker)> {
+) -> anyhow::Result<(SocketAddr, TaskTracker, Arc<Utterances>)> {
     let app = Arc::new(ready(config, started, trained).await?);
+    let utterances = Arc::clone(app.listener.utterances());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let (address, tracker) = (listener.local_addr()?, TaskTracker::new());
     let tasks = tracker.clone();
     tokio::spawn(async move { wyoming::serve(listener, app, &tasks, future::pending()).await });
-    Ok((address, tracker))
+    Ok((address, tracker, utterances))
 }
 
 /// The app of `started` after its pre-render. On the CUDA device of `config`, its models are
@@ -640,6 +645,25 @@ mod tests {
     #[ignore = "GPU host"]
     async fn ac_9_2_5_light_command_response_latency_p95_is_400_ms_or_less() -> anyhow::Result<()> {
         within(&LIGHT_COMMANDS, "lights_on", "office", 400).await
+    }
+
+    /// AC-15.4-3.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "GPU host"]
+    async fn ac_15_4_3_cuda_pipeline_embeds_each_committed_utterance() -> anyhow::Result<()> {
+        use crate::ports::VoiceEmbedder as _;
+
+        // The Phase 9.2 latency tests run on this pipeline, so they measure with embeddings on.
+        let pipeline = Pipeline::start(Device::Cuda).await?;
+        let speech = fakes::speech(FAN_COMMANDS[0]).await?.samples;
+        let (transcript, _, _) = pipeline.transcribe(&speech).await?;
+        let committed = pipeline.utterances.correlate(&transcript);
+        let committed = committed.context("no committed utterance")?;
+        let speaker = Config::parse(include_str!("../../jarvis.toml"))?.speaker;
+        let model = sherpa::SherpaEmbedder::try_new(&speaker, Device::Cpu)?;
+        let expected = model.embed(&committed.utterance.audio)?.len();
+        assert_eq!(committed.embedding.await??.len(), expected);
+        Ok(())
     }
 
     /// AC-9.3c-1. Only `tv_show` responses have a variable other than `area`.

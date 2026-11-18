@@ -936,11 +936,12 @@ impl Assistant for App {
 }
 
 /// The listener of `config` on `stt`, which predicts each partial with `classifier`, commits early
-/// for an answer to an open dialog of `queues`, warms `reasoner` and keeps the utterances for
-/// `log.correlate_s`.
+/// for an answer to an open dialog of `queues`, warms `reasoner` and keeps the utterances with
+/// their embeddings by `voice` for `log.correlate_s`.
 fn listener(
     config: &Config,
     stt: Arc<dyn SpeechToText>,
+    voice: Arc<dyn VoiceEmbedder>,
     classifier: Arc<dyn Classifier>,
     reasoner: Arc<dyn Reasoner>,
     queues: &Arc<Queues>,
@@ -958,7 +959,7 @@ fn listener(
         config.log.correlate_s,
     ));
     Listener::new(
-        stt, classifier, reasoner, policy, threshold, queues, clock, utterances,
+        stt, classifier, reasoner, policy, threshold, queues, clock, utterances, voice,
     )
 }
 
@@ -2251,11 +2252,11 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
     }
 }
 
-/// The live models of `config`, then the listener on their STT, which predicts with their System
-/// One model, sees the dialogs of `queues` and warms `reasoner`, the [`activation`] on their TTS,
-/// and the recorder of [`start_log`]. Starts the hotword refresh of the STT with `home`, `cache`
-/// and `catalog`, and the training trigger and the learned intent check with `checks`, `home`,
-/// the live models and the [`activation`].
+/// The live models of `config`, then the listener on their STT and voice embedder, which predicts
+/// with their System One model, sees the dialogs of `queues` and warms `reasoner`, the
+/// [`activation`] on their TTS, and the recorder of [`start_log`]. Starts the hotword refresh of
+/// the STT with `home`, `cache` and `catalog`, and the training trigger and the learned intent
+/// check with `checks`, `home`, the live models and the [`activation`].
 ///
 /// # Errors
 ///
@@ -2272,10 +2273,10 @@ async fn load_models(
     let models = Arc::new(LiveModels::try_new(load(config)).await?);
     let live = models.live();
     let stt = Arc::clone(&live) as _;
-    let (activation, checks) = activation(config, checks, live, cache)?;
+    let (activation, checks) = activation(config, checks, Arc::clone(&live) as _, cache)?;
     start_hotwords(config, &home, cache, catalog, Arc::clone(&stt));
     let classifier = Arc::clone(models.classifier()) as _;
-    let listener = listener(config, stt, classifier, Arc::clone(reasoner), queues);
+    let listener = listener(config, stt, live, classifier, Arc::clone(reasoner), queues);
     let recorded = start_log(
         config,
         &listener,
@@ -3430,7 +3431,15 @@ mod tests {
         let catalog = load_catalog(&config.intents)?;
         let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
         let (reasoner, queues) = (Arc::new(FakeReasoner::default()), queues(&config));
-        let listener = listener(&config, stt, Arc::clone(&classifier), reasoner, &queues);
+        let voice = Arc::new(FakeVoiceEmbedder);
+        let listener = listener(
+            &config,
+            stt,
+            voice,
+            Arc::clone(&classifier),
+            reasoner,
+            &queues,
+        );
         let utterances = Arc::clone(listener.utterances());
         Ok(App {
             conversation: conversation(&config, catalog, classifier, &speech, utterances)?,
