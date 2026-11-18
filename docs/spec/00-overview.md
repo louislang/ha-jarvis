@@ -16,7 +16,7 @@ This specification uses ASD-STE100 Simplified Technical English (STE).
 | `00-overview.md` | This file: the specification format, technical names, goals, examples and the phase index. |
 | `01-architecture.md` | Layers, ports, the System One model, decisions, latency budget, crates, files, configuration, machines, the reference house and the change map. |
 | `02-rules.md` | Code rules, Python rules, test rules, Quint rules, proof rules, PR rules and the required checks. |
-| `phase-00.md` to `phase-19.md` | One file for each phase. |
+| `phase-00.md` to `phase-20.md` | One file for each phase. |
 
 `CLAUDE.md` at the repository root holds the working rules for code changes. It must agree with `02-rules.md`.
 
@@ -84,6 +84,8 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | Timer pool | The HA timer helpers whose entity IDs start with `timer.jarvis_`. Each voice timer runs in one of them. |
 | Timer label | The name, the length and the satellite of one voice timer. Jarvis keeps it in `timers.json`. |
 | Ring | The announces of "Your timer is done" on the satellite of a timer that ended. |
+| Stop phrase | A phrase of `dialog.cancel`, for example "stop" or "never mind". It ends all work of Jarvis on the satellite. |
+| Mute switch | The switch of a satellite device whose entity ID ends in `_mute_microphones`. `on` mutes the microphones of the satellite. |
 | Voice profile | The stored voice embeddings of one person. |
 | Learned intent | An intent that Jarvis adds itself from a cluster of requests that System Two answered. |
 | Static intent | A learned intent with pre-generated responses and no service. |
@@ -152,6 +154,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | G23 | Each proof about a domain function is a Verus proof, written in the same PR as the function. Verus also proves that no domain function overflows an integer, indexes out of bounds or fails an `expect`. The only trusted code is the contracts in `src/domain/contracts.rs`. |
 | G24 | Jarvis has a tab in the HA sidebar: the review of interactions and proposals, the status of Jarvis (online, training or restarting) and a form of chosen settings. A save restarts Jarvis. When the start with the new settings fails, Jarvis puts the last good settings back and shows the rollback. The status entity shows the status to dashboards and automations, also when Jarvis is down, and it stays after an HA restart. |
 | G25 | You can set a voice timer with or without a name, ask for the time left, pause, resume and cancel it. The timer runs in an HA timer helper. When it ends, the satellite where you set it announces the end each 15 s for up to 2 minutes, until you say "stop". |
+| G26 | A stop phrase ends all that Jarvis does on the satellite, and Jarvis says "OK.". A bare "stop" when Jarvis does nothing pauses the music of the room. "Be quiet" or "mute" turns on the mute switch of the satellite for a time or until you unmute it with its button, HA or the Jarvis tab. |
 
 ### 1.1 Example System One Requests
 
@@ -199,7 +202,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 
 ## 2. Phase Index
 
-Each line is one PR. The work order follows the rows of this table, not the phase numbers. Thus phases 17 and 18 come after phase 9 and before phase 10, and phase 19 comes after phase 16.
+Each line is one PR. The work order follows the rows of this table, not the phase numbers. Thus phases 17 and 18 come after phase 9 and before phase 10, and phases 19 and 20 come after phase 16.
 
 | Phase | Sub-phases |
 |---|---|
@@ -223,3 +226,4 @@ Each line is one PR. The work order follows the rows of this table, not the phas
 | [15 Speaker Identification](phase-15.md) | 15.1 Tracker discovery · 15.1b Presence sensor discovery · 15.2 Presence and proximity signals · 15.2b Discovery report · 15.3 Voice ports and adapters · 15.4 Voice embedding at commit · 15.5 Speaker Quint model · 15.6 Identification and enrollment · 15.7 Person-specific intents |
 | [16 System Model](phase-16.md) | 16.1 System Quint model · 16.2 System conformance · 16.3 Composed Quint model · 16.4 Composed conformance |
 | [19 Voice Timers](phase-19.md) | 19.1 Timer Quint model · 19.2 Timer durations · 19.3 Timer labels · 19.3b Timer book updates · 19.4 Timer intents · 19.5 Timer start and time left · 19.5b Timer choice · 19.6 Timer events · 19.6b Timer requests · 19.6c Duration answers · 19.7 Timer ring · 19.8 Timer conformance |
+| [20 Stop and Mute](phase-20.md) | 20.1 Quiet Quint model · 20.2 Stop rules · 20.3 Satellite work · 20.4 Stop routing · 20.5 Mute intent · 20.6 Mute use case · 20.7 Unmute in the Jarvis tab · 20.8 Quiet conformance |

@@ -67,7 +67,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 |---|---|---|---|
 | `Assistant` | Driving | `info`, `listen` (gives a `Listening` session: `push`, `finish`), `handle`, `speak` | Implemented by `App` in `src/lib.rs`. Called by `adapters/wyoming.rs`. |
 | `Review` | Driving | `list`, `audio`, `mark`, `intents`, `proposals`, `resolve` | Implemented by `app/review.rs`. Called by `adapters/web.rs`. |
-| `Control` | Driving | `status`, `settings`, `save` | Implemented in `src/lib.rs`. Called by `adapters/web.rs`. |
+| `Control` | Driving | `status`, `settings`, `save`, `satellites`, `unmute` | Implemented in `src/lib.rs`. Called by `adapters/web.rs`. |
 | `Home` | Driven | `snapshot`, `events`, `call`, `announce`, `ask` | `adapters/ha.rs` |
 | `SpeechToText` | Driven | `stream` (first pass: gives `accept`, `partial`, `reset`), `transcribe` (second pass), `set_hotwords` | `adapters/sherpa.rs` |
 | `TextToSpeech` | Driven | `synth` | `adapters/supertonic.rs` |
@@ -174,6 +174,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 33. **A tab in Home Assistant.** You use Jarvis through HA, so the review page, the status and the settings form are one tab in the HA sidebar, as Music Assistant has. HA runs the Supervisor on the HA host, and Jarvis runs on the GPU host. The Jarvis add-on is an `nginx` reverse proxy on the HA host. HA ingress gives the sidebar entry, the HA login and remote access, and serves the tab under a path prefix. Thus the page uses only relative URLs. The add-on adds the bearer token of `web.token_env` to each request, so the page has no token prompt. When Jarvis does not answer, the add-on shows its own down page. The status entity does not depend on the add-on: Jarvis publishes it through MQTT discovery with a `unique_id`, a retained state and a last will `offline`. Thus the broker marks Jarvis offline when the process dies, and the entity stays after an HA restart. The settings form shows a fixed list of fields and no secret. A save checks the new file with the checks of the start, keeps the old file, and restarts Jarvis with exit code 75, which the unit restarts. When the next start fails or crashes before it is ready, Jarvis puts the old file back and starts again, and the status shows the reason. One save gives at most two automatic restarts (sub-phases 12.8 to 12.9g).
 34. **Speech biasing.** The second pass decodes with modified beam search and a list of hotwords: the names and aliases of the areas, of the entities that people control (lights, switches, fans, climate, covers, locks, media players, scenes, scripts and automations), the command verbs of the intent catalog (`verbs`, for example "Resume" and "Turn on"), and the playlists, artists and albums of the Music Assistant library. A phrase of the list that the audio matches gets `asr.hotwords_score` for each token. Each stream gets the list (`create_stream_with_hotwords`), so the list changes without a model reload. Jarvis builds the list at the start and each hour (sub-phases 18.17 to 18.18b). On the GPU host with the CPU provider, "Play Radio Head." became "Play Radiohead." and "Activate movie time." became "Activate Movie Time.". Hotwords keep the case of the names: hotwords in capital letters broke the decode. A verb has a capital first letter, because it starts the sentence. The first pass stays greedy, because on the GPU host its text only gives the speculative prediction.
 35. **Timers in HA timer helpers.** A voice timer runs in an HA timer helper, so HA keeps its time, shows it on dashboards and keeps it over an HA restart with `restore`. You make the timer pool once in HA: a fixed set of timer helpers whose entity IDs start with `timer.jarvis_`, for example `timer.jarvis_1` to `timer.jarvis_5`. At most that many timers run at the same time, and with all in use Jarvis replies "All timers are in use." Jarvis does not create or delete helpers: HA makes a helper only through the WebSocket commands `timer/create` and `timer/delete`, which need an admin token, a new `Home` method and a registry reload. Jarvis takes the free helper with the lowest entity ID and calls `timer.start`, `timer.pause` and `timer.cancel` (phase 19). A helper has no free text, so Jarvis keeps the label of each timer in `timers.json`. A change from `active` to `idle` at or after `finishes_at` is a finish. A cancel, also from the HA UI, comes before it. A timer that ends while Jarvis is down or disconnected from HA is announced once at the next connection, from the end time of its label ("Your chicken timer finished 40 seconds ago.").
+36. **Stop and mute.** A stop phrase (`dialog.cancel`) ends all work of Jarvis on the satellite: a ring, the open dialog, the queued announces and the deferred jobs, through the generation of the satellite (decision 5). A call that started is not undone. The Satellite1 stops its speech at once when it hears the wake word again, so the stop does not stop the audio itself. HA shows the change from `responding` to `listening`. Jarvis replies "OK.". Only a bare "stop" when Jarvis does nothing on the satellite pauses the music of its area, as `music_pause`. Thus "stop" stops Jarvis first, then the music. A mute ends the work of the satellite and turns on its mute switch, as the training pause does (decision 12). A muted satellite does not hear the wake word, so you unmute it with its button, the switch in HA or the Jarvis tab. Jarvis unmutes only after a timed mute, and only when the switch stayed on. A ring still plays on a muted satellite, because the switch mutes only the microphones (phase 20).
 
 ## 6. Latency Budget (System One)
 
@@ -310,6 +311,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `quint/speaker.qnt` | Model | Speaker identification and enrollment. | 15.5 |
 | `quint/jarvis.qnt` | Model | The system model. It composes the other models. | 16.1 |
 | `quint/timers.qnt` | Model | Timer labels, late HA events and the ring. | 19.1 |
+| `quint/quiet.qnt` | Model | Stop and mute. | 20.1 |
 | `src/lib.rs` | Root | Module tree, `Config`, `SystemClock`, `LiveModels`, `App` (implements `Assistant` by delegation), `run`, the `dataset` command, `main`. | 0.1 |
 | `src/main.rs` | Root | Binary entry point. `main` only calls `jarvis::main`. | 0.1 |
 | `src/ports.rs` | Ports | All port traits and their data types. | 2.1 |
@@ -346,7 +348,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/adapters/openai.rs` | Adapter | `Reasoner` with OpenAI. Prompt builders. | 7.1 |
 | `src/adapters/sqlite.rs` | Adapter | `InteractionLog` with SQLite. | 12.4 |
 | `src/adapters/web.rs` | Driving adapter | Web server of the Jarvis tab with token auth. It calls `Review` and `Control`. | 12.8 |
-| `src/adapters/review.html` | Driving adapter | The page of the Jarvis tab: review, status and settings. `web.rs` embeds it with `include_str!`. | 12.9 |
+| `src/adapters/review.html` | Driving adapter | The page of the Jarvis tab: review, status, settings and the mute state of the satellites. `web.rs` embeds it with `include_str!`. | 12.9 |
 | `src/adapters/mqtt.rs` | Adapter | The status entity through MQTT discovery, a retained state and a last will. No port (section 1). | 12.9c |
 | `src/adapters/settings.rs` | Adapter | The settings form fields: read and edit of `jarvis.toml` with `toml_edit`, backup, trial start marker, confirm and rollback. | 12.9d |
 | `src/adapters/process.rs` | Adapter | `Trainer` that runs `train/train.py` as a local process. | 13.7 |
@@ -454,7 +456,7 @@ idle_wait_s = 30
 max_turns = 3
 timeout_s = 15
 choice_similarity = 0.85
-cancel = ["never mind", "cancel", "forget it", "stop"]
+cancel = ["never mind", "nevermind", "cancel", "forget it", "stop"]
 
 [habits]
 file = "habits.json"
@@ -640,6 +642,7 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 - `kind = "prefetch"`: Jarvis replies with the prefetched answer when it is fresh. Else Jarvis treats the request as System Two. Only learned intents use this kind.
 - `kind = "train"`: Jarvis replies from the pool and starts a training run (sub-phase 13.11).
 - `kind = "timer"`: `timer` names the action: `start`, `left`, `cancel`, `cancel_last`, `pause` or `resume`. Jarvis acts on a timer of the timer pool (phase 19). A timer intent needs no area.
+- `kind = "mute"`: Jarvis turns on the mute switch of the satellite of the request, for the optional `duration` slot (phase 20). A mute intent needs no area.
 - `select` is a list of entity filters. A filter has a `domain`, an optional `name` and an optional `device_class`. `name` matches whole words of the entity name or an alias, without case sensitivity (`fan` matches "Office Fan", not "Infant Monitor"). An entity matches when one filter matches. `select` skips an entity that has an entity category, that is hidden or disabled, or that is on a satellite device (a device with an `assist_satellite` entity) and is not a `media_player`.
 - `exclude` is a list of entity IDs that `select` never matches. Use it for a sensor that gives bad values.
 - `plugin` is the tool name of the plugin of a fetch intent, for example `get_weather`.
@@ -698,7 +701,7 @@ responses = ["Training is already running."]
 responses = ["Which room?"]
 
 [pools.cancelled]
-responses = ["Okay, never mind."]
+responses = ["OK."]
 ```
 
 The pool `ask_area` holds the questions for a missing area. A pool that is not an intent pool uses no template variable.
@@ -821,4 +824,5 @@ Each model has state variables, actions and named invariants. `02-rules.md` sect
 | `prefetch.qnt` | Prefetch | `domain/learn.rs`, `app/background.rs` | `NoCallFromPrefetch`, `ServedAnswerIsFresh`, `PrefetchOnlyInWindow`, `NoEarlyRefresh` |
 | `speaker.qnt` | Speaker identification | `domain/speaker.rs` | `SpeakerIsCandidate`, `NoVoiceOnlyEnrollment` |
 | `timers.qnt` | Voice timers | `domain/timers.rs`, `app/timers.rs` | `NoRingAfterCancel`, `RingOnlyFinished`, `RingLimit`, `NoRingAfterStop`, `LateRingOnce`, `RunningTimerLabeled` |
+| `quiet.qnt` | Stop and mute | `domain/dialog.rs`, `app/conversation.rs` | `NothingAfterStop`, `PauseOnlyWhenIdle`, `UnmuteOnlyOwnMute` |
 | `jarvis.qnt` | System | All use cases | `OneHandledPerRequest`, `ReplyBeforeCall`, `FillerBeforeAnswer`, `ModelSwapAtomic`, `NoTalkOver` |
