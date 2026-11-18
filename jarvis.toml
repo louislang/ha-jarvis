@@ -147,6 +147,9 @@ model = "models/wespeaker_en_voxceleb_CAM++.onnx"
 voices = "voices.json"
 voice_threshold = 0.6 # voice similarity
 max_samples = 20
+threshold = 0.6 # combined score of proximity and voice
+margin = 0.15
+enroll_threshold = 0.5 # proximity 1 / (1 + distance): 1 m or less
 
 # Optional. The people are the `person` entities of HA. An entry only replaces the discovered
 # trackers of one person.

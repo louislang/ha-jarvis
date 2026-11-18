@@ -306,7 +306,34 @@ impl Config {
             (1..=60).contains(&lead),
             "learn.prefetch_lead_min = {lead} is out of range: it must be in [1, 60]"
         );
+        self.validate_speaker()?;
         self.validate_relations()
+    }
+
+    /// Checks that `speaker.threshold` and `speaker.margin` are more than 0 and that
+    /// `speaker.enroll_threshold` is in `[0, 1]`.
+    ///
+    /// # Errors
+    ///
+    /// A field is out of its range. The error names the field and the range.
+    fn validate_speaker(&self) -> anyhow::Result<()> {
+        let speaker = &self.speaker;
+        let positive = [
+            ("speaker.threshold", speaker.threshold),
+            ("speaker.margin", speaker.margin),
+        ];
+        for (name, value) in positive {
+            anyhow::ensure!(
+                value > 0.0,
+                "{name} = {value} is out of range: it must be more than 0"
+            );
+        }
+        let enroll = speaker.enroll_threshold;
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&enroll),
+            "speaker.enroll_threshold = {enroll} is out of range: it must be in [0, 1]"
+        );
+        Ok(())
     }
 
     /// Checks that each timeout, interval, count and limit is more than 0.
@@ -756,6 +783,12 @@ pub struct SpeakerConfig {
     pub voice_threshold: f32,
     /// The samples that each profile keeps.
     pub max_samples: usize,
+    /// The combined score of proximity and voice that identifies a speaker.
+    pub threshold: f64,
+    /// The lead of the top score over each other score.
+    pub margin: f64,
+    /// The proximity that gives the source `Proximity`.
+    pub enroll_threshold: f64,
 }
 
 /// The `Clock` of the system time.
@@ -2756,6 +2789,9 @@ mod tests {
             voices: PathBuf::from("voices.json"),
             voice_threshold: 0.6,
             max_samples: 20,
+            threshold: 0.6,
+            margin: 0.15,
+            enroll_threshold: 0.5,
         }
     }
 
@@ -2830,6 +2866,31 @@ mod tests {
             error.contains("learn.check_interval_s") && error.contains("more than 0"),
             "error for learn.check_interval_s = 0 has no field or range: {error}"
         );
+    }
+
+    /// A `[speaker]` score out of its range gives an error with the field and the range.
+    #[test]
+    fn speaker_score_out_of_range_names_field_and_range() {
+        let cases = [
+            ("\nthreshold = 0.6 #", "\nthreshold = 0.0 #", "more than 0"),
+            ("margin = 0.15", "margin = -0.1", "more than 0"),
+            (
+                "enroll_threshold = 0.5",
+                "enroll_threshold = 1.5",
+                "in [0, 1]",
+            ),
+        ];
+        for (field, broken, range) in cases {
+            let name = format!(
+                "speaker.{}",
+                broken.trim().split(' ').next().unwrap_or_default()
+            );
+            let error = parse_error(&VALID.replace(field, broken));
+            assert!(
+                error.contains(&name) && error.contains(range),
+                "error for {broken} has no field or range: {error}"
+            );
+        }
     }
 
     /// A zero `speaker.max_samples` is an error, so `enroll` never empties a profile.
