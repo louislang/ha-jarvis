@@ -42,6 +42,7 @@ use crate::domain::responses;
 use crate::domain::responses::Pool;
 use crate::domain::responses::Pools;
 use crate::domain::speech;
+use crate::domain::state::AreaId;
 use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
@@ -673,13 +674,65 @@ pub fn start_learning(learning: Learning, interval: Duration) -> JoinHandle<()> 
     })
 }
 
-/// A prefetched answer and its time.
+/// A prefetched answer, the area of its question and its time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Answer {
     /// The text.
     pub text: String,
+    /// The area of the question.
+    pub area: Option<AreaId>,
     /// The time when the answer was complete.
     pub time: Timestamp,
+}
+
+/// The prefetched answers and the area of the most recent request of each prefetch intent, by
+/// intent name.
+#[derive(Default)]
+pub struct Answers {
+    /// The stored answer of each intent.
+    stored: Mutex<BTreeMap<String, Answer>>,
+    /// The area of the most recent request of each intent.
+    areas: Mutex<BTreeMap<String, Option<AreaId>>>,
+}
+
+impl Answers {
+    /// Stores `answer` of the intent `name`, or removes the stored answer without `answer`. Gives
+    /// the text of the old answer when no stored answer has it.
+    pub fn store(&self, name: &str, answer: Option<Answer>) -> Option<String> {
+        let mut stored = lock(&self.stored);
+        let old = match answer {
+            Some(answer) => stored.insert(name.to_owned(), answer),
+            None => stored.remove(name),
+        };
+        let kept = |old: &String| stored.values().any(|answer| answer.text == *old);
+        old.map(|old| old.text).filter(|old| !kept(old))
+    }
+
+    /// Keeps `area` as the area of the most recent request of the intent `name`.
+    pub fn heard(&self, name: &str, area: Option<AreaId>) {
+        lock(&self.areas).insert(name.to_owned(), area);
+    }
+
+    /// The area of the most recent request of the intent `name`.
+    fn area(&self, name: &str) -> Option<AreaId> {
+        lock(&self.areas).get(name).cloned().flatten()
+    }
+
+    /// The text of the stored answer of the intent `name` when it has `area` and is fresh at
+    /// `now` with `fresh_min`.
+    #[must_use]
+    pub fn fresh(
+        &self,
+        name: &str,
+        area: Option<&AreaId>,
+        now: Timestamp,
+        fresh_min: u32,
+    ) -> Option<String> {
+        let stored = lock(&self.stored);
+        let answer = stored.get(name)?;
+        let fresh = answer.area.as_ref() == area && learn::fresh(answer.time, now, fresh_min);
+        fresh.then(|| answer.text.clone())
+    }
 }
 
 /// The prefetch of the answers of the active prefetch intents.
@@ -696,8 +749,8 @@ pub struct Prefetch {
     lead_min: u64,
     /// The time of the last prefetch of each intent.
     attempts: Mutex<BTreeMap<String, Timestamp>>,
-    /// The stored answer of each intent.
-    answers: Mutex<BTreeMap<String, Answer>>,
+    /// The stored answers and the areas of the requests, shared with `conversation`.
+    answers: Arc<Answers>,
 }
 
 impl Prefetch {
@@ -712,13 +765,13 @@ impl Prefetch {
         config: &Config,
     ) -> Self {
         Self {
+            answers: conversation.answers(),
             conversation,
             activation,
             habits,
             min_score: config.habits.min_score,
             lead_min: config.learn.prefetch_lead_min,
             attempts: Mutex::default(),
-            answers: Mutex::default(),
         }
     }
 
@@ -755,32 +808,29 @@ impl Prefetch {
         due.then(|| question.clone())
     }
 
-    /// Stores the answer to the prefetch question `question` of the intent `name` after its
-    /// pre-render, as `store` does. A failed answer or pre-render logs and keeps the stored answer.
+    /// Stores the answer to the prefetch question `question` of the intent `name`, asked from the
+    /// area of its most recent request, after its pre-render, as `store` does. A failed answer or
+    /// pre-render logs and keeps the stored answer.
     async fn run(&self, name: &str, question: &str) {
-        let speech = &self.activation.speech;
-        let answer = match self.conversation.prefetch(question).await {
+        let (speech, area) = (&self.activation.speech, self.answers.area(name));
+        let answer = match self.conversation.prefetch(question, area.as_ref()).await {
             Ok(Some(text)) => speech.render(&text).await.map(|()| Some(text)),
             other => other,
         };
         match answer {
-            Ok(answer) => self.store(name, answer),
+            Ok(answer) => self.store(name, answer, area),
             Err(error) => tracing::warn!("the prefetch of {name} failed: {error:#}"),
         }
     }
 
-    /// Stores `answer` of the intent `name` with the current time, or removes the stored answer
-    /// without `answer`. Drops the audio of a replaced or removed answer that no stored answer has.
-    fn store(&self, name: &str, answer: Option<String>) {
+    /// Stores `answer` of the intent `name` with `area` and the current time, or removes the
+    /// stored answer without `answer`. Drops the audio of a replaced or removed answer that no
+    /// stored answer has.
+    fn store(&self, name: &str, answer: Option<String>, area: Option<AreaId>) {
         let time = self.activation.clock.now();
-        let mut answers = lock(&self.answers);
-        let old = match answer {
-            Some(text) => answers.insert(name.to_owned(), Answer { text, time }),
-            None => answers.remove(name),
-        };
-        let stored = |old: &Answer| answers.values().any(|answer| answer.text == old.text);
-        if let Some(old) = old.filter(|old| !stored(old)) {
-            self.activation.speech.forget(&old.text);
+        let answer = answer.map(|text| Answer { text, area, time });
+        if let Some(old) = self.answers.store(name, answer) {
+            self.activation.speech.forget(&old);
         }
     }
 }
@@ -2288,7 +2338,9 @@ mod tests {
         prefetcher.tick(0, said("Old.")).await;
         let steps = vec![Scripted::Sentence("New."), Scripted::Error("lost")];
         prefetcher.tick(30, steps).await;
-        let answer = lock(&prefetcher.prefetch.answers).get(CALENDAR).cloned();
+        let answer = lock(&prefetcher.prefetch.answers.stored)
+            .get(CALENDAR)
+            .cloned();
         assert_eq!(
             answer.map(|answer| (answer.text, answer.time)),
             Some(("Old.".to_owned(), thursday()))

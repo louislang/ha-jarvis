@@ -29,6 +29,7 @@ use crate::Started;
 use crate::adapters::files::FileStore;
 use crate::adapters::sherpa;
 use crate::adapters::wyoming;
+use crate::app::background::Answer;
 use crate::domain::learn::Learned;
 use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
@@ -105,24 +106,26 @@ impl Pipeline {
     ///
     /// A file or a model cannot load, or the server cannot bind.
     pub(crate) async fn start(device: Device) -> anyhow::Result<Self> {
-        Self::start_with(device, None).await
+        Self::start_with(device, None, None).await
     }
 
-    /// [`Pipeline::start`] with the learned intents and the swapped-in classifier of `trained`.
-    /// Fails as [`Pipeline::start`] does.
+    /// [`Pipeline::start`] with the learned intents and the swapped-in classifier of `trained`,
+    /// and with the pre-rendered `answer` of an intent stored as a prefetched answer. Fails as
+    /// [`Pipeline::start`] does.
     pub(crate) async fn start_with(
         device: Device,
         trained: Option<(Learned, Arc<dyn Classifier>)>,
+        answer: Option<(&str, Answer)>,
     ) -> anyhow::Result<Self> {
         let folder = tempfile::tempdir()?;
         let config = config(device, folder.path())?;
         let home = Arc::new(FakeHome::default());
         home.send(Event::Reconnected);
         let reasoner = Arc::new(FakeReasoner::default());
-        let (house, two) = (Arc::clone(&home) as _, Arc::clone(&reasoner) as _);
         let classifier = trained.map(|trained| learn(&config, trained)).transpose()?;
-        let started = start_app(&config, house, two).await?;
-        let (address, tracker) = serve(&config, started, classifier).await?;
+        let started =
+            start_app(&config, Arc::clone(&home) as _, Arc::clone(&reasoner) as _).await?;
+        let (address, tracker) = serve(&config, started, (classifier, answer)).await?;
         Ok(Self {
             address,
             home,
@@ -229,6 +232,10 @@ impl Pipeline {
     }
 }
 
+/// The classifier that replaces the System One model, and an intent name with its prefetched
+/// answer.
+type Trained<'name> = (Option<Arc<dyn Classifier>>, Option<(&'name str, Answer)>);
+
 /// Saves `learned` to `learn.file` of `config` and gives `classifier`. Fails when the save fails.
 fn learn(
     config: &Config,
@@ -252,8 +259,8 @@ async fn start_app(
     crate::start_app(config, catalog, pools, home, reasoner, plugins, None).await
 }
 
-/// Waits for `started` as [`ready`] does with `classifier`, and serves it on a local port. Gives
-/// the address and the tracker of the connection tasks.
+/// Waits for `started` as [`ready`] does with `trained`, and serves it on a local port. Gives the
+/// address and the tracker of the connection tasks.
 ///
 /// # Errors
 ///
@@ -261,9 +268,9 @@ async fn start_app(
 async fn serve(
     config: &Config,
     started: Started,
-    classifier: Option<Arc<dyn Classifier>>,
+    trained: Trained<'_>,
 ) -> anyhow::Result<(SocketAddr, TaskTracker)> {
-    let app = Arc::new(ready(config, started, classifier).await?);
+    let app = Arc::new(ready(config, started, trained).await?);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let (address, tracker) = (listener.local_addr()?, TaskTracker::new());
     let tasks = tracker.clone();
@@ -273,7 +280,8 @@ async fn serve(
 
 /// The app of `started` after its pre-render. On the CUDA device of `config`, its models are
 /// released and restored first, so the GPU latency tests run after the pause of a local training
-/// run (AC-13.10f-1). Then `classifier`, when set, replaces the System One model.
+/// run (AC-13.10f-1). Then the classifier of `trained`, when set, replaces the System One model,
+/// and the answer of `trained`, when set, is pre-rendered and stored for its intent.
 ///
 /// # Errors
 ///
@@ -281,7 +289,7 @@ async fn serve(
 async fn ready(
     config: &Config,
     started: Started,
-    classifier: Option<Arc<dyn Classifier>>,
+    (classifier, answer): Trained<'_>,
 ) -> anyhow::Result<App> {
     let (app, _, prerender, models) = started;
     prerender.await?;
@@ -291,6 +299,10 @@ async fn ready(
     }
     if let Some(classifier) = classifier {
         models.classifier().swap("trained".to_owned(), classifier);
+    }
+    if let Some((name, answer)) = answer {
+        app.speech.render(&answer.text).await?;
+        let _ = app.conversation.answers().store(name, Some(answer));
     }
     Ok(app)
 }
@@ -454,9 +466,11 @@ mod tests {
     use jiff::Timestamp;
     use serde_json::Map;
 
+    use crate::domain::learn::LearnedKind;
     use crate::domain::learn::LearnedStatus;
     use crate::domain::model::Prediction;
     use crate::domain::responses;
+    use crate::domain::state::AreaId;
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::Scripted;
 
@@ -698,23 +712,60 @@ mod tests {
     #[ignore = "GPU host"]
     async fn ac_14_7b_2_learned_intent_response_latency_p95_is_300_ms_or_less() -> anyhow::Result<()>
     {
-        let (joke, classifier) = ("Why did the fan stop?", Arc::new(FakeClassifier::default()));
-        for _ in 0..10_000 {
-            let ranked = vec![("tell_joke".to_owned(), 0.9)];
-            classifier.script(Prediction {
-                ranked,
-                slots: Vec::new(),
-            });
-        }
+        let (joke, classifier) = ("Why did the fan stop?", always("tell_joke"));
         let mut entry = fakes::learned("tell_joke", LearnedStatus::Active);
         (entry.service, entry.responses) = (None, vec![joke.to_owned()]);
         entry.activated = Some(Timestamp::UNIX_EPOCH);
         let learned = Learned {
             intents: vec![entry],
         };
-        let pipeline = Pipeline::start_with(Device::Cuda, Some((learned, classifier))).await?;
+        let pipeline =
+            Pipeline::start_with(Device::Cuda, Some((learned, classifier)), None).await?;
         let p95 = p95(&pipeline, "tell me a joke", &[joke.to_owned()]).await?;
         assert!(p95 <= Duration::from_millis(300), "p95 {p95:?}");
+        Ok(())
+    }
+
+    /// A classifier that gives `label` with 0.9 to each prediction.
+    fn always(label: &str) -> Arc<FakeClassifier> {
+        let classifier = Arc::new(FakeClassifier::default());
+        for _ in 0..10_000 {
+            let ranked = vec![(label.to_owned(), 0.9)];
+            classifier.script(Prediction {
+                ranked,
+                slots: Vec::new(),
+            });
+        }
+        classifier
+    }
+
+    /// AC-14.10d-4. The classifier gives `family_calendar` to each prediction, and its stored
+    /// answer is fresh in the kitchen.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "GPU host"]
+    async fn ac_14_10d_4_prefetch_answer_response_latency_p95_is_300_ms_or_less()
+    -> anyhow::Result<()> {
+        let (name, text) = ("family_calendar", "There are two events today.");
+        let mut entry = fakes::learned(name, LearnedStatus::Active);
+        (entry.kind, entry.service, entry.fresh_min) = (LearnedKind::Prefetch, None, Some(30));
+        let learned = Learned {
+            intents: vec![entry],
+        };
+        let answer = Answer {
+            text: text.to_owned(),
+            area: Some(AreaId("kitchen".to_owned())),
+            time: Timestamp::now(),
+        };
+        let trained = Some((learned, always(name) as Arc<dyn Classifier>));
+        let pipeline = Pipeline::start_with(Device::Cuda, trained, Some((name, answer))).await?;
+        let p95 = p95(
+            &pipeline,
+            "what is on the calendar today",
+            &[text.to_owned()],
+        )
+        .await?;
+        let limit = Duration::from_millis(300);
+        assert!(p95 <= limit, "p95 {p95:?}, limit {limit:?}");
         Ok(())
     }
 }
