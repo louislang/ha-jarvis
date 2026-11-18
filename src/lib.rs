@@ -3932,6 +3932,7 @@ mod tests {
             text: text.to_owned(),
             voice_end_ms: None,
             vad_ms: 20,
+            voiced_ms: 0,
         };
         let stt = FakeStt {
             partials: vec![partial],

@@ -198,6 +198,8 @@ pub struct Partial {
     pub voice_end_ms: Option<u64>,
     /// The end of the audio that the VAD has decided.
     pub vad_ms: u64,
+    /// The length of the finished VAD speech segments.
+    pub voiced_ms: u64,
 }
 
 /// Speech to text.
