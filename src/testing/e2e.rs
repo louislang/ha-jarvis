@@ -466,6 +466,7 @@ mod tests {
     use jiff::Timestamp;
     use serde_json::Map;
 
+    use crate::domain::decide::PluginCall;
     use crate::domain::learn::LearnedKind;
     use crate::domain::learn::LearnedStatus;
     use crate::domain::model::Prediction;
@@ -753,6 +754,7 @@ mod tests {
         };
         let answer = Answer {
             text: text.to_owned(),
+            call: None,
             area: Some(AreaId("kitchen".to_owned())),
             time: Timestamp::now(),
         };
@@ -764,6 +766,29 @@ mod tests {
             &[text.to_owned()],
         )
         .await?;
+        let limit = Duration::from_millis(300);
+        assert!(p95 <= limit, "p95 {p95:?}, limit {limit:?}");
+        Ok(())
+    }
+
+    /// AC-14.10b-8. The fixture model gives `weather`, and its answer is fresh in the kitchen.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "GPU host"]
+    async fn ac_14_10b_8_fetch_answer_response_latency_p95_is_300_ms_or_less() -> anyhow::Result<()>
+    {
+        let text = "Today will be sunny, with a high of 72 degrees.";
+        let call = PluginCall {
+            plugin: "get_weather".to_owned(),
+            arguments: Map::from_iter([("when".to_owned(), json!("today"))]),
+        };
+        let answer = Answer {
+            text: text.to_owned(),
+            call: Some(call),
+            area: Some(AreaId("kitchen".to_owned())),
+            time: Timestamp::now(),
+        };
+        let pipeline = Pipeline::start_with(Device::Cuda, None, Some(("weather", answer))).await?;
+        let p95 = p95(&pipeline, "what is the weather like", &[text.to_owned()]).await?;
         let limit = Duration::from_millis(300);
         assert!(p95 <= limit, "p95 {p95:?}, limit {limit:?}");
         Ok(())

@@ -34,6 +34,7 @@ use crate::app::plugins::Plugins;
 use crate::app::speech::Utterances;
 use crate::app::training::Trigger;
 use crate::domain::catalog::Catalog;
+use crate::domain::catalog::Intent;
 use crate::domain::catalog::Kind;
 use crate::domain::decide;
 use crate::domain::decide::AskCall;
@@ -600,20 +601,15 @@ impl Conversation {
     }
 
     /// The decision for `prediction` of `request` in the current hot cache and pools, or a reply
-    /// with the fresh prefetched answer of `prefetched`.
+    /// with the fresh prefetched answer of `prefetched` or `prefetched_fetch`.
     fn decide(&self, prediction: &Prediction, request: &Request) -> Decision {
         if let Some(text) = self.prefetched(prediction, request) {
-            let reply = Chosen {
-                text,
-                pool: String::new(),
-                index: 0,
-            };
-            return Decision::Reply { reply, call: None };
+            return stored_reply(text);
         }
         let (cache, pools) = (self.queues.cache.borrow(), self.pools.load());
         let rng = &mut self.rng.lock().expect("no lock holder panics");
         let catalog = &self.catalog.load();
-        decide::decide(
+        let decision = decide::decide(
             prediction,
             request,
             catalog,
@@ -621,7 +617,11 @@ impl Conversation {
             &pools,
             self.threshold,
             rng,
-        )
+        );
+        match self.prefetched_fetch(&decision, request) {
+            Some(text) => stored_reply(text),
+            None => decision,
+        }
     }
 
     /// The text of the fresh prefetched answer with the area of `request`, when the top intent of
@@ -636,9 +636,37 @@ impl Conversation {
             .find(|intent| &intent.name == label)?;
         let prefetch = intent.kind == Kind::Prefetch && *probability >= self.threshold;
         let fresh_min = intent.fresh_min.filter(|_| prefetch)?;
+        self.stored(label, None, fresh_min, request)
+    }
+
+    /// The text of the fresh prefetched answer of the fetch of `decision` with its call and the
+    /// area of `request`. Keeps that area as the area of the most recent request of the intent.
+    fn prefetched_fetch(&self, decision: &Decision, request: &Request) -> Option<String> {
+        let Decision::Defer {
+            job: Job::Fetch { call, pool },
+            ..
+        } = decision
+        else {
+            return None;
+        };
+        let catalog = self.catalog.load();
+        let intent = catalog.intents.iter().find(|intent| &intent.name == pool)?;
+        self.stored(pool, Some(call), intent.fresh_min?, request)
+    }
+
+    /// The text of the stored answer of the intent `name` with `call` and the area of `request`,
+    /// when it is fresh with `fresh_min`. Keeps that area as the area of the most recent request
+    /// of the intent.
+    fn stored(
+        &self,
+        name: &str,
+        call: Option<&PluginCall>,
+        fresh_min: u32,
+        request: &Request,
+    ) -> Option<String> {
         let answers = &self.two.answers;
-        answers.heard(label, request.area.clone());
-        answers.fresh(label, request.area.as_ref(), request.now, fresh_min)
+        answers.heard(name, request.area.clone());
+        answers.fresh(name, call, request.area.as_ref(), request.now, fresh_min)
     }
 
     /// The dispatch of `decision` of `heard` from `area` on its satellite. Without a satellite, the
@@ -1175,6 +1203,28 @@ impl Conversation {
         Arc::clone(&self.two.answers)
     }
 
+    /// The plugin call of the fetch intent `intent` with its `data` for `area` and no slots, and a
+    /// response of its pool for `area` with a new result of the call as `response`.
+    ///
+    /// # Errors
+    ///
+    /// A data value needs a slot, the intent has no plugin, or the fetch or the render fails.
+    pub async fn fetch_reply(
+        &self,
+        intent: &Intent,
+        area: Option<&AreaId>,
+    ) -> anyhow::Result<(PluginCall, String)> {
+        use anyhow::Context as _;
+        let mut context = decide::context(Map::new(), area, &self.queues.cache.borrow());
+        let arguments = decide::data(intent, &context).context("a data value needs a slot")?;
+        let plugin = intent.plugin.clone().context("no plugin")?;
+        let call = PluginCall { plugin, arguments };
+        let response = self.two.plugins.refresh(&call, &self.home()?).await?;
+        context.insert("response".to_owned(), response);
+        let text = responses::render(&self.pick(&intent.name), &context)?;
+        Ok((call, text))
+    }
+
     /// The text of the System Two answer to the prefetch question `text` from `area`, or `None` at a call of
     /// a service that `prefetch_services` lacks, which does not run.
     ///
@@ -1313,6 +1363,16 @@ impl Conversation {
         let pool = pool.to_owned();
         Chosen { text, pool, index }
     }
+}
+
+/// The reply with the stored answer `text`.
+fn stored_reply(text: String) -> Decision {
+    let reply = Chosen {
+        text,
+        pool: String::new(),
+        index: 0,
+    };
+    Decision::Reply { reply, call: None }
 }
 
 /// Where a System Two answer goes, and the dialog that it continues.
@@ -4314,6 +4374,7 @@ mod tests {
             .store(Arc::new(learn::live(catalog, vec![entry])));
         let answer = background::Answer {
             text: "Two events.".to_owned(),
+            call: None,
             area: Some(AreaId(area.to_owned())),
             time: Timestamp::UNIX_EPOCH - jiff::SignedDuration::from_mins(minutes),
         };
@@ -4364,5 +4425,66 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_14_10d_3_answer_of_another_area_goes_to_system_two() -> anyhow::Result<()> {
         deferred(10, OFFICE).await
+    }
+
+    /// A conversation in which the classifier gives `weather`, with the `get_weather` plugin of
+    /// [`weather`], whose stored `weather` answer "Sunny." of `call` from the kitchen is `minutes`
+    /// old at the request. Gives the plugin.
+    fn stored_weather(minutes: i64, call: PluginCall) -> (Conversation, Arc<FakePlugin>) {
+        let (_cache, _changes, mut conversation) = still_with(
+            &Arc::default(),
+            "idle",
+            scripted(&["weather"]),
+            Arc::default(),
+        );
+        let plugin = weather(&mut conversation, Ok(json!({ "sky": "sunny" })));
+        let answer = background::Answer {
+            text: "Sunny.".to_owned(),
+            call: Some(call),
+            area: Some(AreaId("kitchen".to_owned())),
+            time: Timestamp::UNIX_EPOCH - jiff::SignedDuration::from_mins(minutes),
+        };
+        let _ = conversation.two.answers.store("weather", Some(answer));
+        (conversation, plugin)
+    }
+
+    /// The weather request of the fetch reply tests.
+    const WEATHER: &str = "what is the weather like";
+
+    /// AC-14.10b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10b_2_fresh_fetch_answer_is_the_reply() -> anyhow::Result<()> {
+        let (conversation, plugin) = stored_weather(15, today("get_weather"));
+        let handled = conversation.handle(WEATHER, from_device(KITCHEN)).await?;
+        assert_eq!(handled.text, "Sunny.");
+        assert!(handled.after.is_none(), "the reply has work");
+        assert_eq!(plugin.fetches(), []);
+        Ok(())
+    }
+
+    /// Asserts that the weather request from `device` with the stored answer of [`stored_weather`]
+    /// gets a filler and one fetch.
+    async fn refetched(minutes: i64, call: PluginCall, device: &str) -> anyhow::Result<()> {
+        let (conversation, plugin) = stored_weather(minutes, call);
+        let handled = conversation.handle(WEATHER, from_device(device)).await?;
+        assert_eq!(handled.text, "One moment.");
+        handled.after.expect("the fetch").await?;
+        assert_eq!(plugin.fetches().len(), 1);
+        Ok(())
+    }
+
+    /// AC-14.10b-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10b_4_old_fetch_answer_fetches() -> anyhow::Result<()> {
+        refetched(31, today("get_weather"), KITCHEN).await
+    }
+
+    /// AC-14.10b-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_14_10b_5_other_call_or_area_fetches() -> anyhow::Result<()> {
+        let mut tomorrow = today("get_weather");
+        tomorrow.arguments["when"] = json!("tomorrow");
+        refetched(10, tomorrow, KITCHEN).await?;
+        refetched(10, today("get_weather"), OFFICE).await
     }
 }
