@@ -41,6 +41,7 @@ flowchart LR
         crate_domain_model[model]
         crate_domain_responses[responses]
         crate_domain_select[select]
+        crate_domain_speaker[speaker]
         crate_domain_speech[speech]
         crate_domain_state[state]
         crate_domain_state_cache[state_cache]
@@ -79,6 +80,7 @@ flowchart LR
     crate --> crate_domain_learn
     crate --> crate_domain_model
     crate --> crate_domain_responses
+    crate --> crate_domain_speaker
     crate --> crate_domain_speech
     crate --> crate_domain_state
     crate --> crate_domain_state_cache
@@ -213,6 +215,7 @@ flowchart LR
     crate_domain_contracts --> crate_domain_intent
     crate_domain_contracts --> crate_domain_learn
     crate_domain_contracts --> crate_domain_responses
+    crate_domain_contracts --> crate_domain_speaker
     crate_domain_contracts --> crate_domain_state
     crate_domain_contracts --> crate_domain_state_cache
     crate_domain_contracts --> crate_domain_training
@@ -252,6 +255,9 @@ flowchart LR
     crate_domain_select --> crate_domain_state
     crate_domain_select --> crate_domain_state_cache
     crate_domain_select --> crate_testing_fakes
+    crate_domain_speaker --> crate_domain_contracts
+    crate_domain_speaker --> crate_domain_state
+    crate_domain_speaker --> crate_domain_state_cache
     crate_domain_speech --> crate_domain_catalog
     crate_domain_speech --> crate_domain_contracts
     crate_domain_speech --> crate_domain_intent
