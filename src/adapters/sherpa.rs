@@ -945,8 +945,9 @@ mod tests {
             times.push(start.elapsed());
         }
         times.sort();
-        // The 95th percentile of 20 times is the 19th.
-        Ok((times[18], times))
+        // The 95th percentile of 20 times is the 19th, of 100 times the 95th.
+        let index = (times.len() * 95 / 100).saturating_sub(1);
+        Ok((times[index], times))
     }
 
     /// AC-6.7-4.
@@ -1066,7 +1067,8 @@ mod tests {
         let stt = stt(Device::Cuda)?;
         stt.set_hotwords(&phrases);
         let samples = dentist(30).await?;
-        let (p95, times) = p95(&stt, &samples, &[samples.as_slice(); 20])?;
+        // 100 runs: with 20 runs, one slow run on a shared GPU fails the p95.
+        let (p95, times) = p95(&stt, &samples, &[samples.as_slice(); 100])?;
         assert!(p95 < Duration::from_millis(90), "p95 {p95:?} of {times:?}");
         Ok(())
     }
