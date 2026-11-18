@@ -56,17 +56,17 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 ### 15.2 Presence and Proximity Signals
 
-**Goal:** Read who is home, whether the satellite's room is occupied, and how close each person's phone or watch is to the satellite. Log a discovery report at startup, so you can check what Jarvis found.
+**Goal:** Read who is home, whether the satellite's room is occupied, and how close each person's phone or watch is to the satellite.
 
 - **Implements:** G12. **Depends on:** 15.1b.
 - **Files:** modify `src/domain/speaker.rs`, `src/lib.rs`.
 
 **Model.**
 
+- `Person`: a `[[people]]` entry (`person` and the optional `trackers`). The type moves from `src/lib.rs` to `src/domain/speaker.rs`, so that domain functions can take it.
 - `home(cache, people) -> Vec<Person>`: people whose `person` state is `home`.
-- `occupied(cache, satellite_device) -> Option<bool>`: `None` without a presence sensor, else true when one sensor is `on`.
+- `occupied(cache, satellite_device, configured) -> Option<bool>`: `None` without a presence sensor, else true when one sensor is `on`. The presence sensors are `presence_sensors(cache, satellite_device, configured)`.
 - `proximity(cache, trackers, area) -> f64`: 0 when no available tracker is in the area, else `1 / (1 + distance)` of the nearest tracker in the area.
-- `discovery_report(cache, people) -> Vec<String>`: one line for each satellite with its presence sensors, and one for each person with their trackers. `run` logs it. `trackers` reads the current cache at each identification, so an area sensor that shows no area at startup is found when it shows one. The report names a tracker without an area sensor at that time.
 
 **Acceptance criteria.**
 
@@ -76,13 +76,36 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 - AC-15.2-4: When no tracker is in the satellite area, `proximity` returns 0.
 - AC-15.2-5: When a person has two trackers in the area, `proximity` uses the nearer one.
 - AC-15.2-6: When a tracker state is `unavailable`, `proximity` ignores it.
-- AC-15.2-7: When `discovery_report` runs, it names each satellite with its presence sensors and each person with their trackers.
 
 **Proofs.**
 
 - P-15.2-3 to P-15.2-6. Ensures: `proximity` is in `[0, 1]` and equals `1 / (1 + min distance)` over available trackers in the area. Argument: the function filters by availability and area, takes the minimum distance, and maps it with `1 / (1 + d)`. An empty filter gives 0. For `d >= 0`, `1 / (1 + d)` is in `(0, 1]`, and `d = 1` gives 0.5.
 - P-15.2-1, P-15.2-2. Ensures: `home` gives the people whose state is `home`, and `occupied` is `None` without a presence sensor, else whether one sensor is `on`. Argument: both functions are filters with the stated predicate.
-- P-15.2-7 (AC-15.2-7). Ensures: the report has one line for each satellite with its presence sensors and one line for each person with their trackers. Argument: `discovery_report` maps over the satellites and over the people, and formats each with the result of `presence_sensors` or `trackers`.
+
+---
+
+### 15.2b Discovery Report
+
+**Goal:** Log a discovery report at startup, so you can check what Jarvis found.
+
+- **Implements:** G12. **Depends on:** 15.2.
+- **Files:** modify `src/domain/speaker.rs`, `src/lib.rs`.
+
+**Model.**
+
+- `Satellite`: a `[[satellites]]` entry (`satellite` and `presence`). The type moves from `src/lib.rs` to `src/domain/speaker.rs`.
+- `discovery_report(cache, people, satellites) -> Vec<String>`: one line for each `assist_satellite` entity with its presence sensors, and one for each person with their trackers. The `presence` of the `[[satellites]]` entry of a satellite replaces discovery. `run` logs it.
+- `trackers` reads the current cache at each identification, so an area sensor that shows no area at startup is found when it shows one. The line of a person also names each `device_tracker` of the person that gives no tracker at that time.
+
+**Acceptance criteria.**
+
+- AC-15.2b-1: When `discovery_report` runs, it names each satellite with its presence sensors and each person with their trackers.
+- AC-15.2b-2: When the area sensor of a `device_tracker` of a person shows no area, `discovery_report` names that `device_tracker` in the line of the person.
+
+**Proofs.**
+
+- P-15.2b-1 (AC-15.2b-1). Ensures: the report has one line for each satellite with its presence sensors and one line for each person with their trackers. Argument: `discovery_report` maps over the satellites and over the people, and formats each with the result of `presence_sensors` or `trackers`.
+- P-15.2b-2 (AC-15.2b-2). Ensures: the line of a person names each item of its `device_trackers` attribute that gives no tracker. Argument: the person line appends each item for which the tracker filter of sub-phase 15.1 finds no pair of sensors.
 
 ---
 
@@ -90,7 +113,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Goal:** Add the `VoiceEmbedder` and `VoiceProfiles` ports and their sherpa-onnx adapters. Jarvis can turn an utterance into a voice embedding and compare it with stored profiles.
 
-- **Implements:** G12. **Depends on:** 15.2.
+- **Implements:** G12. **Depends on:** 15.2b.
 - **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `justfile`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.** `VoiceEmbedder::embed(audio) -> Result<Vec<f32>>` with `SpeakerEmbeddingExtractor`. `VoiceProfiles::enroll(person, embedding)` and `similarities(embedding) -> Map<person, f32>` with `SpeakerEmbeddingManager`, saved to `speaker.voices`. A profile keeps the newest `max_samples` embeddings. `just models` also downloads the speaker model and the multi-speaker test voice `vits-piper-en_US-libritts_r-medium`. This sub-phase adds `[speaker]` (`model`, `voices`, `max_samples`, `voice_threshold`). `voice_threshold` is a voice similarity. Sub-phase 15.6 adds `threshold`, which is a combined score. `LiveModels` (sub-phase 13.10d) also keeps the voice embedder session, so the training pause releases it and loads it again.
