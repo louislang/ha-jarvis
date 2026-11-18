@@ -307,14 +307,15 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 **Goal:** Add `people` and `assign` to the `Review` port. A pick for a logged request moves its voice sample and records the person as the speaker.
 
 - **Implements:** G12, G15, G19. **Depends on:** 15.8.
-- **Files:** modify `src/ports.rs`, `src/domain/speaker.rs`, `src/app/review.rs`, `src/app/conversation.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `quint/speaker.qnt`.
+- **Files:** modify `src/ports.rs`, `src/domain/speaker.rs`, `src/app/review.rs`, `src/app/conversation.rs`, `src/adapters/sqlite.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `quint/speaker.qnt`.
 - **Quint:** `speaker.qnt` (`assign`, conformance).
 
 **Model.**
 
 - `Source` gets `Assigned`.
 - `Review::people() -> Vec<Person>`: `people` of the hot cache (sub-phase 15.2).
-- `Review::assign(id, person: Option<EntityId>)`: checks that `person` is `None` or the entity of one of `people()`, and gets the embedding with `embedding(id)` (sub-phase 15.6b). Then it calls `VoiceProfiles::assign` and sends the log update `Speaker { speaker: person, source: Assigned, embedding: None }`. A person that is not in `people()` gives an error, and no embedding gives `NotFound`. Both checks run before the writes.
+- `Review::assign(id, person: Option<EntityId>)`: checks that `person` is `None` or the entity of one of `people()`, and gets the embedding with `embedding(id)` (sub-phase 15.6b). Then it calls `VoiceProfiles::assign` and writes the log update `Speaker { speaker: person, source: Assigned, embedding: None }`. A person that is not in `people()` gives an error, and no embedding gives `NotFound`. Both checks run before the writes. One `tokio::sync::Mutex` of the use case is held from `VoiceProfiles::assign` to the end of the log update. Thus two picks of one interaction at the same time do not interleave, and the last pick sets both the profile and the record, as the one `assign` action of `speaker.qnt` does.
+- A `Speaker` update of the log (sub-phase 15.6b) whose source is not `Assigned` does not replace a stored `Assigned` speaker and source. It only stores the embedding. Thus a passive identification that arrives after a pick does not change the record, and its enroll changes no profile (P-15.3-9).
 - `speaker.qnt`: the new state `picks: int -> Option[PERSON]` is the pick record. The new action `assign(id, p)` sets `picks[id] = p`, removes `id` from `samples`, and with `p = Some(person)` adds `samples[id] = (person, Assigned)` and trims `person` as `enroll` does. `enroll` is also disabled when `picks` has `utterance`. The new invariant `PickWins`: for each ID in `picks`, a sample of that ID has the person of the pick and the source `Assigned`, and a pick of none has no sample. `NoVoiceOnlyEnrollment` and `ProfilesBounded` still hold.
 - The conformance driver of sub-phase 15.6 maps `assign` to `Review::assign`. After each step, it compares the samples of `FakeVoiceProfiles` with `samples` and its pick record with `picks`.
 
@@ -327,10 +328,14 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 - AC-15.8b-5: When the interaction has no embedding, `assign` returns `NotFound`.
 - AC-15.8b-6 [Quint]: `PickWins`, `NoVoiceOnlyEnrollment` and `ProfilesBounded` hold in simulation and to 10 steps in `quint verify`.
 - AC-15.8b-7: When `quint-connect` replays 100 traces of `speaker.qnt` with `assign`, the samples and the pick record of `FakeVoiceProfiles` match `samples` and `picks` after each step.
+- AC-15.8b-8: When `assign(id, Some(person.alex))` waits inside `FakeVoiceProfiles` and `assign(id, Some(person.sam))` starts during the wait, the pick of `FakeVoiceProfiles` and the speaker of the interaction record are the same person.
+- AC-15.8b-9: When the record has the source `Assigned` and an identification update with the source `Presence` comes later, the record keeps the assigned speaker and the source `Assigned`, and `embedding(id)` gives the new embedding.
 
 **Proofs.**
 
 - P-15.8b-4, P-15.8b-5. Argument: the use case checks the person and the embedding before both writes and returns on failure.
+- P-15.8b-8. Argument: the mutex is held across the profile write and the log update, so the second call does both writes after the first call ends, and its writes are the last ones in both stores.
+- P-15.8b-9. Argument: the `Speaker` update keeps the stored speaker and source when they have the source `Assigned` and the change has another source.
 - P-15.8b-6. `PickWins`: `assign` sets the pick of `id` and the sample of `id` in the same step. A later trim can only remove that sample, and `enroll` is disabled for an ID in `picks`, so no action adds a sample of a picked ID with another person or source. `NoVoiceOnlyEnrollment`: `assign` sets the source `Assigned`, not `Voice`. `ProfilesBounded`: `assign` trims the person in the same step as it adds the sample. Evidence: model check.
 - P-15.8b-1 to P-15.8b-3, P-15.8b-7. Evidence: test.
 
