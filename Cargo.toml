@@ -18,7 +18,7 @@ dbscan = "=0.3.1"
 futures = "0.3.34"
 hound = "3.5.1"
 jiff = { version = "0.2.38", features = ["serde"] }
-minijinja = { version = "3.0.5", features = ["serde"] }
+minijinja = { version = "3.0.5", features = ["json", "serde"] }
 ort = { version = "=2.0.0-rc.10", default-features = false, features = ["std", "load-dynamic", "cuda"] }
 rand = { version = "0.10.3", default-features = false, features = ["std_rng"] }
 rand_distr = "0.6.0"

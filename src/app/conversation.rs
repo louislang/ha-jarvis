@@ -604,17 +604,22 @@ impl Conversation {
         (Some(id.clone()), area.map(|area| area.name.clone()))
     }
 
-    /// The decision for `prediction` of `request` in the current hot cache and pools, or a reply
-    /// with the fresh prefetched answer of `prefetched` or `prefetched_fetch`.
+    /// The decision for `prediction` with its Plex title matched (`titled`) of `request` in the
+    /// current hot cache and pools, a `not_in_library` reply when the title has no match, or a
+    /// reply with the fresh prefetched answer of `prefetched` or `prefetched_fetch`.
     fn decide(&self, prediction: &Prediction, request: &Request) -> Decision {
         if let Some(text) = self.prefetched(prediction, request) {
             return stored_reply(text);
         }
+        let catalog = &self.catalog.load();
+        let Some(prediction) = self.titled(prediction, catalog) else {
+            let reply = self.chosen("not_in_library");
+            return Decision::Reply { reply, call: None };
+        };
         let (cache, pools) = (self.queues.cache.borrow(), self.pools.load());
         let rng = &mut self.rng.lock().expect("no lock holder panics");
-        let catalog = &self.catalog.load();
         let decision = decide::decide(
-            prediction,
+            &prediction,
             request,
             catalog,
             &cache,
@@ -626,6 +631,20 @@ impl Conversation {
             Some(text) => stored_reply(text),
             None => decision,
         }
+    }
+
+    /// `prediction` with its Plex title matched against the title list (`retitled`), or
+    /// `prediction` when it is not clear, it has no title slot of its intent, or the list is
+    /// empty. `None` when no title matches.
+    fn titled(&self, prediction: &Prediction, catalog: &Catalog) -> Option<Prediction> {
+        let titles = self.titles.load();
+        let usable = self.is_clear(prediction) && !titles.is_empty();
+        let Some((kind, spoken)) = title_slot(prediction, catalog).filter(|_| usable) else {
+            return Some(prediction.clone());
+        };
+        let similarity = self.queues.dialog.choice_similarity;
+        let found = matched(spoken, kind, &titles, similarity)?;
+        retitled(prediction, kind, found, catalog)
     }
 
     /// The text of the fresh prefetched answer with the area of `request`, when the top intent of
@@ -1496,6 +1515,70 @@ fn unpooled(text: String) -> Spoken {
         pool: String::new(),
         template: String::new(),
     }
+}
+
+/// The `title` of the top intent of `prediction` in `catalog`, and the value of the slot that it
+/// names.
+fn title_slot<'a>(prediction: &'a Prediction, catalog: &'a Catalog) -> Option<(&'a str, &'a str)> {
+    let (label, _) = prediction.ranked.first()?;
+    let intent = catalog
+        .intents
+        .iter()
+        .find(|intent| &intent.name == label)?;
+    let kind = intent.title.as_deref()?;
+    let slot = prediction.slots.iter().find(|slot| slot.name == kind)?;
+    Some((kind, slot.value.as_str()))
+}
+
+/// The normalized `text` with no spaces.
+fn compact(text: &str) -> String {
+    intent::normalize(text).replace(' ', "")
+}
+
+/// The title of `titles` whose compact name `fill` gives for the compact `spoken` with
+/// `similarity`, with the titles of `kind` first. `None` when no title matches.
+fn matched<'titles>(
+    spoken: &str,
+    kind: &str,
+    titles: &'titles [Title],
+    similarity: f64,
+) -> Option<&'titles Title> {
+    let (own, other): (Vec<&Title>, Vec<&Title>) =
+        titles.iter().partition(|title| title.kind == kind);
+    let named = own
+        .into_iter()
+        .chain(other)
+        .map(|title| (compact(&title.name), title));
+    let (choices, ordered): (Vec<String>, Vec<&Title>) =
+        named.filter(|(choice, _)| !choice.is_empty()).unzip();
+    let found = dialog::fill(&compact(spoken), &choices, similarity)?;
+    let index = choices.iter().position(|choice| *choice == found)?;
+    ordered.get(index).copied()
+}
+
+/// `prediction` with the slot `kind` replaced by a slot of the kind of `found` with its name, and
+/// with the first intent of `catalog` of that kind as its top label when the kinds differ. `None`
+/// when no intent has that kind.
+fn retitled(
+    prediction: &Prediction,
+    kind: &str,
+    found: &Title,
+    catalog: &Catalog,
+) -> Option<Prediction> {
+    let mut retitled = prediction.clone();
+    if found.kind != kind {
+        let mut intents = catalog.intents.iter();
+        let intent = intents.find(|intent| intent.title.as_ref() == Some(&found.kind))?;
+        if let Some((label, _)) = retitled.ranked.first_mut() {
+            label.clone_from(&intent.name);
+        }
+    }
+    retitled.slots.retain(|slot| slot.name != kind);
+    retitled.slots.push(Slot {
+        name: found.kind.clone(),
+        value: found.name.clone(),
+    });
+    Some(retitled)
 }
 
 /// The items to play for the match `found` in `results`: the first track of an artist match,
@@ -3898,6 +3981,182 @@ mod tests {
             let services: Vec<&str> = calls.iter().map(|call| call.service.as_str()).collect();
             assert_eq!(services, ["play_media"], "{label}");
         }
+        Ok(())
+    }
+
+    /// The titles of AC-18.9-5 to AC-18.9-11.
+    fn titles() -> Vec<Title> {
+        let movies = ["The Matrix", "Fargo"].map(|name| fakes::title(name, "movie"));
+        let shows = ["VisionQuest", "Bluey", "The Office (US)", "Fargo"];
+        let shows = shows.map(|name| fakes::title(name, "show"));
+        movies.into_iter().chain(shows).collect()
+    }
+
+    /// The prediction of `label` with `probability` and the slot `slot` with `value`.
+    fn predicted(label: &str, probability: f32, (slot, value): (&str, &str)) -> Prediction {
+        let ranked = vec![(label.to_owned(), probability)];
+        let (name, value) = (slot.to_owned(), value.to_owned());
+        let slots = vec![Slot { name, value }];
+        Prediction { ranked, slots }
+    }
+
+    /// A conversation with the catalog and the pools of the repository and the title list
+    /// `titles` on `home`, whose classifier gives `prediction`.
+    fn watching(
+        home: &Arc<FakeHome>,
+        prediction: Prediction,
+        titles: Vec<Title>,
+    ) -> anyhow::Result<Conversation> {
+        let classifier = Arc::new(FakeClassifier::default());
+        classifier.script(prediction);
+        let (_cache, _changes, mut conversation) =
+            still_with(home, "idle", classifier, Arc::default());
+        conversation.titles().store(Arc::new(titles));
+        let catalog = crate::load_catalog(Path::new("intents.toml"))?;
+        let pools = crate::load_pools(Path::new("responses.toml"), &catalog)?;
+        conversation.pools = Arc::new(ArcSwap::from_pointee(pools));
+        Ok(conversation)
+    }
+
+    /// The reply and the calls after a request from the kitchen satellite whose prediction is
+    /// `label` with 0.9 and the slot `slot`, with the title list `titles`.
+    async fn watched(
+        label: &str,
+        slot: (&str, &str),
+        titles: Vec<Title>,
+    ) -> anyhow::Result<(String, Vec<ServiceCall>)> {
+        let home = Arc::new(FakeHome::default());
+        let conversation = watching(&home, predicted(label, 0.9, slot), titles)?;
+        let context = Context {
+            device_id: Some(KITCHEN.to_owned()),
+            satellite_id: Some(SATELLITE.to_owned()),
+            ..Context::default()
+        };
+        let Handled { text, after } = conversation.handle("play it", context).await?;
+        if let Some(after) = after {
+            after.await?;
+        }
+        Ok((text, home.calls()))
+    }
+
+    /// The `play_media` call of the TV with `media_content_type` `kind` and the content ID `id`.
+    fn on_tv(kind: &str, id: &str) -> ServiceCall {
+        let data = json!({ "media_content_type": kind, "media_content_id": id });
+        let mut call = service("media_player", "play_media", "media_player.apple_tv");
+        call.data = serde_json::from_value(data).expect("the data is an object");
+        call
+    }
+
+    /// The call that plays the show `name` with `shuffle`.
+    fn show(name: &str) -> ServiceCall {
+        let id = format!(
+            r#"plex://{{"library_name": "TV Shows", "show_name": "{name}", "shuffle": 1}}"#
+        );
+        on_tv("episode", &id)
+    }
+
+    /// The call that plays the movie `name`.
+    fn movie(name: &str) -> ServiceCall {
+        let id = format!(r#"plex://{{"library_name": "Movies", "title": "{name}"}}"#);
+        on_tv("movie", &id)
+    }
+
+    /// AC-18.9-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_9_5_spaced_show_name_plays_the_library_title() -> anyhow::Result<()> {
+        let (reply, calls) = watched("tv_show", ("show", "vision quest"), titles()).await?;
+        let replies = ["Putting VisionQuest on the TV.", "Playing VisionQuest."];
+        assert!(replies.contains(&reply.as_str()), "{reply}");
+        assert_eq!(calls, [show("VisionQuest")]);
+        Ok(())
+    }
+
+    /// AC-18.9-6.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_9_6_movie_title_of_a_show_intent_plays_the_movie() -> anyhow::Result<()> {
+        let (reply, calls) = watched("tv_show", ("show", "the matrix"), titles()).await?;
+        assert_eq!(reply, "Putting on The Matrix.");
+        assert_eq!(calls, [movie("The Matrix")]);
+        Ok(())
+    }
+
+    /// AC-18.9-7.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_9_7_show_title_of_a_movie_intent_plays_the_show() -> anyhow::Result<()> {
+        let (_, calls) = watched("play_movie", ("movie", "bluey"), titles()).await?;
+        assert_eq!(calls, [show("Bluey")]);
+        Ok(())
+    }
+
+    /// AC-18.9-8.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_9_8_similar_title_continues_the_show() -> anyhow::Result<()> {
+        let (_, calls) = watched("continue_show", ("show", "the office"), titles()).await?;
+        let id =
+            r#"plex://{"library_name": "TV Shows", "show_name": "The Office (US)", "resume": 1}"#;
+        assert_eq!(calls, [on_tv("episode", id)]);
+        Ok(())
+    }
+
+    /// AC-18.9-9.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_9_9_same_title_keeps_the_kind_of_the_intent() -> anyhow::Result<()> {
+        let (_, shown) = watched("tv_show", ("show", "fargo"), titles()).await?;
+        assert_eq!(shown, [show("Fargo")]);
+        let (_, played) = watched("play_movie", ("movie", "fargo"), titles()).await?;
+        assert_eq!(played, [movie("Fargo")]);
+        Ok(())
+    }
+
+    /// AC-18.9-10.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_9_10_unknown_title_is_not_in_the_library() -> anyhow::Result<()> {
+        let (reply, calls) = watched("tv_show", ("show", "jeopardy"), titles()).await?;
+        let replies = [
+            "That is not in the Plex library.",
+            "I could not find that on Plex.",
+        ];
+        assert!(replies.contains(&reply.as_str()), "{reply}");
+        assert_eq!(calls, []);
+        Ok(())
+    }
+
+    /// AC-18.9-11.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_9_11_no_titles_or_unclear_prediction_acts_as_before() -> anyhow::Result<()> {
+        let (_, calls) = watched("tv_show", ("show", "vision quest"), Vec::new()).await?;
+        assert_eq!(calls, [show("vision quest")]);
+        let unclear = predicted("tv_show", 0.5, ("show", "jeopardy"));
+        let conversation = watching(&Arc::default(), unclear.clone(), titles())?;
+        let (transcript, now) = ("play jeopardy".to_owned(), Timestamp::UNIX_EPOCH);
+        let request = Request {
+            transcript,
+            area: None,
+            now,
+        };
+        let decision = conversation.decide(&unclear, &request);
+        let llm = matches!(
+            decision,
+            Decision::Defer {
+                job: Job::Llm(_),
+                ..
+            }
+        );
+        assert!(llm, "{decision:?}");
+        Ok(())
+    }
+
+    /// AC-18.9-16.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_9_16_quoted_title_gives_a_json_content_id() -> anyhow::Result<()> {
+        let quoted = vec![fakes::title(r#"Paw Patrol "Live""#, "show")];
+        let (_, calls) = watched("tv_show", ("show", "paw patrol live"), quoted).await?;
+        let id = calls
+            .first()
+            .and_then(|call| call.data.get("media_content_id"));
+        let id = id.and_then(Value::as_str).unwrap_or_default();
+        let object: Value = serde_json::from_str(id.trim_start_matches("plex://"))?;
+        assert_eq!(object["show_name"], json!(r#"Paw Patrol "Live""#), "{id}");
         Ok(())
     }
 
