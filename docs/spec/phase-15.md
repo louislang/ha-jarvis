@@ -1,6 +1,6 @@
 # Phase 15: Speaker Identification
 
-This phase identifies the speaker from presence, Bluetooth proximity through the satellites, the satellite presence sensors and voice. Person-specific intents act for that speaker.
+This phase identifies the speaker from presence, Bluetooth proximity through the satellites, the satellite presence sensors and voice. The people of the house are the `person` entities of HA, so `jarvis.toml` lists no people. Replies can address each person in their own way. In the Jarvis tab, you can assign the voice of a request to a person.
 
 ---
 
@@ -13,19 +13,21 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Model.**
 
-- `trackers(cache, person, configured) -> Vec<Tracker { area_sensor, distance_sensor }>`: `configured` when it is `Some`. Else from the `device_trackers` attribute of the `person` entity. For each tracker device: the sensor whose state is an area name, and the sensor with the unit `m`. A device without both sensors gives no tracker. `configured` is `[[people]].trackers`.
-- This sub-phase adds `[[people]]` (`person` and the optional `trackers`).
+- `trackers(cache, person, configured) -> Vec<Tracker { area_sensor, distance_sensor }>`: `configured` when it is `Some`. Else from the `device_trackers` attribute of the `person` entity. For each tracker device: the sensor whose state is an area name, and the sensor with the unit `m`. A device without both sensors gives no tracker. `configured` is the `trackers` of the `[[people]]` entry whose `person` is that entity.
+- This sub-phase adds the optional `[[people]]` (`person` and `trackers`) with `#[serde(default)]`. An entry is only an override of the trackers of one person. The people of the house are the `person` entities of HA (sub-phase 15.2).
 
 **Acceptance criteria.**
 
 - AC-15.1-1: When `person.alex` has `device_trackers = [device_tracker.alex_watch]`, `trackers` returns the area and distance sensors on the watch device.
 - AC-15.1-2: When a sensor on the tracker device has the unit `m`, `trackers` uses it as the distance sensor.
-- AC-15.1-3: When `[[people]].trackers` is set, `trackers` returns it and does not use discovery.
+- AC-15.1-3: When the `[[people]]` entry of `person.alex` sets `trackers`, `trackers` returns them and does not use discovery.
+- AC-15.1-4: When `jarvis.toml` has no `[[people]]`, `Config::parse` succeeds with no overrides.
 
 **Proofs.**
 
 - P-15.1-3. Ensures: with an override, the result is the override. Argument: `trackers` returns the override first when it is `Some`.
 - P-15.1-1, P-15.1-2. Ensures: each tracker has the sensor of its device whose state is an area name and the sensor with the unit `m`. Argument: the tracker filter selects sensors on the same device by the two stated predicates.
+- P-15.1-4. Evidence: test.
 
 ---
 
@@ -56,31 +58,35 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 ### 15.2 Presence and Proximity Signals
 
-**Goal:** Read who is home, whether the satellite's room is occupied, and how close each person's phone or watch is to the satellite.
+**Goal:** Read the people of the house from HA, who is home, whether the satellite's room is occupied, and how close each person's phone or watch is to the satellite.
 
 - **Implements:** G12. **Depends on:** 15.1b.
-- **Files:** modify `src/domain/speaker.rs`, `src/lib.rs`.
+- **Files:** modify `src/domain/speaker.rs`.
 
 **Model.**
 
-- `Person`: a `[[people]]` entry (`person` and the optional `trackers`). The type moves from `src/lib.rs` to `src/domain/speaker.rs`, so that domain functions can take it.
-- `home(cache, people) -> Vec<Person>`: people whose `person` state is `home`.
+- `Person { entity, name }`: a `person` entity of HA and its name. The name is the `friendly_name` attribute of the state, else the entity ID.
+- `people(cache) -> Vec<Person>`: each state of the cache in the domain `person`, in entity ID order. `jarvis.toml` does not list people.
+- `home(cache) -> Vec<Person>`: the people whose state is `home`.
 - `occupied(cache, satellite_device, configured) -> Option<bool>`: `None` without a presence sensor, else true when one sensor is `on`. The presence sensors are `presence_sensors(cache, satellite_device, configured)`.
 - `proximity(cache, trackers, area) -> f64`: 0 when no available tracker is in the area, else `1 / (1 + distance)` of the nearest tracker in the area.
 
 **Acceptance criteria.**
 
-- AC-15.2-1: When two people are `home` and one is `not_home`, `home` returns the two people.
+- AC-15.2-1: When two `person` entities are `home` and one is `not_home`, `home` returns the two people.
 - AC-15.2-2: When the satellite device has no presence sensor, `occupied` returns `None`.
 - AC-15.2-3: When a tracker area is the satellite area and the distance is 1 m, `proximity` returns 0.5.
 - AC-15.2-4: When no tracker is in the satellite area, `proximity` returns 0.
 - AC-15.2-5: When a person has two trackers in the area, `proximity` uses the nearer one.
 - AC-15.2-6: When a tracker state is `unavailable`, `proximity` ignores it.
+- AC-15.2-7: When HA has `person.alex` and `person.sam` and `jarvis.toml` has no `[[people]]`, `people` returns both with their friendly names.
+- AC-15.2-8: When a `person` entity has no `friendly_name`, `people` gives its entity ID as its name.
 
 **Proofs.**
 
 - P-15.2-3 to P-15.2-6. Ensures: `proximity` is in `[0, 1]` and equals `1 / (1 + min distance)` over available trackers in the area. Argument: the function filters by availability and area, takes the minimum distance, and maps it with `1 / (1 + d)`. An empty filter gives 0. For `d >= 0`, `1 / (1 + d)` is in `(0, 1]`, and `d = 1` gives 0.5.
 - P-15.2-1, P-15.2-2. Ensures: `home` gives the people whose state is `home`, and `occupied` is `None` without a presence sensor, else whether one sensor is `on`. Argument: both functions are filters with the stated predicate.
+- P-15.2-7, P-15.2-8. Ensures: `people` gives exactly the states in the domain `person`, in key order, and the name of each is its `friendly_name` text, else its entity ID. Argument: `people` maps the filtered states of the ordered state map, and the name falls back to the key when the attribute is not a string.
 
 ---
 
@@ -93,18 +99,18 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Model.**
 
-- `Satellite`: a `[[satellites]]` entry (`satellite` and `presence`). The type moves from `src/lib.rs` to `src/domain/speaker.rs`.
-- `discovery_report(cache, people, satellites) -> Vec<String>`: one line for each `assist_satellite` entity with its presence sensors, and one for each person with their trackers. The `presence` of the `[[satellites]]` entry of a satellite replaces discovery. `run` logs it.
+- `Satellite`: a `[[satellites]]` entry (`satellite` and `presence`). `PersonTrackers`: a `[[people]]` entry (`person` and `trackers`). Both types move from `src/lib.rs` to `src/domain/speaker.rs`.
+- `discovery_report(cache, overrides, satellites) -> Vec<String>`: one line for each `assist_satellite` entity with its presence sensors, and one for each person of `people(cache)` with their trackers. The `presence` of the `[[satellites]]` entry of a satellite and the `trackers` of the `[[people]]` entry of a person replace discovery. `run` logs it.
 - `trackers` reads the current cache at each identification, so an area sensor that shows no area at startup is found when it shows one. The line of a person also names each `device_tracker` of the person that gives no tracker at that time.
 
 **Acceptance criteria.**
 
-- AC-15.2b-1: When `discovery_report` runs, it names each satellite with its presence sensors and each person with their trackers.
+- AC-15.2b-1: When `discovery_report` runs, it names each satellite with its presence sensors and each `person` entity of HA with its trackers.
 - AC-15.2b-2: When the area sensor of a `device_tracker` of a person shows no area, `discovery_report` names that `device_tracker` in the line of the person.
 
 **Proofs.**
 
-- P-15.2b-1 (AC-15.2b-1). Ensures: the report has one line for each satellite with its presence sensors and one line for each person with their trackers. Argument: `discovery_report` maps over the satellites and over the people, and formats each with the result of `presence_sensors` or `trackers`.
+- P-15.2b-1 (AC-15.2b-1). Ensures: the report has one line for each satellite with its presence sensors and one line for each person of `people(cache)` with their trackers. Argument: `discovery_report` maps over the satellites and over `people(cache)`, and formats each with the result of `presence_sensors` or `trackers`.
 - P-15.2b-2 (AC-15.2b-2). Ensures: the line of a person names each item of its `device_trackers` attribute that gives no tracker. Argument: the person line appends each item for which the tracker filter of sub-phase 15.1 finds no pair of sensors.
 
 ---
@@ -116,7 +122,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 - **Implements:** G12. **Depends on:** 15.2b.
 - **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `justfile`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `VoiceEmbedder::embed(audio) -> Result<Vec<f32>>` with `SpeakerEmbeddingExtractor`. `VoiceProfiles::enroll(person, embedding)` and `similarities(embedding) -> Map<person, f32>` with `SpeakerEmbeddingManager`, saved to `speaker.voices`. A profile keeps the newest `max_samples` embeddings. `just models` also downloads the speaker model and the multi-speaker test voice `vits-piper-en_US-libritts_r-medium`. This sub-phase adds `[speaker]` (`model`, `voices`, `max_samples`, `voice_threshold`). `voice_threshold` is a voice similarity. Sub-phase 15.6 adds `threshold`, which is a combined score. `LiveModels` (sub-phase 13.10d) also keeps the voice embedder session, so the training pause releases it and loads it again.
+**Model.** `VoiceEmbedder::embed(audio) -> Result<Vec<f32>>` with `SpeakerEmbeddingExtractor`. `VoiceProfiles::enroll(person, id, embedding)` and `similarities(embedding) -> Map<person, f32>` with `SpeakerEmbeddingManager`, saved to `speaker.voices`. `id` is the interaction ID of the request (sub-phase 12.6). The store keys each sample by its interaction ID, so one request gives at most one sample. `enroll` with an interaction ID that the store has does not change the store. A profile keeps the samples of the newest `max_samples` interaction IDs: after each change, the store removes the samples of the person with the oldest IDs until `max_samples` are left. Sub-phase 15.8 adds `assign` and the pick record. `just models` also downloads the speaker model and the multi-speaker test voice `vits-piper-en_US-libritts_r-medium`. This sub-phase adds `[speaker]` (`model`, `voices`, `max_samples`, `voice_threshold`). `voice_threshold` is a voice similarity. Sub-phase 15.6 adds `threshold`, which is a combined score. `LiveModels` (sub-phase 13.10d) also keeps the voice embedder session, so the training pause releases it and loads it again.
 
 **Acceptance criteria.**
 
@@ -128,10 +134,12 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 - AC-15.3-6 [GPU host]: With `device = cpu`, one embedding of 3 s of audio has a p95 of less than 80 ms.
 - AC-15.3-7 [GPU host]: With `device = cuda`, the voice embedder runs on the CUDA execution provider.
 - AC-15.3-8: When `LiveModels::release` returns, no reference to the `VoiceEmbedder` fake exists. After `restore`, `embed` returns an embedding.
+- AC-15.3-9: When `enroll` gets an interaction ID that the store has, the store does not change.
 
 **Proofs.**
 
-- P-15.3-4. Argument: `enroll` pushes to a bounded deque that drops the oldest element when it is full.
+- P-15.3-4. Argument: `enroll` adds the sample, and then removes the samples of the person with the oldest interaction IDs until `max_samples` are left.
+- P-15.3-9. Argument: `enroll` returns before any change when the store has a sample of the interaction ID, or (from sub-phase 15.8) a pick of it.
 - P-15.3-1 to P-15.3-3, P-15.3-5 to P-15.3-8. Evidence: test.
 
 ---
@@ -143,7 +151,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 - **Implements:** G12, G15. **Depends on:** 15.3.
 - **Files:** modify `src/app/speech.rs`, `src/app/conversation.rs`.
 
-**Model.** At commit, the speech use case spawns `embed(audio)` in a blocking task and stores the future with the utterance. The conversation use case gets it with the utterance that `handle` correlates (sub-phases 12.1b and 12.6). Sub-phase 15.6 uses it to identify the speaker.
+**Model.** At commit, the speech use case spawns `embed(audio)` in a blocking task and stores the future with the utterance. The conversation use case gets it with the utterance that `handle` correlates (sub-phases 12.1b and 12.6). Sub-phase 15.6 uses it to identify the speaker, and sub-phase 15.6b stores it with the interaction.
 
 **Acceptance criteria.**
 
@@ -168,21 +176,22 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Model.**
 
-- Constants: `PEOPLE = Set("alex", "sam")`.
-- State: `home: Option[Set[PERSON]]` (`None` when presence is not known), `occupied: Option[bool]`, `proximity: PERSON -> int`, `voice: PERSON -> int`, `result: Option[PERSON]`, `source: Presence | Proximity | Voice | NoSource`, `enrolled: List[(PERSON, source)]`.
-- Actions: `setSignals(...)`, `identify` (rules 1 to 4 of sub-phase 15.6), `enroll` (rule 5).
+- Constants: `PEOPLE = Set("alex", "sam")`, `MAX_SAMPLES = 2`.
+- State: `home: Option[Set[PERSON]]` (`None` when presence is not known), `occupied: Option[bool]`, `proximity: PERSON -> int`, `voice: PERSON -> int`, `result: Option[PERSON]`, `source: Presence | Proximity | Voice | NoSource`, `utterance: int` (the interaction ID of the current request), `samples: int -> (PERSON, source)` (the stored samples by interaction ID).
+- Actions: `setSignals(...)` (a new request: `utterance += 1`), `identify` (rules 1 to 4 of sub-phase 15.6), `enroll` (rule 5). `enroll` is enabled only when `samples` has no entry for `utterance`. After it adds the sample, `enroll` trims the person: it removes the samples of that person with the lowest IDs until `MAX_SAMPLES` are left, as the store of sub-phase 15.3 does.
 - Invariants:
   - `SpeakerIsCandidate`: `result = Some(p)` implies `p` is in `home`, or `home = None`.
-  - `NoVoiceOnlyEnrollment`: no entry in `enrolled` has source `Voice`.
+  - `NoVoiceOnlyEnrollment`: no value in `samples` has source `Voice`.
+  - `ProfilesBounded`: each person has at most `MAX_SAMPLES` samples in `samples`.
 
 **Acceptance criteria.**
 
 - AC-15.5-1 [Quint]: `quint typecheck` passes.
-- AC-15.5-2 [Quint]: Both invariants hold in simulation and to 10 steps in `quint verify`.
+- AC-15.5-2 [Quint]: The three invariants hold in simulation and to 10 steps in `quint verify`.
 
 **Proofs.**
 
-- P-15.5-2. `SpeakerIsCandidate`: `identify` chooses only from the candidate set, which is `home` when presence is known (rule 1). `NoVoiceOnlyEnrollment`: `enroll` is enabled only when `source` is `Presence` or `Proximity`.
+- P-15.5-2. `SpeakerIsCandidate`: `identify` chooses only from the candidate set, which is `home` when presence is known (rule 1). `NoVoiceOnlyEnrollment`: `enroll` is enabled only when `source` is `Presence` or `Proximity`. `ProfilesBounded`: only `enroll` adds a sample, and it trims the person to `MAX_SAMPLES` in the same step.
 - P-15.5-1. Evidence: model check.
 
 ---
@@ -197,13 +206,13 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Model.** Rules:
 
-1. Only people who are `home` are candidates. Presence is known when each `[[people]]` person has the state `home` or `not_home`. If presence is not known, all people are candidates, and no presence identification occurs.
+1. The people are `people(cache)` (sub-phase 15.2). Only people who are `home` are candidates. Presence is known when each person has the state `home` or `not_home`. If presence is not known, all people are candidates, and no presence identification occurs.
 2. One candidate gives that person with confidence 1.0 and source `Presence`.
 3. If `occupied` is `Some(false)`, proximity counts 0.
 4. With more than one candidate, score = proximity + voice similarity. The top score must be more than `threshold` and more than the second score plus `margin`. The source is `Proximity` when proximity alone is at least `enroll_threshold` (`0.5` is 1 m or less), else `Voice`.
-5. Jarvis enrolls the embedding only when all of these are true: the source is `Presence` or `Proximity`; the utterance has `min_enroll_ms` of voice or more; and, when the person has `min_profile` samples or more, the voice similarity to that person is at least `voice_threshold` and higher than to each other person. Thus a guest, a TV or stale presence cannot change a profile that has samples.
+5. Jarvis enrolls the embedding under the interaction ID only when all of these are true: the source is `Presence` or `Proximity`; the utterance has `min_enroll_ms` of voice or more; and, when the person has `min_profile` samples or more, the voice similarity to that person is at least `voice_threshold` and higher than to each other person. Thus a guest, a TV or stale presence cannot change a profile that has samples.
 
-The interaction record gets the speaker and the source. This sub-phase adds `speaker.threshold`, `speaker.margin`, `speaker.enroll_threshold`, `speaker.min_enroll_ms` and `speaker.min_profile`.
+`Source` (`Presence`, `Proximity`, `Voice`) is in `src/domain/speaker.rs`. Sub-phase 15.6b stores the speaker and the source with the interaction. This sub-phase adds `speaker.threshold`, `speaker.margin`, `speaker.enroll_threshold`, `speaker.min_enroll_ms` and `speaker.min_profile`.
 
 **Acceptance criteria.**
 
@@ -212,13 +221,13 @@ The interaction record gets the speaker and the source. This sub-phase adds `spe
 - AC-15.6-3: When the satellite presence sensor is `off`, proximity does not identify a speaker.
 - AC-15.6-4: When two people are home, no tracker is in the area, and the voice matches one profile, `identify` returns that person.
 - AC-15.6-5: When the top two scores differ by less than `margin`, `identify` returns no speaker.
-- AC-15.6-6: When `identify` returns confidence 1.0 from presence, `FakeVoiceProfiles` records an enroll for that person.
+- AC-15.6-6: When `identify` returns confidence 1.0 from presence, `FakeVoiceProfiles` records an enroll for that person with the interaction ID.
 - AC-15.6-7: When the identification comes from voice alone, `FakeVoiceProfiles` records no enroll.
 - AC-15.6-8: When `quint-connect` replays 100 traces of `speaker.qnt`, `identify` and the enrolls match the model after each step.
 - AC-15.6-9: When the person has `min_profile` samples and the voice similarity to that person is less than `voice_threshold`, or higher to another person, `FakeVoiceProfiles` records no enroll.
 - AC-15.6-10: When the utterance has less than `min_enroll_ms` of voice, `FakeVoiceProfiles` records no enroll.
 - AC-15.6-11: When one `person` state is `unavailable`, all people are candidates, and presence alone identifies no speaker.
-- AC-15.6-12: When `identify` returns a speaker, the interaction record has the speaker and the source.
+- AC-15.6-13: When HA has `person.alex` and `person.sam`, both are `home`, and `jarvis.toml` has no `[[people]]`, the candidates of `identify` are both.
 
 **Proofs.**
 
@@ -227,39 +236,207 @@ The interaction record gets the speaker and the source. This sub-phase adds `spe
 - P-15.6-5. Ensures: `identify` returns a speaker only when the top score is more than the second score plus `margin`. Argument: rule 4 requires `top > second + margin`.
 - P-15.6-6, P-15.6-7, P-15.6-9, P-15.6-10. Requires: `NoVoiceOnlyEnrollment`. Argument: rule 5 is a conjunction of guards on the source, the voice duration and the profile similarity, and voice-only identification has source `Voice`.
 - P-15.6-11 (AC-15.6-11). Ensures: when a person state is not `home` or `not_home`, all people are candidates and rule 2 does not identify. Argument: rule 1 checks that each state is `home` or `not_home` before it filters, and else takes all people with no presence identification.
-- P-15.6-12. Evidence: test.
+- P-15.6-13 (AC-15.6-13). Ensures: when presence is known, the candidates are exactly the people of `people(cache)` whose state is `home`. Argument: rule 1 filters `people(cache)` (P-15.2-7) by the state `home`, and reads no configuration.
 - P-15.6-2, P-15.6-4. Requires: `SpeakerIsCandidate`. Argument: the maximum of rule 4 ranges over candidates only. Evidence: test for the scores.
 - P-15.6-8. Evidence: test.
 
 ---
 
-### 15.7 Person-Specific Intents
+### 15.6b Speaker Record
 
-**Goal:** Add `needs_speaker`, the `person` template variable and `next_date`. "Add dentist to my calendar for Monday" adds the event to the speaker's calendar.
+**Goal:** Store the speaker, the source and the voice embedding with each voice request. The embedding stays after the log deletes the audio, so you can assign the voice of a request later.
 
-- **Implements:** G12. **Depends on:** 15.6.
-- **Files:** modify `src/domain/catalog.rs`, `src/domain/responses.rs`, `src/domain/decide.rs`, `src/app/conversation.rs`, `intents.toml`, `responses.toml`, `src/lib.rs`, `jarvis.toml`.
+- **Implements:** G12, G15. **Depends on:** 15.6.
+- **Files:** modify `src/ports.rs`, `src/domain/feedback.rs`, `src/adapters/sqlite.rs`, `src/testing/fakes.rs`, `src/app/conversation.rs`.
 
-**Model.** An intent with `needs_speaker = true` waits up to `speaker.wait_ms` for the embedding, then calls `identify`. The `person` variable has the name and the fields of its `[[people]]` entry. No speaker gives `Defer` with a filler and `Job::Llm`, because a missing `person` usually means that System One has the wrong intent (sub-phase 4.5). `next_date(day, plus_days)`: the ISO date of the next `day` (a day name, `today` or `tomorrow`) plus `plus_days`. An empty `day` is today. Another value is an error that gives `Defer` with `Job::Llm`. This sub-phase adds `speaker.wait_ms`.
+**Model.**
+
+- `Interaction` gets `speaker: Option<EntityId>` and `source: Option<Source>`. Sub-phase 15.8 adds the source `Assigned`.
+- The next migration step of the schema (sub-phase 12.4) adds the columns `speaker`, `source` and `embedding` (a BLOB of little-endian `f32` values). `prune` deletes the audio after `log.audio_days`, but the embedding stays as long as the record.
+- `update(id, change)` gets the change `Speaker { speaker, source, embedding }`. `embedding: None` keeps the stored embedding. `embedding(id) -> Option<Vec<f32>>` gives the stored embedding. `list` and `get` do not read the embedding.
+- When the embedding of a voice request completes, the conversation use case identifies the speaker (sub-phase 15.6) and sends the `Speaker` update with the embedding to the log writer. It sends the update also when `identify` gives no speaker, so you can assign the voice later. The update uses the channel of the append, so it comes after the append (P-12.6c-2).
 
 **Acceptance criteria.**
 
-- AC-15.7-1: When Alex says "add dentist to my calendar for monday", `FakeHome` records `calendar.create_event` for `calendar.alex` with `summary = dentist`.
-- AC-15.7-2: When the date is Wednesday 2026-10-28, `next_date("monday", 0)` returns `2026-11-02` and `next_date("monday", 1)` returns `2026-11-03`.
-- AC-15.7-3: When `day` is empty, `next_date` uses today.
-- AC-15.7-4: When `day` is "someday", `next_date` returns an error and `decide` returns `Defer` with `Job::Llm`.
-- AC-15.7-5: When `identify` returns no speaker, `decide` returns `Defer` with `Job::Llm` and `FakeHome` records no service call.
-- AC-15.7-7: When the embedding does not complete within `speaker.wait_ms`, Jarvis uses presence and proximity only.
-- AC-15.7-8: When the intent does not have `needs_speaker`, Jarvis does not wait for the speaker.
-- AC-15.7-9 [GPU host]: For "add dentist to my calendar", the response latency has a p95 of 400 ms or less.
+- AC-15.6b-1: When `identify` returns a speaker, the interaction record has the speaker and the source.
+- AC-15.6b-2: When `identify` returns no speaker, `embedding(id)` returns the embedding of the request.
+- AC-15.6b-3: When `prune` deletes the audio of an interaction, `embedding(id)` still returns its embedding.
+- AC-15.6b-4: When the database has the previous schema version with records, the adapter migrates it and keeps every record.
 
 **Proofs.**
 
-- P-15.7-2, P-15.7-3. Requires: `day` is a day name. Ensures: the result is the first date after today with that weekday, plus `plus_days`. Argument: `next_date` adds `(target - today_weekday + 6) mod 7 + 1` days, which is in `1..=7`. Wednesday to Monday is `(0 - 2 + 6) mod 7 + 1 = 5` days, so 2026-10-28 plus 5 days is 2026-11-02.
-- P-15.7-4. Ensures: a `day` that is not a day name, `today` or `tomorrow` gives `Err`, and `decide` gives `Defer` with `Job::Llm`. Argument: the parser matches the allowed words and returns `Err` for others, and `decide` maps the error to `Defer`.
-- P-15.7-5. Ensures: no speaker gives `Defer` with `Job::Llm` and no call. Argument: `decide` returns `Defer` before it builds a call when the speaker is `None`.
-- P-15.7-8. Argument: the wait is inside `if intent.needs_speaker`.
-- P-15.7-1, P-15.7-7, P-15.7-9. Evidence: test.
+- P-15.6b-2. Argument: the use case sends the `Speaker` update with the embedding after `identify` in both branches.
+- P-15.6b-3. Argument: the audio delete of `prune` does not change the `embedding` column.
+- P-15.6b-1, P-15.6b-4. Evidence: test.
+
+---
+
+### 15.7 Person-Specific Intents (removed)
+
+This sub-phase is removed. The calendar intent was only an example, so no intent acts for the speaker yet. Thus no intent sets `needs_speaker`, nothing fills the `person` template variable, and Jarvis has no `next_date` and no `speaker.wait_ms`. The `needs_speaker` field of the catalog and the `person` pool variable of sub-phases 3.2 and 4.2 already exist, and they stay unchanged. The form of address (sub-phase 15.9) uses the speaker without them.
+
+---
+
+### 15.8 Voice Sample Assignment
+
+**Goal:** Add `VoiceProfiles::assign`. It puts the voice sample of one request into the profile of a person, moves it to another person, or removes it.
+
+- **Implements:** G12. **Depends on:** 15.6b.
+- **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`.
+
+**Model.** `assign(id, person: Option<EntityId>, embedding)`. The store keeps a pick record apart from the samples: the last pick of each interaction ID, a person or none. `assign` sets the pick of `id` and removes the sample of `id` from each profile. With `Some(person)`, it adds the sample to the profile of `person` and then trims that profile to the newest `max_samples` interaction IDs (sub-phase 15.3), so the trim can remove the new sample at once. With `None`, it adds no sample. A later `enroll` with `id` changes nothing, because `id` has a pick (P-15.3-9). Thus a pick always wins over passive enrollment, also after a trim.
+
+**Acceptance criteria.**
+
+- AC-15.8-1: When the sample of an interaction is in the profile of `person.alex` and `assign(id, Some(person.sam))` runs, the sample is only in the profile of `person.sam`.
+- AC-15.8-2: When `assign(id, None)` runs, the sample of `id` is in no profile.
+- AC-15.8-3: When `assign(id, None)` runs and then `enroll` runs with the same ID, the sample of `id` is in no profile.
+- AC-15.8-4: When the profile of `person.sam` has `max_samples` samples and `assign` adds a newer one, the profile keeps the newest `max_samples`.
+- AC-15.8-5: When the profile of `person.sam` has `max_samples` newer samples and `assign(id, Some(person.sam))` runs for an older interaction, the sample of `id` is in no profile, the pick of `id` is `person.sam`, and a later `enroll` with `id` changes nothing.
+
+**Proofs.**
+
+- P-15.8-1, P-15.8-2. Argument: the store keys each sample by its interaction ID, so one ID has one entry, and `assign` replaces the entry of `id`.
+- P-15.8-3, P-15.8-5. Argument: `assign` always sets the pick of `id`, the trim removes samples but never picks, and `enroll` does not change an ID that has a pick (P-15.3-9).
+- P-15.8-4. Argument: `assign` uses the same trim as `enroll` (P-15.3-4).
+
+---
+
+### 15.8b Voice Assignment Use Case
+
+**Goal:** Add `people` and `assign` to the `Review` port. A pick for a logged request moves its voice sample and records the person as the speaker.
+
+- **Implements:** G12, G15, G19. **Depends on:** 15.8.
+- **Files:** modify `src/ports.rs`, `src/domain/speaker.rs`, `src/app/review.rs`, `src/app/conversation.rs`, `src/adapters/sqlite.rs`, `src/testing/fakes.rs`, `src/lib.rs`, `quint/speaker.qnt`.
+- **Quint:** `speaker.qnt` (`assign`, conformance).
+
+**Model.**
+
+- `Source` gets `Assigned`.
+- `Review::people() -> Vec<Person>`: `people` of the hot cache (sub-phase 15.2).
+- `Review::assign(id, person: Option<EntityId>)`: checks that `person` is `None` or the entity of one of `people()`, and gets the embedding with `embedding(id)` (sub-phase 15.6b). Then it calls `VoiceProfiles::assign` and writes the log update `Speaker { speaker: person, source: Assigned, embedding: None }`. A person that is not in `people()` gives an error, and no embedding gives `NotFound`. Both checks run before the writes. One `tokio::sync::Mutex` of the use case is held from `VoiceProfiles::assign` to the end of the log update. Thus two picks of one interaction at the same time do not interleave, and the last pick sets both the profile and the record, as the one `assign` action of `speaker.qnt` does.
+- A `Speaker` update of the log (sub-phase 15.6b) whose source is not `Assigned` does not replace a stored `Assigned` speaker and source. It only stores the embedding. Thus a passive identification that arrives after a pick does not change the record, and its enroll changes no profile (P-15.3-9).
+- `speaker.qnt`: the new state `picks: int -> Option[PERSON]` is the pick record. The new action `assign(id, p)` sets `picks[id] = p`, removes `id` from `samples`, and with `p = Some(person)` adds `samples[id] = (person, Assigned)` and trims `person` as `enroll` does. `enroll` is also disabled when `picks` has `utterance`. The new invariant `PickWins`: for each ID in `picks`, a sample of that ID has the person of the pick and the source `Assigned`, and a pick of none has no sample. `NoVoiceOnlyEnrollment` and `ProfilesBounded` still hold.
+- The conformance driver of sub-phase 15.6 maps `assign` to `Review::assign`. After each step, it compares the samples of `FakeVoiceProfiles` with `samples` and its pick record with `picks`.
+
+**Acceptance criteria.**
+
+- AC-15.8b-1: When `people` runs, it returns each `person` entity of the hot cache with its friendly name.
+- AC-15.8b-2: When `assign(id, Some(person.sam))` runs, `FakeVoiceProfiles` records the assign, and the interaction record has the speaker `person.sam` and the source `Assigned`.
+- AC-15.8b-3: When `assign(id, None)` runs, the interaction record has no speaker and the source `Assigned`.
+- AC-15.8b-4: When the person is not a `person` entity of the hot cache, `assign` returns an error, and `FakeVoiceProfiles` and `FakeLog` record no change.
+- AC-15.8b-5: When the interaction has no embedding, `assign` returns `NotFound`.
+- AC-15.8b-6 [Quint]: `PickWins`, `NoVoiceOnlyEnrollment` and `ProfilesBounded` hold in simulation and to 10 steps in `quint verify`.
+- AC-15.8b-7: When `quint-connect` replays 100 traces of `speaker.qnt` with `assign`, the samples and the pick record of `FakeVoiceProfiles` match `samples` and `picks` after each step.
+- AC-15.8b-8: When `assign(id, Some(person.alex))` waits inside `FakeVoiceProfiles` and `assign(id, Some(person.sam))` starts during the wait, the pick of `FakeVoiceProfiles` and the speaker of the interaction record are the same person.
+- AC-15.8b-9: When the record has the source `Assigned` and an identification update with the source `Presence` comes later, the record keeps the assigned speaker and the source `Assigned`, and `embedding(id)` gives the new embedding.
+
+**Proofs.**
+
+- P-15.8b-4, P-15.8b-5. Argument: the use case checks the person and the embedding before both writes and returns on failure.
+- P-15.8b-8. Argument: the mutex is held across the profile write and the log update, so the second call does both writes after the first call ends, and its writes are the last ones in both stores.
+- P-15.8b-9. Argument: the `Speaker` update keeps the stored speaker and source when they have the source `Assigned` and the change has another source.
+- P-15.8b-6. `PickWins`: `assign` sets the pick of `id` and the sample of `id` in the same step. A later trim can only remove that sample, and `enroll` is disabled for an ID in `picks`, so no action adds a sample of a picked ID with another person or source. `NoVoiceOnlyEnrollment`: `assign` sets the source `Assigned`, not `Voice`. `ProfilesBounded`: `assign` trims the person in the same step as it adds the sample. Evidence: model check.
+- P-15.8b-1 to P-15.8b-3, P-15.8b-7. Evidence: test.
+
+---
+
+### 15.8c Voice Assignment Page
+
+**Goal:** Add a person list to each request in the review section of the Jarvis tab. You pick the speaker of a request, and Jarvis moves its voice sample at once.
+
+- **Implements:** G12, G15, G24. **Depends on:** 15.8b.
+- **Files:** modify `src/adapters/web.rs`, `src/adapters/review.html`, `README.md`.
+
+**Model.**
+
+- `GET api/people` gives `[{ "entity": "<person entity>", "name": "<friendly name>" }]` from `Review::people`.
+- `POST api/interactions/{id}/speaker` with `{ "person": "<person entity>" | null }` calls `Review::assign`. Success gives 204, an unknown person gives 400, and `NotFound` gives 404.
+- The items of `GET api/interactions` have `speaker` and `source`.
+- The page loads `api/people` once. Each interaction with a `satellite` gets the list `select.speaker`: an empty choice, then each person by name. The list shows the speaker of the interaction, which is the identified or the picked person. A change of the list sends the `speaker` request at once.
+
+**Acceptance criteria.**
+
+- AC-15.8c-1: When `GET api/people` runs, it returns the people of `FakeReview`.
+- AC-15.8c-2: When `POST api/interactions/{id}/speaker` has `{"person": "person.sam"}`, `FakeReview` receives `assign(id, Some(person.sam))` and the adapter returns 204. With `null`, `FakeReview` receives `assign(id, None)`.
+- AC-15.8c-3: When the person is unknown, the adapter returns 400. When the interaction has no embedding, the adapter returns 404.
+- AC-15.8c-4: When `GET /` runs, the template `template#interaction` has a `select.speaker` element.
+
+**Proofs.**
+
+- P-15.8c-3. Argument: the handler maps the person error of `Review::assign` to 400 and `NotFound` to 404.
+- P-15.8c-1, P-15.8c-2, P-15.8c-4. Evidence: test.
+
+---
+
+### 15.9 Form of Address
+
+**Goal:** Address each person in their own way. With the form of address "Lady Lang" for Ali, a reply to Ali can say "I will turn on the lights for you, Lady Lang."
+
+- **Implements:** G12. **Depends on:** 15.8c.
+- **Files:** modify `src/domain/responses.rs`, `src/app/conversation.rs`, `src/app/speech.rs`, `src/lib.rs`, `jarvis.toml`, `README.md`.
+
+**Model.**
+
+- This sub-phase adds the optional table `[address]` to `jarvis.toml`. A key is a `person` entity ID, and its value is the form of address, a free text. Example: `"person.ali" = "Lady Lang"`. An empty value is the same as no value. Sub-phase 15.9b sets it from the Jarvis tab.
+- `address` is a template variable of each catalog intent pool: the form of address of the speaker. A proposal does not act for the speaker, so it does not get `address` (sub-phase 14.2b).
+- Pool selection (sub-phase 4.1) gets `address: Option<&str>`. A response whose template uses `address` is eligible only when `address` is `Some` and not empty. Else only the responses without `address` are eligible. The rule of sub-phase 4.1 then applies to the eligible responses: with two or more eligible responses, `last` is not allowed. With one eligible response, selection gives it, also when it is `last`.
+- Pool validation (sub-phase 4.2): a pool with a response that uses `address` must also have a response without `address`. Else the error names the pool. Thus selection always has a candidate.
+- The reply does not wait for the voice embedding. `handle` calls `identify` with no embedding, so only presence and proximity identify the speaker. Without an embedding, the voice similarity of each person is 0.
+- `prerender` (sub-phase 6.3b) also synthesizes each template whose variables are in `{area, address}`, for each area and each non-empty value of `[address]`. A change of `[address]` restarts Jarvis (sub-phase 12.9f), so the pre-render has the new values.
+- A pool with a response that uses `address` gets no backfill, because a backfill pool uses only `area` (sub-phase 8.1).
+- `responses.toml` does not change. `README.md` describes `[address]` and gives the example response `"I will turn on the lights for you, {{ address }}."`.
+
+**Acceptance criteria.**
+
+- AC-15.9-1: When the speaker is `person.ali` with `"person.ali" = "Lady Lang"` in `[address]`, and selection chooses the response `I will turn on the lights for you, {{ address }}.`, the reply is "I will turn on the lights for you, Lady Lang."
+- AC-15.9-2: When no speaker is identified, selection never chooses a response that uses `address`.
+- AC-15.9-3: When the value of the speaker in `[address]` is empty, selection never chooses a response that uses `address`.
+- AC-15.9-4: When each response of a pool uses `address`, validation returns an error that names the pool.
+- AC-15.9-5: When `prerender` runs with `"person.ali" = "Lady Lang"`, the audio cache has each `address` template for each area name with `Lady Lang`.
+- AC-15.9-6: When `handle` chooses a reply, it does not wait for the embedding, and it calls `identify` with no embedding.
+- AC-15.9-7: When no speaker is identified and the pool has one response without `address` and one with it, two requests in a row both reply with the response without `address`.
+
+**Proofs.**
+
+- P-15.9-2, P-15.9-3. Ensures: the chosen response uses `address` only when `address` is `Some` and not empty. Argument: selection filters the candidates by this predicate before it chooses.
+- P-15.9-4. Ensures: validation fails for a pool if and only if the pool has responses and each of them uses `address`. Argument: the check looks for one response without `address`.
+- P-15.9-6. Argument: the `identify` call of the reply passes `None` for the embedding, and `handle` does not await the embedding future.
+- P-15.9-7. Requires: the pool has a response without `address` (P-15.9-4). Ensures: with one eligible response, selection gives it. Argument: the exclusion of `last` applies only to two or more eligible responses, so the one eligible response is the only candidate (P-4.1-5 on the eligible responses).
+- P-15.9-1, P-15.9-5. Evidence: test.
+
+---
+
+### 15.9b Address Settings and System Two
+
+**Goal:** Set the form of address of each person in the settings of the Jarvis tab, and give it to System Two. A System Two answer can then address the speaker too.
+
+- **Implements:** G12, G24. **Depends on:** 15.9.
+- **Files:** modify `src/adapters/settings.rs`, `src/adapters/review.html`, `src/adapters/openai.rs`, `src/ports.rs`, `src/app/conversation.rs`, `README.md`.
+
+**Model.**
+
+- Settings `read` (sub-phase 12.9d) also gives one setting `address.<entity>` for each key of `[address]`, in the group `People`. `edit` accepts the name `address.<entity>` when the entity ID starts with `person.` and the value is a JSON string. It sets the key in `[address]`, and it adds the table when the file has no `[address]`. An empty string removes the key. Other text stays the same.
+- The settings section of the page lists each person of `GET api/people` (sub-phase 15.8c) with an "Address as" text field (`input.address`). The field shows the value of the setting `address.<entity>`, or is empty. Save sends the changed fields with the other settings (sub-phase 12.9e).
+- The request of `Reasoner::answer` gets the form of address of the speaker that the reply identified (P-15.9-6). When it is not empty, the system prompt gets the line `Address the user as <address>.`.
+
+**Acceptance criteria.**
+
+- AC-15.9b-1: When `jarvis.toml` has `"person.ali" = "Lady Lang"` in `[address]`, `read` returns the setting `address.person.ali` with `Lady Lang` in the group `People`.
+- AC-15.9b-2: When `edit` sets `address.person.ali` to `Mrs Lang`, the result has the new value and the other text stays. When the value is empty, the key is removed. When the file has no `[address]`, `edit` adds the table with the key.
+- AC-15.9b-3: When `edit` gets `address.light.kitchen`, it returns an error that names the field.
+- AC-15.9b-4: When `GET /` runs, the settings section has a `template#person` with an `input.address` element.
+- AC-15.9b-5: When the speaker has the form of address `Lady Lang`, the OpenAI request has the line `Address the user as Lady Lang.`. With no speaker or an empty form of address, the request has no such line.
+
+**Proofs.**
+
+- P-15.9b-3. Argument: `edit` checks the prefix `address.person.` before it changes the document, and returns the error on the first name that fails.
+- P-15.9b-5. Argument: the prompt builder adds the line only for a `Some` value that is not empty.
+- P-15.9b-1, P-15.9b-2, P-15.9b-4. Evidence: test.
+
+## Later
+
+- Measure on the GPU host how long a reply takes when it waits for the voice embedding. Then decide if a reply with `{{ address }}` waits for the voice. This note has no criteria yet.
 
 ## Field Log
 
@@ -269,5 +446,7 @@ These steps are not tests and gate nothing.
 2. If the satellite firmware has a Bluetooth proxy option, turn it on.
 3. Install Bermuda. Add iPhones and Apple Watches with the Private BLE Device integration first.
 4. Add each Bermuda `device_tracker` to the correct `person` entity.
-5. Start Jarvis. Make sure the discovery report names each satellite presence sensor and each person tracker.
+5. Start Jarvis. Make sure the discovery report names each satellite presence sensor and each HA person with their trackers.
 6. Walk to each satellite with a phone. Make sure the tracker area changes to the satellite area.
+7. In the review section of the Jarvis tab, pick the speaker of some requests. Make sure that later requests of that person get the voice source more often.
+8. In the settings of the Jarvis tab, set "Address as" for Ali to "Lady Lang". Add a response with `{{ address }}` to a pool. Ask Jarvis from the Office satellite while only Ali is home. Make sure the reply says "Lady Lang".

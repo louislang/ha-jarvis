@@ -8,7 +8,7 @@ This phase composes the component models into one Quint model of the whole reque
 
 **Goal:** Add `quint/jarvis.qnt`, the model of the request lifecycle on two satellites. Prove the properties that span components: one answer per request, reply before action, filler before deferred answers, no talk-over between requests, and atomic model swaps.
 
-- **Implements:** G19. **Depends on:** 15.7.
+- **Implements:** G19. **Depends on:** 15.9b.
 - **Files:** create `quint/jarvis.qnt`.
 - **Quint:** `jarvis.qnt`.
 
