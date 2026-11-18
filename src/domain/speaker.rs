@@ -1,6 +1,8 @@
 //! Speaker identification: discovery of the person trackers and the satellite presence sensors,
 //! and the people, presence and proximity signals.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 use serde_json::Value;
 use vstd::prelude::*;
@@ -51,6 +53,30 @@ pub struct Person {
     pub entity: EntityId,
     /// The `friendly_name` attribute, else the entity ID.
     pub name: String,
+}
+
+/// The signals of one voice request at a satellite.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Signals {
+    /// The people at home, or `None` when presence is not known.
+    pub home: Option<Vec<EntityId>>,
+    /// The signals of each person of the house, in entity ID order.
+    pub people: Vec<PersonSignals>,
+    /// Whether the room of the satellite is occupied, or `None` without a presence sensor.
+    pub occupied: Option<bool>,
+}
+
+/// The proximity and the voice similarity of one person.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PersonSignals {
+    /// The `person` entity.
+    pub entity: EntityId,
+    /// The proximity of the nearest tracker in the satellite area, as `proximity` gives it.
+    pub proximity: f64,
+    /// The voice similarity of the request to the profile of the person.
+    pub voice: f32,
 }
 
 /// The trackers of `person`: `configured` when set, else the area and distance sensors of each
@@ -530,6 +556,222 @@ fn distance_in(cache: &StateCache, tracker: &Tracker, area: &AreaId) -> Option<f
     }
 }
 
+/// The signals of a request at the satellite device `device` in `area`: presence, the occupancy
+/// from the presence sensors `presence`, and the proximity with the trackers of `overrides` and
+/// the similarity in `voice` of each person.
+#[verus_spec(found =>
+    ensures
+        exists|everyone: Seq<Person>| #[trigger] people_in(*cache, everyone, None)
+            && entity_ids(everyone) == found.people@.map_values(|person: PersonSignals| person.entity.0@),
+        forall|index: int| 0 <= index < found.people@.len()
+            && !settled(*cache, (#[trigger] found.people@[index]).entity.0@) ==> found.home is None,
+        found.home matches Some(ids) ==> at_home(*cache, ids@),
+        forall|index: int| 0 <= index < found.people@.len()
+            ==> reads(*cache, overrides@, area, voice, #[trigger] found.people@[index]),
+)]
+#[must_use]
+pub fn signals(
+    cache: &StateCache,
+    device: &str,
+    area: Option<&AreaId>,
+    overrides: &[PersonTrackers],
+    presence: Option<Vec<EntityId>>,
+    voice: Option<&BTreeMap<String, f32>>,
+) -> Signals {
+    let everyone = people(cache);
+    Signals {
+        home: if known(cache, &everyone) {
+            Some(entities(&home(cache)))
+        } else {
+            None
+        },
+        people: each_person(cache, &everyone, area, overrides, voice),
+        occupied: occupied(cache, device, presence),
+    }
+}
+
+/// True when the state of each of `everyone` is `home` or `not_home`.
+#[verus_spec(found =>
+    ensures
+        forall|index: int| 0 <= index < everyone@.len()
+            && !settled(*cache, (#[trigger] everyone@[index]).entity.0@) ==> !found,
+)]
+fn known(cache: &StateCache, everyone: &[Person]) -> bool {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= everyone@.len(),
+            forall|position: int| 0 <= position < index
+                ==> settled(*cache, (#[trigger] everyone@[position]).entity.0@),
+        decreases everyone@.len() - index,
+    ))]
+    while index < everyone.len() {
+        let person = &everyone[index].entity;
+        if !has_state(cache, person, "home") && !has_state(cache, person, "not_home") {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// The signals of each of `everyone`, in order, as `person_signals` gives them.
+#[verus_spec(each =>
+    ensures
+        entity_ids(everyone@) == each@.map_values(|signal: PersonSignals| signal.entity.0@),
+        each@.len() == everyone@.len(),
+        forall|index: int| 0 <= index < each@.len()
+            ==> reads(*cache, overrides@, area, voice, #[trigger] each@[index])
+            && each@[index].entity.0@ == everyone@[index].entity.0@,
+)]
+fn each_person(
+    cache: &StateCache,
+    everyone: &[Person],
+    area: Option<&AreaId>,
+    overrides: &[PersonTrackers],
+    voice: Option<&BTreeMap<String, f32>>,
+) -> Vec<PersonSignals> {
+    let mut each: Vec<PersonSignals> = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= everyone@.len(),
+            each@.len() == index,
+            forall|position: int| 0 <= position < index ==> (#[trigger] each@[position]).entity.0@
+                == everyone@[position].entity.0@,
+            forall|position: int| 0 <= position < index
+                ==> reads(*cache, overrides@, area, voice, #[trigger] each@[position]),
+        decreases everyone@.len() - index,
+    ))]
+    while index < everyone.len() {
+        each.push(person_signals(
+            cache,
+            &everyone[index].entity,
+            area,
+            overrides,
+            voice,
+        ));
+        index += 1;
+    }
+    proof! {
+        assert(entity_ids(everyone@) =~= each@.map_values(|signal: PersonSignals| signal.entity.0@));
+    }
+    each
+}
+
+/// The proximity in `area` with the trackers of `overrides` and the similarity in `voice` of
+/// `person`.
+#[verus_spec(found =>
+    ensures
+        found.entity.0@ == person.0@,
+        reads(*cache, overrides@, area, voice, found),
+)]
+fn person_signals(
+    cache: &StateCache,
+    person: &EntityId,
+    area: Option<&AreaId>,
+    overrides: &[PersonTrackers],
+    voice: Option<&BTreeMap<String, f32>>,
+) -> PersonSignals {
+    PersonSignals {
+        entity: EntityId(person.0.clone()),
+        proximity: closeness(cache, person, area, overrides),
+        voice: similarity(voice, person),
+    }
+}
+
+/// The entity IDs of `found`.
+#[verus_spec(ids =>
+    ensures
+        texts(ids@) == entity_ids(found@),
+)]
+fn entities(found: &[Person]) -> Vec<EntityId> {
+    let mut ids: Vec<EntityId> = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= found@.len(),
+            ids@.len() == index,
+            forall|position: int| 0 <= position < index ==> (#[trigger] ids@[position]).0@
+                == found@[position].entity.0@,
+        decreases found@.len() - index,
+    ))]
+    while index < found.len() {
+        ids.push(EntityId(found[index].entity.0.clone()));
+        index += 1;
+    }
+    proof! {
+        assert(texts(ids@) =~= entity_ids(found@));
+    }
+    ids
+}
+
+/// The proximity of `person` in `area` with the trackers of its entry in `overrides`, else with
+/// the discovered trackers. 0 without an area.
+#[verus_spec(found =>
+    ensures
+        near(*cache, overrides@, person.0@, area, found),
+)]
+fn closeness(
+    cache: &StateCache,
+    person: &EntityId,
+    area: Option<&AreaId>,
+    overrides: &[PersonTrackers],
+) -> f64 {
+    let Some(area) = area else {
+        return 0.0;
+    };
+    match entry_of(overrides, person) {
+        Some(entry) => proximity(cache, &entry.trackers, area),
+        None => proximity(cache, &trackers(cache, person, None), area),
+    }
+}
+
+/// The entry of `person` in `overrides`.
+#[verus_spec(found =>
+    ensures
+        found matches Some(entry) ==> overrides@.contains(*entry) && entry.person.0@ == person.0@,
+        found is None ==> unlisted(overrides@, person.0@),
+)]
+fn entry_of<'entries>(
+    overrides: &'entries [PersonTrackers],
+    person: &EntityId,
+) -> Option<&'entries PersonTrackers> {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= overrides@.len(),
+            forall|position: int| 0 <= position < index
+                ==> (#[trigger] overrides@[position]).person.0@ != person.0@,
+        decreases overrides@.len() - index,
+    ))]
+    while index < overrides.len() {
+        if overrides[index].person.0.as_str() == person.0.as_str() {
+            proof! {
+                assert(overrides@.contains(overrides@[index as int]));
+            }
+            return Some(&overrides[index]);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// The similarity of `person` in `voice`, or 0.
+#[verus_spec(found =>
+    ensures
+        found == heard(voice, person.0@),
+)]
+fn similarity(voice: Option<&BTreeMap<String, f32>>, person: &EntityId) -> f32 {
+    let Some(similarities) = voice else {
+        return 0.0;
+    };
+    match similarities.get(person.0.as_str()) {
+        Some(value) => *value,
+        None => 0.0,
+    }
+}
+
 verus! {
 
 broadcast use {
@@ -537,6 +779,10 @@ broadcast use {
     crate::domain::contracts::axiom_arc_str_borrow,
     crate::domain::contracts::axiom_arc_str_contains_borrowed_key,
     crate::domain::contracts::axiom_arc_str_maps_borrowed_key,
+    crate::domain::contracts::axiom_string_obeys_cmp,
+    crate::domain::contracts::axiom_string_borrow,
+    crate::domain::contracts::axiom_string_contains_borrowed_key,
+    crate::domain::contracts::axiom_string_maps_borrowed_key,
     vstd::seq_lib::lemma_seq_contains_after_push,
 };
 
@@ -753,6 +999,67 @@ pub open spec fn proximate(cache: StateCache, trackers: Seq<Tracker>, area: Area
     }
 }
 
+/// True when the state of `id` is `home` or `not_home`.
+pub open spec fn settled(cache: StateCache, id: Seq<char>) -> bool {
+    shows(cache, id, "home"@) || shows(cache, id, "not_home"@)
+}
+
+/// The entity ID of each person of `found`.
+pub open spec fn entity_ids(found: Seq<Person>) -> Seq<Seq<char>> {
+    found.map_values(|person: Person| person.entity.0@)
+}
+
+/// The text of each of `ids`.
+pub open spec fn texts(ids: Seq<EntityId>) -> Seq<Seq<char>> {
+    ids.map_values(|id: EntityId| id.0@)
+}
+
+/// True when `ids` are the entity IDs of the people of `cache` at home, in entity ID order.
+pub open spec fn at_home(cache: StateCache, ids: Seq<EntityId>) -> bool {
+    exists|found: Seq<Person>| #[trigger] people_in(cache, found, Some("home"@)) && texts(ids) == entity_ids(found)
+}
+
+/// True when no entry of `overrides` is of `person`.
+pub open spec fn unlisted(overrides: Seq<PersonTrackers>, person: Seq<char>) -> bool {
+    forall|index: int| 0 <= index < overrides.len() ==> (#[trigger] overrides[index]).person.0@ != person
+}
+
+/// True when `trackers` are the trackers of an entry of `person` in `overrides`, or, without such
+/// an entry, discovered trackers.
+pub open spec fn trackers_of(cache: StateCache, overrides: Seq<PersonTrackers>, person: Seq<char>, trackers: Seq<Tracker>) -> bool {
+    ||| exists|entry: PersonTrackers| #[trigger] overrides.contains(entry) && entry.person.0@ == person
+        && entry.trackers@ == trackers
+    ||| unlisted(overrides, person) && forall|position: int| 0 <= position < trackers.len()
+        ==> #[trigger] tracked(cache, trackers[position])
+}
+
+/// True when `found` is the proximity in `area` of the trackers of `person`, or 0 without an area.
+pub open spec fn near(cache: StateCache, overrides: Seq<PersonTrackers>, person: Seq<char>, area: Option<&AreaId>, found: f64) -> bool {
+    match area {
+        Some(area) => exists|trackers: Seq<Tracker>| #[trigger] proximate(cache, trackers, *area, found)
+            && trackers_of(cache, overrides, person, trackers),
+        None => found == 0.0f64,
+    }
+}
+
+/// True when `signal` has the proximity in `area` of the trackers of its person and the similarity
+/// in `voice` of its person.
+pub open spec fn reads(cache: StateCache, overrides: Seq<PersonTrackers>, area: Option<&AreaId>, voice: Option<&BTreeMap<String, f32>>, signal: PersonSignals) -> bool {
+    &&& near(cache, overrides, signal.entity.0@, area, signal.proximity)
+    &&& signal.voice == heard(voice, signal.entity.0@)
+}
+
+/// The similarity of `person` in `voice`, or 0.
+pub open spec fn heard(voice: Option<&BTreeMap<String, f32>>, person: Seq<char>) -> f32 {
+    match voice {
+        Some(similarities) => {
+            let key = crate::domain::contracts::string_key(person);
+            if similarities@.contains_key(key) { similarities@[key] } else { 0.0f32 }
+        },
+        None => 0.0f32,
+    }
+}
+
 } // verus!
 
 /// Tests of discovery.
@@ -883,9 +1190,9 @@ mod tests {
         assert_eq!(office("occupancy", Some(configured.clone())), configured);
     }
 
-    /// The cache of the house with the `person` entities of `persons` (entity ID, state and
-    /// attributes) instead of its own.
-    fn household(persons: Vec<(&str, &str, Value)>) -> StateCache {
+    /// The house with the `person` entities of `persons` (entity ID, state and attributes)
+    /// instead of its own.
+    fn residents(persons: Vec<(&str, &str, Value)>) -> Snapshot {
         let mut snapshot = house();
         snapshot
             .states
@@ -893,7 +1200,12 @@ mod tests {
         for (person, value, attributes) in persons {
             add(&mut snapshot, person, "phone", value, attributes);
         }
-        StateCache::load(snapshot)
+        snapshot
+    }
+
+    /// The cache of [`residents`].
+    fn household(persons: Vec<(&str, &str, Value)>) -> StateCache {
+        StateCache::load(residents(persons))
     }
 
     /// The person `entity` with the name `name`.
@@ -944,7 +1256,7 @@ mod tests {
     }
 
     /// Gives `person` in `snapshot` the watch `device_tracker.watch`, whose area sensor shows
-    /// `area` and whose distance sensor shows 1.2 m.
+    /// `area` and whose distance sensor shows 1 m.
     fn watch(snapshot: &mut Snapshot, person: &str, area: &str) {
         let found = snapshot
             .states
@@ -958,7 +1270,7 @@ mod tests {
         add(snapshot, "device_tracker.watch", "watch", "home", json!({}));
         add(snapshot, "sensor.watch_area", "watch", area, json!({}));
         let meters = json!({ "unit_of_measurement": "m" });
-        add(snapshot, "sensor.watch_distance", "watch", "1.2", meters);
+        add(snapshot, "sensor.watch_distance", "watch", "1", meters);
     }
 
     /// AC-15.2b-1.
@@ -1075,5 +1387,68 @@ mod tests {
             ("Office", "inf"),
         ];
         assert_near(&readings, 0.5);
+    }
+
+    /// The signals at the Office satellite of `person.alex` in the state `alex`, with a watch in
+    /// the Office at 1 m, and `person.sam` at home, with the similarities `voice`.
+    fn office_signals(alex: &str, voice: Option<&BTreeMap<String, f32>>) -> Signals {
+        let mut snapshot = residents(vec![
+            ("person.alex", alex, json!({})),
+            ("person.sam", "home", json!({})),
+        ]);
+        watch(&mut snapshot, "person.alex", "Office");
+        let office = AreaId("office".to_owned());
+        let cache = StateCache::load(snapshot);
+        signals(&cache, OFFICE, Some(&office), &[], None, voice)
+    }
+
+    /// The `field` of each person of `signals`, by entity ID.
+    fn each<T>(signals: &Signals, field: fn(&PersonSignals) -> T) -> Vec<(String, T)> {
+        let people = signals.people.iter();
+        people
+            .map(|heard| (heard.entity.0.clone(), field(heard)))
+            .collect()
+    }
+
+    /// AC-15.6-11.
+    #[test]
+    fn ac_15_6_11_unavailable_person_gives_unknown_presence() {
+        assert_eq!(office_signals("unavailable", None).home, None);
+    }
+
+    /// AC-15.6-13.
+    #[test]
+    fn ac_15_6_13_people_at_home_are_the_home_of_the_signals() {
+        let expected = vec![id("person.alex"), id("person.sam")];
+        assert_eq!(office_signals("home", None).home, Some(expected));
+    }
+
+    /// AC-15.6-14.
+    #[test]
+    fn ac_15_6_14_watch_in_the_area_gives_its_owner_the_proximity() {
+        let found = each(&office_signals("home", None), |heard| heard.proximity);
+        let expected = [
+            ("person.alex".to_owned(), 0.5),
+            ("person.sam".to_owned(), 0.0),
+        ];
+        assert_eq!(found, expected);
+    }
+
+    /// AC-15.6-15.
+    #[test]
+    fn ac_15_6_15_person_without_a_similarity_has_zero() {
+        let found = each(&office_signals("home", None), |heard| heard.voice);
+        let zero = [
+            ("person.alex".to_owned(), 0.0),
+            ("person.sam".to_owned(), 0.0),
+        ];
+        assert_eq!(found, zero);
+        let voice = BTreeMap::from([("person.alex".to_owned(), 0.8)]);
+        let found = each(&office_signals("home", Some(&voice)), |heard| heard.voice);
+        let expected = [
+            ("person.alex".to_owned(), 0.8),
+            ("person.sam".to_owned(), 0.0),
+        ];
+        assert_eq!(found, expected);
     }
 }
