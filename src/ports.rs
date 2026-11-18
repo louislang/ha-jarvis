@@ -233,6 +233,9 @@ pub trait SttStream: Send {
 
     /// Drops the audio so far.
     fn reset(&mut self);
+
+    /// Ends the open VAD speech segment, so `partial` counts its voice.
+    fn flush(&mut self);
 }
 
 /// One listen session: the audio of one utterance, chunk by chunk.

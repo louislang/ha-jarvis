@@ -245,7 +245,6 @@ impl Listener {
             confident: false,
             samples: Vec::new(),
             voice_end_ms: None,
-            voiced_ms: 0,
         }))
     }
 }
@@ -278,8 +277,6 @@ struct Session {
     samples: Vec<i16>,
     /// The audio position of the last voiced sample of the last partial.
     voice_end_ms: Option<u64>,
-    /// The voiced time of the last partial.
-    voiced_ms: u64,
 }
 
 impl Session {
@@ -321,7 +318,8 @@ impl Session {
     }
 
     /// The second-pass text of the pushed samples, else the first-pass text. A second-pass error
-    /// gives the first-pass text. Logs the text, its pass and the audio length, and keeps it.
+    /// gives the first-pass text. Logs the text, its pass and the audio length, and keeps it with
+    /// the voiced time after the end of the open VAD segment.
     ///
     /// # Errors
     ///
@@ -329,28 +327,30 @@ impl Session {
     async fn transcript(&self) -> anyhow::Result<String> {
         let voice_end = self.voice_end(self.clock.now());
         let (stt, samples) = (Arc::clone(&self.stt), self.samples.clone());
-        let (text, pass) =
-            match tokio::task::spawn_blocking(move || stt.transcribe(&samples)).await? {
-                Ok(Some(text)) => (text, "second"),
-                Ok(None) => (self.text.clone(), "first"),
-                Err(error) => {
-                    tracing::warn!("the second pass failed: {error:#}");
-                    (self.text.clone(), "first")
-                }
-            };
+        let stream = Arc::clone(&self.stream);
+        let passes = move || (stt.transcribe(&samples), voiced(&stream));
+        let (second, voiced_ms) = tokio::task::spawn_blocking(passes).await?;
+        let (text, pass) = match second {
+            Ok(Some(text)) => (text, "second"),
+            Ok(None) => (self.text.clone(), "first"),
+            Err(error) => {
+                tracing::warn!("the second pass failed: {error:#}");
+                (self.text.clone(), "first")
+            }
+        };
         tracing::info!(
             transcript = text,
             pass,
             audio_ms = self.audio_ms(),
             "transcript"
         );
-        self.keep(text.clone(), voice_end);
+        self.keep(text.clone(), voice_end, voiced_ms);
         Ok(text)
     }
 
-    /// Keeps `text` with the pushed samples, `voice_end` and a blocking task of their voice
-    /// embedding in the utterances.
-    fn keep(&self, text: String, voice_end: Option<Timestamp>) {
+    /// Keeps `text` with the pushed samples, `voice_end`, the voiced time `voiced_ms` and a
+    /// blocking task of their voice embedding in the utterances.
+    fn keep(&self, text: String, voice_end: Option<Timestamp>, voiced_ms: u64) {
         let audio = Audio {
             samples: self.samples.clone(),
             rate: 16_000,
@@ -359,8 +359,17 @@ impl Session {
         // Spawned and not awaited, so the embedding adds no time to the transcript.
         let embedding = tokio::task::spawn_blocking(move || voice.embed(&sound));
         self.utterances
-            .append(text, audio, voice_end, embedding, self.voiced_ms);
+            .append(text, audio, voice_end, embedding, voiced_ms);
     }
+}
+
+/// Ends the open VAD speech segment of `stream` and gives the voiced time, or 0 when an earlier
+/// decode panicked.
+fn voiced(stream: &Mutex<Box<dyn SttStream>>) -> u64 {
+    stream.lock().map_or(0, |mut stream| {
+        stream.flush();
+        stream.partial().voiced_ms
+    })
 }
 
 /// Decodes `samples` with `stream` and gives its partial.
@@ -405,7 +414,7 @@ impl Listening for Session {
         self.samples.extend_from_slice(&samples);
         let stream = Arc::clone(&self.stream);
         let partial = tokio::task::spawn_blocking(move || accept(&stream, &samples)).await??;
-        (self.voice_end_ms, self.voiced_ms) = (partial.voice_end_ms, partial.voiced_ms);
+        self.voice_end_ms = partial.voice_end_ms;
         self.update(&partial.text).await;
         if !self.commits(&partial) {
             return Ok(None);

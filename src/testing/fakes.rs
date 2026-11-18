@@ -1002,6 +1002,8 @@ impl SttStream for FakeSttStream {
     fn reset(&mut self) {
         self.current = Partial::default();
     }
+
+    fn flush(&mut self) {}
 }
 
 /// A `Store` in memory that records each save.

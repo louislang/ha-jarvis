@@ -605,6 +605,11 @@ impl SttStream for SherpaStream {
         self.vad.reset();
         (self.fed, self.decided, self.voice_end, self.voiced) = (0, 0, None, 0);
     }
+
+    fn flush(&mut self) {
+        self.vad.flush();
+        self.track(0);
+    }
 }
 
 /// The samples in [-1, 1] of the 16-bit `samples`.
@@ -798,6 +803,29 @@ mod tests {
     /// The partials of `speech(REQUEST)` on the CPU.
     async fn partials() -> anyhow::Result<Vec<Partial>> {
         partials_of(&stt(Device::Cpu)?, &fakes::speech(REQUEST).await?)
+    }
+
+    /// Speech cut at its voice end has the voiced time of the same speech with its silence,
+    /// within 100 ms, after `flush`.
+    #[tokio::test]
+    async fn flush_counts_the_open_speech_segment() -> anyhow::Result<()> {
+        let (stt, mut audio) = (stt(Device::Cpu)?, fakes::speech(REQUEST).await?);
+        let ended = partials_of(&stt, &audio)?
+            .last()
+            .map_or(0, |last| last.voiced_ms);
+        let end = voice_end(&config()?.asr, &audio.samples)?.unwrap_or_default();
+        audio.samples.truncate(usize::try_from(end)?);
+        let mut stream = stt.stream()?;
+        for chunk in speech::chunks(&audio, CHUNK) {
+            stream.accept(chunk);
+        }
+        stream.flush();
+        let voiced = stream.partial().voiced_ms;
+        assert!(
+            ended > 0 && voiced.abs_diff(ended) <= 100,
+            "voiced {voiced}, not {ended}"
+        );
+        Ok(())
     }
 
     /// The partial after each 20 ms chunk of `audio` in a new first pass of `stt`.

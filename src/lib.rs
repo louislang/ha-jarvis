@@ -1195,6 +1195,10 @@ impl SttStream for LiveStream {
     fn reset(&mut self) {
         self.stream.reset();
     }
+
+    fn flush(&mut self) {
+        self.stream.flush();
+    }
 }
 
 /// The model sessions of Jarvis: both STT passes, TTS, the voice embedder and the System One
