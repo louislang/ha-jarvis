@@ -77,6 +77,8 @@ pub enum Source {
     Proximity,
     /// The voice, with no near tracker.
     Voice,
+    /// A pick in the Jarvis tab.
+    Assigned,
 }
 
 /// The identified speaker of a request.

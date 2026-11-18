@@ -71,6 +71,7 @@ use crate::domain::learn::LearnedIntent;
 use crate::domain::learn::LearnedStatus;
 use crate::domain::learn::PluginRequest;
 use crate::domain::model::Prediction;
+use crate::domain::speaker::Person;
 use crate::domain::speech::Audio;
 use crate::domain::state::EntityId;
 use crate::domain::state::Event;
@@ -111,6 +112,7 @@ use crate::ports::TextToSpeech;
 use crate::ports::Title;
 use crate::ports::Tool;
 use crate::ports::Trainer;
+use crate::ports::Unassigned;
 use crate::ports::Unresolved;
 use crate::ports::VoiceEmbedder;
 use crate::ports::VoiceProfiles;
@@ -862,7 +864,11 @@ impl VoiceEmbedder for FakeVoiceEmbedder {
     }
 }
 
-/// A `VoiceProfiles` with fixed similarities and sample counts, which records each enroll.
+/// The samples that one profile of `FakeVoiceProfiles` keeps, as `MAX_SAMPLES` of `speaker.qnt`.
+const PROFILE_SAMPLES: usize = 2;
+
+/// A `VoiceProfiles` with fixed similarities and sample counts, which records each enroll and keeps
+/// the samples and the picks by the rules of the voice store.
 #[derive(Default)]
 pub(crate) struct FakeVoiceProfiles {
     /// The similarity of each person.
@@ -871,21 +877,60 @@ pub(crate) struct FakeVoiceProfiles {
     pub counts: BTreeMap<String, usize>,
     /// The person and the interaction ID of each enroll.
     pub enrolls: Mutex<Vec<(String, u64)>>,
+    /// The person of each sample, by interaction ID.
+    pub samples: Mutex<BTreeMap<u64, String>>,
+    /// The last pick of each interaction ID.
+    pub picks: Mutex<BTreeMap<u64, Option<String>>>,
+    /// The wait of the next `assign` after its change, until the sender sends or drops.
+    pub gate: Mutex<Option<oneshot::Receiver<()>>>,
+}
+
+/// Removes the samples of `person` with the oldest IDs until `PROFILE_SAMPLES` are left.
+fn trim(samples: &mut BTreeMap<u64, String>, person: &str) {
+    let own: Vec<u64> = samples
+        .iter()
+        .filter(|(_, owner)| *owner == person)
+        .map(|(&id, _)| id)
+        .collect();
+    let oldest = own.iter().take(own.len().saturating_sub(PROFILE_SAMPLES));
+    for id in oldest {
+        samples.remove(id);
+    }
 }
 
 #[async_trait]
 impl VoiceProfiles for FakeVoiceProfiles {
     async fn enroll(&self, person: &EntityId, id: u64, _embedding: &[f32]) -> anyhow::Result<()> {
         lock(&self.enrolls).push((person.0.clone(), id));
+        let picked = lock(&self.picks).contains_key(&id);
+        let mut samples = lock(&self.samples);
+        if !picked && !samples.contains_key(&id) {
+            samples.insert(id, person.0.clone());
+            trim(&mut samples, &person.0);
+        }
         Ok(())
     }
 
     async fn assign(
         &self,
-        _id: u64,
-        _person: Option<&EntityId>,
+        id: u64,
+        person: Option<&EntityId>,
         _embedding: &[f32],
     ) -> anyhow::Result<()> {
+        lock(&self.picks).insert(id, person.map(|person| person.0.clone()));
+        {
+            let mut samples = lock(&self.samples);
+            samples.remove(&id);
+            if let Some(person) = person {
+                samples.insert(id, person.0.clone());
+                trim(&mut samples, &person.0);
+            }
+        }
+        let gate = lock(&self.gate).take();
+        if let Some(gate) = gate {
+            // A dropped sender opens the gate too.
+            let _ = gate.await;
+        }
         Ok(())
     }
 
@@ -1222,9 +1267,14 @@ impl InteractionLog for FakeLog {
     }
 }
 
-/// A `Review` of fixed interactions that records each mark whose correction is in `intents`.
+/// A `Review` of fixed interactions and people that records each mark whose correction is in
+/// `intents`, and each assign of one of its people to one of its interactions.
 #[derive(Default)]
 pub struct FakeReview {
+    /// The people of the house.
+    pub people: Vec<Person>,
+    /// The interaction ID and the person of each accepted assign, in order.
+    pub assigns: Mutex<Vec<(u64, Option<EntityId>)>>,
     /// The interactions with their audio, newest first.
     pub interactions: Vec<(Interaction, Option<Audio>)>,
     /// The names that a correction can have.
@@ -1266,6 +1316,20 @@ impl Review for FakeReview {
 
     async fn resolve(&self, name: &str, approve: bool) -> Result<(), Unresolved> {
         review::resolve(&mut lock(&self.learned), name, approve)
+    }
+
+    fn people(&self) -> Vec<Person> {
+        self.people.clone()
+    }
+
+    async fn assign(&self, id: u64, person: Option<EntityId>) -> Result<(), Unassigned> {
+        review::check_person(&self.people, person.as_ref())?;
+        let mut interactions = self.interactions.iter();
+        if !interactions.any(|(interaction, _)| interaction.id == id) {
+            return Err(Unassigned::NotFound);
+        }
+        lock(&self.assigns).push((id, person));
+        Ok(())
     }
 }
 

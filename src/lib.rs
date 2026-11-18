@@ -2038,22 +2038,29 @@ fn start_log(
         (home, models, stop, shared.clone()),
     )?;
     let (recorded, writer) = recorder(config, listener, &log, last_id, &trigger)?;
-    let (checks, review) = start_checks(config, trigger, log, (reasoner, catalog), (learn, tools));
+    let (checks, review) = start_checks(
+        config,
+        trigger,
+        (log, &recorded.speakers),
+        (reasoner, catalog),
+        (learn, tools),
+    );
     Ok((recorded, ((writer, checks), review, stopped, shared)))
 }
 
 /// Starts the training trigger `trigger` each `train.check_interval_s`, and the learned intent
 /// check of `config` on `log` with `reasoner`, `catalog`, the activation and the request habits
 /// of `learn` and the plugin tools `tools` each `learn.check_interval_s`. Gives both tasks, and the
-/// review of `log` with the activation of the check.
+/// review of `log` and the voice profiles of `speakers` with the activation of the check.
 fn start_checks(
     config: &Config,
     trigger: Arc<Trigger>,
-    log: Arc<dyn InteractionLog>,
+    (log, speakers): (Arc<dyn InteractionLog>, &Arc<Speakers>),
     (reasoner, catalog): (&Arc<dyn Reasoner>, &Arc<Catalog>),
     ((activation, habits), tools): ((Activation, Arc<Habits>), Vec<Tool>),
 ) -> Checked {
-    let review = Reviewer::new(Arc::clone(&log), activation.clone());
+    let voices = Arc::clone(&speakers.voices);
+    let review = Reviewer::new(Arc::clone(&log), activation.clone(), voices);
     let learning = Learning {
         config: config.learn.clone(),
         log,
