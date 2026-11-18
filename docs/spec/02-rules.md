@@ -103,7 +103,7 @@ Format:
 ```
 
 1. `Requires` and `Ensures` are exact enough to become Verus clauses. A type invariant or a loop invariant is named in the argument.
-2. A criterion about a pure function (a domain function, or a pure function of `xtask` or `train.py`) has a proof with `Ensures`. The proof states `Requires` only when the function has a precondition.
+2. A criterion about a pure function (a domain function, or a pure function of `xtask` or `train.py`) has a proof with `Ensures`. The proof states `Requires` only when the function has a precondition. A domain function that only builds log text for the user is an exception: its line says `Evidence: test.`
 3. A criterion about other code (a use case or an adapter) has a proof when a short argument exists: an order of effects, a guard or one branch. The proof then can state only the argument. Else its line says `Evidence: test.`
 4. An argument uses only the model of the sub-phase, earlier proofs and the invariants of a Quint model. It names each one that it uses.
 5. A criterion that depends on an external system (HA, a tool, a model file, a network, the GPU), on the behavior of a crate or on wall-clock time has no proof. A conformance criterion has no proof. Its line in the proofs part says `Evidence: test.`

@@ -56,9 +56,9 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 ---
 
-### 15.2 Presence and Proximity Signals
+### 15.2 People and Presence
 
-**Goal:** Read the people of the house from HA, who is home, whether the satellite's room is occupied, and how close each person's phone or watch is to the satellite.
+**Goal:** Read the people of the house from HA, who is home, and whether the satellite's room is occupied.
 
 - **Implements:** G12. **Depends on:** 15.1b.
 - **Files:** modify `src/domain/speaker.rs`.
@@ -69,22 +69,16 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 - `people(cache) -> Vec<Person>`: each state of the cache in the domain `person`, in entity ID order. `jarvis.toml` does not list people.
 - `home(cache) -> Vec<Person>`: the people whose state is `home`.
 - `occupied(cache, satellite_device, configured) -> Option<bool>`: `None` without a presence sensor, else true when one sensor is `on`. The presence sensors are `presence_sensors(cache, satellite_device, configured)`.
-- `proximity(cache, trackers, area) -> f64`: 0 when no available tracker is in the area, else `1 / (1 + distance)` of the nearest tracker in the area.
 
 **Acceptance criteria.**
 
 - AC-15.2-1: When two `person` entities are `home` and one is `not_home`, `home` returns the two people.
 - AC-15.2-2: When the satellite device has no presence sensor, `occupied` returns `None`.
-- AC-15.2-3: When a tracker area is the satellite area and the distance is 1 m, `proximity` returns 0.5.
-- AC-15.2-4: When no tracker is in the satellite area, `proximity` returns 0.
-- AC-15.2-5: When a person has two trackers in the area, `proximity` uses the nearer one.
-- AC-15.2-6: When a tracker state is `unavailable`, `proximity` ignores it.
 - AC-15.2-7: When HA has `person.alex` and `person.sam` and `jarvis.toml` has no `[[people]]`, `people` returns both with their friendly names.
 - AC-15.2-8: When a `person` entity has no `friendly_name`, `people` gives its entity ID as its name.
 
 **Proofs.**
 
-- P-15.2-3 to P-15.2-6. Ensures: `proximity` is in `[0, 1]` and equals `1 / (1 + min distance)` over available trackers in the area. Argument: the function filters by availability and area, takes the minimum distance, and maps it with `1 / (1 + d)`. An empty filter gives 0. For `d >= 0`, `1 / (1 + d)` is in `(0, 1]`, and `d = 1` gives 0.5.
 - P-15.2-1, P-15.2-2. Ensures: `home` gives the people whose state is `home`, and `occupied` is `None` without a presence sensor, else whether one sensor is `on`. Argument: both functions are filters with the stated predicate.
 - P-15.2-7, P-15.2-8. Ensures: `people` gives exactly the states in the domain `person`, in key order, and the name of each is its `friendly_name` text, else its entity ID. Argument: `people` maps the filtered states of the ordered state map, and the name falls back to the key when the attribute is not a string.
 
@@ -110,8 +104,31 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Proofs.**
 
-- P-15.2b-1 (AC-15.2b-1). Ensures: the report has one line for each satellite with its presence sensors and one line for each person of `people(cache)` with their trackers. Argument: `discovery_report` maps over the satellites and over `people(cache)`, and formats each with the result of `presence_sensors` or `trackers`.
-- P-15.2b-2 (AC-15.2b-2). Ensures: the line of a person names each item of its `device_trackers` attribute that gives no tracker. Argument: the person line appends each item for which the tracker filter of sub-phase 15.1 finds no pair of sensors.
+- P-15.2b-1, P-15.2b-2. Evidence: test. The report is log text for the user, and its tests check each line.
+
+---
+
+### 15.2c Tracker Proximity
+
+**Goal:** Read how close each person's phone or watch is to the satellite.
+
+- **Implements:** G12. **Depends on:** 15.2b.
+- **Files:** modify `src/domain/speaker.rs`.
+
+**Model.**
+
+- `proximity(cache, trackers, area) -> f64`: 0 when no available tracker is in the area, else `1 / (1 + distance)` of the nearest tracker in the area.
+
+**Acceptance criteria.**
+
+- AC-15.2c-1: When a tracker area is the satellite area and the distance is 1 m, `proximity` returns 0.5.
+- AC-15.2c-2: When no tracker is in the satellite area, `proximity` returns 0.
+- AC-15.2c-3: When a person has two trackers in the area, `proximity` uses the nearer one.
+- AC-15.2c-4: When a tracker state is `unavailable`, `proximity` ignores it.
+
+**Proofs.**
+
+- P-15.2c-1 to P-15.2c-4. Ensures: `proximity` is in `[0, 1]` and equals `1 / (1 + min distance)` over available trackers in the area. Argument: the function filters by availability and area, takes the minimum distance, and maps it with `1 / (1 + d)`. An empty filter gives 0. For `d >= 0`, `1 / (1 + d)` is in `(0, 1]`, and `d = 1` gives 0.5.
 
 ---
 
@@ -119,7 +136,7 @@ This phase identifies the speaker from presence, Bluetooth proximity through the
 
 **Goal:** Add the `VoiceEmbedder` and `VoiceProfiles` ports and their sherpa-onnx adapters. Jarvis can turn an utterance into a voice embedding and compare it with stored profiles.
 
-- **Implements:** G12. **Depends on:** 15.2b.
+- **Implements:** G12. **Depends on:** 15.2c.
 - **Files:** modify `src/ports.rs`, `src/adapters/sherpa.rs`, `src/testing/fakes.rs`, `justfile`, `src/lib.rs`, `jarvis.toml`.
 
 **Model.** `VoiceEmbedder::embed(audio) -> Result<Vec<f32>>` with `SpeakerEmbeddingExtractor`. `VoiceProfiles::enroll(person, id, embedding)` and `similarities(embedding) -> Map<person, f32>` with `SpeakerEmbeddingManager`, saved to `speaker.voices`. `id` is the interaction ID of the request (sub-phase 12.6). The store keys each sample by its interaction ID, so one request gives at most one sample. `enroll` with an interaction ID that the store has does not change the store. A profile keeps the samples of the newest `max_samples` interaction IDs: after each change, the store removes the samples of the person with the oldest IDs until `max_samples` are left. Sub-phase 15.8 adds `assign` and the pick record. `just models` also downloads the speaker model and the multi-speaker test voice `vits-piper-en_US-libritts_r-medium`. This sub-phase adds `[speaker]` (`model`, `voices`, `max_samples`, `voice_threshold`). `voice_threshold` is a voice similarity. Sub-phase 15.6 adds `threshold`, which is a combined score. `LiveModels` (sub-phase 13.10d) also keeps the voice embedder session, so the training pause releases it and loads it again.
