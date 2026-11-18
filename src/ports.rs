@@ -277,6 +277,9 @@ pub trait VoiceProfiles: Send + Sync {
     ///
     /// A sample has another length than `embedding`.
     async fn similarities(&self, embedding: &[f32]) -> anyhow::Result<BTreeMap<String, f32>>;
+
+    /// The number of samples in the profile of `person`.
+    fn sample_count(&self, person: &EntityId) -> usize;
 }
 
 /// A value that survives a restart.

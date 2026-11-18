@@ -2594,6 +2594,7 @@ mod tests {
             writer: tokio::sync::mpsc::unbounded_channel().0,
             last_id: None,
             trigger: fakes::trigger("unused".as_ref()).0,
+            speakers: fakes::speakers(Arc::default()),
         }
     }
 

@@ -53,6 +53,7 @@ use crate::Config;
 use crate::CurrentClassifier;
 use crate::Device;
 use crate::adapters::supertonic::SupertonicTts;
+use crate::app::conversation::Speakers;
 use crate::app::review;
 use crate::app::training::FIXTURE;
 use crate::app::training::Training;
@@ -71,6 +72,7 @@ use crate::domain::learn::LearnedStatus;
 use crate::domain::learn::PluginRequest;
 use crate::domain::model::Prediction;
 use crate::domain::speech::Audio;
+use crate::domain::state::EntityId;
 use crate::domain::state::Event;
 use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
@@ -111,6 +113,7 @@ use crate::ports::Tool;
 use crate::ports::Trainer;
 use crate::ports::Unresolved;
 use crate::ports::VoiceEmbedder;
+use crate::ports::VoiceProfiles;
 
 /// The reference house snapshot.
 #[must_use]
@@ -857,6 +860,45 @@ impl VoiceEmbedder for FakeVoiceEmbedder {
     fn embed(&self, _audio: &Audio) -> anyhow::Result<Vec<f32>> {
         Ok(vec![1.0])
     }
+}
+
+/// A `VoiceProfiles` with fixed similarities and sample counts, which records each enroll.
+#[derive(Default)]
+pub(crate) struct FakeVoiceProfiles {
+    /// The similarity of each person.
+    pub similarities: BTreeMap<String, f32>,
+    /// The sample count of each person. A person without one has 0.
+    pub counts: BTreeMap<String, usize>,
+    /// The person and the interaction ID of each enroll.
+    pub enrolls: Mutex<Vec<(String, u64)>>,
+}
+
+#[async_trait]
+impl VoiceProfiles for FakeVoiceProfiles {
+    async fn enroll(&self, person: &EntityId, id: u64, _embedding: &[f32]) -> anyhow::Result<()> {
+        lock(&self.enrolls).push((person.0.clone(), id));
+        Ok(())
+    }
+
+    async fn similarities(&self, _embedding: &[f32]) -> anyhow::Result<BTreeMap<String, f32>> {
+        Ok(self.similarities.clone())
+    }
+
+    fn sample_count(&self, person: &EntityId) -> usize {
+        self.counts.get(&person.0).copied().unwrap_or_default()
+    }
+}
+
+/// The speaker identification of `jarvis.toml` with `voices`.
+#[must_use]
+pub(crate) fn speakers(voices: Arc<FakeVoiceProfiles>) -> Arc<Speakers> {
+    let config = Config::parse(include_str!("../../jarvis.toml")).expect("jarvis.toml is valid");
+    Arc::new(Speakers {
+        voices,
+        config: config.speaker,
+        people: Vec::new(),
+        satellites: Vec::new(),
+    })
 }
 
 /// The 16 kHz audio of `text` from the `SupertonicTts` of `jarvis.toml` on the CPU, with 250 ms

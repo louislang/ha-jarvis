@@ -67,6 +67,7 @@ use crate::adapters::process::ProcessTrainer;
 use crate::adapters::runpod::RunPodTrainer;
 use crate::adapters::sherpa::SherpaEmbedder;
 use crate::adapters::sherpa::SherpaStt;
+use crate::adapters::sherpa::SherpaVoices;
 use crate::adapters::sqlite::SqliteLog;
 use crate::adapters::supertonic::SupertonicTts;
 use crate::app::background::Activation;
@@ -80,6 +81,7 @@ use crate::app::conversation::Conversation;
 use crate::app::conversation::PoolsTask;
 use crate::app::conversation::Queues;
 use crate::app::conversation::Recorder;
+use crate::app::conversation::Speakers;
 use crate::app::conversation::SystemTwo;
 use crate::app::plugins::Plugins;
 use crate::app::review::Reviewer;
@@ -2031,7 +2033,7 @@ fn start_log(
         runpod,
         (home, models, stop, shared.clone()),
     )?;
-    let (recorded, writer) = recorder(listener, &log, last_id, &trigger);
+    let (recorded, writer) = recorder(config, listener, &log, last_id, &trigger)?;
     let (checks, review) = start_checks(config, trigger, log, (reasoner, catalog), (learn, tools));
     Ok((recorded, ((writer, checks), review, stopped, shared)))
 }
@@ -2084,22 +2086,44 @@ fn open_log(config: &Config) -> anyhow::Result<(Arc<dyn InteractionLog>, Option<
     Ok((log, last_id))
 }
 
-/// The recorder of the utterances of `listener` and `log` with the largest stored ID `last_id`
-/// and `trigger`, and its new log writer task.
+/// The speaker identification of `config`, with the voice store `speaker.voices`.
+///
+/// # Errors
+///
+/// The voice store path is not a `.toml` or `.json` file, or the store cannot load.
+fn speakers(config: &Config) -> anyhow::Result<Arc<Speakers>> {
+    let store = Arc::new(FileStore::try_new(config.speaker.voices.clone())?);
+    Ok(Arc::new(Speakers {
+        voices: Arc::new(SherpaVoices::try_new(&config.speaker, store)?),
+        config: config.speaker.clone(),
+        people: config.people.clone(),
+        satellites: config.satellites.clone(),
+    }))
+}
+
+/// The recorder of the utterances of `listener` and `log` with the largest stored ID `last_id`,
+/// `trigger` and the speaker identification of `config`, and its new log writer task.
+///
+/// # Errors
+///
+/// The voice store cannot load.
 fn recorder(
+    config: &Config,
     listener: &Listener,
     log: &Arc<dyn InteractionLog>,
     last_id: Option<u64>,
     trigger: &Arc<Trigger>,
-) -> (Recorder, JoinHandle<()>) {
+) -> anyhow::Result<(Recorder, JoinHandle<()>)> {
+    let speakers = speakers(config)?;
     let (writer, task) = app::conversation::start_writer(Arc::clone(log));
     let recorder = Recorder {
         utterances: Arc::clone(listener.utterances()),
         writer,
         last_id,
         trigger: Arc::clone(trigger),
+        speakers,
     };
-    (recorder, task)
+    Ok((recorder, task))
 }
 
 /// The training trigger of `config` with the backoff `train.failure_backoff_s`, the process
@@ -3502,6 +3526,7 @@ mod tests {
             writer: tokio::sync::mpsc::unbounded_channel().0,
             last_id: None,
             trigger: fakes::trigger(Path::new("unused")).0,
+            speakers: fakes::speakers(Arc::default()),
         }
     }
 
