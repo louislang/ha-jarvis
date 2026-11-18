@@ -353,7 +353,7 @@ impl Config {
     }
 
     /// The name and the value of each timeout and interval.
-    fn durations(&self) -> [(&'static str, u64); 17] {
+    fn durations(&self) -> [(&'static str, u64); 18] {
         let (ha, asr, openai) = (&self.ha, &self.asr, &self.openai);
         [
             ("ha.request_timeout_ms", ha.request_timeout_ms),
@@ -373,11 +373,12 @@ impl Config {
             ("habits.save_interval_s", self.habits.save_interval_s),
             ("train.check_interval_s", self.train.check_interval_s),
             ("learn.check_interval_s", self.learn.check_interval_s),
+            ("speaker.min_enroll_ms", self.speaker.min_enroll_ms),
         ]
     }
 
     /// The name and the value of each count and limit.
-    fn counts(&self) -> [(&'static str, u64); 12] {
+    fn counts(&self) -> [(&'static str, u64); 13] {
         let (openai, backfill, train) = (&self.openai, &self.backfill, &self.train);
         [
             ("tts.num_steps", u64::from(self.tts.num_steps)),
@@ -398,6 +399,7 @@ impl Config {
             ("train.epochs", train.epochs as u64),
             ("train.batch_size", train.batch_size as u64),
             ("speaker.max_samples", self.speaker.max_samples as u64),
+            ("speaker.min_profile", self.speaker.min_profile as u64),
         ]
     }
 
@@ -789,6 +791,10 @@ pub struct SpeakerConfig {
     pub margin: f64,
     /// The proximity that gives the source `Proximity`.
     pub enroll_threshold: f64,
+    /// The voice length of an utterance that can enroll, in ms.
+    pub min_enroll_ms: u64,
+    /// The sample count from which an enroll needs a voice match.
+    pub min_profile: usize,
 }
 
 /// The `Clock` of the system time.
@@ -2792,6 +2798,8 @@ mod tests {
             threshold: 0.6,
             margin: 0.15,
             enroll_threshold: 0.5,
+            min_enroll_ms: 1500,
+            min_profile: 5,
         }
     }
 
@@ -2889,6 +2897,20 @@ mod tests {
             assert!(
                 error.contains(&name) && error.contains(range),
                 "error for {broken} has no field or range: {error}"
+            );
+        }
+    }
+
+    /// A zero `speaker.min_enroll_ms` or `speaker.min_profile` gives an error with the field and
+    /// the range.
+    #[test]
+    fn zero_enroll_limit_names_field_and_range() {
+        for (field, value) in [("min_enroll_ms", 1500), ("min_profile", 5)] {
+            let text = VALID.replace(&format!("{field} = {value}"), &format!("{field} = 0"));
+            let error = parse_error(&text);
+            assert!(
+                error.contains(&format!("speaker.{field}")) && error.contains("more than 0"),
+                "error for speaker.{field} = 0 has no field or range: {error}"
             );
         }
     }

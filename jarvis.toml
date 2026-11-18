@@ -150,6 +150,8 @@ max_samples = 20
 threshold = 0.6 # combined score of proximity and voice
 margin = 0.15
 enroll_threshold = 0.5 # proximity 1 / (1 + distance): 1 m or less
+min_enroll_ms = 1500
+min_profile = 5
 
 # Optional. The people are the `person` entities of HA. An entry only replaces the discovered
 # trackers of one person.

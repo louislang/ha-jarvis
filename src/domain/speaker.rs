@@ -753,6 +753,96 @@ pub fn identify(
     })
 }
 
+/// True when the embedding of the request of `speaker` goes into the profile of the speaker: the
+/// source is `Presence` or `Proximity`, the utterance has `min_enroll_ms` of voice, and a profile
+/// of `min_profile` samples or more needs a similarity of `voice_threshold` or more that is more
+/// than each other similarity. `samples` is the size of the profile.
+#[verus_spec(found =>
+    ensures
+        found ==> passive(speaker.source) && voice_ms >= min_enroll_ms
+            && (samples >= min_profile ==> voiced(*signals, speaker.person.0@, voice_threshold)),
+        passive(speaker.source) && voice_ms >= min_enroll_ms && samples < min_profile ==> found,
+)]
+#[must_use]
+pub fn enrolls(
+    signals: &Signals,
+    speaker: &Speaker,
+    voice_ms: u64,
+    samples: usize,
+    min_enroll_ms: u64,
+    min_profile: usize,
+    voice_threshold: f32,
+) -> bool {
+    let passive = matches!(speaker.source, Source::Presence | Source::Proximity);
+    passive
+        && voice_ms >= min_enroll_ms
+        && (samples < min_profile || sounds_like(signals, &speaker.person, voice_threshold))
+}
+
+/// True when the similarity of `person` in `signals` is `threshold` or more and more than each
+/// other similarity.
+#[verus_spec(found =>
+    ensures
+        found ==> voiced(*signals, person.0@, threshold),
+)]
+fn sounds_like(signals: &Signals, person: &EntityId, threshold: f32) -> bool {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= signals.people@.len(),
+        decreases signals.people@.len() - index,
+    ))]
+    while index < signals.people.len() {
+        if signals.people[index].entity.0.as_str() == person.0.as_str() {
+            let above = signals.people[index].voice >= threshold;
+            if !above {
+                return false;
+            }
+            let found = louder(signals, index);
+            proof! {
+                if found {
+                    assert(owner(*signals, index as int, person.0@, threshold));
+                }
+            }
+            return found;
+        }
+        index += 1;
+    }
+    false
+}
+
+/// True when the similarity at `index` of `signals` is more than each other similarity.
+#[verus_spec(found =>
+    requires
+        index < signals.people@.len(),
+    ensures
+        found ==> forall|other: int| 0 <= other < signals.people@.len() && other != index
+            ==> #[trigger] vstd::std_specs::cmp::gt_ensures::<f32>(signals.people@[index as int].voice, signals.people@[other].voice, true),
+)]
+fn louder(signals: &Signals, index: usize) -> bool {
+    let voice = signals.people[index].voice;
+    let mut other = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            other <= signals.people@.len(),
+            index < signals.people@.len(),
+            voice == signals.people@[index as int].voice,
+            forall|seen: int| 0 <= seen < other && seen != index
+                ==> #[trigger] vstd::std_specs::cmp::gt_ensures::<f32>(voice, signals.people@[seen].voice, true),
+        decreases signals.people@.len() - other,
+    ))]
+    while other < signals.people.len() {
+        if other != index {
+            let ahead = voice > signals.people[other].voice;
+            if !ahead {
+                return false;
+            }
+        }
+        other += 1;
+    }
+    true
+}
+
 /// The first candidate of `signals` with the top score, and that score.
 #[verus_spec(found =>
     ensures
@@ -1255,6 +1345,26 @@ pub open spec fn by_score(signals: Signals, found: Option<Speaker>, threshold: f
     }
 }
 
+/// True when `source` is `Presence` or `Proximity`.
+pub open spec fn passive(source: Source) -> bool {
+    source == Source::Presence || source == Source::Proximity
+}
+
+/// True when `person` is at `index` of `signals` with a similarity of `threshold` or more that is
+/// more than the similarity of each other person.
+pub open spec fn owner(signals: Signals, index: int, person: Seq<char>, threshold: f32) -> bool {
+    &&& 0 <= index < signals.people@.len()
+    &&& signals.people@[index].entity.0@ == person
+    &&& vstd::std_specs::cmp::ge_ensures::<f32>(signals.people@[index].voice, threshold, true)
+    &&& forall|other: int| 0 <= other < signals.people@.len() && other != index
+        ==> #[trigger] vstd::std_specs::cmp::gt_ensures::<f32>(signals.people@[index].voice, signals.people@[other].voice, true)
+}
+
+/// True when the voice of the request matches the profile of `person` and no other profile better.
+pub open spec fn voiced(signals: Signals, person: Seq<char>, threshold: f32) -> bool {
+    exists|index: int| #[trigger] owner(signals, index, person, threshold)
+}
+
 /// True when `id` is one of `ids`.
 pub open spec fn listed(ids: Seq<EntityId>, id: Seq<char>) -> bool {
     exists|index: int| 0 <= index < ids.len() && (#[trigger] ids[index]).0@ == id
@@ -1310,6 +1420,13 @@ pub open spec fn heard(voice: Option<&BTreeMap<String, f32>>, person: Seq<char>)
 /// Tests of discovery.
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use quint_connect::Driver;
+    use quint_connect::State as ModelState;
+    use quint_connect::Step;
+    use quint_connect::quint_run;
+    use quint_connect::switch;
     use serde_json::json;
 
     use super::*;
@@ -1773,5 +1890,167 @@ mod tests {
     fn ac_15_6c_6_unknown_presence_identifies_no_one() {
         let signals = scene(None, None, (0.0, 0.0), (0.0, 0.0));
         assert_eq!(speaker_of(&signals), None);
+    }
+
+    /// AC-15.6d-2.
+    #[test]
+    fn ac_15_6d_2_presence_enrolls_and_voice_does_not() {
+        let signals = scene(BOTH, None, (0.0, 0.0), (0.0, 0.0));
+        let mut speaker = Speaker {
+            person: id("person.alex"),
+            confidence: 1.0,
+            source: Source::Presence,
+        };
+        assert!(enrolls(&signals, &speaker, 1500, 4, 1500, 5, 0.6));
+        speaker.source = Source::Voice;
+        assert!(!enrolls(&signals, &speaker, 1500, 4, 1500, 5, 0.6));
+    }
+
+    /// The model state of `speaker.qnt` that the conformance test compares.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct SpeakerModel {
+        /// The identified speaker.
+        result: Chosen,
+        /// The signal that identified `result`.
+        source: Tag,
+        /// The person and the source of each stored sample, by interaction ID.
+        samples: BTreeMap<i64, (String, Tag)>,
+    }
+
+    /// A Quint `Option[PERSON]`.
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(tag = "tag", content = "value")]
+    enum Chosen {
+        /// A person.
+        Some(String),
+        /// No person, with the empty tuple of Quint.
+        None(Vec<i64>),
+    }
+
+    /// The variant of a Quint sum type value.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Tag {
+        /// The variant name.
+        tag: String,
+    }
+
+    /// The Quint variant of `source`, or `NoSource`.
+    fn tag(source: Option<Source>) -> Tag {
+        let tag = source.map_or_else(|| "NoSource".to_owned(), |source| format!("{source:?}"));
+        Tag { tag }
+    }
+
+    impl ModelState<SpeakerDriver> for SpeakerModel {
+        /// The speaker of the last `identify` of the request and the samples of the driver.
+        fn from_driver(driver: &SpeakerDriver) -> anyhow::Result<Self> {
+            let speaker = driver.speaker.as_ref();
+            let person = speaker.map(|speaker| speaker.person.0.clone());
+            let samples = driver.samples.iter();
+            let samples =
+                samples.map(|(&id, (person, source))| (id, (person.clone(), tag(Some(*source)))));
+            Ok(Self {
+                result: person.map_or(Chosen::None(Vec::new()), Chosen::Some),
+                source: tag(speaker.map(|speaker| speaker.source)),
+                samples: samples.collect(),
+            })
+        }
+    }
+
+    /// The value of the model level `level`, in tenths.
+    fn tenths(level: i64) -> f32 {
+        f32::from(u8::try_from(level).expect("a level from 0 to 10")) / 10.0
+    }
+
+    /// The nondet pick `name` of `step`.
+    fn pick<T: serde::de::DeserializeOwned>(step: &Step, name: &str) -> anyhow::Result<T> {
+        let found = step.nondet_picks.get(name);
+        let value = found.ok_or_else(|| anyhow::anyhow!("no pick {name}"))?;
+        Ok(T::deserialize(value.clone())?)
+    }
+
+    /// Replays `speaker.qnt` against `identify` and `enrolls`, with the model constants in tenths:
+    /// `threshold` 0.7, `margin` 0.2, `enroll_threshold` 0.5, `voice_threshold` 0.6 and
+    /// `min_profile` 1. Each utterance has `min_enroll_ms`. The driver keeps the samples and trims
+    /// each person to 2, as the voice store of sub-phase 15.3b does.
+    #[derive(Default)]
+    struct SpeakerDriver {
+        /// The signals of the request, or `None` before the first request.
+        signals: Option<Signals>,
+        /// The speaker of the last `identify` of the request.
+        speaker: Option<Speaker>,
+        /// The interaction ID of the request.
+        utterance: i64,
+        /// The person and the source of each sample, by interaction ID.
+        samples: BTreeMap<i64, (String, Source)>,
+    }
+
+    impl SpeakerDriver {
+        /// A new request with the signals of the picks of `step`.
+        fn set(&mut self, step: &Step) -> anyhow::Result<()> {
+            let at_home: BTreeSet<String> = pick(step, "atHome")?;
+            let proximity: BTreeMap<String, i64> = pick(step, "prox")?;
+            let voice: BTreeMap<String, i64> = pick(step, "v")?;
+            let mut people = Vec::new();
+            for (person, level) in &proximity {
+                people.push(PersonSignals {
+                    entity: id(person),
+                    proximity: f64::from(tenths(*level)),
+                    voice: tenths(voice[person]),
+                });
+            }
+            let (known, sensor) = (pick::<bool>(step, "known")?, pick::<bool>(step, "sensor")?);
+            self.signals = Some(Signals {
+                home: known.then(|| at_home.iter().map(|person| id(person)).collect()),
+                people,
+                occupied: sensor.then_some(pick(step, "state")?),
+            });
+            (self.speaker, self.utterance) = (None, self.utterance + 1);
+            Ok(())
+        }
+
+        /// Rule 5 for `person`, then the sample of the request and the trim of its profile.
+        fn enroll(&mut self, person: &str) -> anyhow::Result<()> {
+            let (Some(signals), Some(speaker)) = (&self.signals, &self.speaker) else {
+                anyhow::bail!("an enroll without a speaker");
+            };
+            let samples = self.samples.iter();
+            let own: Vec<i64> = samples
+                .filter(|(_, (owner, _))| owner == person)
+                .map(|(&id, _)| id)
+                .collect();
+            anyhow::ensure!(speaker.person.0 == person, "an enroll of another person");
+            anyhow::ensure!(
+                enrolls(signals, speaker, 1, own.len(), 1, 1, 0.6),
+                "no enroll"
+            );
+            self.samples
+                .insert(self.utterance, (person.to_owned(), speaker.source));
+            if own.len() >= 2 {
+                self.samples.remove(&own[0]);
+            }
+            Ok(())
+        }
+    }
+
+    impl Driver for SpeakerDriver {
+        type State = SpeakerModel;
+
+        fn step(&mut self, step: &Step) -> anyhow::Result<()> {
+            switch!(step {
+                init => *self = Self::default(),
+                setSignals => self.set(step)?,
+                identify => {
+                    let signals = self.signals.as_ref();
+                    self.speaker = signals.and_then(|signals| identify(signals, 0.7, 0.2, 0.5));
+                },
+                enroll(p: String) => self.enroll(&p)?,
+            })
+        }
+    }
+
+    /// AC-15.6d-1. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/speaker.qnt", max_steps = 30, seed = "1")]
+    fn ac_15_6d_1_conformance() -> impl Driver {
+        SpeakerDriver::default()
     }
 }
