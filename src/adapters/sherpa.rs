@@ -1,4 +1,4 @@
-//! `SpeechToText` with sherpa-onnx.
+//! `SpeechToText` and `VoiceEmbedder` with sherpa-onnx.
 
 use std::fs;
 use std::ops::RangeInclusive;
@@ -18,15 +18,20 @@ use sherpa_onnx::OnlineRecognizerConfig;
 use sherpa_onnx::OnlineStream;
 use sherpa_onnx::OnlineTransducerModelConfig;
 use sherpa_onnx::SileroVadModelConfig;
+use sherpa_onnx::SpeakerEmbeddingExtractor;
+use sherpa_onnx::SpeakerEmbeddingExtractorConfig;
 use sherpa_onnx::VadModelConfig;
 use sherpa_onnx::VoiceActivityDetector;
 use tempfile::NamedTempFile;
 
 use crate::AsrConfig;
 use crate::Device;
+use crate::SpeakerConfig;
+use crate::domain::speech::Audio;
 use crate::ports::Partial;
 use crate::ports::SpeechToText;
 use crate::ports::SttStream;
+use crate::ports::VoiceEmbedder;
 
 /// The sample rate of the first pass in Hz.
 const RATE: u16 = 16_000;
@@ -305,6 +310,46 @@ impl SpeechToText for SherpaStt {
     }
 }
 
+/// A `VoiceEmbedder` with a speaker embedding model.
+pub struct SherpaEmbedder {
+    /// The speaker embedding extractor.
+    extractor: SpeakerEmbeddingExtractor,
+}
+
+impl SherpaEmbedder {
+    /// Loads the speaker model of `config` on `device`.
+    ///
+    /// # Errors
+    ///
+    /// The model cannot load.
+    pub fn try_new(config: &SpeakerConfig, device: Device) -> anyhow::Result<Self> {
+        let extractor_config = SpeakerEmbeddingExtractorConfig {
+            model: Some(config.model.to_string_lossy().into_owned()),
+            provider: Some(provider(device)),
+            num_threads: 4,
+            ..SpeakerEmbeddingExtractorConfig::default()
+        };
+        let extractor = SpeakerEmbeddingExtractor::create(&extractor_config)
+            .with_context(|| format!("cannot load the speaker model {}", config.model.display()))?;
+        Ok(Self { extractor })
+    }
+}
+
+impl VoiceEmbedder for SherpaEmbedder {
+    fn embed(&self, audio: &Audio) -> anyhow::Result<Vec<f32>> {
+        let stream = self
+            .extractor
+            .create_stream()
+            .context("no speaker stream")?;
+        stream.accept_waveform(i32::try_from(audio.rate)?, &wave(&audio.samples));
+        stream.input_finished();
+        anyhow::ensure!(self.extractor.is_ready(&stream), "the audio is too short");
+        self.extractor
+            .compute(&stream)
+            .context("no voice embedding")
+    }
+}
+
 /// `text` with its numbers as words.
 fn number_words(text: &str) -> String {
     let words: Vec<String> = text.split_whitespace().map(colon_time).collect();
@@ -504,7 +549,6 @@ mod tests {
     use crate::Config;
     use crate::domain::intent;
     use crate::domain::speech;
-    use crate::domain::speech::Audio;
     use crate::testing::fakes;
 
     /// The request of the STT tests.
@@ -930,18 +974,18 @@ mod tests {
         Ok(samples)
     }
 
-    /// The p95 of the `transcribe` times of `stt` of each of `inputs`, after a warm-up with
-    /// `warm_up`, and the sorted times.
-    fn p95(
-        stt: &SherpaStt,
+    /// The p95 of the times of `run` of each of `inputs`, after a warm-up with `warm_up`, and the
+    /// sorted times.
+    fn p95<T>(
+        run: impl Fn(&[i16]) -> anyhow::Result<T>,
         warm_up: &[i16],
         inputs: &[&[i16]],
     ) -> anyhow::Result<(Duration, Vec<Duration>)> {
-        stt.transcribe(warm_up)?;
+        run(warm_up)?;
         let mut times = Vec::new();
         for input in inputs {
             let start = Instant::now();
-            stt.transcribe(input)?;
+            run(input)?;
             times.push(start.elapsed());
         }
         times.sort();
@@ -955,7 +999,12 @@ mod tests {
     #[ignore = "GPU host"]
     async fn ac_6_7_4_three_second_utterance_p95() -> anyhow::Result<()> {
         let samples = dentist(30).await?;
-        let (p95, times) = p95(&stt(Device::Cuda)?, &samples, &[samples.as_slice(); 20])?;
+        let stt = stt(Device::Cuda)?;
+        let (p95, times) = p95(
+            |input| stt.transcribe(input),
+            &samples,
+            &[samples.as_slice(); 20],
+        )?;
         assert!(p95 < Duration::from_millis(90), "p95 {p95:?} of {times:?}");
         Ok(())
     }
@@ -970,7 +1019,8 @@ mod tests {
         let prefix = |tenths: usize| &samples[..tenths * usize::from(RATE) / 10];
         let inputs: Vec<&[i16]> = (15..35).map(prefix).collect();
         // The warm-up has a length that no run has.
-        let (p95, times) = p95(&stt(Device::Cuda)?, prefix(10), &inputs)?;
+        let stt = stt(Device::Cuda)?;
+        let (p95, times) = p95(|input| stt.transcribe(input), prefix(10), &inputs)?;
         // The test harness captures `eprintln!` of a test that passes, but not a direct write.
         writeln!(std::io::stderr(), "AC-6.7-7: p95 {p95:?} of {times:?}")?;
         assert!(p95 <= Duration::from_millis(90), "p95 {p95:?} of {times:?}");
@@ -1068,8 +1118,30 @@ mod tests {
         stt.set_hotwords(&phrases);
         let samples = dentist(30).await?;
         // 100 runs: with 20 runs, one slow run on a shared GPU fails the p95.
-        let (p95, times) = p95(&stt, &samples, &[samples.as_slice(); 100])?;
+        let (p95, times) = p95(
+            |input| stt.transcribe(input),
+            &samples,
+            &[samples.as_slice(); 100],
+        )?;
         assert!(p95 < Duration::from_millis(90), "p95 {p95:?} of {times:?}");
+        Ok(())
+    }
+
+    /// AC-15.3-6.
+    #[tokio::test]
+    #[ignore = "GPU host"]
+    async fn ac_15_3_6_cpu_voice_embedding_p95() -> anyhow::Result<()> {
+        let embedder = SherpaEmbedder::try_new(&config()?.speaker, Device::Cpu)?;
+        let rate = u32::from(RATE);
+        let embed = |samples: &[i16]| {
+            embedder.embed(&Audio {
+                samples: samples.to_vec(),
+                rate,
+            })
+        };
+        let samples = dentist(30).await?;
+        let (p95, times) = p95(embed, &samples, &[samples.as_slice(); 20])?;
+        assert!(p95 < Duration::from_millis(80), "p95 {p95:?} of {times:?}");
         Ok(())
     }
 }

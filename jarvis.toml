@@ -142,6 +142,9 @@ url = "mqtt://homeassistant.local:1883"
 username_env = "MQTT_USERNAME"
 password_env = "MQTT_PASSWORD"
 
+[speaker]
+model = "models/wespeaker_en_voxceleb_CAM++.onnx"
+
 # Optional. The people are the `person` entities of HA. An entry only replaces the discovered
 # trackers of one person.
 # [[people]]
