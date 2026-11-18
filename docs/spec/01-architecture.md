@@ -73,7 +73,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | `SpeechToText` | Driven | `stream` (first pass: gives `accept`, `partial`, `reset`), `transcribe` (second pass), `set_hotwords` | `adapters/sherpa.rs` |
 | `TextToSpeech` | Driven | `synth` | `adapters/supertonic.rs` |
 | `VoiceEmbedder` | Driven | `embed` | `adapters/sherpa.rs` |
-| `VoiceProfiles` | Driven | `enroll`, `assign`, `similarities` | `adapters/sherpa.rs` |
+| `VoiceProfiles` | Driven | `enroll`, `assign`, `similarities`, `sample_count` | `adapters/sherpa.rs` |
 | `Classifier` | Driven | `predict` | `adapters/onnx.rs` |
 | `ModelLoader` | Driven | `load` (gives a `Classifier` for a model folder) | `adapters/onnx.rs` |
 | `Trainer` | Driven | `train` (gives a model folder for a training set) | `adapters/process.rs` (local GPU) and `adapters/runpod.rs` (fallback) |
