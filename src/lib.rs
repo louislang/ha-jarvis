@@ -238,6 +238,9 @@ pub struct Config {
     /// The tracker overrides of the people. The people are the `person` entities of HA.
     #[serde(default)]
     pub people: Vec<PersonConfig>,
+    /// The satellites whose presence sensors replace discovery.
+    #[serde(default)]
+    pub satellites: Vec<SatelliteConfig>,
 }
 
 impl Config {
@@ -744,6 +747,16 @@ pub struct PersonConfig {
     pub person: EntityId,
     /// The trackers that replace discovery.
     pub trackers: Vec<Tracker>,
+}
+
+/// A `[[satellites]]` entry.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SatelliteConfig {
+    /// The `assist_satellite` entity.
+    pub satellite: EntityId,
+    /// The presence sensors that replace discovery.
+    pub presence: Vec<EntityId>,
 }
 
 /// The `Clock` of the system time.
@@ -2752,6 +2765,7 @@ mod tests {
             web: expected_web(),
             mqtt: Some(expected_mqtt()),
             people: Vec::new(),
+            satellites: Vec::new(),
         };
         assert_eq!(Config::parse(VALID)?, expected);
         Ok(())

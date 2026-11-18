@@ -147,3 +147,8 @@ password_env = "MQTT_PASSWORD"
 # [[people]]
 # person = "person.louis"
 # trackers = [{ area = "sensor.louis_watch_area", distance = "sensor.louis_watch_distance" }]
+
+# Optional. Discovery finds the presence sensors when this is not set.
+# [[satellites]]
+# satellite = "assist_satellite.carson_bedroom"
+# presence = ["binary_sensor.bedroom_presence"]
