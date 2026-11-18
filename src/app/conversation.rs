@@ -27,11 +27,13 @@ use tokio::task::JoinHandle;
 use crate::CurrentClassifier;
 use crate::DialogConfig;
 use crate::RunClassifier;
+use crate::SpeakerConfig;
 use crate::app::background::Answers;
 use crate::app::background::Backfill;
 use crate::app::background::Habits;
 use crate::app::plugins::Plugins;
 use crate::app::speech::Committed;
+use crate::app::speech::Embedding;
 use crate::app::speech::Utterances;
 use crate::app::training::Trigger;
 use crate::domain::catalog::Catalog;
@@ -63,8 +65,13 @@ use crate::domain::model::Slot;
 use crate::domain::responses;
 use crate::domain::responses::Pools;
 use crate::domain::responses::Response;
+use crate::domain::speaker;
+use crate::domain::speaker::PersonTrackers;
+use crate::domain::speaker::Satellite;
+use crate::domain::speaker::Signals;
 use crate::domain::speech::Audio;
 use crate::domain::state::AreaId;
+use crate::domain::state::EntityId;
 use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
@@ -78,6 +85,7 @@ use crate::ports::Reasoner;
 use crate::ports::Step;
 use crate::ports::Store;
 use crate::ports::Title;
+use crate::ports::VoiceProfiles;
 use crate::ports::Work;
 
 /// One change to the pools, applied by the pools task.
@@ -115,6 +123,20 @@ pub struct Recorder {
     pub last_id: Option<u64>,
     /// The training trigger of a `train` request.
     pub trigger: Arc<Trigger>,
+    /// The speaker identification of voice requests.
+    pub speakers: Arc<Speakers>,
+}
+
+/// The voice profiles, the `[speaker]` settings and the overrides of speaker identification.
+pub struct Speakers {
+    /// The voice profiles of the people.
+    pub voices: Arc<dyn VoiceProfiles>,
+    /// The `[speaker]` section.
+    pub config: SpeakerConfig,
+    /// The `[[people]]` entries.
+    pub people: Vec<PersonTrackers>,
+    /// The `[[satellites]]` entries.
+    pub satellites: Vec<Satellite>,
 }
 
 /// One message to the log writer task.
@@ -237,7 +259,10 @@ impl Conversation {
         let key = context.satellite_id.or(context.conversation_id).map(Key);
         let (handled, logged) = self.respond(text, key, area, &mut heard).await?;
         if let Some((prediction, decided)) = logged {
-            self.append(heard, &prediction, decided);
+            let (id, satellite) = (heard.id, heard.satellite.clone());
+            if let Some(voice) = self.append(heard, &prediction, decided) {
+                self.identify_speaker(id, (satellite, context.device_id), voice);
+            }
         }
         Ok(handled)
     }
@@ -295,17 +320,18 @@ impl Conversation {
     }
 
     /// Sends the record of `heard` with `prediction` and `decided` to the log writer, with the
-    /// audio of its utterance.
-    fn append(&self, heard: Heard, prediction: &Prediction, decided: Decided) {
+    /// audio of its utterance. Gives the embedding task and the voiced time of the utterance.
+    fn append(&self, heard: Heard, prediction: &Prediction, decided: Decided) -> Option<Voice> {
         let Decided {
             route,
             call,
             response,
         } = decided;
-        let (audio, voice_end) = heard.utterance.map_or((None, None), |committed| {
+        let (audio, voice_end, voice) = heard.utterance.map_or((None, None, None), |committed| {
             (
                 Some(committed.utterance.audio),
                 committed.utterance.voice_end,
+                Some((committed.embedding, committed.voiced_ms)),
             )
         });
         let interaction = Interaction {
@@ -328,6 +354,19 @@ impl Conversation {
         // A send fails only after the writer ended, at shutdown.
         let write = Write::Append(Box::new(interaction), audio);
         let _ = self.recorder.writer.send(write);
+        voice
+    }
+
+    /// Spawns the speaker identification of the voice request `id` from the satellite and the
+    /// device of `origin` with `voice`, and its enroll by rule 5.
+    fn identify_speaker(&self, id: u64, origin: Origins, voice: Voice) {
+        let speakers = Arc::clone(&self.recorder.speakers);
+        let cache = self.queues.cache.clone();
+        tokio::spawn(async move {
+            if let Err(error) = enroll_voice(&speakers, &cache, id, origin, voice).await {
+                tracing::info!("no voice enroll for {id}: {error:#}");
+            }
+        });
     }
 
     /// The open dialog of `key` at the time of `heard` and its key. The dialog map and the link
@@ -1454,6 +1493,12 @@ struct Origin {
     id: u64,
 }
 
+/// The embedding task and the voiced time in ms of the utterance of a voice request.
+type Voice = (Embedding, u64);
+
+/// The satellite entity and the device of a request.
+type Origins = (Option<String>, Option<String>);
+
 /// The reply to a dialog answer that ends the routing, with its prediction and the parts of its
 /// record, or `None` for a cancel, which is not logged.
 type Answered = (Handled, Option<(Prediction, Decided)>);
@@ -1478,6 +1523,73 @@ struct Decided {
     call: Option<ServiceCall>,
     /// The response that `handle` gives.
     response: Spoken,
+}
+
+/// Awaits the embedding of `voice`, identifies the speaker of the request `id` from `origin` in
+/// `cache` with the profiles of `speakers`, and enrolls the embedding when rule 5 allows it.
+///
+/// # Errors
+///
+/// The embedding or a call of the voice profiles failed.
+async fn enroll_voice(
+    speakers: &Speakers,
+    cache: &watch::Receiver<StateCache>,
+    id: u64,
+    origin: Origins,
+    (embedding, voiced_ms): Voice,
+) -> anyhow::Result<()> {
+    let embedding = embedding.await??;
+    let similarities = speakers.voices.similarities(&embedding).await?;
+    let signals = speakers.signals(&cache.borrow(), origin, &similarities);
+    if let Some(person) = speakers.enrollee(&signals, voiced_ms) {
+        speakers.voices.enroll(&person, id, &embedding).await?;
+    }
+    Ok(())
+}
+
+impl Speakers {
+    /// The signals in `cache` of a request from the satellite and the device of `origin`, with
+    /// the voice `similarities`.
+    fn signals(
+        &self,
+        cache: &StateCache,
+        (satellite, device): Origins,
+        similarities: &BTreeMap<String, f32>,
+    ) -> Signals {
+        let area = device
+            .as_deref()
+            .and_then(|device| cache.area_of_device(device));
+        let entry = self.satellites.iter();
+        let mut entry = entry.filter(|entry| satellite.as_deref() == Some(&*entry.satellite.0));
+        let presence = entry.next().map(|entry| entry.presence.clone());
+        let device = device.as_deref().unwrap_or_default();
+        speaker::signals(
+            cache,
+            device,
+            area,
+            &self.people,
+            presence,
+            Some(similarities),
+        )
+    }
+
+    /// The speaker of `signals` when rule 5 enrolls a voice of `voiced_ms`.
+    fn enrollee(&self, signals: &Signals, voiced_ms: u64) -> Option<EntityId> {
+        let config = &self.config;
+        let (threshold, margin) = (config.threshold, config.margin);
+        let found = speaker::identify(signals, threshold, margin, config.enroll_threshold)?;
+        let samples = self.voices.sample_count(&found.person);
+        let enrolls = speaker::enrolls(
+            signals,
+            &found,
+            voiced_ms,
+            samples,
+            config.min_enroll_ms,
+            config.min_profile,
+            config.voice_threshold,
+        );
+        enrolls.then_some(found.person)
+    }
 }
 
 /// The milliseconds from `voice_end` to `end`, or `None` without a voice end.
@@ -1926,6 +2038,7 @@ mod tests {
     use crate::testing::fakes::FakeTrainer;
     use crate::testing::fakes::FakeTts;
     use crate::testing::fakes::FakeVoiceEmbedder;
+    use crate::testing::fakes::FakeVoiceProfiles;
     use crate::testing::fakes::Scripted;
     use crate::testing::fakes::SetClock;
     use crate::testing::fakes::house;
@@ -2880,12 +2993,12 @@ mod tests {
             writer: tokio::sync::mpsc::unbounded_channel().0,
             last_id: None,
             trigger: fakes::trigger(Path::new("unused")).0,
+            speakers: fakes::speakers(Arc::default()),
         }
     }
 
-    /// A conversation on `home` whose classifier gives `lights_on` with 0.9 and the area slot
-    /// `kitchen`, which logs to a `FakeLog` that waits `delay` for each call, and the log.
-    fn logging(home: &Arc<FakeHome>, delay: Duration) -> (Arc<FakeLog>, Conversation) {
+    /// A classifier that gives `lights_on` with 0.9 and the area slot `kitchen`.
+    fn lights() -> Arc<FakeClassifier> {
         let classifier = Arc::new(FakeClassifier::default());
         let slot = Slot {
             name: "area".to_owned(),
@@ -2895,7 +3008,13 @@ mod tests {
             ranked: vec![("lights_on".to_owned(), 0.9)],
             slots: vec![slot],
         });
-        logging_with(home, classifier, Arc::default(), delay)
+        classifier
+    }
+
+    /// A conversation on `home` whose classifier is [`lights`], which logs to a `FakeLog` that
+    /// waits `delay` for each call, and the log.
+    fn logging(home: &Arc<FakeHome>, delay: Duration) -> (Arc<FakeLog>, Conversation) {
+        logging_with(home, lights(), Arc::default(), delay)
     }
 
     /// A conversation on `home`, `classifier` and `reasoner`, which logs to a `FakeLog` that waits
@@ -2918,16 +3037,95 @@ mod tests {
     /// Keeps an utterance of `LIGHTS` in `conversation`, whose voice ended 200 ms before the time
     /// of the tests, with its `FakeVoiceEmbedder` embedding. Gives its audio.
     fn hear(conversation: &Conversation) -> Audio {
+        hear_voiced(conversation, vec![1, 2, 3], 0)
+    }
+
+    /// [`hear`] with the audio `samples` and the voiced time `voiced_ms`.
+    fn hear_voiced(conversation: &Conversation, samples: Vec<i16>, voiced_ms: u64) -> Audio {
         use crate::ports::VoiceEmbedder as _;
 
         let voice_end = Timestamp::UNIX_EPOCH - Duration::from_millis(200);
-        let (samples, rate) = (vec![1, 2, 3], 16_000);
-        let audio = Audio { samples, rate };
+        let audio = Audio {
+            samples,
+            rate: 16_000,
+        };
         let sound = audio.clone();
         let embedding = tokio::task::spawn_blocking(move || FakeVoiceEmbedder.embed(&sound));
         let utterances = &conversation.recorder.utterances;
-        utterances.append(LIGHTS.to_owned(), audio.clone(), Some(voice_end), embedding);
+        let (text, voice_end) = (LIGHTS.to_owned(), Some(voice_end));
+        utterances.append(text, audio.clone(), voice_end, embedding, voiced_ms);
         audio
+    }
+
+    /// The enrolls of `voices` after a voice request of `LIGHTS` with 2 s of audio and the voiced
+    /// time `voiced_ms`, when `person.louis` is in the state `louis` and `person.ali` is home.
+    async fn enrolls_of(
+        louis: &str,
+        voices: FakeVoiceProfiles,
+        voiced_ms: u64,
+    ) -> anyhow::Result<Vec<(String, u64)>> {
+        let voices = Arc::new(voices);
+        let (cache, _changes, mut conversation) =
+            still_with(&Arc::default(), "idle", lights(), Arc::default());
+        cache.send_modify(|cache| {
+            let state = cache
+                .states
+                .get_mut("person.louis")
+                .expect("the house has it");
+            Arc::make_mut(state).state = louis.to_owned();
+        });
+        conversation.recorder.speakers = fakes::speakers(Arc::clone(&voices));
+        hear_voiced(&conversation, vec![0; 32_000], voiced_ms);
+        let _handled = conversation.handle(LIGHTS, on_satellite()).await?;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let enrolls = voices.enrolls.lock().expect("no lock holder panics");
+        Ok(enrolls.clone())
+    }
+
+    /// Profiles with the similarities `similarities` and 5 samples of `person.ali`.
+    fn profiles(similarities: &[(&str, f32)]) -> FakeVoiceProfiles {
+        let similarities = similarities.iter();
+        FakeVoiceProfiles {
+            similarities: similarities
+                .map(|&(person, value)| (person.to_owned(), value))
+                .collect(),
+            counts: BTreeMap::from([("person.ali".to_owned(), 5)]),
+            ..FakeVoiceProfiles::default()
+        }
+    }
+
+    /// AC-15.6e-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_6e_1_presence_enrolls_the_voice() -> anyhow::Result<()> {
+        let enrolls = enrolls_of("not_home", FakeVoiceProfiles::default(), 2000).await?;
+        assert_eq!(enrolls, [("person.ali".to_owned(), 0)]);
+        Ok(())
+    }
+
+    /// AC-15.6e-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_6e_2_voice_alone_does_not_enroll() -> anyhow::Result<()> {
+        let voices = profiles(&[("person.ali", 0.9), ("person.louis", 0.1)]);
+        assert_eq!(enrolls_of("home", voices, 2000).await?, []);
+        Ok(())
+    }
+
+    /// AC-15.6e-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_6e_3_profile_with_samples_needs_a_voice_match() -> anyhow::Result<()> {
+        let weak = profiles(&[("person.ali", 0.5)]);
+        assert_eq!(enrolls_of("not_home", weak, 2000).await?, []);
+        let other = profiles(&[("person.ali", 0.9), ("person.louis", 0.95)]);
+        assert_eq!(enrolls_of("not_home", other, 2000).await?, []);
+        Ok(())
+    }
+
+    /// AC-15.6e-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_6e_4_short_voice_does_not_enroll() -> anyhow::Result<()> {
+        let enrolls = enrolls_of("not_home", FakeVoiceProfiles::default(), 1000).await?;
+        assert_eq!(enrolls, []);
+        Ok(())
     }
 
     /// AC-15.4-2.

@@ -443,6 +443,12 @@ impl VoiceProfiles for SherpaVoices {
             .map(|found| (found.name, found.score))
             .collect())
     }
+
+    fn sample_count(&self, person: &EntityId) -> usize {
+        let voices = self.voices();
+        let samples = voices.samples.values();
+        samples.filter(|sample| sample.person == person.0).count()
+    }
 }
 
 /// Removes the samples of `person` with the oldest interaction IDs until `max_samples` are left.
@@ -1408,6 +1414,20 @@ mod tests {
             similarities["person.ali"] > similarities["person.louis"],
             "{similarities:?}"
         );
+        Ok(())
+    }
+
+    /// AC-15.6e-5.
+    #[test]
+    fn ac_15_6e_5_sample_count_counts_the_samples_of_the_person() -> anyhow::Result<()> {
+        let samples = BTreeMap::from([
+            (1, sample("person.alex", &[1.0, 0.0])),
+            (2, sample("person.sam", &[0.0, 1.0])),
+            (3, sample("person.alex", &[1.0, 0.1])),
+        ]);
+        let store = Arc::new(FakeStore::new(Some(Voices { samples })));
+        let alex = EntityId("person.alex".to_owned());
+        assert_eq!(voices(&store, 20)?.sample_count(&alex), 2);
         Ok(())
     }
 

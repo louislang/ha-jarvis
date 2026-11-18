@@ -170,6 +170,7 @@ flowchart LR
     crate_app_conversation --> crate_domain_intent
     crate_app_conversation --> crate_domain_model
     crate_app_conversation --> crate_domain_responses
+    crate_app_conversation --> crate_domain_speaker
     crate_app_conversation --> crate_domain_speech
     crate_app_conversation --> crate_domain_state
     crate_app_conversation --> crate_domain_state_cache

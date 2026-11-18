@@ -53,6 +53,8 @@ pub struct Committed {
     pub utterance: Utterance,
     /// The task of its voice embedding.
     pub embedding: Embedding,
+    /// The voiced time of the utterance in ms, without the trailing silence.
+    pub voiced_ms: u64,
 }
 
 /// The kept utterances and their embedding tasks.
@@ -60,10 +62,10 @@ pub struct Committed {
 struct Kept {
     /// The utterances in commit order.
     utterances: Vec<Utterance>,
-    /// The embedding task of each utterance by its time and text. Two utterances with the same
-    /// time and text share one entry, but `correlate` never gives either: both match, or both
-    /// expired.
-    embeddings: BTreeMap<(Timestamp, String), Embedding>,
+    /// The embedding task and the voiced time of each utterance by its time and text. Two
+    /// utterances with the same time and text share one entry, but `correlate` never gives
+    /// either: both match, or both expired.
+    embeddings: BTreeMap<(Timestamp, String), (Embedding, u64)>,
 }
 
 /// The committed utterances of the last `log.correlate_s`, which a request finds by its text.
@@ -87,19 +89,21 @@ impl Utterances {
         }
     }
 
-    /// Drops the expired utterances, then keeps `text`, `audio`, `voice_end` and `embedding` at
-    /// the time now.
+    /// Drops the expired utterances, then keeps `text`, `audio`, `voice_end`, `embedding` and the
+    /// voiced time `voiced_ms` at the time now.
     pub fn append(
         &self,
         text: String,
         audio: Audio,
         voice_end: Option<Timestamp>,
         embedding: Embedding,
+        voiced_ms: u64,
     ) {
         self.change(|kept, time| {
             let mut utterances =
                 speech::expire(mem::take(&mut kept.utterances), time, self.window_s);
-            kept.embeddings.insert((time, text.clone()), embedding);
+            let key = (time, text.clone());
+            kept.embeddings.insert(key, (embedding, voiced_ms));
             utterances.push(Utterance {
                 text,
                 audio,
@@ -120,10 +124,11 @@ impl Utterances {
             kept.utterances = rest;
             let utterance = found?;
             let key = (utterance.time, utterance.text.clone());
-            let embedding = kept.embeddings.remove(&key)?;
+            let (embedding, voiced_ms) = kept.embeddings.remove(&key)?;
             Some(Committed {
                 utterance,
                 embedding,
+                voiced_ms,
             })
         })
         .flatten()
@@ -240,6 +245,8 @@ impl Listener {
             confident: false,
             samples: Vec::new(),
             voice_end_ms: None,
+            vad_ms: 0,
+            voiced_ms: 0,
         }))
     }
 }
@@ -272,6 +279,10 @@ struct Session {
     samples: Vec<i16>,
     /// The audio position of the last voiced sample of the last partial.
     voice_end_ms: Option<u64>,
+    /// The end of the audio that the VAD decided in the last partial.
+    vad_ms: u64,
+    /// The length of the decided chunks with voice, in ms.
+    voiced_ms: u64,
 }
 
 impl Session {
@@ -350,7 +361,8 @@ impl Session {
         let (voice, sound) = (Arc::clone(&self.voice), audio.clone());
         // Spawned and not awaited, so the embedding adds no time to the transcript.
         let embedding = tokio::task::spawn_blocking(move || voice.embed(&sound));
-        self.utterances.append(text, audio, voice_end, embedding);
+        self.utterances
+            .append(text, audio, voice_end, embedding, self.voiced_ms);
     }
 }
 
@@ -396,7 +408,11 @@ impl Listening for Session {
         self.samples.extend_from_slice(&samples);
         let stream = Arc::clone(&self.stream);
         let partial = tokio::task::spawn_blocking(move || accept(&stream, &samples)).await??;
-        self.voice_end_ms = partial.voice_end_ms;
+        // A decided chunk is voiced when the voice end moves into it.
+        if partial.voice_end_ms > self.voice_end_ms {
+            self.voiced_ms += partial.vad_ms.saturating_sub(self.vad_ms);
+        }
+        (self.voice_end_ms, self.vad_ms) = (partial.voice_end_ms, partial.vad_ms);
         self.update(&partial.text).await;
         if !self.commits(&partial) {
             return Ok(None);
@@ -633,9 +649,10 @@ mod tests {
             audio.clone(),
             None,
             empty(),
+            0,
         );
         set(11)?;
-        utterances.append("turn off the fan".to_owned(), audio, None, empty());
+        utterances.append("turn off the fan".to_owned(), audio, None, empty(), 0);
         assert_eq!(texts(&utterances), ["turn off the fan"], "after an append");
         set(22)?;
         assert!(utterances.correlate("pause the music").is_none());
@@ -811,6 +828,33 @@ mod tests {
         assert!(!embedding.is_finished(), "the embedding completed first");
         release.send(())?;
         assert_eq!(embedding.await??, [2.0]);
+        Ok(())
+    }
+
+    /// The voiced time of a commit counts the decided chunks with voice, and not the silence
+    /// before the commit.
+    #[tokio::test(start_paused = true)]
+    async fn voiced_time_has_no_trailing_silence() -> anyhow::Result<()> {
+        let stt = FakeStt {
+            partials: vec![
+                partial("", None, 100),
+                partial(TEXT, Some(300), 300),
+                partial(TEXT, Some(500), 500),
+                partial(TEXT, Some(500), 700),
+            ],
+            ..FakeStt::default()
+        };
+        let classifier = Arc::new(FakeClassifier::default());
+        classifier.script(prediction("lights_on", 0.95));
+        let queues = dialogs(Vec::new(), Timestamp::UNIX_EPOCH);
+        let voice = Arc::new(FakeVoiceEmbedder);
+        let listener = listener(stt, &classifier, &Arc::default(), queues, voice);
+        let mut session = listener.listen()?;
+        for _ in 0..4 {
+            session.push(vec![0; 320]).await?;
+        }
+        let committed = listener.utterances().correlate(TEXT);
+        assert_eq!(committed.context("no utterance")?.voiced_ms, 400);
         Ok(())
     }
 
