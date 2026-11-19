@@ -32,6 +32,7 @@ use crate::domain::feedback::Mark;
 use crate::domain::feedback::Value;
 use crate::domain::learn::LearnedIntent;
 use crate::domain::speech::Audio;
+use crate::domain::state::EntityId;
 use crate::ports::Clock;
 use crate::ports::Control;
 use crate::ports::Filter;
@@ -40,6 +41,7 @@ use crate::ports::Refusal;
 use crate::ports::Review;
 use crate::ports::Setting;
 use crate::ports::Status;
+use crate::ports::Unassigned;
 use crate::ports::Unresolved;
 
 /// The page of the Jarvis tab.
@@ -107,6 +109,13 @@ struct ResolveBody {
     approve: bool,
 }
 
+/// The body of `POST api/interactions/{id}/speaker`.
+#[derive(Deserialize)]
+struct SpeakerBody {
+    /// The `person` entity of the speaker, or `None` for no speaker.
+    person: Option<EntityId>,
+}
+
 /// Serves the routes of `web` on `listener` until `shutdown` completes, then waits for the open
 /// requests.
 ///
@@ -131,6 +140,8 @@ fn router(web: Web) -> Router {
         .route("/interactions", routing::get(list))
         .route("/interactions/{id}/audio", routing::get(audio))
         .route("/interactions/{id}/mark", routing::post(mark))
+        .route("/interactions/{id}/speaker", routing::post(speaker))
+        .route("/people", routing::get(people))
         .route("/intents", routing::get(intents))
         .route("/proposals", routing::get(proposals))
         .route("/proposals/{name}", routing::post(resolve))
@@ -262,6 +273,31 @@ async fn resolve(
     }
 }
 
+/// The people of the house as `{entity, name}`.
+async fn people(State(web): State<Arc<Web>>) -> Json<Vec<serde_json::Value>> {
+    let people = web.review.people().into_iter();
+    Json(
+        people
+            .map(|person| json!({ "entity": person.entity, "name": person.name }))
+            .collect(),
+    )
+}
+
+/// Sets the person of `body` as the speaker of the interaction `id`. Gives 400 for a person that
+/// is not one of the people, and 404 when the interaction has no embedding.
+async fn speaker(
+    State(web): State<Arc<Web>>,
+    Path(id): Path<u64>,
+    Json(body): Json<SpeakerBody>,
+) -> StatusCode {
+    match web.review.assign(id, body.person).await {
+        Ok(()) => StatusCode::NO_CONTENT,
+        Err(Unassigned::NotPerson) => StatusCode::BAD_REQUEST,
+        Err(Unassigned::NotFound) => StatusCode::NOT_FOUND,
+        Err(Unassigned::Failed(error)) => failed(&error),
+    }
+}
+
 /// The status of Jarvis.
 async fn status(State(web): State<Arc<Web>>) -> Json<Status> {
     Json(web.control.status())
@@ -294,6 +330,7 @@ mod tests {
     use super::*;
     use crate::domain::learn::Learned;
     use crate::domain::learn::LearnedStatus;
+    use crate::domain::speaker::Person;
     use crate::ports;
     use crate::testing::fakes;
     use crate::testing::fakes::FakeClock;
@@ -321,10 +358,14 @@ mod tests {
         Ok((interaction, audio))
     }
 
-    /// A `FakeReview` with the interaction 1 with audio, the interaction 2 without audio and the
-    /// intent `tv_on`.
+    /// A `FakeReview` with the interaction 1 with audio, the interaction 2 without audio, the
+    /// intent `tv_on` and the person `person.sam`.
     fn review() -> anyhow::Result<FakeReview> {
         Ok(FakeReview {
+            people: vec![Person {
+                entity: EntityId("person.sam".to_owned()),
+                name: "Sam".to_owned(),
+            }],
             interactions: vec![logged(2, &[])?, logged(1, &SAMPLES)?],
             intents: vec!["tv_on".to_owned(), "unknown".to_owned()],
             ..FakeReview::default()
@@ -652,6 +693,67 @@ mod tests {
         ] {
             assert!(template.contains(element), "the template has no {element}");
         }
+        Ok(())
+    }
+
+    /// AC-15.8c-1.
+    #[tokio::test]
+    async fn ac_15_8c_1_people_are_the_people_of_the_review() -> anyhow::Result<()> {
+        let people: serde_json::Value = get("people").await?.json().await?;
+        assert_eq!(people, json!([{ "entity": "person.sam", "name": "Sam" }]));
+        Ok(())
+    }
+
+    /// The status of a speaker request with `person` on the interaction `id`, and the assigns of
+    /// the review.
+    async fn post_speaker(
+        id: u64,
+        person: serde_json::Value,
+    ) -> anyhow::Result<(StatusCode, Vec<(u64, Option<EntityId>)>)> {
+        let review = Arc::new(review()?);
+        let url = start(Arc::clone(&review), ONLINE).await?;
+        let request = reqwest::Client::new().post(format!("{url}interactions/{id}/speaker"));
+        let body = json!({ "person": person });
+        let response = request.bearer_auth(TOKEN).json(&body).send().await?;
+        let assigns = review.assigns.lock().expect("no test panicked").clone();
+        Ok((response.status(), assigns))
+    }
+
+    /// AC-15.8c-2.
+    #[tokio::test]
+    async fn ac_15_8c_2_speaker_assigns_the_person_or_none() -> anyhow::Result<()> {
+        let sam = Some(EntityId("person.sam".to_owned()));
+        let picked = post_speaker(1, json!("person.sam")).await?;
+        assert_eq!(picked, (StatusCode::NO_CONTENT, vec![(1, sam)]));
+        let cleared = post_speaker(1, serde_json::Value::Null).await?;
+        assert_eq!(cleared, (StatusCode::NO_CONTENT, vec![(1, None)]));
+        Ok(())
+    }
+
+    /// AC-15.8c-3.
+    #[tokio::test]
+    async fn ac_15_8c_3_unknown_person_gives_400_and_no_embedding_404() -> anyhow::Result<()> {
+        let unknown = post_speaker(1, json!("person.alex")).await?;
+        assert_eq!(unknown, (StatusCode::BAD_REQUEST, Vec::new()));
+        let missing = post_speaker(9, json!("person.sam")).await?;
+        assert_eq!(missing, (StatusCode::NOT_FOUND, Vec::new()));
+        Ok(())
+    }
+
+    /// AC-15.8c-4.
+    #[tokio::test]
+    async fn ac_15_8c_4_interaction_template_has_the_speaker_list() -> anyhow::Result<()> {
+        let api = start(Arc::new(review()?), ONLINE).await?;
+        let html = reqwest::get(api.trim_end_matches("api/")).await?;
+        let html = html.text().await?;
+        let (_, template) = html
+            .split_once(r#"<template id="interaction">"#)
+            .expect("the page has template#interaction");
+        let (template, _) = template.split_once("</template>").expect("it ends");
+        assert!(
+            template.contains(r#"<select class="speaker""#),
+            "the template has no select.speaker"
+        );
         Ok(())
     }
 
