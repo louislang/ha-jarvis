@@ -467,7 +467,7 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 
 **Acceptance criteria.**
 
-- AC-15.8d-1 [Quint]: `PickWins`, `NoVoiceOnlyEnrollment` and `ProfilesBounded` hold in simulation and to 10 steps in `quint verify`. This replaces AC-15.8b-6.
+- AC-15.8d-1 [Quint]: `PickWins`, `NoVoiceOnlyEnrollment` and `ProfilesBounded` hold in simulation and to `VERIFY_STEPS` (8) steps in `quint verify`. This replaces AC-15.8b-6.
 - AC-15.8d-2: When `quint-connect` replays 100 traces of `speaker.qnt` with `assignVoice`, the samples and the pick record of `FakeVoiceProfiles` match `samples` and `picks` after each step. This replaces AC-15.8b-7.
 
 **Proofs.**
