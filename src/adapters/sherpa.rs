@@ -255,11 +255,13 @@ fn detector(config: &VadModelConfig) -> anyhow::Result<VoiceActivityDetector> {
     VoiceActivityDetector::create(config, 30.0).context("cannot load the VAD")
 }
 
-/// Removes the first finished speech segment of `vad` and gives its end in samples.
-fn pop_segment_end(vad: &VoiceActivityDetector) -> Option<u64> {
+/// Removes the first finished speech segment of `vad` and gives its end and its length in
+/// samples.
+fn pop_segment(vad: &VoiceActivityDetector) -> Option<(u64, u64)> {
     let segment = vad.front()?;
     vad.pop();
-    Some(segment.start().unsigned_abs() + u64::from(segment.n().unsigned_abs()))
+    let length = u64::from(segment.n().unsigned_abs());
+    Some((segment.start().unsigned_abs() + length, length))
 }
 
 /// The voice end in samples that a stream of `config` gives for the 16 kHz `samples`, or `None`
@@ -275,7 +277,7 @@ pub(crate) fn voice_end(config: &AsrConfig, samples: &[i16]) -> anyhow::Result<O
     // A stream gives the VAD at most one frame in each call.
     for window in wave(samples).chunks(usize::from(WINDOW)) {
         vad.accept_waveform(window);
-        while let Some(segment_end) = pop_segment_end(&vad) {
+        while let Some((segment_end, _)) = pop_segment(&vad) {
             end = Some(segment_end);
         }
     }
@@ -293,6 +295,7 @@ impl SpeechToText for SherpaStt {
             fed: 0,
             decided: 0,
             voice_end: None,
+            voiced: 0,
         }))
     }
 
@@ -529,6 +532,8 @@ struct SherpaStream {
     decided: u64,
     /// The end of the last voiced frame, or `None` before any speech.
     voice_end: Option<u64>,
+    /// The length of the finished speech segments.
+    voiced: u64,
 }
 
 impl SherpaStream {
@@ -545,8 +550,8 @@ impl SherpaStream {
     fn track(&mut self, count: usize) -> bool {
         self.fed += count as u64;
         let mut ended = false;
-        while let Some(end) = pop_segment_end(&self.vad) {
-            self.voice_end = Some(end);
+        while let Some((end, length)) = pop_segment(&self.vad) {
+            (self.voice_end, self.voiced) = (Some(end), self.voiced + length);
             ended = true;
         }
         let detected = self.vad.detected();
@@ -590,6 +595,7 @@ impl SttStream for SherpaStream {
             text: result.map(|result| result.text).unwrap_or_default(),
             voice_end_ms: self.voice_end.map(ms),
             vad_ms: ms(self.decided),
+            voiced_ms: ms(self.voiced),
         }
     }
 
@@ -597,7 +603,12 @@ impl SttStream for SherpaStream {
     fn reset(&mut self) {
         self.stream = self.recognizer.create_stream();
         self.vad.reset();
-        (self.fed, self.decided, self.voice_end) = (0, 0, None);
+        (self.fed, self.decided, self.voice_end, self.voiced) = (0, 0, None, 0);
+    }
+
+    fn flush(&mut self) {
+        self.vad.flush();
+        self.track(0);
     }
 }
 
@@ -792,6 +803,29 @@ mod tests {
     /// The partials of `speech(REQUEST)` on the CPU.
     async fn partials() -> anyhow::Result<Vec<Partial>> {
         partials_of(&stt(Device::Cpu)?, &fakes::speech(REQUEST).await?)
+    }
+
+    /// Speech cut at its voice end has the voiced time of the same speech with its silence,
+    /// within 100 ms, after `flush`.
+    #[tokio::test]
+    async fn flush_counts_the_open_speech_segment() -> anyhow::Result<()> {
+        let (stt, mut audio) = (stt(Device::Cpu)?, fakes::speech(REQUEST).await?);
+        let ended = partials_of(&stt, &audio)?
+            .last()
+            .map_or(0, |last| last.voiced_ms);
+        let end = voice_end(&config()?.asr, &audio.samples)?.unwrap_or_default();
+        audio.samples.truncate(usize::try_from(end)?);
+        let mut stream = stt.stream()?;
+        for chunk in speech::chunks(&audio, CHUNK) {
+            stream.accept(chunk);
+        }
+        stream.flush();
+        let voiced = stream.partial().voiced_ms;
+        assert!(
+            ended > 0 && voiced.abs_diff(ended) <= 100,
+            "voiced {voiced}, not {ended}"
+        );
+        Ok(())
     }
 
     /// The partial after each 20 ms chunk of `audio` in a new first pass of `stt`.

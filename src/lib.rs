@@ -1195,6 +1195,10 @@ impl SttStream for LiveStream {
     fn reset(&mut self) {
         self.stream.reset();
     }
+
+    fn flush(&mut self) {
+        self.stream.flush();
+    }
 }
 
 /// The model sessions of Jarvis: both STT passes, TTS, the voice embedder and the System One
@@ -3932,6 +3936,7 @@ mod tests {
             text: text.to_owned(),
             voice_end_ms: None,
             vad_ms: 20,
+            voiced_ms: 0,
         };
         let stt = FakeStt {
             partials: vec![partial],

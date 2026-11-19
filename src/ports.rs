@@ -198,6 +198,8 @@ pub struct Partial {
     pub voice_end_ms: Option<u64>,
     /// The end of the audio that the VAD has decided.
     pub vad_ms: u64,
+    /// The length of the finished VAD speech segments.
+    pub voiced_ms: u64,
 }
 
 /// Speech to text.
@@ -231,6 +233,9 @@ pub trait SttStream: Send {
 
     /// Drops the audio so far.
     fn reset(&mut self);
+
+    /// Ends the open VAD speech segment, so `partial` counts its voice.
+    fn flush(&mut self);
 }
 
 /// One listen session: the audio of one utterance, chunk by chunk.
