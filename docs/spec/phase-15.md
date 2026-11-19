@@ -453,25 +453,26 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 
 ### 15.8d Assignment Conformance
 
-**Goal:** Add the pick record and `assign` to `speaker.qnt`, and replay the model against `Review::assign`. Prove that a pick always wins over passive enrollment.
+**Goal:** Add the pick record and `assignVoice` to `speaker.qnt`, and replay the model against `Review::assign`. Prove that a pick always wins over passive enrollment.
 
 - **Implements:** G12, G19. **Depends on:** 15.8b.
 - **Files:** modify `quint/speaker.qnt`, `src/domain/speaker.rs`, `src/app/review.rs`, `src/testing/fakes.rs`.
-- **Quint:** `speaker.qnt` (`assign`, conformance).
+- **Quint:** `speaker.qnt` (`assignVoice`, conformance).
 
 **Model.**
 
-- `speaker.qnt`: the new state `picks: int -> Option[PERSON]` is the pick record. The new action `assign(id, p)` sets `picks[id] = p`, removes `id` from `samples`, and with `p = Some(person)` adds `samples[id] = (person, Assigned)` and trims `person` as `enroll` does. `enroll` is also disabled when `picks` has `utterance`. The new invariant `PickWins`: for each ID in `picks`, a sample of that ID has the person of the pick and the source `Assigned`, and a pick of none has no sample. `NoVoiceOnlyEnrollment` and `ProfilesBounded` still hold.
-- The conformance driver of sub-phase 15.6d moves to the test block of `src/app/review.rs`. It maps `enroll` to `enroll` of `FakeVoiceProfiles` and `assign` to `Review::assign`. After each step, it compares the samples of `FakeVoiceProfiles` with `samples` and its pick record with `picks`.
+- `speaker.qnt`: the new state `picks: int -> Option[PERSON]` is the pick record. The new action `assignVoice(id, p)` sets `picks[id] = p`, removes `id` from `samples`, and with `p = Some(person)` adds `samples[id] = (person, Assigned)` and trims `person` as `enroll` does. `enroll` is also disabled when `picks` has `utterance`. The new invariant `PickWins`: for each ID in `picks`, a sample of that ID has the person of the pick and the source `Assigned`, and a pick of none has no sample. `NoVoiceOnlyEnrollment` and `ProfilesBounded` still hold.
+- Quint has a built-in `assign`, so the action is named `assignVoice`. With `picks`, `quint verify` of `speaker.qnt` takes hours past step 8, so the model sets `VERIFY_STEPS = 8` (`02-rules.md` section 4).
+- The conformance driver of sub-phase 15.6d moves to the test block of `src/app/review.rs`. It maps `enroll` to `enroll` of `FakeVoiceProfiles` and `assignVoice` to `Review::assign`. After each step, it compares the samples of `FakeVoiceProfiles` with `samples` and its pick record with `picks`.
 
 **Acceptance criteria.**
 
-- AC-15.8d-1 [Quint]: `PickWins`, `NoVoiceOnlyEnrollment` and `ProfilesBounded` hold in simulation and to 10 steps in `quint verify`. This replaces AC-15.8b-6.
-- AC-15.8d-2: When `quint-connect` replays 100 traces of `speaker.qnt` with `assign`, the samples and the pick record of `FakeVoiceProfiles` match `samples` and `picks` after each step. This replaces AC-15.8b-7.
+- AC-15.8d-1 [Quint]: `PickWins`, `NoVoiceOnlyEnrollment` and `ProfilesBounded` hold in simulation and to `VERIFY_STEPS` (8) steps in `quint verify`. This replaces AC-15.8b-6.
+- AC-15.8d-2: When `quint-connect` replays 100 traces of `speaker.qnt` with `assignVoice`, the samples and the pick record of `FakeVoiceProfiles` match `samples` and `picks` after each step. This replaces AC-15.8b-7.
 
 **Proofs.**
 
-- P-15.8d-1. `PickWins`: `assign` sets the pick of `id` and the sample of `id` in the same step. A later trim can only remove that sample, and `enroll` is disabled for an ID in `picks`, so no action adds a sample of a picked ID with another person or source. `NoVoiceOnlyEnrollment`: `assign` sets the source `Assigned`, not `Voice`. `ProfilesBounded`: `assign` trims the person in the same step as it adds the sample. Evidence: model check.
+- P-15.8d-1. `PickWins`: `assignVoice` sets the pick of `id` and the sample of `id` in the same step. A later trim can only remove that sample, and `enroll` is disabled for an ID in `picks`, so no action adds a sample of a picked ID with another person or source. `NoVoiceOnlyEnrollment`: `assignVoice` sets the source `Assigned`, not `Voice`. `ProfilesBounded`: `assign` trims the person in the same step as it adds the sample. Evidence: model check.
 - P-15.8d-2. Evidence: test.
 
 ---
