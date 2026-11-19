@@ -757,6 +757,27 @@ mod tests {
         Ok(())
     }
 
+    /// AC-15.9b-4.
+    #[tokio::test]
+    async fn ac_15_9b_4_settings_have_the_person_template() -> anyhow::Result<()> {
+        let api = start(Arc::new(review()?), ONLINE).await?;
+        let html = reqwest::get(api.trim_end_matches("api/")).await?;
+        let html = html.text().await?;
+        let (_, settings) = html
+            .split_once(r#"<section id="configuration""#)
+            .expect("the page has the settings section");
+        let (settings, _) = settings.split_once("</section>").expect("it ends");
+        let (_, template) = settings
+            .split_once(r#"<template id="person">"#)
+            .expect("the settings section has template#person");
+        let (template, _) = template.split_once("</template>").expect("it ends");
+        assert!(
+            template.contains(r#"<input class="address""#),
+            "the template has no input.address"
+        );
+        Ok(())
+    }
+
     /// AC-12.9-2.
     #[test]
     fn ac_12_9_2_page_script_parses() -> anyhow::Result<()> {

@@ -221,6 +221,9 @@
       <button id="save" type="submit">Save</button>
     </div>
   </form>
+  <template id="person">
+    <label><span>Address <span class="name"></span> as</span><input class="address" type="text"></label>
+  </template>
 </section>
 </main>
 <template id="response">
@@ -237,6 +240,9 @@
   const statusSection = document.getElementById('status');
   let intents = [];
   let people = [];
+  const listedPeople = fetch('api/people')
+    .then((response) => (response.ok ? response.json() : []))
+    .catch(() => []);
   let page = 0;
   let loads = 0;
 
@@ -369,9 +375,9 @@
   }
 
   async function start() {
-    const [found, listed] = await Promise.all([fetch('api/intents'), fetch('api/people')]);
+    const [found, listed] = await Promise.all([fetch('api/intents'), listedPeople]);
     if (found.ok) intents = await found.json();
-    if (listed.ok) people = await listed.json();
+    people = listed;
     filter.addEventListener('change', () => load(false));
     more.addEventListener('click', () => load(true));
     await load(false);
@@ -415,6 +421,14 @@
     return field;
   }
 
+  // The "Address as" field of the person of `setting`.
+  function personField(setting) {
+    const row = document.getElementById('person').content.firstElementChild.cloneNode(true);
+    row.querySelector('.name').textContent = setting.person;
+    Object.assign(row.querySelector('.address'), { name: setting.name, value: setting.value });
+    return row;
+  }
+
   // The value of the form field of `setting`, with the type of its old value.
   function edited(setting) {
     const text = settingsForm.elements.namedItem(setting.name).value;
@@ -428,13 +442,24 @@
       settingsError.textContent = `The settings did not load: ${response.status}`;
       return;
     }
-    settings = await response.json();
+    const loaded = await response.json();
+    // One `People` field for each person, also with no form of address yet.
+    const addresses = (await listedPeople).map((person) => {
+      const name = `address.${person.entity}`;
+      const value = loaded.find((setting) => setting.name === name)?.value ?? '';
+      return { group: 'People', name, value, person: person.name };
+    });
+    settings = [...loaded.filter((setting) => setting.group !== 'People'), ...addresses];
     const groups = new Map();
     for (const setting of settings) {
       if (!groups.has(setting.group)) {
         const fieldset = document.createElement('fieldset');
         fieldset.append(Object.assign(document.createElement('legend'), { textContent: setting.group }));
         groups.set(setting.group, fieldset);
+      }
+      if (setting.person !== undefined) {
+        groups.get(setting.group).append(personField(setting));
+        continue;
       }
       const label = document.createElement('label');
       const field = Object.assign(input(setting), { name: setting.name });

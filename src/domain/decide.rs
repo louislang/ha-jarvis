@@ -181,6 +181,8 @@ pub struct Question {
     pub now: DateTime,
     /// The `ask_user` call that `text` answers, or `None` for a new request.
     pub answers: Option<AskCall>,
+    /// The form of address of the speaker.
+    pub address: Option<String>,
 }
 
 /// One `ask_user` call of System Two.
@@ -237,6 +239,7 @@ pub fn question(
         unassigned: unassigned_entities(domains, cache),
         now,
         answers: None,
+        address: None,
     }
 }
 

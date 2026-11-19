@@ -575,7 +575,7 @@ pub struct Setting {
     /// The group of the field in the form.
     pub group: &'static str,
     /// The dotted name, for example `asr.endpoint_ms`.
-    pub name: &'static str,
+    pub name: String,
     /// A JSON number, string or list of strings.
     pub value: Value,
 }

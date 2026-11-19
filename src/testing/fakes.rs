@@ -584,6 +584,16 @@ impl FakeReasoner {
             .collect()
     }
 
+    /// The form of address of each question, in order.
+    #[must_use]
+    pub(crate) fn addresses(&self) -> Vec<Option<String>> {
+        let questions = lock(&self.questions);
+        questions
+            .iter()
+            .map(|question| question.address.clone())
+            .collect()
+    }
+
     /// The call ID that each question answers, in order.
     #[must_use]
     pub(crate) fn answered(&self) -> Vec<Option<String>> {
