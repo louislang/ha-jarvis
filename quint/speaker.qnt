@@ -15,6 +15,9 @@ module speaker {
   /// The samples that one profile keeps.
   pure val MAX_SAMPLES = 2
 
+  /// The step bound of `quint verify`: past 8 steps, the int-keyed maps take Apalache hours.
+  pure val VERIFY_STEPS = 8
+
   /// The proximity and voice similarity levels, in tenths.
   pure val LEVELS = Set(0, 5, 10)
 
