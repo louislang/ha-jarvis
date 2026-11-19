@@ -270,12 +270,25 @@ pub trait VoiceEmbedder: Send + Sync {
 #[async_trait]
 pub trait VoiceProfiles: Send + Sync {
     /// Adds `embedding` as the voice sample of the interaction `id` to the profile of `person`.
-    /// An `id` that has a sample changes nothing.
+    /// An `id` that has a sample or a pick changes nothing.
     ///
     /// # Errors
     ///
     /// The store cannot save.
     async fn enroll(&self, person: &EntityId, id: u64, embedding: &[f32]) -> anyhow::Result<()>;
+
+    /// Sets the pick of the interaction `id` to `person`, and moves the voice sample of `id`
+    /// to the profile of `person`, or removes it when `person` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// The store cannot save.
+    async fn assign(
+        &self,
+        id: u64,
+        person: Option<&EntityId>,
+        embedding: &[f32],
+    ) -> anyhow::Result<()>;
 
     /// The voice similarity of `embedding` to each profile, by `person` entity ID.
     ///
