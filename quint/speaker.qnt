@@ -7,7 +7,7 @@ module speaker {
   type PERSON = str
 
   /// The signal that identified the speaker.
-  type Source = Presence | Proximity | Voice | NoSource
+  type Source = Presence | Proximity | Voice | Assigned | NoSource
 
   /// The people.
   pure val PEOPLE: Set[PERSON] = Set("alex", "sam")
@@ -15,8 +15,8 @@ module speaker {
   /// The samples that one profile keeps.
   pure val MAX_SAMPLES = 2
 
-  /// The step bound of `quint verify`: past 8 steps, the int-keyed maps take Apalache hours.
-  pure val VERIFY_STEPS = 8
+  /// The step bound of `quint verify`: past 6 steps, the int-keyed maps take Apalache hours.
+  pure val VERIFY_STEPS = 6
 
   /// The proximity and voice similarity levels, in tenths.
   pure val LEVELS = Set(0, 5, 10)
@@ -59,6 +59,9 @@ module speaker {
 
   /// The stored voice samples by interaction ID.
   var samples: int -> (PERSON, Source)
+
+  /// The last pick of each interaction ID: a person or none.
+  var picks: int -> Option[PERSON]
 
   /// The interaction IDs of the samples of person `p`.
   pure def ids(stored: int -> (PERSON, Source), p: PERSON): Set[int] =
@@ -115,6 +118,7 @@ module speaker {
     source' = NoSource,
     utterance' = 0,
     samples' = Map(),
+    picks' = Map(),
   }
 
   /// A new request with the signals `h`, `o`, `prox` and `v`.
@@ -127,6 +131,7 @@ module speaker {
     source' = NoSource,
     utterance' = utterance + 1,
     samples' = samples,
+    picks' = picks,
   }
 
   /// Rules 1 to 4 of sub-phase 15.6.
@@ -140,6 +145,7 @@ module speaker {
         | None => NoSource
       },
       samples' = samples,
+      picks' = picks,
     }
   }
 
@@ -148,12 +154,23 @@ module speaker {
     result == Some(p),
     source == Presence or source == Proximity,
     not(samples.keys().contains(utterance)),
+    not(picks.keys().contains(utterance)),
     ids(samples, p).size() >= MIN_PROFILE implies
       (voice.get(p) >= VOICE_THRESHOLD and PEOPLE.forall(q => q == p or voice.get(p) > voice.get(q))),
     keepSignals,
     result' = result,
     source' = source,
     samples' = trim(samples.put(utterance, (p, source)), p),
+    picks' = picks,
+  }
+
+  /// A pick of `p` for the request `id`: it moves the sample of `id` to `p`, or removes it.
+  action assignVoice(id: int, p: Option[PERSON]): bool = all {
+    1 <= id and id <= utterance,
+    keepSignals,
+    result' = result, source' = source,
+    samples' = match p { | Some(q) => trim(samples.put(id, (q, Assigned)), q) | None => samples.keys().exclude(Set(id)).mapBy(i => samples.get(i)) },
+    picks' = picks.put(id, p),
   }
 
   /// Any enabled event.
@@ -167,10 +184,13 @@ module speaker {
     nondet prox = PEOPLE.setOfMaps(LEVELS).oneOf()
     nondet v = PEOPLE.setOfMaps(LEVELS).oneOf()
     nondet p = PEOPLE.oneOf()
+    nondet back = 0.to(2).oneOf()
+    nondet chosen = PEOPLE.map(q => Some(q)).union(Set(None)).oneOf()
     any {
       setSignals(h, o, prox, v),
       identify,
       enroll(p),
+      assignVoice(utterance - back, chosen),
     }
   }
 
@@ -189,6 +209,9 @@ module speaker {
   /// Each person has at most `MAX_SAMPLES` samples.
   val ProfilesBounded = PEOPLE.forall(p => ids(samples, p).size() <= MAX_SAMPLES)
 
+  /// A sample of a picked ID has the person of the pick and the source `Assigned`, and a pick of none has no sample.
+  val PickWins = samples.keys().forall(i => picks.keys().contains(i) implies (picks.get(i) == Some(samples.get(i)._1) and samples.get(i)._2 == Assigned))
+
   /// The invariants that `just quint` checks.
-  val allInvariants = SpeakerIsCandidate and NoVoiceOnlyEnrollment and ProfilesBounded
+  val allInvariants = SpeakerIsCandidate and NoVoiceOnlyEnrollment and ProfilesBounded and PickWins
 }
