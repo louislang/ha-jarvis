@@ -138,6 +138,8 @@ pub struct Speakers {
     pub people: Vec<PersonTrackers>,
     /// The `[[satellites]]` entries.
     pub satellites: Vec<Satellite>,
+    /// The `[address]` table: the form of address of each person entity.
+    pub addresses: BTreeMap<String, String>,
 }
 
 /// One message to the log writer task.
@@ -295,7 +297,7 @@ impl Conversation {
             transcript,
             area,
             now,
-            address: None,
+            address: heard.address.clone(),
         };
         let (handled, decided) = self.act(&prediction, &request, key, heard, new).await;
         Ok((handled, Some((prediction, decided))))
@@ -318,7 +320,18 @@ impl Conversation {
             model: self.classifier.0.load_full(),
             utterance,
             link: None,
+            address: self.address(context),
         }
+    }
+
+    /// The form of address of the speaker of a request in `context`, whom presence and proximity
+    /// in the hot cache identify, without the voice embedding.
+    fn address(&self, context: &Context) -> Option<String> {
+        let speakers = &self.recorder.speakers;
+        let origin = (context.satellite_id.clone(), context.device_id.clone());
+        let signals = speakers.signals(&self.queues.cache.borrow(), origin, None);
+        let found = speakers.identify(&signals)?;
+        speakers.addresses.get(&found.person.0).cloned()
     }
 
     /// Sends the record of `heard` with `prediction` and `decided` to the log writer, with the
@@ -1479,6 +1492,8 @@ struct Heard {
     utterance: Option<Committed>,
     /// The ID of the first interaction of the dialog, for a dialog answer.
     link: Option<u64>,
+    /// The form of address of the speaker.
+    address: Option<String>,
 }
 
 /// The satellite of a request, the generation of the request on it and the ID of its record.
@@ -1541,7 +1556,7 @@ async fn enroll_voice(
 ) -> anyhow::Result<()> {
     let embedding = embedding.await??;
     let similarities = speakers.voices.similarities(&embedding).await?;
-    let signals = speakers.signals(&cache.borrow(), origin, &similarities);
+    let signals = speakers.signals(&cache.borrow(), origin, Some(&similarities));
     let found = speakers.identify(&signals);
     // A send fails only after the writer ended, at shutdown.
     let _ = writer.send(Write::Update(
@@ -1557,12 +1572,12 @@ async fn enroll_voice(
 
 impl Speakers {
     /// The signals in `cache` of a request from the satellite and the device of `origin`, with
-    /// the voice `similarities`.
+    /// the voice `similarities`, or none without an embedding.
     fn signals(
         &self,
         cache: &StateCache,
         (satellite, device): Origins,
-        similarities: &BTreeMap<String, f32>,
+        similarities: Option<&BTreeMap<String, f32>>,
     ) -> Signals {
         let area = device
             .as_deref()
@@ -1571,14 +1586,7 @@ impl Speakers {
         let mut entry = entry.filter(|entry| satellite.as_deref() == Some(&*entry.satellite.0));
         let presence = entry.next().map(|entry| entry.presence.clone());
         let device = device.as_deref().unwrap_or_default();
-        speaker::signals(
-            cache,
-            device,
-            area,
-            &self.people,
-            presence,
-            Some(similarities),
-        )
+        speaker::signals(cache, device, area, &self.people, presence, similarities)
     }
 
     /// The speaker of `signals` by rules 2 to 4.
@@ -3103,13 +3111,7 @@ mod tests {
             still_with(&Arc::default(), "idle", lights(), Arc::default());
         let log = Arc::<FakeLog>::default();
         conversation.recorder.writer = start_writer(Arc::clone(&log) as _).0;
-        cache.send_modify(|cache| {
-            let state = cache
-                .states
-                .get_mut("person.louis")
-                .expect("the house has it");
-            Arc::make_mut(state).state = louis.to_owned();
-        });
+        set_louis(&cache, louis);
         conversation.recorder.speakers = fakes::speakers(Arc::clone(&voices));
         hear_voiced(&conversation, vec![0; 32_000], voiced_ms);
         let _handled = conversation.handle(LIGHTS, on_satellite()).await?;
@@ -3194,6 +3196,68 @@ mod tests {
     async fn ac_15_6e_4_short_voice_does_not_enroll() -> anyhow::Result<()> {
         let enrolls = enrolls_of("not_home", FakeVoiceProfiles::default(), 1000).await?;
         assert_eq!(enrolls, []);
+        Ok(())
+    }
+
+    /// Sets the state of `person.louis` in `cache` to `louis`.
+    fn set_louis(cache: &watch::Sender<StateCache>, louis: &str) {
+        cache.send_modify(|cache| {
+            let state = cache
+                .states
+                .get_mut("person.louis")
+                .expect("the house has it");
+            Arc::make_mut(state).state = louis.to_owned();
+        });
+    }
+
+    /// The speakers of `jarvis.toml` with `voices` and the form of address "Lady Lang" of
+    /// `person.ali`.
+    fn addressed_speakers(voices: FakeVoiceProfiles) -> Arc<Speakers> {
+        let mut speakers = Arc::into_inner(fakes::speakers(Arc::new(voices))).expect("one owner");
+        speakers.addresses = BTreeMap::from([("person.ali".to_owned(), "Lady Lang".to_owned())]);
+        Arc::new(speakers)
+    }
+
+    /// The reply to [`LIGHTS`] from the satellite, whose embedding never completes, when
+    /// `person.louis` is in the state `louis`, `person.ali` is home with the form of address
+    /// "Lady Lang", and the voice similarities are those of `voices`. The `lights_on` response
+    /// with `address` has fewer uses.
+    async fn addressed_reply(louis: &str, voices: FakeVoiceProfiles) -> anyhow::Result<String> {
+        let (cache, _changes, mut conversation) =
+            still_with(&Arc::default(), "idle", lights(), Arc::default());
+        let texts = [
+            ("I will turn on the lights.", 1),
+            ("I will turn on the lights for you, {{ address }}.", 0),
+        ];
+        conversation.pools.store(Arc::new(pools(&texts, 0)));
+        set_louis(&cache, louis);
+        conversation.recorder.speakers = addressed_speakers(voices);
+        let audio = Audio {
+            samples: vec![0; 32_000],
+            rate: 16_000,
+        };
+        let pending = tokio::spawn(futures::future::pending());
+        let utterances = &conversation.recorder.utterances;
+        utterances.append(LIGHTS.to_owned(), audio, None, pending, 2000);
+        let handle = conversation.handle(LIGHTS, on_satellite());
+        let handled = tokio::time::timeout(Duration::from_secs(1), handle).await??;
+        Ok(handled.text)
+    }
+
+    /// AC-15.9c-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_9c_1_reply_addresses_the_only_person_at_home() -> anyhow::Result<()> {
+        let text = addressed_reply("not_home", FakeVoiceProfiles::default()).await?;
+        assert_eq!(text, "I will turn on the lights for you, Lady Lang.");
+        Ok(())
+    }
+
+    /// AC-15.9c-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_9c_3_reply_identifies_without_the_embedding() -> anyhow::Result<()> {
+        let voices = profiles(&[("person.ali", 0.9), ("person.louis", 0.1)]);
+        let text = addressed_reply("home", voices).await?;
+        assert_eq!(text, "I will turn on the lights.");
         Ok(())
     }
 

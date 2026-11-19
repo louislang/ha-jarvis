@@ -460,14 +460,29 @@ impl Speech {
         Ok(Arc::new(self.tts.synth(text).await?))
     }
 
-    /// Synthesizes and caches each pool response with no variable, and each pool response whose
-    /// only variable is `area` once for each area name in `areas`.
+    /// [`Speech::prerender_addressed`] with no form of address.
     ///
     /// # Errors
     ///
     /// A template does not parse or render, or a synthesis fails.
     pub async fn prerender(&self, pools: &Pools, areas: &[String]) -> anyhow::Result<()> {
-        for text in texts(pools, areas)? {
+        self.prerender_addressed(pools, areas, &[]).await
+    }
+
+    /// Synthesizes and caches each pool response with no variable, and each pool response whose
+    /// variables are in `area` and `address` once for each area name in `areas` and each form of
+    /// address in `addresses`.
+    ///
+    /// # Errors
+    ///
+    /// A template does not parse or render, or a synthesis fails.
+    pub async fn prerender_addressed(
+        &self,
+        pools: &Pools,
+        areas: &[String],
+        addresses: &[String],
+    ) -> anyhow::Result<()> {
+        for text in texts(pools, areas, addresses)? {
             self.render(&text).await?;
             self.pooled.insert(text);
         }
@@ -492,10 +507,16 @@ impl Speech {
     }
 }
 
-/// The text of each pool response with no variable, and of each pool response whose only
-/// variable is `area` rendered with each area name in `areas` in lowercase, as `decide` renders it.
-fn texts(pools: &Pools, areas: &[String]) -> anyhow::Result<BTreeSet<String>> {
-    let (allowed, none) = (BTreeSet::from(["area".to_owned()]), BTreeSet::new());
+/// The text of each pool response with no variable, and of each pool response whose variables are
+/// in `area` and `address` rendered with each area name in `areas` in lowercase, as `decide`
+/// renders it, and each of `addresses`.
+fn texts(
+    pools: &Pools,
+    areas: &[String],
+    addresses: &[String],
+) -> anyhow::Result<BTreeSet<String>> {
+    let allowed = BTreeSet::from(["area".to_owned(), "address".to_owned()]);
+    let none = BTreeSet::new();
     let mut texts = BTreeSet::new();
     let templates = pools.values().flat_map(|pool| &pool.responses);
     for template in templates {
@@ -507,9 +528,28 @@ fn texts(pools: &Pools, areas: &[String]) -> anyhow::Result<BTreeSet<String>> {
             texts.insert(responses::render(&template.text, &Map::new())?);
             continue;
         }
-        for area in areas {
-            let context = Map::from_iter([("area".to_owned(), Value::from(area.to_lowercase()))]);
-            texts.insert(responses::render(&template.text, &context)?);
+        texts.extend(per_area(&template.text, areas, addresses)?);
+    }
+    Ok(texts)
+}
+
+/// `template` rendered with each area name in `areas` in lowercase, and with each of `addresses`
+/// as `address` when it uses `address`.
+fn per_area(template: &str, areas: &[String], addresses: &[String]) -> anyhow::Result<Vec<String>> {
+    let area = BTreeSet::from(["area".to_owned()]);
+    let values: Vec<Option<&String>> = if catalog::unknown_variable(template, &area)?.is_some() {
+        addresses.iter().map(Some).collect()
+    } else {
+        vec![None]
+    };
+    let mut texts = Vec::new();
+    for area in areas {
+        let mut context = Map::from_iter([("area".to_owned(), Value::from(area.to_lowercase()))]);
+        for address in &values {
+            if let Some(address) = address {
+                context.insert("address".to_owned(), Value::from(address.as_str()));
+            }
+            texts.push(responses::render(template, &context)?);
         }
     }
     Ok(texts)
@@ -1208,6 +1248,28 @@ mod tests {
         speech.speak("It is 21 degrees in the office.").await?;
         assert_eq!(tts.texts()[calls..], ["It is 21 degrees in the office."]);
         assert_eq!(speech.cache.len(), size, "a miss changed the cache size");
+        Ok(())
+    }
+
+    /// AC-15.9c-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_9c_2_prerender_caches_each_address_text() -> anyhow::Result<()> {
+        let (speech, _tts) = speech();
+        let mut pools = pools();
+        let lights = pools.get_mut("lights_on").expect("the pools have it");
+        lights.responses.push(Response {
+            text: "The {{ area }} lights are on, {{ address }}.".to_owned(),
+            uses: 0,
+            generated: false,
+        });
+        let areas = ["Living Room".to_owned(), "Office".to_owned()];
+        speech
+            .prerender_addressed(&pools, &areas, &["Lady Lang".to_owned()])
+            .await?;
+        for area in ["living room", "office"] {
+            let text = format!("The {area} lights are on, Lady Lang.");
+            assert!(speech.cache.contains_key(&text), "{text} is not cached");
+        }
         Ok(())
     }
 }
