@@ -190,7 +190,8 @@
 <template id="interaction">
   <article>
     <p class="transcript"></p>
-    <p class="meta"><time class="time"></time> · <span class="satellite"></span></p>
+    <p class="meta"><time class="time"></time> · <span class="satellite"></span>
+      <select class="speaker" aria-label="Speaker"><option value="">Unknown speaker</option></select></p>
     <audio controls preload="none"></audio>
     <ul class="responses"></ul>
     <div class="action">
@@ -235,17 +236,36 @@
   const more = document.getElementById('more');
   const statusSection = document.getElementById('status');
   let intents = [];
+  let people = [];
   let page = 0;
   let loads = 0;
 
-  async function mark(id, body) {
-    const response = await fetch(`api/interactions/${id}/mark`, {
+  async function post(url, body, what) {
+    const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-    if (!response.ok) alert(`The mark failed: ${response.status}`);
+    if (!response.ok) alert(`The ${what} failed: ${response.status}`);
     return response.ok;
+  }
+
+  const mark = (id, body) => post(`api/interactions/${id}/mark`, body, 'mark');
+
+  // A pick moves the voice sample of the request at once. The list stays disabled until the
+  // server answers, so an earlier pick cannot overwrite a later one.
+  function pickSpeaker(speaker, interaction) {
+    if (!interaction.satellite) {
+      speaker.remove();
+      return;
+    }
+    speaker.append(...people.map((person) => new Option(person.name, person.entity)));
+    speaker.value = interaction.speaker ?? '';
+    speaker.addEventListener('change', async () => {
+      speaker.disabled = true;
+      await post(`api/interactions/${interaction.id}/speaker`,
+        { person: speaker.value || null }, 'speaker pick').finally(() => { speaker.disabled = false; });
+    });
   }
 
   function press(row, value) {
@@ -272,6 +292,7 @@
     field('time').textContent = new Date(interaction.time).toLocaleString();
     field('satellite').textContent = interaction.satellite ?? 'typed';
     field('transcript').textContent = interaction.transcript;
+    pickSpeaker(field('speaker'), interaction);
     shown.querySelector('audio').src = `api/interactions/${interaction.id}/audio`;
     field('intent').textContent = [interaction.action.intent, ...interaction.action.targets].join(' ');
     const action = interaction.marks[0];
@@ -336,13 +357,7 @@
       Object.assign(document.createElement('li'), { textContent: example })));
     for (const [name, approve] of [['approve', true], ['reject', false]]) {
       shown.querySelector(`.${name}`).addEventListener('click', async () => {
-        const response = await fetch(`api/proposals/${encodeURIComponent(entry.name)}`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ approve }),
-        });
-        if (response.ok) shown.remove();
-        else alert(`The ${name} failed: ${response.status}`);
+        if (await post(`api/proposals/${encodeURIComponent(entry.name)}`, { approve }, name)) shown.remove();
       });
     }
     return shown;
@@ -354,8 +369,9 @@
   }
 
   async function start() {
-    const response = await fetch('api/intents');
-    if (response.ok) intents = await response.json();
+    const [found, listed] = await Promise.all([fetch('api/intents'), fetch('api/people')]);
+    if (found.ok) intents = await found.json();
+    if (listed.ok) people = await listed.json();
     filter.addEventListener('change', () => load(false));
     more.addEventListener('click', () => load(true));
     await load(false);
