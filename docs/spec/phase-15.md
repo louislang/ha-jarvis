@@ -505,6 +505,30 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 
 ---
 
+### 15.8e Voice Match Confirmation
+
+**Goal:** Let you confirm a speaker that Jarvis found, so that the confirmation adds a voice sample. In the field test on 2026-11-19, Jarvis found the speaker of each new request by voice after one pick. The list showed that person, so the same choice sent no `change` event, and the voice profile kept one sample.
+
+- **Implements:** G12, G15, G24. **Depends on:** 15.8c.
+- **Files:** modify `src/adapters/review.html`, `src/adapters/web.rs`, `README.md`.
+
+**Model.**
+
+- When an interaction has a `speaker` and its `source` is not `Assigned`, `select.speaker` gets one more choice before the people: the name of the speaker, a space and the source in lower case in parentheses, for example "Louis (voice)". The list shows this choice. The choice sends no request.
+- A choice of the plain person, also the same person, sends the `speaker` request of sub-phase 15.8c. After a 204 reply, the page removes the found choice, and the list shows the plain person.
+- When `source` is `Assigned`, the list shows the plain person, as in sub-phase 15.8c.
+
+**Acceptance criteria.**
+
+- AC-15.8e-1: When `GET /` runs, the page script has the function `found(name, source)`, and `found("Louis", "Voice")` gives "Louis (voice)".
+- AC-15.8e-2: When `GET /` runs, the page script sends the `speaker` request only for a choice that is a person entity or empty.
+
+**Proofs.**
+
+- P-15.8e-1, P-15.8e-2. Evidence: test.
+
+---
+
 ### 15.9 Form of Address
 
 **Goal:** Add the form of address to response selection and pool validation. A reply uses `{{ address }}` only when the speaker has a form of address, and each pool keeps a reply for a request with no known speaker.
