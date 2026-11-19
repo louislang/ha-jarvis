@@ -507,39 +507,63 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 
 ### 15.9 Form of Address
 
-**Goal:** Address each person in their own way. With the form of address "Lady Lang" for Ali, a reply to Ali can say "I will turn on the lights for you, Lady Lang."
+**Goal:** Add the form of address to response selection and pool validation. A reply uses `{{ address }}` only when the speaker has a form of address, and each pool keeps a reply for a request with no known speaker.
 
 - **Implements:** G12. **Depends on:** 15.8c.
-- **Files:** modify `src/domain/responses.rs`, `src/app/conversation.rs`, `src/app/speech.rs`, `src/lib.rs`, `jarvis.toml`, `README.md`.
+- **Files:** modify `src/domain/responses.rs`, `src/domain/decide.rs`, `src/app/conversation.rs`.
+
+**Model.**
+
+- `address` is a template variable of each catalog intent pool: the form of address of the speaker. A proposal does not act for the speaker, so it does not get `address` (sub-phase 14.2b).
+- `addressed(pool) -> Vec<bool>`: for each response, true when its template uses `address` (`minijinja` `undeclared_variables`).
+- Pool selection (sub-phase 4.1) gets `address: Option<&str>`. A response that uses `address` is eligible only when `address` is `Some` and not empty. A response without `address` is always eligible. The rule of sub-phase 4.1 then applies to the eligible responses: with two or more eligible responses, `last` is not allowed. With one eligible response, selection gives it, also when it is `last`. When no response is eligible, each response is eligible. Validation prevents this case (P-15.9-4).
+- Pool validation (sub-phase 4.2): a pool with a response that uses `address` must also have a response without `address`. Else the error names the pool. Thus selection always has an eligible response.
+- `Request` (sub-phase 4.5) gets `address: Option<String>`, the form of address of the speaker. When it is `Some`, `decide` adds it to the template context as `address`, and the reply of the intent selects with it.
+- `handle` gives each request `address = None`. Sub-phase 15.9c gives it the form of address of the speaker.
+
+**Acceptance criteria.**
+
+- AC-15.9-1: When the request has the form of address `Lady Lang`, and selection chooses the response `I will turn on the lights for you, {{ address }}.`, `decide` gives the reply "I will turn on the lights for you, Lady Lang."
+- AC-15.9-2: When `address` is `None`, selection never chooses a response that uses `address`.
+- AC-15.9-3: When `address` is empty, selection never chooses a response that uses `address`.
+- AC-15.9-4: When each response of a pool uses `address`, validation returns an error that names the pool.
+- AC-15.9-7: When `address` is `None` and the pool has one response without `address` and one with it, two selections in a row, with `record_use` after each, both give the response without `address`.
+
+**Proofs.**
+
+- P-15.9-2, P-15.9-3. Ensures: when the pool has a response without `address`, a response that uses `address` is eligible only when `address` is `Some` and not empty, and selection gives an eligible response. Argument: selection filters the candidates by this predicate before it chooses. The flags of `addressed` come from `minijinja`, which Verus cannot see (P-4.2-2). Thus Verus proves the rule over the flags, and the flags are evidence: test.
+- P-15.9-4. Ensures: the address check of a pool fails if and only if each flag of `addressed` is true. Argument: the check looks for one response without `address`.
+- P-15.9-7. Requires: the pool has a response without `address` (P-15.9-4). Ensures: with one eligible response, selection gives it. Argument: the exclusion of `last` applies only to two or more eligible responses, so the one eligible response is the only candidate (P-4.1-5 on the eligible responses).
+- P-15.9-1. Evidence: test.
+
+---
+
+### 15.9c Address Reply
+
+**Goal:** Address each person in their own way. With the form of address "Lady Lang" for Ali, a reply to Ali can say "I will turn on the lights for you, Lady Lang."
+
+- **Implements:** G12. **Depends on:** 15.9.
+- **Files:** modify `src/app/conversation.rs`, `src/app/speech.rs`, `src/app/background.rs`, `src/lib.rs`, `jarvis.toml`, `README.md`.
 
 **Model.**
 
 - This sub-phase adds the optional table `[address]` to `jarvis.toml`. A key is a `person` entity ID, and its value is the form of address, a free text. Example: `"person.ali" = "Lady Lang"`. An empty value is the same as no value. Sub-phase 15.9b sets it from the Jarvis tab.
-- `address` is a template variable of each catalog intent pool: the form of address of the speaker. A proposal does not act for the speaker, so it does not get `address` (sub-phase 14.2b).
-- Pool selection (sub-phase 4.1) gets `address: Option<&str>`. A response whose template uses `address` is eligible only when `address` is `Some` and not empty. Else only the responses without `address` are eligible. The rule of sub-phase 4.1 then applies to the eligible responses: with two or more eligible responses, `last` is not allowed. With one eligible response, selection gives it, also when it is `last`.
-- Pool validation (sub-phase 4.2): a pool with a response that uses `address` must also have a response without `address`. Else the error names the pool. Thus selection always has a candidate.
-- The reply does not wait for the voice embedding. `handle` calls `signals` with no embedding and then `identify`, so only presence and proximity identify the speaker (sub-phase 15.6).
-- `prerender` (sub-phase 6.3b) also synthesizes each template whose variables are in `{area, address}`, for each area and each non-empty value of `[address]`. A change of `[address]` restarts Jarvis (sub-phase 12.9f), so the pre-render has the new values.
+- The reply does not wait for the voice embedding. `handle` calls `signals` with no embedding and then `identify`, so only presence and proximity identify the speaker (sub-phase 15.6). The `address` of the request (sub-phase 15.9) is the value of the speaker in `[address]`, or `None` without a speaker or a value.
+- The answer of a fetch job (sub-phase 4.9d) and a prefetch reply (sub-phase 14.10d) select with `address = None`.
+- `prerender` (sub-phase 6.3b) also synthesizes each template whose variables are in `{area, address}`, for each area and each non-empty value of `[address]`. The pre-render of backfill responses and of learned intents gets no values, because their pools do not use `address`. A change of `[address]` restarts Jarvis (sub-phase 12.9f), so the pre-render has the new values.
 - A pool with a response that uses `address` gets no backfill, because a backfill pool uses only `area` (sub-phase 8.1).
 - `responses.toml` does not change. `README.md` describes `[address]` and gives the example response `"I will turn on the lights for you, {{ address }}."`.
 
 **Acceptance criteria.**
 
-- AC-15.9-1: When the speaker is `person.ali` with `"person.ali" = "Lady Lang"` in `[address]`, and selection chooses the response `I will turn on the lights for you, {{ address }}.`, the reply is "I will turn on the lights for you, Lady Lang."
-- AC-15.9-2: When no speaker is identified, selection never chooses a response that uses `address`.
-- AC-15.9-3: When the value of the speaker in `[address]` is empty, selection never chooses a response that uses `address`.
-- AC-15.9-4: When each response of a pool uses `address`, validation returns an error that names the pool.
-- AC-15.9-5: When `prerender` runs with `"person.ali" = "Lady Lang"`, the audio cache has each `address` template for each area name with `Lady Lang`.
-- AC-15.9-6: When `handle` chooses a reply, it does not wait for the embedding, and it calls `signals` with no embedding.
-- AC-15.9-7: When no speaker is identified and the pool has one response without `address` and one with it, two requests in a row both reply with the response without `address`.
+- AC-15.9c-1: When only `person.ali` is home with `"person.ali" = "Lady Lang"` in `[address]`, and selection chooses the response `I will turn on the lights for you, {{ address }}.`, `handle` replies "I will turn on the lights for you, Lady Lang."
+- AC-15.9c-2: When `prerender` runs with `"person.ali" = "Lady Lang"`, the audio cache has each `address` template for each area name with `Lady Lang`. This replaces AC-15.9-5.
+- AC-15.9c-3: When `handle` chooses a reply, it does not wait for the embedding, and it calls `signals` with no embedding. This replaces AC-15.9-6.
 
 **Proofs.**
 
-- P-15.9-2, P-15.9-3. Ensures: the chosen response uses `address` only when `address` is `Some` and not empty. Argument: selection filters the candidates by this predicate before it chooses.
-- P-15.9-4. Ensures: validation fails for a pool if and only if the pool has responses and each of them uses `address`. Argument: the check looks for one response without `address`.
-- P-15.9-6. Argument: the `signals` call of the reply passes `None` for the embedding, and `handle` does not await the embedding future.
-- P-15.9-7. Requires: the pool has a response without `address` (P-15.9-4). Ensures: with one eligible response, selection gives it. Argument: the exclusion of `last` applies only to two or more eligible responses, so the one eligible response is the only candidate (P-4.1-5 on the eligible responses).
-- P-15.9-1, P-15.9-5. Evidence: test.
+- P-15.9c-3. Argument: the `signals` call of the reply passes `None` for the embedding, and `handle` does not await the embedding future.
+- P-15.9c-1, P-15.9c-2. Evidence: test.
 
 ---
 
@@ -547,14 +571,14 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 
 **Goal:** Set the form of address of each person in the settings of the Jarvis tab, and give it to System Two. A System Two answer can then address the speaker too.
 
-- **Implements:** G12, G24. **Depends on:** 15.9.
+- **Implements:** G12, G24. **Depends on:** 15.9c.
 - **Files:** modify `src/adapters/settings.rs`, `src/adapters/review.html`, `src/adapters/openai.rs`, `src/ports.rs`, `src/app/conversation.rs`, `README.md`.
 
 **Model.**
 
 - Settings `read` (sub-phase 12.9d) also gives one setting `address.<entity>` for each key of `[address]`, in the group `People`. `edit` accepts the name `address.<entity>` when the entity ID starts with `person.` and the value is a JSON string. It sets the key in `[address]`, and it adds the table when the file has no `[address]`. An empty string removes the key. Other text stays the same.
 - The settings section of the page lists each person of `GET api/people` (sub-phase 15.8c) with an "Address as" text field (`input.address`). The field shows the value of the setting `address.<entity>`, or is empty. Save sends the changed fields with the other settings (sub-phase 12.9e).
-- The request of `Reasoner::answer` gets the form of address of the speaker that the reply identified (P-15.9-6). When it is not empty, the system prompt gets the line `Address the user as <address>.`.
+- The request of `Reasoner::answer` gets the form of address of the speaker that the reply identified (P-15.9c-3). When it is not empty, the system prompt gets the line `Address the user as <address>.`.
 
 **Acceptance criteria.**
 
