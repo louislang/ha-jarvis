@@ -462,12 +462,12 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 **Model.**
 
 - `speaker.qnt`: the new state `picks: int -> Option[PERSON]` is the pick record. The new action `assignVoice(id, p)` sets `picks[id] = p`, removes `id` from `samples`, and with `p = Some(person)` adds `samples[id] = (person, Assigned)` and trims `person` as `enroll` does. `enroll` is also disabled when `picks` has `utterance`. The new invariant `PickWins`: for each ID in `picks`, a sample of that ID has the person of the pick and the source `Assigned`, and a pick of none has no sample. `NoVoiceOnlyEnrollment` and `ProfilesBounded` still hold.
-- Quint has a built-in `assign`, so the action is named `assignVoice`. With `picks`, `quint verify` of `speaker.qnt` takes hours past step 8, so the model sets `VERIFY_STEPS = 8` (`02-rules.md` section 4).
+- Quint has a built-in `assign`, so the action is named `assignVoice`. With `picks`, `quint verify` of `speaker.qnt` grows too slow past a few steps, so the model sets `VERIFY_STEPS` to the largest bound that ends in about 5 minutes (`02-rules.md` section 4).
 - The conformance driver of sub-phase 15.6d moves to the test block of `src/app/review.rs`. It maps `enroll` to `enroll` of `FakeVoiceProfiles` and `assignVoice` to `Review::assign`. After each step, it compares the samples of `FakeVoiceProfiles` with `samples` and its pick record with `picks`.
 
 **Acceptance criteria.**
 
-- AC-15.8d-1 [Quint]: `PickWins`, `NoVoiceOnlyEnrollment` and `ProfilesBounded` hold in simulation and to `VERIFY_STEPS` (8) steps in `quint verify`. This replaces AC-15.8b-6.
+- AC-15.8d-1 [Quint]: `PickWins`, `NoVoiceOnlyEnrollment` and `ProfilesBounded` hold in simulation and to `VERIFY_STEPS` steps in `quint verify`. This replaces AC-15.8b-6.
 - AC-15.8d-2: When `quint-connect` replays 100 traces of `speaker.qnt` with `assignVoice`, the samples and the pick record of `FakeVoiceProfiles` match `samples` and `picks` after each step. This replaces AC-15.8b-7.
 
 **Proofs.**
