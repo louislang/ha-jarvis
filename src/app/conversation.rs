@@ -295,6 +295,7 @@ impl Conversation {
             transcript,
             area,
             now,
+            address: None,
         };
         let (handled, decided) = self.act(&prediction, &request, key, heard, new).await;
         Ok((handled, Some((prediction, decided))))
@@ -1424,8 +1425,8 @@ impl Conversation {
         let (text, index) = {
             let pools = self.pools.load();
             let found = pools.get(pool).expect("valid pools have each answer pool");
-            let index =
-                responses::select(found, &mut self.rng.lock().expect("no lock holder panics"));
+            let mut rng = self.rng.lock().expect("no lock holder panics");
+            let index = responses::select(found, &mut rng, None);
             (found.responses[index].text.clone(), index)
         };
         self.backfill.record_use(pool.to_owned(), index);
@@ -4422,6 +4423,7 @@ mod tests {
             transcript,
             area: None,
             now,
+            address: None,
         };
         let decision = conversation.decide(&unclear, &request);
         let llm = matches!(

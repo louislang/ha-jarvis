@@ -146,7 +146,7 @@ pub enum Matching {
     Artist,
 }
 
-/// The transcript, the satellite area and the time of a request.
+/// The transcript, the satellite area, the time and the speaker's form of address of a request.
 #[verus_verify]
 #[derive(Clone, Debug, PartialEq)]
 pub struct Request {
@@ -156,6 +156,8 @@ pub struct Request {
     pub area: Option<AreaId>,
     /// The time of the request.
     pub now: Timestamp,
+    /// The form of address of the speaker.
+    pub address: Option<String>,
 }
 
 /// A System Two question with the context of its area.
@@ -459,7 +461,8 @@ fn act(
 type Situated<'a> = (Option<&'a AreaId>, Map<String, Value>);
 
 /// The area of the first area slot of `prediction`, else of `request`, and the template context of
-/// `intent` in it. Else the decision for a missing slot, of `place`, or for a service with no area.
+/// `intent` in it with the form of address of `request`. Else the decision for a missing slot, of
+/// `place`, or for a service with no area.
 #[verus_spec(found =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
@@ -489,7 +492,11 @@ fn situation<'a>(
     if area.is_none() && matches!((intent.kind, &intent.service), (Kind::Command, Some(_))) {
         return Err(ask(intent, prediction, request, cache, pools, rng));
     }
-    Ok((area, context(slots, area, cache)))
+    let mut context = context(slots, area, cache);
+    if let Some(address) = &request.address {
+        context.insert("address".to_owned(), Value::from(address.clone()));
+    }
+    Ok((area, context))
 }
 
 /// The question from `ask_area` for the area of `intent`, with the slots of `prediction`, the name
@@ -510,7 +517,7 @@ fn ask(
     rng: &mut StdRng,
 ) -> Box<Decision> {
     Box::new(Decision::Ask {
-        question: choose(pools, "ask_area", rng),
+        question: choose(pools, "ask_area", None, rng),
         pending: Pending::Slot {
             intent: intent.name.clone(),
             slots: prediction.slots.clone(),
@@ -743,7 +750,7 @@ fn fetch(
     };
     let pool = intent.name.clone();
     Some(Decision::Defer {
-        filler: choose(pools, "filler", rng),
+        filler: choose(pools, "filler", None, rng),
         job: Job::Fetch { call, pool },
     })
 }
@@ -852,8 +859,8 @@ fn evaluate(source: &str, context: &Map<String, Value>) -> Option<Value> {
     serde_json::to_value(value).ok()
 }
 
-/// `Reply` with `call` and the reply of `intent` rendered with `context`, or `None` when the
-/// reply does not render.
+/// `Reply` with `call` and the reply of `intent` for the `address` of `context`, rendered with
+/// `context`, or `None` when the reply does not render.
 #[verus_spec(decision =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
@@ -868,7 +875,11 @@ fn respond(
     pools: &Pools,
     rng: &mut StdRng,
 ) -> Option<Decision> {
-    let mut reply = choose(pools, intent.name.as_str(), rng);
+    let address = match context.get("address") {
+        Some(value) => value.as_str(),
+        None => None,
+    };
+    let mut reply = choose(pools, intent.name.as_str(), address, rng);
     reply.text = responses::render(reply.text.as_str(), context).ok()?;
     Some(Decision::Reply { reply, call })
 }
@@ -1093,8 +1104,8 @@ fn area_slot(slots: &[Slot]) -> Option<usize> {
 )]
 fn train(intent: &Intent, pools: &Pools, rng: &mut StdRng) -> Decision {
     Decision::Train {
-        reply: choose(pools, intent.name.as_str(), rng),
-        busy: choose(pools, "training_busy", rng),
+        reply: choose(pools, intent.name.as_str(), None, rng),
+        busy: choose(pools, "training_busy", None, rng),
     }
 }
 
@@ -1108,12 +1119,13 @@ fn train(intent: &Intent, pools: &Pools, rng: &mut StdRng) -> Decision {
 )]
 fn defer(request: &Request, pools: &Pools, rng: &mut StdRng) -> Decision {
     Decision::Defer {
-        filler: choose(pools, "filler", rng),
+        filler: choose(pools, "filler", None, rng),
         job: Job::Llm(request.transcript.clone()),
     }
 }
 
-/// A random response of the pool `name`, with its template as the text.
+/// A random response of the pool `name` for the form of address `address`, with its template as
+/// the text.
 #[verus_spec(chosen =>
     requires
         pools@.contains_key(crate::domain::contracts::string_key(name@)),
@@ -1121,9 +1133,9 @@ fn defer(request: &Request, pools: &Pools, rng: &mut StdRng) -> Decision {
     ensures
         chosen.pool@ == name@,
 )]
-fn choose(pools: &Pools, name: &str, rng: &mut StdRng) -> Chosen {
+fn choose(pools: &Pools, name: &str, address: Option<&str>, rng: &mut StdRng) -> Chosen {
     let pool = pools.get(name).expect("the pool exists");
-    let index = responses::select(pool, rng);
+    let index = responses::select(pool, rng, address);
     Chosen {
         text: pool.responses[index].text.clone(),
         pool: name.to_owned(),
@@ -1771,6 +1783,7 @@ mod tests {
             transcript: transcript.to_owned(),
             area: Some(AreaId("kitchen".to_owned())),
             now: Timestamp::UNIX_EPOCH,
+            address: None,
         };
         let cache = StateCache::load(house());
         decided_for(&catalog(), (label, probability), &[], &request, &cache)
@@ -1787,6 +1800,7 @@ mod tests {
             transcript: String::new(),
             area: area.map(|area| AreaId(area.to_owned())),
             now: Timestamp::UNIX_EPOCH,
+            address: None,
         };
         let slots: Vec<(&str, &str)> = slot.map(|value| ("area", value)).into_iter().collect();
         let cache = StateCache::load(house());
@@ -1816,6 +1830,7 @@ mod tests {
             transcript: String::new(),
             area: Some(AreaId(area.to_owned())),
             now: Timestamp::UNIX_EPOCH,
+            address: None,
         };
         decided_for(catalog, (label, 0.89), &[], &request, cache)
     }
@@ -1909,6 +1924,7 @@ mod tests {
             transcript: String::new(),
             area: Some(AreaId("office".to_owned())),
             now: Timestamp::UNIX_EPOCH,
+            address: None,
         };
         let cache = StateCache::load(house());
         let decision = decided_for(catalog, ("tv_show", 0.89), slots, &request, &cache);
@@ -1973,6 +1989,7 @@ mod tests {
             transcript: "turn on the lights".to_owned(),
             area: None,
             now: Timestamp::UNIX_EPOCH,
+            address: None,
         };
         let cache = StateCache::load(house());
         let decision = decided_for(&catalog(), ("lights_on", 0.89), &[], &request, &cache);
@@ -2020,6 +2037,7 @@ mod tests {
             transcript: String::new(),
             area: None,
             now: Timestamp::UNIX_EPOCH,
+            address: None,
         };
         let decided = |area: &str| {
             decided_for(
@@ -2095,6 +2113,7 @@ mod tests {
             transcript: String::new(),
             area: Some(AreaId("office".to_owned())),
             now: Timestamp::UNIX_EPOCH,
+            address: None,
         };
         let cache = StateCache::load(snapshot);
         let decision = decided_for(&catalog(), (label, 0.89), &[], &request, &cache);
@@ -2293,6 +2312,7 @@ mod tests {
             transcript: String::new(),
             area: Some(AreaId(area.to_owned())),
             now: Timestamp::UNIX_EPOCH,
+            address: None,
         };
         let slots: Vec<(&str, &str)> = slot.map(|value| ("area", value)).into_iter().collect();
         decided_with(&catalog(), &filed(), (label, 0.89), &slots, &request, cache)
@@ -2583,6 +2603,7 @@ mod tests {
             transcript: String::new(),
             area: Some(AreaId(area.to_owned())),
             now: Timestamp::UNIX_EPOCH,
+            address: None,
         };
         decided_for(&catalog(), (label, 0.89), slots, &request, cache)
     }
@@ -2705,6 +2726,7 @@ mod tests {
             transcript: String::new(),
             area: Some(AreaId("kitchen".to_owned())),
             now: Timestamp::UNIX_EPOCH,
+            address: None,
         };
         let cache = StateCache::load(house());
         let slots = [("media", "jazz"), ("area", "downstairs")];
@@ -3207,5 +3229,30 @@ mod tests {
         let found = first_track(&results, "the national").map(|track| track.name.as_str());
         assert_eq!(found, Some("Bloodbuzz Ohio"));
         assert_eq!(first_track(&results, "muse"), None);
+    }
+
+    /// AC-15.9-1.
+    #[test]
+    fn ac_15_9_1_reply_uses_the_form_of_address_of_the_request() {
+        let request = Request {
+            transcript: String::new(),
+            area: Some(AreaId("kitchen".to_owned())),
+            now: Timestamp::UNIX_EPOCH,
+            address: Some("Lady Lang".to_owned()),
+        };
+        let texts = [
+            "I will turn on the lights.",
+            "I will turn on the lights for you, {{ address }}.",
+        ];
+        let mut lights = pool(&texts.map(str::to_owned));
+        lights.responses[0].uses = 1;
+        let mut pools = filed();
+        pools.insert("lights_on".to_owned(), lights);
+        let cache = StateCache::load(house());
+        let top = ("lights_on", 0.89);
+        let decision = decided_with(&catalog(), &pools, top, &[], &request, &cache);
+        let text = "I will turn on the lights for you, Lady Lang.";
+        let replied = matches!(&decision, Decision::Reply { reply, .. } if reply.text == text);
+        assert!(replied, "{decision:?}");
     }
 }
