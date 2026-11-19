@@ -757,6 +757,84 @@ mod tests {
         Ok(())
     }
 
+    /// The function `name` of the page script, up to its closing brace.
+    fn page_function(name: &str) -> &'static str {
+        let start = PAGE
+            .find(&format!("  function {name}("))
+            .expect("the page script has the function");
+        let length = PAGE[start..].find("\n  }\n").expect("the function ends") + 4;
+        &PAGE[start..start + length]
+    }
+
+    /// The standard output of `script` in Node.
+    fn node_output(script: &str) -> anyhow::Result<String> {
+        let file = tempfile::NamedTempFile::new()?;
+        std::fs::write(file.path(), script)?;
+        let output = std::process::Command::new("node")
+            .arg(file.path())
+            .output()?;
+        assert!(output.status.success(), "node gave {}", output.status);
+        Ok(String::from_utf8(output.stdout)?)
+    }
+
+    /// AC-15.8e-1.
+    #[test]
+    fn ac_15_8e_1_found_gives_the_name_and_the_source() -> anyhow::Result<()> {
+        let script = format!(
+            "{}\nconsole.log(found('Louis', 'Voice'));",
+            page_function("found")
+        );
+        assert_eq!(node_output(&script)?.trim_end(), "Louis (voice)");
+        Ok(())
+    }
+
+    /// AC-15.8e-2. The test picks each choice of a voice-identified request, and the empty
+    /// choice of the template.
+    #[test]
+    fn ac_15_8e_2_only_a_person_or_the_empty_choice_sends_a_request() -> anyhow::Result<()> {
+        let harness = r"
+            const people = [{ entity: 'person.sam', name: 'Sam' }];
+            const sent = [];
+            const post = async (url, body) => { sent.push(body.person ?? ''); return true; };
+            class Option { constructor(text, value) { this.value = value; } remove() {} }
+            const choices = [''];
+            const speaker = {
+              append(...options) { choices.push(...options.map((option) => option.value)); },
+              addEventListener(event, listener) { this.listener = listener; },
+            };
+            const interaction = { id: 1, satellite: 'office', speaker: 'person.sam', source: 'Voice' };
+            pickSpeaker(speaker, interaction);
+            (async () => {
+              for (const choice of [...choices]) {
+                speaker.value = choice;
+                await speaker.listener();
+              }
+              console.log(JSON.stringify({ choices, sent }));
+            })();";
+        let script = format!(
+            "{}\n{}\n{harness}",
+            page_function("found"),
+            page_function("pickSpeaker")
+        );
+        let output: serde_json::Value = serde_json::from_str(&node_output(&script)?)?;
+        let choices = output["choices"].as_array().expect("choices is a list");
+        let wanted: Vec<serde_json::Value> = choices
+            .iter()
+            .filter(|choice| {
+                choice
+                    .as_str()
+                    .is_some_and(|value| value.is_empty() || value.starts_with("person."))
+            })
+            .cloned()
+            .collect();
+        assert!(
+            choices.len() > wanted.len(),
+            "no found choice in {choices:?}"
+        );
+        assert_eq!(output["sent"], serde_json::Value::Array(wanted));
+        Ok(())
+    }
+
     /// AC-15.9b-4.
     #[tokio::test]
     async fn ac_15_9b_4_settings_have_the_person_template() -> anyhow::Result<()> {

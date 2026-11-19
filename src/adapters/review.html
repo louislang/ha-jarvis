@@ -258,6 +258,12 @@
 
   const mark = (id, body) => post(`api/interactions/${id}/mark`, body, 'mark');
 
+  // The list shows a speaker that Jarvis found with its source, so a pick of the plain person
+  // confirms it and adds the voice sample.
+  function found(name, source) {
+    return `${name} (${source.toLowerCase()})`;
+  }
+
   // A pick moves the voice sample of the request at once. The list stays disabled until the
   // server answers, so an earlier pick cannot overwrite a later one.
   function pickSpeaker(speaker, interaction) {
@@ -265,12 +271,18 @@
       speaker.remove();
       return;
     }
-    speaker.append(...people.map((person) => new Option(person.name, person.entity)));
-    speaker.value = interaction.speaker ?? '';
+    const name = people.find((person) => person.entity === interaction.speaker)?.name
+      ?? interaction.speaker;
+    const guess = interaction.speaker && interaction.source !== 'Assigned'
+      ? [new Option(found(name, interaction.source), 'found')] : [];
+    speaker.append(...guess, ...people.map((person) => new Option(person.name, person.entity)));
+    speaker.value = guess.length ? 'found' : interaction.speaker ?? '';
     speaker.addEventListener('change', async () => {
+      if (speaker.value === 'found') return;
       speaker.disabled = true;
-      await post(`api/interactions/${interaction.id}/speaker`,
+      const picked = await post(`api/interactions/${interaction.id}/speaker`,
         { person: speaker.value || null }, 'speaker pick').finally(() => { speaker.disabled = false; });
+      if (picked) guess[0]?.remove();
     });
   }
 
