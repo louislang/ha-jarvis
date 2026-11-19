@@ -147,7 +147,8 @@ quint:
         if grep -q '^  val Inductive ' "$model"; then
             quint verify --inductive-invariant=Inductive --invariant=allInvariants "$model"
         else
-            quint verify --invariant=allInvariants --max-steps=10 "$model"
+            steps=$(sed -n 's/^  pure val VERIFY_STEPS = \([0-9]*\).*/\1/p' "$model")
+            quint verify --invariant=allInvariants --max-steps="${steps:-10}" "$model"
         fi
     done
 
