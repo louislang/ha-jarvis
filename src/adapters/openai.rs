@@ -71,8 +71,9 @@ pub fn system_prompt() -> &'static str {
     "You are Jarvis, the voice assistant of a house. Answer the request with plain text to speak \
      aloud: short sentences, with no Markdown, lists or emoji. Ask the user a question only with \
      the ask_user tool, never in the text. Do not say again text that you already said in this \
-     answer. Say that an action happened only after its tool call succeeded. If no tool can do the \
-     request, say that you cannot do it."
+     answer. Say that an action happened only after its tool call succeeded. If the request asks \
+     for an action that no tool can do, say that you cannot do it. Answer a question of fact from \
+     your own knowledge."
 }
 
 /// The user message of `question`: the local time, the HA location name, the area names, the
@@ -1587,7 +1588,8 @@ mod tests {
     fn ac_10_6b_7_system_prompt_claims_only_succeeded_calls() {
         assert_rules(&[
             "Say that an action happened only after its tool call succeeded.",
-            "If no tool can do the request, say that you cannot do it.",
+            "If the request asks for an action that no tool can do, say that you cannot do it.",
+            "Answer a question of fact from your own knowledge.",
         ]);
     }
 
