@@ -618,9 +618,66 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 - P-15.9b-5. Argument: the prompt builder adds the line only for a `Some` value that is not empty.
 - P-15.9b-1, P-15.9b-2, P-15.9b-4. Evidence: test.
 
-## Later
+---
 
-- Measure on the GPU host how long a reply takes when it waits for the voice embedding. Then decide if a reply with `{{ address }}` waits for the voice. This note has no criteria yet.
+### 15.9d Voice Address
+
+**Goal:** Address the speaker also when only the voice identifies the speaker, in intent replies and in System Two answers. In the field test on 2026-11-19, Louis and Ali were home, and "Who wrote Hamlet?" from the Office satellite got no "Your lordship": presence and proximity found no speaker, but the voice match found Louis.
+
+- **Implements:** G1, G12. **Depends on:** 15.9b.
+- **Files:** modify `src/app/conversation.rs`, `README.md`.
+
+**Model.**
+
+- A voice request is a request from a satellite with an utterance (sub-phase 12.1b). For a voice request, `handle` identifies the speaker before `respond`. It awaits the embedding of the utterance (sub-phase 15.4), gets `similarities`, reads `signals` with them, and calls `identify` (rules 1 to 4 of sub-phase 15.6). The `address` of `Heard` is the value of that speaker in `[address]`, or `None` without a speaker or a value.
+- Each reply of the request uses this `address`: the intent reply (`Request.address`, sub-phase 15.9), the System Two answer (`Thread.address`, sub-phase 15.9b) and the System Two answer to a dialog answer (sub-phase 10.6b). This replaces the rule of sub-phase 15.9c that the reply does not wait for the voice embedding (AC-15.9c-3, P-15.9c-3).
+- After the append, the identification task of sub-phase 15.6e gets this identification: the embedding, the signals and the speaker. It does not await the embedding again. It sends the `Speaker` log update (sub-phase 15.6b) and enrolls by rule 5. Thus the embedding, `similarities` and `identify` run once for each request, and the log records the speaker that the reply addresses.
+- When the embedding or `similarities` fails, the `address` is the presence and proximity address of sub-phase 15.9c. As in sub-phase 15.6e, the failure gives a log line, no `Speaker` update and no enroll.
+- `handle` waits for each voice request, also when the chosen pool has no response with `address`. The pool is known only after `decide`, and a System Two answer also needs the address. Thus a wait for some requests only needs a second path and gives no gain while the latency budget holds.
+- The wait has no time limit. The embedding starts at the commit in a blocking task (`keep`, sub-phase 15.4), so it runs while HA sends the transcript to `handle`. It ends with an embedding or an error, and it has a p95 of less than 80 ms on the CPU for 3 s of audio (AC-15.3-6). AC-15.9d-4 checks the latency budget on the GPU host. A limit needs a new setting.
+- A typed request and a request from a satellite with no utterance do not wait, and use the presence and proximity address. The answer of a fetch job and a prefetch reply select with `address = None` (sub-phase 15.9c).
+- No Quint model changes, so this is not a stateful change. The identification rules of `speaker.qnt` do not change. The wait adds no state to `dialog.qnt` or `announce.qnt`, because it comes before the decision.
+- `README.md`: the form of address row says that a voice request waits for the voice match, and that each reply addresses that speaker.
+
+**Acceptance criteria.**
+
+- AC-15.9d-1: When `person.ali` and `person.louis` are home, no tracker is in the satellite area, the voice matches only `person.ali`, `[address]` has `"person.ali" = "Lady Lang"`, and a voice request goes to System Two, the question of `Reasoner::answer` has the form of address `Lady Lang`.
+- AC-15.9d-2: With the signals of AC-15.9d-1, when selection chooses the response `I will turn on the lights for you, {{ address }}.`, `handle` replies "I will turn on the lights for you, Lady Lang." This replaces AC-15.9c-3.
+- AC-15.9d-3: When the embedding of a voice request fails, only `person.ali` is home, and selection chooses the response of AC-15.9d-2, `handle` replies "I will turn on the lights for you, Lady Lang."
+- AC-15.9d-4 [GPU host]: With the wait for the voice identification, all Phase 9.2 latency tests pass.
+
+**Proofs.**
+
+- P-15.9d-1, P-15.9d-2. Argument: `handle` sets the `address` of `Heard` from `identify` with the voice similarities before `respond`, and `Request` and `Thread` copy that `address`. Evidence: test.
+- P-15.9d-3. Argument: on an error of the embedding or of `similarities`, `handle` keeps the address of `identify` with no voice, which is the address of sub-phase 15.9c.
+- P-15.9d-4. Evidence: test.
+
+---
+
+### 15.9e Addressed Command Responses
+
+**Goal:** Let quick intent replies address the speaker sometimes, for example "Turn on the fan" gives "Right away, your lordship." or "I will turn the fan on for you, your lordship.".
+
+- **Implements:** G12. **Depends on:** 15.9d.
+- **Files:** modify `responses.toml`, `src/domain/responses.rs`, `README.md`.
+
+**Model.**
+
+- Each pool of a `command` intent of `intents.toml` gets one or two responses with `{{ address }}`: "Right away, {{ address }}." and an action-specific response, for example "I will turn the fan on for you, {{ address }}.". This replaces the statement of sub-phase 15.9c that `responses.toml` does not change. The pools of other kinds do not change.
+- A response with `address` uses no variable other than `area` and `address`. Thus pre-render (sub-phase 15.9c) synthesizes it for each area and each value of `[address]`, and no reply with `address` runs TTS at request time. Pre-render needs no change. A response with only `address` gives one text for each value of `[address]`, so it adds less start time than a response with `area` too.
+- Selection does not change (sub-phase 15.9). When the speaker has a form of address, the responses with `address` and without it are both eligible, so a reply addresses the speaker sometimes. Selection prefers the lowest use count, and a new response starts with 0 uses (`merge`, sub-phase 4.8). Thus after the update, a speaker with a form of address hears the new responses first, until their use counts reach the counts of the old responses.
+- Pool validation (sub-phase 15.9) already requires a response without `address` in each pool. Each command pool keeps its responses.
+- A pool with a response that uses `address` gets no backfill (sub-phase 8.1, sub-phase 15.9c). Thus the command pools stop getting backfill. The responses that backfill already added to them stay (`merge`, sub-phase 4.8). Backfill still adds responses to the other pools.
+- `README.md`: the form of address row gives the example "Right away, {{ address }}." of the command pools, and says that the command pools get no backfill.
+
+**Acceptance criteria.**
+
+- AC-15.9e-1: When the repository files load, each pool of a `command` intent has a response that uses `address` and a response that does not, and pool validation passes.
+- AC-15.9e-2: When the repository files load, each response that uses `address` has no variable other than `area` and `address`.
+
+**Proofs.**
+
+- P-15.9e-1, P-15.9e-2. Evidence: test. The variables of a template come from `minijinja`, which Verus cannot see (P-4.2-2).
 
 ## Field Log
 
@@ -634,3 +691,5 @@ These steps are not tests and gate nothing.
 6. Walk to each satellite with a phone. Make sure the tracker area changes to the satellite area.
 7. In the review section of the Jarvis tab, pick the speaker of some requests. Make sure that later requests of that person get the voice source more often.
 8. In the settings of the Jarvis tab, set "Address as" for Ali to "Lady Lang". Add a response with `{{ address }}` to a pool. Ask Jarvis from the Office satellite while only Ali is home. Make sure the reply says "Lady Lang".
+9. Set "Address as" for Louis to "Your lordship". While Louis and Ali are home and no phone is near the Office satellite, Louis asks "Who wrote Hamlet?" there. Make sure the System Two answer says "Your lordship".
+10. With the same people and place, Louis says "Turn on the fan" a few times. Make sure that some replies say "your lordship" and that the replies come as fast as before.
