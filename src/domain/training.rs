@@ -1302,6 +1302,8 @@ mod tests {
             latency_ms: None,
             link: None,
             marks: mark.into_iter().collect(),
+            speaker: None,
+            source: None,
         }
     }
 

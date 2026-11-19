@@ -54,7 +54,7 @@ pub struct Context {
 pub struct AreaId(pub String);
 
 /// The ID of an entity, for example `light.kitchen`.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct EntityId(pub String);
 

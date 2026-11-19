@@ -23,13 +23,17 @@ use crate::ports::Page;
 
 /// The migration steps of the schema. The step at index `n` moves the schema from version `n` to
 /// version `n + 1`.
-const STEPS: [&str; 2] = [
+const STEPS: [&str; 3] = [
     "CREATE TABLE interactions (id INTEGER PRIMARY KEY, time INTEGER NOT NULL, record TEXT NOT NULL, audio BLOB)",
     "CREATE TABLE marks (interaction INTEGER NOT NULL, mark TEXT NOT NULL)",
+    "ALTER TABLE interactions ADD COLUMN speaker TEXT; ALTER TABLE interactions ADD COLUMN source TEXT; \
+    ALTER TABLE interactions ADD COLUMN embedding BLOB",
 ];
 
-/// The JSON record of an interaction with its marks, in the order that they were stored.
-const RECORD: &str = "json_set(record, '$.marks', json((SELECT json_group_array(json(mark) ORDER BY rowid) FROM marks WHERE interaction = interactions.id)))";
+/// The JSON record of an interaction with its marks, in the order that they were stored, and its
+/// speaker and source.
+const RECORD: &str = "json_set(record, '$.marks', json((SELECT json_group_array(json(mark) ORDER BY rowid) FROM marks WHERE interaction = interactions.id)), \
+    '$.speaker', speaker, '$.source', source)";
 
 /// Adds the mark `?2` to the interaction `?1`.
 const ADD: &str = "INSERT INTO marks (interaction, mark) VALUES (?1, ?2)";
@@ -136,6 +140,17 @@ impl SqliteLog {
         Ok(interactions.collect::<Result<_, _>>()?)
     }
 
+    /// Runs the statement `query` with `values`.
+    async fn execute(
+        &self,
+        query: &'static str,
+        values: impl Params + Send + 'static,
+    ) -> anyhow::Result<()> {
+        self.run(move |connection| connection.execute(query, values))
+            .await?;
+        Ok(())
+    }
+
     /// The value of `column` of the interaction `id`, or `None` when the interaction does not
     /// exist.
     async fn column<T: FromSql + Send + 'static>(
@@ -172,8 +187,8 @@ impl InteractionLog for SqliteLog {
         let (id, time) = (interaction.id, interaction.time.as_millisecond());
         self.run(move |connection| {
             let transaction = connection.unchecked_transaction()?;
-            let insert =
-                "INSERT INTO interactions (id, time, record, audio) VALUES (?1, ?2, ?3, ?4)";
+            let insert = "INSERT INTO interactions (id, time, record, audio, speaker, source) \
+                VALUES (?1, ?2, ?3, ?4, json_extract(?3, '$.speaker'), json_extract(?3, '$.source'))";
             transaction.execute(insert, params![id, time, record, bytes])?;
             for mark in &marks {
                 transaction.execute(ADD, params![id, mark])?;
@@ -184,14 +199,29 @@ impl InteractionLog for SqliteLog {
     }
 
     async fn update(&self, id: u64, change: Change) -> anyhow::Result<()> {
-        let Change::Response(spoken) = change;
-        let spoken = serde_json::to_string(&spoken)?;
-        self.run(move |connection| {
-            let add = "UPDATE interactions SET record = json_insert(record, '$.responses[#]', json(?2)) WHERE id = ?1";
-            connection.execute(add, params![id, spoken])
-        })
-        .await?;
-        Ok(())
+        match change {
+            Change::Response(spoken) => {
+                let add = "UPDATE interactions SET record = json_insert(record, '$.responses[#]', json(?2)) WHERE id = ?1";
+                self.execute(add, (id, serde_json::to_string(&spoken)?))
+                    .await
+            }
+            Change::Speaker {
+                speaker,
+                source,
+                embedding,
+            } => {
+                let set = "UPDATE interactions SET speaker = json_extract(?2, '$[0]'), source = json_extract(?2, '$[1]'), \
+                    embedding = coalesce(?3, embedding) WHERE id = ?1";
+                let bytes: Option<Vec<u8>> = embedding.map(|embedding| {
+                    embedding
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect()
+                });
+                let identified = serde_json::to_string(&(speaker, source))?;
+                self.execute(set, (id, identified, bytes)).await
+            }
+        }
     }
 
     async fn list(&self, filter: Filter, page: Page) -> anyhow::Result<Vec<Interaction>> {
@@ -218,6 +248,14 @@ impl InteractionLog for SqliteLog {
                 samples: samples.collect(),
                 rate: RATE,
             }
+        }))
+    }
+
+    async fn embedding(&self, id: u64) -> anyhow::Result<Option<Vec<f32>>> {
+        let bytes: Option<Option<Vec<u8>>> = self.column("embedding", id).await?;
+        Ok(bytes.flatten().map(|bytes| {
+            let (quads, _) = bytes.as_chunks::<4>();
+            quads.iter().map(|quad| f32::from_le_bytes(*quad)).collect()
         }))
     }
 
@@ -281,6 +319,8 @@ mod tests {
     use crate::domain::feedback::Spoken;
     use crate::domain::feedback::Tagged;
     use crate::domain::feedback::Value;
+    use crate::domain::speaker::Source;
+    use crate::domain::state::EntityId;
     use crate::domain::state::ServiceCall;
 
     /// The first page of 50 interactions.
@@ -383,7 +423,24 @@ mod tests {
             latency_ms: Some(120),
             link: Some(1),
             marks: Vec::new(),
+            speaker: Some(EntityId("person.alex".to_owned())),
+            source: Some(Source::Proximity),
         }
+    }
+
+    /// The interaction `id` of [`interaction`] without a speaker.
+    fn unspoken(id: u64) -> Interaction {
+        Interaction {
+            speaker: None,
+            source: None,
+            ..interaction(id)
+        }
+    }
+
+    /// The schema version of the database at `path`.
+    fn version(path: &Path) -> anyhow::Result<usize> {
+        let connection = Connection::open(path)?;
+        Ok(connection.pragma_query_value(None, "user_version", |row| row.get(0))?)
     }
 
     /// AC-12.4-1.
@@ -412,9 +469,9 @@ mod tests {
     #[test]
     fn ac_12_4_3_open_creates_the_database() -> anyhow::Result<()> {
         let (_log, folder) = log();
-        let connection = Connection::open(folder.path().join("jarvis.db"))?;
-        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 2);
+        let path = folder.path().join("jarvis.db");
+        assert_eq!(version(&path)?, 3);
+        let connection = Connection::open(path)?;
         let count: u32 =
             connection.query_row("SELECT count(*) FROM interactions", [], |row| row.get(0))?;
         assert_eq!(count, 0);
@@ -426,11 +483,11 @@ mod tests {
     fn ac_12_4_4_newer_schema_is_an_error() -> anyhow::Result<()> {
         let folder = tempfile::tempdir()?;
         let config = config(&folder);
-        Connection::open(&config.database)?.pragma_update(None, "user_version", 3)?;
+        Connection::open(&config.database)?.pragma_update(None, "user_version", 4)?;
         let Err(error) = SqliteLog::open(&config) else {
             panic!("a newer schema opens");
         };
-        let expected = "the schema version 3 of the database is newer than the version 2 of Jarvis";
+        let expected = "the schema version 4 of the database is newer than the version 3 of Jarvis";
         assert_eq!(error.to_string(), expected);
         Ok(())
     }
@@ -509,15 +566,19 @@ mod tests {
         Ok(())
     }
 
-    /// Writes a database of schema version 1 at `path` with the record of `interaction` without
-    /// its marks.
-    fn version_one(path: &Path, interaction: &Interaction) -> anyhow::Result<()> {
+    /// Writes a database of schema version `version` at `path` with the record of `interaction`
+    /// without its marks, its speaker and its source.
+    fn stored(path: &Path, version: usize, interaction: &Interaction) -> anyhow::Result<()> {
         let connection = Connection::open(path)?;
-        connection.execute_batch(STEPS[0])?;
-        connection.pragma_update(None, "user_version", 1)?;
+        for step in &STEPS[..version] {
+            connection.execute_batch(step)?;
+        }
+        connection.pragma_update(None, "user_version", version)?;
         let mut record = serde_json::to_value(interaction)?;
         if let Some(fields) = record.as_object_mut() {
-            fields.remove("marks");
+            for field in ["marks", "speaker", "source"] {
+                fields.remove(field);
+            }
         }
         let (id, time) = (interaction.id, interaction.time.as_millisecond());
         let insert = "INSERT INTO interactions (id, time, record) VALUES (?1, ?2, ?3)";
@@ -530,12 +591,23 @@ mod tests {
     async fn ac_12_5_3_migration_keeps_every_record() -> anyhow::Result<()> {
         let folder = tempfile::tempdir()?;
         let config = config(&folder);
-        version_one(&config.database, &interaction(7))?;
+        stored(&config.database, 1, &unspoken(7))?;
         let log = SqliteLog::open(&config)?;
-        assert_eq!(log.get(7).await?, Some(interaction(7)));
-        let connection = Connection::open(&config.database)?;
-        let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        assert_eq!(version, 2);
+        assert_eq!(log.get(7).await?, Some(unspoken(7)));
+        assert_eq!(version(&config.database)?, 3);
+        Ok(())
+    }
+
+    /// AC-15.6b-4.
+    #[tokio::test]
+    async fn ac_15_6b_4_migration_keeps_every_record() -> anyhow::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let config = config(&folder);
+        stored(&config.database, 2, &unspoken(7))?;
+        let log = SqliteLog::open(&config)?;
+        assert_eq!(log.get(7).await?, Some(unspoken(7)));
+        assert_eq!(log.embedding(7).await?, None);
+        assert_eq!(version(&config.database)?, 3);
         Ok(())
     }
 
@@ -635,6 +707,45 @@ mod tests {
         log.mark(mark(2, Some(Value::Bad))).await?;
         log.prune(day(1000)).await?;
         assert_eq!(ids(&log.list(Filter::All, PAGE).await?), [2, 1]);
+        Ok(())
+    }
+
+    /// The `Speaker` change to `person.sam` from presence with `embedding`.
+    fn sam(embedding: Option<Vec<f32>>) -> Change {
+        Change::Speaker {
+            speaker: Some(EntityId("person.sam".to_owned())),
+            source: Some(Source::Presence),
+            embedding,
+        }
+    }
+
+    /// A `Speaker` change sets the speaker and the source, and one without an embedding keeps the
+    /// stored embedding.
+    #[tokio::test]
+    async fn update_sets_the_speaker() -> anyhow::Result<()> {
+        let (log, _folder) = log();
+        log.append(unspoken(7), None).await?;
+        log.update(7, sam(Some(vec![0.5, -1.0]))).await?;
+        log.update(7, sam(None)).await?;
+        let expected = Interaction {
+            speaker: Some(EntityId("person.sam".to_owned())),
+            source: Some(Source::Presence),
+            ..unspoken(7)
+        };
+        assert_eq!(log.get(7).await?, Some(expected));
+        assert_eq!(log.embedding(7).await?, Some(vec![0.5, -1.0]));
+        Ok(())
+    }
+
+    /// AC-15.6b-3.
+    #[tokio::test]
+    async fn ac_15_6b_3_prune_keeps_the_embedding() -> anyhow::Result<()> {
+        let (log, _folder) = aged(&[(1, 5)]).await?;
+        let embedding = vec![0.5, -1.0, f32::MAX];
+        log.update(1, sam(Some(embedding.clone()))).await?;
+        log.prune(day(40)).await?;
+        assert_eq!(log.audio(1).await?, None);
+        assert_eq!(log.embedding(1).await?, Some(embedding));
         Ok(())
     }
 }

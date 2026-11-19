@@ -67,6 +67,7 @@ use crate::domain::responses::Pool;
 use crate::domain::responses::Response;
 use crate::domain::speaker::PersonTrackers;
 use crate::domain::speaker::Satellite;
+use crate::domain::speaker::Source;
 use crate::domain::speaker::Tracker;
 use crate::domain::state::Area;
 use crate::domain::state::AreaId;
@@ -177,6 +178,10 @@ pub struct ExPersonTrackers(PersonTrackers);
 /// A `[[satellites]]` entry: the presence sensors that replace discovery for one satellite.
 #[verifier::external_type_specification]
 pub struct ExSatellite(Satellite);
+
+/// The signal that identified the speaker.
+#[verifier::external_type_specification]
+pub struct ExSource(Source);
 
 /// The intent catalog of `intents.toml`.
 #[verifier::external_type_specification]

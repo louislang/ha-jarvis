@@ -1050,6 +1050,8 @@ pub struct FakeLog {
     pub interactions: Mutex<Vec<(Interaction, Option<Audio>)>>,
     /// The time of each `prune` call, in order.
     pub prunes: Mutex<Vec<Timestamp>>,
+    /// The stored voice embedding of each interaction ID.
+    pub embeddings: Mutex<BTreeMap<u64, Vec<f32>>>,
     /// The wait of each `append` and `update`.
     pub delay: Duration,
 }
@@ -1098,6 +1100,8 @@ impl FakeLog {
             latency_ms: None,
             link: None,
             marks: Vec::new(),
+            speaker: None,
+            source: None,
         };
         interactions.push((interaction, None));
     }
@@ -1130,8 +1134,24 @@ impl InteractionLog for FakeLog {
 
     async fn update(&self, id: u64, change: Change) -> anyhow::Result<()> {
         tokio::time::sleep(self.delay).await;
-        let Change::Response(spoken) = change;
-        self.change(id, |interaction| interaction.responses.push(spoken));
+        match change {
+            Change::Response(spoken) => {
+                self.change(id, |interaction| interaction.responses.push(spoken));
+            }
+            Change::Speaker {
+                speaker,
+                source,
+                embedding,
+            } => {
+                self.change(id, |interaction| {
+                    interaction.speaker = speaker;
+                    interaction.source = source;
+                });
+                if let Some(embedding) = embedding {
+                    lock(&self.embeddings).insert(id, embedding);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1151,6 +1171,10 @@ impl InteractionLog for FakeLog {
 
     async fn audio(&self, id: u64) -> anyhow::Result<Option<Audio>> {
         Ok(self.find(id).and_then(|(_, audio)| audio))
+    }
+
+    async fn embedding(&self, id: u64) -> anyhow::Result<Option<Vec<f32>>> {
+        Ok(lock(&self.embeddings).get(&id).cloned())
     }
 
     async fn mark(&self, mark: Mark) -> anyhow::Result<()> {

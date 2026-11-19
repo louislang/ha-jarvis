@@ -214,6 +214,8 @@ mod tests {
             latency_ms: None,
             link,
             marks: Vec::new(),
+            speaker: None,
+            source: None,
         }
     }
 

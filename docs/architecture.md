@@ -236,6 +236,7 @@ flowchart LR
     crate_domain_dialog --> crate_domain_intent
     crate_domain_dialog --> crate_domain_model
     crate_domain_dialog --> crate_domain_select
+    crate_domain_feedback --> crate_domain_speaker
     crate_domain_feedback --> crate_domain_state
     crate_domain_habits --> crate_domain_contracts
     crate_domain_habits --> crate_domain_habits
@@ -282,6 +283,7 @@ flowchart LR
     crate_ports --> crate_domain_feedback
     crate_ports --> crate_domain_learn
     crate_ports --> crate_domain_model
+    crate_ports --> crate_domain_speaker
     crate_ports --> crate_domain_speech
     crate_ports --> crate_domain_state
     crate_ports --> crate_domain_training
