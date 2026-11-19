@@ -63,6 +63,8 @@ pub enum PoolError {
         /// The variable name.
         variable: String,
     },
+    /// Each response of the pool with this name uses `address`.
+    Address(String),
 }
 
 /// A rejected backfill candidate.
@@ -82,12 +84,144 @@ pub enum CandidateError {
     Variable(String),
 }
 
-/// The index of a random response of `pool` with the lowest use count, other than the last
-/// response when the pool has two or more.
+/// The index of a random eligible response of `pool` with the lowest use count, other than the
+/// last response when two or more are eligible. A response that uses `address` is eligible only
+/// when `address` is not empty, or when each response uses it.
 ///
 /// # Panics
 ///
 /// `pool` has no responses.
+#[verus_spec(index =>
+    requires
+        pool.responses.len() > 0,
+    ensures
+        index < pool.responses.len(),
+)]
+#[must_use]
+pub fn select(pool: &Pool, rng: &mut StdRng, address: Option<&str>) -> usize {
+    let usable = match address {
+        Some(text) => !text.is_empty(),
+        None => false,
+    };
+    let (addressed, plain) = addressed(pool);
+    let kept = eligible(&addressed, usable || !plain);
+    let position = pick(&counted(pool, &kept), rng);
+    proof! {
+        assert(usable || !plain || !addressed@[kept@[position as int] as int]);
+    }
+    kept[position]
+}
+
+/// For each response of `pool`, true when its template uses `address`, and true when a response
+/// does not use it.
+#[verus_spec(result =>
+    ensures
+        result.0@.len() == pool.responses.len(),
+        result.1 == plain(result.0@),
+)]
+fn addressed(pool: &Pool) -> (Vec<bool>, bool) {
+    let mut flags = Vec::new();
+    let mut unaddressed = false;
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= pool.responses.len(),
+            flags@.len() == index,
+            unaddressed == plain(flags@),
+        decreases pool.responses.len() - index,
+    ))]
+    while index < pool.responses.len() {
+        let uses = uses_address(pool.responses[index].text.as_str());
+        proof! {
+            if plain(flags@) {
+                let found = choose|found: int| 0 <= found < flags@.len() && !flags@[found];
+                assert(flags@.push(uses)[found] == flags@[found]);
+            }
+            if !uses {
+                assert(flags@.push(uses)[index as int] == uses);
+            }
+        }
+        flags.push(uses);
+        unaddressed = unaddressed || !uses;
+        index += 1;
+    }
+    (flags, unaddressed)
+}
+
+/// True when `template` parses and uses `address`.
+#[verus_verify]
+fn uses_address(template: &str) -> bool {
+    let environment = Environment::new();
+    let Ok(parsed) = environment.template_from_str(template) else {
+        return false;
+    };
+    let variables = BTreeSet::from_iter(parsed.undeclared_variables(false));
+    variables.contains("address")
+}
+
+/// The indices of the eligible responses with the flags `addressed`. Without `open`, a response
+/// that uses `address` is not eligible.
+#[verus_spec(kept =>
+    ensures
+        forall|position: int| 0 <= position < kept@.len()
+            ==> #[trigger] kept@[position] < addressed@.len()
+            && (open || !addressed@[kept@[position] as int]),
+        (open && addressed@.len() > 0) || plain(addressed@) ==> kept@.len() > 0,
+)]
+fn eligible(addressed: &[bool], open: bool) -> Vec<usize> {
+    let mut kept: Vec<usize> = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= addressed.len(),
+            forall|position: int| 0 <= position < kept@.len()
+                ==> #[trigger] kept@[position] < index && (open || !addressed@[kept@[position] as int]),
+            kept@.len() == 0 ==> (!open || index == 0) && forall|seen: int| 0 <= seen < index ==> #[trigger] addressed@[seen],
+        decreases addressed.len() - index,
+    ))]
+    while index < addressed.len() {
+        if open || !addressed[index] {
+            kept.push(index);
+        }
+        index += 1;
+    }
+    kept
+}
+
+/// A pool with the use counts of the responses of `pool` at `kept`, and the last one of them.
+#[verus_spec(counted =>
+    requires
+        forall|position: int| 0 <= position < kept@.len() ==> #[trigger] kept@[position] < pool.responses.len(),
+    ensures
+        counted.responses.len() == kept@.len(),
+)]
+fn counted(pool: &Pool, kept: &[usize]) -> Pool {
+    let (mut responses, mut last) = (Vec::new(), None);
+    let mut position = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            position <= kept@.len(),
+            responses@.len() == position,
+            forall|other: int| 0 <= other < kept@.len() ==> #[trigger] kept@[other] < pool.responses.len(),
+        decreases kept@.len() - position,
+    ))]
+    while position < kept.len() {
+        let index = kept[position];
+        if pool.last == Some(index) {
+            last = Some(position);
+        }
+        responses.push(Response {
+            text: String::new(),
+            uses: pool.responses[index].uses,
+            generated: false,
+        });
+        position += 1;
+    }
+    Pool { responses, last }
+}
+
+/// The index of a random response of `pool` with the lowest use count, other than the last
+/// response when the pool has two or more.
 #[verus_spec(index =>
     requires
         pool.responses.len() > 0,
@@ -99,7 +233,7 @@ pub enum CandidateError {
         index == chosen(*pool, crate::domain::contracts::next(&*old(rng))),
 )]
 #[must_use]
-pub fn select(pool: &Pool, rng: &mut StdRng) -> usize {
+fn pick(pool: &Pool, rng: &mut StdRng) -> usize {
     let random = rng.next_u32() as usize;
     let found = candidates(pool);
     proof! {
@@ -297,7 +431,8 @@ fn require(pools: &Pools, name: &str) -> Result<(), PoolError> {
     }
 }
 
-/// Checks that the pool `name` has responses whose templates parse and use only its variables.
+/// Checks that the pool `name` has responses whose templates parse and use only its variables,
+/// and that a response does not use `address`.
 #[verus_spec(result =>
     ensures
         result is Ok ==> pool.responses.len() > 0,
@@ -310,7 +445,11 @@ fn check_pool(name: &str, pool: &Pool, catalog: &Catalog) -> Result<(), PoolErro
     for response in &pool.responses {
         check_template(name, response.text.as_str(), &allowed)?;
     }
-    Ok(())
+    if addressed(pool).1 {
+        Ok(())
+    } else {
+        Err(PoolError::Address(name.to_owned()))
+    }
 }
 
 /// The template variables of the pool `name`: none when no intent of `catalog` has the name.
@@ -326,6 +465,7 @@ fn variables(name: &str, catalog: &Catalog) -> BTreeSet<String> {
     };
     catalog::insert_slots(intent, &mut variables);
     let mut variables = pool_variables(variables, intent.kind, intent.target);
+    variables.insert("address".to_owned());
     if intent.needs_speaker {
         variables.insert("person".to_owned());
     }
@@ -554,6 +694,11 @@ pub open spec fn filled(pools: Map<String, Pool>) -> bool {
     forall|name: String| #[trigger] pools.contains_key(name) ==> pools[name].responses.len() > 0
 }
 
+/// True when a flag of `addressed` is false: a response does not use `address`.
+pub open spec fn plain(addressed: Seq<bool>) -> bool {
+    exists|index: int| 0 <= index < addressed.len() && !#[trigger] addressed[index]
+}
+
 /// True when `select` can give the response at `index` of `pool`.
 pub open spec fn allowed(pool: Pool, index: int) -> bool {
     &&& 0 <= index < pool.responses.len()
@@ -779,7 +924,7 @@ mod tests {
     /// The index that `select` gives for `pool` with an RNG from each seed of `seeds`.
     fn selected(pool: &Pool, seeds: Range<u64>) -> Vec<usize> {
         seeds
-            .map(|seed| select(pool, &mut StdRng::seed_from_u64(seed)))
+            .map(|seed| select(pool, &mut StdRng::seed_from_u64(seed), None))
             .collect()
     }
 
@@ -1042,5 +1187,57 @@ mod tests {
     fn ac_8_1_7_variable_other_than_area_gets_no_backfill() {
         assert!(!needs_backfill(&texts(&["{{ entity }} is on."]), 3, 30));
         assert!(needs_backfill(&texts(&["In the {{ area }}."]), 3, 30));
+    }
+
+    /// A response without `address` and a response with it.
+    const ADDRESSED: [&str; 2] = [
+        "I will turn on the lights.",
+        "I will turn on the lights for you, {{ address }}.",
+    ];
+
+    /// The indices that `select` gives with `address` for `ADDRESSED`, whose response without
+    /// `address` has more uses.
+    fn addressed_indices(address: Option<&str>) -> Vec<usize> {
+        let mut pool = texts(&ADDRESSED);
+        pool.responses[0].uses = 1;
+        let seeds = 0..20;
+        let rngs = seeds.map(StdRng::seed_from_u64);
+        rngs.map(|mut rng| select(&pool, &mut rng, address))
+            .collect()
+    }
+
+    /// AC-15.9-2.
+    #[test]
+    fn ac_15_9_2_no_address_never_selects_an_address_response() {
+        assert_eq!(addressed_indices(None), [0; 20]);
+        assert_eq!(addressed_indices(Some("Lady Lang")), [1; 20]);
+    }
+
+    /// AC-15.9-3.
+    #[test]
+    fn ac_15_9_3_empty_address_never_selects_an_address_response() {
+        assert_eq!(addressed_indices(Some("")), [0; 20]);
+    }
+
+    /// AC-15.9-4.
+    #[test]
+    fn ac_15_9_4_pool_with_only_address_responses_names_the_pool() {
+        let result = validate(|pools, _| set(pools, "lights_on", &ADDRESSED));
+        assert_eq!(result, Ok(()));
+        let only = ["{{ address }}.", "Done, {{ address }}."];
+        let result = validate(|pools, _| set(pools, "lights_on", &only));
+        assert_eq!(result, Err(PoolError::Address("lights_on".to_owned())));
+    }
+
+    /// AC-15.9-7.
+    #[test]
+    fn ac_15_9_7_no_address_repeats_the_only_eligible_response() {
+        let mut pools = Pools::from([("lights_on".to_owned(), texts(&ADDRESSED))]);
+        let mut rng = StdRng::seed_from_u64(1);
+        for _ in 0..2 {
+            let index = select(&pools["lights_on"], &mut rng, None);
+            assert_eq!(index, 0);
+            pools = record_use(pools, "lights_on", index);
+        }
     }
 }
