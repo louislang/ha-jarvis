@@ -76,6 +76,17 @@ pub fn system_prompt() -> &'static str {
      your own knowledge."
 }
 
+/// The system prompt, with the line `Address the user as <address>.` after it when `address` is
+/// not empty. The line comes last, so the prompt cache still reuses [`system_prompt`].
+fn instructions(address: Option<&str>) -> String {
+    match address {
+        Some(address) if !address.is_empty() => {
+            format!("{}\nAddress the user as {address}.", system_prompt())
+        }
+        _ => system_prompt().to_owned(),
+    }
+}
+
 /// The user message of `question`: the local time, the HA location name, the area names, the
 /// area, the entities of the area, the entities with no area and the text.
 #[must_use]
@@ -802,7 +813,7 @@ impl OpenAiReasoner {
         let mut request = CreateResponseArgs::default();
         request
             .model(&self.model)
-            .instructions(system_prompt())
+            .instructions(instructions(question.address.as_deref()))
             .tools(tools)
             .max_output_tokens(self.max_output_tokens)
             .parallel_tool_calls(false);
@@ -1376,6 +1387,35 @@ mod tests {
         let output = json!({"type": "function_call_output", "call_id": "call_0", "output": "four"});
         assert_eq!(body["input"], json!([output]));
         assert_eq!(body["parallel_tool_calls"], false);
+        Ok(())
+    }
+
+    /// The instructions of the answer request when the speaker has the form of address
+    /// `address`.
+    async fn sent_instructions(address: Option<&str>) -> anyhow::Result<Value> {
+        let (server, reasoner) = serve(spoken(TEXT, &["Done."])).await?;
+        let question = Question {
+            address: address.map(str::to_owned),
+            ..question(Some("kitchen"))
+        };
+        let _steps: Vec<anyhow::Result<Step>> = reasoner.answer(&question).collect().await;
+        let requests = server.received_requests().await.context("no requests")?;
+        let body: Value = requests[0].body_json()?;
+        Ok(body["instructions"].clone())
+    }
+
+    /// AC-15.9b-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_9b_5_instructions_address_the_speaker() -> anyhow::Result<()> {
+        let addressed = format!("{}\nAddress the user as Lady Lang.", system_prompt());
+        assert_eq!(sent_instructions(Some("Lady Lang")).await?, addressed);
+        for address in [None, Some("")] {
+            assert_eq!(
+                sent_instructions(address).await?,
+                system_prompt(),
+                "{address:?}"
+            );
+        }
         Ok(())
     }
 

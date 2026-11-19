@@ -22,8 +22,7 @@ pub const RESTART: u8 = 75;
 /// The rollback reason when the trial start left no error text.
 const CRASHED: &str = "start after save crashed";
 
-/// The form fields in their groups, in the order of the form. No secret, path or address is a
-/// field.
+/// The form fields in their groups, in the order of the form. No secret, path or URL is a field.
 pub const FIELDS: [(&str, &[&str]); 8] = [
     (
         "Speech",
@@ -55,7 +54,8 @@ pub const FIELDS: [(&str, &[&str]); 8] = [
     ("Log", &["log.audio_days", "log.record_days"]),
 ];
 
-/// Each field of [`FIELDS`] with its value in `text`, in the order of [`FIELDS`].
+/// Each field of [`FIELDS`] with its value in `text`, in the order of [`FIELDS`], then the
+/// field `address.<entity>` of each key of `[address]` in the group `People`.
 ///
 /// # Errors
 ///
@@ -71,24 +71,38 @@ pub fn read(text: &str) -> anyhow::Result<Vec<Setting>> {
                 .with_context(|| format!("{name} is missing"))?;
             settings.push(Setting {
                 group,
-                name,
+                name: name.to_owned(),
                 value: serde_json::to_value(value)?,
             });
         }
+    }
+    let addresses = root.get("address").and_then(toml::Value::as_table);
+    for (entity, value) in addresses.into_iter().flatten() {
+        settings.push(Setting {
+            group: "People",
+            name: format!("address.{entity}"),
+            value: serde_json::to_value(value)?,
+        });
     }
     Ok(settings)
 }
 
 /// `text` with each field of `changes` set to its new value. All other text stays, also the
-/// comments. A new value keeps the TOML type of the old value.
+/// comments. A new value keeps the TOML type of the old value. A field `address.<entity>` sets
+/// the form of address of a person in `[address]`.
 ///
 /// # Errors
 ///
-/// `text` is not TOML, a name is not in [`FIELDS`] or not in `text`, or a value does not fit
-/// the TOML type of the old value. The error names the field.
+/// `text` is not TOML, a name is not in [`FIELDS`] or not in `text`, a value does not fit
+/// the TOML type of the old value, or an address is not of a person or not a string. The error
+/// names the field.
 pub fn edit(text: &str, changes: BTreeMap<String, Json>) -> Result<String, String> {
     let mut document: DocumentMut = text.parse().map_err(|error| format!("{error}"))?;
     for (name, new) in changes {
+        if let Some(entity) = name.strip_prefix("address.") {
+            address(&mut document, &name, entity, &new)?;
+            continue;
+        }
         let old = field(&mut document, &name)?;
         let mut value = converted(old, &new)
             .ok_or_else(|| format!("{name} needs a value of type {}", old.type_name()))?;
@@ -96,6 +110,42 @@ pub fn edit(text: &str, changes: BTreeMap<String, Json>) -> Result<String, Strin
         *old = value;
     }
     Ok(document.to_string())
+}
+
+/// Sets the form of address of `entity` in `[address]` of `document` to the JSON string `new`,
+/// and adds the table when `document` has none. An empty string removes the key.
+///
+/// # Errors
+///
+/// `entity` is not a `person` entity, `new` is not a string, or `address` is not a table. The
+/// error names the field `name`.
+fn address(document: &mut DocumentMut, name: &str, entity: &str, new: &Json) -> Result<(), String> {
+    if !entity.starts_with("person.") {
+        return Err(format!("{name} is not the address of a person"));
+    }
+    let text = new
+        .as_str()
+        .ok_or_else(|| format!("{name} needs a value of type string"))?;
+    let table = document
+        .entry("address")
+        .or_insert_with(toml_edit::table)
+        .as_table_like_mut()
+        .ok_or_else(|| format!("{name} needs address to be a table"))?;
+    if text.is_empty() {
+        table.remove(entity);
+        return Ok(());
+    }
+    match table.get_mut(entity).and_then(Item::as_value_mut) {
+        Some(old) => {
+            let decor = old.decor().clone();
+            *old = Value::from(text);
+            *old.decor_mut() = decor;
+        }
+        None => {
+            table.insert(entity, toml_edit::value(text));
+        }
+    }
+    Ok(())
 }
 
 /// The value of the field `name` in `document`.
@@ -266,7 +316,10 @@ mod tests {
     #[test]
     fn ac_12_9d_1_read_gives_the_fields_in_order_with_the_file_values() -> anyhow::Result<()> {
         let settings = read(REPOSITORY)?;
-        let names: Vec<&str> = settings.iter().map(|setting| setting.name).collect();
+        let names: Vec<&str> = settings
+            .iter()
+            .map(|setting| setting.name.as_str())
+            .collect();
         let expected: Vec<&str> = FIELDS
             .iter()
             .flat_map(|(_, names)| *names)
@@ -341,6 +394,42 @@ mod tests {
         );
         let changed = edit(REPOSITORY, change("habits.min_score", json!(3))).expect("a number");
         assert!(changed.contains("min_score = 3.0"), "{changed}");
+    }
+
+    /// AC-15.9b-1.
+    #[test]
+    fn ac_15_9b_1_read_gives_each_form_of_address_in_people() -> anyhow::Result<()> {
+        let text = format!("{REPOSITORY}\n[address]\n\"person.ali\" = \"Lady Lang\"\n");
+        let settings = read(&text)?;
+        let expected = Setting {
+            group: "People",
+            name: "address.person.ali".to_owned(),
+            value: json!("Lady Lang"),
+        };
+        assert_eq!(settings.last(), Some(&expected));
+        Ok(())
+    }
+
+    /// AC-15.9b-2.
+    #[test]
+    fn ac_15_9b_2_edit_sets_removes_and_adds_the_form_of_address() {
+        let name = "address.person.ali";
+        let text = "[asr] # speech\n\n[address]\n\"person.ali\" = \"Lady Lang\" # Ali\n";
+        let set = edit(text, change(name, json!("Mrs Lang")));
+        assert_eq!(set, Ok(text.replace("Lady Lang", "Mrs Lang")));
+        let removed = edit(text, change(name, json!("")));
+        assert_eq!(removed, Ok("[asr] # speech\n\n[address]\n".to_owned()));
+        let added = edit("[asr] # speech\n", change(name, json!("Mrs Lang")));
+        let expected = "[asr] # speech\n\n[address]\n\"person.ali\" = \"Mrs Lang\"\n";
+        assert_eq!(added.as_deref(), Ok(expected));
+    }
+
+    /// AC-15.9b-3.
+    #[test]
+    fn ac_15_9b_3_edit_refuses_an_address_of_no_person() {
+        let name = "address.light.kitchen";
+        let error = edit(REPOSITORY, change(name, json!("Lamp"))).expect_err("not a person");
+        assert!(error.contains(name), "{error:?} names {name}");
     }
 
     /// AC-12.9i-3.

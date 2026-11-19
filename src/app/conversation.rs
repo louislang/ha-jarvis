@@ -552,6 +552,7 @@ impl Conversation {
                 response_id,
                 call_id,
             }),
+            address: heard.address.clone(),
         };
         if thread.request.is_some() {
             let after = self.llm(text.to_owned(), None, thread);
@@ -761,18 +762,21 @@ impl Conversation {
             (Decision::Defer { job, .. }, None) => match job {
                 Job::Fetch { call, pool } => self.fetched(&call, &pool).await,
                 Job::Llm(text) => {
-                    let thread = Thread {
-                        key,
-                        first: Some(first),
-                        ..Thread::default()
-                    };
+                    let thread = heard.thread(key, first);
                     let answer = self.answer(&text, area, &thread).await;
                     answer.map(|all| unpooled(all.join(" ")))
                 }
             },
             (decision, satellite) => {
                 return (
-                    self.dispatch(decision, area, satellite, heard.id, first),
+                    self.dispatch(
+                        decision,
+                        area,
+                        satellite,
+                        heard.id,
+                        first,
+                        heard.address.as_deref(),
+                    ),
                     None,
                 );
             }
@@ -786,7 +790,7 @@ impl Conversation {
     /// work, and its fetch, answer or question only with `satellite`. Records the use of the reply.
     /// Increases the generation of `satellite`, the satellite entity of the request. Later
     /// announces go to the record `id`. A question of System Two links its answers to the record
-    /// `first`.
+    /// `first` and gets `address`, the form of address of the speaker.
     pub fn dispatch(
         &self,
         decision: Decision,
@@ -794,6 +798,7 @@ impl Conversation {
         satellite: Option<&str>,
         id: u64,
         first: u64,
+        address: Option<&str>,
     ) -> Handled {
         let request = self.origin(satellite, id);
         let (chosen, after) = match decision {
@@ -808,23 +813,32 @@ impl Conversation {
             Decision::Defer {
                 filler,
                 job: Job::Llm(text),
-            } => {
-                let llm = request.map(|request| {
-                    let thread = Thread {
-                        request: Some(request),
-                        first: Some(first),
-                        ..Thread::default()
-                    };
-                    self.llm(text, area.cloned(), thread)
-                });
-                (filler, llm)
-            }
+            } => (filler, self.deferred(text, area, request, first, address)),
             Decision::Ask { question, .. } => self.ask(question, request),
             Decision::Train { .. } => unreachable!("`act` makes a train decision a reply"),
         };
         let Chosen { text, pool, index } = chosen;
         self.backfill.record_use(pool, index);
         Handled { text, after }
+    }
+
+    /// The System Two answer to `text` from `area` as background work, only with `request`. Its
+    /// question links its answers to the record `first` and gets the form of address `address`.
+    fn deferred(
+        &self,
+        text: String,
+        area: Option<&AreaId>,
+        request: Option<Origin>,
+        first: u64,
+        address: Option<&str>,
+    ) -> Option<Work> {
+        let thread = Thread {
+            request: Some(request?),
+            first: Some(first),
+            address: address.map(str::to_owned),
+            ..Thread::default()
+        };
+        Some(self.llm(text, area.cloned(), thread))
     }
 
     /// The origin of the request `id` on `satellite`, with the next generation of the satellite.
@@ -1019,6 +1033,7 @@ impl Conversation {
         use futures::StreamExt;
         let question = Question {
             answers: thread.answers.clone(),
+            address: thread.address.clone(),
             ..self.question(text, area)?
         };
         let mut steps = self.two.reasoner.answer(&question);
@@ -1472,6 +1487,8 @@ struct Thread {
     turns: u32,
     /// The `ask_user` call that the request answers.
     answers: Option<AskCall>,
+    /// The form of address of the speaker.
+    address: Option<String>,
 }
 
 /// A request as `handle` hears it, before its decision.
@@ -1494,6 +1511,19 @@ struct Heard {
     link: Option<u64>,
     /// The form of address of the speaker.
     address: Option<String>,
+}
+
+impl Heard {
+    /// The thread of a System Two answer with no satellite. Its question opens a dialog for `key`
+    /// and links its answers to the record `first`.
+    fn thread(&self, key: Option<Key>, first: u64) -> Thread {
+        Thread {
+            key,
+            first: Some(first),
+            address: self.address.clone(),
+            ..Thread::default()
+        }
+    }
 }
 
 /// The satellite of a request, the generation of the request on it and the ID of its record.
@@ -2263,7 +2293,7 @@ mod tests {
         });
         let (_task, _store, conversation) = start(&home)?;
         let start = Instant::now();
-        let handled = conversation.dispatch(reply(Some(call())), None, None, 0, 0);
+        let handled = conversation.dispatch(reply(Some(call())), None, None, 0, 0, None);
         assert_eq!(Instant::now(), start, "dispatch waited for the call");
         assert!(handled.after.is_some(), "the call is not in after");
         Ok(())
@@ -2275,7 +2305,7 @@ mod tests {
         let home = Arc::new(FakeHome::default());
         let (_task, _store, conversation) = start(&home)?;
         let after = conversation
-            .dispatch(reply(Some(call())), None, None, 0, 0)
+            .dispatch(reply(Some(call())), None, None, 0, 0, None)
             .after;
         assert_eq!(home.calls(), [], "a call came before the start");
         after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
@@ -2287,7 +2317,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_4_8_3_store_receives_new_use_count() -> anyhow::Result<()> {
         let started = start(&Arc::new(FakeHome::default()))?;
-        let _ = started.2.dispatch(reply(Some(call())), None, None, 0, 0);
+        let _ = started
+            .2
+            .dispatch(reply(Some(call())), None, None, 0, 0, None);
         let expected = responses::record_use(unused(), "lights_on", 1);
         assert_eq!(last_save(started).await?, expected);
         Ok(())
@@ -2298,7 +2330,7 @@ mod tests {
     async fn ac_4_8_4_reply_without_call_makes_no_call() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
         let (_task, _store, conversation) = start(&home)?;
-        let handled = conversation.dispatch(reply(None), None, None, 0, 0);
+        let handled = conversation.dispatch(reply(None), None, None, 0, 0, None);
         assert!(handled.after.is_none(), "a reply with no call has work");
         assert_eq!(home.calls(), []);
         Ok(())
@@ -2310,7 +2342,7 @@ mod tests {
         let started = start(&Arc::new(FakeHome::default()))?;
         thread::scope(|scope| {
             for _ in 0..100 {
-                scope.spawn(|| started.2.dispatch(reply(None), None, None, 0, 0));
+                scope.spawn(|| started.2.dispatch(reply(None), None, None, 0, 0, None));
             }
         });
         let saved = last_save(started).await?;
@@ -2480,7 +2512,7 @@ mod tests {
         decision: Decision,
         satellite: Option<&str>,
     ) -> anyhow::Result<Work> {
-        let handled = conversation.dispatch(decision, None, satellite, 0, 0);
+        let handled = conversation.dispatch(decision, None, satellite, 0, 0, None);
         handled.after.ok_or_else(|| anyhow::anyhow!("no after"))
     }
 
@@ -2526,7 +2558,7 @@ mod tests {
         let home = Arc::new(FakeHome::default());
         let (_cache, _changes, conversation) = still(&home, "idle");
         let first = failed(&home, &conversation)?;
-        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE), 0, 0);
+        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE), 0, 0, None);
         first.await?;
         assert_eq!(announces(&home), [] as [&str; 0]);
         Ok(())
@@ -2556,7 +2588,7 @@ mod tests {
         let classifier = Arc::<FakeClassifier>::default();
         let (_cache, changes, conversation) =
             still_with(&home, "idle", classifier, Arc::clone(&reasoner));
-        let _ = conversation.dispatch(reply(None), None, None, 0, 0);
+        let _ = conversation.dispatch(reply(None), None, None, 0, 0, None);
         let _ = changes
             .try_iter()
             .fold(unused(), |pools, change| change(pools));
@@ -3252,6 +3284,22 @@ mod tests {
         Ok(())
     }
 
+    /// AC-15.9b-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_9b_5_system_two_gets_the_form_of_address() -> anyhow::Result<()> {
+        let reasoner = Arc::new(FakeReasoner::default());
+        let classifier = scripted(&["unknown"]);
+        let (cache, _changes, mut conversation) =
+            still_with(&Arc::default(), "idle", classifier, Arc::clone(&reasoner));
+        set_louis(&cache, "not_home");
+        conversation.recorder.speakers = addressed_speakers(FakeVoiceProfiles::default());
+        let handled = conversation.handle("plan dinner", on_satellite()).await?;
+        let after = handled.after.ok_or_else(|| anyhow::anyhow!("no after"))?;
+        after.await?;
+        assert_eq!(reasoner.addresses(), [Some("Lady Lang".to_owned())]);
+        Ok(())
+    }
+
     /// AC-15.9c-3.
     #[tokio::test(start_paused = true)]
     async fn ac_15_9c_3_reply_identifies_without_the_embedding() -> anyhow::Result<()> {
@@ -3941,7 +3989,7 @@ mod tests {
             Decision::Defer { filler, job },
             Some(SATELLITE),
         )?;
-        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE), 0, 0);
+        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE), 0, 0, None);
         old.await?;
         assert_eq!(home.calls(), []);
         Ok(())
