@@ -223,12 +223,20 @@ impl Review for Reviewer {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::sync::Mutex;
     use std::sync::mpsc;
     use std::thread;
 
     use arc_swap::ArcSwap;
     use jiff::Timestamp;
+    use quint_connect::Driver;
+    use quint_connect::State as ModelState;
+    use quint_connect::Step;
+    use quint_connect::quint_run;
+    use quint_connect::switch;
+    use serde::Deserialize;
+    use tokio::runtime::Runtime;
     use tokio::sync::watch;
     use tokio::task::JoinHandle;
 
@@ -241,6 +249,9 @@ mod tests {
     use crate::domain::learn;
     use crate::domain::learn::Cluster;
     use crate::domain::responses::Pools;
+    use crate::domain::speaker::PersonSignals;
+    use crate::domain::speaker::Signals;
+    use crate::domain::speaker::Speaker;
     use crate::domain::state_cache::StateCache;
     use crate::testing::fakes;
     use crate::testing::fakes::FakeClock;
@@ -591,5 +602,208 @@ mod tests {
         assert!(recorded.is_some(), "an assign sets the speaker");
         assert_eq!(picks[&1].clone().map(EntityId), recorded);
         Ok(())
+    }
+
+    /// The model state of `speaker.qnt` that the conformance test compares.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct SpeakerModel {
+        /// The identified speaker.
+        result: Chosen,
+        /// The signal that identified `result`.
+        source: Tag,
+        /// The person and the source of each stored sample, by interaction ID.
+        samples: BTreeMap<u64, (String, Tag)>,
+        /// The last pick of each interaction ID.
+        picks: BTreeMap<u64, Chosen>,
+    }
+
+    /// A Quint `Option[PERSON]`.
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(tag = "tag", content = "value")]
+    enum Chosen {
+        /// A person.
+        Some(String),
+        /// No person, with the empty tuple of Quint.
+        None(Vec<i64>),
+    }
+
+    /// The variant of a Quint sum type value.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Tag {
+        /// The variant name.
+        tag: String,
+    }
+
+    /// The Quint variant of `source`, or `NoSource`.
+    fn tag(source: Option<Source>) -> Tag {
+        let tag = source.map_or_else(|| "NoSource".to_owned(), |source| format!("{source:?}"));
+        Tag { tag }
+    }
+
+    /// The model people with the people of the reference house in their place.
+    const HOUSE: [(&str, &str); 2] = [("alex", "person.ali"), ("sam", "person.louis")];
+
+    /// The house person of the model person `name`, or the model person of the house person `name`.
+    fn swap(name: &str) -> String {
+        let pair = HOUSE.iter().find(|pair| pair.0 == name || pair.1 == name);
+        let (model, house) = pair.expect("a person of the model or the house");
+        if *model == name { house } else { model }.to_string()
+    }
+
+    /// The model value of the house person `person`, if any.
+    fn chosen(person: Option<&str>) -> Chosen {
+        let chosen = person.map(swap);
+        chosen.map_or(Chosen::None(Vec::new()), Chosen::Some)
+    }
+
+    impl ModelState<SpeakerDriver> for SpeakerModel {
+        /// The speaker of the last `identify` of the request, and the samples and the picks of
+        /// `FakeVoiceProfiles` with the sources of the driver.
+        fn from_driver(driver: &SpeakerDriver) -> anyhow::Result<Self> {
+            let speaker = driver.speaker.as_ref();
+            let source = |id: &u64| tag(driver.sources.get(id).copied());
+            let samples = driver.fakes.1.samples.lock().expect("no panic");
+            let picks = driver.fakes.1.picks.lock().expect("no panic");
+            Ok(Self {
+                result: chosen(speaker.map(|speaker| speaker.person.0.as_str())),
+                source: tag(speaker.map(|speaker| speaker.source)),
+                samples: samples
+                    .iter()
+                    .map(|(id, person)| (*id, (swap(person), source(id))))
+                    .collect(),
+                picks: picks
+                    .iter()
+                    .map(|(id, person)| (*id, chosen(person.as_deref())))
+                    .collect(),
+            })
+        }
+    }
+
+    /// The value of the model level `level`, in tenths.
+    fn tenths(level: i64) -> f32 {
+        f32::from(u8::try_from(level).expect("a level from 0 to 10")) / 10.0
+    }
+
+    /// The nondet pick `name` of `step`.
+    fn pick<T: serde::de::DeserializeOwned>(step: &Step, name: &str) -> anyhow::Result<T> {
+        let found = step.nondet_picks.get(name);
+        let value = found.ok_or_else(|| anyhow::anyhow!("no pick {name}"))?;
+        Ok(T::deserialize(value.clone())?)
+    }
+
+    /// The signals of the request of the picks of `step`.
+    fn signals(step: &Step) -> anyhow::Result<Signals> {
+        let at_home: BTreeSet<String> = pick(step, "atHome")?;
+        let proximity: BTreeMap<String, i64> = pick(step, "prox")?;
+        let voice: BTreeMap<String, i64> = pick(step, "v")?;
+        let mut people = Vec::new();
+        for (person, level) in &proximity {
+            people.push(PersonSignals {
+                entity: EntityId(swap(person)),
+                proximity: f64::from(tenths(*level)),
+                voice: tenths(voice[person]),
+            });
+        }
+        let (known, sensor) = (pick::<bool>(step, "known")?, pick::<bool>(step, "sensor")?);
+        let home = at_home.into_iter().map(|person| EntityId(swap(&person)));
+        Ok(Signals {
+            home: known.then(|| home.collect()),
+            people,
+            occupied: sensor.then_some(pick(step, "state")?),
+        })
+    }
+
+    /// Replays `speaker.qnt` against `identify`, `enrolls`, the enroll of `FakeVoiceProfiles` and
+    /// `Review::assign`, with the model constants in tenths: `threshold` 0.7, `margin` 0.2,
+    /// `enroll_threshold` 0.5, `voice_threshold` 0.6 and `min_profile` 1. Each utterance has
+    /// `min_enroll_ms` and an embedding in the log.
+    #[derive(Default)]
+    struct SpeakerDriver {
+        /// The signals of the request, or `None` before the first request.
+        signals: Option<Signals>,
+        /// The speaker of the last `identify` of the request.
+        speaker: Option<Speaker>,
+        /// The interaction ID of the request.
+        utterance: u64,
+        /// The source of each sample, by interaction ID.
+        sources: BTreeMap<u64, Source>,
+        /// The review of the reference house.
+        fakes: Fakes,
+    }
+
+    /// The review of the reference house, its voice profiles, its log and the runtime of its calls.
+    struct Fakes(Arc<Reviewer>, Arc<FakeVoiceProfiles>, Arc<FakeLog>, Runtime);
+
+    impl Default for Fakes {
+        fn default() -> Self {
+            let (review, voices, log) = assigning(FakeVoiceProfiles::default());
+            Self(review, voices, log, Runtime::new().expect("a runtime"))
+        }
+    }
+
+    impl SpeakerDriver {
+        /// A new request with the signals of the picks of `step`, and its embedding in the log.
+        fn set(&mut self, step: &Step) -> anyhow::Result<()> {
+            (self.signals, self.speaker) = (Some(signals(step)?), None);
+            self.utterance += 1;
+            let mut embeddings = self.fakes.2.embeddings.lock().expect("no panic");
+            embeddings.insert(self.utterance, vec![1.0]);
+            Ok(())
+        }
+
+        /// Rule 5 for `person`, then the enroll of the request into `FakeVoiceProfiles`.
+        fn enroll(&mut self, person: &str) -> anyhow::Result<()> {
+            let (Some(signals), Some(identified)) = (&self.signals, &self.speaker) else {
+                anyhow::bail!("an enroll without a speaker");
+            };
+            let (entity, voices) = (&identified.person, &self.fakes.1);
+            anyhow::ensure!(entity.0 == swap(person), "another person");
+            let samples = voices.samples.lock().expect("no panic");
+            let own = samples.values().filter(|owner| **owner == entity.0);
+            let enrolls = speaker::enrolls(signals, identified, 1, own.count(), 1, 1, 0.6);
+            drop(samples);
+            anyhow::ensure!(enrolls, "no enroll");
+            let enroll = voices.enroll(entity, self.utterance, &[1.0]);
+            self.fakes.3.block_on(enroll)?;
+            self.sources.insert(self.utterance, identified.source);
+            Ok(())
+        }
+
+        /// `Review::assign` of `chosen` to the request `back` requests before the current one.
+        fn assign(&mut self, back: u64, chosen: Chosen) -> anyhow::Result<()> {
+            let id = self.utterance - back;
+            let person = match chosen {
+                Chosen::Some(name) => Some(EntityId(swap(&name))),
+                Chosen::None(_) => None,
+            };
+            let assigned = self.fakes.3.block_on(self.fakes.0.assign(id, person));
+            assigned.map_err(|error| anyhow::anyhow!("the assign gave {error:?}"))?;
+            self.sources.insert(id, Source::Assigned);
+            Ok(())
+        }
+    }
+
+    impl Driver for SpeakerDriver {
+        type State = SpeakerModel;
+
+        fn step(&mut self, step: &Step) -> anyhow::Result<()> {
+            switch!(step {
+                init => *self = Self::default(),
+                setSignals => self.set(step)?,
+                identify => {
+                    let signals = self.signals.as_ref();
+                    self.speaker =
+                        signals.and_then(|signals| speaker::identify(signals, 0.7, 0.2, 0.5));
+                },
+                enroll(p: String) => self.enroll(&p)?,
+                assignVoice(back: u64, chosen: Chosen) => self.assign(back, chosen)?,
+            })
+        }
+    }
+
+    /// AC-15.8d-2, which also checks AC-15.6d-1. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/speaker.qnt", max_steps = 30, seed = "1")]
+    fn ac_15_8d_2_conformance() -> impl Driver {
+        SpeakerDriver::default()
     }
 }
