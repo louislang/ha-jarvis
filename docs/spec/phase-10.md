@@ -307,6 +307,7 @@ A choice is a closed set, so step 2 comes before step 3. The answer to System Tw
 - When the dialog times out or is cancelled, Jarvis sends nothing for the open call.
 - Jarvis speaks each sentence of the text with `announce`, which does not listen. Only an `ask_user` call asks with `Home::ask`. In the field test on 2026-11-12, System Two asked "Which downstairs speaker should I play it in?" in the text. The satellite did not listen after it, so Jarvis did not get the answer. The user heard the question two times, and HA recorded four `announce` calls and no `start_conversation`. The answer probably had two rounds around a tool call, and the second round said the text of the first again. Thus the system prompt (sub-phase 7.2) gets two rules after its first two sentences: "Ask the user a question only with the ask_user tool, never in the text. Do not say again text that you already said in this answer." The fix PR `Fix: System Two Questions` changes `system_prompt()` in `src/adapters/openai.rs` and its tests.
 - System Two can say that an action happened when it made no call. In the field test on 2026-11-12, "presume music" (the transcript of "resume music") went to System Two. System Two said "I'm on it now" and "Playing music in the office", but it made no tool call, and HA recorded only the `announce` calls. Thus the system prompt gets a third rule after the two rules above: "Say that an action happened only after its tool call succeeded. If no tool can do the request, say that you cannot do it." The fix PR `Fix: System Two Questions` also adds this rule.
+- That rule also stopped questions of fact. In the field test on 2026-11-19, "How tall is the Statue of Liberty?" went to System Two, and System Two said "I cannot do that." Thus the last sentence of the rule becomes: "If the request asks for an action that no tool can do, say that you cannot do it. Answer a question of fact from your own knowledge." The fix PR `Fix: Answer Questions of Fact` changes the prompt.
 - `FakeReasoner` records the call ID that each question answers.
 
 **Acceptance criteria.**
@@ -317,7 +318,7 @@ A choice is a closed set, so step 2 comes before step 3. The answer to System Tw
 - AC-10.6b-4: When `FakeReasoner` asks three questions and then answers, `FakeHome` records three `ask` calls, then the announce.
 - AC-10.6b-5: When `FakeReasoner` asks more than `max_turns` questions, `FakeHome` records an announce from `failure` and the dialog closes.
 - AC-10.6b-6: When the system prompt is read, it says to ask a question only with the `ask_user` tool and not to say again text that the answer already said.
-- AC-10.6b-7: When the system prompt is read, it says to tell that an action happened only after its tool call succeeded, and to say that it cannot do a request that no tool can do.
+- AC-10.6b-7: When the system prompt is read, it says to tell that an action happened only after its tool call succeeded, to say that it cannot do an action that no tool can do, and to answer a question of fact from its own knowledge.
 
 **Proofs.**
 
