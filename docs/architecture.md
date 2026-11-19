@@ -131,6 +131,7 @@ flowchart LR
     crate_adapters_sqlite --> crate
     crate_adapters_sqlite --> crate_adapters_sqlite
     crate_adapters_sqlite --> crate_domain_feedback
+    crate_adapters_sqlite --> crate_domain_speaker
     crate_adapters_sqlite --> crate_domain_speech
     crate_adapters_sqlite --> crate_ports
     crate_adapters_supertonic --> crate
@@ -187,7 +188,9 @@ flowchart LR
     crate_app_review --> crate_domain_catalog
     crate_app_review --> crate_domain_feedback
     crate_app_review --> crate_domain_learn
+    crate_app_review --> crate_domain_speaker
     crate_app_review --> crate_domain_speech
+    crate_app_review --> crate_domain_state
     crate_app_review --> crate_ports
     crate_app_speech --> crate_app_conversation
     crate_app_speech --> crate_app_speech

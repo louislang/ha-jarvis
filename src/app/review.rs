@@ -1,5 +1,5 @@
-//! The review use case: the logged interactions, their audio and their marks, and the pending
-//! learned entries.
+//! The review use case: the logged interactions, their audio, their marks and their speakers,
+//! and the pending learned entries.
 
 use std::sync::Arc;
 
@@ -14,28 +14,49 @@ use crate::domain::feedback::Mark;
 use crate::domain::learn::Learned;
 use crate::domain::learn::LearnedIntent;
 use crate::domain::learn::LearnedStatus;
+use crate::domain::speaker;
+use crate::domain::speaker::Person;
+use crate::domain::speaker::Source;
 use crate::domain::speech::Audio;
+use crate::domain::state::EntityId;
 use crate::ports::Filter;
 use crate::ports::InteractionLog;
 use crate::ports::Page;
 use crate::ports::Review;
 use crate::ports::Store;
+use crate::ports::Unassigned;
 use crate::ports::Unresolved;
+use crate::ports::VoiceProfiles;
 
-/// The review of the logged interactions and the learned entries. A mark reaches the log, and a
-/// resolve reaches the learned intents file through the pools task.
+/// The review of the logged interactions and the learned entries. A mark reaches the log, a
+/// resolve reaches the learned intents file through the pools task, and an assign reaches the
+/// voice profiles and the log.
 pub struct Reviewer {
     /// The log of the interactions.
     log: Arc<dyn InteractionLog>,
-    /// The activation, with the learned intents file, its pools task and the live catalog.
+    /// The activation, with the learned intents file, its pools task, the hot cache and the live
+    /// catalog.
     activation: Activation,
+    /// The voice profiles of the people.
+    voices: Arc<dyn VoiceProfiles>,
+    /// Held from the profile write to the end of the log update of an assign.
+    assigning: tokio::sync::Mutex<()>,
 }
 
 impl Reviewer {
-    /// The review of `log` and of the learned intents file of `activation`.
+    /// The review of `log`, of the learned intents file of `activation` and of `voices`.
     #[must_use]
-    pub fn new(log: Arc<dyn InteractionLog>, activation: Activation) -> Self {
-        Self { log, activation }
+    pub fn new(
+        log: Arc<dyn InteractionLog>,
+        activation: Activation,
+        voices: Arc<dyn VoiceProfiles>,
+    ) -> Self {
+        Self {
+            log,
+            activation,
+            voices,
+            assigning: tokio::sync::Mutex::default(),
+        }
     }
 
     /// The result of `task` on the learned intents file, run by the pools task in order. Fails when
@@ -123,6 +144,20 @@ pub fn check(mark: &Mark, names: &[String]) -> anyhow::Result<()> {
     }
 }
 
+/// Checks that `person`, if any, is the entity of one of `people`.
+///
+/// # Errors
+///
+/// `person` is not one of `people`.
+pub fn check_person(people: &[Person], person: Option<&EntityId>) -> Result<(), Unassigned> {
+    match person {
+        Some(person) if !people.iter().any(|known| known.entity == *person) => {
+            Err(Unassigned::NotPerson)
+        }
+        _ => Ok(()),
+    }
+}
+
 #[async_trait]
 impl Review for Reviewer {
     async fn list(&self, filter: Filter, page: Page) -> anyhow::Result<Vec<Interaction>> {
@@ -161,10 +196,33 @@ impl Review for Reviewer {
         // After the activation changes, `intents` has the approved entry.
         self.run(|_| ()).await
     }
+
+    fn people(&self) -> Vec<Person> {
+        speaker::people(&self.activation.cache.borrow())
+    }
+
+    async fn assign(&self, id: u64, person: Option<EntityId>) -> Result<(), Unassigned> {
+        check_person(&self.people(), person.as_ref())?;
+        let embedding = self.log.embedding(id).await.map_err(Unassigned::Failed)?;
+        let embedding = embedding.ok_or(Unassigned::NotFound)?;
+        let _assigning = self.assigning.lock().await;
+        let assigned = self.voices.assign(id, person.as_ref(), &embedding).await;
+        assigned.map_err(Unassigned::Failed)?;
+        let change = crate::ports::Change::Speaker {
+            speaker: person,
+            source: Some(Source::Assigned),
+            embedding: None,
+        };
+        self.log
+            .update(id, change)
+            .await
+            .map_err(Unassigned::Failed)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::sync::mpsc;
     use std::thread;
@@ -172,6 +230,7 @@ mod tests {
     use arc_swap::ArcSwap;
     use jiff::Timestamp;
     use tokio::sync::watch;
+    use tokio::task::JoinHandle;
 
     use super::*;
     use crate::app::speech::Speech;
@@ -188,6 +247,7 @@ mod tests {
     use crate::testing::fakes::FakeLog;
     use crate::testing::fakes::FakeStore;
     use crate::testing::fakes::FakeTts;
+    use crate::testing::fakes::FakeVoiceProfiles;
 
     /// The target of the action of each interaction.
     const OFFICE: &str = "media_player.office";
@@ -249,7 +309,8 @@ mod tests {
             ..FakeLog::default()
         });
         let (learned, changes) = (Arc::new(FakeStore::new(None)), mpsc::channel().0);
-        let review = Reviewer::new(Arc::clone(&log) as _, activation(learned, changes));
+        let voices = Arc::new(FakeVoiceProfiles::default());
+        let review = Reviewer::new(Arc::clone(&log) as _, activation(learned, changes), voices);
         (review, log)
     }
 
@@ -264,8 +325,11 @@ mod tests {
                 change(Pools::new());
             }
         });
-        let log = Arc::new(FakeLog::default());
-        let review = Reviewer::new(log, activation(Arc::clone(&store) as _, changes));
+        let (log, voices) = (
+            Arc::new(FakeLog::default()),
+            Arc::new(FakeVoiceProfiles::default()),
+        );
+        let review = Reviewer::new(log, activation(Arc::clone(&store) as _, changes), voices);
         (review, store)
     }
 
@@ -392,6 +456,140 @@ mod tests {
         let result = review.resolve("good_night", true).await;
         assert!(result.is_err(), "the resolve gave {result:?}");
         assert_eq!(review.proposals()?.len(), 1, "good_night is pending");
+        Ok(())
+    }
+
+    /// The review of `voices` and of a log with the request "turn on the tv" (1) with an
+    /// embedding and the dialog answer "the office" (2) without one, and the log.
+    fn assigning(
+        voices: FakeVoiceProfiles,
+    ) -> (Arc<Reviewer>, Arc<FakeVoiceProfiles>, Arc<FakeLog>) {
+        let logged = vec![
+            (interaction(1, "turn on the tv", None), None),
+            (interaction(2, "the office", Some(1)), None),
+        ];
+        let log = Arc::new(FakeLog {
+            interactions: Mutex::new(logged),
+            embeddings: Mutex::new(BTreeMap::from([(1, vec![1.0])])),
+            ..FakeLog::default()
+        });
+        let voices = Arc::new(voices);
+        let (learned, changes) = (Arc::new(FakeStore::new(None)), mpsc::channel().0);
+        let activation = activation(learned, changes);
+        let review = Reviewer::new(Arc::clone(&log) as _, activation, Arc::clone(&voices) as _);
+        (Arc::new(review), voices, log)
+    }
+
+    /// The `person` entity `name`.
+    fn person(name: &str) -> EntityId {
+        EntityId(format!("person.{name}"))
+    }
+
+    /// The speaker and the source of the request in `log`.
+    async fn record(log: &FakeLog) -> (Option<EntityId>, Option<Source>) {
+        let request = log.get(1).await.expect("the fake log reads");
+        let request = request.expect("it has the request");
+        (request.speaker, request.source)
+    }
+
+    /// Starts the assign of `person.<name>` to the request on `review`.
+    fn start(review: &Arc<Reviewer>, name: &str) -> JoinHandle<Result<(), Unassigned>> {
+        let (review, name) = (Arc::clone(review), Some(person(name)));
+        tokio::spawn(async move { review.assign(1, name).await })
+    }
+
+    /// AC-15.8b-1. The reference house has `person.ali` and `person.louis`.
+    #[test]
+    fn ac_15_8b_1_people_are_the_person_entities() {
+        let (review, _, _) = assigning(FakeVoiceProfiles::default());
+        let people = [("ali", "Ali"), ("louis", "Louis")].map(|(entity, name)| Person {
+            entity: person(entity),
+            name: name.to_owned(),
+        });
+        assert_eq!(review.people(), people);
+    }
+
+    /// AC-15.8b-2, with `person.louis` of the reference house in place of `person.sam`.
+    #[tokio::test]
+    async fn ac_15_8b_2_assign_moves_the_sample_and_sets_the_speaker() {
+        let (review, voices, log) = assigning(FakeVoiceProfiles::default());
+        let assigned = review.assign(1, Some(person("louis"))).await;
+        assert!(assigned.is_ok(), "the assign gave {assigned:?}");
+        let louis = Some("person.louis".to_owned());
+        assert_eq!(
+            *voices.picks.lock().expect("no panic"),
+            BTreeMap::from([(1, louis)])
+        );
+        let sample = BTreeMap::from([(1, "person.louis".to_owned())]);
+        assert_eq!(*voices.samples.lock().expect("no panic"), sample);
+        assert_eq!(
+            record(&log).await,
+            (Some(person("louis")), Some(Source::Assigned))
+        );
+    }
+
+    /// AC-15.8b-3.
+    #[tokio::test]
+    async fn ac_15_8b_3_assign_of_none_clears_the_speaker() {
+        let (review, voices, log) = assigning(FakeVoiceProfiles::default());
+        let assigned = review.assign(1, None).await;
+        assert!(assigned.is_ok(), "the assign gave {assigned:?}");
+        assert_eq!(
+            *voices.picks.lock().expect("no panic"),
+            BTreeMap::from([(1, None)])
+        );
+        assert_eq!(record(&log).await, (None, Some(Source::Assigned)));
+    }
+
+    /// AC-15.8b-4. `person.sam` is not a `person` entity of the reference house.
+    #[tokio::test]
+    async fn ac_15_8b_4_unknown_person_changes_nothing() {
+        let (review, voices, log) = assigning(FakeVoiceProfiles::default());
+        let assigned = review.assign(1, Some(person("sam"))).await;
+        assert!(
+            matches!(assigned, Err(Unassigned::NotPerson)),
+            "{assigned:?}"
+        );
+        assert_eq!(*voices.picks.lock().expect("no panic"), BTreeMap::new());
+        assert_eq!(*voices.samples.lock().expect("no panic"), BTreeMap::new());
+        assert_eq!(record(&log).await, (None, None));
+    }
+
+    /// AC-15.8b-5.
+    #[tokio::test]
+    async fn ac_15_8b_5_no_embedding_is_not_found() {
+        let (review, _, _) = assigning(FakeVoiceProfiles::default());
+        let assigned = review.assign(2, None).await;
+        assert!(
+            matches!(assigned, Err(Unassigned::NotFound)),
+            "{assigned:?}"
+        );
+    }
+
+    /// AC-15.8b-8, with `person.ali` and `person.louis` of the reference house. The first assign
+    /// waits at the gate after its pick, and the second starts during the wait.
+    #[tokio::test]
+    async fn ac_15_8b_8_concurrent_assigns_end_on_one_person() -> anyhow::Result<()> {
+        let (open, gate) = oneshot::channel();
+        let voices = FakeVoiceProfiles {
+            gate: Mutex::new(Some(gate)),
+            ..FakeVoiceProfiles::default()
+        };
+        let (review, voices, log) = assigning(voices);
+        let first = start(&review, "ali");
+        tokio::task::yield_now().await;
+        let second = start(&review, "louis");
+        tokio::task::yield_now().await;
+        let _ = open.send(());
+        let results = (first.await?, second.await?);
+        assert!(
+            results.0.is_ok() && results.1.is_ok(),
+            "the assigns gave {results:?}"
+        );
+        let picks = voices.picks.lock().expect("no panic").clone();
+        let (recorded, _) = record(&log).await;
+        assert!(recorded.is_some(), "an assign sets the speaker");
+        assert_eq!(picks[&1].clone().map(EntityId), recorded);
         Ok(())
     }
 }

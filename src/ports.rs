@@ -26,6 +26,7 @@ use crate::domain::feedback::Spoken;
 use crate::domain::learn::LearnedIntent;
 use crate::domain::learn::PluginRequest;
 use crate::domain::model::Prediction;
+use crate::domain::speaker::Person;
 use crate::domain::speaker::Source;
 use crate::domain::speech::Audio;
 use crate::domain::state::EntityId;
@@ -509,6 +510,17 @@ pub trait Review: Send + Sync {
     /// No `pending` entry has the name, or the file cannot load or save. The file does not
     /// change.
     async fn resolve(&self, name: &str, approve: bool) -> Result<(), Unresolved>;
+
+    /// The people of the house, from the hot cache.
+    fn people(&self) -> Vec<Person>;
+
+    /// Sets `person` as the speaker of the interaction `id`, and moves its voice sample to the
+    /// profile of `person`, or removes it when `person` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// `person` is not one of `people`, the interaction has no embedding, or a store fails.
+    async fn assign(&self, id: u64, person: Option<EntityId>) -> Result<(), Unassigned>;
 }
 
 /// Why a review does not resolve a learned entry.
@@ -518,6 +530,18 @@ pub enum Unresolved {
     /// No `pending` entry has the name.
     NotPending,
     /// The learned intents file cannot load or save, or the pools task stopped.
+    Failed(anyhow::Error),
+}
+
+/// Why a review does not assign the speaker of an interaction.
+#[must_use]
+#[derive(Debug)]
+pub enum Unassigned {
+    /// The person is not one of the people of the house.
+    NotPerson,
+    /// The interaction has no voice embedding.
+    NotFound,
+    /// The voice profiles or the log fail.
     Failed(anyhow::Error),
 }
 

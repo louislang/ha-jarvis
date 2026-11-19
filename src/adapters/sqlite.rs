@@ -15,6 +15,7 @@ use crate::LogConfig;
 use crate::domain::feedback::Deferred;
 use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
+use crate::domain::speaker::Source;
 use crate::domain::speech::Audio;
 use crate::ports::Change;
 use crate::ports::Filter;
@@ -210,8 +211,12 @@ impl InteractionLog for SqliteLog {
                 source,
                 embedding,
             } => {
-                let set = "UPDATE interactions SET speaker = json_extract(?2, '$[0]'), source = json_extract(?2, '$[1]'), \
+                // A passive identification keeps a stored pick.
+                let set = "UPDATE interactions SET \
+                    speaker = iif(?4 AND source = 'Assigned', speaker, json_extract(?2, '$[0]')), \
+                    source = iif(?4 AND source = 'Assigned', source, json_extract(?2, '$[1]')), \
                     embedding = coalesce(?3, embedding) WHERE id = ?1";
+                let passive = source != Some(Source::Assigned);
                 let bytes: Option<Vec<u8>> = embedding.map(|embedding| {
                     embedding
                         .iter()
@@ -219,7 +224,7 @@ impl InteractionLog for SqliteLog {
                         .collect()
                 });
                 let identified = serde_json::to_string(&(speaker, source))?;
-                self.execute(set, (id, identified, bytes)).await
+                self.execute(set, (id, identified, bytes, passive)).await
             }
         }
     }
@@ -319,7 +324,6 @@ mod tests {
     use crate::domain::feedback::Spoken;
     use crate::domain::feedback::Tagged;
     use crate::domain::feedback::Value;
-    use crate::domain::speaker::Source;
     use crate::domain::state::EntityId;
     use crate::domain::state::ServiceCall;
 
@@ -734,6 +738,26 @@ mod tests {
         };
         assert_eq!(log.get(7).await?, Some(expected));
         assert_eq!(log.embedding(7).await?, Some(vec![0.5, -1.0]));
+        Ok(())
+    }
+
+    /// AC-15.8b-9.
+    #[tokio::test]
+    async fn ac_15_8b_9_identification_keeps_the_assigned_speaker() -> anyhow::Result<()> {
+        let (log, _folder) = log();
+        log.append(unspoken(7), None).await?;
+        let alex = Some(EntityId("person.alex".to_owned()));
+        let source = Some(Source::Assigned);
+        let assigned = Change::Speaker {
+            speaker: alex.clone(),
+            source,
+            embedding: None,
+        };
+        log.update(7, assigned).await?;
+        log.update(7, sam(Some(vec![0.5]))).await?;
+        let record = log.get(7).await?.expect("the log has the interaction");
+        assert_eq!((record.speaker, record.source), (alex, source));
+        assert_eq!(log.embedding(7).await?, Some(vec![0.5]));
         Ok(())
     }
 
