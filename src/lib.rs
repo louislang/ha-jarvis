@@ -247,6 +247,9 @@ pub struct Config {
     /// The satellites whose presence sensors replace discovery.
     #[serde(default)]
     pub satellites: Vec<Satellite>,
+    /// The form of address of each person entity, for `{{ address }}` in responses.
+    #[serde(default)]
+    pub address: BTreeMap<String, String>,
 }
 
 impl Config {
@@ -1958,7 +1961,7 @@ async fn start_app_with(
         (extras, (task.changes.clone(), habits.habits.clone())),
     )
     .await?;
-    let prerender = start_prerender(&activation.speech, &task.pools, &cache);
+    let prerender = start_prerender(config, &activation.speech, &task.pools, &cache);
     start_report(config, &cache);
     let parts = (task, queues, habits, reasoner);
     let loaded = (models, listener, activation, (recorder, logged));
@@ -2109,6 +2112,7 @@ fn speakers(config: &Config) -> anyhow::Result<Arc<Speakers>> {
         config: config.speaker.clone(),
         people: config.people.clone(),
         satellites: config.satellites.clone(),
+        addresses: config.address.clone(),
     }))
 }
 
@@ -2431,19 +2435,28 @@ fn start_sync(home: Arc<dyn Home>, config: &Config) -> (watch::Receiver<StateCac
 }
 
 /// Starts a task that pre-renders `pools` with `speech` for the area names of the first snapshot
-/// in `cache`, and gives its handle.
+/// in `cache` and the non-empty forms of address of `config`, and gives its handle.
 fn start_prerender(
+    config: &Config,
     speech: &Arc<Speech>,
     pools: &Arc<ArcSwap<Pools>>,
     cache: &watch::Receiver<StateCache>,
 ) -> JoinHandle<()> {
     let (speech, pools, mut cache) = (Arc::clone(speech), Arc::clone(pools), cache.clone());
+    let addresses = config
+        .address
+        .values()
+        .filter(|address| !address.is_empty());
+    let addresses: Vec<String> = addresses.cloned().collect();
     tokio::spawn(async move {
         if cache.changed().await.is_err() {
             return;
         }
         let areas = app::background::area_names(&cache.borrow());
-        if let Err(error) = speech.prerender(&pools.load_full(), &areas).await {
+        if let Err(error) = speech
+            .prerender_addressed(&pools.load_full(), &areas, &addresses)
+            .await
+        {
             tracing::warn!("the pre-render failed: {error:#}");
         }
     })
@@ -2887,6 +2900,7 @@ mod tests {
             speaker: expected_speaker(),
             people: Vec::new(),
             satellites: Vec::new(),
+            address: BTreeMap::new(),
         };
         assert_eq!(Config::parse(VALID)?, expected);
         Ok(())

@@ -159,6 +159,10 @@ min_profile = 5
 # person = "person.louis"
 # trackers = [{ area = "sensor.louis_watch_area", distance = "sensor.louis_watch_distance" }]
 
+# Optional. The form of address of each person, for `{{ address }}` in responses.
+# [address]
+# "person.ali" = "Lady Lang"
+
 # Optional. Discovery finds the presence sensors when this is not set.
 # [[satellites]]
 # satellite = "assist_satellite.carson_bedroom"

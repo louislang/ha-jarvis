@@ -952,6 +952,7 @@ pub(crate) fn speakers(voices: Arc<FakeVoiceProfiles>) -> Arc<Speakers> {
         config: config.speaker,
         people: Vec::new(),
         satellites: Vec::new(),
+        addresses: config.address,
     })
 }
 
