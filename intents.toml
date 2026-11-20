@@ -36,7 +36,7 @@ service = "media_player.play_media"
 target = "entity"
 entity = "media_player.living_room"
 title = "show"
-data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": {{ show | tojson }}, "shuffle": 1}' }
+data = { show = "{{ show }}", mode = "shuffle" }
 
 [[intent]]
 name = "temperature_query"
@@ -207,7 +207,7 @@ service = "media_player.play_media"
 target = "entity"
 entity = "media_player.living_room"
 title = "movie"
-data = { media_content_type = "movie", media_content_id = 'plex://{"library_name": "Movies", "title": {{ movie | tojson }}}' }
+data = { movie = "{{ movie }}" }
 
 [[intent]]
 name = "continue_show"
@@ -218,7 +218,7 @@ service = "media_player.play_media"
 target = "entity"
 entity = "media_player.living_room"
 title = "show"
-data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": {{ show | tojson }}, "resume": 1}' }
+data = { show = "{{ show }}", mode = "next" }
 
 [[intent]]
 name = "play_episode"
@@ -228,7 +228,7 @@ service = "media_player.play_media"
 target = "entity"
 entity = "media_player.living_room"
 title = "show"
-data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": {{ show | tojson }}, "season_number": {{ season | number }}, "episode_number": {{ episode | number }}}' }
+data = { show = "{{ show }}", season = "{{ season | number | int }}", episode = "{{ episode | number | int }}" }
 
 [[intent]]
 name = "tv_pause"

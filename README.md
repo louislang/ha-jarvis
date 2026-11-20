@@ -18,7 +18,7 @@ The design is in [`docs/spec/`](docs/spec/00-overview.md).
 | Weather | "What is the weather like?", "Will it rain today?" | Local, Open-Meteo plugin |
 | Music (Music Assistant) | "Play hip hop", "Play jazz in the kitchen", "Play Radiohead", "Play music like Miles Davis", "Queue Abbey Road", "Next song", "Previous song", "Pause the music", "Resume the music", "Turn it up", "Set the volume to 50", "What is playing in the living room?" | Local. "Play" searches your library playlists first, then artists, albums and tracks. An artist starts with one of its tracks, and the rest of the artist follows in the queue. |
 | Speaker groups (Music Assistant) | "Play jazz downstairs", "Play Christmas music downstairs", "Play Radiohead on the downstairs speakers", "Pause the music downstairs", "Turn it up downstairs" | Local. A place that is not an HA area but matches a Music Assistant group name plays on the whole group. A control acts on the group when the group plays, else on the members that play. |
-| TV and Plex | "Play Bluey on the TV", "Put on The Matrix", "Continue The Office", "Play season two episode five of The Office", "Pause the TV", "Skip ahead", "Stop the movie", "Turn off the TV", "Are there any new shows?". With the Plex plugin, Jarvis matches the spoken title to the Plex library ("Vision Quest" plays "VisionQuest", a movie plays as a movie) and says when a title is not in the library. The TV requests act on the Apple TV of the Living Room from each room. | Local, Plex plugin |
+| TV and Plex | "Play Bluey on the TV", "Put on The Matrix", "Continue The Office", "Play season two episode five of The Office", "Pause the TV", "Skip ahead", "Stop the movie", "Turn off the TV", "Are there any new shows?". Jarvis matches the spoken title to the Plex library ("Vision Quest" plays "VisionQuest", a movie plays as a movie) and says when a title is not in the library. The TV requests act on the Apple TV of the Living Room from each room. To play, Jarvis turns on the TV, opens the title in the Plezy app with a `plezy://` link, and 3 s later presses Select to accept the "Open in Plezy" popup of tvOS. A specific episode asks the Plex server for its key. Playback needs the Plex plugin. | Local, Plex plugin |
 | Follow-up questions | "Turn on the lights" from a device with no area: "Which room?" "The kitchen." Say "never mind" to cancel. | Local |
 | Everything else | Any other request, for example "Plan dinner for tonight" | OpenAI, with HA tools and plugins. OpenAI can ask you a question and use your answer. |
 | Speech | Streaming speech-to-text, then a second pass at the end of speech. The second pass prefers the names of the house, the command verbs and the playlists, artists and albums of the Music Assistant library, refreshed each hour. Text-to-speech with a cache of rendered responses. A short answer like "Kitchen" ends listening after 100 ms. | Local |
@@ -44,7 +44,7 @@ You need:
 - A Linux x86-64 host. An NVIDIA GPU is optional (see step 7).
 - Home Assistant with a long-lived access token, and voice satellites.
 - An OpenAI API key.
-- Optional: Music Assistant for music, and a Plex server and token for TV.
+- Optional: Music Assistant for music, and for TV a Plex server and token and an Apple TV with the Plezy app and the HA Apple TV integration.
 - To build the System One model: Rust, [`just`](https://github.com/casey/just) and Python 3.12.
 
 Steps:
