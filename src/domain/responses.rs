@@ -874,6 +874,14 @@ mod tests {
 
     /// The result of `validate_pools` for the repository files after `change`.
     fn validate(change: impl FnOnce(&mut Pools, &mut Catalog)) -> Result<(), PoolError> {
+        let mut pools = repository_pools();
+        let mut catalog = toml::from_str(INTENTS).expect("intents.toml is a catalog");
+        change(&mut pools, &mut catalog);
+        validate_pools(&pools, &catalog)
+    }
+
+    /// The pools of `responses.toml`, each response with no uses.
+    fn repository_pools() -> Pools {
         let file: toml::Table = toml::from_str(RESPONSES).expect("responses.toml is TOML");
         let mut pools = Pools::new();
         for (name, pool) in file["pools"].as_table().expect("pools is a table") {
@@ -889,9 +897,36 @@ mod tests {
             };
             pools.insert(name.clone(), pool);
         }
-        let mut catalog = toml::from_str(INTENTS).expect("intents.toml is a catalog");
-        change(&mut pools, &mut catalog);
-        validate_pools(&pools, &catalog)
+        pools
+    }
+
+    /// AC-15.9e-1.
+    #[test]
+    fn ac_15_9e_1_each_command_pool_has_an_address_response() {
+        let pools = repository_pools();
+        let catalog: Catalog = toml::from_str(INTENTS).expect("intents.toml is a catalog");
+        let intents = catalog.intents.iter();
+        let commands = intents.filter(|intent| matches!(intent.kind, Kind::Command));
+        for intent in commands {
+            let (flags, _) = addressed(&pools[&intent.name]);
+            let both = flags.contains(&true) && flags.contains(&false);
+            assert!(both, "{} has the address flags {flags:?}", intent.name);
+        }
+        assert_eq!(validate_pools(&pools, &catalog), Ok(()));
+    }
+
+    /// AC-15.9e-2.
+    #[test]
+    fn ac_15_9e_2_address_responses_use_only_area_and_address() {
+        let allowed = BTreeSet::from(["area".to_owned(), "address".to_owned()]);
+        let pools = repository_pools();
+        let responses = pools.values().flat_map(|pool| &pool.responses);
+        let addressed = responses.filter(|response| uses_address(&response.text));
+        for response in addressed {
+            let unknown = catalog::unknown_variable(&response.text, &allowed);
+            let only = matches!(unknown, Ok(None));
+            assert!(only, "{:?} has the variable {unknown:?}", response.text);
+        }
     }
 
     /// Sets the responses of the pool `name` of `pools` to `texts`.
