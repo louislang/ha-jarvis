@@ -365,8 +365,8 @@ impl Training {
         self.state.save(&TrainingState { current, last_time })?;
         if let Some(new) = new {
             self.classifier.swap(run_id.to_owned(), new);
-            let keep = [run_id, previous.as_deref().unwrap_or(FIXTURE)];
-            if let Err(error) = prune(&self.config.model.dir, keep) {
+            let keep = [run_id, previous.as_deref().unwrap_or(FIXTURE), FIXTURE];
+            if let Err(error) = prune(&self.config.model.dir, &keep) {
                 tracing::warn!("the delete of the old model folders failed: {error}");
             }
         }
@@ -588,7 +588,7 @@ async fn measure(
 }
 
 /// Deletes the folders in `dir` other than `keep`.
-fn prune(dir: &Path, keep: [&str; 2]) -> io::Result<()> {
+fn prune(dir: &Path, keep: &[&str]) -> io::Result<()> {
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() && !keep.iter().any(|name| entry.file_name() == *name) {
@@ -1195,6 +1195,31 @@ mod tests {
         drop(closed);
         task.await??;
         assert_eq!(harness.training.changes().await?, 1);
+        Ok(())
+    }
+
+    /// AC-13.9b-7.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_9b_7_accepted_run_keeps_previous_and_fixture() -> anyhow::Result<()> {
+        let (old, new) = (classifier(&wrong_slot()), classifier(&[]));
+        let harness = swap(&old);
+        for name in [FIXTURE, "previous", "stale"] {
+            fs::create_dir(harness.models.path().join(name))?;
+        }
+        let current = Some("previous".to_owned());
+        let saved = TrainingState {
+            current,
+            ..TrainingState::default()
+        };
+        harness.training.state.save(&saved)?;
+        script(&harness, &new, Ok(()));
+        harness.training.run().await?;
+        for name in [FIXTURE, "previous", RUN] {
+            let folder = harness.models.path().join(name);
+            assert!(folder.is_dir(), "{} is deleted", folder.display());
+        }
+        let stale = harness.models.path().join("stale");
+        assert!(!stale.exists(), "{} stays", stale.display());
         Ok(())
     }
 
