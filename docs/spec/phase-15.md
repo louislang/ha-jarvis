@@ -529,6 +529,30 @@ This sub-phase is removed. The calendar intent was only an example, so no intent
 
 ---
 
+### 15.8f Speaker Pick Needs a Voice
+
+**Goal:** Show the person list only for a request that has a voice embedding. In the field test on 2026-11-19, a pick on an older request gave 404. That request had audio but no embedding, because the speaker model did not run before v0.1.30.
+
+- **Implements:** G12, G15, G24. **Depends on:** 15.8e.
+- **Files:** modify `src/domain/feedback.rs`, `src/adapters/sqlite.rs`, `src/adapters/web.rs`, `src/adapters/review.html`, `src/app/conversation.rs`, `src/app/review.rs`, `src/domain/training.rs`, `src/testing/fakes.rs`, `README.md`.
+
+**Model.**
+
+- `Interaction` gets `embedded: bool`: true when the log has a voice embedding of the interaction. The listing of the log sets it from the `embedding` column, so the value in the stored record has no effect. The items of `GET api/interactions` have `embedded`.
+- `pickSpeaker` removes `select.speaker` when the interaction has no `satellite` or `embedded` is false.
+- Jarvis does not make embeddings for older requests. A request with no embedding keeps no person list.
+
+**Acceptance criteria.**
+
+- AC-15.8f-1: When the log lists an interaction with an embedding, `embedded` is true. When the interaction has no embedding, `embedded` is false.
+- AC-15.8f-2: When `GET /` runs, the page script `pickSpeaker` removes `select.speaker` for an interaction with a `satellite` and `embedded` false, and keeps it for an interaction with a `satellite` and `embedded` true.
+
+**Proofs.**
+
+- P-15.8f-1, P-15.8f-2. Evidence: test.
+
+---
+
 ### 15.9 Form of Address
 
 **Goal:** Add the form of address to response selection and pool validation. A reply uses `{{ address }}` only when the speaker has a form of address, and each pool keeps a reply for a request with no known speaker.
