@@ -298,13 +298,13 @@ This phase selects responses, selects entities and decides the action from a pre
 **Acceptance criteria.**
 
 - AC-4.5d-1: When the intent is `climate_down` and the target temperature is 72, the call data has `temperature = 70` as a number.
-- AC-4.5d-2: When the `show` slot is "24", the rendered `media_content_id` is a string that contains `"show_name": "24"`.
+- AC-4.5d-2: When the `show` slot is "24", the rendered `show` data value of `tv_show` is the string "24", not a number.
 - AC-4.5d-3: When an `optional` slot is missing, the template renders it as an empty string. When a slot that is not `optional` and not `area` is missing, the result is `Defer` with `Job::Llm`.
 
 **Proofs.**
 
 - P-4.5d-1 (AC-4.5d-1). Evidence: test. A data value that is one `{{ expression }}` keeps the type of its result through `minijinja` `compile_expression`, which Verus cannot see. `{{ entity.attributes.temperature - 2 }}` is one expression whose result is a number.
-- P-4.5d-2 (AC-4.5d-2). Ensures: a data value that is not one `{{ expression }}` becomes a JSON string. Argument: step 8 renders each such value with `render`, which returns a `String`. The `media_content_id` value of `tv_show` has text around `{{ show }}`, so it is not one expression.
+- P-4.5d-2 (AC-4.5d-2). Ensures: a data value that is one slot expression becomes a JSON string. Argument: step 8 keeps the type of the expression result, and each slot in the render context is a string. The `show` value of `tv_show` is `{{ show }}` (sub-phase 18.19c).
 - P-4.5d-3 (AC-4.5d-3). Evidence: test. The slot names come from `catalog::insert_slots`, which has no `ensures`, and from `parse_example`, whose `ensures` does not state the slot names (P-3.2b). The empty string reaches the text through `minijinja`.
 - P-4.5c-1 now holds for an intent without `entity`. For an intent with `entity`, the target is the rendered `entity` text, which Verus cannot see.
 
