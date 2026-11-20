@@ -811,19 +811,26 @@ impl Plugin for FakePlugin {
     }
 }
 
-/// A `MediaLibrary` that gives the scripted title lists in order, then an error.
+/// A `MediaLibrary` that gives the scripted title lists and episode keys in order, then an
+/// error, and records each episode request.
 #[derive(Default)]
 pub(crate) struct FakeLibrary {
-    /// The results of the next calls in order: the titles, or the error text.
+    /// The results of the next `titles` calls in order: the titles, or the error text.
     pub(crate) results: Mutex<VecDeque<Result<Vec<Title>, &'static str>>>,
+    /// The results of the next `episode` calls in order: the key, or the error text.
+    pub(crate) episodes: Mutex<VecDeque<Result<String, &'static str>>>,
+    /// The show key, the season and the episode of each `episode` call, in order.
+    pub(crate) asked: Mutex<Vec<(String, u64, u64)>>,
 }
 
-/// The title `name` of `kind`.
+/// The title `name` of `kind`, with `name` as its key, on the server `abc123`.
 #[must_use]
 pub(crate) fn title(name: &str, kind: &str) -> Title {
     Title {
         name: name.to_owned(),
         kind: kind.to_owned(),
+        key: name.to_owned(),
+        server: "abc123".to_owned(),
     }
 }
 
@@ -833,6 +840,14 @@ impl MediaLibrary for FakeLibrary {
         let result = lock(&self.results).pop_front();
         result
             .unwrap_or(Err("no scripted titles"))
+            .map_err(anyhow::Error::msg)
+    }
+
+    async fn episode(&self, show: &str, season: u64, episode: u64) -> anyhow::Result<String> {
+        lock(&self.asked).push((show.to_owned(), season, episode));
+        let result = lock(&self.episodes).pop_front();
+        result
+            .unwrap_or(Err("no scripted episode"))
             .map_err(anyhow::Error::msg)
     }
 }

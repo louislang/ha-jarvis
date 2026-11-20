@@ -351,6 +351,10 @@ pub struct Title {
     pub name: String,
     /// The type of its section: `movie` or `show`.
     pub kind: String,
+    /// The item key in the library, the Plex `ratingKey`.
+    pub key: String,
+    /// The ID of the server of the library, the Plex `machineIdentifier`.
+    pub server: String,
 }
 
 /// The movie and show titles of a media library.
@@ -362,6 +366,13 @@ pub trait MediaLibrary: Send + Sync {
     ///
     /// A request fails or a reply does not parse.
     async fn titles(&self) -> anyhow::Result<Vec<Title>>;
+
+    /// The key of episode `episode` of season `season` of the show with the key `show`.
+    ///
+    /// # Errors
+    ///
+    /// A request fails, a reply does not parse, or the show has no such episode.
+    async fn episode(&self, show: &str, season: u64, episode: u64) -> anyhow::Result<String>;
 }
 
 /// Trains System One models.
