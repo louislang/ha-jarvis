@@ -287,6 +287,7 @@ mod tests {
             marks: Vec::new(),
             speaker: None,
             source: None,
+            embedded: false,
         }
     }
 

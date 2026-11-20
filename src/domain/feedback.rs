@@ -115,6 +115,9 @@ pub struct Interaction {
     pub speaker: Option<EntityId>,
     /// The signal that identified the speaker.
     pub source: Option<Source>,
+    /// True when the log has a voice embedding of the interaction. The log listing sets it.
+    #[serde(default)]
+    pub embedded: bool,
 }
 
 /// A request that System Two answered.
