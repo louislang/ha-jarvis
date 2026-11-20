@@ -350,7 +350,7 @@ AC-13.9-5 to AC-13.9-8, AC-13.9-10 and AC-13.9-11 move to sub-phase 13.9b as AC-
 4. `ModelLoader::load` the new folder.
 5. Predict the held-out set with the old and the new classifier.
 6. Log both measures and the decision. If `accept`, set `current :=` the new run. Else delete the new folder.
-7. Save the training state with `last_time := started`. Thus a change during the run counts for the next run. After the save of an accepted run, swap the classifier and delete the model folders other than the current and the previous one. A failed delete logs one `warn` event.
+7. Save the training state with `last_time := started`. Thus a change during the run counts for the next run. After the save of an accepted run, swap the classifier and delete the model folders other than the current one, the previous one and `fixture`. `run` loads `fixture` when the training state is lost (sub-phase 13.9d). A failed delete logs one `warn` event.
 
 - On a final error, the old model stays and the training state does not change.
 - `Training::changes` gives the change count: `changes` (sub-phase 13.3) of the saved training state and the marked interactions.
@@ -365,13 +365,14 @@ AC-13.9-5 to AC-13.9-8, AC-13.9-10 and AC-13.9-11 move to sub-phase 13.9b as AC-
 - AC-13.9b-4: When the trainer returns an error, the old classifier stays and the change count does not change.
 - AC-13.9b-5: When `ModelLoader::load` is blocked during a run, `predict` of the `Classifier` wrapper returns before virtual time advances. `handle` reads the classifier only through it.
 - AC-13.9b-6: When a mark arrives during a run, the change count after the run is 1.
+- AC-13.9b-7: When a run is accepted, the folders of the new run, the previous run and `fixture` stay, and the other folders in `model.dir` are deleted.
 
 **Proofs.**
 
 - P-13.9b-1, P-13.9b-2. Requires: `SwapNeverWorse`. Argument: step 6 swaps only when `accept(new, old)`, which is `new >= old`.
 - P-13.9b-3, P-13.9b-4. Requires: `CountResetsAfterRun`, `FailureKeepsModel`. Argument: step 7 runs after both branches of step 6. The error path returns before step 6.
 - P-13.9b-5. Argument: `handle` reads the classifier through the `Classifier` wrapper of sub-phase 5.4, which calls `ArcSwap::load` once. `load` never waits for a writer.
-- P-13.9b-6. Evidence: test.
+- P-13.9b-6, P-13.9b-7. Evidence: test.
 
 ---
 
