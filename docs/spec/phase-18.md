@@ -1,6 +1,6 @@
 # Phase 18: Queries and Media
 
-This phase adds System One query intents about the house, Music Assistant playback and Plex playback. The queries read only the hot cache and make no service call. The music intents call `music_assistant.play_media` and the `media_player` services on the speaker of the area, or on a Music Assistant speaker group. The Plex intents call `media_player.play_media` with a `plex://` content ID on the TV. The list of new Plex shows comes from the Plex server, so it is a plugin (`01-architecture.md` decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 17 and before phase 10. Sub-phases 18.17 to 18.18b bias the second pass toward the names of the house and of the music library, because the field tests misheard them.
+This phase adds System One query intents about the house, Music Assistant playback and Plex playback. The queries read only the hot cache and make no service call. The music intents call `music_assistant.play_media` and the `media_player` services on the speaker of the area, or on a Music Assistant speaker group. The Plex intents play a `plezy://` link in the Plezy app on the Living Room Apple TV (sub-phases 18.19 to 18.19c). Before 18.19c, they called `media_player.play_media` with a `plex://` content ID on the TV. The list of new Plex shows comes from the Plex server, so it is a plugin (`01-architecture.md` decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 17 and before phase 10. Sub-phases 18.17 to 18.18b bias the second pass toward the names of the house and of the music library, because the field tests misheard them. Sub-phases 18.19 to 18.19c move the TV intents to the Apple TV, because the filter `name = "tv"` found no single TV on 2026-11-18, and Plezy on the Apple TV plays more reliably than the Sony TV.
 
 Each sub-phase that adds an intent adds its seed examples to `intents.toml` and its pool to `responses.toml` (`01-architecture.md` section 12). The training set then changes, so `just fixture-model` trains the fixture model again (sub-phase 3.9), and CI trains it again because the cache key is the hash of the training set. AC-3.12-1 to AC-3.12-4 then check the new seed examples. When the fixture model does not learn a new example, the PR changes the examples, not the tests. Jarvis serves the fixture model until sub-phase 13.9, and the training runs of phase 13 use the same seed examples. The tests of the intent sub-phases decide with the catalog of `intents.toml`, the pools of `responses.toml` and the reference house. A test that needs an entity that the reference house does not have adds it to the snapshot before it loads the cache. The tests of AC-3.2-1 and AC-3.2c-2 in `src/domain/catalog.rs` list the intent names in the order of `intents.toml`, so each such sub-phase adds its names there. The fixture model gives each seed example a context by its position, so a new intent can move the contexts of the examples after it. The order of the new intents can change to keep the existing tests passing.
 
@@ -247,6 +247,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 **Model.**
 
+- Sub-phase 18.19b moves the TV intents to the Apple TV `media_player.living_room`, and sub-phase 18.19c replaces the `plex://` playback with Plezy.
 - Each intent calls `media_player.play_media` on the TV: `target = "entity"` and `select = [{ domain = "media_player", name = "tv" }]`, as `tv_show`. HA resolves the `plex://` content ID through the Plex integration. The library names are `Movies` and `TV Shows`. Change them in `intents.toml` when the Plex server uses other names.
 - `play_movie`: examples "put on [the matrix](movie)", "play the movie [inception](movie)", "watch [toy story](movie)", "put on the movie [up](movie)". `data = { media_content_type = "movie", media_content_id = 'plex://{"library_name": "Movies", "title": "{{ movie }}"}' }`. Pool: `Putting on {{ movie }}.`
 - `continue_show`: examples "continue [the office](show)", "play the next episode of [bluey](show)", "keep watching [severance](show)", "next episode of [the office](show)". `data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": "{{ show }}", "resume": 1}' }`. With `resume`, Plex starts the On Deck episode of the show, else the first episode. Pool: `Continuing {{ show }}.`
@@ -279,25 +280,25 @@ Two fix PRs add the title match below. As one PR, the fix changes about 590 line
 
 **Acceptance criteria.**
 
-- AC-18.9-1: When the intent is `play_movie` with the slot `movie = the matrix`, the call is `media_player.play_media` with the target `media_player.apple_tv`, `media_content_type = "movie"`, and the `media_content_id` `plex://{"library_name": "Movies", "title": "the matrix"}`.
-- AC-18.9-2: When the intent is `continue_show` with the slot `show = the office`, the `media_content_id` is `plex://{"library_name": "TV Shows", "show_name": "the office", "resume": 1}`.
-- AC-18.9-3: When the intent is `play_episode` with the slots `show = the office`, `season = 2` and `episode = 5`, the `media_content_id` is `plex://{"library_name": "TV Shows", "show_name": "the office", "season_number": 2, "episode_number": 5}`.
-- AC-18.9-4: When the slots are `season = two` and `episode = five`, the `media_content_id` is the one of AC-18.9-3. When `volume_set` has `volume = fifty`, `volume_level` is 0.5.
+- AC-18.9-1: When the intent is `play_movie` with the slot `movie = the matrix`, the call is `media_player.play_media` with the target `media_player.apple_tv`, `media_content_type = "movie"`, and the `media_content_id` `plex://{"library_name": "Movies", "title": "the matrix"}`. AC-18.19c-6 replaces this criterion.
+- AC-18.9-2: When the intent is `continue_show` with the slot `show = the office`, the `media_content_id` is `plex://{"library_name": "TV Shows", "show_name": "the office", "resume": 1}`. AC-18.19c-6 replaces this criterion.
+- AC-18.9-3: When the intent is `play_episode` with the slots `show = the office`, `season = 2` and `episode = 5`, the `media_content_id` is `plex://{"library_name": "TV Shows", "show_name": "the office", "season_number": 2, "episode_number": 5}`. AC-18.19c-6 replaces this criterion.
+- AC-18.9-4: When the slots are `season = two` and `episode = five`, the `media_content_id` is the one of AC-18.9-3. When `volume_set` has `volume = fifty`, `volume_level` is 0.5. AC-18.19c-6 replaces this criterion.
 
 The tests of AC-18.9-5 to AC-18.9-11 use this title list, unless the criterion gives another: the movies "The Matrix" and "Fargo", and the shows "VisionQuest", "Bluey", "The Office (US)" and "Fargo".
 
-- AC-18.9-5: When the intent is `tv_show` with `show = vision quest`, the reply is "Putting VisionQuest on the TV." or "Playing VisionQuest.", and `FakeHome` records `media_player.play_media` with the `media_content_id` `plex://{"library_name": "TV Shows", "show_name": "VisionQuest", "shuffle": 1}`.
-- AC-18.9-6: When the intent is `tv_show` with `show = the matrix`, the reply is "Putting on The Matrix.", and `FakeHome` records `media_player.play_media` with `media_content_type = "movie"` and the `media_content_id` `plex://{"library_name": "Movies", "title": "The Matrix"}`.
-- AC-18.9-7: When the intent is `play_movie` with `movie = bluey`, the call has `media_content_type = "episode"` and the `media_content_id` `plex://{"library_name": "TV Shows", "show_name": "Bluey", "shuffle": 1}`.
-- AC-18.9-8: When the intent is `continue_show` with `show = the office`, the `media_content_id` is `plex://{"library_name": "TV Shows", "show_name": "The Office (US)", "resume": 1}`.
-- AC-18.9-9: When the intent is `tv_show` with `show = fargo`, the call plays the show "Fargo". When the intent is `play_movie` with `movie = fargo`, the call plays the movie "Fargo".
+- AC-18.9-5: When the intent is `tv_show` with `show = vision quest`, the reply is "Putting VisionQuest on the TV." or "Playing VisionQuest.", and `FakeHome` records `media_player.play_media` with the `media_content_id` `plex://{"library_name": "TV Shows", "show_name": "VisionQuest", "shuffle": 1}`. AC-18.19c-1 replaces this criterion.
+- AC-18.9-6: When the intent is `tv_show` with `show = the matrix`, the reply is "Putting on The Matrix.", and `FakeHome` records `media_player.play_media` with `media_content_type = "movie"` and the `media_content_id` `plex://{"library_name": "Movies", "title": "The Matrix"}`. AC-18.19c-3 replaces this criterion.
+- AC-18.9-7: When the intent is `play_movie` with `movie = bluey`, the call has `media_content_type = "episode"` and the `media_content_id` `plex://{"library_name": "TV Shows", "show_name": "Bluey", "shuffle": 1}`. AC-18.19c-3 replaces this criterion.
+- AC-18.9-8: When the intent is `continue_show` with `show = the office`, the `media_content_id` is `plex://{"library_name": "TV Shows", "show_name": "The Office (US)", "resume": 1}`. AC-18.19c-3 replaces this criterion.
+- AC-18.9-9: When the intent is `tv_show` with `show = fargo`, the call plays the show "Fargo". When the intent is `play_movie` with `movie = fargo`, the call plays the movie "Fargo". AC-18.19c-3 replaces this criterion.
 - AC-18.9-10: When the intent is `tv_show` with `show = jeopardy`, the reply is from the pool `not_in_library`, and `FakeHome` records no call.
-- AC-18.9-11: When the title list is empty, the call of `tv_show` with `show = vision quest` has the `show_name` "vision quest". When the top probability of `tv_show` with `show = jeopardy` is less than `model.threshold`, the result is `Defer` with `Job::Llm`, not the `not_in_library` reply.
-- AC-18.9-12: When `titles` runs, and the mock gives the sections "Movies" (key 1, type `movie`), "TV Shows" (key 2, type `show`) and "Music" (key 3, type `artist`), the mock receives `GET /library/sections`, `GET /library/sections/1/all` and `GET /library/sections/2/all`, each with the headers of AC-18.11-2, and no request for section 3. The result is each item title of sections 1 and 2, in order, with the type of its section as its kind.
+- AC-18.9-11: When the title list is empty, the call of `tv_show` with `show = vision quest` has the `show_name` "vision quest". When the top probability of `tv_show` with `show = jeopardy` is less than `model.threshold`, the result is `Defer` with `Job::Llm`, not the `not_in_library` reply. AC-18.19c-5 replaces this criterion.
+- AC-18.9-12: When `titles` runs, and the mock gives the sections "Movies" (key 1, type `movie`), "TV Shows" (key 2, type `show`) and "Music" (key 3, type `artist`), the mock receives `GET /library/sections`, `GET /library/sections/1/all` and `GET /library/sections/2/all`, each with the headers of AC-18.11-2, and no request for section 3. The result is each item title of sections 1 and 2, in order, with the type of its section as its kind. AC-18.19-1 replaces this criterion.
 - AC-18.9-13: When the mock returns status 401, a body without `MediaContainer`, or an item without `title`, `titles` returns an error.
 - AC-18.9-14: When `start_titles` runs with `FakeLibrary`, the shared list has the titles of the first call at once. After one hour of virtual time, it has the titles of the second call. When the second call fails, the list keeps the titles of the first call.
 - AC-18.9-15: When the pool `not_in_library` is missing, `validate_pools` returns an error that names it.
-- AC-18.9-16: When the title list has only the show `Paw Patrol "Live"` and the intent is `tv_show` with `show = paw patrol live`, the `media_content_id` is `plex://` and a JSON object whose `show_name` is `Paw Patrol "Live"`.
+- AC-18.9-16: When the title list has only the show `Paw Patrol "Live"` and the intent is `tv_show` with `show = paw patrol live`, the `media_content_id` is `plex://` and a JSON object whose `show_name` is `Paw Patrol "Live"`. AC-18.19c-5 replaces this criterion.
 
 **Proofs.**
 
@@ -321,7 +322,7 @@ The tests of AC-18.9-5 to AC-18.9-11 use this title list, unless the criterion g
 
 **Model.**
 
-- Each intent has `target = "entity"` and the TV filter of sub-phase 18.9.
+- Each intent has `target = "entity"` and the TV filter of sub-phase 18.9. Sub-phase 18.19b replaces the filter with the Apple TV.
 - `tv_pause`: `media_player.media_pause`. Examples: "pause the tv", "pause the show", "pause the movie". Pool: `Pausing the TV.`
 - HA has no relative seek, and a player does not update `media_position` while it plays. The position is valid at `media_position_updated_at` (HA media player documentation). Thus `Request` gets `now`, the time of the request, which `handle` takes from `Clock`.
 - `position(state, attributes, now)` is a pure function. It gives `media_position` plus the seconds from `media_position_updated_at` to `now` when `state` is `playing`, else `media_position`. A missing value, or a time that does not parse as a `jiff` `Timestamp`, gives `None`. The `entity` object gets `position` when the result is `Some`.
@@ -796,6 +797,125 @@ Sub-phases 18.18 and 18.18b were one sub-phase. With the Verus proofs and the te
 - P-18.18b-4. Argument: `refresh_hotwords` makes the calls only when `music_entry` gives `Some` (P-18.18-3).
 - P-18.18b-5. Evidence: test.
 
+---
+
+### 18.19 Plezy Library Data
+
+**Goal:** Give each Plex title its item key and the server ID, and find the key of one episode by its season and episode numbers. Sub-phase 18.19c then plays a title in the Plezy app on the Apple TV with a `plezy://` link.
+
+- **Implements:** G3. **Depends on:** 18.18b.
+- **Files:** modify `src/ports.rs`, `src/adapters/plex.rs`, `src/testing/fakes.rs`.
+
+TV playback through Plezy was one sub-phase. With its tests, it changes about 550 lines, which is more than the limit of 400 (`02-rules.md` section 7.1, rule 8). Thus 18.19 has the library data (about 190 lines), 18.19b moves the TV intents to the Apple TV (about 60 lines), and 18.19c plays through Plezy (about 300 lines).
+
+**Model.**
+
+- Field facts of 2026-11-18 and 2026-11-19:
+  - The TV of the Living Room has two kinds of players in HA. `media_player.living_room` is the Apple TV 4K, and its remote is `remote.living_room`. `media_player.living_room_tv`, `media_player.living_room_tv_2` and `media_player.living_room_tv_3` are the Sony TV: its own Plex player and Chromecast.
+  - On 2026-11-18, the filter `name = "tv"` of the TV intents (sub-phase 18.9) matched the three Sony players and gave no single target. The request went to System Two.
+  - You chose the Plezy app on the Apple TV for movies and shows, because it plays more reliably than the Sony players.
+  - In the live test on 2026-11-19, `media_player.turn_on` on `media_player.living_room` woke the Sony TV through HDMI-CEC and selected its input. Then `media_player.play_media` on `media_player.living_room` with `media_content_type: url` and `media_content_id: plezy://play?type=movie&imdb=tt0133093` made tvOS show the popup "Open in Plezy" (Open and Cancel). tvOS shows this popup each time. About 2 s to 3 s later, `remote.send_command` with `command: select` on `remote.living_room` pressed Open, and The Matrix played in Plezy.
+- Plezy links (the README and `lib/services/deep_links/deep_link.dart` of `edde746/plezy`):
+  - `plezy://play?server=<server>&id=<item>[&mode=next|shuffle]` plays one item of one server. For Plex, `<server>` is the `machineIdentifier` of the server, and `<item>` is the `ratingKey` of the item. A movie or an episode plays. For a show, `mode=next` (the default) plays the next episode to watch (the On Deck episode, else the first episode), and `mode=shuffle` plays the show shuffled.
+  - `plezy://play?type=movie|show&tmdb=<n>|tvdb=<n>|imdb=tt<n>|plex=<hash>[&mode=next|shuffle]` plays a movie or a show by an external ID. It has no form for one episode.
+- Jarvis uses the `server` and `id` form for all TV playback. Only this form plays one episode, so one form serves each variant. The title refresh (sub-phase 18.9) already reads each item of the movie and show sections, and each item has `ratingKey`. An external ID needs `includeGuids=1`, a list of IDs for each item and a choice between them, and some items (for example home videos) have none.
+- `Title` gets two fields: `key`, the `ratingKey` of the item, and `server`, the `machineIdentifier` of the server. All titles of one refresh have the same `server`.
+- `titles` (sub-phase 18.9) first does `GET <url>/identity` with the headers of AC-18.11-2. The server ID is `MediaContainer.machineIdentifier`. Then it reads the sections as before. A reply without `machineIdentifier`, or an item without `ratingKey`, gives an error. Plex gives `ratingKey` as a string.
+- `MediaLibrary` gets the method `episode(show, season, episode) -> anyhow::Result<String>`. `Plex` implements it:
+  1. `GET <url>/library/metadata/<show>/allLeaves` with the headers of AC-18.11-2. `show` is the `key` of a show title. The episodes are the items of `MediaContainer.Metadata`.
+  2. The result is the `ratingKey` of the first episode whose `parentIndex` (the season number) is `season` and whose `index` (the episode number) is `episode`.
+  3. A status that is not a success, a body without `MediaContainer`, or no such episode gives an error.
+- Thus only the play of one episode makes a Plex request, and Jarvis makes it after the reply (sub-phase 18.19c).
+- `FakeLibrary` gives a scripted result for `episode` and records each `(show, season, episode)`. `fakes::title` also gives the key and the server.
+
+**Acceptance criteria.**
+
+- AC-18.19-1: When `titles` runs, the mock gives the `machineIdentifier` "abc123" for `GET /identity`, and it gives the sections of AC-18.9-12 with a `ratingKey` for each item, the mock receives `GET /identity` and the requests of AC-18.9-12, each with the headers of AC-18.11-2, and no request for section 3. The result is each item title of sections 1 and 2, in order, with the type of its section as its kind, its `ratingKey` as its key and "abc123" as its server. This replaces AC-18.9-12.
+- AC-18.19-2: When the reply of `GET /identity` has no `machineIdentifier`, or an item has no `ratingKey`, `titles` returns an error. The tests of AC-18.9-13 also mock `GET /identity`.
+- AC-18.19-3: When `episode("12", 2, 5)` runs, and the mock gives for `GET /library/metadata/12/allLeaves` the episodes season 2 episode 4 (`ratingKey` "1204"), season 2 episode 5 ("1205") and season 3 episode 5 ("1305"), the mock receives this request with the headers of AC-18.11-2, and the result is "1205".
+- AC-18.19-4: When no episode has season 2 and episode 5, or the mock returns status 401, `episode` returns an error.
+
+**Proofs.**
+
+- P-18.19-1 to P-18.19-4. Evidence: test. The replies come from the Plex server (`02-rules.md` section 5, rule 5).
+
+---
+
+### 18.19b Apple TV Target
+
+**Goal:** Make each TV intent act on the Living Room Apple TV, not on a player that the filter `name = "tv"` finds. "Pause the TV" then acts on the Apple TV, where Plezy plays, from each room.
+
+- **Implements:** G3. **Depends on:** 18.19.
+- **Files:** modify `intents.toml`, `src/testing/house.json`, `src/domain/decide.rs`, `src/domain/select.rs` and `src/app/conversation.rs` (tests only), `README.md` (the TV entity in the setup, `CLAUDE.md` workflow item 15).
+
+**Model.**
+
+- The house has one TV room today, the Living Room, and its TV is the Apple TV `media_player.living_room` (sub-phase 18.19). Thus each TV intent gets `entity = "media_player.living_room"` and loses the filter `name = "tv"`: `tv_show`, `play_movie`, `continue_show`, `play_episode`, `tv_pause`, `tv_skip`, `tv_stop` and `tv_off`. With `target = "entity"`, `entity` comes before `select` (`01-architecture.md` section 9). Thus a request from any area acts on the Apple TV, and the Sony players are never a target. This needs no new setting and no code. A second TV room needs a spec change.
+- Plezy plays on the Apple TV, so the TV controls (sub-phase 18.10 and `tv_off` of sub-phase 18.16) act on the Apple TV too. Their services and data do not change. `media_player.turn_off` puts the Apple TV to sleep, and tvOS then turns off the TV through HDMI-CEC.
+- The data of the four play intents does not change in this sub-phase. Sub-phase 18.19c changes it.
+- The reference house gets the entity ID of the real Apple TV: `media_player.apple_tv` becomes `media_player.living_room` in `src/testing/house.json`. Its name, aliases and device do not change. Thus the replies of sub-phase 18.6 and the hotwords of sub-phase 18.18 do not change. The criteria of sub-phases 18.9, 18.10 and 18.16 that name `media_player.apple_tv` now mean `media_player.living_room`, and their tests use the new ID.
+- The test of AC-4.4b-3 selects with `tv_show` and its filter. `tv_show` has no `select` now, so the test gives its copy of `tv_show` the filter `{ domain = "media_player", name = "tv" }`.
+
+**Acceptance criteria.**
+
+- AC-18.19b-1: When the intent is `tv_pause`, `tv_stop`, `tv_off` or `play_movie` (with `movie = the matrix`), from the Office, the Bedroom or the Living Room satellite, the target of the call is `media_player.living_room`.
+- AC-18.19b-2: When the test adds the player `media_player.living_room_tv` ("Living Room TV") in the Living Room to the hot cache, the targets of AC-18.19b-1 do not change.
+
+**Proofs.**
+
+- P-18.19b-1, P-18.19b-2. Argument: for `target = "entity"`, `selection` renders `entity` and does not call `select` (sub-phase 4.5), so the area and the other players do not change the target.
+
+---
+
+### 18.19c Plezy Playback
+
+**Goal:** Play movies, shows and episodes in the Plezy app on the Apple TV. "Put on The Matrix" then turns on the TV, opens Plezy and plays the movie.
+
+- **Implements:** G3. **Depends on:** 18.19b.
+- **Files:** modify `intents.toml`, `src/app/conversation.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `src/domain/decide.rs` (tests only), `README.md` (TV playback through Plezy, `CLAUDE.md` workflow item 15).
+
+**Model.**
+
+- The data of the four play intents holds the parts of the Plezy link, not HA service data:
+  - `tv_show`: `{ show = "{{ show }}", mode = "shuffle" }`.
+  - `continue_show`: `{ show = "{{ show }}", mode = "next" }`.
+  - `play_movie`: `{ movie = "{{ movie }}" }`.
+  - `play_episode`: `{ show = "{{ show }}", season = "{{ season | number | int }}", episode = "{{ episode | number | int }}" }`. "two" gives the number 2 (sub-phase 18.9).
+- The title match (sub-phase 18.9) sets the title slot to the name of the Plex title. Thus the data has the exact name. A title is a JSON string value, not text inside a JSON string, so the data does not use `tojson`.
+- The intents keep `service = "media_player.play_media"` and `title`. The record of the request keeps this call (sub-phase 18.9).
+- `dispatch` finds the intent of the reply pool, as for `search` (sub-phase 18.13b). When the intent has `title`, the background work of the call plays through Plezy:
+  1. The kind is the `title` of the intent. The name is the data value with the key of that kind. The title is the first title of the list with this kind and name.
+  2. The item is the `key` of the title. When the data has `season` and `episode`, the item is `episode(key, season, episode)` of the media library (sub-phase 18.19).
+  3. The link is `plezy://play?server=<server>&id=<item>`, and `&mode=<mode>` when the data has `mode`. The server ID and the keys are letters and digits, so the link needs no escaping.
+  4. Call `media_player.turn_on` on the target. Your rule: a play on the TV first turns on the TV of the room.
+  5. Call `media_player.play_media` on the target with `{ media_content_type: "url", media_content_id: <link> }`.
+  6. Wait `PLEZY_WAIT` (3 s, a constant). In the live test, Select pressed Open 2 s to 3 s after the play.
+  7. Call `remote.send_command` on the remote of the target with `{ command: "select" }`. This presses Open on the popup of tvOS. The remote is `remote.<object ID>` of the target: `remote.living_room` for `media_player.living_room`. The HA Apple TV integration gives both entities the object ID of the device name. Thus Jarvis needs no setting for the remote.
+- A missing title, a failed episode lookup or a failed call stops the work. The work then makes no more calls and announces `failure`, as in sub-phase 18.14. Steps 1 and 2 come before the calls, so a missing title or episode makes no call.
+- Select comes only after a successful play. But a Select without the popup acts on what the screen shows. You accept this risk.
+- The title list is empty before the first refresh and without `[plugins.plex]`. Then the title match does not change the slot (sub-phase 18.9), step 1 finds no title, and Jarvis announces `failure` after the reply. Thus TV playback needs `[plugins.plex]`.
+- `run` gives the `MediaLibrary` of the Plex plugin to the conversation use case, with the title list.
+- The work is a fixed order of calls with no state, as the calls of sub-phase 18.14. Thus no Quint model changes.
+- These do not change: the music intents, their speakers and groups (sub-phases 18.7 to 18.15b), the `now_playing` query, the requests of other rooms, the title match and the `not_in_library` reply (sub-phase 18.9), the title refresh, `new_shows` (sub-phases 18.11 and 18.12), the replies of the play intents and the TV controls (sub-phase 18.19b).
+
+The tests of AC-18.19c-1 to AC-18.19c-5 use the title list of AC-18.9-5 with the server "abc123" and these keys: The Matrix "1", Fargo (movie) "2", VisionQuest "10", Bluey "11", The Office (US) "12" and Fargo (show) "13".
+
+**Acceptance criteria.**
+
+- AC-18.19c-1: When the intent is `tv_show` with `show = vision quest` from the Kitchen satellite, the reply is "Putting VisionQuest on the TV." or "Playing VisionQuest.". Then `FakeHome` records three calls in this order: `media_player.turn_on` on `media_player.living_room` with no data, `media_player.play_media` on `media_player.living_room` with `{ media_content_type: "url", media_content_id: "plezy://play?server=abc123&id=10&mode=shuffle" }`, and `remote.send_command` on `remote.living_room` with `{ command: "select" }`. This replaces AC-18.9-5.
+- AC-18.19c-2: After the `play_media` call returns, `FakeHome` records no `remote.send_command` call until 3 s of virtual time pass. After 3 s, it records the call.
+- AC-18.19c-3: The `media_content_id` is `plezy://play?server=abc123&id=1` for `tv_show` with `show = the matrix`, with the reply "Putting on The Matrix.". It is `plezy://play?server=abc123&id=11&mode=shuffle` for `play_movie` with `movie = bluey`, and `plezy://play?server=abc123&id=12&mode=next` for `continue_show` with `show = the office`. It is `plezy://play?server=abc123&id=13&mode=shuffle` for `tv_show` with `show = fargo`, and `plezy://play?server=abc123&id=2` for `play_movie` with `movie = fargo`. This replaces AC-18.9-6 to AC-18.9-9.
+- AC-18.19c-4: When the intent is `play_episode` with `show = the office`, `season = two` and `episode = five`, and `FakeLibrary` gives "1205", `FakeLibrary` records `("12", 2, 5)`, and the `media_content_id` is `plezy://play?server=abc123&id=1205`.
+- AC-18.19c-5: When the title list is empty, or `FakeLibrary` fails the episode lookup, `FakeHome` records no call, and the satellite gets the announce of the `failure` pool. When the `turn_on` call fails, `FakeHome` records no other call. When the top probability of `tv_show` with `show = jeopardy` is less than `model.threshold`, the result is `Defer` with `Job::Llm`. This replaces AC-18.9-11 and AC-18.9-16. No content ID has JSON text now, so the test of AC-18.9-16 is deleted.
+- AC-18.19c-6: When `decide` gets `play_movie` with `movie = The Matrix` from the Office, the call is `media_player.play_media` with the target `media_player.living_room` and the data `{ movie: "The Matrix" }`. `continue_show` with `show = the office` gives `{ show: "the office", mode: "next" }`. `play_episode` with `show = the office`, `season = two` and `episode = five` gives `{ show: "the office", season: 2, episode: 5 }`, with numbers. `volume_set` with `volume = fifty` gives `volume_level = 0.5`. This replaces AC-18.9-1 to AC-18.9-4.
+
+**Proofs.**
+
+- P-18.19c-1, P-18.19c-2. Argument: `dispatch` returns the reply before the work runs (P-4.8-1). The work makes the calls of steps 4, 5 and 7 in order, and it waits `PLEZY_WAIT` between steps 5 and 7.
+- P-18.19c-3, P-18.19c-4. Argument: the title match gives the exact name of the title (P-18.9-5 to P-18.9-9). Step 1 finds that title, step 2 gives its key or the key of the episode, and step 3 adds the mode of the data.
+- P-18.19c-5. Argument: steps 1 and 2 return an error before the first call, and the work stops at the first failed call (P-18.14-1). The use case does not match the title of an unclear prediction (P-18.9-11).
+- P-18.19c-6. Evidence: test. The rules are P-4.5c-1, P-4.5d-1 and P-18.9-4.
+
 ## Field Log
 
 These steps are not tests and gate nothing.
@@ -811,3 +931,6 @@ These steps are not tests and gate nothing.
 9. In the Office, say "Play Radiohead" and "Resume the music". Make sure that the transcripts in the log are "Play Radiohead." and "Resume the music.", and that the speaker plays the artist "Radiohead". If "Presume" stays, record it and the score of the verbs (sub-phase 18.18).
 10. In the Office, say "Turn on the office lights" five times. Make sure that the response latency in the log has no new delay (Phase 9 field log).
 11. After a release with the fix PR `Fix: Match Plex Titles`, say "Play Vision Quest on the TV" and "Turn on the matrix on the TV" in the Living Room. Make sure that the TV plays the show "VisionQuest" and the movie "The Matrix", and that Jarvis announces no failure. Say the name of a title that is not on the Plex server. Make sure that Jarvis replies that it is not in the library.
+12. After a release with sub-phase 18.19c, turn off the TV. In the Living Room, say "Put on The Matrix." Make sure that the TV turns on, Plezy plays the movie, and no popup stays. If the play fails when the Apple TV sleeps, record it. A wait after `turn_on` then needs a spec change.
+13. Say "Play season two episode five of The Office", "Continue The Office" and "Play Bluey on the TV" from the Office. Make sure that Plezy plays that episode, the next episode to watch, and Bluey shuffled.
+14. Say "Pause the TV", "Skip ahead", "Stop the TV" and "Turn off the TV". Make sure that each acts on Plezy on the Apple TV, and that the TV turns off. If "Skip ahead" fails, record the `media_position` attributes of `media_player.living_room`.
