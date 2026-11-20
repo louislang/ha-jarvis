@@ -599,7 +599,7 @@ service = "media_player.play_media"
 target = "entity"
 entity = "media_player.living_room"
 title = "show"
-data = { show = "{{ show }}", mode = "shuffle" }
+data = { show = "{{ show }}", mode = "next" }
 
 [[intent]]
 name = "temperature_query"

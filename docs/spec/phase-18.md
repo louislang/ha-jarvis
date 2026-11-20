@@ -1,6 +1,6 @@
 # Phase 18: Queries and Media
 
-This phase adds System One query intents about the house, Music Assistant playback and Plex playback. The queries read only the hot cache and make no service call. The music intents call `music_assistant.play_media` and the `media_player` services on the speaker of the area, or on a Music Assistant speaker group. The Plex intents play a `plezy://` link in the Plezy app on the Living Room Apple TV (sub-phases 18.19 to 18.19c). Before 18.19c, they called `media_player.play_media` with a `plex://` content ID on the TV. The list of new Plex shows comes from the Plex server, so it is a plugin (`01-architecture.md` decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 17 and before phase 10. Sub-phases 18.17 to 18.18b bias the second pass toward the names of the house and of the music library, because the field tests misheard them. Sub-phases 18.19 to 18.19c move the TV intents to the Apple TV, because the filter `name = "tv"` found no single TV on 2026-11-18, and Plezy on the Apple TV plays more reliably than the Sony TV.
+This phase adds System One query intents about the house, Music Assistant playback and Plex playback. The queries read only the hot cache and make no service call. The music intents call `music_assistant.play_media` and the `media_player` services on the speaker of the area, or on a Music Assistant speaker group. The Plex intents play a `plezy://` link in the Plezy app on the Living Room Apple TV (sub-phases 18.19 to 18.19c). Before 18.19c, they called `media_player.play_media` with a `plex://` content ID on the TV. The list of new Plex shows comes from the Plex server, so it is a plugin (`01-architecture.md` decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 17 and before phase 10. Sub-phases 18.17 to 18.18b bias the second pass toward the names of the house and of the music library, because the field tests misheard them. Sub-phases 18.19 to 18.19c move the TV intents to the Apple TV, because the filter `name = "tv"` found no single TV on 2026-11-18, and Plezy on the Apple TV plays more reliably than the Sony TV. Sub-phases 18.19d and 18.19e fix two TV defects of the field test on 2026-11-20: a show played shuffled, and the second pass did not hear a show title.
 
 Each sub-phase that adds an intent adds its seed examples to `intents.toml` and its pool to `responses.toml` (`01-architecture.md` section 12). The training set then changes, so `just fixture-model` trains the fixture model again (sub-phase 3.9), and CI trains it again because the cache key is the hash of the training set. AC-3.12-1 to AC-3.12-4 then check the new seed examples. When the fixture model does not learn a new example, the PR changes the examples, not the tests. Jarvis serves the fixture model until sub-phase 13.9, and the training runs of phase 13 use the same seed examples. The tests of the intent sub-phases decide with the catalog of `intents.toml`, the pools of `responses.toml` and the reference house. A test that needs an entity that the reference house does not have adds it to the snapshot before it loads the cache. The tests of AC-3.2-1 and AC-3.2c-2 in `src/domain/catalog.rs` list the intent names in the order of `intents.toml`, so each such sub-phase adds its names there. The fixture model gives each seed example a context by its position, so a new intent can move the contexts of the examples after it. The order of the new intents can change to keep the existing tests passing.
 
@@ -777,7 +777,7 @@ Sub-phases 18.18 and 18.18b were one sub-phase. With the Verus proofs and the te
   1. When `music_entry` of the hot cache gives a config entry, it calls `music_assistant.get_library` with no target, `return_response: true` and the data `{ config_entry_id, media_type, limit: 500, order_by: "play_count_desc" }`, for each `media_type` of `playlist`, `artist` and `album`, in this order. The names are the `name` of each item of `items` in the response.
   2. A failed call, or a response that does not parse, is logged. The list then has no names of that media type.
   3. It calls `stt.set_hotwords(hotwords(cache, catalog, names))` with the hot cache after the calls and the catalog of `intents.toml`. It logs one `info` event with the number of hotwords.
-- `music_assistant.get_library` gives the library of Music Assistant, not the catalog of a streaming provider. The limit of the action is 500 items, so each media type has one call and at most the 500 most played items. Thus the list has at most 1500 music names, the names of the house and the verbs. AC-18.17-7 measures 2000 hotwords.
+- `music_assistant.get_library` gives the library of Music Assistant, not the catalog of a streaming provider. The limit of the action is 500 items, so each media type has one call and at most the 500 most played items. Thus the list has at most 1500 music names, the names of the house and the verbs. AC-18.17-7 measures 2000 hotwords. Sub-phase 18.19e adds at most 250 Plex show titles.
 - Track names are not hotwords. A library has many more tracks than artists, and many track names are common words, for example "Jazz" or "Home". "Play" with a track name still goes to the search of sub-phase 18.13b.
 - `start_hotwords(home, cache, catalog, stt)` starts a task. The task waits until the hot cache has its first snapshot (`config` is not `None`). Then it runs `refresh_hotwords` at once and again each `HOTWORDS_REFRESH` (one hour, a constant). Thus a change of a name reaches the second pass in one hour or less. The task stops with the runtime and saves nothing.
 - `run` starts the task only when `asr.hotwords` is true and `asr.second_pass_dir` is set.
@@ -876,6 +876,7 @@ TV playback through Plezy was one sub-phase. With its tests, it changes about 55
 
 **Model.**
 
+- Sub-phase 18.19d changes the `mode` of `tv_show` to `next` and adds `shuffle_show`.
 - The data of the four play intents holds the parts of the Plezy link, not HA service data:
   - `tv_show`: `{ show = "{{ show }}", mode = "shuffle" }`.
   - `continue_show`: `{ show = "{{ show }}", mode = "next" }`.
@@ -902,9 +903,9 @@ The tests of AC-18.19c-1 to AC-18.19c-5 use the title list of AC-18.9-5 with the
 
 **Acceptance criteria.**
 
-- AC-18.19c-1: When the intent is `tv_show` with `show = vision quest` from the Kitchen satellite, the reply is "Putting VisionQuest on the TV." or "Playing VisionQuest.". Then `FakeHome` records three calls in this order: `media_player.turn_on` on `media_player.living_room` with no data, `media_player.play_media` on `media_player.living_room` with `{ media_content_type: "url", media_content_id: "plezy://play?server=abc123&id=10&mode=shuffle" }`, and `remote.send_command` on `remote.living_room` with `{ command: "select" }`. This replaces AC-18.9-5.
+- AC-18.19c-1: When the intent is `tv_show` with `show = vision quest` from the Kitchen satellite, the reply is "Putting VisionQuest on the TV." or "Playing VisionQuest.". Then `FakeHome` records three calls in this order: `media_player.turn_on` on `media_player.living_room` with no data, `media_player.play_media` on `media_player.living_room` with `{ media_content_type: "url", media_content_id: "plezy://play?server=abc123&id=10&mode=shuffle" }`, and `remote.send_command` on `remote.living_room` with `{ command: "select" }`. This replaces AC-18.9-5. AC-18.19d-1 replaces this criterion.
 - AC-18.19c-2: After the `play_media` call returns, `FakeHome` records no `remote.send_command` call until 3 s of virtual time pass. After 3 s, it records the call.
-- AC-18.19c-3: The `media_content_id` is `plezy://play?server=abc123&id=1` for `tv_show` with `show = the matrix`, with the reply "Putting on The Matrix.". It is `plezy://play?server=abc123&id=11&mode=shuffle` for `play_movie` with `movie = bluey`, and `plezy://play?server=abc123&id=12&mode=next` for `continue_show` with `show = the office`. It is `plezy://play?server=abc123&id=13&mode=shuffle` for `tv_show` with `show = fargo`, and `plezy://play?server=abc123&id=2` for `play_movie` with `movie = fargo`. This replaces AC-18.9-6 to AC-18.9-9.
+- AC-18.19c-3: The `media_content_id` is `plezy://play?server=abc123&id=1` for `tv_show` with `show = the matrix`, with the reply "Putting on The Matrix.". It is `plezy://play?server=abc123&id=11&mode=shuffle` for `play_movie` with `movie = bluey`, and `plezy://play?server=abc123&id=12&mode=next` for `continue_show` with `show = the office`. It is `plezy://play?server=abc123&id=13&mode=shuffle` for `tv_show` with `show = fargo`, and `plezy://play?server=abc123&id=2` for `play_movie` with `movie = fargo`. This replaces AC-18.9-6 to AC-18.9-9. AC-18.19d-2 replaces this criterion.
 - AC-18.19c-4: When the intent is `play_episode` with `show = the office`, `season = two` and `episode = five`, and `FakeLibrary` gives "1205", `FakeLibrary` records `("12", 2, 5)`, and the `media_content_id` is `plezy://play?server=abc123&id=1205`.
 - AC-18.19c-5: When the title list is empty, or `FakeLibrary` fails the episode lookup, `FakeHome` records no call, and the satellite gets the announce of the `failure` pool. When the `turn_on` call fails, `FakeHome` records no other call. When the top probability of `tv_show` with `show = jeopardy` is less than `model.threshold`, the result is `Defer` with `Job::Llm`. This replaces AC-18.9-11 and AC-18.9-16. No content ID has JSON text now, so the test of AC-18.9-16 is deleted.
 - AC-18.19c-6: When `decide` gets `play_movie` with `movie = The Matrix` from the Office, the call is `media_player.play_media` with the target `media_player.living_room` and the data `{ movie: "The Matrix" }`. `continue_show` with `show = the office` gives `{ show: "the office", mode: "next" }`. `play_episode` with `show = the office`, `season = two` and `episode = five` gives `{ show: "the office", season: 2, episode: 5 }`, with numbers. `volume_set` with `volume = fifty` gives `volume_level = 0.5`. This replaces AC-18.9-1 to AC-18.9-4.
@@ -915,6 +916,72 @@ The tests of AC-18.19c-1 to AC-18.19c-5 use the title list of AC-18.9-5 with the
 - P-18.19c-3, P-18.19c-4. Argument: the title match gives the exact name of the title (P-18.9-5 to P-18.9-9). Step 1 finds that title, step 2 gives its key or the key of the episode, and step 3 adds the mode of the data.
 - P-18.19c-5. Argument: steps 1 and 2 return an error before the first call, and the work stops at the first failed call (P-18.14-1). The use case does not match the title of an unclear prediction (P-18.9-11).
 - P-18.19c-6. Evidence: test. The rules are P-4.5c-1, P-4.5d-1 and P-18.9-4.
+
+---
+
+### 18.19d Continue Shows
+
+**Goal:** Make "Put Survivor on the TV" play the next episode to watch, not a random episode. Only "Shuffle Survivor" then plays a show shuffled.
+
+- **Implements:** G3. **Depends on:** 18.19c.
+- **Files:** modify `intents.toml`, `responses.toml`, `src/domain/catalog.rs`, `src/domain/decide.rs` and `src/app/conversation.rs` (tests only), `README.md` (the shuffle request, `CLAUDE.md` workflow item 15).
+
+**Model.**
+
+- In the field test on 2026-11-20, "Put Survivor on the TV" gave `tv_show` and played a random old episode. The data of `tv_show` has `mode = "shuffle"` (sub-phase 18.19c), from the `shuffle: 1` of the old `plex://` content ID (sub-phase 18.9).
+- You chose (2026-11-20): `tv_show` plays the next episode to watch, as `continue_show` does. A show plays shuffled only when you say "shuffle".
+- `tv_show` gets `data = { show = "{{ show }}", mode = "next" }`. Plezy then plays the On Deck episode of the show, else the first episode (sub-phase 18.19).
+- The new command intent `shuffle_show` has the service, `target`, `entity` and `title` of `tv_show`, and `data = { show = "{{ show }}", mode = "shuffle" }`. Thus the work of sub-phase 18.19c plays it, and it turns on the TV and presses Select as `tv_show` does. Examples: "shuffle [survivor](show)", "shuffle [bluey](show) on the tv", "put [the office](show) on shuffle", "play [severance](show) on shuffle". Pool: "Shuffling {{ show }}.", "Putting {{ show }} on shuffle." and "Right away, {{ address }}." (sub-phase 15.9e).
+- `shuffle_show` comes last in `intents.toml`, after `tv_show`. The title match (sub-phase 18.9, step 6) gives a show title of another intent to the first intent with `title = "show"`. That intent stays `tv_show`, so `play_movie` with a show title plays the next episode, not a shuffle. `shuffle_show` with a movie title plays the movie with `play_movie`.
+- The tests of AC-3.2-1 and AC-3.2c-2 add `shuffle_show` at the end of the intent names. The new examples make the fixture model stale, so `just fixture-model` trains it again. AC-3.12-1 and AC-3.12-3 then check the new examples.
+- `shuffle_show` has no verb (sub-phase 18.18), so the hotwords do not change.
+- The work is the stateless work of sub-phase 18.19c. Thus no Quint model changes.
+
+The tests of AC-18.19d-1 to AC-18.19d-3 use the title list and the keys of sub-phase 18.19c.
+
+**Acceptance criteria.**
+
+- AC-18.19d-1: When the intent is `tv_show` with `show = vision quest` from the Kitchen satellite, the reply and the three calls are those of AC-18.19c-1, but the `media_content_id` is `plezy://play?server=abc123&id=10&mode=next`. This replaces AC-18.19c-1.
+- AC-18.19d-2: The `media_content_id` is `plezy://play?server=abc123&id=1` for `tv_show` with `show = the matrix`, with the reply "Putting on The Matrix.". It is `plezy://play?server=abc123&id=11&mode=next` for `play_movie` with `movie = bluey`, and `plezy://play?server=abc123&id=12&mode=next` for `continue_show` with `show = the office`. It is `plezy://play?server=abc123&id=13&mode=next` for `tv_show` with `show = fargo`, and `plezy://play?server=abc123&id=2` for `play_movie` with `movie = fargo`. This replaces AC-18.19c-3.
+- AC-18.19d-3: When the intent is `shuffle_show` with `show = bluey` from the Kitchen satellite, the reply is "Shuffling Bluey." or "Putting Bluey on shuffle.". Then `FakeHome` records the three calls of AC-18.19c-1 in the same order, with the `media_content_id` `plezy://play?server=abc123&id=11&mode=shuffle`. For `shuffle_show` with `show = the matrix`, the `media_content_id` is `plezy://play?server=abc123&id=1`.
+- AC-18.19d-4: When `decide` gets `tv_show` with `show = the office` from the Office, the call is `media_player.play_media` with the target `media_player.living_room` and the data `{ show: "the office", mode: "next" }`. `shuffle_show` with `show = the office` gives the same call with the data `{ show: "the office", mode: "shuffle" }`.
+
+**Proofs.**
+
+- P-18.19d-1 to P-18.19d-3. Argument: step 3 of the work (sub-phase 18.19c) adds the `mode` of the data, and `tv_show` and `shuffle_show` give `next` and `shuffle`. The title match gives a title of the other kind to the first intent of that kind (P-18.9-5 to P-18.9-9): `tv_show` for a show, because it comes before `shuffle_show`, and `play_movie` for a movie, whose data has no `mode`.
+- P-18.19d-4. Evidence: test. The rules are P-4.5c-1 and P-4.5d-1.
+
+---
+
+### 18.19e Show Hotwords
+
+**Goal:** Add the Plex show titles to the hotwords. "Put Survivor on the TV" then gives "Survivor", not other words.
+
+- **Implements:** G2. **Depends on:** 18.19d.
+- **Files:** modify `src/app/background.rs`, `src/lib.rs`, `README.md` (the hotwords of the second pass, `CLAUDE.md` workflow item 15).
+
+**Model.**
+
+- In the field test on 2026-11-20, the second pass heard "Put Survivor on the TV" as "Let's circle over on the G". The hotwords have the names of the house, the verbs and the music names (sub-phases 18.18 and 18.18b), but no Plex title.
+- You chose (2026-11-20): the Plex show titles are hotwords. The movie titles are not.
+- The shared title list of the conversation use case (sub-phase 18.9) has each title with its `kind`: `movie` or `show`. The title refresh `start_titles` fills it each hour. The hotwords use this list. They make no Plex request.
+- `refresh_hotwords` (sub-phase 18.18b) gives `hotwords` (sub-phase 18.18) the music names, then the names of the first `HOTWORD_SHOWS` titles of the list with the kind `show`, in list order. `HOTWORD_SHOWS` is 250, a constant in `src/app/background.rs`. `hotwords` does not change: its last part is these names, in order.
+- AC-18.17-7 measured 2000 hotwords. The list has the names of the house (about 210 in the measured list), the verbs (15 today), at most 1500 music names and at most 250 show titles: about 1975. Thus the cap keeps the list near the measured 2000. The field log compares the logged number.
+- `hotword_text` (sub-phase 18.17) makes each title valid for sherpa-onnx: "The Office (US)" becomes "The Office US".
+- The first title refresh can end after the first hotword refresh. Thus `start_titles` gets a `tokio::sync::Notify`. After it stores a list, it calls `notify_one`. `start_hotwords` gets the shared title list and the `Notify`. After the first snapshot, it runs `refresh_hotwords` at once, at each `HOTWORDS_REFRESH` and each time the `Notify` wakes it. Thus the show titles reach the second pass after the first title refresh, not one hour later. The hotwords then refresh about two times each hour, and each refresh makes the three local `get_library` calls.
+- `run` gives the shared title list of the conversation use case and the `Notify` to the two tasks. Without `[plugins.plex]`, no title task runs, the list stays empty, and the hotwords are those of sub-phase 18.18b.
+- The tasks have no state other than the shared list. Thus no Quint model changes.
+
+**Acceptance criteria.**
+
+- AC-18.19e-1: When the title list has the movie "The Matrix" and the shows "VisionQuest" and "The Office (US)", and the three `get_library` calls give "Jazzy", "Radiohead" and "OK Computer", `FakeStt` records the list of `hotwords` with the last names "Jazzy", "Radiohead", "OK Computer", "VisionQuest" and "The Office (US)", in this order. The list does not contain "The Matrix".
+- AC-18.19e-2: When the title list has the shows "Show 1" to "Show 300", the recorded list contains "Show 1" to "Show 250" and does not contain "Show 251".
+- AC-18.19e-3: When `start_hotwords` runs with an empty title list, `FakeStt` records a list without show titles. When `start_titles` then stores the show "Bluey" from `FakeLibrary`, `FakeStt` records a second list with "Bluey" before one hour of virtual time passes.
+
+**Proofs.**
+
+- P-18.19e-1, P-18.19e-2. Argument: `refresh_hotwords` appends at most `HOTWORD_SHOWS` show titles, in list order, after the music names, and `hotwords` keeps the order of its last part (P-18.18-1).
+- P-18.19e-3. Argument: `start_titles` wakes the hotword task after each store, and the hotword task refreshes at each wake.
 
 ## Field Log
 
@@ -932,5 +999,6 @@ These steps are not tests and gate nothing.
 10. In the Office, say "Turn on the office lights" five times. Make sure that the response latency in the log has no new delay (Phase 9 field log).
 11. After a release with the fix PR `Fix: Match Plex Titles`, say "Play Vision Quest on the TV" and "Turn on the matrix on the TV" in the Living Room. Make sure that the TV plays the show "VisionQuest" and the movie "The Matrix", and that Jarvis announces no failure. Say the name of a title that is not on the Plex server. Make sure that Jarvis replies that it is not in the library.
 12. After a release with sub-phase 18.19c, turn off the TV. In the Living Room, say "Put on The Matrix." Make sure that the TV turns on, Plezy plays the movie, and no popup stays. If the play fails when the Apple TV sleeps, record it. A wait after `turn_on` then needs a spec change.
-13. Say "Play season two episode five of The Office", "Continue The Office" and "Play Bluey on the TV" from the Office. Make sure that Plezy plays that episode, the next episode to watch, and Bluey shuffled.
+13. After a release with sub-phase 18.19d, say "Play season two episode five of The Office", "Continue The Office", "Play Bluey on the TV" and "Shuffle Bluey" from the Office. Make sure that Plezy plays that episode, the next episode to watch of The Office, the next episode to watch of Bluey, and then Bluey shuffled.
 14. Say "Pause the TV", "Skip ahead", "Stop the TV" and "Turn off the TV". Make sure that each acts on Plezy on the Apple TV, and that the TV turns off. If "Skip ahead" fails, record the `media_position` attributes of `media_player.living_room`.
+15. After a release with sub-phase 18.19e, find the `info` event with the number of hotwords in the log of the `jarvis` unit. Make sure that the number is about 2000 or less. In the Living Room, say "Put Survivor on the TV". Make sure that the transcript in the log has "Survivor", and that Plezy plays the next episode to watch.
