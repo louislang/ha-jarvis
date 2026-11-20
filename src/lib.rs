@@ -1860,6 +1860,7 @@ async fn start_live_app(
     let catalog = Arc::new(catalog);
     let started = start_app(config, catalog, pools, home, reasoner, plugins, runpod).await?;
     if let Some(library) = library {
+        started.0.conversation.set_library(Arc::clone(&library));
         app::background::start_titles(library, started.0.conversation.titles());
     }
     Ok(started)

@@ -7,6 +7,7 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -81,12 +82,17 @@ use crate::ports::Context;
 use crate::ports::Handled;
 use crate::ports::Home;
 use crate::ports::InteractionLog;
+use crate::ports::MediaLibrary;
 use crate::ports::Reasoner;
 use crate::ports::Step;
 use crate::ports::Store;
 use crate::ports::Title;
 use crate::ports::VoiceProfiles;
 use crate::ports::Work;
+
+/// The wait from a Plezy play to the Select that accepts the "Open in Plezy" popup of tvOS. In
+/// the live test, Select pressed Open 2 s to 3 s after the play.
+const PLEZY_WAIT: Duration = Duration::from_secs(3);
 
 /// One change to the pools, applied by the pools task.
 pub type Change = Box<dyn FnOnce(Pools) -> Pools + Send>;
@@ -197,6 +203,8 @@ pub struct Conversation {
     next_id: Arc<AtomicU64>,
     /// The movie and show titles of the media library, empty until the first refresh.
     titles: Arc<ArcSwap<Vec<Title>>>,
+    /// The media library of the episode lookups, unset without the Plex plugin.
+    library: Arc<OnceLock<Arc<dyn MediaLibrary>>>,
 }
 
 impl Conversation {
@@ -241,6 +249,7 @@ impl Conversation {
             recorder,
             next_id,
             titles: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            library: Arc::default(),
         }
     }
 
@@ -886,7 +895,7 @@ impl Conversation {
     }
 
     /// `reply` and the work of `call` for `request`, with a search first when the intent of the
-    /// pool of `reply` has `search`.
+    /// pool of `reply` has `search`, or a Plezy play when it has `title`.
     fn replied(
         &self,
         reply: Chosen,
@@ -895,8 +904,11 @@ impl Conversation {
     ) -> (Chosen, Option<Work>) {
         let catalog = self.catalog.load();
         let mut intents = catalog.intents.iter();
-        let search = intents.any(|intent| intent.search && intent.name == reply.pool);
-        (reply, call.map(|call| self.after(call, search, request)))
+        let intent = intents.find(|intent| intent.name == reply.pool);
+        let search = intent.is_some_and(|intent| intent.search);
+        let kind = intent.and_then(|intent| intent.title.clone());
+        let after = call.map(|call| self.after(call, search, kind, request));
+        (reply, after)
     }
 
     /// Empty text and `question` in the queue of the satellite of `request` with the generation of
@@ -918,14 +930,26 @@ impl Conversation {
         (question, Some(ask.boxed()))
     }
 
-    /// Makes the calls of `resolve` of `call` with `search` in order. When one fails, makes no
-    /// more calls, logs the error, queues a `failure` answer on the satellite of `request` with
-    /// the generation of `request`, and records its use.
-    fn after(&self, call: ServiceCall, search: bool, request: Option<Origin>) -> Work {
+    /// Plays the title of the kind `kind` of `call` through Plezy (`watch`), or makes the calls
+    /// of `resolve` of `call` with `search` in order. When one fails, makes no more calls, logs
+    /// the error, queues a `failure` answer on the satellite of `request` with the generation of
+    /// `request`, and records its use.
+    fn after(
+        &self,
+        call: ServiceCall,
+        search: bool,
+        kind: Option<String>,
+        request: Option<Origin>,
+    ) -> Work {
         let conversation = self.clone();
         async move {
-            let calls = conversation.resolve(call, search).await;
-            let Err(error) = conversation.make(calls).await else {
+            let made = if let Some(kind) = kind {
+                conversation.watch(call, &kind).await
+            } else {
+                let calls = conversation.resolve(call, search).await;
+                conversation.make(calls).await
+            };
+            let Err(error) = made else {
                 return Ok(());
             };
             tracing::warn!("the call failed: {error:#}");
@@ -935,6 +959,56 @@ impl Conversation {
             conversation.announce(&origin, conversation.failure()).await
         }
         .boxed()
+    }
+
+    /// Plays the Plezy `link` of the title of the kind `kind` of `call` on its target: turns the
+    /// target on, plays the link, and after `PLEZY_WAIT` presses Select on its remote.
+    async fn watch(&self, call: ServiceCall, kind: &str) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let link = self.link(&call.data, kind).await?;
+        let target = call.target.first().context("no target")?;
+        let select = select(target)?;
+        let on = played_call("media_player", "turn_on", target, Map::new());
+        let data = [("media_content_type", "url"), ("media_content_id", &link)];
+        let play = played_call("media_player", "play_media", target, data_of(&data));
+        self.make(vec![on, play]).await?;
+        tokio::time::sleep(PLEZY_WAIT).await;
+        self.make(vec![select]).await
+    }
+
+    /// The Plezy link of the first title of the kind `kind` whose name is the value of `kind` in
+    /// `data`: its key, or the key of the episode `episode` of the season `season` of `data`, and
+    /// the `mode` of `data`. An error when the library has no such episode or no library is set.
+    async fn link(&self, data: &Map<String, Value>, kind: &str) -> anyhow::Result<String> {
+        use anyhow::Context as _;
+
+        let (server, key) = self.title_of(data, kind)?;
+        let season = data.get("season").and_then(Value::as_u64);
+        let episode = data.get("episode").and_then(Value::as_u64);
+        let item = match (season, episode) {
+            (Some(season), Some(episode)) => {
+                let library = self.library.get().context("no media library")?;
+                library.episode(&key, season, episode).await?
+            }
+            _ => key,
+        };
+        let mode = data.get("mode").and_then(Value::as_str);
+        let mode = mode.map(|mode| format!("&mode={mode}")).unwrap_or_default();
+        Ok(format!("plezy://play?server={server}&id={item}{mode}"))
+    }
+
+    /// The server and the key of the first title of the kind `kind` whose name is the value of
+    /// `kind` in `data`, or an error.
+    fn title_of(&self, data: &Map<String, Value>, kind: &str) -> anyhow::Result<(String, String)> {
+        use anyhow::Context as _;
+
+        let name = data.get(kind).and_then(Value::as_str);
+        let titles = self.titles.load();
+        let mut kept = titles.iter().filter(|title| title.kind == kind);
+        let found = kept.find(|title| Some(title.name.as_str()) == name);
+        let found = found.with_context(|| format!("no {kind} {name:?} in the library"))?;
+        Ok((found.server.clone(), found.key.clone()))
     }
 
     /// Makes `calls` in order, up to the first that fails.
@@ -1334,6 +1408,11 @@ impl Conversation {
     #[must_use]
     pub fn titles(&self) -> Arc<ArcSwap<Vec<Title>>> {
         Arc::clone(&self.titles)
+    }
+
+    /// Makes `library` the media library of the episode lookups, when none is set.
+    pub fn set_library(&self, library: Arc<dyn MediaLibrary>) {
+        self.library.get_or_init(|| library);
     }
 
     /// The plugin call of the fetch intent `intent` with its `data` for `area` and no slots, and a
@@ -1793,6 +1872,35 @@ fn retitled(
     Some(retitled)
 }
 
+/// The call of `domain.service` on `target` with `data`.
+fn played_call(domain: &str, service: &str, target: &str, data: Map<String, Value>) -> ServiceCall {
+    ServiceCall {
+        domain: domain.to_owned(),
+        service: service.to_owned(),
+        target: vec![target.to_owned()],
+        data,
+        return_response: false,
+    }
+}
+
+/// The call that presses Select on the remote of the media player `target`: the remote with the
+/// object ID of `target`, or an error when `target` has none.
+fn select(target: &str) -> anyhow::Result<ServiceCall> {
+    use anyhow::Context as _;
+
+    let (_, object) = target.split_once('.').context("no object ID")?;
+    let data = data_of(&[("command", "select")]);
+    let remote = format!("remote.{object}");
+    Ok(played_call("remote", "send_command", &remote, data))
+}
+
+/// The service data with the string values of `entries`.
+fn data_of(entries: &[(&str, &str)]) -> Map<String, Value> {
+    let entries = entries.iter();
+    let data = entries.map(|(key, value)| ((*key).to_owned(), Value::from(*value)));
+    data.collect()
+}
+
 /// The items to play for the match `found` in `results`: the first track of an artist match,
 /// if any, and then the match.
 fn items(results: &SearchResults, found: &MediaItem) -> Vec<MediaItem> {
@@ -2130,6 +2238,7 @@ mod tests {
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
+    use crate::testing::fakes::FakeLibrary;
     use crate::testing::fakes::FakeLog;
     use crate::testing::fakes::FakePlugin;
     use crate::testing::fakes::FakeReasoner;
@@ -4453,12 +4562,14 @@ mod tests {
         Ok(())
     }
 
-    /// The titles of AC-18.9-5 to AC-18.9-11.
+    /// The titles of AC-18.9-10 and AC-18.19c-1 to AC-18.19c-5, with their keys.
     fn titles() -> Vec<Title> {
         let movies = ["The Matrix", "Fargo"].map(|name| fakes::title(name, "movie"));
         let shows = ["VisionQuest", "Bluey", "The Office (US)", "Fargo"];
         let shows = shows.map(|name| fakes::title(name, "show"));
-        movies.into_iter().chain(shows).collect()
+        let keys = ["1", "2", "10", "11", "12", "13"].map(str::to_owned);
+        let titles = movies.into_iter().chain(shows).zip(keys);
+        titles.map(|(title, key)| Title { key, ..title }).collect()
     }
 
     /// The prediction of `label` with `probability` and the slot `slot` with `value`.
@@ -4487,15 +4598,16 @@ mod tests {
         Ok(conversation)
     }
 
-    /// The reply and the calls after a request from the kitchen satellite whose prediction is
-    /// `label` with 0.9 and the slot `slot`, with the title list `titles`.
-    async fn watched(
-        label: &str,
-        slot: (&str, &str),
+    /// The reply and the calls of `home` after a request from the kitchen satellite whose
+    /// prediction is `prediction`, with the title list `titles` and the media library `library`.
+    async fn watched_on(
+        home: &Arc<FakeHome>,
+        prediction: Prediction,
         titles: Vec<Title>,
+        library: Arc<FakeLibrary>,
     ) -> anyhow::Result<(String, Vec<ServiceCall>)> {
-        let home = Arc::new(FakeHome::default());
-        let conversation = watching(&home, predicted(label, 0.9, slot), titles)?;
+        let conversation = watching(home, prediction, titles)?;
+        conversation.set_library(library);
         let context = Context {
             device_id: Some(KITCHEN.to_owned()),
             satellite_id: Some(SATELLITE.to_owned()),
@@ -4508,72 +4620,104 @@ mod tests {
         Ok((text, home.calls()))
     }
 
-    /// The `play_media` call of the TV with `media_content_type` `kind` and the content ID `id`.
-    fn on_tv(kind: &str, id: &str) -> ServiceCall {
-        let data = json!({ "media_content_type": kind, "media_content_id": id });
-        let mut call = service("media_player", "play_media", "media_player.living_room");
-        call.data = serde_json::from_value(data).expect("the data is an object");
-        call
+    /// The reply and the calls after a request from the kitchen satellite whose prediction is
+    /// `label` with 0.9 and the slot `slot`, with the title list `titles`.
+    async fn watched(
+        label: &str,
+        slot: (&str, &str),
+        titles: Vec<Title>,
+    ) -> anyhow::Result<(String, Vec<ServiceCall>)> {
+        let prediction = predicted(label, 0.9, slot);
+        watched_on(&Arc::default(), prediction, titles, Arc::default()).await
     }
 
-    /// The call that plays the show `name` with `shuffle`.
-    fn show(name: &str) -> ServiceCall {
-        let id = format!(
-            r#"plex://{{"library_name": "TV Shows", "show_name": "{name}", "shuffle": 1}}"#
-        );
-        on_tv("episode", &id)
+    /// The calls that turn on the Apple TV, play `link` on it and press Select on its remote.
+    fn plezy(link: &str) -> Vec<ServiceCall> {
+        const TV: &str = "media_player.living_room";
+        let mut play = service("media_player", "play_media", TV);
+        let data = json!({ "media_content_type": "url", "media_content_id": link });
+        play.data = serde_json::from_value(data).expect("the data is an object");
+        let mut select = service("remote", "send_command", "remote.living_room");
+        select.data = serde_json::from_value(json!({ "command": "select" })).expect("an object");
+        vec![service("media_player", "turn_on", TV), play, select]
     }
 
-    /// The call that plays the movie `name`.
-    fn movie(name: &str) -> ServiceCall {
-        let id = format!(r#"plex://{{"library_name": "Movies", "title": "{name}"}}"#);
-        on_tv("movie", &id)
+    /// The services of `calls`, in order.
+    fn services(calls: &[ServiceCall]) -> Vec<&str> {
+        calls.iter().map(|call| call.service.as_str()).collect()
     }
 
-    /// AC-18.9-5.
+    /// The prediction of `play_episode` with 0.9 and season 2, episode 5 of The Office.
+    fn episode() -> Prediction {
+        let mut prediction = predicted("play_episode", 0.9, ("show", "the office"));
+        for (name, value) in [("season", "two"), ("episode", "five")] {
+            let (name, value) = (name.to_owned(), value.to_owned());
+            prediction.slots.push(Slot { name, value });
+        }
+        prediction
+    }
+
+    /// AC-18.19c-1.
     #[tokio::test(start_paused = true)]
-    async fn ac_18_9_5_spaced_show_name_plays_the_library_title() -> anyhow::Result<()> {
+    async fn ac_18_19c_1_show_turns_on_the_tv_and_plays_shuffled_in_plezy() -> anyhow::Result<()> {
         let (reply, calls) = watched("tv_show", ("show", "vision quest"), titles()).await?;
         let replies = ["Putting VisionQuest on the TV.", "Playing VisionQuest."];
         assert!(replies.contains(&reply.as_str()), "{reply}");
-        assert_eq!(calls, [show("VisionQuest")]);
+        let link = "plezy://play?server=abc123&id=10&mode=shuffle";
+        assert_eq!(calls, plezy(link));
         Ok(())
     }
 
-    /// AC-18.9-6.
+    /// AC-18.19c-2.
     #[tokio::test(start_paused = true)]
-    async fn ac_18_9_6_movie_title_of_a_show_intent_plays_the_movie() -> anyhow::Result<()> {
-        let (reply, calls) = watched("tv_show", ("show", "the matrix"), titles()).await?;
+    async fn ac_18_19c_2_select_comes_3_s_after_the_play() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let start = Instant::now();
+        let shown = ("show", "vision quest");
+        let (home_of, prediction) = (Arc::clone(&home), predicted("tv_show", 0.9, shown));
+        let work = tokio::spawn(async move {
+            watched_on(&home_of, prediction, titles(), Arc::default()).await
+        });
+        tokio::time::sleep(Duration::from_millis(2999)).await;
+        assert_eq!(services(&home.calls()), ["turn_on", "play_media"]);
+        assert_eq!(work.await??.1.len(), 3);
+        assert_eq!(start.elapsed(), Duration::from_secs(3));
+        Ok(())
+    }
+
+    /// AC-18.19c-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_19c_3_each_title_plays_by_its_key_and_mode() -> anyhow::Result<()> {
+        let (reply, _) = watched("tv_show", ("show", "the matrix"), titles()).await?;
         assert_eq!(reply, "Putting on The Matrix.");
-        assert_eq!(calls, [movie("The Matrix")]);
+        let requests = [
+            ("tv_show", ("show", "the matrix"), "id=1"),
+            ("play_movie", ("movie", "bluey"), "id=11&mode=shuffle"),
+            ("continue_show", ("show", "the office"), "id=12&mode=next"),
+            ("tv_show", ("show", "fargo"), "id=13&mode=shuffle"),
+            ("play_movie", ("movie", "fargo"), "id=2"),
+        ];
+        for (label, slot, id) in requests {
+            let (_, calls) = watched(label, slot, titles()).await?;
+            let link = format!("plezy://play?server=abc123&{id}");
+            assert_eq!(calls, plezy(&link), "{label} {slot:?}");
+        }
         Ok(())
     }
 
-    /// AC-18.9-7.
+    /// AC-18.19c-4.
     #[tokio::test(start_paused = true)]
-    async fn ac_18_9_7_show_title_of_a_movie_intent_plays_the_show() -> anyhow::Result<()> {
-        let (_, calls) = watched("play_movie", ("movie", "bluey"), titles()).await?;
-        assert_eq!(calls, [show("Bluey")]);
-        Ok(())
-    }
-
-    /// AC-18.9-8.
-    #[tokio::test(start_paused = true)]
-    async fn ac_18_9_8_similar_title_continues_the_show() -> anyhow::Result<()> {
-        let (_, calls) = watched("continue_show", ("show", "the office"), titles()).await?;
-        let id =
-            r#"plex://{"library_name": "TV Shows", "show_name": "The Office (US)", "resume": 1}"#;
-        assert_eq!(calls, [on_tv("episode", id)]);
-        Ok(())
-    }
-
-    /// AC-18.9-9.
-    #[tokio::test(start_paused = true)]
-    async fn ac_18_9_9_same_title_keeps_the_kind_of_the_intent() -> anyhow::Result<()> {
-        let (_, shown) = watched("tv_show", ("show", "fargo"), titles()).await?;
-        assert_eq!(shown, [show("Fargo")]);
-        let (_, played) = watched("play_movie", ("movie", "fargo"), titles()).await?;
-        assert_eq!(played, [movie("Fargo")]);
+    async fn ac_18_19c_4_episode_plays_by_the_key_of_the_library() -> anyhow::Result<()> {
+        let episodes = Mutex::new([Ok("1205".to_owned())].into());
+        let library = Arc::new(FakeLibrary {
+            episodes,
+            ..FakeLibrary::default()
+        });
+        let home = Arc::default();
+        let (_, calls) = watched_on(&home, episode(), titles(), Arc::clone(&library)).await?;
+        let asked = library.asked.lock().expect("no lock holder panics").clone();
+        assert_eq!(asked, [("12".to_owned(), 2, 5)]);
+        assert_eq!(calls, plezy("plezy://play?server=abc123&id=1205"));
         Ok(())
     }
 
@@ -4590,11 +4734,26 @@ mod tests {
         Ok(())
     }
 
-    /// AC-18.9-11.
+    /// AC-18.19c-5.
     #[tokio::test(start_paused = true)]
-    async fn ac_18_9_11_no_titles_or_unclear_prediction_acts_as_before() -> anyhow::Result<()> {
+    async fn ac_18_19c_5_missing_title_episode_or_failed_call_announces_failure()
+    -> anyhow::Result<()> {
         let (_, calls) = watched("tv_show", ("show", "vision quest"), Vec::new()).await?;
-        assert_eq!(calls, [show("vision quest")]);
+        assert_eq!(services(&calls), ["announce"]);
+        let home = Arc::default();
+        let (_, calls) = watched_on(&home, episode(), titles(), Arc::default()).await?;
+        assert_eq!(services(&calls), ["announce"]);
+        assert_eq!(announces(&home), ["Sorry, I could not do that."]);
+        let home = Arc::new(FakeHome::default());
+        drop(home.delay());
+        let prediction = predicted("tv_show", 0.9, ("show", "vision quest"));
+        let (_, calls) = watched_on(&home, prediction, titles(), Arc::default()).await?;
+        assert_eq!(services(&calls), ["turn_on", "announce"]);
+        unclear_defers()
+    }
+
+    /// Checks that a `tv_show` prediction under the threshold gives `Defer` with `Job::Llm`.
+    fn unclear_defers() -> anyhow::Result<()> {
         let unclear = predicted("tv_show", 0.5, ("show", "jeopardy"));
         let conversation = watching(&Arc::default(), unclear.clone(), titles())?;
         let (transcript, now) = ("play jeopardy".to_owned(), Timestamp::UNIX_EPOCH);
@@ -4613,20 +4772,6 @@ mod tests {
             }
         );
         assert!(llm, "{decision:?}");
-        Ok(())
-    }
-
-    /// AC-18.9-16.
-    #[tokio::test(start_paused = true)]
-    async fn ac_18_9_16_quoted_title_gives_a_json_content_id() -> anyhow::Result<()> {
-        let quoted = vec![fakes::title(r#"Paw Patrol "Live""#, "show")];
-        let (_, calls) = watched("tv_show", ("show", "paw patrol live"), quoted).await?;
-        let id = calls
-            .first()
-            .and_then(|call| call.data.get("media_content_id"));
-        let id = id.and_then(Value::as_str).unwrap_or_default();
-        let object: Value = serde_json::from_str(id.trim_start_matches("plex://"))?;
-        assert_eq!(object["show_name"], json!(r#"Paw Patrol "Live""#), "{id}");
         Ok(())
     }
 

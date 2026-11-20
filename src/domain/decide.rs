@@ -1921,8 +1921,8 @@ mod tests {
         called(decision).data
     }
 
-    /// The `media_content_id` of the `tv_show` call of `catalog` with `slots` in the office.
-    fn content_id(catalog: &Catalog, slots: &[(&str, &str)]) -> String {
+    /// The `show` value of the `tv_show` call of `catalog` with `slots` in the office.
+    fn content_id(catalog: &Catalog, slots: &[(&str, &str)]) -> Value {
         let request = Request {
             transcript: String::new(),
             area: Some(AreaId("office".to_owned())),
@@ -1931,10 +1931,7 @@ mod tests {
         };
         let cache = StateCache::load(house());
         let decision = decided_for(catalog, ("tv_show", 0.89), slots, &request, &cache);
-        let id = &data(decision)["media_content_id"];
-        id.as_str()
-            .expect("media_content_id is a string")
-            .to_owned()
+        data(decision)["show"].clone()
     }
 
     /// AC-4.5-2.
@@ -2126,11 +2123,7 @@ mod tests {
     /// AC-4.5d-2.
     #[test]
     fn ac_4_5d_2_show_slot_renders_string() {
-        let id = content_id(&catalog(), &[("show", "24")]);
-        assert!(
-            id.contains(r#""show_name": "24""#),
-            "media_content_id is {id}"
-        );
+        assert_eq!(content_id(&catalog(), &[("show", "24")]), Value::from("24"));
     }
 
     /// AC-4.5d-3.
@@ -2140,11 +2133,7 @@ mod tests {
         let decision = decided_in(&catalog, "tv_show", None, Some("office"));
         assert_eq!(decision, deferral(""));
         catalog.intents[3].optional = vec!["show".to_owned()];
-        let id = content_id(&catalog, &[]);
-        assert!(
-            id.contains(r#""show_name": """#),
-            "media_content_id is {id}"
-        );
+        assert_eq!(content_id(&catalog, &[]), Value::from(""));
     }
 
     /// A `service` without a dot, an unregistered area or an entity without a state gives `Defer`
@@ -2879,60 +2868,37 @@ mod tests {
         assert_eq!(call.target, [DOWNSTAIRS]);
     }
 
-    /// The `media_content_id` of the `label` call with `slots` from the Office satellite.
-    fn plex_id(label: &str, slots: &[(&str, &str)]) -> String {
-        let id = &data(played(label, slots, "office"))["media_content_id"];
-        id.as_str()
-            .expect("media_content_id is a string")
-            .to_owned()
-    }
-
-    /// AC-18.9-1.
+    /// AC-18.19c-6.
     #[test]
-    fn ac_18_9_1_play_movie_plays_the_movie_on_the_tv() {
-        let call = called(played("play_movie", &[("movie", "the matrix")], "office"));
-        let id = r#"plex://{"library_name": "Movies", "title": "the matrix"}"#;
-        let mut data = Map::new();
-        data.insert("media_content_type".to_owned(), Value::from("movie"));
-        data.insert("media_content_id".to_owned(), Value::from(id));
+    fn ac_18_19c_6_play_data_holds_the_parts_of_the_link() {
+        let call = called(played("play_movie", &[("movie", "The Matrix")], "office"));
+        let mut movie = Map::new();
+        movie.insert("movie".to_owned(), Value::from("The Matrix"));
         let expected = ServiceCall {
             domain: "media_player".to_owned(),
             service: "play_media".to_owned(),
             target: vec![TV.to_owned()],
-            data,
+            data: movie,
             return_response: false,
         };
         assert_eq!(call, expected);
+        words_become_numbers();
     }
 
-    /// AC-18.9-2.
-    #[test]
-    fn ac_18_9_2_continue_show_resumes_the_show() {
-        let id = plex_id("continue_show", &[("show", "the office")]);
-        let expected =
-            r#"plex://{"library_name": "TV Shows", "show_name": "the office", "resume": 1}"#;
-        assert_eq!(id, expected);
-    }
-
-    /// The `media_content_id` of season 2, episode 5 of The Office.
-    const EPISODE: &str = r#"plex://{"library_name": "TV Shows", "show_name": "the office", "season_number": 2, "episode_number": 5}"#;
-
-    /// AC-18.9-3.
-    #[test]
-    fn ac_18_9_3_play_episode_plays_the_episode_by_number() {
-        let slots = [("show", "the office"), ("season", "2"), ("episode", "5")];
-        assert_eq!(plex_id("play_episode", &slots), EPISODE);
-    }
-
-    /// AC-18.9-4.
-    #[test]
-    fn ac_18_9_4_number_words_become_digits() {
+    /// Checks the data of `continue_show`, of `play_episode` with number words and of
+    /// `volume_set` with a number word.
+    fn words_become_numbers() {
+        let next = serde_json::json!({ "show": "the office", "mode": "next" });
+        let shown = data(played("continue_show", &[("show", "the office")], "office"));
+        assert_eq!(Value::Object(shown), next);
         let slots = [
             ("show", "the office"),
             ("season", "two"),
             ("episode", "five"),
         ];
-        assert_eq!(plex_id("play_episode", &slots), EPISODE);
+        let episode = serde_json::json!({ "show": "the office", "season": 2, "episode": 5 });
+        let played_episode = data(played("play_episode", &slots, "office"));
+        assert_eq!(Value::Object(played_episode), episode);
         let data = data(played("volume_set", &[("volume", "fifty")], "kitchen"));
         assert_eq!(data["volume_level"], Value::from(0.5));
     }
