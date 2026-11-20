@@ -2537,8 +2537,8 @@ mod tests {
     /// The speaker of the Living Room that is not on the satellite device.
     const SPEAKER: &str = "media_player.carson_living_room_media_player";
 
-    /// The TV of the Living Room.
-    const TV: &str = "media_player.apple_tv";
+    /// The Apple TV of the Living Room.
+    const TV: &str = "media_player.living_room";
 
     /// The reference house with each player of `players` `playing` with its media attributes.
     fn playing(players: &[(&str, &[(&str, Value)])]) -> StateCache {
@@ -3077,6 +3077,46 @@ mod tests {
     fn ac_18_16_6_tv_off_turns_off_the_tv() {
         let call = called(played("tv_off", &[], "office"));
         assert_eq!(call, on_tv("turn_off"));
+    }
+
+    /// The targets of `tv_pause`, `tv_stop`, `tv_off` and `play_movie` from the Office, the
+    /// Bedroom and the Living Room in `cache`.
+    fn tv_targets(cache: &StateCache) -> Vec<Vec<String>> {
+        let movie = [("movie", "the matrix")];
+        let requests = [
+            ("tv_pause", &[][..]),
+            ("tv_stop", &[]),
+            ("tv_off", &[]),
+            ("play_movie", &movie),
+        ];
+        let mut targets = Vec::new();
+        for area in ["office", "bedroom", "living_room"] {
+            for (label, slots) in requests {
+                targets.push(called(played_in(label, slots, area, cache)).target);
+            }
+        }
+        targets
+    }
+
+    /// AC-18.19b-1.
+    #[test]
+    fn ac_18_19b_1_tv_intents_target_the_apple_tv_from_each_area() {
+        let targets = tv_targets(&StateCache::load(house()));
+        assert_eq!(targets, vec![vec![TV.to_owned()]; 12]);
+    }
+
+    /// AC-18.19b-2.
+    #[test]
+    fn ac_18_19b_2_a_living_room_tv_player_does_not_change_the_target() {
+        let mut snapshot = house();
+        let sony = (
+            "media_player.living_room_tv",
+            "Living Room TV",
+            "living_room",
+        );
+        add(&mut snapshot, (sony.0, sony.1, sony.2, None, "on"));
+        let targets = tv_targets(&StateCache::load(snapshot));
+        assert_eq!(targets, vec![vec![TV.to_owned()]; 12]);
     }
 
     /// AC-7.6-3.

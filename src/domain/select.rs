@@ -885,9 +885,14 @@ mod tests {
     fn ac_4_4b_3_alias_word() {
         let mut tv_show = intent("tv_show");
         tv_show.target = Target::Entities;
+        tv_show.select = vec![Filter {
+            domain: "media_player".to_owned(),
+            name: Some("tv".to_owned()),
+            device_class: None,
+        }];
         let house = with(
             house(),
-            "media_player.apple_tv",
+            "media_player.living_room",
             "media_player.box",
             |entity| {
                 entity.name = "Box".to_owned();
@@ -895,7 +900,7 @@ mod tests {
         );
         assert_eq!(
             selected(&tv_show, "living_room", house),
-            ["media_player.apple_tv", "media_player.box"]
+            ["media_player.living_room", "media_player.box"]
         );
     }
 

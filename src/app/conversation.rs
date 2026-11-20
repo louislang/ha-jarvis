@@ -4511,7 +4511,7 @@ mod tests {
     /// The `play_media` call of the TV with `media_content_type` `kind` and the content ID `id`.
     fn on_tv(kind: &str, id: &str) -> ServiceCall {
         let data = json!({ "media_content_type": kind, "media_content_id": id });
-        let mut call = service("media_player", "play_media", "media_player.apple_tv");
+        let mut call = service("media_player", "play_media", "media_player.living_room");
         call.data = serde_json::from_value(data).expect("the data is an object");
         call
     }

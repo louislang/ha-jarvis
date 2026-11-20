@@ -34,7 +34,7 @@ kind = "command"
 examples = ["put the tv on [the office](show)", "play [bluey](show) on the tv", "turn the tv to [jeopardy](show)"]
 service = "media_player.play_media"
 target = "entity"
-select = [{ domain = "media_player", name = "tv" }]
+entity = "media_player.living_room"
 title = "show"
 data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": {{ show | tojson }}, "shuffle": 1}' }
 
@@ -205,7 +205,7 @@ kind = "command"
 examples = ["put on [the matrix](movie)", "play the movie [inception](movie)", "watch [toy story](movie)", "put on the movie [up](movie)"]
 service = "media_player.play_media"
 target = "entity"
-select = [{ domain = "media_player", name = "tv" }]
+entity = "media_player.living_room"
 title = "movie"
 data = { media_content_type = "movie", media_content_id = 'plex://{"library_name": "Movies", "title": {{ movie | tojson }}}' }
 
@@ -216,7 +216,7 @@ examples = ["continue [the office](show)", "play the next episode of [bluey](sho
 verbs = ["Continue", "Keep watching"]
 service = "media_player.play_media"
 target = "entity"
-select = [{ domain = "media_player", name = "tv" }]
+entity = "media_player.living_room"
 title = "show"
 data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": {{ show | tojson }}, "resume": 1}' }
 
@@ -226,7 +226,7 @@ kind = "command"
 examples = ["play season [two](season) episode [five](episode) of [the office](show)", "put on [bluey](show) season [one](season) episode [three](episode)", "watch [severance](show) season [1](season) episode [1](episode)"]
 service = "media_player.play_media"
 target = "entity"
-select = [{ domain = "media_player", name = "tv" }]
+entity = "media_player.living_room"
 title = "show"
 data = { media_content_type = "episode", media_content_id = 'plex://{"library_name": "TV Shows", "show_name": {{ show | tojson }}, "season_number": {{ season | number }}, "episode_number": {{ episode | number }}}' }
 
@@ -237,7 +237,7 @@ examples = ["pause the tv", "pause the show", "pause the movie"]
 verbs = ["Pause"]
 service = "media_player.media_pause"
 target = "entity"
-select = [{ domain = "media_player", name = "tv" }]
+entity = "media_player.living_room"
 
 [[intent]]
 name = "tv_skip"
@@ -246,7 +246,7 @@ examples = ["skip ahead", "skip ahead on the tv", "fast forward the movie"]
 verbs = ["Fast forward"]
 service = "media_player.media_seek"
 target = "entity"
-select = [{ domain = "media_player", name = "tv" }]
+entity = "media_player.living_room"
 data = { seek_position = "{{ entity.position + 30 }}" }
 
 [[intent]]
@@ -255,7 +255,7 @@ kind = "command"
 examples = ["stop the tv", "stop the movie", "stop the show"]
 service = "media_player.media_stop"
 target = "entity"
-select = [{ domain = "media_player", name = "tv" }]
+entity = "media_player.living_room"
 
 [[intent]]
 name = "new_shows"
@@ -315,7 +315,7 @@ examples = ["turn off the tv", "turn the tv off", "switch off the tv", "tv off"]
 verbs = ["Turn off"]
 service = "media_player.turn_off"
 target = "entity"
-select = [{ domain = "media_player", name = "tv" }]
+entity = "media_player.living_room"
 
 [[intent]]
 name = "start_training"
