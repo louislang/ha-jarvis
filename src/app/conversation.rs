@@ -33,7 +33,6 @@ use crate::app::background::Backfill;
 use crate::app::background::Habits;
 use crate::app::plugins::Plugins;
 use crate::app::speech::Committed;
-use crate::app::speech::Embedding;
 use crate::app::speech::Utterances;
 use crate::app::training::Trigger;
 use crate::domain::catalog::Catalog;
@@ -259,15 +258,35 @@ impl Conversation {
     pub async fn handle(&self, text: &str, context: Context) -> anyhow::Result<Handled> {
         let (area, name) = self.area(context.device_id.as_deref());
         let mut heard = self.hear(text, &context, name.as_deref(), self.two.clock.now());
+        let voice = self.identify_voice(&mut heard, &context).await;
         let key = context.satellite_id.or(context.conversation_id).map(Key);
         let (handled, logged) = self.respond(text, key, area, &mut heard).await?;
         if let Some((prediction, decided)) = logged {
-            let (id, satellite) = (heard.id, heard.satellite.clone());
-            if let Some(voice) = self.append(heard, &prediction, decided) {
-                self.identify_speaker(id, (satellite, context.device_id), voice);
+            let id = heard.id;
+            self.append(heard, &prediction, decided);
+            if let Some(identified) = voice {
+                self.record_speaker(id, identified);
             }
         }
         Ok(handled)
+    }
+
+    /// The identification of the voice request `heard` in `context` with its embedding, which also
+    /// sets the form of address of `heard`. `None` without an utterance, and after a failure of the
+    /// embedding or of the voice profiles, which keeps the address of `heard`.
+    async fn identify_voice(&self, heard: &mut Heard, context: &Context) -> Option<Identified> {
+        let (id, committed) = (heard.id, heard.utterance.as_mut()?);
+        let origin = (context.satellite_id.clone(), context.device_id.clone());
+        let speakers = &self.recorder.speakers;
+        let identified = speakers
+            .identified(&self.queues.cache, origin, committed)
+            .await;
+        let identified = identified
+            .inspect_err(|error| tracing::info!("no voice identification for {id}: {error:#}"))
+            .ok()?;
+        let found = identified.found.as_ref();
+        heard.address = found.and_then(|found| speakers.addresses.get(&found.person.0).cloned());
+        Some(identified)
     }
 
     /// The reply to `text` of `heard` with the dialog key `key` from the area `area`, as `handle`
@@ -335,14 +354,19 @@ impl Conversation {
     }
 
     /// Sends the record of `heard` with `prediction` and `decided` to the log writer, with the
-    /// audio of its utterance. Gives the embedding task and the voiced time of the utterance.
-    fn append(&self, heard: Heard, prediction: &Prediction, decided: Decided) -> Option<Voice> {
+    /// audio of its utterance.
+    fn append(&self, heard: Heard, prediction: &Prediction, decided: Decided) {
         let Decided {
             route,
             call,
             response,
         } = decided;
-        let (audio, voice_end, voice) = voice_parts(heard.utterance);
+        let (audio, voice_end) = heard.utterance.map_or((None, None), |committed| {
+            (
+                Some(committed.utterance.audio),
+                committed.utterance.voice_end,
+            )
+        });
         let interaction = Interaction {
             id: heard.id,
             time: heard.time,
@@ -365,17 +389,27 @@ impl Conversation {
         // A send fails only after the writer ended, at shutdown.
         let write = Write::Append(Box::new(interaction), audio);
         let _ = self.recorder.writer.send(write);
-        voice
     }
 
-    /// Spawns the speaker identification of the voice request `id` from the satellite and the
-    /// device of `origin` with `voice`, its `Speaker` log update and its enroll by rule 5.
-    fn identify_speaker(&self, id: u64, origin: Origins, voice: Voice) {
+    /// Sends the `Speaker` update of the voice request `id` with `identified` to the log writer,
+    /// and spawns the enroll of its embedding when rule 5 allows it.
+    fn record_speaker(&self, id: u64, identified: Identified) {
+        let Identified {
+            embedding,
+            signals,
+            found,
+            voiced_ms,
+        } = identified;
+        let change = speaker_change(found.as_ref(), &embedding);
+        // A send fails only after the writer ended, at shutdown.
+        let _ = self.recorder.writer.send(Write::Update(id, change));
         let speakers = Arc::clone(&self.recorder.speakers);
-        let cache = self.queues.cache.clone();
-        let writer = self.recorder.writer.clone();
+        let enrollee = found.and_then(|found| speakers.enrollee(&signals, found, voiced_ms));
+        let Some(person) = enrollee else {
+            return;
+        };
         tokio::spawn(async move {
-            if let Err(error) = enroll_voice(&speakers, &cache, &writer, id, origin, voice).await {
+            if let Err(error) = speakers.voices.enroll(&person, id, &embedding).await {
                 tracing::info!("no voice enroll for {id}: {error:#}");
             }
         });
@@ -1537,8 +1571,17 @@ struct Origin {
     id: u64,
 }
 
-/// The embedding task and the voiced time in ms of the utterance of a voice request.
-type Voice = (Embedding, u64);
+/// The speaker identification of a voice request with its voice embedding.
+struct Identified {
+    /// The voice embedding.
+    embedding: Vec<f32>,
+    /// The signals with the voice similarities.
+    signals: Signals,
+    /// The speaker by rules 1 to 4, or `None` when no speaker is identified.
+    found: Option<Speaker>,
+    /// The voiced time of the utterance in ms.
+    voiced_ms: u64,
+}
 
 /// The satellite entity and the device of a request.
 type Origins = (Option<String>, Option<String>);
@@ -1569,38 +1612,31 @@ struct Decided {
     response: Spoken,
 }
 
-/// Awaits the embedding of `voice`, identifies the speaker of the request `id` from `origin` in
-/// `cache` with the profiles of `speakers`, sends the speaker with the embedding to the log
-/// `writer`, and enrolls the embedding when rule 5 allows it.
-///
-/// # Errors
-///
-/// The embedding or a call of the voice profiles failed.
-async fn enroll_voice(
-    speakers: &Speakers,
-    cache: &watch::Receiver<StateCache>,
-    writer: &UnboundedSender<Write>,
-    id: u64,
-    origin: Origins,
-    (embedding, voiced_ms): Voice,
-) -> anyhow::Result<()> {
-    let embedding = embedding.await??;
-    let similarities = speakers.voices.similarities(&embedding).await?;
-    let signals = speakers.signals(&cache.borrow(), origin, Some(&similarities));
-    let found = speakers.identify(&signals);
-    // A send fails only after the writer ended, at shutdown.
-    let _ = writer.send(Write::Update(
-        id,
-        speaker_change(found.as_ref(), &embedding),
-    ));
-    let enrollee = found.and_then(|found| speakers.enrollee(&signals, found, voiced_ms));
-    if let Some(person) = enrollee {
-        speakers.voices.enroll(&person, id, &embedding).await?;
-    }
-    Ok(())
-}
-
 impl Speakers {
+    /// Awaits the embedding of `committed`, and identifies the speaker of a request from the
+    /// satellite and the device of `origin` in `cache` with the voice similarities.
+    ///
+    /// # Errors
+    ///
+    /// The embedding or the voice similarities failed.
+    async fn identified(
+        &self,
+        cache: &watch::Receiver<StateCache>,
+        origin: Origins,
+        committed: &mut Committed,
+    ) -> anyhow::Result<Identified> {
+        let embedding = (&mut committed.embedding).await??;
+        let similarities = self.voices.similarities(&embedding).await?;
+        let signals = self.signals(&cache.borrow(), origin, Some(&similarities));
+        let found = self.identify(&signals);
+        Ok(Identified {
+            embedding,
+            signals,
+            found,
+            voiced_ms: committed.voiced_ms,
+        })
+    }
+
     /// The signals in `cache` of a request from the satellite and the device of `origin`, with
     /// the voice `similarities`, or none without an embedding.
     fn signals(
@@ -1641,17 +1677,6 @@ impl Speakers {
         );
         enrolls.then_some(found.person)
     }
-}
-
-/// The audio, the voice end, and the embedding task with the voiced time of `utterance`.
-fn voice_parts(utterance: Option<Committed>) -> (Option<Audio>, Option<Timestamp>, Option<Voice>) {
-    utterance.map_or((None, None, None), |committed| {
-        (
-            Some(committed.utterance.audio),
-            committed.utterance.voice_end,
-            Some((committed.embedding, committed.voiced_ms)),
-        )
-    })
 }
 
 /// The `Speaker` log change of the identified speaker `found` with `embedding`.
@@ -2084,6 +2109,7 @@ mod tests {
 
     use super::*;
     use crate::app::background;
+    use crate::app::speech::Embedding;
     use crate::app::speech::Speech;
     use crate::app::training::FIXTURE;
     use crate::domain::habits::Bucket;
@@ -3250,11 +3276,15 @@ mod tests {
         Arc::new(speakers)
     }
 
-    /// The reply to [`LIGHTS`] from the satellite, whose embedding never completes, when
+    /// The reply to [`LIGHTS`] from the satellite with the embedding task `embedding`, when
     /// `person.louis` is in the state `louis`, `person.ali` is home with the form of address
     /// "Lady Lang", and the voice similarities are those of `voices`. The `lights_on` response
     /// with `address` has fewer uses.
-    async fn addressed_reply(louis: &str, voices: FakeVoiceProfiles) -> anyhow::Result<String> {
+    async fn addressed_reply(
+        louis: &str,
+        voices: FakeVoiceProfiles,
+        embedding: Embedding,
+    ) -> anyhow::Result<String> {
         let (cache, _changes, mut conversation) =
             still_with(&Arc::default(), "idle", lights(), Arc::default());
         let texts = [
@@ -3268,18 +3298,62 @@ mod tests {
             samples: vec![0; 32_000],
             rate: 16_000,
         };
-        let pending = tokio::spawn(futures::future::pending());
         let utterances = &conversation.recorder.utterances;
-        utterances.append(LIGHTS.to_owned(), audio, None, pending, 2000);
+        utterances.append(LIGHTS.to_owned(), audio, None, embedding, 2000);
         let handle = conversation.handle(LIGHTS, on_satellite());
         let handled = tokio::time::timeout(Duration::from_secs(1), handle).await??;
         Ok(handled.text)
     }
 
+    /// An embedding task that gives the embedding of `FakeVoiceEmbedder`.
+    fn embedded() -> Embedding {
+        tokio::spawn(async { Ok(vec![1.0]) })
+    }
+
+    /// Profiles whose voice similarity matches only `person.ali`.
+    fn ali_voice() -> FakeVoiceProfiles {
+        profiles(&[("person.ali", 0.9), ("person.louis", 0.1)])
+    }
+
     /// AC-15.9c-1.
     #[tokio::test(start_paused = true)]
     async fn ac_15_9c_1_reply_addresses_the_only_person_at_home() -> anyhow::Result<()> {
-        let text = addressed_reply("not_home", FakeVoiceProfiles::default()).await?;
+        let voices = FakeVoiceProfiles::default();
+        let text = addressed_reply("not_home", voices, embedded()).await?;
+        assert_eq!(text, "I will turn on the lights for you, Lady Lang.");
+        Ok(())
+    }
+
+    /// AC-15.9d-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_9d_1_system_two_addresses_the_voice_speaker() -> anyhow::Result<()> {
+        let reasoner = Arc::new(FakeReasoner::default());
+        let classifier = scripted(&["unknown"]);
+        let (cache, _changes, mut conversation) =
+            still_with(&Arc::default(), "idle", classifier, Arc::clone(&reasoner));
+        set_louis(&cache, "home");
+        conversation.recorder.speakers = addressed_speakers(ali_voice());
+        hear(&conversation);
+        let handled = conversation.handle(LIGHTS, on_satellite()).await?;
+        let after = handled.after.ok_or_else(|| anyhow::anyhow!("no after"))?;
+        after.await?;
+        assert_eq!(reasoner.addresses(), [Some("Lady Lang".to_owned())]);
+        Ok(())
+    }
+
+    /// AC-15.9d-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_9d_2_reply_addresses_the_voice_speaker() -> anyhow::Result<()> {
+        let text = addressed_reply("home", ali_voice(), embedded()).await?;
+        assert_eq!(text, "I will turn on the lights for you, Lady Lang.");
+        Ok(())
+    }
+
+    /// AC-15.9d-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_15_9d_3_failed_embedding_keeps_the_presence_address() -> anyhow::Result<()> {
+        let failed = tokio::spawn(async { Err(anyhow::anyhow!("the embedder failed")) });
+        let text = addressed_reply("not_home", ali_voice(), failed).await?;
         assert_eq!(text, "I will turn on the lights for you, Lady Lang.");
         Ok(())
     }
@@ -3297,15 +3371,6 @@ mod tests {
         let after = handled.after.ok_or_else(|| anyhow::anyhow!("no after"))?;
         after.await?;
         assert_eq!(reasoner.addresses(), [Some("Lady Lang".to_owned())]);
-        Ok(())
-    }
-
-    /// AC-15.9c-3.
-    #[tokio::test(start_paused = true)]
-    async fn ac_15_9c_3_reply_identifies_without_the_embedding() -> anyhow::Result<()> {
-        let voices = profiles(&[("person.ali", 0.9), ("person.louis", 0.1)]);
-        let text = addressed_reply("home", voices).await?;
-        assert_eq!(text, "I will turn on the lights.");
         Ok(())
     }
 
