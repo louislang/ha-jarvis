@@ -385,6 +385,7 @@ impl Conversation {
             marks: Vec::new(),
             speaker: None,
             source: None,
+            embedded: false,
         };
         // A send fails only after the writer ended, at shutdown.
         let write = Write::Append(Box::new(interaction), audio);
@@ -3422,6 +3423,7 @@ mod tests {
             marks: Vec::new(),
             speaker: None,
             source: None,
+            embedded: false,
         }
     }
 

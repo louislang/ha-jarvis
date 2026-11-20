@@ -1182,6 +1182,7 @@ impl FakeLog {
             marks: Vec::new(),
             speaker: None,
             source: None,
+            embedded: false,
         };
         interactions.push((interaction, None));
     }

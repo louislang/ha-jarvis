@@ -802,7 +802,9 @@ mod tests {
               append(...options) { choices.push(...options.map((option) => option.value)); },
               addEventListener(event, listener) { this.listener = listener; },
             };
-            const interaction = { id: 1, satellite: 'office', speaker: 'person.sam', source: 'Voice' };
+            const interaction = {
+              id: 1, satellite: 'office', speaker: 'person.sam', source: 'Voice', embedded: true,
+            };
             pickSpeaker(speaker, interaction);
             (async () => {
               for (const choice of [...choices]) {
@@ -832,6 +834,23 @@ mod tests {
             "no found choice in {choices:?}"
         );
         assert_eq!(output["sent"], serde_json::Value::Array(wanted));
+        Ok(())
+    }
+
+    /// AC-15.8f-2.
+    #[test]
+    fn ac_15_8f_2_the_speaker_list_needs_an_embedding() -> anyhow::Result<()> {
+        let harness = r"
+            const people = [];
+            const kept = [false, true].map((embedded) => {
+              const speaker = { kept: true, remove() { this.kept = false; }, append() {},
+                addEventListener() {} };
+              pickSpeaker(speaker, { id: 1, satellite: 'office', embedded });
+              return speaker.kept;
+            });
+            console.log(JSON.stringify(kept));";
+        let script = format!("{}\n{harness}", page_function("pickSpeaker"));
+        assert_eq!(node_output(&script)?.trim_end(), "[false,true]");
         Ok(())
     }
 

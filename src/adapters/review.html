@@ -267,7 +267,7 @@
   // A pick moves the voice sample of the request at once. The list stays disabled until the
   // server answers, so an earlier pick cannot overwrite a later one.
   function pickSpeaker(speaker, interaction) {
-    if (!interaction.satellite) {
+    if (!interaction.satellite || !interaction.embedded) {
       speaker.remove();
       return;
     }

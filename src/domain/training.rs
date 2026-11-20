@@ -1304,6 +1304,7 @@ mod tests {
             marks: mark.into_iter().collect(),
             speaker: None,
             source: None,
+            embedded: false,
         }
     }
 

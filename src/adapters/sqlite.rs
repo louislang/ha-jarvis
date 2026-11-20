@@ -32,9 +32,9 @@ const STEPS: [&str; 3] = [
 ];
 
 /// The JSON record of an interaction with its marks, in the order that they were stored, and its
-/// speaker and source.
+/// speaker, source and whether it has an embedding.
 const RECORD: &str = "json_set(record, '$.marks', json((SELECT json_group_array(json(mark) ORDER BY rowid) FROM marks WHERE interaction = interactions.id)), \
-    '$.speaker', speaker, '$.source', source)";
+    '$.speaker', speaker, '$.source', source, '$.embedded', json(iif(embedding IS NULL, 'false', 'true')))";
 
 /// Adds the mark `?2` to the interaction `?1`.
 const ADD: &str = "INSERT INTO marks (interaction, mark) VALUES (?1, ?2)";
@@ -429,6 +429,7 @@ mod tests {
             marks: Vec::new(),
             speaker: Some(EntityId("person.alex".to_owned())),
             source: Some(Source::Proximity),
+            embedded: false,
         }
     }
 
@@ -734,10 +735,27 @@ mod tests {
         let expected = Interaction {
             speaker: Some(EntityId("person.sam".to_owned())),
             source: Some(Source::Presence),
+            embedded: true,
             ..unspoken(7)
         };
         assert_eq!(log.get(7).await?, Some(expected));
         assert_eq!(log.embedding(7).await?, Some(vec![0.5, -1.0]));
+        Ok(())
+    }
+
+    /// AC-15.8f-1.
+    #[tokio::test]
+    async fn ac_15_8f_1_listing_tells_if_the_interaction_has_an_embedding() -> anyhow::Result<()> {
+        let (log, _folder) = log();
+        log.append(unspoken(7), None).await?;
+        log.append(unspoken(8), None).await?;
+        log.update(8, sam(Some(vec![0.5]))).await?;
+        let listed = log.list(Filter::All, PAGE).await?;
+        let embedded: Vec<(u64, bool)> = listed
+            .iter()
+            .map(|interaction| (interaction.id, interaction.embedded))
+            .collect();
+        assert_eq!(embedded, [(8, true), (7, false)]);
         Ok(())
     }
 
