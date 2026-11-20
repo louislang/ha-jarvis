@@ -498,13 +498,19 @@ mod tests {
     /// The number of measured runs of each phrase.
     const RUNS: usize = 20;
 
-    /// The responses of `pool` in `responses.toml`, rendered in `area` with the show `bluey`.
+    /// The responses of `pool` in `responses.toml`, rendered in `area` with the show `bluey` and
+    /// an empty form of address.
     fn responses(pool: &str, area: &str) -> anyhow::Result<Vec<String>> {
         let config = Config::parse(include_str!("../../jarvis.toml"))?;
         let catalog = crate::load_catalog(&config.intents)?;
         let pools = crate::load_pools(&config.responses, &catalog)?;
         let pool = pools.get(pool).with_context(|| format!("no {pool} pool"))?;
-        let variables = [("area", json!(area)), ("show", json!("bluey"))];
+        // The app has no `[address]`, so a response with `address` never replies.
+        let variables = [
+            ("area", json!(area)),
+            ("show", json!("bluey")),
+            ("address", json!("")),
+        ];
         let variables = Map::from_iter(variables.map(|(name, value)| (name.to_owned(), value)));
         let render = |template: &str| responses::render(template, &variables);
         let texts = pool.responses.iter().map(|response| render(&response.text));

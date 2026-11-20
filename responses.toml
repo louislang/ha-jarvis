@@ -1,14 +1,14 @@
 [pools.lights_on]
-responses = ["I am turning the lights on.", "I will turn on the lights.", "Powering up the {{ area }} lights."]
+responses = ["I am turning the lights on.", "I will turn on the lights.", "Powering up the {{ area }} lights.", "Right away, {{ address }}.", "I will turn the lights on for you, {{ address }}."]
 
 [pools.fan_on]
-responses = ["I am turning the fan on.", "Starting the {{ area }} fan."]
+responses = ["I am turning the fan on.", "Starting the {{ area }} fan.", "Right away, {{ address }}.", "I will turn the fan on for you, {{ address }}."]
 
 [pools.climate_down]
-responses = ["I am turning the air down.", "Making it cooler."]
+responses = ["I am turning the air down.", "Making it cooler.", "Right away, {{ address }}.", "I will cool it down for you, {{ address }}."]
 
 [pools.tv_show]
-responses = ["Putting {{ show }} on the TV.", "Playing {{ show }}."]
+responses = ["Putting {{ show }} on the TV.", "Playing {{ show }}.", "Right away, {{ address }}.", "Your show is coming on, {{ address }}."]
 
 [pools.temperature_query]
 responses = ["It is {{ entity.state }} degrees in the {{ area }}."]
@@ -47,67 +47,67 @@ responses = ['{% if entity.state == "disarmed" %}The alarm is off.{% else %}The 
 responses = ['{% for player in entities %}{% if player.attributes.media_title is defined and player.attributes.media_title is string %}{{ player.attributes.media_title }}{% if player.attributes.media_artist is defined and player.attributes.media_artist is string %} by {{ player.attributes.media_artist }}{% endif %}{% else %}Something with no title{% endif %} is playing on the {{ player.name }}.{{ " " if not loop.last else "" }}{% else %}Nothing is playing in the {{ area }}.{% endfor %}']
 
 [pools.play_music]
-responses = ["Playing {{ media }}."]
+responses = ["Playing {{ media }}.", "Right away, {{ address }}.", "Your music is coming on, {{ address }}."]
 
 [pools.play_radio]
-responses = ["Playing music like {{ media }}."]
+responses = ["Playing music like {{ media }}.", "Right away, {{ address }}.", "I will play something like that for you, {{ address }}."]
 
 [pools.queue_music]
-responses = ["Adding {{ media }} to the queue."]
+responses = ["Adding {{ media }} to the queue.", "Right away, {{ address }}.", "I will add that to the queue for you, {{ address }}."]
 
 [pools.music_next]
-responses = ["Next song."]
+responses = ["Next song.", "Right away, {{ address }}.", "On to the next song, {{ address }}."]
 
 [pools.music_pause]
-responses = ["Pausing the music."]
+responses = ["Pausing the music.", "Right away, {{ address }}.", "I will pause the music for you, {{ address }}."]
 
 [pools.volume_up]
-responses = ["Turning it up."]
+responses = ["Turning it up.", "Right away, {{ address }}.", "A little louder, {{ address }}."]
 
 [pools.volume_down]
-responses = ["Turning it down."]
+responses = ["Turning it down.", "Right away, {{ address }}.", "A little softer, {{ address }}."]
 
 [pools.volume_set]
-responses = ["Setting the volume to {{ volume }} percent."]
+responses = ["Setting the volume to {{ volume }} percent.", "Right away, {{ address }}.", "I will set the volume for you, {{ address }}."]
 
 [pools.play_movie]
-responses = ["Putting on {{ movie }}."]
+responses = ["Putting on {{ movie }}.", "Right away, {{ address }}.", "Your film is coming on, {{ address }}."]
 
 [pools.continue_show]
-responses = ["Continuing {{ show }}."]
+responses = ["Continuing {{ show }}.", "Right away, {{ address }}.", "I will pick up where you left off, {{ address }}."]
 
 [pools.play_episode]
-responses = ["Playing {{ show }}, season {{ season }}, episode {{ episode }}."]
+responses = ["Playing {{ show }}, season {{ season }}, episode {{ episode }}.", "Right away, {{ address }}.", "Your episode is coming on, {{ address }}."]
 
 [pools.tv_pause]
-responses = ["Pausing the TV."]
+responses = ["Pausing the TV.", "Right away, {{ address }}.", "I will pause the TV for you, {{ address }}."]
 
 [pools.tv_skip]
-responses = ["Skipping ahead."]
+responses = ["Skipping ahead.", "Right away, {{ address }}.", "Skipping ahead for you, {{ address }}."]
 
 [pools.tv_stop]
-responses = ["Stopping the TV."]
+responses = ["Stopping the TV.", "Right away, {{ address }}.", "I will stop the TV for you, {{ address }}."]
 
 [pools.new_shows]
 responses = ['{% if response.added %}New on Plex: {{ response.added | join(", ") }}.{% else %}Nothing new was added to Plex in the last day.{% endif %}{% if response.on_deck %} You can continue {{ response.on_deck | join(", ") }}.{% endif %}']
 
 [pools.lights_off]
-responses = ["I am turning the lights off.", "I will turn off the lights.", "Turning off the lights in the {{ area }}."]
+responses = ["I am turning the lights off.", "I will turn off the lights.", "Turning off the lights in the {{ area }}.", "Right away, {{ address }}.", "I will turn the lights off for you, {{ address }}."]
 
 [pools.fan_off]
-responses = ["I am turning the fan off.", "Stopping the {{ area }} fan."]
+responses = ["I am turning the fan off.", "Stopping the {{ area }} fan.", "Right away, {{ address }}.", "I will turn the fan off for you, {{ address }}."]
 
 [pools.climate_up]
-responses = ["I am turning the heat up.", "Making it warmer."]
+responses = ["I am turning the heat up.", "Making it warmer.", "Right away, {{ address }}.", "I will warm it up for you, {{ address }}."]
 
 [pools.music_resume]
-responses = ["Resuming the music."]
+responses = ["Resuming the music.", "Right away, {{ address }}.", "I will resume the music for you, {{ address }}."]
 
 [pools.music_previous]
-responses = ["Previous song."]
+responses = ["Previous song.", "Right away, {{ address }}.", "Back to the previous song, {{ address }}."]
 
 [pools.tv_off]
-responses = ["Turning off the TV."]
+responses = ["Turning off the TV.", "Right away, {{ address }}.", "I will turn the TV off for you, {{ address }}."]
 
 [pools.start_training]
 responses = ["I will start training now."]
