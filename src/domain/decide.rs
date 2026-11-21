@@ -2968,6 +2968,16 @@ mod tests {
         assert_eq!(data["volume_level"], Value::from(0.5));
     }
 
+    /// AC-18.19d-3.
+    #[test]
+    fn ac_18_19d_3_show_plays_the_next_episode() {
+        let call = called(played("tv_show", &[("show", "the office")], "office"));
+        let expected = serde_json::json!({ "show": "the office", "mode": "next" });
+        assert_eq!(call.service, "play_media");
+        assert_eq!(call.target, [TV]);
+        assert_eq!(Value::Object(call.data), expected);
+    }
+
     /// The call of `media_player.<service>` on the TV with no data.
     fn on_tv(service: &str) -> ServiceCall {
         ServiceCall {
