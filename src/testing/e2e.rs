@@ -260,7 +260,8 @@ async fn start_app(
     let pools = crate::load_pools(&config.responses, &catalog)?;
     let plugins = crate::registry(config, vec![Arc::new(FakePlugin::new("get_weather"))]);
     let catalog = Arc::new(catalog);
-    crate::start_app(config, catalog, pools, home, reasoner, plugins, None).await
+    let remotes = (None, None);
+    crate::start_app(config, catalog, pools, home, reasoner, plugins, remotes).await
 }
 
 /// Waits for `started` as [`ready`] does with `trained`, and serves it on a local port. Gives the
