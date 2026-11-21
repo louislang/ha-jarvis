@@ -127,6 +127,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 **Model.**
 
 - `Decision::Ask { question: Chosen, pending }`. A missing `area`, or an area slot that matches no area, gives `Ask` from the pool `ask_area`. These cases replace the `Defer` of sub-phase 4.5b. A missing `area` is a real ambiguity: the intent is clear, and only the room is not. Sub-phase 18.15 adds one exception: for a command, an area slot that names a Music Assistant speaker group gives a call on the group.
+- An area slot that names the whole house is not an area slot. The house names are "house", "home", "the house", "whole house" and "the whole house". `decide` compares the value of the first area slot with them in lowercase, as `area_by_name` compares area names (sub-phase 2.8b). An area name comes first. For a house name, step 3 of sub-phase 4.5b uses `request.area`, as for a prediction with no area slot. Thus `select` applies the house fallback of sub-phase 4.4c, and no `Ask` occurs. In the field test on 2026-11-20, "what's the current temperature set in the house" from the Living Room satellite gave `climate_query` with the area slot "house", and `decide` asked for the room instead of the thermostat reply of sub-phase 18.4. Sub-phase 10.4 did not have this rule, so the fix PR `Fix: House Area Slot` adds it to the code on `main`. It modifies `src/domain/decide.rs` with its Verus clauses and tests.
 - A missing `person` and any other missing template slot do not ask. They still give `Defer` with `Job::Llm` (sub-phase 4.5d), because a missing value usually means that System One has the wrong intent.
 - The choices for `area` are the area names and their aliases. `decide` maps a filled alias to its area with `area_by_name`.
 - `Home::ask(satellite, question)` calls `start_conversation` with `preannounce = false` and the deadline `ha.announce_timeout_s`.
@@ -145,6 +146,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 - AC-10.4-7: When an intent has a template slot that is not `optional` and not `area`, and the prediction does not have it, `decide` returns `Defer` with `Job::Llm`, not `Ask`.
 - AC-10.4-8: When `decide` returns `Ask` with a `satellite_id`, `FakeHome` records `ask` after the satellite state becomes idle, and not before.
 - AC-10.4-9: When the user answers with an area alias, `decide` uses the area of that alias.
+- AC-10.4-10: When the intent is `climate_query` with the area slot "house" from the Living Room satellite, and the only climate entity is in the Kitchen, the reply is "The thermostat is set to 66 degrees in heat mode." and the result is not `Ask`.
 
 **Proofs.**
 
@@ -153,6 +155,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 - P-10.4-7. Ensures: a missing template slot that is not `optional`, not `area` and has no habit value gives `Defer` with `Job::Llm`. Argument: `decide` checks each template slot of the intent against the prediction, `optional` and `habit_defaults` before it renders, and the only `Ask` is from `ask_area`. Sub-phase 11.2 removes `habit_defaults`.
 - P-10.4-8. Requires: `AnnounceWhenIdle` (P-4.7-2). Argument: the question is an item of the announce queue, which waits for `idle` (P-4.9c-1).
 - P-10.4-9. Ensures: a filled alias gives the area of the alias. Argument: the choices contain the aliases, and `decide` resolves the filled value with `area_by_name` (P-2.8b-1).
+- P-10.4-10 (AC-10.4-10). Ensures: when the first area slot matches no area and is a house name, the area of step 3 is `request.area`, and the result is not `Ask`. Argument: step 3 checks the house names after `area_by_name` (P-2.8b-2) and before `group`, and gives `request.area` for a house name. Thus the Living Room is the area, `select` gives the one thermostat of the house (P-4.4c-2), and the pool of `climate_query` renders the reply (P-18.4-1).
 - P-10.4-3, P-10.4-6. Evidence: test.
 
 ---
