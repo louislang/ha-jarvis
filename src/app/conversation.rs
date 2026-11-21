@@ -87,12 +87,33 @@ use crate::ports::Reasoner;
 use crate::ports::Step;
 use crate::ports::Store;
 use crate::ports::Title;
+use crate::ports::Tool;
 use crate::ports::VoiceProfiles;
 use crate::ports::Work;
 
 /// The wait from a Plezy play to the Select that accepts the "Open in Plezy" popup of tvOS. In
 /// the live test, Select pressed Open 2 s to 3 s after the play.
 const PLEZY_WAIT: Duration = Duration::from_secs(3);
+
+/// The name of the System Two tool that plays a Plex title on the TV.
+const PLAY_TOOL: &str = "play_on_tv";
+
+/// The System Two tool that plays a movie or a show of the media library on the TV.
+#[must_use]
+pub fn play_tool() -> Tool {
+    let description = "Plays a movie or a show of the Plex library on the TV. A show plays its \
+                       next episode to watch.";
+    Tool {
+        name: PLAY_TOOL.to_owned(),
+        description: description.to_owned(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": { "title": { "type": "string" } },
+            "required": ["title"],
+            "additionalProperties": false,
+        }),
+    }
+}
 
 /// One change to the pools, applied by the pools task.
 pub type Change = Box<dyn FnOnce(Pools) -> Pools + Send>;
@@ -1172,15 +1193,14 @@ impl Conversation {
         let request = thread.request.as_ref();
         match step {
             Step::Sentence(sentence) => self.say(sentence, request, sentences).await?,
-            Step::Call(call, reply) => return Ok(self.step_call(call, reply, request).await),
+            Step::Call(call, reply) => {
+                return Ok(self.step_call(self.tool(call), reply, request).await);
+            }
             Step::States(area, reply) => {
                 // The send fails only when the answer has ended, so the result is not needed.
                 let _ = reply.send(self.states(&area));
             }
-            Step::Plugin(call, reply) => {
-                // The send fails only when the answer has ended, so the result is not needed.
-                let _ = reply.send(self.plugin(&call).await.map(Some));
-            }
+            Step::Plugin(call, reply) => return Ok(self.step_plugin(call, reply, request).await),
             Step::Ask {
                 question,
                 response_id,
@@ -1319,11 +1339,11 @@ impl Conversation {
         self.announce(origin, unpooled(sentence)).await
     }
 
-    /// Makes `call` and sends its result on `reply` while `request` is the newest of its
+    /// Runs the call `made` and sends its result on `reply` while `request` is the newest of its
     /// satellite, or with no `request`. False when it is not.
     async fn step_call(
         &self,
-        call: ServiceCall,
+        made: impl Future<Output = anyhow::Result<Option<Value>>>,
         reply: oneshot::Sender<anyhow::Result<Option<Value>>>,
         request: Option<&Origin>,
     ) -> bool {
@@ -1331,9 +1351,83 @@ impl Conversation {
             .is_none_or(|origin| self.queues.is_current(&origin.satellite, origin.generation));
         if current {
             // The send fails only when the answer has ended, so the result is not needed.
-            let _ = reply.send(self.tool(call).await);
+            let _ = reply.send(made.await);
         }
         current
+    }
+
+    /// Runs the plugin step `call` and sends its result on `reply`: `play_on_tv` as a call of
+    /// `request` (`step_call`), else a fetch of the registry. False when the play does not run.
+    async fn step_plugin(
+        &self,
+        call: PluginCall,
+        reply: oneshot::Sender<anyhow::Result<Option<Value>>>,
+        request: Option<&Origin>,
+    ) -> bool {
+        if call.plugin == PLAY_TOOL {
+            return self
+                .step_call(self.play(call.arguments), reply, request)
+                .await;
+        }
+        // The send fails only when the answer has ended, so the result is not needed.
+        let _ = reply.send(self.plugin(&call).await.map(Some));
+        true
+    }
+
+    /// Plays the `title` of the `play_on_tv` `arguments` as a clear `tv_show` request with that
+    /// show: `{ playing: <name> }`, or `"not_in_library"` with no call when no title matches.
+    ///
+    /// # Errors
+    ///
+    /// No title argument or show intent, another decision, or a failed play.
+    async fn play(&self, arguments: Map<String, Value>) -> anyhow::Result<Option<Value>> {
+        use anyhow::Context as _;
+
+        let spoken = arguments
+            .get("title")
+            .and_then(Value::as_str)
+            .context("no title")?;
+        let (prediction, area) = self.shown(spoken).context("no show intent")?;
+        let request = Request {
+            transcript: spoken.to_owned(),
+            area,
+            now: self.two.clock.now(),
+            address: None,
+        };
+        let Decision::Reply { reply, call } = self.decide(&prediction, &request) else {
+            anyhow::bail!("no play of {spoken:?}");
+        };
+        let Some(call) = call else {
+            return Ok(Some(Value::from("not_in_library")));
+        };
+        let kind = self.title_kind(&reply.pool).context("no title kind")?;
+        let name = call.data.get(&kind).cloned();
+        self.watch(call, &kind).await?;
+        Ok(Some(serde_json::json!({ "playing": name })))
+    }
+
+    /// The prediction of the first intent with show titles, with the probability 1 and the show
+    /// `spoken`, and the area of the `entity` of that intent in the hot cache.
+    fn shown(&self, spoken: &str) -> Option<(Prediction, Option<AreaId>)> {
+        let catalog = self.catalog.load();
+        let mut intents = catalog.intents.iter();
+        let intent = intents.find(|intent| intent.title.as_deref() == Some("show"))?;
+        let cache = self.queues.cache.borrow();
+        let entity = intent.entity.as_deref().unwrap_or_default();
+        let area = cache.area_of_entity(entity).cloned();
+        let slots = vec![Slot {
+            name: "show".to_owned(),
+            value: spoken.to_owned(),
+        }];
+        let ranked = vec![(intent.name.clone(), 1.0)];
+        Some((Prediction { ranked, slots }, area))
+    }
+
+    /// The `title` of the intent of the pool `pool`.
+    fn title_kind(&self, pool: &str) -> Option<String> {
+        let catalog = self.catalog.load();
+        let mut intents = catalog.intents.iter();
+        intents.find(|intent| intent.name == pool)?.title.clone()
     }
 
     /// The response data of the System Two `call`, with `return_response` when `read_services`
@@ -4773,6 +4867,121 @@ mod tests {
             }
         );
         assert!(llm, "{decision:?}");
+        Ok(())
+    }
+
+    /// A conversation with the title list `titles` whose System Two answers call `play_on_tv`
+    /// with `title`, with the registry of the test plugin, and that plugin.
+    fn playing(
+        home: &Arc<FakeHome>,
+        title: &str,
+        titles: Vec<Title>,
+    ) -> anyhow::Result<(Conversation, Arc<FakeReasoner>, Arc<FakePlugin>)> {
+        let mut conversation = watching(home, predicted("unknown", 1.0, ("show", "")), titles)?;
+        let reasoner = Arc::new(FakeReasoner::default());
+        let arguments = Map::from_iter([("title".to_owned(), Value::from(title))]);
+        let plugin = PLAY_TOOL.to_owned();
+        reasoner.script(vec![Scripted::Plugin(PluginCall { plugin, arguments })]);
+        conversation.two.reasoner = Arc::clone(&reasoner) as _;
+        let (plugin, plugins) = test_plugin(Vec::new());
+        conversation.two.plugins = plugins;
+        Ok((conversation, reasoner, plugin))
+    }
+
+    /// The calls of the System Two job of a request on the kitchen satellite whose answer calls
+    /// `play_on_tv` with `title`, the tool result and the fetches of the test plugin.
+    async fn tool_played(
+        title: &str,
+        titles: Vec<Title>,
+    ) -> anyhow::Result<(Vec<ServiceCall>, Vec<String>, usize)> {
+        let home = Arc::default();
+        let (conversation, reasoner, plugin) = playing(&home, title, titles)?;
+        let (filler, job) = (chosen("filler", 0), Job::Llm("tell me".to_owned()));
+        work(
+            &conversation,
+            Decision::Defer { filler, job },
+            Some(SATELLITE),
+        )?
+        .await?;
+        Ok((home.calls(), reasoner.results(), plugin.fetches().len()))
+    }
+
+    /// AC-18.19g-1.
+    #[test]
+    fn ac_18_19g_1_play_tool_takes_one_title() {
+        let tool = play_tool();
+        assert_eq!(tool.name, "play_on_tv");
+        let parameters = json!({
+            "type": "object",
+            "properties": { "title": { "type": "string" } },
+            "required": ["title"],
+            "additionalProperties": false,
+        });
+        assert_eq!(tool.parameters, parameters);
+    }
+
+    /// AC-18.19g-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_19g_2_play_tool_plays_the_title_in_plezy() -> anyhow::Result<()> {
+        let (calls, results, fetches) = tool_played("vision quest", titles()).await?;
+        assert_eq!(calls, plezy("plezy://play?server=abc123&id=10&mode=next"));
+        assert_eq!(fetches, 0);
+        let result = json!({ "playing": "VisionQuest" });
+        let sent = format!("{:?}", Ok::<_, ()>(Some(Ok::<_, ()>(Some(result)))));
+        assert_eq!(results, [sent]);
+        let (calls, _, _) = tool_played("the matrix", titles()).await?;
+        assert_eq!(calls, plezy("plezy://play?server=abc123&id=1"));
+        Ok(())
+    }
+
+    /// AC-18.19g-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_19g_3_unknown_title_is_not_in_the_library() -> anyhow::Result<()> {
+        let (calls, results, _) = tool_played("jeopardy", titles()).await?;
+        assert_eq!(calls, []);
+        let result = json!("not_in_library");
+        let sent = format!("{:?}", Ok::<_, ()>(Some(Ok::<_, ()>(Some(result)))));
+        assert_eq!(results, [sent]);
+        Ok(())
+    }
+
+    /// AC-18.19g-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_19g_4_empty_title_list_is_an_error() -> anyhow::Result<()> {
+        let (calls, results, _) = tool_played("vision quest", Vec::new()).await?;
+        assert_eq!(calls, []);
+        assert!(results[0].contains("in the library"), "{results:?}");
+        Ok(())
+    }
+
+    /// AC-18.19g-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_19g_5_newer_request_stops_the_play() -> anyhow::Result<()> {
+        let home = Arc::default();
+        let (conversation, _, _) = playing(&home, "vision quest", titles())?;
+        let (filler, job) = (chosen("filler", 0), Job::Llm("tell me".to_owned()));
+        let old = work(
+            &conversation,
+            Decision::Defer { filler, job },
+            Some(SATELLITE),
+        )?;
+        let _ = conversation.dispatch(reply(None), None, Some(SATELLITE), 0, 0, None);
+        old.await?;
+        assert_eq!(home.calls(), []);
+        Ok(())
+    }
+
+    /// AC-18.19g-6.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_19g_6_prefetch_does_not_play() -> anyhow::Result<()> {
+        let home = Arc::default();
+        let (conversation, reasoner, _) = playing(&home, "vision quest", titles())?;
+        // The script has no `Done`, so the prefetch itself fails after the step.
+        let _ = conversation
+            .prefetch("put vision quest on the tv", None)
+            .await;
+        assert_eq!(home.calls(), []);
+        assert_eq!(reasoner.results(), ["no plugin has the tool play_on_tv"]);
         Ok(())
     }
 
