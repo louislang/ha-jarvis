@@ -1852,7 +1852,7 @@ async fn start_live_app(
 ) -> anyhow::Result<Started> {
     let (plugins, library) = plugins(config, secrets)?;
     let plugins = registry(config, plugins);
-    let tools = plugins.tools();
+    let tools = answer_tools(&plugins, library.as_ref());
     let reasoner = Arc::new(OpenAiReasoner::try_new(
         &config.openai,
         &secrets.openai_key,
@@ -1899,6 +1899,14 @@ fn plugins(config: &Config, secrets: &Secrets) -> anyhow::Result<Sources> {
     let plex = Arc::new(Plex::try_new(plex, token, Arc::new(SystemClock))?);
     plugins.push(Arc::clone(&plex) as _);
     Ok((plugins, Some(plex)))
+}
+
+/// The tools of the System Two answers: the tools of `plugins`, and `play_on_tv` with the media
+/// library `library`.
+fn answer_tools(plugins: &Plugins, library: Option<&Arc<dyn MediaLibrary>>) -> Vec<Tool> {
+    let mut tools = plugins.tools();
+    tools.extend(library.map(|_| app::conversation::play_tool()));
+    tools
 }
 
 /// The registry of `plugins` with the `[plugins]` of `config` and the system time.
@@ -3461,12 +3469,37 @@ mod tests {
         SystemTwo { clock, ..two }
     }
 
+    /// The `[plugins.plex]` section of `jarvis.toml`.
+    const PLEX_SECTION: &str =
+        "[plugins.plex]\nurl = \"http://plex.local:32400\"\ntoken_env = \"PLEX_TOKEN\"\n";
+
     /// The tool names of the registry of the configuration `text` with every variable set.
     fn tool_names(text: &str) -> anyhow::Result<Vec<String>> {
         let config = Config::parse(text)?;
         let secrets = Secrets::resolve(&config, |_| Some("token".to_owned()))?;
         let tools = registry(&config, plugins(&config, &secrets)?.0).tools();
         Ok(tools.into_iter().map(|tool| tool.name).collect())
+    }
+
+    /// The tool names of the System Two answers of the configuration `text` with every variable
+    /// set.
+    fn answer_names(text: &str) -> anyhow::Result<Vec<String>> {
+        let config = Config::parse(text)?;
+        let secrets = Secrets::resolve(&config, |_| Some("token".to_owned()))?;
+        let (plugins, library) = plugins(&config, &secrets)?;
+        let tools = answer_tools(&registry(&config, plugins), library.as_ref());
+        Ok(tools.into_iter().map(|tool| tool.name).collect())
+    }
+
+    /// AC-18.19g-7.
+    #[test]
+    fn ac_18_19g_7_play_tool_needs_the_plex_section() -> anyhow::Result<()> {
+        let plex = ["get_new_shows", "play_on_tv"].map(str::to_owned);
+        let names = answer_names(VALID)?;
+        assert!(plex.iter().all(|name| names.contains(name)), "{names:?}");
+        let names = answer_names(&VALID.replace(PLEX_SECTION, ""))?;
+        assert!(!plex.iter().any(|name| names.contains(name)), "{names:?}");
+        Ok(())
     }
 
     /// AC-17.3b-1.
@@ -3499,10 +3532,11 @@ mod tests {
     async fn ac_18_11_7_plex_needs_its_section_and_token() -> anyhow::Result<()> {
         let plex = "get_new_shows".to_owned();
         assert!(tool_names(VALID)?.contains(&plex), "no Plex plugin");
-        let section =
-            "[plugins.plex]\nurl = \"http://plex.local:32400\"\ntoken_env = \"PLEX_TOKEN\"\n";
-        assert!(VALID.contains(section), "jarvis.toml has no [plugins.plex]");
-        let names = tool_names(&VALID.replace(section, ""))?;
+        assert!(
+            VALID.contains(PLEX_SECTION),
+            "jarvis.toml has no [plugins.plex]"
+        );
+        let names = tool_names(&VALID.replace(PLEX_SECTION, ""))?;
         assert!(!names.contains(&plex), "{names:?}");
         let lookup = |name: &str| (name != "PLEX_TOKEN").then(|| "token".to_owned());
         let error = run_error_with(VALID, lookup).await?;
