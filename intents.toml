@@ -31,7 +31,7 @@ data = { temperature = "{{ entity.attributes.temperature - 2 }}" }
 [[intent]]
 name = "tv_show"
 kind = "command"
-examples = ["put the tv on [the office](show)", "play [bluey](show) on the tv", "turn the tv to [jeopardy](show)"]
+examples = ["put the tv on [the office](show)", "play [bluey](show) on the tv", "turn the tv to [jeopardy](show)", "put [the floor](show) on the tv", "put [survivor](show) on the tv"]
 service = "media_player.play_media"
 target = "entity"
 entity = "media_player.living_room"
