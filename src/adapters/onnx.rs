@@ -423,6 +423,22 @@ mod tests {
         .await
     }
 
+    /// AC-18.19f-1.
+    #[tokio::test]
+    async fn ac_18_19f_1_put_show_on_the_tv_is_tv_show() -> anyhow::Result<()> {
+        let cases = [
+            ("put the floor on the tv", "show", "the floor"),
+            ("put survivor on the tv", "show", "survivor"),
+        ];
+        let classifier = OnnxLoader.load(Path::new(FIXTURE), Device::Cpu).await?;
+        for (text, _, _) in cases {
+            let prediction = classifier.predict(CONTEXT, text).await?;
+            let top = prediction.ranked.first().map(|pair| pair.0.as_str());
+            assert_eq!(top, Some("tv_show"), "top label of {text}");
+        }
+        assert_slots(&cases).await
+    }
+
     /// AC-18.7-8.
     #[tokio::test]
     async fn ac_18_7_8_genre_music_phrase_tags_media_and_group() -> anyhow::Result<()> {
