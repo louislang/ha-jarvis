@@ -512,9 +512,14 @@ impl Conversation {
     }
 
     /// Opens a dialog on `key` that waits for `pending`, asked at the time of `heard`, with the
-    /// first interaction of the dialog of `heard`, else `heard` itself, as its first.
+    /// first interaction of the dialog of `heard`, else `heard` itself, as its first. Opens none
+    /// when a newer request on the satellite of `heard` started, because its question drops.
     fn open(&self, key: Key, pending: Pending, heard: &Heard) {
         let mut dialogs = self.queues.dialogs();
+        let current = |origin: &Origin| dialogs.generation(&key) == origin.generation;
+        if !heard.origin.as_ref().is_none_or(current) {
+            return;
+        }
         self.queues.set_link(key.clone(), heard.first());
         dialogs.open(key, pending, heard.time);
     }
@@ -707,7 +712,8 @@ impl Conversation {
         let Some(next) = dialog::next_turn(dialog, max_turns, heard.time) else {
             return said(prediction, Route::Reply, self.failure(), None);
         };
-        self.queues.put(key, next, heard.link);
+        let generation = heard.origin.as_ref().map(|origin| origin.generation);
+        self.queues.put(key, next, heard.link, generation);
         let request = heard.origin.clone();
         let question = self.chosen("ask_area");
         let response = self.spoken(question.clone());
@@ -1235,7 +1241,7 @@ impl Conversation {
         let question = next.is_some().then_some(question);
         let Some(origin) = &thread.request else {
             if let (Some(key), Some(next)) = (thread.key.clone(), next) {
-                self.queues.put(key, next, thread.first);
+                self.queues.put(key, next, thread.first, None);
             }
             sentences.push(question.unwrap_or_else(|| self.pick("failure")));
             return Ok(());
@@ -2087,9 +2093,13 @@ impl Queues {
         links.insert(key, first);
     }
 
-    /// Opens `dialog` on `key`, with the interaction `first`, when it is set, as its first.
-    fn put(&self, key: Key, dialog: Dialog, first: Option<u64>) {
+    /// Opens `dialog` on `key`, with the interaction `first`, when it is set, as its first. Opens
+    /// none when `generation` is set and is no longer the generation of `key`.
+    fn put(&self, key: Key, dialog: Dialog, first: Option<u64>, generation: Option<u64>) {
         let mut dialogs = self.dialogs();
+        if generation.is_some_and(|generation| dialogs.generation(&key) != generation) {
+            return;
+        }
         if let Some(first) = first {
             self.set_link(key.clone(), first);
         }
@@ -2847,15 +2857,51 @@ mod tests {
     async fn ac_16_1b_3_later_reply_keeps_the_newer_answer() -> anyhow::Result<()> {
         let (home, reasoner) = (Arc::default(), Arc::default());
         let conversation = deferring(&home, &reasoner, &["unknown", "lights_on"]);
-        let release = held(&conversation, LIGHTS);
-        let first = conversation.clone();
-        let first = tokio::spawn(async move { first.handle(LIGHTS, in_kitchen()).await });
-        tokio::task::yield_now().await;
-        let newer = conversation.handle("plan dinner", in_kitchen()).await?;
-        let _ = release.send(());
-        let replied = first.await??;
+        let (replied, newer) = overtaken(&conversation, LIGHTS, in_kitchen()).await?;
         assert_ne!(replied.text, "One moment.", "the first request deferred");
         assert_eq!(answered(&home, &reasoner, newer).await?, ["Pasta."]);
+        Ok(())
+    }
+
+    /// The results of `text` in `context`, which waits for its voice embedding after its start,
+    /// and of a newer request in `context` that `handle` finishes during the wait.
+    async fn overtaken(
+        conversation: &Conversation,
+        text: &'static str,
+        context: Context,
+    ) -> anyhow::Result<(Handled, Handled)> {
+        let release = held(conversation, text);
+        let (first, older) = (conversation.clone(), context.clone());
+        let first = tokio::spawn(async move { first.handle(text, older).await });
+        tokio::task::yield_now().await;
+        let newer = conversation.handle("plan dinner", context).await?;
+        let _ = release.send(());
+        Ok((first.await??, newer))
+    }
+
+    /// The question of a request that a newer request on its satellite overtook opens no dialog.
+    #[tokio::test(start_paused = true)]
+    async fn overtaken_question_opens_no_dialog() -> anyhow::Result<()> {
+        let (home, reasoner) = (Arc::default(), Arc::default());
+        let conversation = deferring(&home, &reasoner, &["unknown", "lights_on"]);
+        let (asked, _) = overtaken(&conversation, LIGHTS, on_satellite()).await?;
+        assert_eq!(asked.text, "", "the first request did not ask");
+        assert_eq!(open_dialogs(&conversation), BTreeMap::new());
+        Ok(())
+    }
+
+    /// The unclear answer of a request that a newer request on its satellite overtook keeps no
+    /// dialog.
+    #[tokio::test(start_paused = true)]
+    async fn overtaken_unclear_answer_keeps_no_dialog() -> anyhow::Result<()> {
+        let (home, reasoner) = (Arc::default(), Arc::default());
+        let labels = ["lights_on", "unknown", "unknown"];
+        let conversation = deferring(&home, &reasoner, &labels);
+        let asked = conversation.handle(LIGHTS, on_satellite()).await?;
+        assert_eq!(asked.text, "", "the request did not ask");
+        let (again, _) = overtaken(&conversation, "zzz", on_satellite()).await?;
+        assert_eq!(again.text, "", "the answer did not ask again");
+        assert_eq!(open_dialogs(&conversation), BTreeMap::new());
         Ok(())
     }
 
