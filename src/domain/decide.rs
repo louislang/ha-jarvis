@@ -475,7 +475,8 @@ type Situated<'a> = (Option<&'a AreaId>, Map<String, Value>);
     ensures
         match found {
             Ok((Some(area), _)) => located(*prediction, *request, *cache, *area),
-            Ok((None, _)) => unslotted(prediction.slots@) && request.area is None,
+            Ok((None, _)) => (unslotted(prediction.slots@) || house_slotted(prediction.slots@, *cache))
+                && request.area is None,
             Err(decision) => deferred(*decision, request.transcript) || asked(*intent, *request, *cache, *decision)
                 || unplaced(*intent, *prediction, *cache, *decision),
         },
@@ -541,10 +542,12 @@ fn ask(
     ensures
         match found {
             Ok(Some(area)) => located(*prediction, *request, *cache, *area),
-            Ok(None) => unslotted(prediction.slots@) && request.area is None,
+            Ok(None) => (unslotted(prediction.slots@) || house_slotted(prediction.slots@, *cache))
+                && request.area is None,
             Err(decision) => asked(*intent, *request, *cache, *decision)
                 || unplaced(*intent, *prediction, *cache, *decision),
         },
+        house_slotted(prediction.slots@, *cache) ==> found is Ok,
 )]
 fn place<'a>(
     intent: &Intent,
@@ -562,15 +565,36 @@ fn place<'a>(
     if let Some(area) = cache.area_by_name(name) {
         return Ok(Some(area));
     }
-    let decision = match (intent.kind, select::group(intent, name, cache)) {
+    if is_house_name(name) {
+        return Ok(request.area.as_ref());
+    }
+    match group_call(intent, name, slots, cache, pools, rng) {
+        Some(decision) => Err(Box::new(decision)),
+        None => Err(ask(intent, prediction, request, cache, pools, rng)),
+    }
+}
+
+/// The call of the command `intent` with `slots` on the group player of `text`, or `None`.
+#[verus_spec(decision =>
+    requires
+        pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
+        responses::filled(pools@),
+    ensures
+        decision matches Some(made) ==> grouped(*intent, *cache, text@, made),
+)]
+fn group_call(
+    intent: &Intent,
+    text: &str,
+    slots: &Map<String, Value>,
+    cache: &StateCache,
+    pools: &Pools,
+    rng: &mut StdRng,
+) -> Option<Decision> {
+    match (intent.kind, select::group(intent, text, cache)) {
         (Kind::Command, Some(group)) => {
             serve(intent, &aim(intent, group, cache), slots, pools, rng)
         }
         _ => None,
-    };
-    match decision {
-        Some(decision) => Err(Box::new(decision)),
-        None => Err(ask(intent, prediction, request, cache, pools, rng)),
     }
 }
 
@@ -1070,6 +1094,21 @@ fn texts(ids: &[EntityId]) -> Vec<String> {
     texts
 }
 
+/// True when `text` names the whole house.
+#[verus_spec(found =>
+    ensures
+        found == house_name(text@),
+)]
+fn is_house_name(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let lower = lower.as_str();
+    lower == "house"
+        || lower == "home"
+        || lower == "the house"
+        || lower == "whole house"
+        || lower == "the whole house"
+}
+
 /// The index of the first `area` slot of `slots`.
 #[verus_spec(found =>
     ensures
@@ -1372,15 +1411,16 @@ pub open spec fn handled(prediction: Prediction, catalog: Catalog, threshold: f3
         || catalog.intents@[index].kind is Fetch)
 }
 
-/// True when `decision` for `intent` obeys the area rules: an area slot that names no area, or a
-/// service without an area, defers the request to System Two, and no service gives no call. A
+/// True when `decision` for `intent` obeys the area rules: an area slot that names no area and not
+/// the house, or a service without an area, defers the request to System Two, and no service gives no call. A
 /// call makes the service of the intent on its selection in the area of the request. A query gives
 /// no call and reads a selection in the area of the request. A fetch needs no area and defers to
 /// System Two or gives a fetch job, and a fetch with no plugin defers to System Two. A `house`
 /// query needs no area and reads the selection of the house.
 pub open spec fn acted(intent: Intent, prediction: Prediction, request: Request, cache: StateCache, decision: Decision) -> bool {
     &&& forall|slot: int| #[trigger] first_area(prediction.slots@, slot)
-        && !area_named(cache, prediction.slots@[slot].value@) ==> deferred(decision, request.transcript)
+        && !area_named(cache, prediction.slots@[slot].value@) && !house_name(prediction.slots@[slot].value@)
+        ==> deferred(decision, request.transcript)
             || unplaced(intent, prediction, cache, decision)
     &&& unslotted(prediction.slots@) && request.area is None && intent.service is Some
         && !(intent.kind is Fetch) && !housing(intent) ==> deferred(decision, request.transcript)
@@ -1541,10 +1581,26 @@ pub open spec fn aimed(intent: Intent, prediction: Prediction, request: Request,
 }
 
 /// True when `area` is the area of the first area slot of `prediction`, else the area of `request`.
+/// A first area slot that names no area and names the house gives the area of `request`.
 pub open spec fn located(prediction: Prediction, request: Request, cache: StateCache, area: AreaId) -> bool {
     &&& forall|slot: int| #[trigger] first_area(prediction.slots@, slot)
         ==> area_called(cache, prediction.slots@[slot].value@, area)
+            || (!area_named(cache, prediction.slots@[slot].value@)
+            && house_name(prediction.slots@[slot].value@) && request.area == Some(area))
     &&& unslotted(prediction.slots@) ==> request.area == Some(area)
+}
+
+/// True when the first area slot of `slots` names no area of `cache` and names the house.
+pub open spec fn house_slotted(slots: Seq<Slot>, cache: StateCache) -> bool {
+    exists|slot: int| #[trigger] first_area(slots, slot) && !area_named(cache, slots[slot].value@)
+        && house_name(slots[slot].value@)
+}
+
+/// True when `text` in lowercase is a name of the whole house.
+pub open spec fn house_name(text: Seq<char>) -> bool {
+    let lower = crate::domain::contracts::lowercase(text);
+    lower == "house"@ || lower == "home"@ || lower == "the house"@ || lower == "whole house"@
+        || lower == "the whole house"@
 }
 
 /// True when `area` is the ID of an area of `cache` whose name or alias is `text`, without case.
@@ -2049,6 +2105,15 @@ mod tests {
             )
         };
         assert_eq!(decided("study"), decided("Office"));
+    }
+
+    /// AC-10.4-10.
+    #[test]
+    fn ac_10_4_10_house_slot_answers_from_the_house() {
+        let cache = StateCache::load(house());
+        let decision = replied("climate_query", Some("house"), "living_room", &cache);
+        let text = "The thermostat is set to 66 degrees in heat mode.";
+        assert_eq!(decision, answered("climate_query", text));
     }
 
     /// AC-4.5b-5.
