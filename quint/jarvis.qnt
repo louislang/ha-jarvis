@@ -64,7 +64,10 @@ module jarvis {
   /// The satellite entity is `idle`.
   var idle: SAT -> bool
 
-  /// The newest request of each satellite. 0 before any.
+  /// The last started request of each satellite. 0 before any.
+  var started: SAT -> REQUEST
+
+  /// The request that Jarvis started to handle last on each satellite. 0 before any.
   var newest: SAT -> REQUEST
 
   /// `modelVersion` before the last step.
@@ -74,7 +77,7 @@ module jarvis {
   var lastAction: Event
 
   /// Request `r` started and its phase is in `phases`.
-  def isIn(r: REQUEST, phases: Set[Phase]): bool = r > 0 and r <= newest.get(sat(r)) and phases.contains(phase.get(r))
+  def isIn(r: REQUEST, phases: Set[Phase]): bool = r > 0 and r <= started.get(sat(r)) and phases.contains(phase.get(r))
 
   /// Sets the history of step `e`.
   action record(e: Event): bool = all {
@@ -91,6 +94,7 @@ module jarvis {
   /// The satellites do not change.
   action keepSatellites: bool = all {
     idle' = idle,
+    started' = started,
     newest' = newest,
     idleAfterReply' = idleAfterReply,
   }
@@ -120,6 +124,7 @@ module jarvis {
     announceTimes' = REQUESTS.mapBy(_ => Set()),
     modelVersion' = REQUESTS.mapBy(_ => 0),
     idle' = SATS.mapBy(_ => true),
+    started' = SATS.mapBy(_ => 0),
     newest' = SATS.mapBy(_ => 0),
     prevVersion' = REQUESTS.mapBy(_ => 0),
     lastAction' = Init,
@@ -127,10 +132,11 @@ module jarvis {
 
   /// A user starts request `r`. Its satellite leaves `idle`.
   action audio(r: REQUEST): bool = all {
-    newest.get(sat(r)) == prev(r),
+    started.get(sat(r)) == prev(r),
     record(Audio(r)),
     phase' = phase,
-    newest' = newest.set(sat(r), r),
+    started' = started.set(sat(r), r),
+    newest' = newest,
     idle' = idle.set(sat(r), false),
     idleAfterReply' = idleAfterReply,
     keepTime,
@@ -149,16 +155,21 @@ module jarvis {
     keepCounts,
   }
 
-  /// The assistant starts to handle `r` and reads the active model once.
+  /// The assistant starts to handle `r`, reads the active model once and makes `r` the newest request of its satellite.
+  /// HA sends the transcripts of a satellite in order, so the request before `r` is handled first.
   action handle(r: REQUEST): bool = all {
     isIn(r, Set(Committed)),
+    prev(r) == 0 or not(at(prev(r), Set(Listening, Committed))),
     record(Handle(r)),
     phase' = phase.set(r, Handling),
     modelVersion' = modelVersion.set(r, activeModel),
+    newest' = newest.set(sat(r), r),
     handled' = handled,
     replyTime' = replyTime,
+    idle' = idle,
+    started' = started,
+    idleAfterReply' = idleAfterReply,
     keepTime,
-    keepSatellites,
     keepOutputs,
   }
 
@@ -184,9 +195,9 @@ module jarvis {
   /// Jarvis speaks the filler of `r` and defers its answer to System Two.
   action defer(r: REQUEST): bool = finish(Defer(r), r, Deferred, replyTime.set(r, now))
 
-  /// Jarvis calls HA for `r` after its reply or filler.
+  /// Jarvis calls HA for `r` after its reply or filler. System Two calls only for the newest request.
   action call(r: REQUEST): bool = all {
-    isIn(r, Set(Replied, Deferred)),
+    isIn(r, Set(Replied)) or (isIn(r, Set(Deferred)) and newest.get(sat(r)) == r),
     callTime.get(r) < 0,
     record(Call(r)),
     callTime' = callTime.set(r, now),
@@ -197,12 +208,13 @@ module jarvis {
     keepCounts,
   }
 
-  /// HA ends the pipeline of `s` after the reply, the filler or the error of its newest request.
+  /// HA ends the pipeline of `s` after the reply, the filler or the error of its last started request.
   action pipelineEnd(s: SAT): bool = all {
-    isIn(newest.get(s), Set(Replied, Deferred, Done)),
+    isIn(started.get(s), Set(Replied, Deferred, Done)),
     record(PipelineEnd(s)),
     idle' = idle.set(s, true),
     idleAfterReply' = REQUESTS.mapBy(r => idleAfterReply.get(r) or (sat(r) == s and isIn(r, Set(Replied, Deferred)))),
+    started' = started,
     newest' = newest,
     phase' = phase,
     keepTime,
@@ -317,15 +329,20 @@ module jarvis {
     announceTimes.in(REQUESTS.setOfMaps(0.to(MAX_TIME).powerset())),
     modelVersion.in(REQUESTS.setOfMaps(Set(0).union(VERSIONS))),
     idle.in(SATS.setOfMaps(Bool)),
+    started.in(SATS.setOfMaps(0.to(3))),
     newest.in(SATS.setOfMaps(0.to(3))),
     prevVersion.in(REQUESTS.setOfMaps(Set(0).union(VERSIONS))),
     lastAction.in(EVENTS),
     allInvariants,
-    SATS.forall(s => newest.get(s) == 0 or sat(newest.get(s)) == s),
-    // The pipeline of a satellite ends only after its newest request replied, deferred or failed.
-    SATS.forall(s => (idle.get(s) and newest.get(s) > 0) implies isIn(newest.get(s), Set(Replied, Deferred, Done))),
+    SATS.forall(s => started.get(s) == 0 or sat(started.get(s)) == s),
+    // The newest request is the last handled request of its satellite.
+    SATS.forall(s => newest.get(s) == 0 or (sat(newest.get(s)) == s and isIn(newest.get(s), Set(Handling, Replied, Deferred, Done)))),
+    // The pipeline of a satellite ends only after its last started request replied, deferred or failed.
+    SATS.forall(s => (idle.get(s) and started.get(s) > 0) implies isIn(started.get(s), Set(Replied, Deferred, Done))),
     REQUESTS.forall(r => all {
       at(r, Set(Listening)) or isIn(r, Set(Committed, Handling, Replied, Deferred, Done)),
+      isIn(r, Set(Handling, Replied, Deferred, Done)) implies r <= newest.get(sat(r)),
+      (prev(r) > 0 and at(r, Set(Handling, Replied, Deferred, Done))) implies not(at(prev(r), Set(Listening, Committed))),
       handled.get(r) == (if (at(r, Set(Replied, Deferred, Done))) 1 else 0),
       modelVersion.get(r) == 0 iff at(r, Set(Listening, Committed)),
       replyTime.get(r) >= 0 iff at(r, Set(Replied, Deferred)),
