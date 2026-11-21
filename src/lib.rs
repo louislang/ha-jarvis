@@ -42,6 +42,7 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
+use tokio::runtime::Runtime;
 use tokio::signal::unix;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::Notify;
@@ -1578,7 +1579,7 @@ type Activated = (
 type Checked = ((JoinHandle<()>, JoinHandle<()>), Reviewer);
 
 /// The longest wait of [`run`] for the running tasks and the saves after the shutdown future
-/// completes.
+/// completes, and of [`end`] for the threads of the runtime.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(5);
 
 /// The outside world of [`run`].
@@ -2520,7 +2521,7 @@ fn exit_on_panic(config: &Path) {
 /// A signal handler cannot be registered, or `run` fails.
 fn serve(config: &Path) -> anyhow::Result<Ended> {
     exit_on_panic(config);
-    let runtime = tokio::runtime::Runtime::new()?;
+    let runtime = Runtime::new()?;
     let result = runtime.block_on(async {
         let mut interrupt = unix::signal(SignalKind::interrupt())?;
         let mut terminate = unix::signal(SignalKind::terminate())?;
@@ -2536,10 +2537,15 @@ fn serve(config: &Path) -> anyhow::Result<Ended> {
         };
         run(config, startup).await
     });
-    // `run` waited up to 5 s. A drop of the runtime would wait for the blocking tasks with no
-    // limit, and the pools task blocks until its last sender drops.
-    runtime.shutdown_background();
+    end(runtime);
     result
+}
+
+/// Ends `runtime`: drops its tasks and waits up to [`SHUTDOWN_WAIT`] for its threads. Thus the
+/// ONNX sessions that the tasks hold drop before `exit` ends CUDA.
+fn end(runtime: Runtime) {
+    // A drop of the runtime would wait with no limit for a blocking task that does not end.
+    runtime.shutdown_timeout(SHUTDOWN_WAIT);
 }
 
 /// Entry point of Jarvis: installs the stderr log subscriber of `RUST_LOG` and runs the command
@@ -2641,6 +2647,7 @@ mod tests {
     use serde_json::json;
     use tokio::io::DuplexStream;
     use tokio::net::TcpListener;
+    use tokio::runtime::Builder;
     use tokio::sync::mpsc;
     use tokio::sync::oneshot;
     use tokio::sync::watch;
@@ -4195,6 +4202,45 @@ mod tests {
         );
         let habits = folder.path().join("habits.json");
         assert!(habits.exists(), "run did not save {}", habits.display());
+        Ok(())
+    }
+
+    /// Sets its flag when it drops.
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The live app holds the ONNX sessions. They must drop before `exit` ends CUDA. The worker
+    /// is parked after it polls the task, so a runtime end that does not wait returns first.
+    #[test]
+    fn end_drops_the_tasks_before_it_returns() -> anyhow::Result<()> {
+        let (events, received) = std::sync::mpsc::channel();
+        let parked = events.clone();
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(1)
+            .on_thread_park(move || {
+                let _ = parked.send(false);
+            })
+            .build()?;
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = DropFlag(Arc::clone(&dropped));
+        runtime.spawn(async move {
+            let _flag = flag;
+            let _ = events.send(true);
+            future::pending::<()>().await;
+        });
+        // `true` is the poll of the task, `false` a park of the worker.
+        while !received.recv()? {}
+        while received.recv()? {}
+        end(runtime);
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "a task still holds its value after the end of the runtime"
+        );
         Ok(())
     }
 
