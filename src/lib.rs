@@ -1562,6 +1562,9 @@ type Learn = (mpsc::Sender<Change>, Arc<Habits>);
 /// The [`Extras`] and the [`Learn`] of the learned intent check.
 type Checks = (Extras, Learn);
 
+/// The `RunPod` trainer and the media library of a configuration, each if it is set.
+type Remotes = (Option<Arc<dyn Trainer>>, Option<Arc<dyn MediaLibrary>>);
+
 /// The plugins of a configuration and its media library, if any.
 type Sources = (Vec<Arc<dyn Plugin>>, Option<Arc<dyn MediaLibrary>>);
 
@@ -1858,12 +1861,8 @@ async fn start_live_app(
     )?);
     let runpod = runpod(config, secrets)?;
     let catalog = Arc::new(catalog);
-    let started = start_app(config, catalog, pools, home, reasoner, plugins, runpod).await?;
-    if let Some(library) = library {
-        started.0.conversation.set_library(Arc::clone(&library));
-        app::background::start_titles(library, started.0.conversation.titles());
-    }
-    Ok(started)
+    let sources = (runpod, library);
+    start_app(config, catalog, pools, home, reasoner, plugins, sources).await
 }
 
 /// The `RunPod` trainer of `[train.runpod]` of `config` with the keys of `secrets`, when it is set.
@@ -1912,7 +1911,8 @@ fn registry(config: &Config, plugins: Vec<Arc<dyn Plugin>>) -> Arc<Plugins> {
 }
 
 /// The app of [`start_app_with`] with System Two on `reasoner` and the plugin registry `plugins`,
-/// and with the `RunPod` trainer `runpod`, the tools of `plugins` and [`learned`].
+/// and with the `RunPod` trainer and the media library of `sources`, the tools of `plugins` and
+/// [`learned`].
 ///
 /// # Errors
 ///
@@ -1924,19 +1924,20 @@ async fn start_app(
     home: Arc<dyn Home>,
     reasoner: Arc<dyn Reasoner>,
     plugins: Arc<Plugins>,
-    runpod: Option<Arc<dyn Trainer>>,
+    (runpod, library): Remotes,
 ) -> anyhow::Result<Started> {
     let tools = plugins.tools();
     let system_two = system_two(config, Arc::clone(&reasoner), plugins);
     let (live, pools) = learned(config, &catalog, pools)?;
-    let extras = (runpod, (tools, live));
+    let extras = ((runpod, (tools, live)), library);
     start_app_with(config, catalog, pools, home, reasoner, system_two, extras).await
 }
 
 /// The app of `config`, `catalog` and the source pools `pools` on `home`, `reasoner` and
 /// `system_two`, its pools task and habit task, its pre-render task and its live models. Starts
 /// the sync, the pools task and the habit task, loads the live models, and starts the training
-/// trigger and the learned intent check with `extras`. Then starts the pre-render.
+/// trigger and the learned intent check with `extras`. Then starts the pre-render and
+/// [`start_media`] with the media library of `extras`.
 ///
 /// # Errors
 ///
@@ -1949,24 +1950,26 @@ async fn start_app_with(
     home: Arc<dyn Home>,
     reasoner: Arc<dyn Reasoner>,
     system_two: SystemTwo,
-    extras: Extras,
+    (extras, library): (Extras, Option<Arc<dyn MediaLibrary>>),
 ) -> anyhow::Result<Started> {
     let (cache, queues, task, habits) = start_tasks(&home, config, pools)?;
-    let (models, listener, activation, (recorder, logged)) = load_models(
+    let checks = (extras, (task.changes.clone(), habits.habits.clone()));
+    let loaded = load_models(
         config,
         &reasoner,
         &queues,
-        home,
+        Arc::clone(&home),
         &cache,
         &catalog,
-        (extras, (task.changes.clone(), habits.habits.clone())),
+        checks,
     )
     .await?;
-    let prerender = start_prerender(config, &activation.speech, &task.pools, &cache);
+    let prerender = start_prerender(config, &loaded.2.speech, &task.pools, &cache);
     start_report(config, &cache);
     let parts = (task, queues, habits, reasoner);
-    let loaded = (models, listener, activation, (recorder, logged));
-    Ok(started(config, parts, system_two, loaded, prerender))
+    let started = started(config, parts, system_two, loaded, prerender);
+    start_media(config, home, cache, catalog, &started, library);
+    Ok(started)
 }
 
 /// The app of `config`, `parts`, `system_two`, `loaded` and `prerender`. Starts its prefetch.
@@ -2333,9 +2336,8 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
 
 /// The live models of `config`, then the listener on their STT and voice embedder, which predicts
 /// with their System One model, sees the dialogs of `queues` and warms `reasoner`, the
-/// [`activation`] on their TTS, and the recorder of [`start_log`]. Starts the hotword refresh of
-/// the STT with `home`, `cache` and `catalog`, and the training trigger and the learned intent
-/// check with `checks`, `home`, the live models and the [`activation`].
+/// [`activation`] on their TTS, and the recorder of [`start_log`]. Starts the training trigger and
+/// the learned intent check with `checks`, `home`, the live models and the [`activation`].
 ///
 /// # Errors
 ///
@@ -2353,7 +2355,6 @@ async fn load_models(
     let live = models.live();
     let stt = Arc::clone(&live) as _;
     let (activation, checks) = activation(config, checks, Arc::clone(&live) as _, cache)?;
-    start_hotwords(config, &home, cache, catalog, Arc::clone(&stt));
     let classifier = Arc::clone(models.classifier()) as _;
     let listener = listener(config, stt, live, classifier, Arc::clone(reasoner), queues);
     let recorded = start_log(
@@ -2408,17 +2409,27 @@ async fn load_classifier(config: &Config) -> anyhow::Result<RunClassifier> {
     Ok(RunClassifier { run, classifier })
 }
 
-/// Starts the hotword refresh of `stt` with `home`, `cache` and `catalog` when `asr.hotwords` is
-/// true and `asr.second_pass_dir` is set in `config`.
-fn start_hotwords(
+/// Gives `library` to the conversation of `started` and starts its title refresh, when it is set.
+/// Starts the hotword refresh of the STT of `started` with `home`, `cache`, `catalog` and the
+/// title list of the conversation when `asr.hotwords` is true and `asr.second_pass_dir` is set
+/// in `config`. Each stored title list wakes the hotword refresh.
+fn start_media(
     config: &Config,
-    home: &Arc<dyn Home>,
-    cache: &watch::Receiver<StateCache>,
-    catalog: &Arc<Catalog>,
-    stt: Arc<dyn SpeechToText>,
+    home: Arc<dyn Home>,
+    cache: watch::Receiver<StateCache>,
+    catalog: Arc<Catalog>,
+    started: &Started,
+    library: Option<Arc<dyn MediaLibrary>>,
 ) {
+    let conversation = &started.0.conversation;
+    let (titles, stored) = (conversation.titles(), Arc::new(Notify::new()));
+    if let Some(library) = library {
+        conversation.set_library(Arc::clone(&library));
+        app::background::start_titles(library, Arc::clone(&titles), Arc::clone(&stored));
+    }
     if config.asr.hotwords && config.asr.second_pass_dir.is_some() {
-        app::background::start_hotwords(Arc::clone(home), cache.clone(), Arc::clone(catalog), stt);
+        let stt = started.3.live();
+        app::background::start_hotwords(home, cache, catalog, stt, (titles, stored));
     }
 }
 

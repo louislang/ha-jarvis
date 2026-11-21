@@ -18,6 +18,7 @@ use jiff::SignedDuration;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde::Deserialize;
+use tokio::sync::Notify;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -75,6 +76,9 @@ const HOTWORDS_REFRESH: Duration = Duration::from_hours(1);
 
 /// The time between two refreshes of the media library titles.
 const TITLES_REFRESH: Duration = Duration::from_hours(1);
+
+/// The most show titles of the media library that are hotwords.
+const HOTWORD_SHOWS: usize = 250;
 
 /// The media types of the library names that are hotwords, in the order of their calls.
 const LIBRARY_TYPES: [&str; 3] = ["playlist", "artist", "album"];
@@ -977,12 +981,14 @@ pub async fn prune(log: Arc<dyn InteractionLog>, clock: Arc<dyn Clock>) {
 }
 
 /// Starts a task that waits for the first snapshot in `cache`, then gives `stt` the hotwords of
-/// `home`, `cache` and `catalog` at once and each [`HOTWORDS_REFRESH`].
+/// `home`, `cache`, `catalog` and the title list `titles` at once, each [`HOTWORDS_REFRESH`] and
+/// each time `stored` wakes it.
 pub fn start_hotwords(
     home: Arc<dyn Home>,
     mut cache: watch::Receiver<StateCache>,
     catalog: Arc<Catalog>,
     stt: Arc<dyn SpeechToText>,
+    (titles, stored): (Arc<ArcSwap<Vec<Title>>>, Arc<Notify>),
 ) {
     tokio::spawn(async move {
         let Ok(_) = cache.wait_for(|cache| cache.config.is_some()).await else {
@@ -990,15 +996,24 @@ pub fn start_hotwords(
         };
         let mut refresh = tokio::time::interval(HOTWORDS_REFRESH);
         loop {
-            refresh.tick().await;
-            refresh_hotwords(home.as_ref(), &cache, &catalog, stt.as_ref()).await;
+            tokio::select! {
+                _ = refresh.tick() => {}
+                () = stored.notified() => {}
+            }
+            let titles = titles.load();
+            refresh_hotwords(home.as_ref(), &cache, &catalog, &titles, stt.as_ref()).await;
         }
     });
 }
 
 /// Starts a task that puts the titles of `library` into `titles` at once and each
-/// [`TITLES_REFRESH`]. Logs the number of titles, or a failed call, which keeps the list.
-pub fn start_titles(library: Arc<dyn MediaLibrary>, titles: Arc<ArcSwap<Vec<Title>>>) {
+/// [`TITLES_REFRESH`], and wakes `stored` after each store. Logs the number of titles, or a
+/// failed call, which keeps the list.
+pub fn start_titles(
+    library: Arc<dyn MediaLibrary>,
+    titles: Arc<ArcSwap<Vec<Title>>>,
+    stored: Arc<Notify>,
+) {
     tokio::spawn(async move {
         let mut refresh = tokio::time::interval(TITLES_REFRESH);
         loop {
@@ -1007,6 +1022,7 @@ pub fn start_titles(library: Arc<dyn MediaLibrary>, titles: Arc<ArcSwap<Vec<Titl
                 Ok(found) => {
                     tracing::info!("the media library has {} titles", found.len());
                     titles.store(Arc::new(found));
+                    stored.notify_one();
                 }
                 Err(error) => tracing::warn!("the media library call failed: {error:#}"),
             }
@@ -1015,19 +1031,22 @@ pub fn start_titles(library: Arc<dyn MediaLibrary>, titles: Arc<ArcSwap<Vec<Titl
 }
 
 /// Gives `stt` the hotwords of the hot cache `cache` and `catalog`, with the playlist, artist and
-/// album names of the Music Assistant library on `home`. Logs a failed library call and the
-/// number of hotwords.
+/// album names of the Music Assistant library on `home`, then the first [`HOTWORD_SHOWS`] show
+/// names of `titles`. Logs a failed library call and the number of hotwords.
 async fn refresh_hotwords(
     home: &dyn Home,
     cache: &watch::Receiver<StateCache>,
     catalog: &Catalog,
+    titles: &[Title],
     stt: &dyn SpeechToText,
 ) {
     let entry = speech::music_entry(&cache.borrow()).map(str::to_owned);
-    let names = match entry {
+    let mut names = match entry {
         Some(entry) => music_names(home, &entry).await,
         None => Vec::new(),
     };
+    let shows = titles.iter().filter(|title| title.kind == "show");
+    names.extend(shows.take(HOTWORD_SHOWS).map(|title| title.name.clone()));
     let words = speech::hotwords(&cache.borrow(), catalog, &names);
     tracing::info!("the second pass has {} hotwords", words.len());
     stt.set_hotwords(&words);
@@ -1485,11 +1504,15 @@ mod tests {
         home
     }
 
-    /// The calls of `home` and the hotword lists of `FakeStt` after one refresh with `cache` and
-    /// the catalog of `intents.toml`.
-    async fn refreshed(home: &FakeHome, cache: StateCache) -> (Vec<ServiceCall>, Vec<Vec<String>>) {
+    /// The calls of `home` and the hotword lists of `FakeStt` after one refresh with `cache`, the
+    /// catalog of `intents.toml` and `titles`.
+    async fn refreshed(
+        home: &FakeHome,
+        cache: StateCache,
+        titles: &[Title],
+    ) -> (Vec<ServiceCall>, Vec<Vec<String>>) {
         let stt = FakeStt::default();
-        refresh_hotwords(home, &watch::channel(cache).1, &catalog(), &stt).await;
+        refresh_hotwords(home, &watch::channel(cache).1, &catalog(), titles, &stt).await;
         let lists = stt.hotwords.into_inner().expect("no lock holder panics");
         (home.calls(), lists)
     }
@@ -1503,7 +1526,7 @@ mod tests {
     /// AC-18.18b-1.
     #[tokio::test(start_paused = true)]
     async fn ac_18_18b_1_three_library_calls_in_order() {
-        let (calls, _) = refreshed(&FakeHome::default(), music_house()).await;
+        let (calls, _) = refreshed(&FakeHome::default(), music_house(), &[]).await;
         let call = |media_type: &str| ServiceCall {
             domain: "music_assistant".to_owned(),
             service: "get_library".to_owned(),
@@ -1520,7 +1543,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_18_18b_2_library_names_are_hotwords() {
         let cache = music_house();
-        let (_, lists) = refreshed(&library_home(), cache.clone()).await;
+        let (_, lists) = refreshed(&library_home(), cache.clone(), &[]).await;
         assert_eq!(
             lists,
             expected(&cache, &["Jazzy", "Radiohead", "OK Computer"])
@@ -1534,7 +1557,7 @@ mod tests {
         let playlist = home.delay();
         drop(home.delay());
         playlist.send(()).expect("the playlist call waits");
-        let (_, lists) = refreshed(&home, cache.clone()).await;
+        let (_, lists) = refreshed(&home, cache.clone(), &[]).await;
         assert_eq!(lists, expected(&cache, &["Jazzy", "OK Computer"]));
     }
 
@@ -1542,7 +1565,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_18_18b_4_no_music_player_gives_no_calls() {
         let cache = StateCache::load(house());
-        let (calls, lists) = refreshed(&library_home(), cache.clone()).await;
+        let (calls, lists) = refreshed(&library_home(), cache.clone(), &[]).await;
         assert!(calls.is_empty(), "the calls are {calls:?}");
         assert_eq!(lists, expected(&cache, &[]));
     }
@@ -1554,13 +1577,23 @@ mod tests {
         fan.expect("the house has it").name = "Study Fan".to_owned();
     }
 
+    /// The `FakeStt` of a new hotword refresh of `cache` and `titles` with a `FakeHome` and the
+    /// catalog of `intents.toml`.
+    fn hotword_task(
+        cache: watch::Receiver<StateCache>,
+        titles: (Arc<ArcSwap<Vec<Title>>>, Arc<Notify>),
+    ) -> Arc<FakeStt> {
+        let stt = Arc::new(FakeStt::default());
+        let (home, catalog) = (Arc::new(FakeHome::default()), Arc::new(catalog()));
+        start_hotwords(home, cache, catalog, Arc::clone(&stt) as _, titles);
+        stt
+    }
+
     /// AC-18.18b-5.
     #[tokio::test(start_paused = true)]
     async fn ac_18_18b_5_first_snapshot_then_each_hour() {
         let (sender, cache) = watch::channel(StateCache::default());
-        let stt = Arc::new(FakeStt::default());
-        let (home, catalog) = (Arc::new(FakeHome::default()), Arc::new(catalog()));
-        start_hotwords(home, cache, catalog, Arc::clone(&stt) as _);
+        let stt = hotword_task(cache, (Arc::default(), Arc::default()));
         let lists = || stt.hotwords.lock().expect("no lock holder panics").clone();
         settle().await;
         assert!(lists().is_empty(), "a list before the first snapshot");
@@ -1583,7 +1616,7 @@ mod tests {
         let library = Arc::new(FakeLibrary::default());
         *library.results.lock().expect("no lock holder panics") = scripted.into();
         let titles = Arc::new(ArcSwap::from_pointee(Vec::new()));
-        start_titles(library, Arc::clone(&titles));
+        start_titles(library, Arc::clone(&titles), Arc::default());
         settle().await;
         assert_eq!(*titles.load_full(), first);
         tokio::time::sleep(TITLES_REFRESH).await;
@@ -1594,6 +1627,58 @@ mod tests {
             second,
             "a failed call changed the list"
         );
+    }
+
+    /// AC-18.19e-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_19e_1_show_titles_follow_music_names() {
+        let cache = music_house();
+        let titles = [
+            fakes::title("The Matrix", "movie"),
+            fakes::title("VisionQuest", "show"),
+            fakes::title("The Office (US)", "show"),
+        ];
+        let (_, lists) = refreshed(&library_home(), cache.clone(), &titles).await;
+        let names = ["Jazzy", "Radiohead", "OK Computer"];
+        let names = [&names[..], &["VisionQuest", "The Office (US)"]].concat();
+        assert_eq!(lists, expected(&cache, &names));
+        assert!(!lists[0].contains(&"The Matrix".to_owned()), "{lists:?}");
+    }
+
+    /// AC-18.19e-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_19e_2_at_most_250_show_titles() {
+        let names: Vec<String> = (1..=300).map(|number| format!("Show {number}")).collect();
+        let titles: Vec<Title> = names
+            .iter()
+            .map(|name| fakes::title(name, "show"))
+            .collect();
+        let cache = StateCache::load(house());
+        let (_, lists) = refreshed(&FakeHome::default(), cache, &titles).await;
+        let words = &lists[0];
+        let kept = names[..250].iter();
+        let missing: Vec<&String> = kept.filter(|&name| !words.contains(name)).collect();
+        assert!(missing.is_empty(), "the list has no {missing:?}");
+        assert!(!words.contains(&names[250]), "the list has {}", names[250]);
+    }
+
+    /// AC-18.19e-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_18_19e_3_stored_titles_wake_the_refresh() {
+        let (_sender, cache) = watch::channel(StateCache::load(house()));
+        let shared = (Arc::default(), Arc::new(Notify::new()));
+        let stt = hotword_task(cache, shared.clone());
+        settle().await;
+        let library = Arc::new(FakeLibrary::default());
+        let bluey = vec![fakes::title("Bluey", "show")];
+        *library.results.lock().expect("no lock holder panics") = [Ok(bluey)].into();
+        start_titles(library, shared.0, shared.1);
+        // The paused clock passes 2 ms, so only the wake gives a second list.
+        settle().await;
+        let lists = stt.hotwords.lock().expect("no lock holder panics").clone();
+        let bluey = "Bluey".to_owned();
+        let has_bluey: Vec<bool> = lists.iter().map(|list| list.contains(&bluey)).collect();
+        assert_eq!(has_bluey, [false, true]);
     }
 
     /// The model state that the conformance test compares.
