@@ -481,7 +481,7 @@ This phase selects responses, selects entities and decides the action from a pre
 **Model.**
 
 - `dispatch(decision, satellite)` gets the satellite of the request, or none. Text from the HA UI, for example, has no satellite.
-- A dispatch with a satellite increases the generation of that satellite. `handle` does not exist until sub-phase 5.3, so `dispatch` increases it. The `after` work of a `Reply` keeps this generation.
+- A dispatch with a satellite increases the generation of that satellite. `handle` does not exist until sub-phase 5.3, so `dispatch` increases it. Sub-phase 16.1b moves the increase to the start of `handle`. The `after` work of a `Reply` keeps this generation.
 - When the call of a `Reply` fails, `after` logs the error. With a satellite, it also puts an answer from `failure` in the queue of the satellite (sub-phase 4.9b), with the generation of its request. `responses::select` picks the answer from the current pools. Each answer that `after` picks sends `record_use` to the pools task, as dispatch does for its `Chosen` (sub-phase 4.8). Thus the next `failure` answer is not the same. Jarvis does not retry a failed call.
 - The service call of a `Reply` is never cancelled. The generation compare runs only before an announce and before the steps of a deferred job (sub-phase 4.9d), not before the call of a `Reply`. Thus a quick second request does not stop the call of the first command.
 - Without a satellite, dispatch returns the reply text as in sub-phase 4.8. A failed call only logs the error and puts nothing in a queue.
