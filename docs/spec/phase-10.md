@@ -212,7 +212,7 @@ A choice is a closed set, so step 2 comes before step 3. The answer to System Tw
 
 **Model.**
 
-- `close` increases the generation of the key, as each new request on a satellite does (sub-phase 4.9c). A deferred job keeps the generation of its key when it starts. Before each announce, question or call, it compares the generation. When the generation changed, the job stops and makes no announce, no question and no further call. A call that already started is not undone. A job that asks increases the generation of its key and ends. The answer continues the request through the dialog.
+- `close` increases the generation of the key, as each new request on a satellite does (sub-phases 4.9c and 16.1b). A deferred job keeps the generation of its key when it starts. Before each announce, question or call, it compares the generation. When the generation changed, the job stops and makes no announce, no question and no further call. A call that already started is not undone. A job that asks increases the generation of its key and ends. The answer continues the request through the dialog.
 - The announce queues use the generations of `Dialogs` (sub-phase 10.2). A new request on a satellite closes the dialog of its key. Thus each key has one generation.
 - The conformance driver maps the model to `handle` on two satellites:
   - `open(k)`: a request on `k` whose decision is `Ask`. Until sub-phase 10.6, `ask(r)` is the same request on the key of the job of `r`.
