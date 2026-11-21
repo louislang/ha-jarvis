@@ -4562,7 +4562,8 @@ mod tests {
         Ok(())
     }
 
-    /// The titles of AC-18.9-10 and AC-18.19c-1 to AC-18.19c-5, with their keys.
+    /// The titles of AC-18.9-10, AC-18.19c-2 to AC-18.19c-5, AC-18.19d-1 and AC-18.19d-2, with
+    /// their keys.
     fn titles() -> Vec<Title> {
         let movies = ["The Matrix", "Fargo"].map(|name| fakes::title(name, "movie"));
         let shows = ["VisionQuest", "Bluey", "The Office (US)", "Fargo"];
@@ -4657,13 +4658,13 @@ mod tests {
         prediction
     }
 
-    /// AC-18.19c-1.
+    /// AC-18.19d-1.
     #[tokio::test(start_paused = true)]
-    async fn ac_18_19c_1_show_turns_on_the_tv_and_plays_shuffled_in_plezy() -> anyhow::Result<()> {
+    async fn ac_18_19d_1_show_turns_on_the_tv_and_plays_the_next_episode() -> anyhow::Result<()> {
         let (reply, calls) = watched("tv_show", ("show", "vision quest"), titles()).await?;
         let replies = ["Putting VisionQuest on the TV.", "Playing VisionQuest."];
         assert!(replies.contains(&reply.as_str()), "{reply}");
-        let link = "plezy://play?server=abc123&id=10&mode=shuffle";
+        let link = "plezy://play?server=abc123&id=10&mode=next";
         assert_eq!(calls, plezy(link));
         Ok(())
     }
@@ -4685,16 +4686,16 @@ mod tests {
         Ok(())
     }
 
-    /// AC-18.19c-3.
+    /// AC-18.19d-2.
     #[tokio::test(start_paused = true)]
-    async fn ac_18_19c_3_each_title_plays_by_its_key_and_mode() -> anyhow::Result<()> {
+    async fn ac_18_19d_2_each_title_plays_by_its_key_and_mode() -> anyhow::Result<()> {
         let (reply, _) = watched("tv_show", ("show", "the matrix"), titles()).await?;
         assert_eq!(reply, "Putting on The Matrix.");
         let requests = [
             ("tv_show", ("show", "the matrix"), "id=1"),
-            ("play_movie", ("movie", "bluey"), "id=11&mode=shuffle"),
+            ("play_movie", ("movie", "bluey"), "id=11&mode=next"),
             ("continue_show", ("show", "the office"), "id=12&mode=next"),
-            ("tv_show", ("show", "fargo"), "id=13&mode=shuffle"),
+            ("tv_show", ("show", "fargo"), "id=13&mode=next"),
             ("play_movie", ("movie", "fargo"), "id=2"),
         ];
         for (label, slot, id) in requests {
