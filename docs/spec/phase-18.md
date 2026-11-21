@@ -1,6 +1,6 @@
 # Phase 18: Queries and Media
 
-This phase adds System One query intents about the house, Music Assistant playback and Plex playback. The queries read only the hot cache and make no service call. The music intents call `music_assistant.play_media` and the `media_player` services on the speaker of the area, or on a Music Assistant speaker group. The Plex intents play a `plezy://` link in the Plezy app on the Living Room Apple TV (sub-phases 18.19 to 18.19c). Before 18.19c, they called `media_player.play_media` with a `plex://` content ID on the TV. The list of new Plex shows comes from the Plex server, so it is a plugin (`01-architecture.md` decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 17 and before phase 10. Sub-phases 18.17 to 18.18b bias the second pass toward the names of the house and of the music library, because the field tests misheard them. Sub-phases 18.19 to 18.19c move the TV intents to the Apple TV, because the filter `name = "tv"` found no single TV on 2026-11-18, and Plezy on the Apple TV plays more reliably than the Sony TV. Sub-phases 18.19d and 18.19e fix two TV defects of the field test on 2026-11-20: a show played shuffled, and the second pass did not hear a show title.
+This phase adds System One query intents about the house, Music Assistant playback and Plex playback. The queries read only the hot cache and make no service call. The music intents call `music_assistant.play_media` and the `media_player` services on the speaker of the area, or on a Music Assistant speaker group. The Plex intents play a `plezy://` link in the Plezy app on the Living Room Apple TV (sub-phases 18.19 to 18.19c). Before 18.19c, they called `media_player.play_media` with a `plex://` content ID on the TV. The list of new Plex shows comes from the Plex server, so it is a plugin (`01-architecture.md` decision 30). The work order follows the phase index (`00-overview.md` section 2), so this phase comes after phase 17 and before phase 10. Sub-phases 18.17 to 18.18b bias the second pass toward the names of the house and of the music library, because the field tests misheard them. Sub-phases 18.19 to 18.19c move the TV intents to the Apple TV, because the filter `name = "tv"` found no single TV on 2026-11-18, and Plezy on the Apple TV plays more reliably than the Sony TV. Sub-phases 18.19d and 18.19e fix two TV defects of the field test on 2026-11-20: a show played shuffled, and the second pass did not hear a show title. Sub-phases 18.19f and 18.19g fix a third: System One did not know "Put The Floor on the TV", and System Two had no tool to play it.
 
 Each sub-phase that adds an intent adds its seed examples to `intents.toml` and its pool to `responses.toml` (`01-architecture.md` section 12). The training set then changes, so `just fixture-model` trains the fixture model again (sub-phase 3.9), and CI trains it again because the cache key is the hash of the training set. AC-3.12-1 to AC-3.12-4 then check the new seed examples. When the fixture model does not learn a new example, the PR changes the examples, not the tests. Jarvis serves the fixture model until sub-phase 13.9, and the training runs of phase 13 use the same seed examples. The tests of the intent sub-phases decide with the catalog of `intents.toml`, the pools of `responses.toml` and the reference house. A test that needs an entity that the reference house does not have adds it to the snapshot before it loads the cache. The tests of AC-3.2-1 and AC-3.2c-2 in `src/domain/catalog.rs` list the intent names in the order of `intents.toml`, so each such sub-phase adds its names there. The fixture model gives each seed example a context by its position, so a new intent can move the contexts of the examples after it. The order of the new intents can change to keep the existing tests passing.
 
@@ -980,6 +980,108 @@ The tests of AC-18.19d-1 and AC-18.19d-2 use the title list and the keys of sub-
 - P-18.19e-1, P-18.19e-2. Argument: `refresh_hotwords` appends at most `HOTWORD_SHOWS` show titles, in list order, after the music names, and `hotwords` keeps the order of its last part (P-18.18-1).
 - P-18.19e-3. Argument: `start_titles` wakes the hotword task after each store, and the hotword task refreshes at each wake.
 
+---
+
+### 18.19f TV Seed Examples
+
+**Goal:** Make System One classify "Put The Floor on the TV" as `tv_show` with the show "the floor". The request then plays the show at System One speed.
+
+- **Implements:** G3. **Depends on:** 18.19d.
+- **Files:** modify `intents.toml`, `src/adapters/onnx.rs` (tests only).
+
+**Model.**
+
+- In the field test on 2026-11-20 (v0.1.35), "Put the floor on the T V" in the Living Room gave `tv_skip` 0.24, `climate_up` 0.23 and `unknown` 0.17 with the live model. The model tagged "floor" as an `area`. The top probability was less than `model.threshold`, so the result was `Defer` with `Job::Llm`. System Two has no tool that plays a Plex title, so it replied "I'm not sure what you mean by put the floor on the TV". The show "The Floor" is in Plex. Sub-phase 18.19g adds the tool.
+- The seeds of `tv_show` are "put the tv on [the office](show)", "play [bluey](show) on the tv" and "turn the tv to [jeopardy](show)". None has the form "put <show> on the tv".
+- You chose (2026-11-20): `tv_show` gets the seeds "put [the floor](show) on the tv" and "put [survivor](show) on the tv", at the end of its examples. No other example changes.
+- Risk: new seeds can lower the probability of other intents. On 2026-11-20, four `shuffle_show` seeds lowered the fixture model probability of `lights_on` for "turn on the office lights", "office lights on" and "turn the office lights on" from about 0.95 to 0.38 to 0.70. That is less than `model.commit_threshold` (0.9), so these requests did not commit early (sub-phase 6.8), and AC-9.2-5 and AC-9.3c-1 failed in `gpu-test` on latency.
+- Measurement on 2026-11-21 on the test machine: the training set of `jarvis dataset` with the reference house, `train.py --device cpu --epochs 80` (the fixture model of sub-phase 3.9), and the context "area: none" of the speculative prediction. Each cell is the top label and its probability.
+
+| Request | Seeds of `main` | With the two new seeds |
+|---|---|---|
+| turn on the office lights | `lights_on` 0.962 | `lights_on` 0.968 |
+| office lights on | `lights_on` 0.950 | `lights_on` 0.960 |
+| turn the office lights on | `lights_on` 0.957 | `lights_on` 0.961 |
+| turn on the office light | `lights_on` 0.947 | `lights_on` 0.953 |
+| turn on the kitchen lights | `lights_on` 0.960 | `lights_on` 0.966 |
+| start the office fan | `fan_on` 0.966 | `fan_on` 0.969 |
+| play bluey on the tv | `tv_show` 0.961 | `tv_show` 0.975 |
+| put the floor on the tv | `tv_show` 0.941 | `tv_show` 0.975 |
+| put survivor on the tv | `tv_show` 0.933 | `tv_show` 0.975 |
+
+- With the new seeds, the fixture model tags "the floor" and "survivor" as `show`, with each of the contexts "area: none", "area: kitchen" and "area: Living Room". The first wording passed, so no other wording was tried.
+- Before the change, the fixture model already gives `tv_show` for "put the floor on the tv". The live model differs: it trains with `train.epochs` and the paraphrases of phase 13. The new seeds reach it at the next training run.
+- The two new seeds keep each light command, "play bluey on the tv" and "start the office fan" at `model.commit_threshold` or more. Thus the latency tests of AC-9.2-5 and AC-9.3c-1 keep their early commit.
+- `seed_set` gives the seed examples their contexts from one seeded random sequence, in catalog order (sub-phase 3.3b). Thus the contexts of the examples after `tv_show` move. The measurement includes this.
+- `just fixture-model` trains the fixture model again, because the training set changes. AC-3.12-1 and AC-3.12-3 then check the new examples.
+- The next training run of phase 13 generates new paraphrases for `tv_show` only, because only its seeds change. The intent list does not change, so the `unknown` paraphrases stay (sub-phase 13.6).
+- `tv_show` has no verb (sub-phase 18.18), so the hotwords do not change.
+- No code and no Quint model changes.
+
+**Acceptance criteria.**
+
+- AC-18.19f-1: When the fixture model gets "put the floor on the tv" and "put survivor on the tv", the top label is `tv_show`, and the slots contain `show = the floor` and `show = survivor`.
+
+**Proofs.**
+
+- P-18.19f-1. Evidence: test. The result comes from the trained model (`02-rules.md` section 5, rule 5).
+
+---
+
+### 18.19g Plex Play Tool
+
+**Goal:** Give System Two one tool that plays a Plex title on the TV. A TV request that System One misses then still plays the title.
+
+- **Implements:** G7. **Depends on:** 18.19f.
+- **Files:** modify `src/app/conversation.rs`, `src/lib.rs`, `README.md` (System Two plays a Plex title, `CLAUDE.md` workflow item 15).
+
+**Model.**
+
+- After sub-phase 18.19f, a TV request in a form that System One does not know still gives `Defer` with `Job::Llm`. System Two has `call_service`, `get_states`, `ask_user` and the plugin tools (sub-phases 7.4, 7.6, 10.6 and 17.2). None of them plays a Plex title. `call_service` does not know the item keys of a Plezy link, and `openai.allowed_domains` has no `remote`.
+- You chose (2026-11-20): System Two gets one tool that plays a Plex title on the TV. Jarvis does not shuffle TV shows, movies or Plex titles. Only music plays shuffled.
+- How a tool reaches the use case today:
+  - `run` gives `OpenAiReasoner` the tools of the plugin registry, for example `get_new_shows` (sub-phases 17.2 and 18.11). A model call of one of these tools gives `Step::Plugin` with the tool name and the arguments.
+  - The `after` work of `Defer(Llm)` runs `Step::Plugin` with `Plugins::fetch`, and `Step::Call` with the `allowed_domains` check and `Home`. It makes a call only while the request is the newest of its satellite, or with no request. Else the answer ends (sub-phase 10.5b).
+  - A prefetch runs `Step::Plugin` with `Plugins::refresh` (sub-phase 14.10).
+- The smallest design: the play tool is one more tool in the tool list of the reasoner, and the use case runs it. It is not a plugin, because it changes the house. Thus `Step`, the OpenAI adapter, the plugin registry and the Plex adapter do not change.
+  - `play_tool()` in `src/app/conversation.rs` gives the tool `play_on_tv`. Its description: "Plays a movie or a show of the Plex library on the TV. A show plays its next episode to watch." Its parameters: `{ type: "object", properties: { title: { type: "string" } }, required: ["title"], additionalProperties: false }`.
+  - `run` gives `OpenAiReasoner` the tools of the registry and, when it registers the Plex plugin (sub-phase 18.11), `play_tool()`. Thus the tool exists only with `[plugins.plex]`, as `get_new_shows`. `propose` (sub-phase 14.4) keeps the tools of the registry, so no learned intent names `play_on_tv`.
+  - A model call of `play_on_tv` gives `Step::Plugin` with the name `play_on_tv` (sub-phase 17.2). The `after` work of `Defer(Llm)` runs this step with `play`, not with `Plugins::fetch`. It compares the generation before the play, as before a `Step::Call`. When the request is no longer the newest of its satellite, the play does not run, and the answer ends. Thus the play is a `jobAct` of `quint/dialog.qnt`, and `NoCallAfterCancel` stays true (sub-phase 10.1).
+- `play(arguments)` uses the System One play path:
+  1. The spoken title is the string `title` of the arguments. A missing title gives an error.
+  2. The prediction has the first intent of the catalog with `title = "show"` (`tv_show`) as its top label, with the probability 1, and the one slot `show` with the spoken title.
+  3. The `decide` of the conversation use case matches the title (sub-phase 18.9) and decides. Its `Request` has the spoken title as the transcript, the area of the `entity` of that intent in the hot cache, no address, and the time of `Clock`. `decide` defers a command with a service and no area (sub-phase 4.5b), so the request needs this area. A typed request with no satellite then also plays. A show title stays `tv_show`, and a movie title gives `play_movie`. Thus a show plays with `mode = next`, and a movie plays with no mode (sub-phase 18.19d).
+  4. A `Reply` with no call (the pool `not_in_library`) gives the result `"not_in_library"` and makes no call.
+  5. A `Reply` with a call plays it with `watch` (sub-phase 18.19c): turn on, the Plezy link, `PLEZY_WAIT`, Select. The kind is the `title` of the intent of the reply pool, as in `dispatch`. The result is `{ "playing": <name> }`, with the name of the title in the data of the call.
+  6. Another decision, or a failed `watch` (no such title, or a failed call), gives an error. The tool result is then "error: " and the error text (sub-phase 7.4). The play announces no `failure`, because System Two gets the error and answers.
+- The play sends its result after `watch` ends, also after `PLEZY_WAIT`. Thus the result tells whether Select ran. The answer then continues about 3 s later.
+- The play calls have no `allowed_domains` check, as the calls of System One. Jarvis makes them from the catalog, not from the arguments of the model.
+- A prefetch runs each `Step::Plugin` with `Plugins::refresh`. The registry has no `play_on_tv`, so the step gets an error and plays nothing. Thus a prefetch has no side effect (`01-architecture.md` decision 22).
+- Before the first title refresh, the title list is empty. Step 3 then does not change the title, `watch` finds no title, and the result is an error with no call (sub-phase 18.19c).
+- The play is the stateless work of sub-phase 18.19c in one step of the job. Thus no Quint model changes.
+
+The tests of AC-18.19g-2 to AC-18.19g-6 use the title list and the keys of sub-phase 18.19c.
+
+**Acceptance criteria.**
+
+- AC-18.19g-1: When `play_tool` runs, the name is `play_on_tv`, and the parameters are an object with the one required string property `title` and `additionalProperties: false`.
+- AC-18.19g-2: When `FakeReasoner` gives `Step::Plugin` of `play_on_tv` with `title = "vision quest"` in the System Two job of a request from the Kitchen satellite, `FakeHome` records the three calls of AC-18.19d-1 in the same order, `FakePlugin` records no fetch, and the tool result is `{"playing":"VisionQuest"}`. With `title = "the matrix"`, the `media_content_id` is `plezy://play?server=abc123&id=1`.
+- AC-18.19g-3: When the title is "jeopardy", the tool result is `"not_in_library"`, and `FakeHome` records no call.
+- AC-18.19g-4: When the title list is empty, the tool result is an error, and `FakeHome` records no call.
+- AC-18.19g-5: When a new request comes on the satellite before the step of `play_on_tv`, `FakeHome` records no call.
+- AC-18.19g-6: When a prefetch answer gives `Step::Plugin` of `play_on_tv`, `FakeHome` records no call, and the tool result is an error.
+- AC-18.19g-7: When `run` builds the tools of the reasoner from a configuration with `[plugins.plex]` and the token variable, they have `get_new_shows` and `play_on_tv`. Without `[plugins.plex]`, they have neither.
+
+**Proofs.**
+
+- P-18.19g-1. Evidence: test.
+- P-18.19g-2. Argument: step 2 gives a clear prediction with the title slot of `tv_show`, so the title match gives "VisionQuest", and "the matrix" gives `play_movie` with "The Matrix" (P-18.9-5 to P-18.9-9). `watch` makes the calls of P-18.19c-1 with the mode of P-18.19d-1. The `play_on_tv` arm does not call `Plugins::fetch`.
+- P-18.19g-3. Argument: no title matches "jeopardy", so `decide` gives the `not_in_library` reply with no call (P-18.9-10), and step 4 makes no call.
+- P-18.19g-4. Argument: with an empty list, the title match does not change the prediction (P-18.9-11), and `watch` returns an error before its first call (P-18.19c-5).
+- P-18.19g-5. Requires: P-10.2-6. Argument: the job compares its generation before the play, as before a call (P-10.5b-1), and the new request changed it.
+- P-18.19g-6. Argument: the prefetch runs each `Step::Plugin` with `Plugins::refresh`, which returns an error for a name that the registry does not have, before any fetch. The prefetch arm has no `Home` call for it.
+- P-18.19g-7. Argument: `run` adds `play_tool()` only in the `Some` arm of the Plex plugin, which needs `[plugins.plex]` (P-18.11-7).
+
 ## Field Log
 
 These steps are not tests and gate nothing.
@@ -999,3 +1101,5 @@ These steps are not tests and gate nothing.
 13. After a release with sub-phase 18.19d, say "Play season two episode five of The Office", "Continue The Office" and "Play Bluey on the TV" from the Office. Make sure that Plezy plays that episode, the next episode to watch of The Office, and the next episode to watch of Bluey.
 14. Say "Pause the TV", "Skip ahead", "Stop the TV" and "Turn off the TV". Make sure that each acts on Plezy on the Apple TV, and that the TV turns off. If "Skip ahead" fails, record the `media_position` attributes of `media_player.living_room`.
 15. After a release with sub-phase 18.19e, find the `info` event with the number of hotwords in the log of the `jarvis` unit. Make sure that the number is about 2000 or less. In the Living Room, say "Put Survivor on the TV". Make sure that the transcript in the log has "Survivor", and that Plezy plays the next episode to watch.
+16. After a release with sub-phase 18.19f and a model trained on its seeds, say "Put The Floor on the TV" in the Living Room. Make sure that the log shows `tv_show` at `model.commit_threshold` or more with `show = the floor`, and that Plezy plays the next episode to watch of "The Floor".
+17. After a release with sub-phase 18.19g, ask for a Plex show and a Plex movie in words that System One does not know, for example "Could you start The Floor on the television?". Make sure that the log shows a `play_on_tv` call of System Two, that Plezy plays the title, and that the answer names it. Ask for a title that is not on the Plex server. Make sure that the answer says that it is not in the library.
