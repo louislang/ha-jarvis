@@ -1460,6 +1460,23 @@ impl Clock for FakeClock {
     }
 }
 
+/// Logs the request `id` with a good action mark at `second`.
+///
+/// # Panics
+///
+/// `second` is not a valid time.
+pub(crate) fn mark(log: &FakeLog, id: u64, second: i64) {
+    let time = Timestamp::from_second(second).expect("a time");
+    let interaction = json!({
+        "id": id, "time": time, "transcript": "turn on the lights", "model_context": "",
+        "model": FIXTURE, "top_labels": [], "slots": [], "service_calls": [], "responses": [],
+        "action": { "intent": "lights_on", "targets": [] }, "decision": "Reply",
+        "marks": [{ "interaction": id, "value": "Good", "time": time }],
+    });
+    let interaction = serde_json::from_value(interaction).expect("an interaction");
+    lock(&log.interactions).push((interaction, None));
+}
+
 /// A `Clock` that gives the time that a test sets.
 pub(crate) struct SetClock(pub(crate) Mutex<Timestamp>);
 

@@ -474,6 +474,7 @@ mod tests {
 
     use arc_swap::ArcSwap;
     use futures::channel::oneshot;
+    use jiff::SignedDuration;
     use jiff::Timestamp;
     use quint_connect::Driver;
     use quint_connect::State as ModelState;
@@ -483,6 +484,7 @@ mod tests {
     use serde::Deserialize;
     use serde_json::Map;
     use tokio::runtime::Runtime;
+    use tokio::sync::OwnedMutexGuard;
     use tokio::sync::watch;
     use tokio::task::JoinHandle;
 
@@ -497,6 +499,7 @@ mod tests {
     use crate::app::speech::Speech;
     use crate::app::training::FIXTURE;
     use crate::app::training::Training;
+    use crate::app::training::Trigger;
     use crate::domain::catalog::Catalog;
     use crate::domain::decide::PluginCall;
     use crate::domain::dialog::Key;
@@ -510,11 +513,14 @@ mod tests {
     use crate::domain::state::AreaId;
     use crate::domain::state_cache::StateCache;
     use crate::ports;
+    use crate::ports::Activity;
     use crate::ports::Handled;
     use crate::ports::Listening;
     use crate::ports::Work;
     use crate::testing::fakes::FakeClassifier;
+    use crate::testing::fakes::FakeLog;
     use crate::testing::fakes::FakeModelLoader;
+    use crate::testing::fakes::FakeModels;
     use crate::testing::fakes::FakeStt;
     use crate::testing::fakes::FakeTrainer;
     use crate::testing::fakes::FakeTts;
@@ -801,9 +807,14 @@ mod tests {
 
     /// A classifier that gives `label` with 0.9 to each prediction.
     fn always(label: &str) -> Arc<FakeClassifier> {
+        repeating(&predicted(label))
+    }
+
+    /// A classifier that gives `prediction` to each prediction.
+    fn repeating(prediction: &Prediction) -> Arc<FakeClassifier> {
         let classifier = Arc::new(FakeClassifier::default());
         for _ in 0..10_000 {
-            classifier.script(predicted(label));
+            classifier.script(prediction.clone());
         }
         classifier
     }
@@ -905,6 +916,18 @@ mod tests {
         /// The questions of the open dialog of each satellite, 0 without one.
         #[serde(rename = "composed::dialogs::turns")]
         turns: BTreeMap<String, u32>,
+        /// `Idle`, `RunPod` while `FakeRunPodTrainer` has a waiting call, else `Local`.
+        #[serde(rename = "composed::training::runState")]
+        run_state: Tag,
+        /// The change count.
+        #[serde(rename = "composed::training::changes")]
+        changes: usize,
+        /// The release state of `FakeModels`.
+        #[serde(rename = "composed::training::paused")]
+        paused: bool,
+        /// The accuracy level of the active classifier.
+        #[serde(rename = "composed::training::modelAcc")]
+        model_acc: usize,
     }
 
     /// The time, the outputs and the satellites that the driver saw, as `System` has them, and
@@ -965,20 +988,21 @@ mod tests {
     }
 
     impl ModelState<SystemDriver> for System {
-        /// What the driver read from the app for each request, the version of the classifier of
-        /// the app and its open dialogs.
+        /// What the driver read from the app for each request, the version and the level of the
+        /// classifier of the app, its open dialogs and its training runs.
         fn from_driver(driver: &SystemDriver) -> anyhow::Result<Self> {
             let phase = |r| *driver.phases.get(&r).unwrap_or(&"Listening");
             let read = |map: &BTreeMap<usize, usize>, r| map.get(&r).copied().unwrap_or(0);
             let tag = |r| Tag {
                 tag: phase(r).to_owned(),
             };
-            let seen = &driver.seen;
+            let (seen, runs) = (&driver.seen, &driver.runs);
+            let (active_model, model_acc) = driver.active_model()?;
             Ok(Self {
                 phase: per_request(tag),
                 handled: per_request(|r| read(&driver.handled, r)),
                 model_version: per_request(|r| read(&driver.models, r)),
-                active_model: driver.active_model()?,
+                active_model,
                 now: seen.now,
                 reply_time: seen.reply_time.clone(),
                 call_time: seen.call_time.clone(),
@@ -988,12 +1012,19 @@ mod tests {
                 started: seen.started.clone(),
                 newest: seen.newest.clone(),
                 turns: driver.turns(),
+                run_state: Tag {
+                    tag: runs.state().to_owned(),
+                },
+                changes: driver.runtime.block_on(runs.training.changes())?,
+                paused: runs.models.released(),
+                model_acc,
             })
         }
     }
 
     /// Replays `composed.qnt` against the app with port fakes on two satellites. Each request says
-    /// `TRANSCRIPT`, and each model version is a `FakeClassifier` that holds its predictions.
+    /// `TRANSCRIPT`, and each model version and accuracy level is a `FakeClassifier` that holds its
+    /// predictions.
     struct SystemDriver {
         /// The paused runtime of the app, the `handle` tasks and the training runs.
         runtime: Runtime,
@@ -1001,10 +1032,10 @@ mod tests {
         app: (Arc<App>, Arc<ArcSwap<Pools>>),
         /// The System One model of the app.
         current: Arc<CurrentClassifier>,
-        /// The classifiers of the model versions 1 and 2.
-        versions: [Arc<FakeClassifier>; 2],
-        /// The training run that swaps the model.
-        swap: Swap,
+        /// The classifier of each model version and accuracy level.
+        versions: [[Arc<FakeClassifier>; LEVELS]; 2],
+        /// The training runs on the System One model of the app.
+        runs: Runs,
         /// The listen session of each request, from `audio` to `commit`.
         sessions: BTreeMap<usize, Box<dyn Listening>>,
         /// The result sender of the waiting prediction and the `handle` task of each request.
@@ -1042,14 +1073,115 @@ mod tests {
     /// The sender of the next step of a System Two answer and the task of the answer.
     type Answering = (oneshot::Sender<Scripted>, JoinHandle<anyhow::Result<()>>);
 
-    /// A training run, its loader, its trainer, its clock and the folder of its model folders.
-    type Swap = (
-        Training,
-        Arc<FakeModelLoader>,
-        Arc<FakeTrainer>,
-        Arc<SetClock>,
-        TempDir,
-    );
+    /// The accuracy levels of `training.qnt`.
+    const LEVELS: usize = 3;
+
+    /// The training runs of `lights_on` with each example held out on the System One model of an
+    /// app, their trigger with the backoff 0 and `min_changes` 2, and their fakes.
+    struct Runs {
+        /// The run.
+        training: Arc<Training>,
+        /// The trigger of the run.
+        trigger: Arc<Trigger>,
+        /// `Training` while a run is active.
+        activity: Arc<Mutex<Activity>>,
+        /// The local trainer and `FakeRunPodTrainer`.
+        trainers: [Arc<FakeTrainer>; 2],
+        /// The gate of each trainer, which the driver holds between steps.
+        gates: [Option<OwnedMutexGuard<()>>; 2],
+        /// The number of ended `FakeRunPodTrainer` calls.
+        runpod_ends: usize,
+        /// The model loader.
+        loader: Arc<FakeModelLoader>,
+        /// The log of the marks.
+        log: Arc<FakeLog>,
+        /// The model sessions that a local attempt releases.
+        models: Arc<FakeModels>,
+        /// The clock of the runs.
+        clock: Arc<SetClock>,
+        /// The folder of the model folders.
+        _folder: TempDir,
+    }
+
+    /// `training` on the examples of `lights_on` with `min_changes` 2, its trigger with the
+    /// backoff 0, and the activity of the trigger.
+    fn triggered(mut training: Training) -> (Arc<Training>, Arc<Trigger>, Arc<Mutex<Activity>>) {
+        let mut catalog = Catalog::clone(&training.catalog);
+        catalog.intents.retain(|intent| intent.name == "lights_on");
+        catalog.unknown_examples.clear();
+        training.catalog = Arc::new(catalog);
+        training.config.train.min_changes = 2;
+        let (training, activity) = (Arc::new(training), Arc::<Mutex<Activity>>::default());
+        let trigger = Trigger::new(
+            Arc::clone(&training),
+            SignedDuration::ZERO,
+            Arc::clone(&activity),
+        );
+        (training, Arc::new(trigger), activity)
+    }
+
+    /// A clock at the Unix epoch.
+    fn epoch() -> Arc<SetClock> {
+        Arc::new(SetClock(Mutex::new(Timestamp::UNIX_EPOCH)))
+    }
+
+    /// The held gate of `trainer`, so that its next call waits.
+    fn closed(trainer: &FakeTrainer) -> Option<OwnedMutexGuard<()>> {
+        Arc::clone(&trainer.gate).try_lock_owned().ok()
+    }
+
+    impl Runs {
+        /// The runs on the classifier `current`.
+        fn new(current: &Arc<CurrentClassifier>) -> Self {
+            let folder = tempfile::tempdir().expect("a temporary folder");
+            let (training, local) = fakes::training(1.0, folder.path());
+            let (loader, log) = (Arc::<FakeModelLoader>::default(), Arc::<FakeLog>::default());
+            let (models, runpod) = (
+                Arc::<FakeModels>::default(),
+                fakes::trainer_in(folder.path()),
+            );
+            let clock = epoch();
+            let training = Training {
+                log: Arc::clone(&log) as _,
+                runpod: Some(Arc::clone(&runpod) as _),
+                loader: Arc::clone(&loader) as _,
+                classifier: Arc::clone(current),
+                clock: Arc::clone(&clock) as _,
+                models: Arc::clone(&models) as _,
+                ..training
+            };
+            let (training, trigger, activity) = triggered(training);
+            let trainers = [local, runpod];
+            let gates = trainers.each_ref().map(|trainer| closed(trainer));
+            Self {
+                training,
+                trigger,
+                activity,
+                trainers,
+                gates,
+                runpod_ends: 0,
+                loader,
+                log,
+                models,
+                clock,
+                _folder: folder,
+            }
+        }
+
+        /// True while `FakeRunPodTrainer` has a waiting call.
+        fn on_runpod(&self) -> bool {
+            self.trainers[1].calls.lock().expect("no panic").len() > self.runpod_ends
+        }
+
+        /// The run state of `training.qnt`.
+        fn state(&self) -> &'static str {
+            match (*self.activity.lock().expect("no panic"), self.on_runpod()) {
+                (Activity::Training, true) => "RunPod",
+                (Activity::Training, false) => "Local",
+                _ => "Idle",
+            }
+        }
+    }
 
     /// The result sender of a waiting prediction and its `handle` task.
     type Waiting = (
@@ -1063,11 +1195,8 @@ mod tests {
             let mut runtime = tokio::runtime::Builder::new_current_thread();
             let runtime = runtime.enable_time().start_paused(true).build();
             let runtime = runtime.expect("the runtime builds");
-            let versions = [always("lights_on"), always("lights_on")];
-            for version in &versions {
-                version.hold(TRANSCRIPT);
-            }
-            let first = Arc::clone(&versions[0]) as _;
+            let versions = levels();
+            let first = Arc::clone(&versions[0][0]) as _;
             let current = Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), first));
             let config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
             let app = runtime.block_on(system_app(&config, Arc::clone(&current)));
@@ -1075,7 +1204,7 @@ mod tests {
             Self {
                 runtime,
                 app: (app, pools),
-                swap: training_run(&current),
+                runs: Runs::new(&current),
                 current,
                 versions,
                 sessions: BTreeMap::new(),
@@ -1120,8 +1249,8 @@ mod tests {
         fn handle(&mut self, r: usize) -> anyhow::Result<()> {
             let task = self.spawn(r, TRANSCRIPT);
             let mut held = || {
-                let mut versions = self.versions.iter().zip(1..);
-                versions.find_map(|(version, v)| Some((version.take_held()?, v)))
+                let mut versions = self.versions.iter().flatten().zip(0..);
+                versions.find_map(|(version, i)| Some((version.take_held()?, i / LEVELS + 1)))
             };
             let found = settle(&self.runtime, &task, &mut held);
             let (sender, v) = found.context("the prediction does not wait")?;
@@ -1151,7 +1280,7 @@ mod tests {
         /// satellite without a prediction, in the active model version.
         fn answer(&mut self, r: usize, text: &'static str) -> anyhow::Result<()> {
             let ended = self.runtime.block_on(self.spawn(r, text))?;
-            self.models.insert(r, self.active_model()?);
+            self.models.insert(r, self.active_model()?.0);
             self.set_newest(r);
             self.ended(r, ended);
             Ok(())
@@ -1201,14 +1330,15 @@ mod tests {
             }
         }
 
-        /// The model version whose classifier the app uses.
-        fn active_model(&self) -> anyhow::Result<usize> {
+        /// The model version and the accuracy level of the classifier of the app.
+        fn active_model(&self) -> anyhow::Result<(usize, usize)> {
             let active = Arc::clone(&self.current.0.load().classifier);
             let same = |version: &Arc<FakeClassifier>| {
                 std::ptr::addr_eq(Arc::as_ptr(version), Arc::as_ptr(&active))
             };
-            let index = self.versions.iter().position(same);
-            Ok(index.context("an unknown classifier")? + 1)
+            let index = self.versions.iter().flatten().position(same);
+            let index = index.context("an unknown classifier")?;
+            Ok((index / LEVELS + 1, index % LEVELS))
         }
 
         /// Runs the work after the reply of replied request `r`, or sends one `Call` step to the
@@ -1308,13 +1438,60 @@ mod tests {
             names.into_iter().zip(idle).collect()
         }
 
-        /// A training run whose loader gives the classifier of model version `v`.
-        fn swap(&mut self, v: usize) -> anyhow::Result<()> {
-            let (training, loader, trainer, clock, _) = &self.swap;
-            loader.script(Arc::clone(&self.versions[v - 1]) as _);
-            trainer.results.lock().expect("no panic").push_back(Ok(()));
-            *clock.0.lock().expect("no panic") += Duration::from_secs(1);
-            self.runtime.block_on(training.run())
+        /// Moves the clock of the runs one second later, so that each mark and each run has its
+        /// own time.
+        fn later(&self) -> Timestamp {
+            let mut now = self.runs.clock.0.lock().expect("no panic");
+            *now += Duration::from_secs(1);
+            *now
+        }
+
+        /// Logs one request with a good action mark.
+        fn change(&self) {
+            let now = self.later().as_second();
+            fakes::mark(&self.runs.log, now.unsigned_abs(), now);
+        }
+
+        /// Starts a run with the voice trigger, else with the change count, and runs it until it
+        /// waits at the gate of the local trainer, after the pause.
+        fn start_run(&mut self, voice: bool) -> anyhow::Result<()> {
+            let trigger = Arc::clone(&self.runs.trigger);
+            self.later();
+            if voice {
+                let _context = self.runtime.enter();
+                trigger.voice();
+            } else {
+                self.runtime.block_on(trigger.check())?;
+            }
+            self.settle_runs();
+            Ok(())
+        }
+
+        /// Ends the waiting call of the trainer of the current attempt with `result`, and runs
+        /// the run until it waits at the next gate or ends.
+        fn end_attempt(&mut self, result: Result<(), &'static str>) {
+            let index = usize::from(self.runs.on_runpod());
+            self.runs.runpod_ends += index;
+            let trainer = Arc::clone(&self.runs.trainers[index]);
+            trainer.results.lock().expect("no panic").push_back(result);
+            self.runs.gates[index] = None;
+            self.settle_runs();
+            self.runs.gates[index] = closed(&trainer);
+        }
+
+        /// The current attempt gives the classifier of model version `v` at the accuracy level
+        /// `a`.
+        fn swap(&mut self, v: usize, a: usize) {
+            self.runs
+                .loader
+                .script(Arc::clone(&self.versions[v - 1][a]) as _);
+            self.end_attempt(Ok(()));
+        }
+
+        /// Runs each task until it waits.
+        fn settle_runs(&self) {
+            let sleep = async { tokio::time::sleep(Duration::from_millis(1)).await };
+            self.runtime.block_on(sleep);
         }
 
         /// Advances the time of the driver by one unit, and the clock of the conversation by 5 s:
@@ -1390,7 +1567,7 @@ mod tests {
                 reply(r: usize) => self.finish(r, Ok(predicted("lights_on")))?,
                 defer(r: usize) => self.finish(r, Ok(predicted("unknown")))?,
                 failRequest(r: usize) => self.finish(r, Err(anyhow::anyhow!("the model failed")))?,
-                swap(v: usize) => self.swap(v)?,
+                swap(v: usize, a: usize) => self.swap(v, a),
                 call(r: usize) => self.call(r)?,
                 pipelineEnd(s: String) => self.pipeline_end(&s)?,
                 announce(r: usize) => self.announce(r)?,
@@ -1401,16 +1578,19 @@ mod tests {
 
         /// Runs the step `step` that only `composed.qnt` has. A held prediction of `unknown` is
         /// `unclear` for a request that holds a dialog. The steps of the commit policies, the
-        /// training trigger, the learned intents and the prefetch change nothing that the driver
-        /// compares.
+        /// learned intents and the prefetch change nothing that the driver compares.
         fn compose(&mut self, step: &Step) -> anyhow::Result<()> {
             switch!(step {
                 unclear(r: usize) => self.finish(r, Ok(predicted("unknown")))?,
                 ask(r: usize) => self.finish(r, Ok(nowhere("lights_on")))?,
                 fill(r: usize) => self.answer(r, "kitchen")?,
                 cancel(r: usize) => self.answer(r, "cancel")?,
-                listen => {}, autoStart => {}, voiceStart => {}, change => {}, localFail => {},
-                runpodFail => {}, propose => {}, approve => {}, reject => {}, writeRequest => {},
+                autoStart => self.start_run(false)?,
+                voiceStart => self.start_run(true)?,
+                change => self.change(),
+                localFail => self.end_attempt(Err("CUDA out of memory")),
+                runpodFail => self.end_attempt(Err("the RunPod job failed")),
+                listen => {}, propose => {}, approve => {}, reject => {}, writeRequest => {},
                 failWrite => {}, prefetch => {}, prefetchStep => {},
             })
         }
@@ -1448,6 +1628,25 @@ mod tests {
             slots,
             ..predicted(label)
         }
+    }
+
+    /// The classifier of each model version and accuracy level, which holds each prediction of
+    /// `TRANSCRIPT`. On the examples of `lights_on`, level 0 gives `unknown`, level 1 `lights_on`
+    /// in an area that the house does not have, and level 2 `lights_on`.
+    fn levels() -> [[Arc<FakeClassifier>; LEVELS]; 2] {
+        let level = |prediction: Prediction| {
+            let classifier = repeating(&prediction);
+            classifier.hold(TRANSCRIPT);
+            classifier
+        };
+        let version = || {
+            [
+                nowhere("unknown"),
+                nowhere("lights_on"),
+                predicted("lights_on"),
+            ]
+        };
+        [(); 2].map(|()| version().map(level))
     }
 
     /// The app of `config` with the System One model `current`, the listener of
@@ -1493,7 +1692,7 @@ mod tests {
         let reasoner = Arc::new(FakeReasoner::default());
         reasoner.hold_steps();
         let margin = Duration::from_millis(config.announce.margin_ms);
-        let clock = Arc::new(SetClock(Mutex::new(Timestamp::UNIX_EPOCH)));
+        let clock = epoch();
         Ok(Probes {
             home,
             reasoner,
@@ -1599,46 +1798,31 @@ mod tests {
         }
     }
 
-    /// A training run of `lights_on` with each example held out, on the classifier `current`.
-    fn training_run(current: &Arc<CurrentClassifier>) -> Swap {
-        let models = tempfile::tempdir().expect("a temporary folder");
-        let (training, trainer) = fakes::training(1.0, models.path());
-        let mut catalog = Catalog::clone(&training.catalog);
-        catalog.intents.retain(|intent| intent.name == "lights_on");
-        catalog.unknown_examples.clear();
-        let loader = Arc::new(FakeModelLoader::default());
-        let clock = Arc::new(SetClock(Mutex::new(Timestamp::UNIX_EPOCH)));
-        let training = Training {
-            loader: Arc::clone(&loader) as _,
-            classifier: Arc::clone(current),
-            clock: Arc::clone(&clock) as _,
-            catalog: Arc::new(catalog),
-            ..training
-        };
-        (training, loader, trainer, clock, models)
-    }
-
-    /// AC-16.4-1. `quint_run` replays 100 traces by default.
+    /// AC-16.4b-1. `quint_run` replays 100 traces by default.
     #[quint_run(spec = "quint/composed.qnt", max_steps = 30, seed = "1")]
-    fn ac_16_4_1_conformance() -> impl Driver {
+    fn ac_16_4b_1_conformance() -> impl Driver {
         SystemDriver::new()
     }
 
-    /// AC-16.2b-2. The steps of `ac_16_1_3_swap_during_request` of `jarvis.qnt`: a swap to
-    /// version 2 before `handle`, and a swap to version 1 between `handle` and the reply.
+    /// AC-16.2b-2. The steps of `ac_16_1_3_swap_during_request` of `jarvis.qnt` in
+    /// `composed.qnt`: a local swap to version 2 before `handle`, and a `RunPod` swap to version 1
+    /// between `handle` and the reply.
     #[test]
     fn ac_16_2b_2_reply_uses_the_model_version_of_handle() -> anyhow::Result<()> {
         let mut driver = SystemDriver::new();
         driver.audio(1)?;
         driver.commit(1)?;
-        driver.swap(2)?;
+        driver.start_run(true)?;
+        driver.swap(2, 0);
+        driver.start_run(true)?;
+        driver.end_attempt(Err("CUDA out of memory"));
         driver.handle(1)?;
-        driver.swap(1)?;
+        driver.swap(1, 0);
         driver.finish(1, Ok(predicted("lights_on")))?;
         let state = System::from_driver(&driver)?;
         assert_eq!((state.model_version[&1], state.active_model), (2, 1));
         assert_eq!(state.phase[&1].tag, "Replied");
-        let first = driver.versions[0].calls();
+        let first = driver.versions[0][0].calls();
         assert!(first.iter().all(|call| call.1 != TRANSCRIPT), "{first:?}");
         Ok(())
     }

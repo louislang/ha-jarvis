@@ -1056,20 +1056,6 @@ mod tests {
         vec![Slot { name, value }]
     }
 
-    /// Logs the request `id` with a good action mark at `second`.
-    fn mark(log: &FakeLog, id: u64, second: i64) {
-        let time = Timestamp::from_second(second).expect("a time");
-        let interaction = json!({
-            "id": id, "time": time, "transcript": "turn on the lights", "model_context": "",
-            "model": FIXTURE, "top_labels": [], "slots": [], "service_calls": [], "responses": [],
-            "action": { "intent": "lights_on", "targets": [] }, "decision": "Reply",
-            "marks": [{ "interaction": id, "value": "Good", "time": time }],
-        });
-        let interaction = serde_json::from_value(interaction).expect("an interaction");
-        let mut interactions = log.interactions.lock().expect("no test panics");
-        interactions.push((interaction, None));
-    }
-
     /// Scripts the new classifier `new` and the trainer result `result` of the next run.
     fn script(harness: &Harness, new: &Arc<FakeClassifier>, result: Result<(), &'static str>) {
         harness.loader.script(Arc::clone(new) as _);
@@ -1135,7 +1121,7 @@ mod tests {
         for slots in [Vec::new(), wrong_slot()] {
             let (old, new) = (classifier(&[]), classifier(&slots));
             let harness = swap(&old);
-            mark(&harness.log, 1, START - 1);
+            fakes::mark(&harness.log, 1, START - 1);
             assert_eq!(harness.training.changes().await?, 1);
             script(&harness, &new, Ok(()));
             harness.training.run().await?;
@@ -1149,7 +1135,7 @@ mod tests {
     async fn ac_13_9b_4_trainer_error_keeps_model_and_count() -> anyhow::Result<()> {
         let (old, new) = (classifier(&wrong_slot()), classifier(&[]));
         let harness = swap(&old);
-        mark(&harness.log, 1, START - 1);
+        fakes::mark(&harness.log, 1, START - 1);
         script(&harness, &new, Err("CUDA out of memory"));
         assert!(harness.training.run().await.is_err(), "the run succeeded");
         assert_eq!(
@@ -1187,11 +1173,11 @@ mod tests {
     async fn ac_13_9b_6_mark_during_run_counts_for_the_next() -> anyhow::Result<()> {
         let old = classifier(&[]);
         let harness = swap(&old);
-        mark(&harness.log, 1, START - 1);
+        fakes::mark(&harness.log, 1, START - 1);
         script(&harness, &old, Ok(()));
         let closed = harness.trainer.gate.lock().await;
         let task = started(&harness).await;
-        mark(&harness.log, 2, START + 1);
+        fakes::mark(&harness.log, 2, START + 1);
         drop(closed);
         task.await??;
         assert_eq!(harness.training.changes().await?, 1);
@@ -1249,7 +1235,7 @@ mod tests {
     /// Logs `count` good action marks before `START`.
     fn marks(harness: &Harness, count: u64) {
         for id in 0..count {
-            mark(&harness.log, id, START - 1);
+            fakes::mark(&harness.log, id, START - 1);
         }
     }
 
@@ -1785,7 +1771,7 @@ mod tests {
                 initRunPod => *self = Self::new(true),
                 change => {
                     let now = self.harness.training.clock.now().as_second();
-                    mark(&self.harness.log, now.unsigned_abs(), now);
+                    fakes::mark(&self.harness.log, now.unsigned_abs(), now);
                 },
                 autoStart => self.runtime.block_on(self.trigger.check())?,
                 voiceStart => {
