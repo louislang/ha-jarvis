@@ -312,7 +312,8 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `quint/learned.qnt` | Model | Learned intent lifecycle, approval and plugin requests. | 14.3 |
 | `quint/prefetch.qnt` | Model | Prefetch window, refresh, freshness and side effects. | 14.8 |
 | `quint/speaker.qnt` | Model | Speaker identification and enrollment. | 15.5 |
-| `quint/jarvis.qnt` | Model | The system model. It composes the other models. | 16.1 |
+| `quint/jarvis.qnt` | Model | The system model: the request lifecycle on two satellites. | 16.1 |
+| `quint/composed.qnt` | Model | The system model composed with the component models, and one wrapper module for each component model. | 16.3 |
 | `src/lib.rs` | Root | Module tree, `Config`, `SystemClock`, `LiveModels`, `App` (implements `Assistant` by delegation), `run`, the `dataset` command, `main`. | 0.1 |
 | `src/main.rs` | Root | Binary entry point. `main` only calls `jarvis::main`. | 0.1 |
 | `src/ports.rs` | Ports | All port traits and their data types. | 2.1 |
@@ -809,3 +810,4 @@ Each model has state variables, actions and named invariants. `02-rules.md` sect
 | `prefetch.qnt` | Prefetch | `domain/learn.rs`, `app/background.rs` | `NoCallFromPrefetch`, `ServedAnswerIsFresh`, `PrefetchOnlyInWindow`, `NoEarlyRefresh` |
 | `speaker.qnt` | Speaker identification and voice assignment | `domain/speaker.rs`, `app/review.rs` | `SpeakerIsCandidate`, `NoVoiceOnlyEnrollment`, `ProfilesBounded`, `PickWins` |
 | `jarvis.qnt` | System | All use cases | `OneHandledPerRequest`, `ReplyBeforeCall`, `FillerBeforeAnswer`, `ModelSwapAtomic`, `NoTalkOver` |
+| `composed.qnt` | System with the components | All use cases | `SystemInvariants`, `ComponentInvariants` |

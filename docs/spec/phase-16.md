@@ -1,6 +1,6 @@
 # Phase 16: System Model
 
-This phase composes the component models into one Quint model of the whole request lifecycle and checks the Rust application against it. Sub-phases 16.1 to 16.2c model and check the lifecycle of requests on two satellites. Sub-phases 16.3 and 16.4 add the component models to it.
+This phase composes the component models into one Quint model of the whole request lifecycle and checks the Rust application against it. Sub-phases 16.1 to 16.2c model and check the lifecycle of requests on two satellites. Sub-phases 16.3 and 16.4 compose it with the component models in `composed.qnt`.
 
 ---
 
@@ -158,46 +158,78 @@ Sub-phase 16.1b changes `newest` from `audio` to `handle`, adds `started` and ad
 
 ### 16.3 Composed Quint Model
 
-**Goal:** Add the component models to `quint/jarvis.qnt`. Prove that the invariants of each component still hold when the components run together in the request lifecycle.
+**Goal:** Add `quint/composed.qnt`, the composition of the system model with the component models. Prove that the invariants of each component and the system invariants still hold when the components run together in the request lifecycle.
 
 - **Implements:** G19. **Depends on:** 16.2c.
-- **Files:** modify `quint/jarvis.qnt`.
-- **Quint:** `jarvis.qnt`, which imports one instance of `commit` for each request, one instance of `announce` for each satellite, and one instance of `dialog`, `training`, `learned` and `prefetch`, with small constants. `cache_sync`, `backfill` and `speaker` are not in the composition: the request reads the cache, a backfill changes only pools, and the speaker is a slot value. Their own models cover them.
+- **Files:** create `quint/composed.qnt`, modify `justfile`.
+- **Quint:** `composed.qnt`. It imports `jarvis.qnt`, one instance of `commit` for each request, one instance of `announce` for each satellite, and one instance of `dialog`, `training`, `learned` and `prefetch`. `cache_sync`, `backfill` and `speaker` are not in the composition: the request reads the cache, a backfill changes only pools, and the speaker is a slot value. Their own models cover them. `jarvis.qnt` does not change, and the driver of sub-phases 16.2 to 16.2c continues to replay it.
 
 **Model.**
 
-- `commit(r)` uses the `commit` instance of `r`. `announce(r)` and `pipelineEnd(s)` use the `announce` instance of `s`.
-- New actions: `ask(r)` and `answer(r)` (from `dialog`; `ask` increments `handled` and moves `Handling` to `Replied`), and `swap` (from `training`: `activeModel := v`).
-- The pause of sub-phase 13.10e: the `training` start actions are enabled only when no request is in `Listening` or `Handling`. `release` waits for the uses in progress, and the mute calls do not wait for a satellite. Thus the driver completes a start action without a later trace step. While `training.paused`, `audio`, `handle` and `answer` are not enabled.
-- The invariants of the imported models also hold in the composition.
+- Quint instantiates only a module that has a constant. Thus `composed.qnt` has one wrapper module for each imported model (`commitOf`, `announceOf`, `dialogOf`, `trainingOf`, `learnedOf`, `prefetchOf`). Each wrapper has the constant `ID`, imports and exports its model, and adds an action that keeps the state of the model (`unchanged`). `announceOf` also adds `play(r)`: `arrive` and `start` of the next sentence of `r` in one step, on an idle satellite that plays no announce. `dialogOf` also adds `take(k)` (`closeDialog(k)`: the dialog of `k` closes and the generation of `k` increases), `openAt(k, time)` (`open(k)`, asked at `time`) and `putBack(k, d, turns, time)` (the dialog of `k` opens again for request `d` with `turns + 1` questions, asked at `time`, and the generation of `k` does not change).
+- The state of `composed.qnt` adds `held: REQUEST -> (int, int)`: the dialog request and the questions of the dialog that each request holds, `(0, 0)` for none. Only `handle(r)`, `ask(r)`, `unclear(r)`, `reply(r)`, `failRequest(r)` and `defer(r)` change `held[r]`. It also adds `heard: REQUEST -> int`, the time of `handle(r)` (`heard.time` in `Conversation::handle`), and `work: REQUEST -> Work`, the work after the reply: `Calls` (the default), `Asks` (a question that `Queues::queued` plays) or `Silent` (no work: a cancel, and the `failure` reply at the turn limit).
+- Each lifecycle action of `jarvis.qnt` becomes an action of `composed.qnt` with the same name. It applies the action of `jarvis.qnt` with its guards and effects, the component effects below and the pause guard. A component that the action does not name does not change.
+  - `audio(r)`, `commit(r)`: no component effect.
+  - `call(r)`: for `Calls`, no further guard. For `Asks`, also requires that `sat(r)` is idle and `r` is its newest request: `Queues::queued` waits for `idle`, plays the question `announce.margin_ms` later, and drops the question of an older request. `Silent` is never enabled.
+  - `reply(r)`, `failRequest(r)`, `defer(r)`: `held[r] := (0, 0)`. A request that holds a dialog and gets a clear prediction or a failed prediction drops the dialog. `defer(r)` requires that `r` holds no dialog, because an `unknown` prediction of a request that holds a dialog is `unclear(r)`.
+  - `handle(r)`: `request` on the announce queue of `sat(r)` (the queue numbers the requests of a satellite from 1), and `request` on `prefetch`. Thus the newest request of the queue changes at `handle`, as in sub-phase 16.1b. `take(sat(r))` on `dialog`, `held[r]` gets the open dialog of `sat(r)`, if any, and `heard[r] := now`. `Conversation::handle` also takes the open dialog (`take_dialog`) and then closes the dialog of the satellite (`next_generation`), before the prediction.
+  - `pipelineEnd(s)`: `pipelineEnd` on the announce queue of `s`.
+  - `announce(r)`: `play` on the announce queue of `sat(r)`. `Conversation::say` gives each sentence of a System Two answer to `Queues::queued`, which plays it `announce.margin_ms` after the satellite is idle. `announce(r)` requires an idle satellite, so the sentence starts when it arrives.
+  - `swap(v, a)`: the current training attempt (`localDone` or `runpodDone`) gives a model of accuracy `a`, and `a` is not less than the accuracy of the installed model. `activeModel := v`.
+  - `tick`: `tick` on `dialog` and `prefetch`, and `finish` on each announce queue.
+- New actions. Each keeps the lifecycle state, except `ask`, `fill`, `cancel` and `unclear`:
+  - `listen(r, kind, voiced, nonEmpty, conf)`: while `r` is `Listening`, the commit policy of `r` takes one event: a chunk for `kind` 0, a VAD decision for 1, else a partial. `commit(r)` ends the utterance: the policy committed, or HA ended the audio. `commit(r)` does not wait for the commit of the policy, and the policy of `r` stops at `commit(r)`. A commit that waits for the policy needs 7 events or more, so the lifecycle does not get to `handle` in a trace of 30 steps.
+  - `ask(r)`: request `r` asks the user a question. `openAt(sat(r), heard[r])`, because `Conversation::open` gives the dialog the time of `handle`. Only when `r` is the newest request of `sat(r)`, because the question of an older request opens no dialog (sub-phase 16.1b), and only when `now - heard[r] < TIMEOUT`, because a dialog that timed out is not open. `held[r] := (0, 0)`, `work[r] := Asks`. `Handling` to `Replied`, `handled += 1`.
+  - `fill(r)` and `cancel(r)`: the text of `Committed` request `r` is a choice of the open dialog of `sat(r)`, or a cancel phrase. `Conversation::route` then replies without a prediction, so the request goes from `Committed` to `Replied` in one step: the effects of `handle(r)` and `reply(r)` of `jarvis.qnt` (`lastAction := Handle(r)`, `modelVersion[r] := activeModel`, `newest[sat(r)] := r`, `handled[r] := 1`, `replyTime[r] := now`), the announce queue and prefetch effects of `handle(r)`, and `fill` or `cancel` on `dialog` for `sat(r)`. `heard[r] := now`. `work[r]` is `Calls` for `fill(r)` and `Silent` for `cancel(r)`.
+  - `unclear(r)`: the prediction of `Handling` request `r`, which holds a dialog, is not clear. Below `MAX_TURNS` questions, `r` asks again (`Replied`, `handled += 1`, `work[r] := Asks`), and `putBack(sat(r), d, turns, heard[r])` when `r` is the newest request of `sat(r)` and `now - heard[r] < TIMEOUT`, because `ask_again` gives `next_turn` the time of `handle`. At `MAX_TURNS`, `r` gives the `failure` reply, and `work[r] := Silent`. `held[r] := (0, 0)`.
+  - `autoStart`, `voiceStart`, `change`, `localFail`, `runpodFail`: the actions of `training` with the same names.
+  - `propose(c, suitable)`, `approve(c)`, `reject(c)`, `writeRequest(c)`, `failWrite(c)`: the actions of `learned` (`failWrite` is `failRequest`).
+  - `prefetch`, `prefetchStep(answerStep)`: the actions of `prefetch`.
+- The pause of sub-phase 13.10e: `autoStart` and `voiceStart` are enabled only when no started request is in `Listening` or `Handling`. `release` waits for the uses in progress, and the mute calls do not wait for a satellite. Thus the driver completes a start action without a later trace step. While `training.paused`, `audio`, `handle`, `fill` and `cancel` are not enabled. Thus only the RunPod attempt can swap while a request is in `Handling`.
+- `training` starts with `initRunPod`: the RunPod fallback is configured.
+- Invariants: `SystemInvariants` (the five system invariants of `jarvis.qnt`) and `ComponentInvariants` (`allInvariants` of each instance). `allInvariants` is both.
+- Limits: `composed.qnt` defines `pure val VERIFY_STEPS = 5` and `pure val SAMPLES = 1000`. A step of the composition takes about 100 times longer in simulation than a step of `jarvis.qnt`, and `quint verify` takes about 2 minutes at 5 steps and about 3 times longer for each further step. The `quint` recipe of the `justfile` reads `SAMPLES` as it reads `VERIFY_STEPS` (`02-rules.md` section 4, rule 5).
 
 **Acceptance criteria.**
 
 - AC-16.3-1 [Quint]: `quint typecheck` passes.
-- AC-16.3-2 [Quint]: The invariants of each imported model hold in the composition, in simulation.
-- AC-16.3-3 [Quint]: The five system invariants of sub-phase 16.1 hold in the composition, in simulation and to 10 steps in `quint verify`.
+- AC-16.3-2 [Quint]: `ComponentInvariants` holds in simulation.
+- AC-16.3-3 [Quint]: `SystemInvariants` holds in simulation and to 5 steps in `quint verify`.
 
 **Proofs.**
 
-- P-16.3-2. Argument: each imported action keeps its own guard and effect, and the composition adds no action that writes the state of an imported model. The pause only adds guards. So each inductive invariant of a component (Phases 4 to 15) still holds.
-- P-16.3-3. Argument: the imported actions replace the simple actions of sub-phase 16.1 with the same guards (P-4.7-2, P-4.7-4), and `ask` increments `handled` only from `Handling`. So the arguments of P-16.1-2 still apply.
+- P-16.3-2. Argument: each imported action keeps its own guard and effect. The pause only adds guards. So each inductive invariant of a component (Phases 4 to 15) still holds for the imported actions. The held dialog actions of `dialogOf` keep `TurnLimit` and `NoCallAfterCancel`: `take` is `closeDialog`, `openAt` is `open` with an earlier time, and `putBack` sets at most `MAX_TURNS` questions. `putBack` opens the dialog of a request that is held, not open, and has no call or cancel, because only `fill` and `cancel` of an open dialog add a call or a cancel. `play` is `arrive` and then `start` with an empty queue: it starts only on an idle satellite (`AnnounceWhenIdle`), with the newest request (`NoStaleAnnounce`), and with the next sentence number of `r` (`SentencesInOrder`).
+- P-16.3-3. Argument: each lifecycle action applies the action of `jarvis.qnt` with its guards and effects, and only adds guards and component effects. `ask` and `unclear` increment `handled` only from `Handling`, as `reply` does. `fill` and `cancel` have the guards of `handle` and set `handled` to 1 from `Committed`, with `lastAction = Handle(r)` and the `modelVersion` of `activeModel`, so `OneHandledPerRequest` and `ModelSwapAtomic` hold. The new component actions do not change the lifecycle state. So the arguments of P-16.1-2 still apply.
 - P-16.3-1. Evidence: model check.
 
 ---
 
 ### 16.4 Composed Conformance
 
-**Goal:** Extend the system driver to the composed actions: questions, answers and training swaps. The whole Rust application now follows the composed model on the replayed traces.
+**Goal:** Point the system driver at `composed.qnt` and extend it to the composed actions: questions, answers, training runs and announce queues. The whole Rust application now follows the composed model on the replayed traces.
 
 - **Implements:** G19. **Depends on:** 16.3.
 - **Files:** modify `src/testing/e2e.rs`.
-- **Quint:** `jarvis.qnt` (conformance).
+- **Quint:** `composed.qnt` (conformance).
 
-**Model.** The driver of sub-phases 16.2 to 16.2c maps `ask` and `answer` through `Assistant::handle` with an open dialog, and `swap` through the training use case with `FakeTrainer`. A start action of `training` also runs the pause with `FakeModels`. The driver does not compare the `switch` calls of the mute, because `jarvis.qnt` has no action for them. After each step, it also reads the dialogs and the training state.
+**Model.**
+
+- The conformance tests of the system driver replay `composed.qnt` in place of `jarvis.qnt`. The lifecycle variables of `composed.qnt` have the names of `jarvis.qnt`.
+- The driver of sub-phases 16.2 to 16.2c keeps its steps for `audio`, `commit`, `handle`, `reply`, `defer`, `failRequest`, `call` and `pipelineEnd`. The transcript of `handle(r)` is no choice of a dialog and no cancel phrase, so `Conversation::route` always calls the prediction, and `handle(r)` stops when the prediction waits, also when `r` takes a dialog. It maps the other actions:
+  - `tick`: the time of the driver advances by one unit, and the clock of the conversation (a `SetClock` in place of the `FakeClock` of `fake_two`) advances by one unit of 5 s: the `dialog.timeout_s` of 15 s in `jarvis.toml` over the `TIMEOUT` of 3 units of `dialog.qnt`.
+  - `ask(r)`: the held prediction of `r` gets `lights_on` with an `area` slot that names no area of the reference house. `decide` then asks `ask_area` with a `Slot` dialog whose choices are the areas. The reply has the question as its `after` work.
+  - `fill(r)` and `cancel(r)`: `Assistant::handle` of `r` with the name of an area of the reference house, or with a cancel phrase, as its transcript. It ends without a prediction. The model version of `r` is the active model version at this step.
+  - `unclear(r)`: the held prediction of `r` gets `unknown`. Below the turn limit, the reply has the question as its `after` work.
+  - `call(r)` of a request with `Asks`: the driver runs its `after` work. `Queues::queued` sees the idle satellite, sleeps `announce.margin_ms`, which the paused runtime advances, and calls `assist_satellite.start_conversation`, which the driver stamps as the call of `r`.
+  - `announce(r)`: as in sub-phase 16.2c, one sentence to the System Two answer of `r` and a clock advance of `announce.margin_ms`.
+  - The training actions as the driver of `training.qnt` (sub-phases 13.9c, 13.10 and 13.10e) maps them: the trigger has the backoff 0 and `min_changes` 2, each trainer waits at a gate, and `change` writes one mark. `autoStart` and `voiceStart` start a run, which stops at the gate of the local trainer after the pause with `FakeModels`. `localFail` and `runpodFail` open the gate with an error. `swap(v, a)` opens the gate with a success, and the loader gives the classifier of version `v` at the accuracy level `a` (one `FakeClassifier` for each pair).
+  - No-op, because the driver does not compare that state: `listen`, `propose`, `approve`, `reject`, `writeRequest`, `failWrite`, `prefetch` and `prefetchStep`.
+- The driver does not compare the `switch` calls of the mute, because `composed.qnt` has no action for them.
+- After each step, the driver also reads the open dialogs and the training state. A dialog is open when the dialog map has it and it did not time out at the conversation clock, because `Dialogs` removes a timed-out dialog only at `take`. The driver compares the satellite and the number of questions of each open dialog, and the run state, the change count, `paused` and the accuracy level of the active model. It does not compare `held`, `heard` or `work`, which are local to a `handle` call or its `after` work.
 
 **Acceptance criteria.**
 
-- AC-16.4-1: When `quint-connect` replays 100 traces of 30 steps of the composed `jarvis.qnt`, the driver state equals the model state after each step.
+- AC-16.4-1: When `quint-connect` replays 100 traces of 30 steps of `composed.qnt`, the driver state equals the model state after each step. This replaces AC-16.2b-1 and AC-16.2c-1.
 
 **Proofs.**
 
