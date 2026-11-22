@@ -468,6 +468,7 @@ mod tests {
     use super::*;
 
     use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::io::Write;
     use std::sync::Mutex;
 
@@ -509,6 +510,7 @@ mod tests {
     use crate::ports;
     use crate::ports::Handled;
     use crate::ports::Listening;
+    use crate::ports::Work;
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeModelLoader;
@@ -883,6 +885,72 @@ mod tests {
         model_version: BTreeMap<usize, usize>,
         /// The model version that `handle` reads.
         active_model: usize,
+        /// The time of the driver.
+        now: i64,
+        /// The time of the reply or the filler of each request, -1 before it.
+        reply_time: BTreeMap<usize, i64>,
+        /// The time of the first call of each request, -1 without one.
+        call_time: BTreeMap<usize, i64>,
+        /// The satellite of each request became idle after its reply or filler.
+        idle_after_reply: BTreeMap<usize, bool>,
+        /// The times of the announces of each request.
+        announce_times: BTreeMap<usize, BTreeSet<i64>>,
+        /// The satellite entity of each satellite is `idle` in the hot cache.
+        idle: BTreeMap<String, bool>,
+        /// The last started request of each satellite, 0 before any.
+        started: BTreeMap<String, usize>,
+        /// The last handled request of each satellite, 0 before any.
+        newest: BTreeMap<String, usize>,
+    }
+
+    /// The time, the outputs and the satellites that the driver saw, as `System` has them, and
+    /// the outputs that wait for a step.
+    struct Seen {
+        /// The time of the driver, which stamps each output.
+        now: i64,
+        /// The time of the reply or the filler of each request, -1 before it.
+        reply_time: BTreeMap<usize, i64>,
+        /// The time of the call of each request, -1 without one.
+        call_time: BTreeMap<usize, i64>,
+        /// The satellite of each request became idle after its reply or filler.
+        idle_after_reply: BTreeMap<usize, bool>,
+        /// The times of the announces of each request.
+        announce_times: BTreeMap<usize, BTreeSet<i64>>,
+        /// The last started request of each satellite, 0 before any.
+        started: BTreeMap<String, usize>,
+        /// The last handled request of each satellite, 0 before any.
+        newest: BTreeMap<String, usize>,
+        /// The number of `FakeHome` calls that have a stamp.
+        recorded: usize,
+        /// The work after the reply of each replied request, until it runs.
+        afters: BTreeMap<usize, Work>,
+        /// The sender of the next step and the task of the System Two answer of each deferred
+        /// request.
+        answers: BTreeMap<usize, Answering>,
+    }
+
+    impl Default for Seen {
+        /// The state of `init`.
+        fn default() -> Self {
+            let satellites = || MODEL_SATELLITES.map(|s| (s.to_owned(), 0)).into();
+            Self {
+                now: 0,
+                reply_time: per_request(|_| -1),
+                call_time: per_request(|_| -1),
+                idle_after_reply: per_request(|_| false),
+                announce_times: per_request(|_| BTreeSet::new()),
+                started: satellites(),
+                newest: satellites(),
+                recorded: 0,
+                afters: BTreeMap::new(),
+                answers: BTreeMap::new(),
+            }
+        }
+    }
+
+    /// The value that `value` gives for each request of `jarvis.qnt`.
+    fn per_request<T>(value: impl Fn(usize) -> T) -> BTreeMap<usize, T> {
+        (1..=3).map(|r| (r, value(r))).collect()
     }
 
     /// The variant of a Quint sum type value.
@@ -901,11 +969,20 @@ mod tests {
             let tag = |r| Tag {
                 tag: phase(r).to_owned(),
             };
+            let seen = &driver.seen;
             Ok(Self {
-                phase: (1..=3).map(|r| (r, tag(r))).collect(),
-                handled: (1..=3).map(|r| (r, read(&driver.handled, r))).collect(),
-                model_version: (1..=3).map(|r| (r, read(&driver.models, r))).collect(),
+                phase: per_request(tag),
+                handled: per_request(|r| read(&driver.handled, r)),
+                model_version: per_request(|r| read(&driver.models, r)),
                 active_model: driver.active_model()?,
+                now: seen.now,
+                reply_time: seen.reply_time.clone(),
+                call_time: seen.call_time.clone(),
+                idle_after_reply: seen.idle_after_reply.clone(),
+                announce_times: seen.announce_times.clone(),
+                idle: driver.idle(),
+                started: seen.started.clone(),
+                newest: seen.newest.clone(),
             })
         }
     }
@@ -933,7 +1010,26 @@ mod tests {
         handled: BTreeMap<usize, usize>,
         /// The model version whose classifier held the prediction of each request.
         models: BTreeMap<usize, usize>,
+        /// The fakes and the hot cache that give the outputs and the satellites of the app.
+        probes: Probes,
+        /// The time, the outputs and the satellites that the driver saw.
+        seen: Seen,
     }
+
+    /// The fakes and the hot cache that give the outputs and the satellites of the app.
+    struct Probes {
+        /// HA of the app, which records its calls and announces and sends the state events.
+        home: Arc<FakeHome>,
+        /// System Two of the app, which holds each step of an answer.
+        reasoner: Arc<FakeReasoner>,
+        /// The hot cache of the app.
+        cache: watch::Receiver<StateCache>,
+        /// The wait of an announce after the satellite becomes idle.
+        margin: Duration,
+    }
+
+    /// The sender of the next step of a System Two answer and the task of the answer.
+    type Answering = (oneshot::Sender<Scripted>, JoinHandle<anyhow::Result<()>>);
 
     /// A training run, its loader, its trainer, its clock and the folder of its model folders.
     type Swap = (
@@ -964,9 +1060,10 @@ mod tests {
             let current = Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), first));
             let config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
             let app = runtime.block_on(system_app(&config, Arc::clone(&current)));
+            let (app, pools, probes) = app.expect("the app starts");
             Self {
                 runtime,
-                app: app.expect("the app starts"),
+                app: (app, pools),
                 swap: training_run(&current),
                 current,
                 versions,
@@ -975,6 +1072,8 @@ mod tests {
                 phases: BTreeMap::new(),
                 handled: BTreeMap::new(),
                 models: BTreeMap::new(),
+                probes,
+                seen: Seen::default(),
             }
         }
 
@@ -989,6 +1088,10 @@ mod tests {
                 anyhow::Ok(session)
             })?;
             self.sessions.insert(r, session);
+            self.set_satellite(satellite(r), "listening")?;
+            self.seen
+                .started
+                .insert(MODEL_SATELLITES[satellite(r)].to_owned(), r);
             Ok(())
         }
 
@@ -1010,21 +1113,18 @@ mod tests {
             let task = self
                 .runtime
                 .spawn(async move { app.handle(TRANSCRIPT, context).await });
-            let versions = &self.versions;
-            let found = self.runtime.block_on(async {
-                loop {
-                    let mut held = versions.iter().zip(1..);
-                    let found = held.find_map(|(version, v)| Some((version.take_held()?, v)));
-                    if found.is_some() || task.is_finished() {
-                        return found;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            });
+            let mut held = || {
+                let mut versions = self.versions.iter().zip(1..);
+                versions.find_map(|(version, v)| Some((version.take_held()?, v)))
+            };
+            let found = settle(&self.runtime, &task, &mut held);
             let (sender, v) = found.context("the prediction does not wait")?;
             self.waiting.insert(r, (sender, task));
             self.models.insert(r, v);
             self.phases.insert(r, "Handling");
+            self.seen
+                .newest
+                .insert(MODEL_SATELLITES[satellite(r)].to_owned(), r);
             Ok(())
         }
 
@@ -1035,14 +1135,29 @@ mod tests {
             let sent = sender.send(result);
             sent.map_err(|_unsent| anyhow::anyhow!("the prediction does not wait"))?;
             let ended = self.runtime.block_on(task)?;
-            self.phases.insert(r, self.phase(ended));
+            let phase = self.phase(&ended);
+            self.phases.insert(r, phase);
             *self.handled.entry(r).or_default() += 1;
+            if phase != "Done" {
+                self.seen.reply_time.insert(r, self.seen.now);
+            }
+            self.keep(r, phase, ended.ok().and_then(|handled| handled.after));
             Ok(())
+        }
+
+        /// Keeps the work `after` of the reply of request `r` in `phase` until `call`, or starts
+        /// the System Two answer of a deferred request.
+        fn keep(&mut self, r: usize, phase: &str, after: Option<Work>) {
+            match (phase, after) {
+                ("Replied", Some(after)) => _ = self.seen.afters.insert(r, after),
+                ("Deferred", Some(after)) => self.wait_answer(r, self.runtime.spawn(after)),
+                _ => {}
+            }
         }
 
         /// The model phase after the end `ended` of `handle`: a filler defers, and an error ends
         /// the request.
-        fn phase(&self, ended: anyhow::Result<Handled>) -> &'static str {
+        fn phase(&self, ended: &anyhow::Result<Handled>) -> &'static str {
             let pools = self.app.1.load();
             let filler = |text: &str| pools["filler"].responses.iter().any(|f| f.text == text);
             match ended {
@@ -1060,6 +1175,103 @@ mod tests {
             };
             let index = self.versions.iter().position(same);
             Ok(index.context("an unknown classifier")? + 1)
+        }
+
+        /// Runs the work after the reply of replied request `r`, or sends one `Call` step to the
+        /// System Two answer of deferred request `r`.
+        fn call(&mut self, r: usize) -> anyhow::Result<()> {
+            match self.seen.afters.remove(&r) {
+                Some(after) => self.runtime.block_on(after)?,
+                None => self.send(r, Scripted::Call(light_call()), Duration::ZERO)?,
+            }
+            self.stamp(Some(r))
+        }
+
+        /// Sends one sentence to the System Two answer of request `r`, with a clock advance of
+        /// `announce.margin_ms`.
+        fn announce(&mut self, r: usize) -> anyhow::Result<()> {
+            self.send(r, Scripted::Sentence("the answer"), self.probes.margin)?;
+            self.stamp(Some(r))
+        }
+
+        /// Sends `step` to the System Two answer of request `r`, advances the clock by `advance`
+        /// and runs the app until the answer waits for its next step or ends.
+        fn send(&mut self, r: usize, step: Scripted, advance: Duration) -> anyhow::Result<()> {
+            let (sender, task) = self.seen.answers.remove(&r).context("no waiting answer")?;
+            let sent = sender.send(step);
+            sent.map_err(|_unsent| anyhow::anyhow!("the answer does not wait"))?;
+            self.runtime
+                .block_on(async { tokio::time::sleep(advance).await });
+            self.wait_answer(r, task);
+            Ok(())
+        }
+
+        /// Runs the app until the System Two answer `task` of request `r` waits for its next
+        /// step, and keeps the sender of the step. Keeps nothing when the answer ends.
+        fn wait_answer(&mut self, r: usize, task: JoinHandle<anyhow::Result<()>>) {
+            let reasoner = Arc::clone(&self.probes.reasoner);
+            if let Some(sender) = settle(&self.runtime, &task, || reasoner.take_step()) {
+                self.seen.answers.insert(r, (sender, task));
+            }
+        }
+
+        /// Sets the satellite entity of model satellite `s` in the hot cache to `value` through a
+        /// state event of `FakeHome`.
+        fn set_satellite(&mut self, s: usize, value: &str) -> anyhow::Result<()> {
+            let entity = SATELLITES[s].0;
+            let state = self.probes.cache.borrow().state(entity).cloned();
+            let mut state = state.context("no satellite entity")?;
+            state.state = value.to_owned();
+            self.probes.home.send(Event::StateChanged {
+                entity_id: entity.to_owned(),
+                old: None,
+                context: state.context.clone(),
+                new: Some(Box::new(state)),
+            });
+            let shown =
+                |cache: &StateCache| cache.state(entity).is_some_and(|new| new.state == value);
+            let mut cache = self.probes.cache.clone();
+            self.runtime
+                .block_on(async { cache.wait_for(shown).await.map(drop) })?;
+            Ok(())
+        }
+
+        /// Sets the satellite entity of `s` to `idle`, which ends the filler or the reply of each
+        /// replied or deferred request of `s`.
+        fn pipeline_end(&mut self, s: &str) -> anyhow::Result<()> {
+            let index = usize::from(s == MODEL_SATELLITES[1]);
+            self.set_satellite(index, "idle")?;
+            let replied = |r: &usize| {
+                satellite(*r) == index
+                    && matches!(self.phases.get(r), Some(&("Replied" | "Deferred")))
+            };
+            let ended = (1..=3).filter(replied).map(|r| (r, true));
+            self.seen.idle_after_reply.extend(ended);
+            Ok(())
+        }
+
+        /// Stamps each new call and announce of `FakeHome` with the time of the driver as an
+        /// output of request `r`. Fails when a step without a request made one.
+        fn stamp(&mut self, r: Option<usize>) -> anyhow::Result<()> {
+            let (calls, now) = (self.probes.home.calls(), self.seen.now);
+            for call in calls.iter().skip(self.seen.recorded) {
+                let r = r.with_context(|| format!("{call:?} in a step without a request"))?;
+                if call.service == "announce" {
+                    self.seen.announce_times.entry(r).or_default().insert(now);
+                } else {
+                    self.seen.call_time.insert(r, now);
+                }
+            }
+            self.seen.recorded = calls.len();
+            Ok(())
+        }
+
+        /// Each model satellite and whether its satellite entity is `idle` in the hot cache.
+        fn idle(&self) -> BTreeMap<String, bool> {
+            let cache = self.probes.cache.borrow();
+            let idle = SATELLITES.map(|(id, _)| cache.state(id).is_some_and(|e| e.state == "idle"));
+            let names = MODEL_SATELLITES.map(str::to_owned);
+            names.into_iter().zip(idle).collect()
         }
 
         /// A training run whose loader gives the classifier of model version `v`.
@@ -1081,10 +1293,18 @@ mod tests {
         ),
     ];
 
-    /// The context of request `r` from its satellite: requests 1 and 2 from the model satellite
-    /// `s1`, and request 3 from `s2`.
+    /// The satellites of `jarvis.qnt`, in the order of `SATELLITES`.
+    const MODEL_SATELLITES: [&str; 2] = ["s1", "s2"];
+
+    /// The index in `SATELLITES` of the satellite of request `r`: requests 1 and 2 on the model
+    /// satellite `s1`, and request 3 on `s2`.
+    fn satellite(r: usize) -> usize {
+        usize::from(r > 2)
+    }
+
+    /// The context of request `r` from its satellite.
     fn satellite_context(r: usize) -> ports::Context {
-        let (satellite, device) = SATELLITES[usize::from(r > 2)];
+        let (satellite, device) = SATELLITES[satellite(r)];
         ports::Context {
             device_id: Some(device.to_owned()),
             satellite_id: Some(satellite.to_owned()),
@@ -1096,6 +1316,14 @@ mod tests {
         type State = System;
 
         fn step(&mut self, step: &Step) -> anyhow::Result<()> {
+            self.apply(step)?;
+            self.stamp(None)
+        }
+    }
+
+    impl SystemDriver {
+        /// Runs the model step `step` on the app.
+        fn apply(&mut self, step: &Step) -> anyhow::Result<()> {
             switch!(step {
                 init => *self = Self::new(),
                 audio(r: usize) => self.audio(r)?,
@@ -1105,15 +1333,40 @@ mod tests {
                 defer(r: usize) => self.finish(r, Ok(predicted("unknown")))?,
                 failRequest(r: usize) => self.finish(r, Err(anyhow::anyhow!("the model failed")))?,
                 swap(v: usize) => self.swap(v)?,
-                // Sub-phase 16.2c maps `call`, `pipelineEnd`, `announce` and `tick`.
-                _ => {},
+                call(r: usize) => self.call(r)?,
+                pipelineEnd(s: String) => self.pipeline_end(&s)?,
+                announce(r: usize) => self.announce(r)?,
+                tick => self.seen.now += 1,
             })
         }
     }
 
+    /// Runs `runtime` until `take` gives a value or `task` ends.
+    fn settle<T, U>(
+        runtime: &Runtime,
+        task: &JoinHandle<U>,
+        mut take: impl FnMut() -> Option<T>,
+    ) -> Option<T> {
+        runtime.block_on(async {
+            loop {
+                let found = take();
+                if found.is_some() || task.is_finished() {
+                    return found;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+    }
+
+    /// The call of a System Two answer: a light of the reference house on.
+    fn light_call() -> ServiceCall {
+        let call = json!({ "domain": "light", "service": "turn_on", "data": {},
+            "target": ["light.office_fan_light"], "return_response": false });
+        serde_json::from_value(call).expect("it is a call")
+    }
+
     /// The app of `config` with the System One model `current`, the listener of
-    /// [`system_listener`], `FakeTts`, `FakeReasoner` and the hot cache of `FakeHome`, and its
-    /// pools.
+    /// [`system_listener`], `FakeTts` and the [`system_probes`], its pools and its probes.
     ///
     /// # Errors
     ///
@@ -1121,15 +1374,13 @@ mod tests {
     async fn system_app(
         config: &Config,
         current: Arc<CurrentClassifier>,
-    ) -> anyhow::Result<(Arc<App>, Arc<ArcSwap<Pools>>)> {
-        let home = Arc::new(FakeHome::default());
-        home.send(Event::Reconnected);
-        let (mut cache, queues) = crate::start_sync(home, config);
-        cache.changed().await?;
-        let reasoner: Arc<dyn Reasoner> = Arc::new(FakeReasoner::default());
+    ) -> anyhow::Result<(Arc<App>, Arc<ArcSwap<Pools>>, Probes)> {
+        let (probes, queues) = system_probes(config).await?;
+        let reasoner: Arc<dyn Reasoner> = Arc::clone(&probes.reasoner) as _;
         let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
         let listener = system_listener(config, &current, &reasoner, &queues);
         let recorder = recorder(Arc::clone(listener.utterances()));
+        let cache = probes.cache.clone();
         let parts = (current, queues, cache, reasoner, Arc::clone(&speech));
         let (conversation, pools) = system_conversation(config, parts, recorder)?;
         let app = App {
@@ -1138,7 +1389,30 @@ mod tests {
             speech,
             _prefetch: None,
         };
-        Ok((Arc::new(app), pools))
+        Ok((Arc::new(app), pools, probes))
+    }
+
+    /// The probes of `config`: `FakeHome`, `FakeReasoner`, which holds each step of an answer, and
+    /// the hot cache of `FakeHome` after its first snapshot. Also gives the queues of the cache.
+    ///
+    /// # Errors
+    ///
+    /// The sync ends before its first snapshot.
+    async fn system_probes(config: &Config) -> anyhow::Result<(Probes, Arc<Queues>)> {
+        let home = Arc::new(FakeHome::default());
+        home.send(Event::Reconnected);
+        let (mut cache, queues) = crate::start_sync(Arc::clone(&home) as _, config);
+        cache.changed().await?;
+        let reasoner = Arc::new(FakeReasoner::default());
+        reasoner.hold_steps();
+        let margin = Duration::from_millis(config.announce.margin_ms);
+        let probes = Probes {
+            home,
+            reasoner,
+            cache,
+            margin,
+        };
+        Ok((probes, queues))
     }
 
     /// The System One model, the queues, the hot cache, System Two and the speech of an app.
@@ -1188,9 +1462,11 @@ mod tests {
         Ok((conversation, pools))
     }
 
-    /// The System Two of `config` on `reasoner` at the time of `FakeClock`.
+    /// The System Two of `config` on `reasoner` at the time of `FakeClock`, with a step timeout
+    /// longer than a trace.
     fn fake_two(config: &Config, reasoner: Arc<dyn Reasoner>) -> SystemTwo {
-        let two = crate::system_two(config, reasoner, crate::registry(config, Vec::new()));
+        let mut two = crate::system_two(config, reasoner, crate::registry(config, Vec::new()));
+        two.timeout = Duration::from_secs(3600);
         let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
         SystemTwo { clock, ..two }
     }
@@ -1254,6 +1530,12 @@ mod tests {
     /// AC-16.2b-1. `quint_run` replays 100 traces by default.
     #[quint_run(spec = "quint/jarvis.qnt", max_steps = 30, seed = "1")]
     fn ac_16_2b_1_conformance() -> impl Driver {
+        SystemDriver::new()
+    }
+
+    /// AC-16.2c-1. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/jarvis.qnt", max_steps = 30, seed = "1")]
+    fn ac_16_2c_1_conformance() -> impl Driver {
         SystemDriver::new()
     }
 
