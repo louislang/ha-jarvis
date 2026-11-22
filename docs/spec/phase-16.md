@@ -1,6 +1,6 @@
 # Phase 16: System Model
 
-This phase composes the component models into one Quint model of the whole request lifecycle and checks the Rust application against it. Sub-phases 16.1 to 16.2b model and check the lifecycle of requests on two satellites. Sub-phases 16.3 and 16.4 add the component models to it.
+This phase composes the component models into one Quint model of the whole request lifecycle and checks the Rust application against it. Sub-phases 16.1 to 16.2c model and check the lifecycle of requests on two satellites. Sub-phases 16.3 and 16.4 add the component models to it.
 
 ---
 
@@ -75,7 +75,7 @@ Sub-phase 16.1b changes `newest` from `audio` to `handle`, adds `started` and ad
 
 ### 16.2 System Conformance
 
-**Goal:** Add a conformance test that replays `jarvis.qnt` traces against the application with all port fakes, and checks the request phases and the model versions. The composed Rust use cases behave like the system model, not only each part alone.
+**Goal:** Add a conformance test that replays `jarvis.qnt` traces against the application with all port fakes, and checks the phase and the `Handled` count of each request. The composed Rust use cases behave like the system model, not only each part alone.
 
 - **Implements:** G19. **Depends on:** 16.1b.
 - **Files:** modify `src/testing/e2e.rs`, `src/testing/fakes.rs`.
@@ -83,39 +83,62 @@ Sub-phase 16.1b changes `newest` from `audio` to `handle`, adds `started` and ad
 
 **Model.**
 
-- The driver builds `App` with `FakeHome`, `FakeStt`, `FakeTts`, `FakeClassifier`, `FakeReasoner`, `FakeLog`, `FakeTrainer` and `FakeClock`. Each model version is one `FakeClassifier`.
+- The driver builds `App` with `FakeHome`, `FakeStt`, `FakeTts`, `FakeClassifier`, `FakeReasoner`, `FakeLog`, `FakeTrainer` and `FakeClock`.
 - `FakeClassifier` can hold each prediction of one text until the test sends its result. It gives the scripted predictions to the other texts, for example the held-out examples of a training run.
 - Each model action maps to one driver step:
   - `audio(r)`: `Assistant::listen` and one audio chunk. `commit(r)`: `Listening::finish`.
-  - `handle(r)`: `Assistant::handle` with the transcript and the satellite of `r`, until its prediction waits. The model version of `r` is the `FakeClassifier` that holds its prediction.
+  - `handle(r)`: `Assistant::handle` with the transcript and the satellite of `r`, until its prediction waits.
   - `reply(r)`, `defer(r)` and `failRequest(r)`: the held prediction of `r` gets a confident command, `unknown` or an error.
-  - `swap(v)`: a training run (`Training::run`) whose `FakeModelLoader` gives the `FakeClassifier` of version `v`.
-  - `call`, `pipelineEnd`, `announce` and `tick` change nothing that this driver compares. Sub-phase 16.2b maps them.
-- After each step, the driver reads the phase, the `Handled` count and the model version of each request, and the active model version.
+  - `swap`, `call`, `pipelineEnd`, `announce` and `tick` change nothing that this driver compares. Sub-phase 16.2b maps `swap`, and sub-phase 16.2c maps the others.
+- After each step, the driver reads the phase and the `Handled` count of each request.
 
 **Acceptance criteria.**
 
-- AC-16.2-1: When `quint-connect` replays 100 traces of 30 steps of `jarvis.qnt`, the phase, the `Handled` count and the model version of each request and the active model version of the driver equal the model state after each step.
-- AC-16.2-2: When a trace has a swap between `commit` and `reply`, the reply uses the model version from the `handle` step.
+- AC-16.2-1: When `quint-connect` replays 100 traces of 30 steps of `jarvis.qnt`, the phase and the `Handled` count of each request of the driver equal the model state after each step.
 
 **Proofs.**
 
-- P-16.2-1, P-16.2-2. Evidence: test. Together with P-16.1-2, they give `OneHandledPerRequest` and `ModelSwapAtomic` for the Rust application on the replayed traces.
+- P-16.2-1. Evidence: test. Together with P-16.1-2, it gives `OneHandledPerRequest` for the Rust application on the replayed traces.
 
 ---
 
-### 16.2b System Conformance of Calls and Announces
+### 16.2b System Conformance of Model Swaps
+
+**Goal:** Extend the system driver to the model swaps. The driver then also checks the model version of each request and the active model version.
+
+- **Implements:** G19. **Depends on:** 16.2.
+- **Files:** modify `src/testing/e2e.rs`.
+- **Quint:** `jarvis.qnt` (conformance).
+
+**Model.**
+
+- Each model version is one `FakeClassifier`. The model version of a request is the `FakeClassifier` that holds its prediction.
+- `swap(v)`: a training run (`Training::run`) whose `FakeModelLoader` gives the `FakeClassifier` of version `v`.
+- After each step, the driver also reads the model version of each request and the active model version.
+
+**Acceptance criteria.**
+
+- AC-16.2b-1: When `quint-connect` replays 100 traces of 30 steps of `jarvis.qnt`, the phase, the `Handled` count and the model version of each request and the active model version of the driver equal the model state after each step. This replaces AC-16.2-1.
+- AC-16.2b-2: When a trace has a swap between `commit` and `reply`, the reply uses the model version from the `handle` step.
+
+**Proofs.**
+
+- P-16.2b-1, P-16.2b-2. Evidence: test. Together with P-16.1-2, they give `OneHandledPerRequest` and `ModelSwapAtomic` for the Rust application on the replayed traces.
+
+---
+
+### 16.2c System Conformance of Calls and Announces
 
 **Goal:** Extend the system driver to the calls, the end of the HA pipeline and the announces. The driver then compares the full model state.
 
-- **Implements:** G19. **Depends on:** 16.2.
+- **Implements:** G19. **Depends on:** 16.2b.
 - **Files:** modify `src/testing/e2e.rs`, `src/testing/fakes.rs`.
 - **Quint:** `jarvis.qnt` (conformance).
 
 **Model.**
 
 - `FakeReasoner` can give an answer whose steps the test sends one at a time.
-- The driver of sub-phase 16.2 maps the other actions:
+- The driver of sub-phases 16.2 and 16.2b maps the other actions:
   - `call(r)`: for a `Replied` request, the `after` work of its reply runs. For a `Deferred` request, its System Two answer gets one `Call` step.
   - `pipelineEnd(s)`: a state event of `FakeHome` sets the satellite entity of `s` to `idle`, through the sync of the hot cache. `audio(r)` also sends a state event that sets it to `listening`.
   - `announce(r)`: the System Two answer of `r` gets one sentence, and the clock advances by `announce.margin_ms`. A dropped announce gives no announce in `FakeHome`.
@@ -125,11 +148,11 @@ Sub-phase 16.1b changes `newest` from `audio` to `handle`, adds `started` and ad
 
 **Acceptance criteria.**
 
-- AC-16.2b-1: When `quint-connect` replays 100 traces of 30 steps of `jarvis.qnt`, the driver state equals the model state after each step.
+- AC-16.2c-1: When `quint-connect` replays 100 traces of 30 steps of `jarvis.qnt`, the driver state equals the model state after each step.
 
 **Proofs.**
 
-- P-16.2b-1. Evidence: test. Together with P-16.1-2 and P-16.2-1, it gives the five system invariants for the Rust application on the replayed traces.
+- P-16.2c-1. Evidence: test. Together with P-16.1-2 and P-16.2b-1, it gives the five system invariants for the Rust application on the replayed traces.
 
 ---
 
@@ -137,7 +160,7 @@ Sub-phase 16.1b changes `newest` from `audio` to `handle`, adds `started` and ad
 
 **Goal:** Add the component models to `quint/jarvis.qnt`. Prove that the invariants of each component still hold when the components run together in the request lifecycle.
 
-- **Implements:** G19. **Depends on:** 16.2b.
+- **Implements:** G19. **Depends on:** 16.2c.
 - **Files:** modify `quint/jarvis.qnt`.
 - **Quint:** `jarvis.qnt`, which imports one instance of `commit` for each request, one instance of `announce` for each satellite, and one instance of `dialog`, `training`, `learned` and `prefetch`, with small constants. `cache_sync`, `backfill` and `speaker` are not in the composition: the request reads the cache, a backfill changes only pools, and the speaker is a slot value. Their own models cover them.
 
@@ -170,7 +193,7 @@ Sub-phase 16.1b changes `newest` from `audio` to `handle`, adds `started` and ad
 - **Files:** modify `src/testing/e2e.rs`.
 - **Quint:** `jarvis.qnt` (conformance).
 
-**Model.** The driver of sub-phases 16.2 and 16.2b maps `ask` and `answer` through `Assistant::handle` with an open dialog, and `swap` through the training use case with `FakeTrainer`. A start action of `training` also runs the pause with `FakeModels`. The driver does not compare the `switch` calls of the mute, because `jarvis.qnt` has no action for them. After each step, it also reads the dialogs and the training state.
+**Model.** The driver of sub-phases 16.2 to 16.2c maps `ask` and `answer` through `Assistant::handle` with an open dialog, and `swap` through the training use case with `FakeTrainer`. A start action of `training` also runs the pause with `FakeModels`. The driver does not compare the `switch` calls of the mute, because `jarvis.qnt` has no action for them. After each step, it also reads the dialogs and the training state.
 
 **Acceptance criteria.**
 
