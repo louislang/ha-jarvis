@@ -145,7 +145,8 @@ quint:
     for model in quint/*.qnt; do
         quint typecheck "$model"
         quint test --seed=1 --match='^ac_' "$model"
-        quint run --seed=1 --invariant=allInvariants --max-samples=10000 --max-steps=30 "$model"
+        samples=$(sed -n 's/^  pure val SAMPLES = \([0-9]*\).*/\1/p' "$model")
+        quint run --seed=1 --invariant=allInvariants --max-samples="${samples:-10000}" --max-steps=30 "$model"
         if grep -q '^  val Inductive ' "$model"; then
             quint verify --inductive-invariant=Inductive --invariant=allInvariants "$model"
         else
