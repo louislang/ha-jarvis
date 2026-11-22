@@ -556,11 +556,14 @@ pub(crate) enum Scripted {
 /// The receiver of the tool result of one call.
 type Reply = oneshot::Receiver<anyhow::Result<Option<Value>>>;
 
+/// The step senders of the held answers that wait for the test, in order.
+type HeldSteps = Arc<Mutex<VecDeque<oneshot::Sender<Scripted>>>>;
+
 /// A `Reasoner` that counts the `warm` calls, records each question, answers with the scripted
-/// steps, keeps the reply of each call, records the pool of each `generate` call and holds
-/// it until `release`, records the target of each `paraphrase` call and gives its scripted result,
-/// gives the scripted embedding of each text, and records the texts of each `propose` call and
-/// gives the scripted proposals in order.
+/// steps or with the steps that the test sends one at a time, keeps the reply of each call,
+/// records the pool of each `generate` call and holds it until `release`, records the target of
+/// each `paraphrase` call and gives its scripted result, gives the scripted embedding of each
+/// text, and records the texts of each `propose` call and gives the scripted proposals in order.
 #[derive(Default)]
 pub(crate) struct FakeReasoner {
     /// The number of `warm` calls.
@@ -569,6 +572,10 @@ pub(crate) struct FakeReasoner {
     questions: Mutex<Vec<Question>>,
     /// The steps of each next answer, in order.
     scripts: Mutex<VecDeque<Vec<Scripted>>>,
+    /// True when each answer waits for the test to send each step.
+    holding: AtomicBool,
+    /// The sender of the next step of each held answer that waits.
+    steps: HeldSteps,
     /// The reply of each call, in order.
     replies: Arc<Mutex<Vec<Reply>>>,
     /// The pool of each `generate` call, in order.
@@ -625,6 +632,17 @@ impl FakeReasoner {
     /// Makes the next answer without earlier scripted steps give `steps`.
     pub(crate) fn script(&self, steps: Vec<Scripted>) {
         lock(&self.scripts).push_back(steps);
+    }
+
+    /// Makes each later answer wait for each step until the test sends it. The answer ends when
+    /// the sender drops.
+    pub(crate) fn hold_steps(&self) {
+        self.holding.store(true, Ordering::SeqCst);
+    }
+
+    /// Takes the sender of the oldest waiting step.
+    pub(crate) fn take_step(&self) -> Option<oneshot::Sender<Scripted>> {
+        lock(&self.steps).pop_front()
     }
 
     /// The tool result of each call that came back: the error text, else the result.
@@ -690,6 +708,16 @@ fn reply(replies: &Mutex<Vec<Reply>>) -> oneshot::Sender<anyhow::Result<Option<V
     sender
 }
 
+/// The steps that the test sends through the senders that each step puts in `steps`.
+fn held(steps: HeldSteps) -> BoxStream<'static, Scripted> {
+    let next = |steps: HeldSteps| async move {
+        let (sender, receiver) = oneshot::channel();
+        lock(&steps).push_back(sender);
+        Some((receiver.await.ok()?, steps))
+    };
+    futures::stream::unfold(steps, next).boxed()
+}
+
 /// The answer step of `step`, with its reply receiver kept in `replies`, or `None` after a wait.
 async fn answered(step: Scripted, replies: Arc<Mutex<Vec<Reply>>>) -> Option<anyhow::Result<Step>> {
     match step {
@@ -720,10 +748,15 @@ impl Reasoner for FakeReasoner {
 
     fn answer(&self, question: &Question) -> BoxStream<'static, anyhow::Result<Step>> {
         lock(&self.questions).push(question.clone());
-        let steps = lock(&self.scripts).pop_front().unwrap_or_default();
+        let steps = if self.holding.load(Ordering::SeqCst) {
+            held(Arc::clone(&self.steps))
+        } else {
+            let steps = lock(&self.scripts).pop_front().unwrap_or_default();
+            futures::stream::iter(steps).boxed()
+        };
         let replies = Arc::clone(&self.replies);
         let step = move |step| answered(step, Arc::clone(&replies));
-        futures::stream::iter(steps).filter_map(step).boxed()
+        steps.filter_map(step).boxed()
     }
 
     async fn generate(
