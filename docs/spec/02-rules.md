@@ -77,14 +77,14 @@ Do not turn off a rule with `# noqa` or `# type: ignore` to pass a check. Change
 
 ## 4. Quint Rules
 
-1. Each stateful component in `01-architecture.md` section 13 has one model in `quint/`. The module name is the file name. Simple stores (G19) have unit tests instead.
+1. Each stateful component in `01-architecture.md` section 13 has one model in `quint/`. The module name is the file name. Simple stores (G19) have unit tests instead. Exception: `composed.qnt` also has one wrapper module for each model that it imports, because Quint instantiates only a module that has a constant.
 2. A model has state variables, an `init` action, one action for each event, a `step` action that chooses any enabled event, and the named invariants of section 13. The invariant names are binding. An invariant must be able to fail: a property that the types or a definition make true is not an invariant. A property about one step uses history variables (for example `lastAction` and the previous value). A check to a step bound is bounded evidence. A model has the interleavings that the code has: concurrent requests, jobs in flight and late outside events. Thus the conformance traces reach them.
 3. A model uses small constants so that model checking ends: for example, two satellites, three intents and five time units.
 4. The model is merged in its own PR before the Rust code that implements it.
 5. `just quint` runs these commands for each model:
    - `quint typecheck`.
    - `quint test --seed=1 --match='^ac_'` (the `run` tests in the model). Without `--match`, Quint runs only the names that end with `Test`. Section 6.1 names the tests `ac_<phase>_<n>_<k>_<words>`.
-   - `quint run --seed=1 --invariant=allInvariants --max-samples=10000 --max-steps=30`.
+   - `quint run --seed=1 --invariant=allInvariants --max-samples=10000 --max-steps=30`. Only `composed.qnt` defines `pure val SAMPLES`, and it uses that number of samples instead of 10000, because a step of the composition is slow to simulate.
    - `quint verify --invariant=allInvariants --max-steps=10` (Apalache). A model that defines `pure val VERIFY_STEPS` uses that bound instead of 10. Only a model whose check takes more than 10 minutes at 10 steps defines it, and its `quint run` still covers 30 steps. A model that defines `val Inductive` runs `quint verify --inductive-invariant=Inductive --invariant=allInvariants` instead. This check is a proof for all executions, not a step bound.
 6. A conformance test uses `quint-connect` to replay 100 traces of 30 steps, from fixed seeds, against the Rust code. After each step, the Rust state must equal the model state. The driver is in the test block of the Rust module. The system driver (sub-phases 16.2 to 16.2c and 16.4) is in `src/testing/e2e.rs`, because it uses all modules.
 7. A change to a stateful rule changes the Rust code, the model and the driver in the same PR.
