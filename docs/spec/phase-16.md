@@ -1,6 +1,6 @@
 # Phase 16: System Model
 
-This phase composes the component models into one Quint model of the whole request lifecycle and checks the Rust application against it. Sub-phases 16.1 to 16.2c model and check the lifecycle of requests on two satellites. Sub-phases 16.3 and 16.4 compose it with the component models in `composed.qnt`.
+This phase composes the component models into one Quint model of the whole request lifecycle and checks the Rust application against it. Sub-phases 16.1 to 16.2c model and check the lifecycle of requests on two satellites. Sub-phases 16.3 to 16.4b compose it with the component models in `composed.qnt`.
 
 ---
 
@@ -206,10 +206,10 @@ Sub-phase 16.1b changes `newest` from `audio` to `handle`, adds `started` and ad
 
 ### 16.4 Composed Conformance
 
-**Goal:** Point the system driver at `composed.qnt` and extend it to the composed actions: questions, answers, training runs and announce queues. The whole Rust application now follows the composed model on the replayed traces.
+**Goal:** Point the system driver at `composed.qnt` and extend it to the questions, the answers and the announce queues. The driver then also checks the open dialogs. Sub-phase 16.4b adds the training runs.
 
 - **Implements:** G19. **Depends on:** 16.3.
-- **Files:** modify `src/testing/e2e.rs`.
+- **Files:** modify `src/testing/e2e.rs`, `src/app/conversation.rs`.
 - **Quint:** `composed.qnt` (conformance).
 
 **Model.**
@@ -222,15 +222,40 @@ Sub-phase 16.1b changes `newest` from `audio` to `handle`, adds `started` and ad
   - `unclear(r)`: the held prediction of `r` gets `unknown`. Below the turn limit, the reply has the question as its `after` work.
   - `call(r)` of a request with `Asks`: the driver runs its `after` work. `Queues::queued` sees the idle satellite, sleeps `announce.margin_ms`, which the paused runtime advances, and calls `assist_satellite.start_conversation`, which the driver stamps as the call of `r`.
   - `announce(r)`: as in sub-phase 16.2c, one sentence to the System Two answer of `r` and a clock advance of `announce.margin_ms`.
-  - The training actions as the driver of `training.qnt` (sub-phases 13.9c, 13.10 and 13.10e) maps them: the trigger has the backoff 0 and `min_changes` 2, each trainer waits at a gate, and `change` writes one mark. `autoStart` and `voiceStart` start a run, which stops at the gate of the local trainer after the pause with `FakeModels`. `localFail` and `runpodFail` open the gate with an error. `swap(v, a)` opens the gate with a success, and the loader gives the classifier of version `v` at the accuracy level `a` (one `FakeClassifier` for each pair).
-  - No-op, because the driver does not compare that state: `listen`, `propose`, `approve`, `reject`, `writeRequest`, `failWrite`, `prefetch` and `prefetchStep`.
-- The driver does not compare the `switch` calls of the mute, because `composed.qnt` has no action for them.
-- After each step, the driver also reads the open dialogs and the training state. A dialog is open when the dialog map has it and it did not time out at the conversation clock, because `Dialogs` removes a timed-out dialog only at `take`. The driver compares the satellite and the number of questions of each open dialog, and the run state, the change count, `paused` and the accuracy level of the active model. It does not compare `held`, `heard` or `work`, which are local to a `handle` call or its `after` work.
+  - `swap(v, a)`: the training run of sub-phase 16.2b, whose loader gives the classifier of version `v`. The driver does not read the accuracy `a`.
+  - No-op, because the driver does not compare that state: `listen`, `autoStart`, `voiceStart`, `change`, `localFail`, `runpodFail`, `propose`, `approve`, `reject`, `writeRequest`, `failWrite`, `prefetch` and `prefetchStep`. Sub-phase 16.4b maps the training actions.
+- `Queues::dialogs` becomes `pub(crate)`, so that the driver reads the dialog map.
+- After each step, the driver also reads the open dialogs. A dialog is open when the dialog map has it and it did not time out at the conversation clock, because `Dialogs` removes a timed-out dialog only at `take`. The driver compares the satellite and the number of questions of each open dialog. It does not compare `held`, `heard` or `work`, which are local to a `handle` call or its `after` work.
 
 **Acceptance criteria.**
 
-- AC-16.4-1: When `quint-connect` replays 100 traces of 30 steps of `composed.qnt`, the driver state equals the model state after each step. This replaces AC-16.2b-1 and AC-16.2c-1.
+- AC-16.4-1: When `quint-connect` replays 100 traces of 30 steps of `composed.qnt`, the lifecycle state and the open dialogs of the driver equal the model state after each step. This replaces AC-16.2b-1 and AC-16.2c-1.
 
 **Proofs.**
 
-- P-16.4-1. Evidence: test. Together with P-16.3-2 and P-16.3-3, it gives the system invariants and the component invariants for the Rust application on the replayed traces.
+- P-16.4-1. Evidence: test. Together with P-16.3-2 and P-16.3-3, it gives the system invariants and the invariants of the dialogs for the Rust application on the replayed traces.
+
+---
+
+### 16.4b Composed Conformance of Training Runs
+
+**Goal:** Extend the system driver to the training runs of `composed.qnt`. The driver then compares the full model state, and the whole Rust application follows the composed model on the replayed traces.
+
+- **Implements:** G19. **Depends on:** 16.4.
+- **Files:** modify `src/testing/e2e.rs`, `src/testing/fakes.rs`, `src/app/training.rs`.
+- **Quint:** `composed.qnt` (conformance).
+
+**Model.**
+
+- The driver maps the training actions as the driver of `training.qnt` (sub-phases 13.9c, 13.10 and 13.10e) maps them: the trigger has the backoff 0 and `min_changes` 2, each trainer waits at a gate, and `change` writes one mark. `autoStart` and `voiceStart` start a run, which stops at the gate of the local trainer after the pause with `FakeModels`. `localFail` and `runpodFail` open the gate with an error. `swap(v, a)` opens the gate with a success, and the loader gives the classifier of version `v` at the accuracy level `a` (one `FakeClassifier` for each pair). This replaces the `swap(v, a)` step of sub-phase 16.4.
+- The function that writes a mark moves from the tests of `src/app/training.rs` to `src/testing/fakes.rs`, so that both drivers use it.
+- The driver does not compare the `switch` calls of the mute, because `composed.qnt` has no action for them.
+- After each step, the driver also reads the training state: the run state, the change count, `paused` and the accuracy level of the active model.
+
+**Acceptance criteria.**
+
+- AC-16.4b-1: When `quint-connect` replays 100 traces of 30 steps of `composed.qnt`, the driver state equals the model state after each step. This replaces AC-16.4-1.
+
+**Proofs.**
+
+- P-16.4b-1. Evidence: test. Together with P-16.3-2 and P-16.3-3, it gives the system invariants and the component invariants for the Rust application on the replayed traces.
