@@ -308,19 +308,34 @@ impl Home for FakeHome {
     }
 }
 
-/// A `Classifier` that gives scripted predictions in order and records each `(context, text)`.
+/// A `Classifier` that gives scripted predictions in order, or holds each prediction of one text
+/// until the test sends its result, and records each `(context, text)`.
 #[derive(Default)]
 pub struct FakeClassifier {
     /// The predictions of the next calls, in order.
     predictions: Mutex<VecDeque<Prediction>>,
     /// The `(context, text)` of each call, in order.
     calls: Mutex<Vec<(String, String)>>,
+    /// The text whose predictions wait for the test.
+    hold: Mutex<Option<String>>,
+    /// The result sender of each waiting prediction, in order.
+    held: Mutex<VecDeque<oneshot::Sender<anyhow::Result<Prediction>>>>,
 }
 
 impl FakeClassifier {
     /// Makes the next call without an earlier scripted prediction give `prediction`.
     pub fn script(&self, prediction: Prediction) {
         lock(&self.predictions).push_back(prediction);
+    }
+
+    /// Makes each later prediction of `text` wait until the test sends its result.
+    pub fn hold(&self, text: &str) {
+        *lock(&self.hold) = Some(text.to_owned());
+    }
+
+    /// Takes the result sender of the oldest waiting prediction.
+    pub fn take_held(&self) -> Option<oneshot::Sender<anyhow::Result<Prediction>>> {
+        lock(&self.held).pop_front()
     }
 
     /// The `(context, text)` of each call, in order.
@@ -334,6 +349,11 @@ impl FakeClassifier {
 impl Classifier for FakeClassifier {
     async fn predict(&self, context: &str, text: &str) -> anyhow::Result<Prediction> {
         lock(&self.calls).push((context.to_owned(), text.to_owned()));
+        if lock(&self.hold).as_deref() == Some(text) {
+            let (sender, receiver) = oneshot::channel();
+            lock(&self.held).push_back(sender);
+            return receiver.await?;
+        }
         let prediction = lock(&self.predictions).pop_front();
         prediction.ok_or_else(|| anyhow::anyhow!("no scripted prediction for {text}"))
     }
