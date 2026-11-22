@@ -499,10 +499,12 @@ mod tests {
     use crate::app::training::Training;
     use crate::domain::catalog::Catalog;
     use crate::domain::decide::PluginCall;
+    use crate::domain::dialog::Key;
     use crate::domain::habits::RequestHabits;
     use crate::domain::learn::LearnedKind;
     use crate::domain::learn::LearnedStatus;
     use crate::domain::model::Prediction;
+    use crate::domain::model::Slot;
     use crate::domain::responses;
     use crate::domain::responses::Pools;
     use crate::domain::state::AreaId;
@@ -512,7 +514,6 @@ mod tests {
     use crate::ports::Listening;
     use crate::ports::Work;
     use crate::testing::fakes::FakeClassifier;
-    use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeModelLoader;
     use crate::testing::fakes::FakeStt;
     use crate::testing::fakes::FakeTrainer;
@@ -873,7 +874,7 @@ mod tests {
     /// The transcript of each request of `jarvis.qnt`.
     const TRANSCRIPT: &str = "conformance request";
 
-    /// The state of `jarvis.qnt` that the driver compares.
+    /// The state of `composed.qnt` that the driver compares.
     #[derive(Debug, Deserialize, PartialEq)]
     #[serde(rename_all = "camelCase")]
     struct System {
@@ -901,6 +902,9 @@ mod tests {
         started: BTreeMap<String, usize>,
         /// The last handled request of each satellite, 0 before any.
         newest: BTreeMap<String, usize>,
+        /// The questions of the open dialog of each satellite, 0 without one.
+        #[serde(rename = "composed::dialogs::turns")]
+        turns: BTreeMap<String, u32>,
     }
 
     /// The time, the outputs and the satellites that the driver saw, as `System` has them, and
@@ -961,8 +965,8 @@ mod tests {
     }
 
     impl ModelState<SystemDriver> for System {
-        /// What the driver read from the app for each request, and the version of the classifier
-        /// of the app.
+        /// What the driver read from the app for each request, the version of the classifier of
+        /// the app and its open dialogs.
         fn from_driver(driver: &SystemDriver) -> anyhow::Result<Self> {
             let phase = |r| *driver.phases.get(&r).unwrap_or(&"Listening");
             let read = |map: &BTreeMap<usize, usize>, r| map.get(&r).copied().unwrap_or(0);
@@ -983,11 +987,12 @@ mod tests {
                 idle: driver.idle(),
                 started: seen.started.clone(),
                 newest: seen.newest.clone(),
+                turns: driver.turns(),
             })
         }
     }
 
-    /// Replays `jarvis.qnt` against the app with port fakes on two satellites. Each request says
+    /// Replays `composed.qnt` against the app with port fakes on two satellites. Each request says
     /// `TRANSCRIPT`, and each model version is a `FakeClassifier` that holds its predictions.
     struct SystemDriver {
         /// The paused runtime of the app, the `handle` tasks and the training runs.
@@ -1026,6 +1031,12 @@ mod tests {
         cache: watch::Receiver<StateCache>,
         /// The wait of an announce after the satellite becomes idle.
         margin: Duration,
+        /// The announce queues and the dialogs of the app.
+        queues: Arc<Queues>,
+        /// The clock of the conversation.
+        clock: Arc<SetClock>,
+        /// The time after the last question that closes a dialog.
+        timeout_s: u64,
     }
 
     /// The sender of the next step of a System Two answer and the task of the answer.
@@ -1107,12 +1118,7 @@ mod tests {
         /// `Assistant::handle` of request `r` on its satellite until its prediction waits in the
         /// classifier of a model version.
         fn handle(&mut self, r: usize) -> anyhow::Result<()> {
-            use crate::ports::Assistant as _;
-
-            let (app, context) = (Arc::clone(&self.app.0), satellite_context(r));
-            let task = self
-                .runtime
-                .spawn(async move { app.handle(TRANSCRIPT, context).await });
+            let task = self.spawn(r, TRANSCRIPT);
             let mut held = || {
                 let mut versions = self.versions.iter().zip(1..);
                 versions.find_map(|(version, v)| Some((version.take_held()?, v)))
@@ -1122,9 +1128,32 @@ mod tests {
             self.waiting.insert(r, (sender, task));
             self.models.insert(r, v);
             self.phases.insert(r, "Handling");
-            self.seen
-                .newest
-                .insert(MODEL_SATELLITES[satellite(r)].to_owned(), r);
+            self.set_newest(r);
+            Ok(())
+        }
+
+        /// The `Assistant::handle` task of request `r` with `text` on its satellite.
+        fn spawn(&self, r: usize, text: &'static str) -> JoinHandle<anyhow::Result<Handled>> {
+            use crate::ports::Assistant as _;
+
+            let (app, context) = (Arc::clone(&self.app.0), satellite_context(r));
+            self.runtime
+                .spawn(async move { app.handle(text, context).await })
+        }
+
+        /// Makes request `r` the newest request of its satellite.
+        fn set_newest(&mut self, r: usize) {
+            let satellite = MODEL_SATELLITES[satellite(r)].to_owned();
+            self.seen.newest.insert(satellite, r);
+        }
+
+        /// `Assistant::handle` of request `r` with `text`, which answers the open dialog of its
+        /// satellite without a prediction, in the active model version.
+        fn answer(&mut self, r: usize, text: &'static str) -> anyhow::Result<()> {
+            let ended = self.runtime.block_on(self.spawn(r, text))?;
+            self.models.insert(r, self.active_model()?);
+            self.set_newest(r);
+            self.ended(r, ended);
             Ok(())
         }
 
@@ -1135,6 +1164,12 @@ mod tests {
             let sent = sender.send(result);
             sent.map_err(|_unsent| anyhow::anyhow!("the prediction does not wait"))?;
             let ended = self.runtime.block_on(task)?;
+            self.ended(r, ended);
+            Ok(())
+        }
+
+        /// Reads the end `ended` of `handle` of request `r`.
+        fn ended(&mut self, r: usize, ended: anyhow::Result<Handled>) {
             let phase = self.phase(&ended);
             self.phases.insert(r, phase);
             *self.handled.entry(r).or_default() += 1;
@@ -1142,7 +1177,6 @@ mod tests {
                 self.seen.reply_time.insert(r, self.seen.now);
             }
             self.keep(r, phase, ended.ok().and_then(|handled| handled.after));
-            Ok(())
         }
 
         /// Keeps the work `after` of the reply of request `r` in `phase` until `call`, or starts
@@ -1282,6 +1316,29 @@ mod tests {
             *clock.0.lock().expect("no panic") += Duration::from_secs(1);
             self.runtime.block_on(training.run())
         }
+
+        /// Advances the time of the driver by one unit, and the clock of the conversation by 5 s:
+        /// the `dialog.timeout_s` of `jarvis.toml` over the `TIMEOUT` of `dialog.qnt`.
+        fn tick(&mut self) {
+            self.seen.now += 1;
+            *self.probes.clock.0.lock().expect("no panic") += Duration::from_secs(5);
+        }
+
+        /// The questions of the open dialog of each model satellite, 0 without one. A dialog that
+        /// timed out at the clock of the conversation is not open.
+        fn turns(&self) -> BTreeMap<String, u32> {
+            use crate::ports::Clock as _;
+
+            let (now, timeout_s) = (self.probes.clock.now(), self.probes.timeout_s);
+            let mut dialogs = self.probes.queues.dialogs().clone();
+            let mut open = |(entity, _): &(&str, &str)| {
+                let dialog = dialogs.take(&Key((*entity).to_owned()), now, timeout_s);
+                dialog.map_or(0, |dialog| dialog.turns)
+            };
+            let turns = SATELLITES.iter().map(&mut open);
+            let names = MODEL_SATELLITES.map(str::to_owned);
+            names.into_iter().zip(turns).collect()
+        }
     }
 
     /// The satellite entity and its device for the model satellites `s1` and `s2`.
@@ -1322,7 +1379,8 @@ mod tests {
     }
 
     impl SystemDriver {
-        /// Runs the model step `step` on the app.
+        /// Runs the model step `step` on the app. The steps of `composed.qnt` that `jarvis.qnt`
+        /// does not have run in [`SystemDriver::compose`].
         fn apply(&mut self, step: &Step) -> anyhow::Result<()> {
             switch!(step {
                 init => *self = Self::new(),
@@ -1336,7 +1394,24 @@ mod tests {
                 call(r: usize) => self.call(r)?,
                 pipelineEnd(s: String) => self.pipeline_end(&s)?,
                 announce(r: usize) => self.announce(r)?,
-                tick => self.seen.now += 1,
+                tick => self.tick(),
+                _ => self.compose(step)?,
+            })
+        }
+
+        /// Runs the step `step` that only `composed.qnt` has. A held prediction of `unknown` is
+        /// `unclear` for a request that holds a dialog. The steps of the commit policies, the
+        /// training trigger, the learned intents and the prefetch change nothing that the driver
+        /// compares.
+        fn compose(&mut self, step: &Step) -> anyhow::Result<()> {
+            switch!(step {
+                unclear(r: usize) => self.finish(r, Ok(predicted("unknown")))?,
+                ask(r: usize) => self.finish(r, Ok(nowhere("lights_on")))?,
+                fill(r: usize) => self.answer(r, "kitchen")?,
+                cancel(r: usize) => self.answer(r, "cancel")?,
+                listen => {}, autoStart => {}, voiceStart => {}, change => {}, localFail => {},
+                runpodFail => {}, propose => {}, approve => {}, reject => {}, writeRequest => {},
+                failWrite => {}, prefetch => {}, prefetchStep => {},
             })
         }
     }
@@ -1365,6 +1440,16 @@ mod tests {
         serde_json::from_value(call).expect("it is a call")
     }
 
+    /// A prediction of `label` with 0.9 in an area that the reference house does not have.
+    fn nowhere(label: &str) -> Prediction {
+        let (name, value) = ("area".to_owned(), "nowhere".to_owned());
+        let slots = vec![Slot { name, value }];
+        Prediction {
+            slots,
+            ..predicted(label)
+        }
+    }
+
     /// The app of `config` with the System One model `current`, the listener of
     /// [`system_listener`], `FakeTts` and the [`system_probes`], its pools and its probes.
     ///
@@ -1375,13 +1460,14 @@ mod tests {
         config: &Config,
         current: Arc<CurrentClassifier>,
     ) -> anyhow::Result<(Arc<App>, Arc<ArcSwap<Pools>>, Probes)> {
-        let (probes, queues) = system_probes(config).await?;
+        let probes = system_probes(config).await?;
+        let (queues, clock) = (Arc::clone(&probes.queues), Arc::clone(&probes.clock));
         let reasoner: Arc<dyn Reasoner> = Arc::clone(&probes.reasoner) as _;
         let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
         let listener = system_listener(config, &current, &reasoner, &queues);
         let recorder = recorder(Arc::clone(listener.utterances()));
         let cache = probes.cache.clone();
-        let parts = (current, queues, cache, reasoner, Arc::clone(&speech));
+        let parts = (current, queues, cache, reasoner, Arc::clone(&speech), clock);
         let (conversation, pools) = system_conversation(config, parts, recorder)?;
         let app = App {
             conversation,
@@ -1392,13 +1478,14 @@ mod tests {
         Ok((Arc::new(app), pools, probes))
     }
 
-    /// The probes of `config`: `FakeHome`, `FakeReasoner`, which holds each step of an answer, and
-    /// the hot cache of `FakeHome` after its first snapshot. Also gives the queues of the cache.
+    /// The probes of `config`: `FakeHome`, `FakeReasoner`, which holds each step of an answer, the
+    /// hot cache of `FakeHome` after its first snapshot, its queues and the clock of the
+    /// conversation.
     ///
     /// # Errors
     ///
     /// The sync ends before its first snapshot.
-    async fn system_probes(config: &Config) -> anyhow::Result<(Probes, Arc<Queues>)> {
+    async fn system_probes(config: &Config) -> anyhow::Result<Probes> {
         let home = Arc::new(FakeHome::default());
         home.send(Event::Reconnected);
         let (mut cache, queues) = crate::start_sync(Arc::clone(&home) as _, config);
@@ -1406,22 +1493,27 @@ mod tests {
         let reasoner = Arc::new(FakeReasoner::default());
         reasoner.hold_steps();
         let margin = Duration::from_millis(config.announce.margin_ms);
-        let probes = Probes {
+        let clock = Arc::new(SetClock(Mutex::new(Timestamp::UNIX_EPOCH)));
+        Ok(Probes {
             home,
             reasoner,
             cache,
             margin,
-        };
-        Ok((probes, queues))
+            queues,
+            clock,
+            timeout_s: config.dialog.timeout_s,
+        })
     }
 
-    /// The System One model, the queues, the hot cache, System Two and the speech of an app.
+    /// The System One model, the queues, the hot cache, System Two, the speech and the clock of the
+    /// conversation of an app.
     type Parts = (
         Arc<CurrentClassifier>,
         Arc<Queues>,
         watch::Receiver<StateCache>,
         Arc<dyn Reasoner>,
         Arc<Speech>,
+        Arc<SetClock>,
     );
 
     /// The conversation of `config` on `parts` and `recorder`, with the System Two of
@@ -1432,7 +1524,7 @@ mod tests {
     /// `intents.toml` or `responses.toml` cannot load.
     fn system_conversation(
         config: &Config,
-        (current, queues, cache, reasoner, speech): Parts,
+        (current, queues, cache, reasoner, speech, clock): Parts,
         recorder: Recorder,
     ) -> anyhow::Result<(Conversation, Arc<ArcSwap<Pools>>)> {
         let catalog = crate::load_catalog(&config.intents)?;
@@ -1455,19 +1547,18 @@ mod tests {
             current,
             catalog,
             config.model.threshold,
-            fake_two(config, reasoner),
+            fake_two(config, reasoner, clock),
             habits,
             recorder,
         );
         Ok((conversation, pools))
     }
 
-    /// The System Two of `config` on `reasoner` at the time of `FakeClock`, with a step timeout
-    /// longer than a trace.
-    fn fake_two(config: &Config, reasoner: Arc<dyn Reasoner>) -> SystemTwo {
+    /// The System Two of `config` on `reasoner` at the time of `clock`, with a step timeout longer
+    /// than a trace.
+    fn fake_two(config: &Config, reasoner: Arc<dyn Reasoner>, clock: Arc<SetClock>) -> SystemTwo {
         let mut two = crate::system_two(config, reasoner, crate::registry(config, Vec::new()));
         two.timeout = Duration::from_secs(3600);
-        let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
         SystemTwo { clock, ..two }
     }
 
@@ -1527,15 +1618,9 @@ mod tests {
         (training, loader, trainer, clock, models)
     }
 
-    /// AC-16.2b-1. `quint_run` replays 100 traces by default.
-    #[quint_run(spec = "quint/jarvis.qnt", max_steps = 30, seed = "1")]
-    fn ac_16_2b_1_conformance() -> impl Driver {
-        SystemDriver::new()
-    }
-
-    /// AC-16.2c-1. `quint_run` replays 100 traces by default.
-    #[quint_run(spec = "quint/jarvis.qnt", max_steps = 30, seed = "1")]
-    fn ac_16_2c_1_conformance() -> impl Driver {
+    /// AC-16.4-1. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/composed.qnt", max_steps = 30, seed = "1")]
+    fn ac_16_4_1_conformance() -> impl Driver {
         SystemDriver::new()
     }
 
