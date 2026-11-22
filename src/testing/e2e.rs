@@ -467,18 +467,50 @@ fn text_of(data: &Value) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
     use std::io::Write;
 
+    use arc_swap::ArcSwap;
+    use futures::channel::oneshot;
     use jiff::Timestamp;
+    use quint_connect::Driver;
+    use quint_connect::State as ModelState;
+    use quint_connect::Step;
+    use quint_connect::quint_run;
+    use quint_connect::switch;
+    use serde::Deserialize;
     use serde_json::Map;
+    use tokio::runtime::Runtime;
+    use tokio::sync::watch;
+    use tokio::task::JoinHandle;
 
+    use crate::CurrentClassifier;
+    use crate::app::background::Backfill;
+    use crate::app::background::Habits;
+    use crate::app::conversation::Conversation;
+    use crate::app::conversation::Queues;
+    use crate::app::conversation::Recorder;
+    use crate::app::conversation::SystemTwo;
+    use crate::app::speech::Listener;
+    use crate::app::speech::Speech;
+    use crate::app::training::FIXTURE;
     use crate::domain::decide::PluginCall;
+    use crate::domain::habits::RequestHabits;
     use crate::domain::learn::LearnedKind;
     use crate::domain::learn::LearnedStatus;
     use crate::domain::model::Prediction;
     use crate::domain::responses;
+    use crate::domain::responses::Pools;
     use crate::domain::state::AreaId;
+    use crate::domain::state_cache::StateCache;
+    use crate::ports;
+    use crate::ports::Handled;
+    use crate::ports::Listening;
     use crate::testing::fakes::FakeClassifier;
+    use crate::testing::fakes::FakeClock;
+    use crate::testing::fakes::FakeStt;
+    use crate::testing::fakes::FakeTts;
+    use crate::testing::fakes::FakeVoiceEmbedder;
     use crate::testing::fakes::Scripted;
 
     /// The text of the runs of sub-phase 9.1.
@@ -762,13 +794,18 @@ mod tests {
     fn always(label: &str) -> Arc<FakeClassifier> {
         let classifier = Arc::new(FakeClassifier::default());
         for _ in 0..10_000 {
-            let ranked = vec![(label.to_owned(), 0.9)];
-            classifier.script(Prediction {
-                ranked,
-                slots: Vec::new(),
-            });
+            classifier.script(predicted(label));
         }
         classifier
+    }
+
+    /// A prediction of `label` with 0.9 and no slots.
+    fn predicted(label: &str) -> Prediction {
+        let ranked = vec![(label.to_owned(), 0.9)];
+        Prediction {
+            ranked,
+            slots: Vec::new(),
+        }
     }
 
     /// AC-14.10d-4. The classifier gives `family_calendar` to each prediction, and its stored
@@ -823,5 +860,326 @@ mod tests {
         let limit = Duration::from_millis(300);
         assert!(p95 <= limit, "p95 {p95:?}, limit {limit:?}");
         Ok(())
+    }
+
+    /// The transcript of each request of `jarvis.qnt`.
+    const TRANSCRIPT: &str = "conformance request";
+
+    /// The state of `jarvis.qnt` that the driver compares.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct System {
+        /// The phase of each request.
+        phase: BTreeMap<usize, Tag>,
+        /// The number of `Handled` messages of each request.
+        handled: BTreeMap<usize, usize>,
+    }
+
+    /// The variant of a Quint sum type value.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Tag {
+        /// The variant name.
+        tag: String,
+    }
+
+    impl ModelState<SystemDriver> for System {
+        /// The phase and the number of ended `handle` calls of each request that the driver read
+        /// from the app.
+        fn from_driver(driver: &SystemDriver) -> anyhow::Result<Self> {
+            let phase = |r| *driver.phases.get(&r).unwrap_or(&"Listening");
+            let handled = |r| driver.handled.get(&r).copied().unwrap_or(0);
+            let tag = |r| Tag {
+                tag: phase(r).to_owned(),
+            };
+            Ok(Self {
+                phase: (1..=3).map(|r| (r, tag(r))).collect(),
+                handled: (1..=3).map(|r| (r, handled(r))).collect(),
+            })
+        }
+    }
+
+    /// Replays `jarvis.qnt` against the app with port fakes on two satellites. Each request says
+    /// `TRANSCRIPT`, and `FakeClassifier` holds its prediction.
+    struct SystemDriver {
+        /// The paused runtime of the app and the `handle` tasks.
+        runtime: Runtime,
+        /// The app and its pools.
+        app: (Arc<App>, Arc<ArcSwap<Pools>>),
+        /// The System One model of the app.
+        classifier: Arc<FakeClassifier>,
+        /// The listen session of each request, from `audio` to `commit`.
+        sessions: BTreeMap<usize, Box<dyn Listening>>,
+        /// The result sender of the waiting prediction and the `handle` task of each request.
+        waiting: BTreeMap<usize, Waiting>,
+        /// The phase of each request that the app showed.
+        phases: BTreeMap<usize, &'static str>,
+        /// The number of ended `handle` calls of each request.
+        handled: BTreeMap<usize, usize>,
+    }
+
+    /// The result sender of a waiting prediction and its `handle` task.
+    type Waiting = (
+        oneshot::Sender<anyhow::Result<Prediction>>,
+        JoinHandle<anyhow::Result<Handled>>,
+    );
+
+    impl SystemDriver {
+        /// A driver at `init`, with no request.
+        fn new() -> Self {
+            let mut runtime = tokio::runtime::Builder::new_current_thread();
+            let runtime = runtime.enable_time().start_paused(true).build();
+            let runtime = runtime.expect("the runtime builds");
+            let classifier = Arc::new(FakeClassifier::default());
+            classifier.hold(TRANSCRIPT);
+            let model = Arc::clone(&classifier) as _;
+            let current = Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), model));
+            let config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
+            let app = runtime.block_on(system_app(&config, current));
+            Self {
+                runtime,
+                app: app.expect("the app starts"),
+                classifier,
+                sessions: BTreeMap::new(),
+                waiting: BTreeMap::new(),
+                phases: BTreeMap::new(),
+                handled: BTreeMap::new(),
+            }
+        }
+
+        /// `Assistant::listen` and one chunk of silence for request `r`.
+        fn audio(&mut self, r: usize) -> anyhow::Result<()> {
+            use crate::ports::Assistant as _;
+
+            let app = Arc::clone(&self.app.0);
+            let session = self.runtime.block_on(async move {
+                let mut session = app.listen()?;
+                session.push(vec![0; CHUNK_SAMPLES]).await?;
+                anyhow::Ok(session)
+            })?;
+            self.sessions.insert(r, session);
+            Ok(())
+        }
+
+        /// `Listening::finish` of request `r`.
+        fn commit(&mut self, r: usize) -> anyhow::Result<()> {
+            let session = self.sessions.remove(&r).context("no listen session")?;
+            let transcript = self.runtime.block_on(session.finish())?;
+            anyhow::ensure!(transcript == TRANSCRIPT, "the transcript is {transcript:?}");
+            self.phases.insert(r, "Committed");
+            Ok(())
+        }
+
+        /// `Assistant::handle` of request `r` on its satellite until its prediction waits.
+        fn handle(&mut self, r: usize) -> anyhow::Result<()> {
+            use crate::ports::Assistant as _;
+
+            let (app, context) = (Arc::clone(&self.app.0), satellite_context(r));
+            let task = self
+                .runtime
+                .spawn(async move { app.handle(TRANSCRIPT, context).await });
+            let classifier = &self.classifier;
+            let held = self.runtime.block_on(async {
+                loop {
+                    let held = classifier.take_held();
+                    if held.is_some() || task.is_finished() {
+                        return held;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            });
+            let sender = held.context("the prediction does not wait")?;
+            self.waiting.insert(r, (sender, task));
+            self.phases.insert(r, "Handling");
+            Ok(())
+        }
+
+        /// Gives `result` to the waiting prediction of request `r`, and reads the end of its
+        /// `handle`.
+        fn finish(&mut self, r: usize, result: anyhow::Result<Prediction>) -> anyhow::Result<()> {
+            let (sender, task) = self.waiting.remove(&r).context("no waiting prediction")?;
+            let sent = sender.send(result);
+            sent.map_err(|_unsent| anyhow::anyhow!("the prediction does not wait"))?;
+            let ended = self.runtime.block_on(task)?;
+            self.phases.insert(r, self.phase(ended));
+            *self.handled.entry(r).or_default() += 1;
+            Ok(())
+        }
+
+        /// The model phase after the end `ended` of `handle`: a filler defers, and an error ends
+        /// the request.
+        fn phase(&self, ended: anyhow::Result<Handled>) -> &'static str {
+            let pools = self.app.1.load();
+            let filler = |text: &str| pools["filler"].responses.iter().any(|f| f.text == text);
+            match ended {
+                Ok(handled) if filler(&handled.text) => "Deferred",
+                Ok(_) => "Replied",
+                Err(_) => "Done",
+            }
+        }
+    }
+
+    /// The satellite entity and its device for the model satellites `s1` and `s2`.
+    const SATELLITES: [(&str, &str); 2] = [
+        (KITCHEN_SATELLITE, KITCHEN_DEVICE),
+        (
+            "assist_satellite.carson_office",
+            "1c8aff5b3943869c175c09b3c12f63d4",
+        ),
+    ];
+
+    /// The context of request `r` from its satellite: requests 1 and 2 from the model satellite
+    /// `s1`, and request 3 from `s2`.
+    fn satellite_context(r: usize) -> ports::Context {
+        let (satellite, device) = SATELLITES[usize::from(r > 2)];
+        ports::Context {
+            device_id: Some(device.to_owned()),
+            satellite_id: Some(satellite.to_owned()),
+            ..ports::Context::default()
+        }
+    }
+
+    impl Driver for SystemDriver {
+        type State = System;
+
+        fn step(&mut self, step: &Step) -> anyhow::Result<()> {
+            switch!(step {
+                init => *self = Self::new(),
+                audio(r: usize) => self.audio(r)?,
+                commit(r: usize) => self.commit(r)?,
+                handle(r: usize) => self.handle(r)?,
+                reply(r: usize) => self.finish(r, Ok(predicted("lights_on")))?,
+                defer(r: usize) => self.finish(r, Ok(predicted("unknown")))?,
+                failRequest(r: usize) => self.finish(r, Err(anyhow::anyhow!("the model failed")))?,
+                // Sub-phase 16.2b maps `swap`, and sub-phase 16.2c maps `call`, `pipelineEnd`,
+                // `announce` and `tick`.
+                _ => {},
+            })
+        }
+    }
+
+    /// The app of `config` with the System One model `current`, the listener of
+    /// [`system_listener`], `FakeTts`, `FakeReasoner` and the hot cache of `FakeHome`, and its
+    /// pools.
+    ///
+    /// # Errors
+    ///
+    /// A file cannot load, or the sync ends before its first snapshot.
+    async fn system_app(
+        config: &Config,
+        current: Arc<CurrentClassifier>,
+    ) -> anyhow::Result<(Arc<App>, Arc<ArcSwap<Pools>>)> {
+        let home = Arc::new(FakeHome::default());
+        home.send(Event::Reconnected);
+        let (mut cache, queues) = crate::start_sync(home, config);
+        cache.changed().await?;
+        let reasoner: Arc<dyn Reasoner> = Arc::new(FakeReasoner::default());
+        let speech = Arc::new(Speech::new(Arc::new(FakeTts::default())));
+        let listener = system_listener(config, &current, &reasoner, &queues);
+        let recorder = recorder(Arc::clone(listener.utterances()));
+        let parts = (current, queues, cache, reasoner, Arc::clone(&speech));
+        let (conversation, pools) = system_conversation(config, parts, recorder)?;
+        let app = App {
+            conversation,
+            listener,
+            speech,
+            _prefetch: None,
+        };
+        Ok((Arc::new(app), pools))
+    }
+
+    /// The System One model, the queues, the hot cache, System Two and the speech of an app.
+    type Parts = (
+        Arc<CurrentClassifier>,
+        Arc<Queues>,
+        watch::Receiver<StateCache>,
+        Arc<dyn Reasoner>,
+        Arc<Speech>,
+    );
+
+    /// The conversation of `config` on `parts` and `recorder`, with the System Two of
+    /// [`fake_two`], and its pools.
+    ///
+    /// # Errors
+    ///
+    /// `intents.toml` or `responses.toml` cannot load.
+    fn system_conversation(
+        config: &Config,
+        (current, queues, cache, reasoner, speech): Parts,
+        recorder: Recorder,
+    ) -> anyhow::Result<(Conversation, Arc<ArcSwap<Pools>>)> {
+        let catalog = crate::load_catalog(&config.intents)?;
+        let pools = crate::load_pools(&config.responses, &catalog)?;
+        let pools = Arc::new(ArcSwap::from_pointee(pools));
+        let catalog = Arc::new(ArcSwap::from_pointee(catalog));
+        let backfill = Backfill::new(
+            config.backfill.clone(),
+            Arc::clone(&reasoner),
+            std::sync::mpsc::channel().0,
+            speech,
+            Arc::clone(&catalog),
+            cache.clone(),
+        );
+        let habits = Arc::new(Habits::new(RequestHabits::default(), 14.0, cache));
+        let conversation = Conversation::new(
+            Arc::clone(&pools),
+            Arc::new(backfill),
+            queues,
+            current,
+            catalog,
+            config.model.threshold,
+            fake_two(config, reasoner),
+            habits,
+            recorder,
+        );
+        Ok((conversation, pools))
+    }
+
+    /// The System Two of `config` on `reasoner` at the time of `FakeClock`.
+    fn fake_two(config: &Config, reasoner: Arc<dyn Reasoner>) -> SystemTwo {
+        let two = crate::system_two(config, reasoner, crate::registry(config, Vec::new()));
+        let clock = Arc::new(FakeClock(Timestamp::UNIX_EPOCH));
+        SystemTwo { clock, ..two }
+    }
+
+    /// The listener of `config` on `FakeStt`, whose second pass gives `TRANSCRIPT`, and
+    /// `FakeVoiceEmbedder`, with `current`, `reasoner` and `queues`.
+    fn system_listener(
+        config: &Config,
+        current: &Arc<CurrentClassifier>,
+        reasoner: &Arc<dyn Reasoner>,
+        queues: &Arc<Queues>,
+    ) -> Listener {
+        let second_pass = Ok(Some(TRANSCRIPT.to_owned()));
+        let stt = Arc::new(FakeStt {
+            second_pass,
+            ..FakeStt::default()
+        });
+        let classifier = Arc::clone(current) as _;
+        let reasoner = Arc::clone(reasoner);
+        crate::listener(
+            config,
+            stt,
+            Arc::new(FakeVoiceEmbedder),
+            classifier,
+            reasoner,
+            queues,
+        )
+    }
+
+    /// A recorder of `utterances` with the training trigger of `FakeTrainer` and `FakeLog`, and a
+    /// log writer that has ended.
+    fn recorder(utterances: Arc<Utterances>) -> Recorder {
+        Recorder {
+            utterances,
+            writer: tokio::sync::mpsc::unbounded_channel().0,
+            last_id: None,
+            trigger: fakes::trigger(Path::new("unused")).0,
+            speakers: fakes::speakers(Arc::default()),
+        }
+    }
+
+    /// AC-16.2-1. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/jarvis.qnt", max_steps = 30, seed = "1")]
+    fn ac_16_2_1_conformance() -> impl Driver {
+        SystemDriver::new()
     }
 }
