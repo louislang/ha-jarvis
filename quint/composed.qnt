@@ -130,7 +130,6 @@ module composed {
 
   /// The step bound of `quint verify`. The check takes about 2 minutes at 5 steps and grows about 3 times with each step.
   pure val VERIFY_STEPS = 5
-
   /// The simulation samples of `just quint`. A composed step takes about 100 times longer than a step of `jarvis.qnt`.
   pure val SAMPLES = 1000
 
