@@ -469,6 +469,7 @@ mod tests {
 
     use std::collections::BTreeMap;
     use std::io::Write;
+    use std::sync::Mutex;
 
     use arc_swap::ArcSwap;
     use futures::channel::oneshot;
@@ -494,6 +495,8 @@ mod tests {
     use crate::app::speech::Listener;
     use crate::app::speech::Speech;
     use crate::app::training::FIXTURE;
+    use crate::app::training::Training;
+    use crate::domain::catalog::Catalog;
     use crate::domain::decide::PluginCall;
     use crate::domain::habits::RequestHabits;
     use crate::domain::learn::LearnedKind;
@@ -508,10 +511,13 @@ mod tests {
     use crate::ports::Listening;
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
+    use crate::testing::fakes::FakeModelLoader;
     use crate::testing::fakes::FakeStt;
+    use crate::testing::fakes::FakeTrainer;
     use crate::testing::fakes::FakeTts;
     use crate::testing::fakes::FakeVoiceEmbedder;
     use crate::testing::fakes::Scripted;
+    use crate::testing::fakes::SetClock;
 
     /// The text of the runs of sub-phase 9.1.
     const REQUEST: &str = "turn on the lights";
@@ -867,11 +873,16 @@ mod tests {
 
     /// The state of `jarvis.qnt` that the driver compares.
     #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(rename_all = "camelCase")]
     struct System {
         /// The phase of each request.
         phase: BTreeMap<usize, Tag>,
         /// The number of `Handled` messages of each request.
         handled: BTreeMap<usize, usize>,
+        /// The model version of each request, 0 before `handle`.
+        model_version: BTreeMap<usize, usize>,
+        /// The model version that `handle` reads.
+        active_model: usize,
     }
 
     /// The variant of a Quint sum type value.
@@ -882,30 +893,36 @@ mod tests {
     }
 
     impl ModelState<SystemDriver> for System {
-        /// The phase and the number of ended `handle` calls of each request that the driver read
-        /// from the app.
+        /// What the driver read from the app for each request, and the version of the classifier
+        /// of the app.
         fn from_driver(driver: &SystemDriver) -> anyhow::Result<Self> {
             let phase = |r| *driver.phases.get(&r).unwrap_or(&"Listening");
-            let handled = |r| driver.handled.get(&r).copied().unwrap_or(0);
+            let read = |map: &BTreeMap<usize, usize>, r| map.get(&r).copied().unwrap_or(0);
             let tag = |r| Tag {
                 tag: phase(r).to_owned(),
             };
             Ok(Self {
                 phase: (1..=3).map(|r| (r, tag(r))).collect(),
-                handled: (1..=3).map(|r| (r, handled(r))).collect(),
+                handled: (1..=3).map(|r| (r, read(&driver.handled, r))).collect(),
+                model_version: (1..=3).map(|r| (r, read(&driver.models, r))).collect(),
+                active_model: driver.active_model()?,
             })
         }
     }
 
     /// Replays `jarvis.qnt` against the app with port fakes on two satellites. Each request says
-    /// `TRANSCRIPT`, and `FakeClassifier` holds its prediction.
+    /// `TRANSCRIPT`, and each model version is a `FakeClassifier` that holds its predictions.
     struct SystemDriver {
-        /// The paused runtime of the app and the `handle` tasks.
+        /// The paused runtime of the app, the `handle` tasks and the training runs.
         runtime: Runtime,
         /// The app and its pools.
         app: (Arc<App>, Arc<ArcSwap<Pools>>),
         /// The System One model of the app.
-        classifier: Arc<FakeClassifier>,
+        current: Arc<CurrentClassifier>,
+        /// The classifiers of the model versions 1 and 2.
+        versions: [Arc<FakeClassifier>; 2],
+        /// The training run that swaps the model.
+        swap: Swap,
         /// The listen session of each request, from `audio` to `commit`.
         sessions: BTreeMap<usize, Box<dyn Listening>>,
         /// The result sender of the waiting prediction and the `handle` task of each request.
@@ -914,7 +931,18 @@ mod tests {
         phases: BTreeMap<usize, &'static str>,
         /// The number of ended `handle` calls of each request.
         handled: BTreeMap<usize, usize>,
+        /// The model version whose classifier held the prediction of each request.
+        models: BTreeMap<usize, usize>,
     }
+
+    /// A training run, its loader, its trainer, its clock and the folder of its model folders.
+    type Swap = (
+        Training,
+        Arc<FakeModelLoader>,
+        Arc<FakeTrainer>,
+        Arc<SetClock>,
+        TempDir,
+    );
 
     /// The result sender of a waiting prediction and its `handle` task.
     type Waiting = (
@@ -923,25 +951,30 @@ mod tests {
     );
 
     impl SystemDriver {
-        /// A driver at `init`, with no request.
+        /// A driver at `init`: no request, and model version 1 active.
         fn new() -> Self {
             let mut runtime = tokio::runtime::Builder::new_current_thread();
             let runtime = runtime.enable_time().start_paused(true).build();
             let runtime = runtime.expect("the runtime builds");
-            let classifier = Arc::new(FakeClassifier::default());
-            classifier.hold(TRANSCRIPT);
-            let model = Arc::clone(&classifier) as _;
-            let current = Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), model));
+            let versions = [always("lights_on"), always("lights_on")];
+            for version in &versions {
+                version.hold(TRANSCRIPT);
+            }
+            let first = Arc::clone(&versions[0]) as _;
+            let current = Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), first));
             let config = Config::parse(include_str!("../../jarvis.toml")).expect("it is valid");
-            let app = runtime.block_on(system_app(&config, current));
+            let app = runtime.block_on(system_app(&config, Arc::clone(&current)));
             Self {
                 runtime,
                 app: app.expect("the app starts"),
-                classifier,
+                swap: training_run(&current),
+                current,
+                versions,
                 sessions: BTreeMap::new(),
                 waiting: BTreeMap::new(),
                 phases: BTreeMap::new(),
                 handled: BTreeMap::new(),
+                models: BTreeMap::new(),
             }
         }
 
@@ -968,7 +1001,8 @@ mod tests {
             Ok(())
         }
 
-        /// `Assistant::handle` of request `r` on its satellite until its prediction waits.
+        /// `Assistant::handle` of request `r` on its satellite until its prediction waits in the
+        /// classifier of a model version.
         fn handle(&mut self, r: usize) -> anyhow::Result<()> {
             use crate::ports::Assistant as _;
 
@@ -976,18 +1010,20 @@ mod tests {
             let task = self
                 .runtime
                 .spawn(async move { app.handle(TRANSCRIPT, context).await });
-            let classifier = &self.classifier;
-            let held = self.runtime.block_on(async {
+            let versions = &self.versions;
+            let found = self.runtime.block_on(async {
                 loop {
-                    let held = classifier.take_held();
-                    if held.is_some() || task.is_finished() {
-                        return held;
+                    let mut held = versions.iter().zip(1..);
+                    let found = held.find_map(|(version, v)| Some((version.take_held()?, v)));
+                    if found.is_some() || task.is_finished() {
+                        return found;
                     }
                     tokio::task::yield_now().await;
                 }
             });
-            let sender = held.context("the prediction does not wait")?;
+            let (sender, v) = found.context("the prediction does not wait")?;
             self.waiting.insert(r, (sender, task));
+            self.models.insert(r, v);
             self.phases.insert(r, "Handling");
             Ok(())
         }
@@ -1014,6 +1050,25 @@ mod tests {
                 Ok(_) => "Replied",
                 Err(_) => "Done",
             }
+        }
+
+        /// The model version whose classifier the app uses.
+        fn active_model(&self) -> anyhow::Result<usize> {
+            let active = Arc::clone(&self.current.0.load().classifier);
+            let same = |version: &Arc<FakeClassifier>| {
+                std::ptr::addr_eq(Arc::as_ptr(version), Arc::as_ptr(&active))
+            };
+            let index = self.versions.iter().position(same);
+            Ok(index.context("an unknown classifier")? + 1)
+        }
+
+        /// A training run whose loader gives the classifier of model version `v`.
+        fn swap(&mut self, v: usize) -> anyhow::Result<()> {
+            let (training, loader, trainer, clock, _) = &self.swap;
+            loader.script(Arc::clone(&self.versions[v - 1]) as _);
+            trainer.results.lock().expect("no panic").push_back(Ok(()));
+            *clock.0.lock().expect("no panic") += Duration::from_secs(1);
+            self.runtime.block_on(training.run())
         }
     }
 
@@ -1049,8 +1104,8 @@ mod tests {
                 reply(r: usize) => self.finish(r, Ok(predicted("lights_on")))?,
                 defer(r: usize) => self.finish(r, Ok(predicted("unknown")))?,
                 failRequest(r: usize) => self.finish(r, Err(anyhow::anyhow!("the model failed")))?,
-                // Sub-phase 16.2b maps `swap`, and sub-phase 16.2c maps `call`, `pipelineEnd`,
-                // `announce` and `tick`.
+                swap(v: usize) => self.swap(v)?,
+                // Sub-phase 16.2c maps `call`, `pipelineEnd`, `announce` and `tick`.
                 _ => {},
             })
         }
@@ -1177,9 +1232,47 @@ mod tests {
         }
     }
 
-    /// AC-16.2-1. `quint_run` replays 100 traces by default.
+    /// A training run of `lights_on` with each example held out, on the classifier `current`.
+    fn training_run(current: &Arc<CurrentClassifier>) -> Swap {
+        let models = tempfile::tempdir().expect("a temporary folder");
+        let (training, trainer) = fakes::training(1.0, models.path());
+        let mut catalog = Catalog::clone(&training.catalog);
+        catalog.intents.retain(|intent| intent.name == "lights_on");
+        catalog.unknown_examples.clear();
+        let loader = Arc::new(FakeModelLoader::default());
+        let clock = Arc::new(SetClock(Mutex::new(Timestamp::UNIX_EPOCH)));
+        let training = Training {
+            loader: Arc::clone(&loader) as _,
+            classifier: Arc::clone(current),
+            clock: Arc::clone(&clock) as _,
+            catalog: Arc::new(catalog),
+            ..training
+        };
+        (training, loader, trainer, clock, models)
+    }
+
+    /// AC-16.2b-1. `quint_run` replays 100 traces by default.
     #[quint_run(spec = "quint/jarvis.qnt", max_steps = 30, seed = "1")]
-    fn ac_16_2_1_conformance() -> impl Driver {
+    fn ac_16_2b_1_conformance() -> impl Driver {
         SystemDriver::new()
+    }
+
+    /// AC-16.2b-2. The steps of `ac_16_1_3_swap_during_request` of `jarvis.qnt`: a swap to
+    /// version 2 before `handle`, and a swap to version 1 between `handle` and the reply.
+    #[test]
+    fn ac_16_2b_2_reply_uses_the_model_version_of_handle() -> anyhow::Result<()> {
+        let mut driver = SystemDriver::new();
+        driver.audio(1)?;
+        driver.commit(1)?;
+        driver.swap(2)?;
+        driver.handle(1)?;
+        driver.swap(1)?;
+        driver.finish(1, Ok(predicted("lights_on")))?;
+        let state = System::from_driver(&driver)?;
+        assert_eq!((state.model_version[&1], state.active_model), (2, 1));
+        assert_eq!(state.phase[&1].tag, "Replied");
+        let first = driver.versions[0].calls();
+        assert!(first.iter().all(|call| call.1 != TRANSCRIPT), "{first:?}");
+        Ok(())
     }
 }
