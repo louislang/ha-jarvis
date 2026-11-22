@@ -2113,7 +2113,7 @@ impl Queues {
     }
 
     /// The open dialogs.
-    fn dialogs(&self) -> MutexGuard<'_, Dialogs> {
+    pub(crate) fn dialogs(&self) -> MutexGuard<'_, Dialogs> {
         self.dialogs.lock().expect("no lock holder panics")
     }
 
