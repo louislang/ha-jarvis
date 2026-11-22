@@ -16,7 +16,7 @@ This specification uses ASD-STE100 Simplified Technical English (STE).
 | `00-overview.md` | This file: the specification format, technical names, goals, examples and the phase index. |
 | `01-architecture.md` | Layers, ports, the System One model, decisions, latency budget, crates, files, configuration, machines, the reference house and the change map. |
 | `02-rules.md` | Code rules, Python rules, test rules, Quint rules, proof rules, PR rules and the required checks. |
-| `phase-00.md` to `phase-18.md` | One file for each phase. |
+| `phase-00.md` to `phase-19.md` | One file for each phase. |
 
 `CLAUDE.md` at the repository root holds the working rules for code changes. It must agree with `02-rules.md`.
 
@@ -76,6 +76,8 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | Announce | The HA service `assist_satellite.announce`. It speaks text on one satellite. |
 | Ask | The HA service `assist_satellite.start_conversation`. It speaks a question on one satellite, then listens without the wake word. |
 | Dialog | The state of one open conversation on one satellite. |
+| Timer helper | An HA `timer` entity whose entity ID starts with `timer.jarvis_`. You create it once. Jarvis runs its voice timers on these helpers. |
+| Ring | The repeated announce of the end of a timer on the satellite that set it. |
 | Response latency | The time that Jarvis adds to a request: from the voice end that the VAD detects to the `transcript` event, from `transcript` to `handled`, and from `synthesize` to the first audio chunk. The time that HA takes between these events is not part of it. |
 | Request habit | A spoken request that people make in the same time slot on several days, for example "what's the traffic like today?" on weekdays at 08:00. Its key is the intent name, or the name of the learned entry of a cluster of System Two requests. HA state changes and automations are not request habits. |
 | Bucket | One time slot for request habits: the day type (weekday or weekend) and the hour. |
@@ -148,6 +150,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | G22 | Every test is deterministic. Every check is a gated check in the pre-commit hook and in CI, not only a rule in `CLAUDE.md`. |
 | G23 | Each proof about a domain function is a Verus proof, written in the same PR as the function. Verus also proves that no domain function overflows an integer, indexes out of bounds or fails an `expect`. The only trusted code is the contracts in `src/domain/contracts.rs`. |
 | G24 | Jarvis has a tab in the HA sidebar: the review of interactions and proposals, the status of Jarvis (online, training or restarting) and a form of chosen settings. A save restarts Jarvis. When the start with the new settings fails, Jarvis puts the last good settings back and shows the rollback. The status entity shows the status to dashboards and automations, also when Jarvis is down, and it stays after an HA restart. |
+| G25 | You can set a generic or a named timer by voice, ask for the time left, and cancel, pause and resume a timer. The timers run in the timer helpers of HA, and they survive a restart of Jarvis. When a timer ends, the satellite that set it announces it every 15 s for up to 2 minutes, or until the user says "stop". |
 
 ### 1.1 Example System One Requests
 
@@ -217,3 +220,4 @@ Each line is one PR. The work order follows the rows of this table, not the phas
 | [14 Learned Intents](phase-14.md) | 14.1 Clusters · 14.2 Proposal rules · 14.2b Proposal validation · 14.2c Proposal kinds · 14.3 Learned intent Quint model · 14.4 Proposal generation · 14.5 Learned intent file · 14.5b Learned intent check · 14.5c Learned intent start · 14.5d Learned intent conformance · 14.5e Cluster request habits · 14.6 Proposal review · 14.7 Activation · 14.7b Live catalog · 14.8 Prefetch Quint model · 14.9 Prefetch rules · 14.10 Prefetch use case · 14.10c Prefetch schedule · 14.10d Prefetch replies · 14.10e Prefetch conformance · 14.10b Fetch intent prefetch · 14.11 Learned intents in training · 14.12 Plugin request port and file adapter · 14.13 Plugin requests |
 | [15 Speaker Identification](phase-15.md) | 15.1 Tracker discovery · 15.1b Presence sensor discovery · 15.2 People and presence · 15.2b Discovery report · 15.2c Tracker proximity · 15.3 Voice embedder · 15.3b Voice profiles · 15.4 Voice embedding at commit · 15.5 Speaker Quint model · 15.6 Speaker signals · 15.6c Identification · 15.6d Enrollment rule · 15.6e Identification use case · 15.6b Speaker record · 15.8 Voice sample assignment · 15.8b Voice assignment use case · 15.8d Assignment conformance · 15.8c Voice assignment page · 15.8e Voice match confirmation · 15.8f Speaker pick needs a voice · 15.9 Form of address · 15.9c Address reply · 15.9b Address settings and System Two · 15.9d Voice address · 15.9e Addressed command responses |
 | [16 System Model](phase-16.md) | 16.1 System Quint model · 16.1b Newest request at handle · 16.2 System conformance · 16.2b System conformance of model swaps · 16.2c System conformance of calls and announces · 16.3 Composed Quint model · 16.4 Composed conformance · 16.4b Composed conformance of training runs |
+| [19 Voice Timers](phase-19.md) | 19.1 Timer Quint model · 19.2 Timer durations · 19.3 Time left · 19.4 Timer table · 19.5 Timer intents · 19.6 Timer answers · 19.7 Timer events · 19.8 Timer store · 19.9 Timer use case · 19.10 Timer ring · 19.11 Early stop commit · 19.12 Timer conformance |
