@@ -176,7 +176,7 @@ This phase lets Jarvis ask questions. Jarvis asks when the area is missing or wh
 5. If a `Slot` dialog is open, ask again with `next_turn`. If it returns none, reply from `failure`.
 6. Else, process the text as a new request.
 
-A choice is a closed set, so step 2 comes before step 3. The answer to System Two is free text, so step 3 comes before step 4. Each `Slot` dialog asks for the area (sub-phase 10.4) or, from sub-phase 19.6, for a timer, so it has choices. The only exception is the duration of a timer, which step 2 fills only with an answer that `timers::duration` reads (sub-phase 19.9).
+A choice is a closed set, so step 2 comes before step 3. The answer to System Two is free text, so step 3 comes before step 4. Each `Slot` dialog asks for the area (sub-phase 10.4) or, from sub-phase 19.6b, for a timer, so it has choices. The only exception is the duration of a timer, which step 2 fills only with an answer that `timers::duration` reads (sub-phase 19.9).
 
 - `handle` takes the dialog of the key of the context (`Key`, sub-phase 10.2) before step 1. Steps 2 to 6 thus close it. Step 5 stores the dialog that `next_turn` gives.
 - The filled value replaces each slot with the name of the missing slot, so `decide` reads the filled area (sub-phase 10.4). The intent of the dialog gets the probability 1.
