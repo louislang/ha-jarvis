@@ -473,10 +473,18 @@ fn variables(name: &str, catalog: &Catalog) -> BTreeSet<String> {
 }
 
 /// `slots` with the built-ins of a pool of an intent of `kind` and `target`: `area`, `entity` or
-/// the `entities` of a list query, and the `response` of a fetch.
+/// the `entities` of a list query, and the `response` of a fetch. A timer pool has only `timer`,
+/// `duration` and `timers`.
 #[verus_verify]
 #[must_use]
 pub fn pool_variables(slots: BTreeSet<String>, kind: Kind, target: Target) -> BTreeSet<String> {
+    if kind == Kind::Timer {
+        let mut variables = BTreeSet::new();
+        for name in &["timer", "duration", "timers"] {
+            variables.insert((*name).to_owned());
+        }
+        return variables;
+    }
     let mut variables = slots;
     variables.insert("area".to_owned());
     if target == Target::Entity {
@@ -866,6 +874,8 @@ mod tests {
 
     use super::*;
 
+    use crate::domain::timers::TimerAction;
+
     /// The pools of the repository.
     const RESPONSES: &str = include_str!("../../responses.toml");
 
@@ -1090,6 +1100,38 @@ mod tests {
         assert_eq!(result, unknown("fan_on", "response"));
         let result = validate(|pools, _| set(pools, "filler", &["One moment, {{ area }}."]));
         assert_eq!(result, unknown("filler", "area"));
+    }
+
+    /// AC-19.5-1.
+    #[test]
+    fn ac_19_5_1_timer_intents_and_pools_are_valid() {
+        let pools = repository_pools();
+        let catalog: Catalog = toml::from_str(INTENTS).expect("intents.toml is a catalog");
+        let timers = catalog
+            .intents
+            .iter()
+            .filter(|intent| intent.kind == Kind::Timer);
+        let found: Vec<(&str, Option<TimerAction>)> = timers
+            .map(|intent| (intent.name.as_str(), intent.timer))
+            .collect();
+        let expected = [
+            ("timer_set", Some(TimerAction::Set)),
+            ("timer_cancel", Some(TimerAction::Cancel)),
+            ("timer_cancel_last", Some(TimerAction::CancelLast)),
+            ("timer_pause", Some(TimerAction::Pause)),
+            ("timer_resume", Some(TimerAction::Resume)),
+            ("timer_left", Some(TimerAction::Left)),
+        ];
+        assert_eq!(found, expected);
+        assert_eq!(catalog::validate_catalog(&catalog), Ok(()));
+        assert_eq!(validate_pools(&pools, &catalog), Ok(()));
+    }
+
+    /// AC-19.5-5.
+    #[test]
+    fn ac_19_5_5_timer_pool_with_area_names_pool_and_variable() {
+        let result = validate(|pools, _| set(pools, "timer_set", &["Set in the {{ area }}."]));
+        assert_eq!(result, unknown("timer_set", "area"));
     }
 
     /// AC-10.4-3.

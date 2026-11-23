@@ -115,6 +115,24 @@ responses = ["I will start training now."]
 [pools.training_busy]
 responses = ["Training is already running."]
 
+[pools.timer_set]
+responses = ["{% if timer %}Your {{ timer }} timer is set for {{ duration }}.{% else %}Timer set for {{ duration }}.{% endif %}"]
+
+[pools.timer_cancel]
+responses = ["{% if timer %}I cancelled the {{ timer }} timer.{% else %}I cancelled the timer for {{ duration }}.{% endif %}"]
+
+[pools.timer_cancel_last]
+responses = ["{% if timer %}I cancelled the {{ timer }} timer.{% else %}I cancelled the timer for {{ duration }}.{% endif %}"]
+
+[pools.timer_pause]
+responses = ["{% if timer %}Pausing the {{ timer }} timer.{% else %}Pausing the timer for {{ duration }}.{% endif %}"]
+
+[pools.timer_resume]
+responses = ["{% if timer %}Resuming the {{ timer }} timer.{% else %}Resuming the timer for {{ duration }}.{% endif %}"]
+
+[pools.timer_left]
+responses = ['{% for t in timers %}{% if t.timer %}The {{ t.timer }} timer{% else %}The timer for {{ t.duration }}{% endif %} has {{ t.left }} left.{{ " " if not loop.last else "" }}{% endfor %}']
+
 [pools.filler]
 responses = ["I will check on that for you.", "Let me look into that.", "One moment."]
 

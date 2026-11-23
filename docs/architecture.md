@@ -215,6 +215,7 @@ flowchart LR
     crate_app_training --> crate_ports
     crate_domain_catalog --> crate_domain_contracts
     crate_domain_catalog --> crate_domain_intent
+    crate_domain_catalog --> crate_domain_timers
     crate_domain_contracts --> crate_domain_catalog
     crate_domain_contracts --> crate_domain_decide
     crate_domain_contracts --> crate_domain_dialog
@@ -226,6 +227,7 @@ flowchart LR
     crate_domain_contracts --> crate_domain_speaker
     crate_domain_contracts --> crate_domain_state
     crate_domain_contracts --> crate_domain_state_cache
+    crate_domain_contracts --> crate_domain_timers
     crate_domain_contracts --> crate_domain_training
     crate_domain_decide --> crate_domain_catalog
     crate_domain_decide --> crate_domain_contracts
@@ -236,6 +238,7 @@ flowchart LR
     crate_domain_decide --> crate_domain_select
     crate_domain_decide --> crate_domain_state
     crate_domain_decide --> crate_domain_state_cache
+    crate_domain_decide --> crate_domain_timers
     crate_domain_dialog --> crate_domain_contracts
     crate_domain_dialog --> crate_domain_dialog
     crate_domain_dialog --> crate_domain_intent

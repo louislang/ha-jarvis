@@ -10,6 +10,7 @@ use vstd::prelude::*;
 
 use crate::domain::intent;
 use crate::domain::intent::MarkupError;
+use crate::domain::timers::TimerAction;
 
 /// The intent catalog of `intents.toml`.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -70,6 +71,8 @@ pub struct Intent {
     pub title: Option<String>,
     /// How long the answer of a fetch or prefetch intent stays fresh, in minutes.
     pub fresh_min: Option<u32>,
+    /// What a timer intent does.
+    pub timer: Option<TimerAction>,
 }
 
 /// How Jarvis replies to an intent and acts on it.
@@ -86,6 +89,8 @@ pub enum Kind {
     Prefetch,
     /// Reply from the pool and start a training run.
     Train,
+    /// Set, cancel, pause, resume or tell the time left on a timer.
+    Timer,
 }
 
 /// The entities that the service of an intent gets.
@@ -140,6 +145,9 @@ pub enum CatalogError {
     /// The fetch or prefetch intent with this name has no `fresh_min` of 1 or more, or the
     /// intent of another kind with this name has one.
     FreshMin(String),
+    /// The timer intent with this name has no `timer` or has a `service`, or the intent of
+    /// another kind with this name has a `timer`.
+    Timer(String),
 }
 
 /// Checks the example counts, the example markup, the intent names, the template variables and
@@ -182,6 +190,7 @@ fn check_intent(catalog: &Catalog, index: usize) -> Result<(), CatalogError> {
     }
     check_examples(intent)?;
     check_fresh(intent)?;
+    check_timer(intent)?;
     check_name(catalog, index)
 }
 
@@ -193,9 +202,23 @@ fn check_intent(catalog: &Catalog, index: usize) -> Result<(), CatalogError> {
 fn check_fresh(intent: &Intent) -> Result<(), CatalogError> {
     match (intent.kind, intent.fresh_min) {
         (Kind::Fetch | Kind::Prefetch, None | Some(0))
-        | (Kind::Command | Kind::Query | Kind::Train, Some(_)) => {
+        | (Kind::Command | Kind::Query | Kind::Train | Kind::Timer, Some(_)) => {
             Err(CatalogError::FreshMin(intent.name.clone()))
         }
+        _ => Ok(()),
+    }
+}
+
+/// Checks that `intent` has a `timer` and no `service` if it is a timer intent, and no `timer`
+/// otherwise.
+#[verus_spec(result =>
+    ensures
+        result is Ok <==> timed(*intent),
+)]
+fn check_timer(intent: &Intent) -> Result<(), CatalogError> {
+    match (intent.kind, intent.timer, &intent.service) {
+        (Kind::Timer, Some(_), None) => Ok(()),
+        (Kind::Timer, _, _) | (_, Some(_), _) => Err(CatalogError::Timer(intent.name.clone())),
         _ => Ok(()),
     }
 }
@@ -439,6 +462,7 @@ pub open spec fn valid_intent(catalog: Catalog, index: int) -> bool {
     &&& examples.len() >= catalog.min_examples
     &&& parsed(examples, examples.len() as int)
     &&& fresh(catalog.intents@[index])
+    &&& timed(catalog.intents@[index])
     &&& named_once(catalog.intents@, index)
 }
 
@@ -449,6 +473,16 @@ pub open spec fn fresh(intent: Intent) -> bool {
         intent.fresh_min matches Some(minutes) && minutes > 0
     } else {
         intent.fresh_min is None
+    }
+}
+
+/// True when `intent` has a `timer` and no `service` if it is a timer intent, and no `timer`
+/// otherwise.
+pub open spec fn timed(intent: Intent) -> bool {
+    if intent.kind is Timer {
+        intent.timer is Some && intent.service is None
+    } else {
+        intent.timer is None
     }
 }
 
@@ -581,7 +615,8 @@ mod tests {
             climate_query fan_query who_is_home alarm_query now_playing play_music play_radio \
             queue_music music_next music_pause volume_up volume_down volume_set play_movie \
             continue_show play_episode tv_pause tv_skip tv_stop new_shows lights_off fan_off \
-            climate_up music_resume music_previous tv_off start_training";
+            climate_up music_resume music_previous tv_off start_training timer_set timer_cancel \
+            timer_cancel_last timer_pause timer_resume timer_left";
         assert_eq!(names.join(" "), expected);
         assert_eq!(validate_catalog(&catalog), Ok(()));
     }
@@ -668,6 +703,8 @@ mod tests {
             "O",
             "B-area",
             "I-area",
+            "B-duration",
+            "I-duration",
             "B-episode",
             "I-episode",
             "B-media",
@@ -678,6 +715,8 @@ mod tests {
             "I-season",
             "B-show",
             "I-show",
+            "B-timer",
+            "I-timer",
             "B-volume",
             "I-volume",
         ];
@@ -692,7 +731,8 @@ mod tests {
             climate_query fan_query who_is_home alarm_query now_playing play_music play_radio \
             queue_music music_next music_pause volume_up volume_down volume_set play_movie \
             continue_show play_episode tv_pause tv_skip tv_stop new_shows lights_off fan_off \
-            climate_up music_resume music_previous tv_off start_training";
+            climate_up music_resume music_previous tv_off start_training timer_set timer_cancel \
+            timer_cancel_last timer_pause timer_resume timer_left";
         assert_eq!(labels(&catalog()).join(" "), expected);
     }
 
@@ -733,6 +773,16 @@ mod tests {
         assert_eq!(fresh_min("weather"), Some(30));
         assert_eq!(fresh_min("new_shows"), Some(60));
         assert_eq!(validate_catalog(&catalog), Ok(()));
+    }
+
+    /// AC-19.5-2.
+    #[test]
+    fn ac_19_5_2_wrong_timer_names_intent() {
+        let last = catalog().intents.len() - 1;
+        let result = validate(|intents| intents[last].timer = None);
+        assert_eq!(result, Err(CatalogError::Timer("timer_left".to_owned())));
+        let result = validate(|intents| intents[0].timer = Some(TimerAction::Set));
+        assert_eq!(result, Err(CatalogError::Timer("lights_on".to_owned())));
     }
 
     /// AC-18.18-4.

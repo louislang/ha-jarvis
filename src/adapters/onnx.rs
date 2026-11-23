@@ -546,6 +546,66 @@ mod tests {
         Ok(())
     }
 
+    /// The slot of each markup span of `example`.
+    fn marked(example: &Example) -> Vec<Slot> {
+        let spans = example.spans.iter().flatten();
+        spans
+            .map(|span| Slot {
+                name: span.slot.clone(),
+                value: example.text[span.start..span.end].to_owned(),
+            })
+            .collect()
+    }
+
+    /// AC-19.5-6.
+    #[tokio::test]
+    async fn ac_19_5_6_timer_examples_give_their_intent_and_slots() -> anyhow::Result<()> {
+        let classifier = OnnxLoader.load(Path::new(FIXTURE), Device::Cpu).await?;
+        let house = Path::new("src/testing/house.json");
+        let set = crate::seed_examples(Path::new("jarvis.toml"), Some(house))?;
+        let mut intents = BTreeSet::new();
+        for example in set.examples {
+            let Label::Intent(intent) = &example.label else {
+                continue;
+            };
+            if !intent.starts_with("timer_") {
+                continue;
+            }
+            let prediction = classifier.predict("area: none", &example.text).await?;
+            let top = prediction.ranked.first().map(|pair| pair.0.as_str());
+            assert_eq!(top, Some(intent.as_str()), "top label of {}", example.text);
+            let expected = marked(&example);
+            assert_eq!(prediction.slots, expected, "slots of {}", example.text);
+            intents.insert(intent.clone());
+        }
+        assert_eq!(intents.len(), 6, "the timer intents {intents:?}");
+        Ok(())
+    }
+
+    /// AC-19.5-7.
+    #[tokio::test]
+    async fn ac_19_5_7_light_commands_stay_confident() -> anyhow::Result<()> {
+        let threshold = crate::Config::load(Path::new("jarvis.toml"))?
+            .model
+            .commit_threshold;
+        let classifier = OnnxLoader.load(Path::new(FIXTURE), Device::Cpu).await?;
+        let texts = [
+            "turn on the office lights",
+            "office lights on",
+            "turn the office lights on",
+        ];
+        for text in texts {
+            let prediction = classifier.predict("area: none", text).await?;
+            let (top, probability) = &prediction.ranked[0];
+            assert_eq!(top, "lights_on", "top label of {text}");
+            assert!(
+                *probability >= threshold,
+                "{text} gives {probability}, under {threshold}"
+            );
+        }
+        Ok(())
+    }
+
     /// AC-3.12-11.
     #[tokio::test]
     async fn ac_3_12_11_long_text_is_truncated() -> anyhow::Result<()> {
