@@ -310,7 +310,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Connect the timer table to the requests, to the store and to the HA events. "Set a timer", "cancel that timer", "pause", "resume" and "how long is left" then act on the HA timer helpers, also after a restart of Jarvis.
 
 - **Implements:** G13, G25. **Depends on:** 19.8.
-- **Files:** create `src/app/timers.rs`. Modify `src/app/conversation.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `src/testing/e2e.rs`, `README.md` (the timer requests and the setup step of the timer helpers, `CLAUDE.md` workflow item 15).
+- **Files:** create `src/app/timers.rs`. Modify `src/domain/timers.rs`, `src/app/conversation.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `src/testing/e2e.rs`, `README.md` (the timer requests and the setup step of the timer helpers, `CLAUDE.md` workflow item 15).
 
 **Model.**
 
@@ -320,6 +320,8 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - When a call in the domain `timer` fails, the `after` work also runs `forget` (sub-phase 19.4) for its target, before the `failure` answer (sub-phase 4.9c). Thus a failed start frees the helper and the name. A failed cancel, pause or resume does not change the table.
 - Routing step 2 of sub-phase 10.5 also fills a `Slot` dialog whose missing slot is `duration`: when `duration` (sub-phase 19.2) reads the answer, the normalized answer is the `duration` slot, and `decide` runs again with the slots of the dialog. Else steps 3 to 6 apply, so Jarvis asks again up to `dialog.max_turns`. `is_answer` (sub-phase 10.7) does not count this dialog, so its answer keeps the `endpoint_ms` wait: "one hour" can continue with "and twenty minutes".
 - `TimerDesk::run(events)` first loads the table from the store. A failed load logs a `warn` event and starts with an empty table. Then it reads the receiver of timer events (sub-phase 19.7). `TimerEnded` runs `ended`, so a finished timer and a timer that a person cancels in HA leave the table. Sub-phase 19.10 adds the ring. `Reconnected` runs `reconcile`.
+- `sync` puts a state change in the hot cache before `run` reads the `TimerEnded` that follows it. Thus after a voice cancel, the hot cache can show the helper `idle` while its `Cancelled` still waits in the channel. A new timer could then take the helper, and the late `ended` would remove the new entry. This sub-phase adds `cancelled: BTreeSet<helper entity ID>` to `Timers` in `src/domain/timers.rs`: the helpers that Jarvis cancelled and whose `TimerEnded` `run` has not read. `plan` adds the helper of each `Act` of `Cancel` and `CancelLast`. A helper in `cancelled` is not free. `ended` removes the helper from `cancelled`. `reconcile` empties `cancelled`, because `sync` sends each event of a connection before the next `Reconnected`, and HA sends no event of a lost connection. The set is part of the saved table, so it also survives a restart of Jarvis until the first `Reconnected`. A failed cancel call keeps the mark until the `Finished` of that helper or the next `Reconnected`.
+- `Finished`, and a cancel in HA, have no such race: their entry stays in the table until `run` reads the event, so the helper is not free before then.
 - The first `Reconnected` comes after the first snapshot. Thus at the start, an entry whose helper is `idle` goes, with no ring: its timer ended or was cancelled while Jarvis was down, and Jarvis cannot tell which. An entry whose helper is `active` or `paused` stays, and its end rings on its satellite (sub-phase 19.10). After an HA restart, the same rule applies.
 - A request without a satellite (text from the HA UI) can set a timer, and its entry has no satellite.
 - `start_sync` also gives the receiver of the timer events. `run` makes the `TimerDesk` with the SQLite adapter as its `TimerStore`, gives it to the conversation use case, and starts `TimerDesk::run` with this receiver.
@@ -335,6 +337,8 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - AC-19.9-6: When the receiver gets `TimerEnded` with `Cancelled` for the helper of "chicken", the next `timer_left` for "chicken" replies "There is no chicken timer.", and `FakeTimerStore` has no entry for it.
 - AC-19.9-7: When `FakeTimerStore` has "chicken" on an `active` helper and "pasta" on an `idle` helper, and a new `TimerDesk` gets `Reconnected`, `timer_left` gives only "chicken", and `FakeTimerStore` has no entry for "pasta".
 - AC-19.9-8: When two `timer_set` requests run at the same time with one free helper, one gets `timer.start` and the other gets "All timers are in use."
+- AC-19.9-9: When the user cancels "chicken" on `timer.jarvis_1`, the hot cache shows `timer.jarvis_1` `idle`, and a `timer_set` for "pasta" comes before `run` reads the `Cancelled` of `timer.jarvis_1`, "pasta" gets `timer.jarvis_2`. After `run` reads the `Cancelled`, the table still has "pasta", and the next `timer_set` takes `timer.jarvis_1`. With only `timer.jarvis_1`, the reply to "pasta" is "All timers are in use."
+- AC-19.9-10: When Jarvis cancelled `timer.jarvis_1` and no `Cancelled` comes before `Reconnected`, the next `timer_set` takes `timer.jarvis_1`.
 
 **Proofs.**
 
@@ -343,6 +347,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - P-19.9-5. Argument: the failure arm of `after` runs `forget` for a call in the domain `timer`, and the hot cache shows the helper `idle` (P-19.4-10).
 - P-19.9-7. Argument: `run` loads the table before it reads the receiver, and `Reconnected` runs `reconcile` (P-19.4-10) and saves.
 - P-19.9-8. Requires: P-19.4-1. Argument: `TimerDesk::decide` runs `plan` and stores the table under one lock, so the second `plan` sees the entry of the first.
+- P-19.9-9, P-19.9-10. Ensures: `Start { helper, .. }` implies that `helper` is not in `cancelled`. After `plan` of `Act` for `Cancel` or `CancelLast`, its helper is in `cancelled`. `ended` and `reconcile` remove it. Argument: `free` also filters `cancelled`, and its loop invariant states it. Thus no new entry exists for the helper when `ended` of the old `Cancelled` runs.
 - P-19.9-4, P-19.9-6. Evidence: test.
 
 ---
@@ -422,7 +427,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Model.** The driver plays the part of the conversation use case and of HA. It maps `h1` and `h2` to `timer.jarvis_1` and `timer.jarvis_2`, `s1` and `s2` to the Kitchen and Office satellites, and `""` and `"chicken"` to no name and "chicken".
 
 - `set(s, n)`: `TimerDesk::decide` with `timer_set`, the name `n`, and the duration "one minute" for `timer.jarvis_1` or "two minutes" for `timer.jarvis_2`, so the labels of two generic timers differ. `started(h)` sets the helper `active` in the hot cache, and `startFailed(h)` runs `forget`.
-- `cancel(h)`, `pause(h)`, `resume(h)`: `TimerDesk::decide` with the action and the label of the timer of `h`, then the HA state of the call in the hot cache. `outside(h)` sets the helper `active`. `quietEnd(h)` sets it `idle` with no event.
+- `cancel(h)`, `pause(h)`, `resume(h)`: `TimerDesk::decide` with the action and the label of the timer of `h`, then the HA state of the call in the hot cache. For `cancel(h)`, the driver then sends `TimerEnded` with `Cancelled` in the same step, because the `cancel` of the model is one step. Thus `timers.qnt` needs no new action. `outside(h)` sets the helper `active`. `quietEnd(h)` sets it `idle` with no event.
 - `finish(h)` and `haCancel(h)`: the helper becomes `idle`, then `TimerEnded` with `Finished` or `Cancelled`. `reconnect`: `Reconnected`. `restart`: a new `TimerDesk` with the same `FakeTimerStore`, then `Reconnected`.
 - `ringOnce(h)`: virtual time advances to the next ring, and the satellite is idle. `stop(s)`: `TimerDesk::stop` of the satellite of `s`. `silence(h)`: `TimerDesk::decide` with `timer_cancel` and the name of the ring of `h`.
 - After each step, the driver compares the table (helper, satellite, name and order), the HA states and the rings (satellite and left rings) with the model. A model entry with `starting` is an entry whose helper is `idle`. The driver drops a held start call at `reconnect` and `restart`, as a disconnect fails it.
