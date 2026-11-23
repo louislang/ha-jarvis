@@ -1,5 +1,6 @@
-//! Timer durations and the time left on a timer.
+//! Timer durations, the time left on a timer, and the timer table.
 
+use std::collections::BTreeMap;
 use std::num::ParseIntError;
 
 use jiff::Timestamp;
@@ -9,6 +10,7 @@ use vstd::prelude::*;
 use crate::domain::intent;
 use crate::domain::select;
 use crate::domain::state::State;
+use crate::domain::state_cache::StateCache;
 
 /// The longest timer in seconds: 24 hours.
 #[verus_verify]
@@ -194,9 +196,235 @@ fn clock(text: &str) -> Option<u32> {
     Some(total)
 }
 
+/// What a timer request does.
+#[verus_verify]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TimerAction {
+    /// Sets a new timer.
+    Set,
+    /// Cancels a timer.
+    Cancel,
+    /// Cancels the newest timer.
+    CancelLast,
+    /// Pauses a timer.
+    Pause,
+    /// Resumes a paused timer.
+    Resume,
+    /// Tells the time left.
+    Left,
+}
+
+/// A timer request of System One.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimerRequest {
+    /// The intent name.
+    pub intent: String,
+    /// What the request does.
+    pub action: TimerAction,
+    /// The `timer` slot: the name of the timer.
+    pub timer: Option<String>,
+    /// The `duration` slot.
+    pub duration: Option<String>,
+    /// The transcript of the request.
+    pub transcript: String,
+}
+
+/// One entry of the timer table.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Timer {
+    /// The satellite that set the timer.
+    pub satellite: Option<String>,
+    /// The normalized name, or `None` for a generic timer.
+    pub name: Option<String>,
+    /// The duration slot of the set request, for example "ten minutes".
+    pub duration: String,
+    /// The order of the set request: a later timer has a higher order.
+    pub order: u64,
+}
+
+/// The timer table.
+#[verus_verify]
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Timers {
+    /// The entry of each helper, by entity ID.
+    pub timers: BTreeMap<String, Timer>,
+    /// The order of the next timer.
+    pub next: u64,
+}
+
+/// The plan of a timer request.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Plan {
+    /// Start `helper` for `seconds`.
+    Start {
+        /// The entity ID of the helper.
+        helper: String,
+        /// The duration of the timer.
+        seconds: u32,
+    },
+    /// The request has no duration.
+    NoDuration,
+    /// The duration does not read.
+    Unclear,
+    /// A timer with the same name runs.
+    Taken,
+    /// No helper is free.
+    Full,
+}
+
+/// The plan of the `Set` request `request` from `satellite`, and the table after it.
+#[verus_spec((planned, table) =>
+    requires
+        unique(timers.timers@),
+    ensures
+        unique(table.timers@),
+        match planned {
+            Plan::Start { helper, .. } => cached_free(*cache, timers.timers@, helper)
+                && table.timers@.contains_key(helper)
+                && table.timers@.remove(helper) == timers.timers@,
+            Plan::Full => none_free(*cache, timers.timers@) && table == timers,
+            _ => table == timers,
+        },
+)]
+#[must_use]
+pub fn set(
+    request: &TimerRequest,
+    timers: Timers,
+    cache: &StateCache,
+    satellite: Option<String>,
+) -> (Plan, Timers) {
+    let Some(spoken) = &request.duration else {
+        return (Plan::NoDuration, timers);
+    };
+    let Some(seconds) = duration(spoken) else {
+        return (Plan::Unclear, timers);
+    };
+    let name = name_of(request.timer.as_ref());
+    if matches!(&name, Some(name) if taken(&timers, name)) {
+        return (Plan::Taken, timers);
+    }
+    let Some(helper) = free(&timers, cache) else {
+        return (Plan::Full, timers);
+    };
+    let timer = Timer {
+        satellite,
+        name,
+        duration: spoken.clone(),
+        order: timers.next,
+    };
+    let mut table = timers;
+    table.timers.insert(helper.clone(), timer);
+    table.next = table.next.saturating_add(1);
+    proof! {
+        assert(table.timers@.remove(helper) =~= timers.timers@);
+    }
+    (Plan::Start { helper, seconds }, table)
+}
+
+/// The normalized `timer` slot `slot`, or `None` when it is missing or empty.
+#[verus_verify]
+fn name_of(slot: Option<&String>) -> Option<String> {
+    let name = intent::normalize(slot?);
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// True when an entry of `timers` has the name `name`.
+#[verus_spec(found =>
+    ensures
+        !found ==> nameless(timers.timers@, name@),
+)]
+fn taken(timers: &Timers, name: &str) -> bool {
+    let entries = timers.timers.iter();
+    proof_decl! {
+        let ghost all = vstd::std_specs::iter::IteratorSpec::remaining(&entries);
+    }
+    #[cfg_attr(verus_only, verus_spec(entry_iter =>
+        invariant
+            entry_iter.seq() == all,
+            entries_of(timers.timers@, all),
+            forall|index: int| 0 <= index < entry_iter.index() ==> !named(*#[trigger] all[index].1, name@),
+    ))]
+    for (_, timer) in entries {
+        if matches!(&timer.name, Some(own) if own.as_str() == name) {
+            return true;
+        }
+    }
+    proof! {
+        assert forall|helper: String| #[trigger] timers.timers@.contains_key(helper)
+            implies !named(timers.timers@[helper], name@) by {
+            let index = choose|index: int| 0 <= index < all.len() && all[index] == (&helper, &timers.timers@[helper]);
+            assert(*all[index].1 == timers.timers@[helper]);
+        }
+    }
+    false
+}
+
+/// The entity ID of the first free helper of `cache`, in entity ID order.
+#[verus_spec(found =>
+    ensures
+        match found {
+            Some(helper) => cached_free(*cache, timers.timers@, helper),
+            None => none_free(*cache, timers.timers@),
+        },
+)]
+fn free(timers: &Timers, cache: &StateCache) -> Option<String> {
+    let entries = cache.states.iter();
+    proof_decl! {
+        let ghost all = vstd::std_specs::iter::IteratorSpec::remaining(&entries);
+    }
+    #[cfg_attr(verus_only, verus_spec(entry_iter =>
+        invariant
+            entry_iter.seq() == all,
+            crate::domain::speaker::ordered(cache.states@, all),
+            forall|index: int| 0 <= index < entry_iter.index() ==> !free_state(**#[trigger] all[index].1, timers.timers@),
+    ))]
+    for (_, state) in entries {
+        if is_free(state, timers) {
+            proof! {
+                assert(cache.states@.contains_key(*all[entry_iter.index() as int].0));
+            }
+            return Some(state.entity_id.clone());
+        }
+    }
+    proof! {
+        assert forall|key: std::sync::Arc<str>| #[trigger] cache.states@.contains_key(key)
+            implies !free_state(*cache.states@[key], timers.timers@) by {
+            let index = choose|index: int| 0 <= index < all.len() && all[index] == (&key, &cache.states@[key]);
+            assert(*all[index].1 == cache.states@[key]);
+        }
+    }
+    None
+}
+
+/// True when `state` is a timer helper that is `idle` and has no entry in `timers`.
+#[verus_spec(found =>
+    ensures
+        found == free_state(*state, timers.timers@),
+)]
+fn is_free(state: &State, timers: &Timers) -> bool {
+    let helper = match state.entity_id.strip_prefix("timer.jarvis_") {
+        Some(_) => {
+            proof! {
+                assert(state.entity_id@.subrange(0, "timer.jarvis_"@.len() as int) =~= "timer.jarvis_"@);
+            }
+            true
+        }
+        None => false,
+    };
+    helper && state.state.as_str() == "idle" && !timers.timers.contains_key(&state.entity_id)
+}
+
 verus! {
 
-broadcast use crate::domain::contracts::axiom_char_pattern;
+broadcast use {
+    crate::domain::contracts::axiom_char_pattern,
+    crate::domain::contracts::axiom_str_pattern,
+    crate::domain::contracts::axiom_string_obeys_cmp,
+    crate::domain::contracts::axiom_arc_str_obeys_cmp,
+};
 
 /// True when `text` is `hours`, a colon, `minutes`, a colon and `seconds`, with the minutes and the
 /// seconds less than 60, and `total` is the seconds of that time.
@@ -220,10 +448,58 @@ pub open spec fn paused_left(attributes: serde_json::Map<String, serde_json::Val
         && is_clock(remaining, total)
 }
 
+/// True when `timer` has the name `name`.
+pub open spec fn named(timer: Timer, name: Seq<char>) -> bool {
+    timer.name matches Some(own) && own@ == name
+}
+
+/// True when `first` and `second` have the same name.
+pub open spec fn same_name(first: Timer, second: Timer) -> bool {
+    first.name matches Some(own) && named(second, own@)
+}
+
+/// True when no two entries of `timers` have the same name (`UniqueNames`).
+pub open spec fn unique(timers: Map<String, Timer>) -> bool {
+    forall|first: String, second: String| #![trigger timers[first], timers[second]]
+        timers.contains_key(first) && timers.contains_key(second) && first != second
+            ==> !same_name(timers[first], timers[second])
+}
+
+/// True when no entry of `timers` has the name `name`.
+pub open spec fn nameless(timers: Map<String, Timer>, name: Seq<char>) -> bool {
+    forall|helper: String| #[trigger] timers.contains_key(helper) ==> !named(timers[helper], name)
+}
+
+/// True when `all` lists each entry of `timers`.
+pub open spec fn entries_of(timers: Map<String, Timer>, all: Seq<(&String, &Timer)>) -> bool {
+    forall|helper: String| #[trigger] timers.contains_key(helper) ==> all.contains((&helper, &timers[helper]))
+}
+
+/// True when `state` is a timer helper that is `idle` and has no entry in `timers`.
+pub open spec fn free_state(state: State, timers: Map<String, Timer>) -> bool {
+    &&& "timer.jarvis_"@.is_prefix_of(state.entity_id@)
+    &&& state.state@ == "idle"@
+    &&& !timers.contains_key(state.entity_id)
+}
+
+/// True when `cache` has a free helper with the entity ID `helper`.
+pub open spec fn cached_free(cache: StateCache, timers: Map<String, Timer>, helper: String) -> bool {
+    exists|key: std::sync::Arc<str>| #[trigger] cache.states@.contains_key(key)
+        && free_state(*cache.states@[key], timers) && cache.states@[key].entity_id == helper
+}
+
+/// True when `cache` has no free helper.
+pub open spec fn none_free(cache: StateCache, timers: Map<String, Timer>) -> bool {
+    forall|key: std::sync::Arc<str>| #[trigger] cache.states@.contains_key(key)
+        ==> !free_state(*cache.states@[key], timers)
+}
+
 } // verus!
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::Value;
     use serde_json::json;
 
@@ -328,6 +604,112 @@ mod tests {
         ];
         for state in cases {
             assert_eq!(left(&state, now()), None, "{}", state.state);
+        }
+    }
+
+    /// The hot cache with each entity ID of `states` in its HA state.
+    fn cache(states: &[(&str, &str)]) -> StateCache {
+        let mut cache = StateCache::default();
+        for (id, state) in states {
+            let mut entity = helper(state, &json!({}));
+            entity.entity_id = (*id).to_owned();
+            cache.states.insert(Arc::from(*id), Arc::new(entity));
+        }
+        cache
+    }
+
+    /// The `idle` helpers `timer.jarvis_1` and `timer.jarvis_2`.
+    fn idle() -> StateCache {
+        cache(&[("timer.jarvis_1", "idle"), ("timer.jarvis_2", "idle")])
+    }
+
+    /// A `Set` request with the slots `timer` and `duration`.
+    fn request(timer: Option<&str>, duration: Option<&str>) -> TimerRequest {
+        TimerRequest {
+            intent: "timer_set".to_owned(),
+            action: TimerAction::Set,
+            timer: timer.map(str::to_owned),
+            duration: duration.map(str::to_owned),
+            transcript: "set a timer".to_owned(),
+        }
+    }
+
+    /// The table after a `Set` request with the slots `timer` and `duration` on an empty table.
+    fn one(timer: Option<&str>, duration: &str, cache: &StateCache) -> Timers {
+        set(
+            &request(timer, Some(duration)),
+            Timers::default(),
+            cache,
+            None,
+        )
+        .1
+    }
+
+    #[test]
+    fn ac_19_4_1_start_on_first_free_helper() {
+        let kitchen = Some("assist_satellite.kitchen".to_owned());
+        let chicken = request(Some("chicken"), Some("five minutes"));
+        let (plan, timers) = set(&chicken, Timers::default(), &idle(), kitchen.clone());
+        let start = Plan::Start {
+            helper: "timer.jarvis_1".to_owned(),
+            seconds: 300,
+        };
+        assert_eq!(plan, start);
+        let entry = Timer {
+            satellite: kitchen.clone(),
+            name: Some("chicken".to_owned()),
+            duration: "five minutes".to_owned(),
+            order: 0,
+        };
+        assert_eq!(timers.timers.get("timer.jarvis_1"), Some(&entry));
+        let generic = request(None, Some("ten minutes"));
+        let (plan, timers) = set(&generic, timers, &idle(), kitchen);
+        let start = Plan::Start {
+            helper: "timer.jarvis_2".to_owned(),
+            seconds: 600,
+        };
+        assert_eq!(plan, start);
+        let second = timers.timers.get("timer.jarvis_2").map(|timer| timer.order);
+        assert_eq!(second, Some(1), "{timers:?}");
+    }
+
+    #[test]
+    fn ac_19_4_2_name_taken() {
+        let timers = one(Some("chicken"), "five minutes", &idle());
+        let again = request(Some("Chicken"), Some("ten minutes"));
+        let (plan, after) = set(&again, timers.clone(), &idle(), None);
+        assert_eq!(plan, Plan::Taken);
+        assert_eq!(after, timers);
+    }
+
+    #[test]
+    fn ac_19_4_3_all_helpers_in_use() {
+        let cache = cache(&[
+            ("timer.jarvis_1", "idle"),
+            ("timer.jarvis_2", "active"),
+            ("timer.kitchen", "idle"),
+        ]);
+        let timers = one(None, "ten minutes", &cache);
+        assert!(timers.timers.contains_key("timer.jarvis_1"), "{timers:?}");
+        let (plan, after) = set(
+            &request(None, Some("ten minutes")),
+            timers.clone(),
+            &cache,
+            None,
+        );
+        assert_eq!(plan, Plan::Full);
+        assert_eq!(after, timers);
+    }
+
+    #[test]
+    fn ac_19_4_4_unclear_or_no_duration() {
+        let cases = [
+            (Some("ten bananas"), Plan::Unclear),
+            (None, Plan::NoDuration),
+        ];
+        for (duration, expected) in cases {
+            let planned = set(&request(None, duration), Timers::default(), &idle(), None);
+            assert_eq!(planned, (expected, Timers::default()), "{duration:?}");
         }
     }
 }
