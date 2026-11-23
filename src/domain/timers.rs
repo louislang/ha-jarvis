@@ -8,6 +8,7 @@ use jiff::Timestamp;
 use text2num::Language;
 use vstd::prelude::*;
 
+use crate::domain::dialog;
 use crate::domain::intent;
 use crate::domain::select;
 use crate::domain::state::State;
@@ -292,6 +293,37 @@ pub enum Plan {
     Taken,
     /// No helper is free.
     Full,
+    /// Call `service` on `helper`.
+    Act {
+        /// The entity ID of the helper.
+        helper: String,
+        /// The service of the domain `timer`: `cancel`, `pause` or `start`.
+        service: String,
+        /// A copy of the entry of `helper`.
+        timer: Timer,
+    },
+    /// Two or more timers fit the request.
+    Several {
+        /// The candidates, in `order`.
+        timers: Vec<Candidate>,
+    },
+    /// The time left on the timers that fit the request.
+    Left {
+        /// The timers with their time left, in `order`.
+        timers: Vec<Remaining>,
+    },
+    /// No timer fits the request.
+    Missing,
+}
+
+/// A timer and its time left.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Remaining {
+    /// A copy of the entry.
+    pub timer: Timer,
+    /// The seconds left.
+    pub left: u32,
 }
 
 /// The plan of the `Set` request `request` from `satellite`, and the table after it.
@@ -452,14 +484,26 @@ pub struct Candidate {
     ensures
         exists|kept: Seq<Candidate>| #[trigger] candidates_of(kept, timers.timers@, *cache, action)
             && crate::domain::contracts::sorted_stable(kept, found@, by_order()),
+        forall|index: int| 0 <= index < found@.len()
+            ==> entry_of(timers.timers@, *cache, action, #[trigger] found@[index]),
 )]
 #[must_use]
 pub fn candidates(action: TimerAction, timers: &Timers, cache: &StateCache) -> Vec<Candidate> {
     let mut found = matching(action, timers, cache);
+    proof_decl! {
+        let ghost kept = found@;
+    }
     proof! {
         assert(crate::domain::contracts::total(by_order()));
     }
     found.sort_by(ascending);
+    proof! {
+        let places = choose|places: Seq<int>| crate::domain::contracts::placed(kept, found@, by_order(), places);
+        assert forall|index: int| 0 <= index < found@.len()
+            implies entry_of(timers.timers@, *cache, action, #[trigger] found@[index]) by {
+            assert(found@[index] == kept[places[index]]);
+        }
+    }
     found
 }
 
@@ -605,6 +649,183 @@ pub fn reconcile(timers: &Timers, cache: &StateCache) -> Timers {
         timers: table,
         next: timers.next,
     }
+}
+
+/// The plan of the timer request `request` from `satellite` at `now`, and the table after it.
+/// `similarity` is the least Jaro-Winkler similarity of a spoken name to a label.
+#[verus_spec((planned, table) =>
+    requires
+        unique(timers.timers@),
+    ensures
+        !(request.action is Set) ==> match planned {
+            Plan::Act { helper, .. } => timers.timers@.contains_key(helper)
+                && in_state(*cache, helper@, request.action)
+                && table.timers@ == if removes(request.action) {
+                    timers.timers@.remove(helper)
+                } else {
+                    timers.timers@
+                },
+            Plan::Several { timers: several } => several@.len() >= 2 && table == timers,
+            _ => table == timers,
+        },
+)]
+#[must_use]
+pub fn plan(
+    request: &TimerRequest,
+    timers: Timers,
+    cache: &StateCache,
+    now: Timestamp,
+    satellite: Option<String>,
+    similarity: f64,
+) -> (Plan, Timers) {
+    let action = request.action;
+    if matches!(action, TimerAction::Set) {
+        return set(request, timers, cache, satellite);
+    }
+    let mut found = candidates(action, &timers, cache);
+    if matches!(action, TimerAction::CancelLast) {
+        let chosen = found.pop();
+        return act(action, chosen, timers);
+    }
+    let mut kept = meant(request.timer.as_ref(), found, similarity);
+    if matches!(action, TimerAction::Left) {
+        let planned = if kept.is_empty() {
+            Plan::Missing
+        } else {
+            Plan::Left {
+                timers: remaining(&kept, cache, now),
+            }
+        };
+        return (planned, timers);
+    }
+    if kept.len() > 1 {
+        return (Plan::Several { timers: kept }, timers);
+    }
+    let chosen = kept.pop();
+    act(action, chosen, timers)
+}
+
+/// `Act` on `chosen` with the service of `action`, or `Missing` without a candidate, and the table
+/// after it. `Cancel` and `CancelLast` remove the entry of `chosen`.
+#[verus_spec((planned, table) =>
+    ensures
+        match planned {
+            Plan::Act { helper, .. } => chosen matches Some(candidate) && candidate.helper == helper
+                && table.timers@ == if removes(action) {
+                    timers.timers@.remove(helper)
+                } else {
+                    timers.timers@
+                },
+            _ => planned == Plan::Missing && table == timers,
+        },
+)]
+fn act(action: TimerAction, chosen: Option<Candidate>, timers: Timers) -> (Plan, Timers) {
+    let Some(candidate) = chosen else {
+        return (Plan::Missing, timers);
+    };
+    let mut table = timers;
+    let service = match action {
+        TimerAction::Cancel | TimerAction::CancelLast => {
+            table.timers.remove(&candidate.helper);
+            "cancel"
+        }
+        TimerAction::Pause => "pause",
+        _ => "start",
+    };
+    let planned = Plan::Act {
+        helper: candidate.helper,
+        service: service.to_owned(),
+        timer: candidate.timer,
+    };
+    (planned, table)
+}
+
+/// The candidates of `found` that the `timer` slot `slot` means: all of them without a name, else
+/// the newest one with the label that `dialog::fill` gives for the name.
+#[verus_spec(kept =>
+    ensures
+        within(kept@, found@),
+)]
+fn meant(slot: Option<&String>, found: Vec<Candidate>, similarity: f64) -> Vec<Candidate> {
+    let Some(name) = slot else {
+        return found;
+    };
+    let labels = labels(&found);
+    let mut kept = Vec::new();
+    let Some(label) = dialog::fill(name, &labels, similarity) else {
+        return kept;
+    };
+    let mut rest = found;
+    let mut index = labels.len();
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= labels@.len(),
+            labels@.len() == rest@.len(),
+            rest@ == found@,
+            kept@.len() == 0,
+        decreases index,
+    ))]
+    while index > 0 {
+        index -= 1;
+        if labels[index].as_str() == label.as_str() {
+            kept.push(rest.swap_remove(index));
+            return kept;
+        }
+    }
+    kept
+}
+
+/// The label of each candidate of `found`: its name, else its duration.
+#[verus_spec(labels =>
+    ensures
+        labels@.len() == found@.len(),
+)]
+fn labels(found: &[Candidate]) -> Vec<String> {
+    let mut labels = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= found@.len(),
+            labels@.len() == index,
+        decreases found@.len() - index,
+    ))]
+    while index < found.len() {
+        let timer = &found[index].timer;
+        let label = match &timer.name {
+            Some(name) => name.clone(),
+            None => timer.duration.clone(),
+        };
+        labels.push(label);
+        index += 1;
+    }
+    labels
+}
+
+/// Each candidate of `found` whose helper `cache` shows with a time left at `now`, with that time.
+#[verus_verify]
+fn remaining(found: &[Candidate], cache: &StateCache, now: Timestamp) -> Vec<Remaining> {
+    let mut timers = Vec::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= found@.len(),
+        decreases found@.len() - index,
+    ))]
+    while index < found.len() {
+        let candidate = &found[index];
+        let seconds = match cache.states.get(candidate.helper.as_str()) {
+            Some(state) => left(state, now),
+            None => None,
+        };
+        if let Some(seconds) = seconds {
+            timers.push(Remaining {
+                timer: candidate.timer.clone(),
+                left: seconds,
+            });
+        }
+        index += 1;
+    }
+    timers
 }
 
 verus! {
@@ -769,6 +990,16 @@ pub open spec fn reconciled(table: Map<String, Timer>, timers: Map<String, Timer
         ==> crate::domain::speaker::shows(cache, helper@, "idle"@)
     &&& forall|index: int| #![trigger all[index]] 0 <= index < count
         && crate::domain::speaker::shows(cache, (*all[index].0)@, "idle"@) ==> !table.contains_key(*all[index].0)
+}
+
+/// True when `action` removes the entry that it acts on.
+pub open spec fn removes(action: TimerAction) -> bool {
+    action is Cancel || action is CancelLast
+}
+
+/// True when each candidate of `kept` is in `found`.
+pub open spec fn within(kept: Seq<Candidate>, found: Seq<Candidate>) -> bool {
+    forall|index: int| 0 <= index < kept.len() ==> found.contains(#[trigger] kept[index])
 }
 
 /// One more step of the loop of `matching`: `found` is `before`, with the entry at `index` of `all`
@@ -1106,5 +1337,145 @@ mod tests {
         let rest: Vec<&String> = after.timers.keys().collect();
         assert_eq!(rest, ["timer.jarvis_1", "timer.jarvis_3"]);
         assert_eq!(reconcile(&timers, &cache), running);
+    }
+
+    /// A generic "ten minutes" entry with the order `order`.
+    fn generic(order: u64) -> Timer {
+        Timer {
+            name: None,
+            ..entry("", order)
+        }
+    }
+
+    /// The plan of a request with `action` and the `timer` slot `timer`.
+    fn planned(
+        action: TimerAction,
+        timer: Option<&str>,
+        timers: &Timers,
+        cache: &StateCache,
+    ) -> (Plan, Timers) {
+        let request = TimerRequest {
+            action,
+            ..request(timer, None)
+        };
+        plan(&request, timers.clone(), cache, now(), None, 0.85)
+    }
+
+    /// The plan `Act` with `service` on `helper` and its entry `timer`.
+    fn act(helper: &str, service: &str, timer: Timer) -> Plan {
+        Plan::Act {
+            helper: helper.to_owned(),
+            service: service.to_owned(),
+            timer,
+        }
+    }
+
+    /// "chicken" with the order 0 on `timer.jarvis_1` and a generic timer with the order 1 on
+    /// `timer.jarvis_2`, both `active`.
+    fn two() -> (Timers, StateCache) {
+        let timers = table(&[
+            ("timer.jarvis_1", entry("chicken", 0)),
+            ("timer.jarvis_2", generic(1)),
+        ]);
+        let cache = cache(&[("timer.jarvis_1", "active"), ("timer.jarvis_2", "active")]);
+        (timers, cache)
+    }
+
+    #[test]
+    fn ac_19_4c_1_cancel_one_or_ask() {
+        let timers = table(&[("timer.jarvis_1", entry("chicken", 0))]);
+        let one = cache(&[("timer.jarvis_1", "active")]);
+        let (plan, after) = planned(TimerAction::Cancel, None, &timers, &one);
+        assert_eq!(plan, act("timer.jarvis_1", "cancel", entry("chicken", 0)));
+        assert!(after.timers.is_empty(), "{after:?}");
+        let (timers, cache) = two();
+        let several: Vec<Candidate> = candidates(TimerAction::Cancel, &timers, &cache);
+        let names: Vec<Option<String>> = several
+            .iter()
+            .map(|candidate| candidate.timer.name.clone())
+            .collect();
+        assert_eq!(names, [Some("chicken".to_owned()), None]);
+        let planned = planned(TimerAction::Cancel, None, &timers, &cache);
+        assert_eq!(planned, (Plan::Several { timers: several }, timers));
+    }
+
+    #[test]
+    fn ac_19_4c_2_cancel_by_name() {
+        let (timers, cache) = two();
+        let (plan, after) = planned(TimerAction::Cancel, Some("the chicken"), &timers, &cache);
+        assert_eq!(plan, act("timer.jarvis_1", "cancel", entry("chicken", 0)));
+        assert!(!after.timers.contains_key("timer.jarvis_1"), "{after:?}");
+        let pizza = planned(TimerAction::Cancel, Some("pizza"), &timers, &cache);
+        assert_eq!(pizza, (Plan::Missing, timers));
+    }
+
+    #[test]
+    fn ac_19_4c_3_cancel_newest() {
+        let (timers, cache) = two();
+        let (plan, _) = planned(TimerAction::CancelLast, None, &timers, &cache);
+        assert_eq!(plan, act("timer.jarvis_2", "cancel", generic(1)));
+    }
+
+    #[test]
+    fn ac_19_4c_4_pause_and_resume() {
+        let timers = table(&[
+            ("timer.jarvis_1", entry("chicken", 1)),
+            ("timer.jarvis_2", entry("pasta", 0)),
+        ]);
+        let cache = cache(&[("timer.jarvis_1", "active"), ("timer.jarvis_2", "paused")]);
+        let pause = planned(TimerAction::Pause, None, &timers, &cache);
+        let paused = act("timer.jarvis_1", "pause", entry("chicken", 1));
+        assert_eq!(pause, (paused, timers.clone()));
+        let resume = planned(TimerAction::Resume, None, &timers, &cache);
+        let resumed = act("timer.jarvis_2", "start", entry("pasta", 0));
+        assert_eq!(resume, (resumed, timers));
+    }
+
+    /// The hot cache of `two` with "chicken" `active` until 252 s after `now` and the generic timer
+    /// `paused` with 10 minutes left.
+    fn timed() -> StateCache {
+        let chicken = json!({ "finishes_at": "2026-11-22T12:04:12+00:00" });
+        let ten = json!({ "remaining": "0:10:00" });
+        let mut cache = StateCache::default();
+        for (id, state, attributes) in [
+            ("timer.jarvis_1", "active", chicken),
+            ("timer.jarvis_2", "paused", ten),
+        ] {
+            let mut entity = helper(state, &attributes);
+            entity.entity_id = id.to_owned();
+            cache.states.insert(Arc::from(id), Arc::new(entity));
+        }
+        cache
+    }
+
+    #[test]
+    fn ac_19_4c_5_time_left() {
+        let (timers, _) = two();
+        let cache = timed();
+        let chicken = Remaining {
+            timer: entry("chicken", 0),
+            left: 252,
+        };
+        let ten = Remaining {
+            timer: generic(1),
+            left: 600,
+        };
+        let (all, after) = planned(TimerAction::Left, None, &timers, &cache);
+        assert_eq!(
+            all,
+            Plan::Left {
+                timers: vec![chicken.clone(), ten]
+            }
+        );
+        assert_eq!(after, timers);
+        let named = planned(TimerAction::Left, Some("chicken"), &timers, &cache).0;
+        assert_eq!(
+            named,
+            Plan::Left {
+                timers: vec![chicken]
+            }
+        );
+        let none = planned(TimerAction::Left, None, &timers, &StateCache::default());
+        assert_eq!(none.0, Plan::Missing);
     }
 }
