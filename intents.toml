@@ -321,3 +321,45 @@ entity = "media_player.living_room"
 name = "start_training"
 kind = "train"
 examples = ["start training", "retrain yourself", "train your model", "start a new training run"]
+
+[[intent]]
+name = "timer_set"
+kind = "timer"
+examples = ["set a timer for [ten minutes](duration)", "set a timer for [five minutes](duration) for the [chicken](timer)", "set a [pasta](timer) timer for [eight minutes](duration)", "start a timer for [thirty seconds](duration)", "timer for [an hour](duration)", "set a [laundry](timer) timer for [one hour and twenty minutes](duration)", "set a timer"]
+optional = ["timer", "duration"]
+timer = "set"
+
+[[intent]]
+name = "timer_cancel"
+kind = "timer"
+examples = ["cancel that timer", "cancel the timer", "cancel the [chicken](timer) timer", "stop the [pasta](timer) timer", "delete my [laundry](timer) timer"]
+optional = ["timer", "duration"]
+timer = "cancel"
+
+[[intent]]
+name = "timer_cancel_last"
+kind = "timer"
+examples = ["cancel the most recent timer", "cancel the last timer", "cancel the newest timer"]
+optional = ["timer", "duration"]
+timer = "cancel_last"
+
+[[intent]]
+name = "timer_pause"
+kind = "timer"
+examples = ["pause the timer", "pause the [chicken](timer) timer", "pause my [pasta](timer) timer", "hold the timer"]
+optional = ["timer", "duration"]
+timer = "pause"
+
+[[intent]]
+name = "timer_resume"
+kind = "timer"
+examples = ["resume the timer", "resume the [chicken](timer) timer", "continue the [pasta](timer) timer", "unpause the timer"]
+optional = ["timer", "duration"]
+timer = "resume"
+
+[[intent]]
+name = "timer_left"
+kind = "timer"
+examples = ["how long is left on the timer", "how long do we have left on the [chicken](timer) timer", "how much time is left on the [pasta](timer) timer", "how much time is left", "how long until the timer goes off"]
+optional = ["timer", "duration"]
+timer = "left"

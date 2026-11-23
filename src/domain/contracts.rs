@@ -82,6 +82,7 @@ use crate::domain::state::Snapshot;
 use crate::domain::state::State;
 use crate::domain::state::UnitSystem;
 use crate::domain::state_cache::StateCache;
+use crate::domain::timers::TimerAction;
 use crate::domain::training::Example;
 use crate::domain::training::ExampleFile;
 use crate::domain::training::Label;
@@ -218,6 +219,10 @@ pub struct ExKind(Kind);
 /// The entities that the service of an intent gets.
 #[verifier::external_type_specification]
 pub struct ExTarget(Target);
+
+/// What a timer request does.
+#[verifier::external_type_specification]
+pub struct ExTimerAction(TimerAction);
 
 /// An entity filter of `select`.
 #[verifier::external_type_specification]

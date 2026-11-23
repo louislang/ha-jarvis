@@ -27,6 +27,7 @@ use crate::domain::state::AreaId;
 use crate::domain::state::EntityId;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
+use crate::domain::timers::TimerRequest;
 
 /// What Jarvis does for a request.
 #[verus_verify]
@@ -60,6 +61,8 @@ pub enum Decision {
         /// The reply when a run is active.
         busy: Chosen,
     },
+    /// Act on a timer.
+    Timer(TimerRequest),
 }
 
 /// A selected response.
@@ -365,8 +368,8 @@ fn has_domain(entity_id: &str, domains: &[&str]) -> bool {
 }
 
 /// The decision for `prediction` of `request`: a System Two job for an `unknown`, uncertain or
-/// removed label or a `prefetch`, `Train` for a `train`, else the decision of the command, the
-/// query or the fetch in its area.
+/// removed label or a `prefetch`, `Train` for a `train`, `Timer` for a `timer`, else the decision
+/// of the command, the query or the fetch in its area.
 #[verus_spec(decision =>
     requires
         responses::valid_pools(pools@, *catalog),
@@ -377,8 +380,13 @@ fn has_domain(entity_id: &str, domains: &[&str]) -> bool {
         prediction.ranked@.len() > 0 && !cataloged(*catalog, prediction.ranked@[0].0@)
             ==> deferred(decision, request.transcript),
         !(decision matches Decision::Defer { job: Job::Llm(_), .. }) && !(decision is Train)
-            ==> exists|index: int| #[trigger] handled(*prediction, *catalog, threshold, index)
+            && !(decision is Timer)
+            ==> exists|index: int| #[trigger] timing(*prediction, *catalog, threshold, index)
+            && handled(*prediction, *catalog, threshold, index)
             && placed(catalog.intents@[index], *prediction, *request, *cache, decision),
+        decision matches Decision::Timer(made)
+            ==> exists|index: int| #[trigger] timing(*prediction, *catalog, threshold, index)
+            && catalog.intents@[index].kind is Timer && catalog.intents@[index].timer == Some(made.action),
 )]
 #[must_use]
 pub fn decide(
@@ -393,33 +401,22 @@ pub fn decide(
     let Some((label, probability)) = prediction.ranked.as_slice().first() else {
         return defer(request, pools, rng);
     };
-    let confident = *probability >= threshold;
-    match intent_index(catalog, label.as_str()) {
-        Some(index)
-            if confident
-                && label.as_str() != "unknown"
-                && matches!(
-                    catalog.intents[index].kind,
-                    Kind::Command | Kind::Query | Kind::Fetch
-                ) =>
-        {
-            let decision = act(
-                &catalog.intents[index],
-                prediction,
-                request,
-                cache,
-                pools,
-                rng,
-            );
-            proof! {
-                assert(handled(*prediction, *catalog, threshold, index as int));
-            }
-            decision
-        }
-        Some(index) if confident && matches!(catalog.intents[index].kind, Kind::Train) => {
-            train(&catalog.intents[index], pools, rng)
-        }
-        _ => defer(request, pools, rng),
+    let (Some(index), true) = (
+        intent_index(catalog, label.as_str()),
+        *probability >= threshold,
+    ) else {
+        return defer(request, pools, rng);
+    };
+    proof! {
+        assert(timing(*prediction, *catalog, threshold, index as int));
+    }
+    let intent = &catalog.intents[index];
+    if label.as_str() != "unknown"
+        && matches!(intent.kind, Kind::Command | Kind::Query | Kind::Fetch)
+    {
+        act(intent, prediction, request, cache, pools, rng)
+    } else {
+        direct(intent, prediction, request, pools, rng)
     }
 }
 
@@ -435,6 +432,7 @@ pub fn decide(
     ensures
         placed(*intent, *prediction, *request, *cache, decision),
         !(decision is Train),
+        !(decision is Timer),
 )]
 fn act(
     intent: &Intent,
@@ -1151,6 +1149,51 @@ fn train(intent: &Intent, pools: &Pools, rng: &mut StdRng) -> Decision {
     }
 }
 
+/// `Train` for a train `intent`, else for a timer `intent` the request with its action, the
+/// `timer` and `duration` slots of `prediction` and the transcript of `request`, else a System Two
+/// job.
+#[verus_spec(decision =>
+    requires
+        pools@.contains_key(crate::domain::contracts::string_key(intent.name@)),
+        pools@.contains_key(crate::domain::contracts::string_key("training_busy"@)),
+        pools@.contains_key(crate::domain::contracts::string_key("filler"@)),
+        responses::filled(pools@),
+    ensures
+        decision matches Decision::Timer(made)
+            ==> intent.kind is Timer && intent.timer == Some(made.action),
+        !(decision is Train) && !(decision is Timer) ==> deferred(decision, request.transcript),
+)]
+fn direct(
+    intent: &Intent,
+    prediction: &Prediction,
+    request: &Request,
+    pools: &Pools,
+    rng: &mut StdRng,
+) -> Decision {
+    match (intent.kind, intent.timer, slots(intent, prediction)) {
+        (Kind::Train, _, _) => train(intent, pools, rng),
+        (Kind::Timer, Some(action), Some(slots)) => Decision::Timer(TimerRequest {
+            intent: intent.name.clone(),
+            action,
+            timer: filled(&slots, "timer"),
+            duration: filled(&slots, "duration"),
+            transcript: request.transcript.clone(),
+        }),
+        _ => defer(request, pools, rng),
+    }
+}
+
+/// The value of the slot `name` of `slots`, or `None` when it is missing or empty.
+#[verus_verify]
+fn filled(slots: &Map<String, Value>, name: &str) -> Option<String> {
+    let value = slots.get(name)?.as_str()?;
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_owned())
+    }
+}
+
 /// A filler and a System Two job with the transcript of `request`.
 #[verus_spec(decision =>
     requires
@@ -1159,7 +1202,8 @@ fn train(intent: &Intent, pools: &Pools, rng: &mut StdRng) -> Decision {
     ensures
         deferred(decision, request.transcript),
 )]
-fn defer(request: &Request, pools: &Pools, rng: &mut StdRng) -> Decision {
+#[must_use]
+pub fn defer(request: &Request, pools: &Pools, rng: &mut StdRng) -> Decision {
     Decision::Defer {
         filler: choose(pools, "filler", None, rng),
         job: Job::Llm(request.transcript.clone()),
@@ -1409,6 +1453,15 @@ pub open spec fn handled(prediction: Prediction, catalog: Catalog, threshold: f3
     &&& catalog.intents@[index].name@ == prediction.ranked@[0].0@
     &&& (catalog.intents@[index].kind is Command || catalog.intents@[index].kind is Query
         || catalog.intents@[index].kind is Fetch)
+}
+
+/// True when the top label of `prediction` is confident and names the intent at `index` of
+/// `catalog`.
+pub open spec fn timing(prediction: Prediction, catalog: Catalog, threshold: f32, index: int) -> bool {
+    &&& prediction.ranked@.len() > 0
+    &&& vstd::std_specs::cmp::ge_ensures::<f32>(prediction.ranked@[0].1, threshold, true)
+    &&& 0 <= index < catalog.intents@.len()
+    &&& catalog.intents@[index].name@ == prediction.ranked@[0].0@
 }
 
 /// True when `decision` for `intent` obeys the area rules: an area slot that names no area and not
@@ -1728,6 +1781,7 @@ mod tests {
     use crate::domain::responses::Pool;
     use crate::domain::responses::Response;
     use crate::domain::state::Snapshot;
+    use crate::domain::timers::TimerAction;
     use crate::testing::fakes::house;
 
     /// The value of `model.threshold` in `jarvis.toml`.
@@ -1892,6 +1946,46 @@ mod tests {
             address: None,
         };
         decided_for(catalog, (label, 0.89), &[], &request, cache)
+    }
+
+    /// The decision of `timer_set` 0.95 with `slots` on the satellite in `area`.
+    fn timer_decision(slots: &[(&str, &str)], area: Option<&str>) -> Decision {
+        let request = Request {
+            transcript: "set a timer".to_owned(),
+            area: area.map(|area| AreaId(area.to_owned())),
+            now: Timestamp::UNIX_EPOCH,
+            address: None,
+        };
+        let cache = StateCache::load(house());
+        decided_for(&catalog(), ("timer_set", 0.95), slots, &request, &cache)
+    }
+
+    /// The `timer_set` decision with the `timer` and `duration` slots.
+    fn set_timer(timer: Option<&str>, duration: Option<&str>) -> Decision {
+        Decision::Timer(TimerRequest {
+            intent: "timer_set".to_owned(),
+            action: TimerAction::Set,
+            timer: timer.map(str::to_owned),
+            duration: duration.map(str::to_owned),
+            transcript: "set a timer".to_owned(),
+        })
+    }
+
+    /// AC-19.5-3.
+    #[test]
+    fn ac_19_5_3_timer_set_gives_the_timer_request() {
+        let slots = [("duration", "five minutes"), ("timer", "chicken")];
+        for area in [Some("kitchen"), None] {
+            let decision = timer_decision(&slots, area);
+            let expected = set_timer(Some("chicken"), Some("five minutes"));
+            assert_eq!(decision, expected, "the decision in {area:?}");
+        }
+    }
+
+    /// AC-19.5-4.
+    #[test]
+    fn ac_19_5_4_timer_set_without_slots_has_none() {
+        assert_eq!(timer_decision(&[], None), set_timer(None, None));
     }
 
     /// The reference house with the state `state` for the entity `id`.

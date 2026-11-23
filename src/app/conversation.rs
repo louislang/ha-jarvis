@@ -540,7 +540,7 @@ impl Conversation {
             Decision::Ask { question, pending } => {
                 (Route::Ask, None, question, Some(pending.clone()))
             }
-            Decision::Train { .. } => unreachable!("`act` makes a train decision a reply"),
+            Decision::Train { .. } | Decision::Timer(_) => unreachable!("replaced before dispatch"),
         };
         let response = self.spoken(chosen.clone());
         let decided = Decided {
@@ -734,8 +734,9 @@ impl Conversation {
     }
 
     /// The decision for `prediction` with its Plex title matched (`titled`) of `request` in the
-    /// current hot cache and pools, a `not_in_library` reply when the title has no match, or a
-    /// reply with the fresh prefetched answer of `prefetched` or `prefetched_fetch`.
+    /// current hot cache and pools, a `not_in_library` reply when the title has no match, a reply
+    /// with the fresh prefetched answer of `prefetched` or `prefetched_fetch`, or a System Two job
+    /// for a timer request.
     fn decide(&self, prediction: &Prediction, request: &Request) -> Decision {
         if let Some(text) = self.prefetched(prediction, request) {
             return stored_reply(text);
@@ -756,6 +757,9 @@ impl Conversation {
             self.threshold,
             rng,
         );
+        if let Decision::Timer(_) = decision {
+            return decide::defer(request, &pools, rng);
+        }
         match self.prefetched_fetch(&decision, request) {
             Some(text) => stored_reply(text),
             None => decision,
@@ -878,7 +882,7 @@ impl Conversation {
                 job: Job::Llm(text),
             } => (filler, self.deferred(text, area, request, first, address)),
             Decision::Ask { question, .. } => self.ask(question, request),
-            Decision::Train { .. } => unreachable!("`act` makes a train decision a reply"),
+            Decision::Train { .. } | Decision::Timer(_) => unreachable!("replaced before dispatch"),
         };
         let Chosen { text, pool, index } = chosen;
         self.backfill.record_use(pool, index);

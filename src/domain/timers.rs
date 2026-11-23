@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::num::ParseIntError;
 
 use jiff::Timestamp;
+use serde::Deserialize;
 use text2num::Language;
 use vstd::prelude::*;
 
@@ -199,8 +200,8 @@ fn clock(text: &str) -> Option<u32> {
 }
 
 /// What a timer request does.
-#[verus_verify]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum TimerAction {
     /// Sets a new timer.
     Set,
