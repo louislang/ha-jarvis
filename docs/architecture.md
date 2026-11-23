@@ -45,6 +45,7 @@ flowchart LR
         crate_domain_speech[speech]
         crate_domain_state[state]
         crate_domain_state_cache[state_cache]
+        crate_domain_timers[timers]
         crate_domain_training[training]
     end
     subgraph ports
@@ -276,6 +277,8 @@ flowchart LR
     crate_domain_state_cache --> crate_domain_select
     crate_domain_state_cache --> crate_domain_state
     crate_domain_state_cache --> crate_domain_state_cache
+    crate_domain_timers --> crate_domain_intent
+    crate_domain_timers --> crate_domain_select
     crate_domain_training --> crate_domain_catalog
     crate_domain_training --> crate_domain_contracts
     crate_domain_training --> crate_domain_feedback

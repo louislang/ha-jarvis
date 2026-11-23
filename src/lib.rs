@@ -155,6 +155,7 @@ pub mod domain {
     pub mod speech;
     pub mod state;
     pub mod state_cache;
+    pub mod timers;
     pub mod training;
 }
 
