@@ -1,5 +1,6 @@
 //! Timer durations, the time left on a timer, and the timer table.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::num::ParseIntError;
 
@@ -232,7 +233,7 @@ pub struct TimerRequest {
 
 /// One entry of the timer table.
 #[verus_verify]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Timer {
     /// The satellite that set the timer.
     pub satellite: Option<String>,
@@ -242,6 +243,24 @@ pub struct Timer {
     pub duration: String,
     /// The order of the set request: a later timer has a higher order.
     pub order: u64,
+}
+
+// Not derived: the derived `clone` has no `ensures`, so Verus cannot see that a copy is equal.
+#[verus_verify]
+impl Clone for Timer {
+    /// A copy of the entry.
+    #[verus_spec(copy =>
+        ensures
+            copy == *self,
+    )]
+    fn clone(&self) -> Self {
+        Timer {
+            satellite: self.satellite.clone(),
+            name: self.name.clone(),
+            duration: self.duration.clone(),
+            order: self.order,
+        }
+    }
 }
 
 /// The timer table.
@@ -417,6 +436,177 @@ fn is_free(state: &State, timers: &Timers) -> bool {
     helper && state.state.as_str() == "idle" && !timers.timers.contains_key(&state.entity_id)
 }
 
+/// A timer that an action can act on.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Candidate {
+    /// The entity ID of the helper.
+    pub helper: String,
+    /// A copy of the entry.
+    pub timer: Timer,
+}
+
+/// The entries of `timers` that `action` can act on, by the HA state of their helper in `cache`,
+/// in `order`.
+#[verus_spec(found =>
+    ensures
+        exists|kept: Seq<Candidate>| #[trigger] candidates_of(kept, timers.timers@, *cache, action)
+            && crate::domain::contracts::sorted_stable(kept, found@, by_order()),
+)]
+#[must_use]
+pub fn candidates(action: TimerAction, timers: &Timers, cache: &StateCache) -> Vec<Candidate> {
+    let mut found = matching(action, timers, cache);
+    proof! {
+        assert(crate::domain::contracts::total(by_order()));
+    }
+    found.sort_by(ascending);
+    found
+}
+
+/// The entries of `timers` that `action` can act on, in entity ID order.
+#[verus_spec(found =>
+    ensures
+        candidates_of(found@, timers.timers@, *cache, action),
+)]
+fn matching(action: TimerAction, timers: &Timers, cache: &StateCache) -> Vec<Candidate> {
+    let mut found = Vec::new();
+    let entries = timers.timers.iter();
+    proof_decl! {
+        let ghost all = vstd::std_specs::iter::IteratorSpec::remaining(&entries);
+    }
+    #[cfg_attr(verus_only, verus_spec(entry_iter =>
+        invariant
+            entry_iter.seq() == all,
+            listing(timers.timers@, all),
+            kept_before(found@, timers.timers@, *cache, action, all, entry_iter.index()),
+    ))]
+    for (helper, timer) in entries {
+        proof_decl! {
+            let ghost before = found@;
+        }
+        if fits(action, cache, helper) {
+            found.push(Candidate {
+                helper: helper.clone(),
+                timer: timer.clone(),
+            });
+        }
+        proof! {
+            lemma_kept(timers.timers@, *cache, action, all, before, found@, entry_iter.index());
+        }
+    }
+    proof! {
+        assert forall|helper: String| #[trigger] timers.timers@.contains_key(helper)
+            && in_state(*cache, helper@, action) implies listed(found@, helper) by {
+            let index = index_of(timers.timers@, all, helper);
+        }
+    }
+    found
+}
+
+/// True when `cache` shows the helper `helper` in a state that `action` acts on.
+#[verus_spec(found =>
+    ensures
+        found == in_state(*cache, helper@, action),
+)]
+fn fits(action: TimerAction, cache: &StateCache, helper: &str) -> bool {
+    let Some(state) = cache.states.get(helper) else {
+        return false;
+    };
+    let state = state.state.as_str();
+    match action {
+        TimerAction::Set => false,
+        TimerAction::Pause => state == "active",
+        TimerAction::Resume => state == "paused",
+        _ => state == "active" || state == "paused",
+    }
+}
+
+/// The order of `first` and `second` by the order of their timers.
+#[verus_spec(ordering =>
+    ensures
+        ordering == by_order()(*first, *second),
+)]
+fn ascending(first: &Candidate, second: &Candidate) -> Ordering {
+    first.timer.order.cmp(&second.timer.order)
+}
+
+/// True when `cache` shows the helper `helper` `idle`.
+#[verus_spec(found =>
+    ensures
+        found == crate::domain::speaker::shows(*cache, helper@, "idle"@),
+)]
+fn idle(cache: &StateCache, helper: &str) -> bool {
+    matches!(cache.states.get(helper), Some(state) if state.state.as_str() == "idle")
+}
+
+/// `timers` without the entry of `helper` when `cache` shows `helper` `idle`: a failed start call.
+#[verus_spec(table =>
+    ensures
+        table.timers@ == if crate::domain::speaker::shows(*cache, helper@, "idle"@) {
+            timers.timers@.remove(crate::domain::contracts::string_key(helper@))
+        } else {
+            timers.timers@
+        },
+)]
+#[must_use]
+pub fn forget(timers: Timers, helper: &str, cache: &StateCache) -> Timers {
+    let mut table = timers;
+    if idle(cache, helper) {
+        table.timers.remove(helper);
+    }
+    table
+}
+
+/// The entry of `helper`, and `timers` without it: HA ended the helper.
+#[verus_spec((entry, table) =>
+    ensures
+        table.timers@ == timers.timers@.remove(crate::domain::contracts::string_key(helper@)),
+)]
+#[must_use]
+pub fn ended(timers: Timers, helper: &str) -> (Option<Timer>, Timers) {
+    let mut table = timers;
+    let entry = table.timers.remove(helper);
+    (entry, table)
+}
+
+/// `timers` without each entry whose helper `cache` shows `idle`: a reconnect.
+#[verus_spec(table =>
+    ensures
+        forall|helper: String| #[trigger] table.timers@.contains_key(helper)
+            == (timers.timers@.contains_key(helper) && !crate::domain::speaker::shows(*cache, helper@, "idle"@)),
+        forall|helper: String| #[trigger] table.timers@.contains_key(helper)
+            ==> table.timers@[helper] == timers.timers@[helper],
+)]
+#[must_use]
+pub fn reconcile(timers: &Timers, cache: &StateCache) -> Timers {
+    let mut table = timers.timers.clone();
+    let entries = timers.timers.iter();
+    proof_decl! {
+        let ghost all = vstd::std_specs::iter::IteratorSpec::remaining(&entries);
+    }
+    #[cfg_attr(verus_only, verus_spec(entry_iter =>
+        invariant
+            entry_iter.seq() == all,
+            listing(timers.timers@, all),
+            reconciled(table@, timers.timers@, *cache, all, entry_iter.index()),
+    ))]
+    for (helper, _) in entries {
+        if idle(cache, helper) {
+            table.remove(helper);
+        }
+    }
+    proof! {
+        assert forall|helper: String| #[trigger] table@.contains_key(helper)
+            implies !crate::domain::speaker::shows(*cache, helper@, "idle"@) by {
+            let index = index_of(timers.timers@, all, helper);
+        }
+    }
+    Timers {
+        timers: table,
+        next: timers.next,
+    }
+}
+
 verus! {
 
 broadcast use {
@@ -424,6 +614,11 @@ broadcast use {
     crate::domain::contracts::axiom_str_pattern,
     crate::domain::contracts::axiom_string_obeys_cmp,
     crate::domain::contracts::axiom_arc_str_obeys_cmp,
+    crate::domain::contracts::axiom_arc_str_borrow,
+    crate::domain::contracts::axiom_arc_str_contains_borrowed_key,
+    crate::domain::contracts::axiom_arc_str_maps_borrowed_key,
+    crate::domain::contracts::axiom_string_borrow,
+    crate::domain::contracts::axiom_string_removes_borrowed_key,
 };
 
 /// True when `text` is `hours`, a colon, `minutes`, a colon and `seconds`, with the minutes and the
@@ -492,6 +687,135 @@ pub open spec fn cached_free(cache: StateCache, timers: Map<String, Timer>, help
 pub open spec fn none_free(cache: StateCache, timers: Map<String, Timer>) -> bool {
     forall|key: std::sync::Arc<str>| #[trigger] cache.states@.contains_key(key)
         ==> !free_state(*cache.states@[key], timers)
+}
+
+/// True when `action` acts on a helper in the HA state `state`.
+pub open spec fn acts_on(action: TimerAction, state: Seq<char>) -> bool {
+    match action {
+        TimerAction::Set => false,
+        TimerAction::Pause => state == "active"@,
+        TimerAction::Resume => state == "paused"@,
+        _ => state == "active"@ || state == "paused"@,
+    }
+}
+
+/// True when `cache` shows the helper `helper` in a state that `action` acts on.
+pub open spec fn in_state(cache: StateCache, helper: Seq<char>, action: TimerAction) -> bool {
+    let key = crate::domain::contracts::str_key(helper);
+    cache.states@.contains_key(key) && acts_on(action, cache.states@[key].state@)
+}
+
+/// True when `candidate` is an entry of `timers` with its helper, which `cache` shows in a state
+/// that `action` acts on.
+pub open spec fn entry_of(timers: Map<String, Timer>, cache: StateCache, action: TimerAction, candidate: Candidate) -> bool {
+    &&& timers.contains_key(candidate.helper)
+    &&& timers[candidate.helper] == candidate.timer
+    &&& in_state(cache, candidate.helper@, action)
+}
+
+/// True when a candidate of `kept` has the helper `helper`.
+pub open spec fn listed(kept: Seq<Candidate>, helper: String) -> bool {
+    exists|index: int| 0 <= index < kept.len() && #[trigger] kept[index].helper == helper
+}
+
+/// True when `kept` has each candidate of `action` once: each entry of `timers` whose helper
+/// `cache` shows in a state that `action` acts on.
+pub open spec fn candidates_of(kept: Seq<Candidate>, timers: Map<String, Timer>, cache: StateCache, action: TimerAction) -> bool {
+    &&& forall|index: int| 0 <= index < kept.len() ==> entry_of(timers, cache, action, #[trigger] kept[index])
+    &&& forall|helper: String| #[trigger] timers.contains_key(helper) && in_state(cache, helper@, action)
+        ==> listed(kept, helper)
+    &&& distinct(kept)
+}
+
+/// The order of two candidates by the order of their timers.
+pub open spec fn by_order() -> spec_fn(Candidate, Candidate) -> Ordering {
+    |first: Candidate, second: Candidate| vstd::std_specs::cmp::OrdSpec::cmp_spec(&first.timer.order, &second.timer.order)
+}
+
+/// True when `all` lists each entry of `timers` once, in increasing entity ID order.
+pub open spec fn listing(timers: Map<String, Timer>, all: Seq<(&String, &Timer)>) -> bool {
+    &&& forall|index: int| #![trigger all[index]] 0 <= index < all.len()
+        ==> timers.contains_key(*all[index].0) && timers[*all[index].0] == *all[index].1
+    &&& entries_of(timers, all)
+    &&& vstd::std_specs::btree::increasing_seq(all.map_values(|entry: (&String, &Timer)| *entry.0))
+}
+
+/// True when one of the first `count` entries of `all` has the helper `helper`.
+pub open spec fn seen_before(all: Seq<(&String, &Timer)>, count: int, helper: String) -> bool {
+    exists|index: int| 0 <= index < count && *#[trigger] all[index].0 == helper
+}
+
+/// True when no two candidates of `kept` have the same helper.
+pub open spec fn distinct(kept: Seq<Candidate>) -> bool {
+    forall|first: int, second: int| #![trigger kept[first], kept[second]] 0 <= first < second < kept.len()
+        ==> kept[first].helper != kept[second].helper
+}
+
+/// True when `found` has each candidate of `action` among the first `count` entries of `all` once.
+pub open spec fn kept_before(found: Seq<Candidate>, timers: Map<String, Timer>, cache: StateCache, action: TimerAction, all: Seq<(&String, &Timer)>, count: int) -> bool {
+    &&& forall|index: int| #![trigger found[index]] 0 <= index < found.len()
+        ==> entry_of(timers, cache, action, found[index]) && seen_before(all, count, found[index].helper)
+    &&& forall|index: int| #![trigger all[index]] 0 <= index < count && in_state(cache, (*all[index].0)@, action)
+        ==> listed(found, *all[index].0)
+    &&& distinct(found)
+}
+
+/// True when `table` is `timers` without the entries whose helper `cache` shows `idle`, among the
+/// first `count` entries of `all`.
+pub open spec fn reconciled(table: Map<String, Timer>, timers: Map<String, Timer>, cache: StateCache, all: Seq<(&String, &Timer)>, count: int) -> bool {
+    &&& forall|helper: String| #[trigger] table.contains_key(helper)
+        ==> timers.contains_key(helper) && table[helper] == timers[helper]
+    &&& forall|helper: String| #[trigger] timers.contains_key(helper) && !table.contains_key(helper)
+        ==> crate::domain::speaker::shows(cache, helper@, "idle"@)
+    &&& forall|index: int| #![trigger all[index]] 0 <= index < count
+        && crate::domain::speaker::shows(cache, (*all[index].0)@, "idle"@) ==> !table.contains_key(*all[index].0)
+}
+
+/// One more step of the loop of `matching`: `found` is `before`, with the entry at `index` of `all`
+/// when it is a candidate.
+proof fn lemma_kept(timers: Map<String, Timer>, cache: StateCache, action: TimerAction, all: Seq<(&String, &Timer)>, before: Seq<Candidate>, found: Seq<Candidate>, index: int)
+    requires
+        listing(timers, all),
+        0 <= index < all.len(),
+        kept_before(before, timers, cache, action, all, index),
+        found == if in_state(cache, (*all[index].0)@, action) {
+            before.push(Candidate { helper: *all[index].0, timer: *all[index].1 })
+        } else {
+            before
+        },
+    ensures
+        kept_before(found, timers, cache, action, all, index + 1),
+{
+    let keys = all.map_values(|entry: (&String, &Timer)| *entry.0);
+    reveal(vstd::laws_cmp::obeys_cmp_ord);
+    reveal(vstd::laws_cmp::obeys_partial_cmp_spec_properties);
+    assert(vstd::laws_cmp::obeys_cmp::<String>());
+    assert forall|item: int| #![trigger before[item]] 0 <= item < before.len() implies before[item].helper != *all[index].0 by {
+        let earlier = choose|earlier: int| 0 <= earlier < index && *#[trigger] all[earlier].0 == before[item].helper;
+        assert(vstd::std_specs::cmp::OrdSpec::cmp_spec(&keys[earlier], &keys[index]) is Less);
+    }
+    assert forall|earlier: int| #![trigger all[earlier]] 0 <= earlier <= index
+        && in_state(cache, (*all[earlier].0)@, action) implies listed(found, *all[earlier].0) by {
+        if earlier < index {
+            let item = choose|item: int| 0 <= item < before.len() && #[trigger] before[item].helper == *all[earlier].0;
+            assert(found[item] == before[item]);
+        } else {
+            assert(found[found.len() - 1].helper == *all[earlier].0);
+        }
+    }
+}
+
+/// The index of the entry of `helper` in `all`.
+proof fn index_of(timers: Map<String, Timer>, all: Seq<(&String, &Timer)>, helper: String) -> (index: int)
+    requires
+        listing(timers, all),
+        timers.contains_key(helper),
+    ensures
+        0 <= index < all.len(),
+        *all[index].0 == helper,
+{
+    assert(all.contains((&helper, &timers[helper])));
+    choose|index: int| 0 <= index < all.len() && all[index] == (&helper, &timers[helper])
 }
 
 } // verus!
@@ -711,5 +1035,76 @@ mod tests {
             let planned = set(&request(None, duration), Timers::default(), &idle(), None);
             assert_eq!(planned, (expected, Timers::default()), "{duration:?}");
         }
+    }
+
+    /// An entry with the name `name` and the order `order`.
+    fn entry(name: &str, order: u64) -> Timer {
+        Timer {
+            satellite: None,
+            name: Some(name.to_owned()),
+            duration: "ten minutes".to_owned(),
+            order,
+        }
+    }
+
+    /// The table with each helper of `entries` and its entry.
+    fn table(entries: &[(&str, Timer)]) -> Timers {
+        let timers: BTreeMap<String, Timer> = entries
+            .iter()
+            .map(|(helper, timer)| ((*helper).to_owned(), timer.clone()))
+            .collect();
+        Timers { timers, next: 3 }
+    }
+
+    /// "chicken" on an `active` helper, "pasta" on a `paused` one and "rice" on an `idle` one.
+    fn three() -> (Timers, StateCache) {
+        let timers = table(&[
+            ("timer.jarvis_1", entry("chicken", 1)),
+            ("timer.jarvis_2", entry("pasta", 0)),
+            ("timer.jarvis_3", entry("rice", 2)),
+        ]);
+        let cache = cache(&[
+            ("timer.jarvis_1", "active"),
+            ("timer.jarvis_2", "paused"),
+            ("timer.jarvis_3", "idle"),
+        ]);
+        (timers, cache)
+    }
+
+    #[test]
+    fn ac_19_4b_1_candidates_in_state_and_order() {
+        let (timers, cache) = three();
+        let cases = [
+            (TimerAction::Cancel, vec!["pasta", "chicken"]),
+            (TimerAction::CancelLast, vec!["pasta", "chicken"]),
+            (TimerAction::Left, vec!["pasta", "chicken"]),
+            (TimerAction::Pause, vec!["chicken"]),
+            (TimerAction::Resume, vec!["pasta"]),
+            (TimerAction::Set, vec![]),
+        ];
+        for (action, expected) in cases {
+            let found = candidates(action, &timers, &cache);
+            let names: Vec<&str> = found
+                .iter()
+                .filter_map(|candidate| candidate.timer.name.as_deref())
+                .collect();
+            assert_eq!(names, expected, "{action:?}");
+        }
+    }
+
+    #[test]
+    fn ac_19_4b_2_table_follows_ha() {
+        let (timers, cache) = three();
+        let running = table(&[
+            ("timer.jarvis_1", entry("chicken", 1)),
+            ("timer.jarvis_2", entry("pasta", 0)),
+        ]);
+        assert_eq!(forget(timers.clone(), "timer.jarvis_3", &cache), running);
+        assert_eq!(forget(timers.clone(), "timer.jarvis_2", &cache), timers);
+        let (gone, after) = ended(timers.clone(), "timer.jarvis_2");
+        assert_eq!(gone, Some(entry("pasta", 0)));
+        let rest: Vec<&String> = after.timers.keys().collect();
+        assert_eq!(rest, ["timer.jarvis_1", "timer.jarvis_3"]);
+        assert_eq!(reconcile(&timers, &cache), running);
     }
 }
