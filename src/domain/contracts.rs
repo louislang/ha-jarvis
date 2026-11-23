@@ -513,6 +513,18 @@ pub trait ExFromStr: Sized {
 #[verifier::external_body]
 pub struct ExParseIntError(ParseIntError);
 
+/// The value of the decimal integer `text`, or `None` when `text` is not a `u32`.
+pub uninterp spec fn natural(text: Seq<char>) -> Option<u32>;
+
+/// Parses the decimal integer `text`. <https://doc.rust-lang.org/std/primitive.u32.html#impl-FromStr-for-u32>
+#[verifier::external_fn_specification]
+pub fn ex_u32_from_str(text: &str) -> (result: Result<u32, ParseIntError>)
+    ensures
+        natural(text@) == result.ok(),
+{
+    <u32 as FromStr>::from_str(text)
+}
+
 /// An error of float parsing. <https://doc.rust-lang.org/std/num/struct.ParseFloatError.html>
 #[verifier::external_type_specification]
 #[verifier::external_body]
