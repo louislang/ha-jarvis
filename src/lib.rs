@@ -168,6 +168,7 @@ pub mod app {
     pub mod plugins;
     pub mod review;
     pub mod speech;
+    pub mod timers;
     pub mod training;
 }
 
