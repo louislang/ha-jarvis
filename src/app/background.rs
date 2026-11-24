@@ -93,6 +93,8 @@ pub async fn sync(home: &dyn Home, cache: &watch::Sender<StateCache>) {
                 cache.send_modify(|cache| *cache = mem::take(cache).apply(event));
             }
             Event::RegistryUpdated | Event::Reconnected => load(home, cache).await,
+            // Sub-phase 19.7b sends the timer events to the timer use case.
+            Event::TimerEnded { .. } => {}
         }
     }
 }

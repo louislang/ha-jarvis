@@ -80,6 +80,7 @@ use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
 use crate::domain::state::State;
+use crate::domain::state::TimerEnd;
 use crate::domain::state::UnitSystem;
 use crate::domain::state_cache::StateCache;
 use crate::domain::timers::TimerAction;
@@ -126,6 +127,10 @@ pub struct ExState(State);
 /// A change in HA.
 #[verifier::external_type_specification]
 pub struct ExEvent(Event);
+
+/// How an HA timer ended.
+#[verifier::external_type_specification]
+pub struct ExTimerEnd(TimerEnd);
 
 /// The hot cache.
 #[verifier::external_type_specification]
