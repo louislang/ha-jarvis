@@ -223,8 +223,8 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 - `Kind::Timer` (`kind = "timer"`), and the intent field `timer: Option<TimerAction>`. `validate_catalog` checks that a `timer` intent has `timer` and no `service`, and that another kind has no `timer`. The error names the intent.
 - `decide`, step 2 of sub-phase 4.5: a confident `timer` intent reads its slots as a command does (sub-phase 4.5d). The result is `Decision::Timer(TimerRequest)` with the intent name, the action, the `timer` and `duration` slots (an empty optional slot is `None`) and the transcript. A `timer` intent needs no area.
-- `pool_variables` (sub-phase 4.2): the pool of a `timer` intent can use `timer`, `duration` and `timers`, and no other variable. Sub-phase 19.6 renders the pools with these variables.
-- The six intents, at the end of `intents.toml`. Each has `kind = "timer"` and `optional = ["timer", "duration"]`, so a missing duration gives the question of sub-phase 19.6, not System Two. The second pass writes numbers as words (sub-phase 18.9), so the durations of the examples are words.
+- `pool_variables` (sub-phase 4.2): the pool of a `timer` intent can use `timer`, `duration` and `timers`, and no other variable. Sub-phases 19.6 and 19.6b render the pools with these variables.
+- The six intents, at the end of `intents.toml`. Each has `kind = "timer"` and `optional = ["timer", "duration"]`, so a missing duration gives the question of sub-phase 19.6b, not System Two. The second pass writes numbers as words (sub-phase 18.9), so the durations of the examples are words.
   - `timer_set` (`set`): "set a timer for [ten minutes](duration)", "set a timer for [five minutes](duration) for the [chicken](timer)", "set a [pasta](timer) timer for [eight minutes](duration)", "start a timer for [thirty seconds](duration)", "timer for [an hour](duration)", "set a [laundry](timer) timer for [one hour and twenty minutes](duration)", "set a timer".
   - `timer_cancel` (`cancel`): "cancel that timer", "cancel the timer", "cancel the [chicken](timer) timer", "stop the [pasta](timer) timer", "delete my [laundry](timer) timer". `timer_cancel_last` (`cancel_last`): "cancel the most recent timer", "cancel the last timer", "cancel the newest timer".
   - `timer_pause` (`pause`): "pause the timer", "pause the [chicken](timer) timer", "pause my [pasta](timer) timer", "hold the timer". `timer_resume` (`resume`): "resume the timer", "resume the [chicken](timer) timer", "continue the [pasta](timer) timer", "unpause the timer".
@@ -256,40 +256,64 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 ### 19.6 Timer Answers
 
-**Goal:** Turn the plan of a timer request into a decision: a reply with an HA call, a reply with no call, a question, or System Two. "Set a timer for five minutes for the chicken" then gives "Your chicken timer is set for five minutes." and a `timer.start` call.
+**Goal:** Turn the plan of a timer request into a reply with an HA call, a reply with no call, or System Two. "Set a timer for five minutes for the chicken" then gives "Your chicken timer is set for five minutes." and a `timer.start` call. Sub-phase 19.6b adds the time left and the questions.
 
 - **Implements:** G13, G25. **Depends on:** 19.5.
 - **Files:** modify `src/domain/timers.rs`, `src/domain/responses.rs`, `responses.toml`.
 
 **Model.**
 
-- `answer(plan, request, pools, rng) -> Decision`. The render context has `timer` (the name of the entry of `Act`, else of the request, else an empty string), `duration` (the `duration` of the entry of `Act`, else of the request, else an empty string) and `timers` (for `Left` and `Several`, each with `timer`, `duration` and, for `Left`, `left`).
+- `answer(plan, request, pools, rng) -> Decision`. The render context has `timer` (the name of the entry of `Act`, else of the request, else an empty string) and `duration` (the `duration` of the entry of `Act`, else of the request, else an empty string).
   - `Start { helper, seconds }`: `Reply` from the pool of the intent, with the call `timer.start` on `helper` and the data `{ duration: seconds }` as a number. HA reads a number of seconds as a duration.
   - `Act { helper, service, timer }`: `Reply` from the pool of the intent, with the call `service` on `helper` and no data.
-  - `Left { timers }`: `Reply` from the pool of the intent. `left` is `spoken` (sub-phase 19.2). No call.
   - `Taken`: `timer_taken`. `Full`: `timer_full`. `Missing`: `timer_missing`. No call. `Unclear`: `Defer` with a filler and `Job::Llm` with the transcript. System Two cannot set a timer, so it says so (sub-phase 10.6b).
-  - `Several { timers }`: `Ask` from `ask_timer` with `Pending::Slot { intent, slots: [], missing: "timer", choices, transcript }`. The choices are the labels of `timers`. Routing step 2 of sub-phase 10.5 fills it as it fills the area: the answer "the chicken" adds the slot `timer = chicken`, and `decide` runs again.
-  - `NoDuration`: `Ask` from `ask_duration` with `Pending::Slot { intent, slots, missing: "duration", choices: [], transcript }`. `slots` has the `timer` slot of the request, if any. Sub-phase 19.9 fills it.
+  - Until sub-phase 19.6b, `Left`, `Several` and `NoDuration` give `Defer` with a filler and `Job::Llm` with the transcript.
   - A pool that does not render gives `Defer` with `Job::Llm`, as in `decide`.
-- The answer pools, which `validate_pools` requires, as it requires `ask_area`: `ask_timer` (`Which timer, {% for t in timers %}the {% if t.timer %}{{ t.timer }} timer{% else %}timer for {{ t.duration }}{% endif %}{{ " or " if loop.revindex == 2 else (", " if not loop.last else "") }}{% endfor %}?`), `ask_duration` (`For how long?`), `timer_full` (`All timers are in use.`), `timer_taken` (`There is already a {{ timer }} timer.`), `timer_missing` (`{% if timer %}There is no {{ timer }} timer.{% else %}No timer is running.{% endif %}`) and `timer_done` (`{% if timer %}Your {{ timer }} timer is done.{% else %}Your timer is done.{% endif %}`, the ring of sub-phase 19.10). They can use `timer`, `duration` and `timers`, and no other variable (`01-architecture.md` section 9).
+- The answer pools, which `validate_pools` requires, as it requires `ask_area`: `ask_timer` (`Which timer, {% for t in timers %}the {% if t.timer %}{{ t.timer }} timer{% else %}timer for {{ t.duration }}{% endif %}{{ " or " if loop.revindex == 2 else (", " if not loop.last else "") }}{% endfor %}?`), `ask_duration` (`For how long?`), `timer_full` (`All timers are in use.`), `timer_taken` (`There is already a {{ timer }} timer.`), `timer_missing` (`{% if timer %}There is no {{ timer }} timer.{% else %}No timer is running.{% endif %}`) and `timer_done` (`{% if timer %}Your {{ timer }} timer is done.{% else %}Your timer is done.{% endif %}`, the ring of sub-phase 19.10). They can use `timer`, `duration` and `timers`, and no other variable (`01-architecture.md` section 9). Sub-phase 19.6b uses `ask_timer` and `ask_duration`.
 
 **Acceptance criteria.**
 
 - AC-19.6-1: When the plan is `Start { timer.jarvis_1, 300 }` for `timer_set` with `timer = chicken` and `duration = five minutes`, the result is `Reply` with "Your chicken timer is set for five minutes." and the call `timer.start` on `timer.jarvis_1` with the data `{ duration: 300 }` as a number. With no name and "ten minutes", the reply is "Timer set for ten minutes."
 - AC-19.6-2: When the plan is `Act` with `timer.cancel` on the generic "ten minutes" timer for `timer_cancel`, the result is `Reply` with "I cancelled the timer for ten minutes." and the call `timer.cancel` with no data.
 - AC-19.6-3: When the plan is `Taken`, `Full` or `Missing`, the result is `Reply` with no call: "There is already a chicken timer.", "All timers are in use.", and "There is no pizza timer." or, with no name, "No timer is running."
-- AC-19.6-4: When the plan is `Several` with "chicken" and "pizza", the result is `Ask` with "Which timer, the chicken timer or the pizza timer?" and `Pending::Slot` with `missing = "timer"`, the choices "chicken" and "pizza" and the transcript of the request. With "chicken", "pizza" and a generic "ten minutes" timer, the question is "Which timer, the chicken timer, the pizza timer or the timer for ten minutes?"
-- AC-19.6-5: When the plan is `Left` with "chicken" (252 s) and a generic "ten minutes" timer (600 s), the reply is "The chicken timer has 4 minutes and 12 seconds left. The timer for ten minutes has 10 minutes left."
-- AC-19.6-6: When the plan is `Unclear`, the result is `Defer` with `Job::Llm` and the transcript. When it is `NoDuration` with `timer = chicken`, the result is `Ask` with "For how long?" and `Pending::Slot` with `missing = "duration"`, no choices and the slot `timer = chicken`.
-- AC-19.6-7: When `ask_timer`, `ask_duration`, `timer_full`, `timer_taken`, `timer_missing` or `timer_done` is missing, `validate_pools` returns an error that names it. When `timer_done` uses `area`, it returns an error with the pool and the variable.
+- AC-19.6-4: When the plan is `Unclear`, the result is `Defer` with `Job::Llm` and the transcript.
+- AC-19.6-5: When `ask_timer`, `ask_duration`, `timer_full`, `timer_taken`, `timer_missing` or `timer_done` is missing, `validate_pools` returns an error that names it. When `timer_done` uses `area`, it returns an error with the pool and the variable.
 
 **Proofs.**
 
-- P-19.6-1, P-19.6-2 (AC-19.6-1, AC-19.6-2). Ensures: a `Reply` with a call comes only from `Start` or `Act`. Its target is the helper of the plan, its domain is `timer`, and its service is `start` for `Start`. Argument: `answer` builds a call only in these two arms, from the helper of the plan.
-- P-19.6-3, P-19.6-6 (AC-19.6-3, AC-19.6-6). Ensures: `Taken`, `Full`, `Missing` and `Left` give `Reply` with `call = None` or `Defer`. `Unclear` gives `Defer` with `Job::Llm`. `NoDuration` gives `Ask` with `missing = "duration"` and no choices. Argument: these arms build `Reply { call: None }`, `Ask` or `Defer`.
-- P-19.6-4 (AC-19.6-4). Ensures: `Several { timers }` gives `Ask` with `Pending::Slot` whose `missing` is `timer` and whose `choices` are the labels of `timers`, in order. Argument: the arm maps `timers` to their labels.
-- P-19.6-7 (AC-19.6-7). Ensures: when `validate_pools` returns `Ok`, the six answer pools exist. Argument: `validate_pools` calls `require` for each, after `training_busy`.
-- P-19.6-5. Evidence: test. The text comes from `minijinja` and P-19.2-3.
+- P-19.6-1, P-19.6-2 (AC-19.6-1, AC-19.6-2). Ensures: a `Reply` with a call comes only from `Start` or `Act`. Its target is the helper of the plan, its domain is `timer`, and its service is `start` for `Start` and the service of the plan for `Act`. Argument: `answer` builds a call only in these two arms, from the helper of the plan.
+- P-19.6-3, P-19.6-4 (AC-19.6-3, AC-19.6-4). Ensures: `answer` gives `Reply` or `Defer` with `Job::Llm` and the transcript. `Unclear` gives `Defer` with `Job::Llm`. Thus, with P-19.6-1, `Taken`, `Full` and `Missing` give `Reply` with `call = None` or `Defer`. Argument: the arms of `Taken`, `Full` and `Missing` build `Reply { call: None }`, and the other arms without a call give `Defer`.
+- P-19.6-5 (AC-19.6-5). Ensures: when `validate_pools` returns `Ok`, the six answer pools exist. Argument: `validate_pools` calls `require` for each, after `training_busy`.
+- The texts of AC-19.6-1 to AC-19.6-3 are evidence by test. They come from `minijinja`.
+
+---
+
+### 19.6b Timer Questions
+
+**Goal:** Add the time left and the questions to `answer`. "How long is left on the timer?" then lists the timers with their time left, "cancel that timer" with two timers asks which timer, and "set a timer" asks "For how long?".
+
+- **Implements:** G13, G25. **Depends on:** 19.6.
+- **Files:** modify `src/domain/timers.rs`.
+
+**Model.**
+
+- The render context of `answer` (sub-phase 19.6) also has `timers` for `Left` and `Several`: each timer with `timer` (its name, else an empty string), `duration` and, for `Left`, `left`.
+  - `Left { timers }`: `Reply` from the pool of the intent. `left` is `spoken` (sub-phase 19.2). No call.
+  - `Several { timers }`: `Ask` from `ask_timer` with `Pending::Slot { intent, slots: [], missing: "timer", choices, transcript }`. The choices are the labels of `timers`. Routing step 2 of sub-phase 10.5 fills it as it fills the area: the answer "the chicken" adds the slot `timer = chicken`, and `decide` runs again.
+  - `NoDuration`: `Ask` from `ask_duration` with `Pending::Slot { intent, slots, missing: "duration", choices: [], transcript }`. `slots` has the `timer` slot of the request, if any. Sub-phase 19.9 fills it.
+  - A pool that does not render gives `Defer` with `Job::Llm`, as in sub-phase 19.6.
+
+**Acceptance criteria.**
+
+- AC-19.6b-1: When the plan is `Several` with "chicken" and "pizza", the result is `Ask` with "Which timer, the chicken timer or the pizza timer?" and `Pending::Slot` with `missing = "timer"`, the choices "chicken" and "pizza" and the transcript of the request. With "chicken", "pizza" and a generic "ten minutes" timer, the question is "Which timer, the chicken timer, the pizza timer or the timer for ten minutes?"
+- AC-19.6b-2: When the plan is `Left` with "chicken" (252 s) and a generic "ten minutes" timer (600 s), the reply is "The chicken timer has 4 minutes and 12 seconds left. The timer for ten minutes has 10 minutes left."
+- AC-19.6b-3: When the plan is `NoDuration` with `timer = chicken`, the result is `Ask` with "For how long?" and `Pending::Slot` with `missing = "duration"`, no choices and the slot `timer = chicken`.
+
+**Proofs.**
+
+- P-19.6b-1 (AC-19.6b-1). Ensures: `Several { timers }` gives `Ask` with `Pending::Slot` whose `missing` is `timer` and whose `choices` are the labels of `timers`, in order, or `Defer` with `Job::Llm` when `ask_timer` does not render. Argument: the arm maps `timers` to their labels.
+- P-19.6b-2 (AC-19.6b-2). Ensures: `Left` gives `Reply` with `call = None`, or `Defer` with `Job::Llm`. Argument: the arm of `Left` builds `Reply { call: None }`. The text is evidence by test: it comes from `minijinja` and P-19.2-3.
+- P-19.6b-3 (AC-19.6b-3). Ensures: `NoDuration` gives `Ask` with `missing = "duration"` and no choices, or `Defer` with `Job::Llm` when `ask_duration` does not render. Argument: the arm builds `Ask` with an empty list of choices.
 
 ---
 
@@ -297,7 +321,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 **Goal:** Give the timer events of HA to Jarvis. Jarvis then knows when a timer finishes, when a person cancels it in HA, and when the connection to HA starts again.
 
-- **Implements:** G25. **Depends on:** 19.6.
+- **Implements:** G25. **Depends on:** 19.6b.
 - **Files:** modify `src/domain/state.rs`, `src/domain/timers.rs`, `src/adapters/ha.rs`, `src/app/background.rs`, `src/lib.rs`, `src/testing/fakes.rs`.
 
 **Model.**
@@ -403,7 +427,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Proofs.**
 
 - P-19.9-1. Requires: `ReplyBeforeCall` (sub-phase 16.1). Argument: the timer decision is a `Reply` with a call, and `dispatch` gives the call as `after` work (P-4.8-1).
-- P-19.9-2, P-19.9-3. Argument: `Several` and `NoDuration` give `Ask` (P-19.6-4, P-19.6-6), `act` opens the dialog (sub-phase 10.5), and the filled answer runs `decide` again with the `timer` or `duration` slot (P-10.5-1).
+- P-19.9-2, P-19.9-3. Argument: `Several` and `NoDuration` give `Ask` (P-19.6b-1, P-19.6b-3), `act` opens the dialog (sub-phase 10.5), and the filled answer runs `decide` again with the `timer` or `duration` slot (P-10.5-1).
 - P-19.9-17. Argument: the `after` work of an `Act` checks `last_updated` in the view and calls under the lock of `TimerDesk`, and `set` and `run` take the same lock. A new run of the helper changes `last_updated`.
 - P-19.9-5, P-19.9-14, P-19.9-15, P-19.9-16. Argument: the failure arm of `after` and the drop of the guard run `forget` only for a `timer.start` call, with the order of its entry. The entry of that call still starts. A new entry on the same helper has a higher order. A failed pause, cancel or resume runs no `forget`.
 - P-19.9-7, P-19.9-11, P-19.9-12. Argument: `TimerDesk::new` loads the table and clears `starting` before any request or input, and `Snapshot` runs `reconcile` and saves.
