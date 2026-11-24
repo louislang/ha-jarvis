@@ -27,6 +27,7 @@ flowchart LR
         crate_app_plugins[plugins]
         crate_app_review[review]
         crate_app_speech[speech]
+        crate_app_timers[timers]
         crate_app_training[training]
     end
     subgraph domain
@@ -204,6 +205,13 @@ flowchart LR
     crate_app_speech --> crate_domain_speech
     crate_app_speech --> crate_domain_training
     crate_app_speech --> crate_ports
+    crate_app_timers --> crate_app_timers
+    crate_app_timers --> crate_domain_decide
+    crate_app_timers --> crate_domain_responses
+    crate_app_timers --> crate_domain_state
+    crate_app_timers --> crate_domain_state_cache
+    crate_app_timers --> crate_domain_timers
+    crate_app_timers --> crate_ports
     crate_app_training --> crate
     crate_app_training --> crate_app_background
     crate_app_training --> crate_app_training
