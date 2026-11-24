@@ -163,11 +163,12 @@ pub struct Guard {
 
 impl Guard {
     /// Ends the guard after the call, and forgets the entry when the call failed (`made` false).
+    /// The guard stays armed until `forget` ends, so a drop while it waits still forgets.
     pub async fn ended(mut self, made: bool) {
-        self.armed = false;
         if !made {
             self.desk.forget(&self.helper, self.order).await;
         }
+        self.armed = false;
     }
 }
 
@@ -235,15 +236,32 @@ mod tests {
             fixture
         }
 
-        /// The reply from the pools of `responses.toml` and the call of the request `intent` with
-        /// `action` and the `timer` slot `name` from `satellite`, with "five minutes" as the
-        /// duration of a `Set`.
+        /// The reply and the call of the request `intent` with `action` and the `timer` slot
+        /// `name` from `satellite`. A start call is made.
         async fn ask(
             &self,
             (intent, action): (&str, TimerAction),
             name: Option<&str>,
             satellite: &str,
         ) -> (String, Option<ServiceCall>) {
+            let (decision, guard) = self.decide((intent, action), name, satellite).await;
+            if let Some(guard) = guard {
+                guard.ended(true).await;
+            }
+            let Decision::Reply { reply, call } = decision else {
+                panic!("not a reply");
+            };
+            (reply.text, call)
+        }
+
+        /// The decision and the start guard of the request `intent` with `action` and the
+        /// `timer` slot `name` from `satellite`, with "five minutes" as the duration of a `Set`.
+        async fn decide(
+            &self,
+            (intent, action): (&str, TimerAction),
+            name: Option<&str>,
+            satellite: &str,
+        ) -> (Decision, Option<Guard>) {
             let request = TimerRequest {
                 intent: intent.to_owned(),
                 action,
@@ -254,15 +272,9 @@ mod tests {
             let now: Timestamp = "2026-11-22T12:00:00Z".parse().expect("a timestamp");
             let satellite = Some(satellite.to_owned());
             let (pools, rng) = (pools(), Mutex::new(StdRng::seed_from_u64(1)));
-            let decision = self.desk.decide(&request, satellite, now, &pools, &rng);
-            let (decision, guard) = decision.await;
-            if let Some(guard) = guard {
-                guard.ended(true).await;
-            }
-            let Decision::Reply { reply, call } = decision else {
-                panic!("not a reply");
-            };
-            (reply.text, call)
+            self.desk
+                .decide(&request, satellite, now, &pools, &rng)
+                .await
         }
 
         /// The reply to `timer_set` for `name` from the Kitchen satellite.
@@ -440,5 +452,20 @@ mod tests {
         let (reply, call) = fixture.set("chicken").await;
         assert_eq!(reply, "There is already a chicken timer.");
         assert_eq!(call, None);
+    }
+
+    /// AC-19.9e-2: a failed start whose cleanup drops while it waits for the desk frees the entry.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9e_2_dropped_cleanup_frees_the_name() {
+        let fixture = Fixture::free().await;
+        let set = ("timer_set", TimerAction::Set);
+        let (_, guard) = fixture.decide(set, Some("chicken"), KITCHEN).await;
+        let held = fixture.desk.desk.lock().await;
+        let cleanup = tokio::spawn(guard.expect("a start guard").ended(false));
+        tokio::task::yield_now().await;
+        cleanup.abort();
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert_eq!(fixture.saved(J1), None);
     }
 }
