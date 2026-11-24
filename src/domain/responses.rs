@@ -24,6 +24,21 @@ use crate::domain::intent;
 /// The response pools by pool name.
 pub type Pools = BTreeMap<String, Pool>;
 
+/// The answer pools of a timer request, which can use the variables of a timer pool.
+#[verus_verify]
+#[expect(
+    clippy::redundant_static_lifetimes,
+    reason = "Verus makes a function of the constant, which needs the lifetime"
+)]
+const TIMER_ANSWERS: [&'static str; 6] = [
+    "ask_timer",
+    "ask_duration",
+    "timer_full",
+    "timer_taken",
+    "timer_missing",
+    "timer_done",
+];
+
 /// The responses of one intent or one filler type.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct Pool {
@@ -391,7 +406,22 @@ pub fn validate_pools(pools: &Pools, catalog: &Catalog) -> Result<(), PoolError>
     require(pools, "cancelled")?;
     require(pools, "training_busy")?;
     require(pools, "not_in_library")?;
+    require_timer(pools)?;
     check_pools(pools, catalog)
+}
+
+/// Checks that `pools` has the answer pools of a timer request.
+#[verus_spec(result =>
+    ensures
+        result is Ok ==> timer_pooled(pools@),
+)]
+fn require_timer(pools: &Pools) -> Result<(), PoolError> {
+    require(pools, "ask_timer")?;
+    require(pools, "ask_duration")?;
+    require(pools, "timer_full")?;
+    require(pools, "timer_taken")?;
+    require(pools, "timer_missing")?;
+    require(pools, "timer_done")
 }
 
 /// Checks each pool of `pools` with `check_pool`.
@@ -452,9 +482,13 @@ fn check_pool(name: &str, pool: &Pool, catalog: &Catalog) -> Result<(), PoolErro
     }
 }
 
-/// The template variables of the pool `name`: none when no intent of `catalog` has the name.
+/// The template variables of the pool `name`: those of a timer pool for a timer answer pool, else
+/// none when no intent of `catalog` has the name.
 #[verus_verify]
 fn variables(name: &str, catalog: &Catalog) -> BTreeSet<String> {
+    if TIMER_ANSWERS.contains(&name) {
+        return timer_variables();
+    }
     let mut variables = BTreeSet::new();
     let Some(intent) = catalog
         .intents
@@ -479,11 +513,7 @@ fn variables(name: &str, catalog: &Catalog) -> BTreeSet<String> {
 #[must_use]
 pub fn pool_variables(slots: BTreeSet<String>, kind: Kind, target: Target) -> BTreeSet<String> {
     if kind == Kind::Timer {
-        let mut variables = BTreeSet::new();
-        for name in &["timer", "duration", "timers"] {
-            variables.insert((*name).to_owned());
-        }
-        return variables;
+        return timer_variables();
     }
     let mut variables = slots;
     variables.insert("area".to_owned());
@@ -494,6 +524,16 @@ pub fn pool_variables(slots: BTreeSet<String>, kind: Kind, target: Target) -> BT
     }
     if kind == Kind::Fetch {
         variables.insert("response".to_owned());
+    }
+    variables
+}
+
+/// The variables of a timer pool: `timer`, `duration` and `timers`.
+#[verus_verify]
+fn timer_variables() -> BTreeSet<String> {
+    let mut variables = BTreeSet::new();
+    for name in &["timer", "duration", "timers"] {
+        variables.insert((*name).to_owned());
     }
     variables
 }
@@ -684,8 +724,8 @@ pub open spec fn pooled(pools: Map<String, Pool>, catalog: Catalog, count: int) 
 }
 
 /// True when each intent of `catalog` has a pool, the `filler`, `failure`, `ask_area`,
-/// `cancelled`, `training_busy` and `not_in_library` pools exist, and each pool has one or more
-/// responses.
+/// `cancelled`, `training_busy`, `not_in_library` and timer answer pools exist, and each pool has
+/// one or more responses.
 pub open spec fn valid_pools(pools: Map<String, Pool>, catalog: Catalog) -> bool {
     &&& pooled(pools, catalog, catalog.intents@.len() as int)
     &&& pools.contains_key(crate::domain::contracts::string_key("filler"@))
@@ -694,7 +734,18 @@ pub open spec fn valid_pools(pools: Map<String, Pool>, catalog: Catalog) -> bool
     &&& pools.contains_key(crate::domain::contracts::string_key("cancelled"@))
     &&& pools.contains_key(crate::domain::contracts::string_key("training_busy"@))
     &&& pools.contains_key(crate::domain::contracts::string_key("not_in_library"@))
+    &&& timer_pooled(pools)
     &&& filled(pools)
+}
+
+/// True when the answer pools of a timer request exist.
+pub open spec fn timer_pooled(pools: Map<String, Pool>) -> bool {
+    &&& pools.contains_key(crate::domain::contracts::string_key("ask_timer"@))
+    &&& pools.contains_key(crate::domain::contracts::string_key("ask_duration"@))
+    &&& pools.contains_key(crate::domain::contracts::string_key("timer_full"@))
+    &&& pools.contains_key(crate::domain::contracts::string_key("timer_taken"@))
+    &&& pools.contains_key(crate::domain::contracts::string_key("timer_missing"@))
+    &&& pools.contains_key(crate::domain::contracts::string_key("timer_done"@))
 }
 
 /// True when each pool of `pools` has one or more responses.
@@ -1153,6 +1204,17 @@ mod tests {
     fn ac_18_9_15_missing_not_in_library_names_it() {
         let result = validate(|pools, _| _ = pools.remove("not_in_library"));
         assert_eq!(result, Err(PoolError::Missing("not_in_library".to_owned())));
+    }
+
+    /// AC-19.6-5.
+    #[test]
+    fn ac_19_6_5_missing_timer_answer_pool_names_it() {
+        for name in TIMER_ANSWERS {
+            let result = validate(|pools, _| _ = pools.remove(name));
+            assert_eq!(result, Err(PoolError::Missing(name.to_owned())));
+        }
+        let result = validate(|pools, _| set(pools, "timer_done", &["Done in the {{ area }}."]));
+        assert_eq!(result, unknown("timer_done", "area"));
     }
 
     /// The result of `validate_pools` when the pool `pool` is `template` and `temperature_query`
