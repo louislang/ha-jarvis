@@ -134,6 +134,7 @@ flowchart LR
     crate_adapters_sqlite --> crate_domain_feedback
     crate_adapters_sqlite --> crate_domain_speaker
     crate_adapters_sqlite --> crate_domain_speech
+    crate_adapters_sqlite --> crate_domain_timers
     crate_adapters_sqlite --> crate_ports
     crate_adapters_supertonic --> crate
     crate_adapters_supertonic --> crate_adapters_supertonic
@@ -306,5 +307,6 @@ flowchart LR
     crate_ports --> crate_domain_speaker
     crate_ports --> crate_domain_speech
     crate_ports --> crate_domain_state
+    crate_ports --> crate_domain_timers
     crate_ports --> crate_domain_training
 ```

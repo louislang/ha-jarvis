@@ -79,6 +79,7 @@ use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
 use crate::domain::state_cache::StateCache;
+use crate::domain::timers::Timers;
 use crate::domain::training::TrainingSet;
 use crate::ports::Assistant;
 use crate::ports::Change;
@@ -109,6 +110,7 @@ use crate::ports::Step;
 use crate::ports::Store;
 use crate::ports::SttStream;
 use crate::ports::TextToSpeech;
+use crate::ports::TimerStore;
 use crate::ports::Title;
 use crate::ports::Tool;
 use crate::ports::Trainer;
@@ -1172,6 +1174,28 @@ impl<T: Clone + Send> Store<T> for FakeStore<T> {
     fn save(&self, value: &T) -> anyhow::Result<()> {
         *lock(&self.value) = Some(value.clone());
         lock(&self.saves).push(value.clone());
+        Ok(())
+    }
+}
+
+/// A `TimerStore` in memory that keeps the last saved table and can fail `save`.
+#[derive(Default)]
+pub struct FakeTimerStore {
+    /// The last saved table.
+    pub timers: Mutex<Timers>,
+    /// True when `save` fails.
+    pub fail: AtomicBool,
+}
+
+#[async_trait]
+impl TimerStore for FakeTimerStore {
+    async fn load(&self) -> anyhow::Result<Timers> {
+        Ok(lock(&self.timers).clone())
+    }
+
+    async fn save(&self, timers: &Timers) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.fail.load(Ordering::SeqCst), "no database");
+        *lock(&self.timers) = timers.clone();
         Ok(())
     }
 }

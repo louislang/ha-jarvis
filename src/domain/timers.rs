@@ -7,6 +7,7 @@ use std::num::ParseIntError;
 use jiff::Timestamp;
 use rand::rngs::StdRng;
 use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value;
 use text2num::Language;
 use vstd::prelude::*;
@@ -245,8 +246,7 @@ pub struct TimerRequest {
 }
 
 /// One entry of the timer table.
-#[verus_verify]
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct Timer {
     /// The satellite that set the timer.
     pub satellite: Option<String>,
@@ -277,8 +277,7 @@ impl Clone for Timer {
 }
 
 /// The timer table.
-#[verus_verify]
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct Timers {
     /// The entry of each helper, by entity ID.
     pub timers: BTreeMap<String, Timer>,

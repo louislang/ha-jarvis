@@ -34,6 +34,7 @@ use crate::domain::state::Event;
 use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
+use crate::domain::timers::Timers;
 use crate::domain::training::TrainingSet;
 
 /// The name and the version that Jarvis gives to HA.
@@ -486,6 +487,16 @@ pub trait InteractionLog: Send + Sync {
     /// Deletes the audio older than `log.audio_days`, and the unmarked records older than
     /// `log.record_days` that no marked record links to.
     async fn prune(&self, now: Timestamp) -> anyhow::Result<()>;
+}
+
+/// The saved timer table.
+#[async_trait]
+pub trait TimerStore: Send + Sync {
+    /// The saved table, or an empty table when none is saved.
+    async fn load(&self) -> anyhow::Result<Timers>;
+
+    /// Saves `timers` instead of the saved table.
+    async fn save(&self, timers: &Timers) -> anyhow::Result<()>;
 }
 
 /// The driving port that the web server calls to review the logged interactions.
