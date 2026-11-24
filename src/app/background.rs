@@ -19,6 +19,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde::Deserialize;
 use tokio::sync::Notify;
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -51,6 +52,7 @@ use crate::domain::state::AreaId;
 use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
+use crate::domain::timers::TimerInput;
 use crate::ports::Clock;
 use crate::ports::Home;
 use crate::ports::InteractionLog;
@@ -84,17 +86,32 @@ const HOTWORD_SHOWS: usize = 250;
 const LIBRARY_TYPES: [&str; 3] = ["playlist", "artist", "album"];
 
 /// Keeps `cache` equal to the states and the registries of `home` until the event stream ends,
-/// from the first `Reconnected`. Publishes each new cache to the receivers of `cache`.
-pub async fn sync(home: &dyn Home, cache: &watch::Sender<StateCache>) {
+/// from the first `Reconnected`. Publishes each new cache to the receivers of `cache`. Sends the
+/// timer changes to `timers` in the order of the events.
+pub async fn sync(
+    home: &dyn Home,
+    cache: &watch::Sender<StateCache>,
+    timers: &UnboundedSender<TimerInput>,
+) {
     let mut events = home.events();
     while let Some(event) = events.next().await {
+        // A closed receiver does not stop the sync.
         match event {
-            Event::StateChanged { .. } => {
+            Event::StateChanged { ref entity_id, .. } => {
+                let timer = entity_id.starts_with("timer.");
+                let input = timer.then(|| TimerInput::Event(event.clone()));
                 cache.send_modify(|cache| *cache = mem::take(cache).apply(event));
+                if let Some(input) = input {
+                    timers.send(input).ok();
+                }
+            }
+            Event::TimerEnded { .. } => {
+                timers.send(TimerInput::Event(event)).ok();
+            }
+            Event::Loaded { states } => {
+                timers.send(TimerInput::Snapshot(states)).ok();
             }
             Event::RegistryUpdated | Event::Reconnected => load(home, cache).await,
-            // Sub-phase 19.7b sends the timer events to the timer use case.
-            Event::TimerEnded { .. } => {}
         }
     }
 }
@@ -1109,6 +1126,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::collections::VecDeque;
     use std::fs;
+    use std::iter;
     use std::ops::RangeInclusive;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1124,6 +1142,7 @@ mod tests {
     use serde_json::Value;
     use serde_json::json;
     use tokio::runtime::Runtime;
+    use tokio::sync::mpsc::UnboundedReceiver;
     use tokio::time::Instant;
 
     use super::*;
@@ -1143,6 +1162,7 @@ mod tests {
     use crate::domain::model::Prediction;
     use crate::domain::state::Snapshot;
     use crate::domain::state::State;
+    use crate::domain::state::TimerEnd;
     use crate::ports::Context;
     use crate::testing::fakes;
     use crate::testing::fakes::FakeClassifier;
@@ -1164,22 +1184,32 @@ mod tests {
     /// The entity that the tests change.
     const KITCHEN: &str = "light.kitchen";
 
+    /// The timer helper that the tests change.
+    const JARVIS_1: &str = "timer.jarvis_1";
+
     /// Starts sync of a new cache with `home`, sends `Reconnected` and waits until sync waits.
     async fn start(home: FakeHome) -> (Arc<FakeHome>, watch::Receiver<StateCache>) {
-        let (home, cache) = spawn(home).await;
+        let (home, cache, _) = spawn(home).await;
         home.send(Event::Reconnected);
         settle().await;
         (home, cache)
     }
 
-    /// Starts sync of a new cache with `home` and waits until it waits.
-    async fn spawn(home: FakeHome) -> (Arc<FakeHome>, watch::Receiver<StateCache>) {
+    /// Starts sync of a new cache with `home` and waits until it waits. Gives the timer inputs.
+    async fn spawn(
+        home: FakeHome,
+    ) -> (
+        Arc<FakeHome>,
+        watch::Receiver<StateCache>,
+        UnboundedReceiver<TimerInput>,
+    ) {
         let home = Arc::new(home);
         let (sender, cache) = watch::channel(StateCache::default());
+        let (timers, inputs) = tokio::sync::mpsc::unbounded_channel();
         let task_home = Arc::clone(&home);
-        tokio::spawn(async move { sync(task_home.as_ref(), &sender).await });
+        tokio::spawn(async move { sync(task_home.as_ref(), &sender, &timers).await });
         settle().await;
-        (home, cache)
+        (home, cache, inputs)
     }
 
     /// Waits until every task waits. A paused clock advances only then.
@@ -1209,7 +1239,7 @@ mod tests {
     /// AC-2.9-1.
     #[tokio::test(start_paused = true)]
     async fn ac_2_9_1_first_reconnect_loads_snapshot() {
-        let (home, cache) = spawn(FakeHome::default()).await;
+        let (home, cache, _) = spawn(FakeHome::default()).await;
         assert_eq!(home.snapshots(), 0, "sync loaded before a connection");
         home.send(Event::Reconnected);
         settle().await;
@@ -1269,7 +1299,7 @@ mod tests {
         for _ in 0..failures {
             drop(home.delay());
         }
-        let (home, cache) = spawn(home).await;
+        let (home, cache, _) = spawn(home).await;
         let begin = Instant::now();
         home.send(Event::Reconnected);
         for (calls, &retry) in (1..).zip(retries) {
@@ -1291,6 +1321,44 @@ mod tests {
     async fn ac_2_9_7_failed_start_loads_after_one_second() {
         let cache = assert_retries(1, &[1]).await;
         assert_eq!(*cache.borrow(), StateCache::load(house()));
+    }
+
+    /// The timer inputs that `inputs` holds now.
+    fn received(inputs: &mut UnboundedReceiver<TimerInput>) -> Vec<TimerInput> {
+        iter::from_fn(|| inputs.try_recv().ok()).collect()
+    }
+
+    /// AC-19.7b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_7b_1_sync_sends_timer_changes_in_order() {
+        let (home, cache, mut inputs) = spawn(FakeHome::default()).await;
+        home.send(Event::Reconnected);
+        let active = changed(JARVIS_1, "active");
+        let ended = Event::TimerEnded {
+            entity_id: JARVIS_1.to_owned(),
+            end: TimerEnd::Finished,
+        };
+        let states = vec![state(JARVIS_1, "idle")];
+        let loaded = Event::Loaded {
+            states: states.clone(),
+        };
+        for event in [
+            active.clone(),
+            ended.clone(),
+            changed(KITCHEN, "off"),
+            loaded,
+        ] {
+            home.send(event);
+        }
+        settle().await;
+        let expected = [
+            TimerInput::Event(active.clone()),
+            TimerInput::Event(ended),
+            TimerInput::Snapshot(states),
+        ];
+        assert_eq!(received(&mut inputs), expected);
+        let applied = StateCache::load(house()).apply(active);
+        assert_eq!(*cache.borrow(), applied.apply(changed(KITCHEN, "off")));
     }
 
     /// The `habits.save_interval_s` of the tests.

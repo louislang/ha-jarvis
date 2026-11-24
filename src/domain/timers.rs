@@ -21,6 +21,7 @@ use crate::domain::model::Slot;
 use crate::domain::responses;
 use crate::domain::responses::Pools;
 use crate::domain::select;
+use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::State;
 use crate::domain::state_cache::StateCache;
@@ -283,6 +284,16 @@ pub struct Timers {
     pub timers: BTreeMap<String, Timer>,
     /// The order of the next timer.
     pub next: u64,
+}
+
+/// A timer change in HA, in the order of HA.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub enum TimerInput {
+    /// A state change of a timer helper, or `TimerEnded`.
+    Event(Event),
+    /// The timer helper states of one `get_states` result.
+    Snapshot(Vec<State>),
 }
 
 /// The plan of a timer request.
