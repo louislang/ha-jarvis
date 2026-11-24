@@ -471,12 +471,12 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Goal:** Give the timer requests to `TimerDesk`, and the timer inputs of `sync` to its `run`. "Set a timer", "cancel that timer", "pause", "resume" and "how long is left" then act on the HA timer helpers.
 
 - **Implements:** G13, G25. **Depends on:** 19.9b.
-- **Files:** modify `src/app/timers.rs`, `src/app/conversation.rs`, `src/app/background.rs` (tests only), `src/lib.rs`, `src/testing/fakes.rs`, `src/testing/e2e.rs`, `README.md` (the timer requests and the setup step of the timer helpers, `CLAUDE.md` workflow item 15).
+- **Files:** modify `src/app/timers.rs` (tests only), `src/app/conversation.rs`, `src/app/background.rs` (tests only), `src/lib.rs`, `src/testing/fakes.rs`, `src/testing/e2e.rs`, `README.md` (the timer requests and the setup step of the timer helpers, `CLAUDE.md` workflow item 15).
 
 **Model.**
 
 - `Conversation::act` gives a `Timer` decision to `TimerDesk::decide` with the satellite of the request, the time of the request, the current pools and its RNG. This replaces the `Defer` of sub-phase 19.5. The result goes through `dispatch` as each other decision: the reply first, then the call (`ReplyBeforeCall`), and the question through the announce queue (sub-phase 10.4).
-- `TimerDesk::decide` puts a guard with the helper and the order of the new entry in a `Start` decision, and the `after` work of its `timer.start` call takes it. When that call fails, the `after` work runs `forget` (sub-phase 19.9) with the helper and the order, before the `failure` answer (sub-phase 4.9c). When the guard drops before the call ends, it runs `forget` the same way in a new task. Thus the decision or the `after` work can drop for any reason, for example a failed write of the reply in the Wyoming adapter, and the helper and the name become free. After the call ends, the guard does nothing. Thus a failed or dropped start frees the helper and the name. A failed cancel, pause or resume does not run `forget` and does not change the table. Its timer can end, and a new timer can take the helper, before the failure comes. An `active` state clears `starting` before the start call ends, so a timer can also end, and a new timer can take the helper, before a start call fails. `next` only grows while Jarvis runs, and a restart drops each start call, so no new entry has the order of a start call that runs. Thus the failure of a start call meets only its own entry. When the connection fails after HA starts a timer but before Jarvis gets the result, or when the start call drops after it reaches HA, the helper runs with no entry and no ring.
+- Until sub-phase 19.9e, a failed or dropped `timer.start` call does not change the table. Its entry starts until a restart of Jarvis, so its helper and its name stay taken. A failed cancel, pause or resume does not change the table.
 - `start_sync` also gives the receiver of the `TimerInput`. `run` makes the `TimerDesk` with the SQLite adapter as its `TimerStore` before the conversation use case gets it, gives it to the conversation use case, and starts `TimerDesk::run` with this receiver. Thus no request changes a table that a later load replaces.
 - The README gets the timer requests and the setup step: in HA, create five timer helpers with the names "Jarvis 1" to "Jarvis 5", so that their entity IDs are `timer.jarvis_1` to `timer.jarvis_5`, and turn on "Restore" for each. Jarvis uses each `timer.jarvis_` helper. The tests add the helpers to the snapshot of the reference house before they load the cache, because the reference house has no timer entity.
 
@@ -484,17 +484,38 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 - AC-19.9c-1: When `FakeClassifier` gives `timer_set` with `duration = five minutes` and `timer = chicken` on the Kitchen satellite, `handle` returns "Your chicken timer is set for five minutes.", `FakeHome` records `timer.start` on `timer.jarvis_1` with `{ duration: 300 }` after the reply, and `FakeTimerStore` has the entry.
 - AC-19.9c-2: When "chicken" and "pizza" are `active` and the user says "cancel that timer", `handle` returns empty text, and `FakeHome` records `ask` with "Which timer, the chicken timer or the pizza timer?". When the user then answers "the chicken", `FakeHome` records `timer.cancel` on the helper of "chicken", and the reply is "I cancelled the chicken timer."
-- AC-19.9c-3: When `FakeHome` fails the `timer.start` call, `FakeHome` records an announce from `failure`, and the next `timer_set` with the same name gives `timer.start` on the same helper, not `timer_taken`.
-- AC-19.9c-4: When the view shows the helper `active` before its `timer.start` call fails, the entry stays.
-- AC-19.9c-5: When `FakeHome` holds a `timer.pause` call on a helper, the timer of the helper ends, a new `timer_set` takes the same helper, and then the pause call fails, the new entry stays and starts.
-- AC-19.9c-6: When `FakeHome` holds a `timer.start` call, the view shows the helper `active`, the timer ends, a new `timer_set` takes the same helper, and then the held start call fails, the new entry stays and starts.
-- AC-19.9c-7: When the `after` work of a `timer_set` drops before it runs, `FakeHome` gets no `timer.start` call, and the next `timer_set` with the same name gives `timer.start` on the same helper, not `timer_taken`.
+- AC-19.9c-3: When the view shows the helper `active` before its `timer.start` call fails, the entry stays.
+- AC-19.9c-4: When `FakeHome` holds a `timer.pause` call on a helper, the timer of the helper ends, a new `timer_set` takes the same helper, and then the pause call fails, the new entry stays and starts.
+- AC-19.9c-5: When `FakeHome` holds a `timer.start` call, the view shows the helper `active`, the timer ends, a new `timer_set` takes the same helper, and then the held start call fails, the new entry stays and starts.
 
 **Proofs.**
 
 - P-19.9c-1. Requires: `ReplyBeforeCall` (sub-phase 16.1). Argument: the timer decision is a `Reply` with a call, and `dispatch` gives the call as `after` work (P-4.8-1).
 - P-19.9c-2. Argument: `Several` gives `Ask` (P-19.6b-1), `act` opens the dialog (sub-phase 10.5), and the filled answer runs `decide` again with the `timer` slot (P-10.5-1).
-- P-19.9c-3 to P-19.9c-7. Requires: P-19.9-1, P-19.9-2. Argument: the failure arm of `after` and the drop of the guard run `forget` only for a `timer.start` call, with the order of its entry. The entry of that call still starts, unless the `active` state of its helper cleared `starting`. A new entry on the same helper has a higher order. A failed pause, cancel or resume runs no `forget`.
+- P-19.9c-3 to P-19.9c-5. Argument: a failed call changes no entry of the table. A new entry starts until `run` reads the `active` of its helper (P-19.9-1).
+
+---
+
+### 19.9e Timer Start Guard
+
+**Goal:** Free the helper and the name of a timer whose start call fails or drops. "Set a timer for the chicken" then works again after a failed start.
+
+- **Implements:** G25. **Depends on:** 19.9c.
+- **Files:** modify `src/app/timers.rs`, `src/app/conversation.rs`.
+
+**Model.**
+
+- `TimerDesk::decide` puts a guard with the helper and the order of the new entry in a `Start` decision, and the `after` work of its `timer.start` call takes it. When that call fails, the `after` work runs `forget` (sub-phase 19.9) with the helper and the order, before the `failure` answer (sub-phase 4.9c). When the guard drops before the call ends, it runs `forget` the same way in a new task. Thus the decision or the `after` work can drop for any reason, for example a failed write of the reply in the Wyoming adapter, and the helper and the name become free. After the call ends, the guard does nothing. Thus a failed or dropped start frees the helper and the name. A failed cancel, pause or resume does not run `forget` and does not change the table. Its timer can end, and a new timer can take the helper, before the failure comes. An `active` state clears `starting` before the start call ends, so a timer can also end, and a new timer can take the helper, before a start call fails. `next` only grows while Jarvis runs, and a restart drops each start call, so no new entry has the order of a start call that runs. Thus the failure of a start call meets only its own entry. When the connection fails after HA starts a timer but before Jarvis gets the result, or when the start call drops after it reaches HA, the helper runs with no entry and no ring.
+- The tests of AC-19.9c-3 to AC-19.9c-5 also pass with the guard: it does not remove a new entry, or an entry whose helper is `active`.
+
+**Acceptance criteria.**
+
+- AC-19.9e-1: When `FakeHome` fails the `timer.start` call, `FakeHome` records an announce from `failure`, and the next `timer_set` with the same name gives `timer.start` on the same helper, not `timer_taken`.
+- AC-19.9e-2: When the `after` work of a `timer_set` drops before it runs, `FakeHome` gets no `timer.start` call, and the next `timer_set` with the same name gives `timer.start` on the same helper, not `timer_taken`.
+
+**Proofs.**
+
+- P-19.9e-1, P-19.9e-2. Requires: P-19.9-1, P-19.9-2. Argument: the failure arm of `after` and the drop of the guard run `forget` only for a `timer.start` call, with the order of its entry. The entry of that call still starts, unless the `active` state of its helper cleared `starting`. A new entry on the same helper has a higher order. A failed pause, cancel or resume runs no `forget`.
 
 ---
 
@@ -502,7 +523,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 **Goal:** Fill the duration of a timer from the answer to "For how long?", ask a timer question again with its own text, and let a cancel, pause or resume that waits act only on its own timer.
 
-- **Implements:** G13, G25. **Depends on:** 19.9c.
+- **Implements:** G13, G25. **Depends on:** 19.9e.
 - **Files:** modify `src/domain/timers.rs`, `src/app/timers.rs`, `src/app/conversation.rs`, `README.md` (the answer to "For how long?", `CLAUDE.md` workflow item 15).
 
 **Model.**
