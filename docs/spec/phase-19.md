@@ -319,31 +319,26 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 ### 19.7 Timer Events
 
-**Goal:** Give the timer events of HA to Jarvis. Jarvis then knows when a timer finishes, when a person cancels it in HA, and when the connection to HA starts again.
+**Goal:** Give the timer events of HA to Jarvis. Jarvis then knows when a timer finishes and when a person cancels it in HA. Sub-phase 19.7b sends them to the timer use case.
 
 - **Implements:** G25. **Depends on:** 19.6b.
-- **Files:** modify `src/domain/state.rs`, `src/domain/timers.rs`, `src/adapters/ha.rs`, `src/app/background.rs`, `src/lib.rs`, `src/testing/fakes.rs`.
+- **Files:** modify `src/domain/state.rs`, `src/adapters/ha.rs`, `src/app/background.rs`.
 
 **Model.**
 
 - HA fires `timer.finished` when a timer ends, and `timer.cancelled` when a timer is cancelled. The data of each has `entity_id`. A state change does not tell a finish from a cancel: both go from `active` to `idle`.
-- `Event::TimerEnded { entity_id, end: TimerEnd }`, with `TimerEnd::Finished` or `TimerEnd::Cancelled`. After `Ready`, the HA adapter also subscribes to `timer.finished` and `timer.cancelled` (sub-phase 2.4b), before it gives `Reconnected`.
-- `sync` (sub-phase 2.9) gets a sender of `TimerInput` (in `src/domain/timers.rs`): `Event(Event)` or `Snapshot(Vec<State>)`. It sends each `StateChanged` of an entity in the domain `timer` after it applies it to the hot cache, and each `TimerEnded`, which does not change the hot cache. When the HA adapter delivers the result of a `get_states` request, it first gives `Event::Loaded { states }` in `events`, with the states of the entities in the domain `timer` from that result. The read loop delivers the messages one at a time in the order of the socket, so `Loaded` comes after each event that HA sends before the states, and before each later event. `sync` sends the states of each `Loaded` as `Snapshot` when it reads it. Thus each `Snapshot` is the states of one `get_states` result, at the place of that result in the socket, also when two loads overlap or a load fails after its `get_states`. Thus a timer that ends while `load` runs gives its `TimerEnded` before the `Snapshot` that shows its helper `idle`. HA writes the `idle` state and fires the timer event in one step of its event loop, so no result of `get_states` comes between them. Thus the receiver gets the changes of the timer helpers and the timer events in the order of HA. A closed receiver does not stop `sync`. Until sub-phase 19.9, `run` gives `sync` a sender whose receiver it drops. A timer event and `Loaded` do not change the cache, so `cache_sync.qnt` and its driver do not change.
+- `Event::TimerEnded { entity_id, end: TimerEnd }`, with `TimerEnd::Finished` or `TimerEnd::Cancelled`. After `Ready`, the HA adapter also subscribes to `timer.finished` and `timer.cancelled` (sub-phase 2.4b), before it gives `Reconnected`. Until sub-phase 19.7b, `sync` (sub-phase 2.9) ignores `TimerEnded`, which does not change the hot cache.
 - After each connect, the HA adapter sends a service call only after HA gives the result of each subscription. A call that comes earlier waits, and its timeout includes the wait. HA sends the state change that a service call makes before the result of the call, on the same socket. Thus, when a `timer.start` call succeeds, `events` already has the `active` state of its helper, also after a reconnect.
 
 **Acceptance criteria.**
 
 - AC-19.7-1: When `FakeHaServer` sends `timer.finished` with `entity_id = timer.jarvis_1`, `events` gives `TimerEnded` with `timer.jarvis_1` and `Finished`. For `timer.cancelled`, it gives `Cancelled`.
 - AC-19.7-2: When the HA adapter connects, `FakeHaServer` receives `subscribe_events` for `timer.finished` and for `timer.cancelled` before `events` gives `Reconnected`.
-- AC-19.7-3: When `sync` gets a `StateChanged` of `timer.jarvis_1`, then a `TimerEnded`, the receiver gets both in this order, and the hot cache gets only the state. A `StateChanged` of a light does not reach the receiver. When `sync` gets `Loaded`, the receiver gets `Snapshot` with its states.
-- AC-19.7-4: When `FakeHaServer` holds the results of the subscriptions after a connect, a `call` sends nothing until the server gives them. When the server then sends a `state_changed` of `timer.jarvis_1` and the result of the `timer.start` call, `events` gives the state change before `call` returns.
-- AC-19.7-5: When `FakeHaServer` sends `timer.finished` of `timer.jarvis_1` after a reconnect and before the result of `get_states`, the receiver gets the `TimerEnded` before the `Snapshot`. A `StateChanged` that the server sends after the result comes after the `Snapshot`.
-- AC-19.7-6: When `sync` gets `RegistryUpdated` while the load of a `Reconnected` runs, and `FakeHaServer` sends `timer.finished` of `timer.jarvis_1` between the two `get_states` results, the receiver gets the `Snapshot` of the first result with `timer.jarvis_1` `active`, then the `TimerEnded`, then the `Snapshot` of the second result with `timer.jarvis_1` `idle`.
+- AC-19.7-3: When `FakeHaServer` holds the results of the subscriptions after a connect, a `call` sends nothing until the server gives them. When the server then sends a `state_changed` of `timer.jarvis_1` and the result of the `timer.start` call, `events` gives the state change before `call` returns.
 
 **Proofs.**
 
-- P-19.7-3, P-19.7-5, P-19.7-6. Argument: `sync` reads one event at a time and sends it before it reads the next. The `TimerEnded` arm only sends. The `Loaded` arm sends only its own states. The adapter gives `Loaded` in the order of the socket.
-- P-19.7-1, P-19.7-2, P-19.7-4. Evidence: test, and step 4 of the field log for the order of HA.
+- P-19.7-1, P-19.7-2, P-19.7-3. Evidence: test, and step 4 of the field log for the order of HA.
 
 **Field log.** Before the first release with sub-phase 19.9, on the live HA, in the developer tools, with a helper `timer.jarvis_1`:
 
@@ -354,11 +349,34 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 ---
 
+### 19.7b Timer Inputs
+
+**Goal:** Send the changes of the timer helpers and the timer events to the timer use case, in the order of HA. Jarvis then knows when the connection to HA starts again, and which timers ran out while it was not connected.
+
+- **Implements:** G25. **Depends on:** 19.7.
+- **Files:** modify `src/domain/state.rs`, `src/domain/timers.rs`, `src/adapters/ha.rs`, `src/app/background.rs`, `src/lib.rs`, `src/testing/fakes.rs`.
+
+**Model.**
+
+- `sync` (sub-phase 2.9) gets a sender of `TimerInput` (in `src/domain/timers.rs`): `Event(Event)` or `Snapshot(Vec<State>)`. It sends each `StateChanged` of an entity in the domain `timer` after it applies it to the hot cache, and each `TimerEnded` (sub-phase 19.7), which does not change the hot cache. When the HA adapter delivers the result of a `get_states` request, it first gives `Event::Loaded { states }` in `events`, with the states of the entities in the domain `timer` from that result. The read loop delivers the messages one at a time in the order of the socket, so `Loaded` comes after each event that HA sends before the states, and before each later event. `sync` sends the states of each `Loaded` as `Snapshot` when it reads it. Thus each `Snapshot` is the states of one `get_states` result, at the place of that result in the socket, also when two loads overlap or a load fails after its `get_states`. Thus a timer that ends while `load` runs gives its `TimerEnded` before the `Snapshot` that shows its helper `idle`. HA writes the `idle` state and fires the timer event in one step of its event loop, so no result of `get_states` comes between them. Thus the receiver gets the changes of the timer helpers and the timer events in the order of HA. A closed receiver does not stop `sync`. Until sub-phase 19.9, `run` gives `sync` a sender whose receiver it drops. A timer event and `Loaded` do not change the cache, so `cache_sync.qnt` and its driver do not change.
+
+**Acceptance criteria.**
+
+- AC-19.7b-1: When `sync` gets a `StateChanged` of `timer.jarvis_1`, then a `TimerEnded`, the receiver gets both in this order, and the hot cache gets only the state. A `StateChanged` of a light does not reach the receiver. When `sync` gets `Loaded`, the receiver gets `Snapshot` with its states.
+- AC-19.7b-2: When `FakeHaServer` sends `timer.finished` of `timer.jarvis_1` after a reconnect and before the result of `get_states`, the receiver gets the `TimerEnded` before the `Snapshot`. A `StateChanged` that the server sends after the result comes after the `Snapshot`.
+- AC-19.7b-3: When `sync` gets `RegistryUpdated` while the load of a `Reconnected` runs, and `FakeHaServer` sends `timer.finished` of `timer.jarvis_1` between the two `get_states` results, the receiver gets the `Snapshot` of the first result with `timer.jarvis_1` `active`, then the `TimerEnded`, then the `Snapshot` of the second result with `timer.jarvis_1` `idle`.
+
+**Proofs.**
+
+- P-19.7b-1, P-19.7b-2, P-19.7b-3. Argument: `sync` reads one event at a time and sends it before it reads the next. The `TimerEnded` arm only sends. The `Loaded` arm sends only its own states. The adapter gives `Loaded` in the order of the socket.
+
+---
+
 ### 19.8 Timer Store
 
 **Goal:** Add the `TimerStore` port and its SQLite adapter, which keep the timer table in `jarvis.db`. The table then survives a restart of Jarvis.
 
-- **Implements:** G25. **Depends on:** 19.7.
+- **Implements:** G25. **Depends on:** 19.7b.
 - **Files:** modify `src/ports.rs`, `src/adapters/sqlite.rs`, `src/domain/timers.rs`, `src/testing/fakes.rs`.
 
 **Model.**
@@ -389,7 +407,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Model.**
 
 - `TimerDesk` holds, in one async mutex, the timer table, the view and the rings (sub-phase 19.10). It also holds the `TimerStore` and `dialog.choice_similarity`. Each change of the table saves it under the lock, so the saves keep the order of the changes. A failed save logs a `warn` event, and the table in memory stays.
-- The view is a `StateCache` of the timer helpers. Only `run` changes it, from the receiver (sub-phase 19.7): `apply` (sub-phase 2.7) for each state change, and a new cache of the states of each `Snapshot`. `TimerDesk` does not read the hot cache. Thus each state change of a helper and each timer event reach the table in the order of HA.
+- The view is a `StateCache` of the timer helpers. Only `run` changes it, from the receiver (sub-phase 19.7b): `apply` (sub-phase 2.7) for each state change, and a new cache of the states of each `Snapshot`. `TimerDesk` does not read the hot cache. Thus each state change of a helper and each timer event reach the table in the order of HA.
 - `TimerDesk::decide(request, satellite, now, pools, rng) -> Decision`: takes the lock, runs `plan` (sub-phase 19.4c) with the view, stores and saves the new table, and gives `answer` (sub-phase 19.6). One lock, so two requests at the same time cannot take the same free helper.
 - `Conversation::act` gives a `Timer` decision to `TimerDesk::decide` with the satellite of the request, the time of the request, the current pools and its RNG. This replaces the `Defer` of sub-phase 19.5. The result goes through `dispatch` as each other decision: the reply first, then the call (`ReplyBeforeCall`), and the question through the announce queue (sub-phase 10.4).
 - `TimerDesk::decide` puts a guard with the helper and the order of the new entry in a `Start` decision, and the `after` work of its `timer.start` call takes it. When that call fails, the `after` work runs `forget` (sub-phase 19.4b) with the helper and the order, before the `failure` answer (sub-phase 4.9c). When the guard drops before the call ends, it runs `forget` the same way in a new task. Thus the decision or the `after` work can drop for any reason, for example a failed write of the reply in the Wyoming adapter, and the helper and the name become free. After the call ends, the guard does nothing. Thus a failed or dropped start frees the helper and the name. A failed cancel, pause or resume does not run `forget` and does not change the table. Its timer can end, and a new timer can take the helper, before the failure comes. An `active` state clears `starting` before the start call ends, so a timer can also end, and a new timer can take the helper, before a start call fails. `next` only grows while Jarvis runs, and a restart drops each start call, so no new entry has the order of a start call that runs. Thus the failure of a start call meets only its own entry. When the connection fails after HA starts a timer but before Jarvis gets the result, or when the start call drops after it reaches HA, the helper runs with no entry and no ring.
@@ -397,7 +415,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - Routing step 2 of sub-phase 10.5 also fills a `Slot` dialog whose missing slot is `duration`: when `duration` (sub-phase 19.2) reads the answer, the normalized answer is the `duration` slot, and `decide` runs again with the slots of the dialog. Else steps 3 to 6 apply, so Jarvis asks again up to `dialog.max_turns`. `is_answer` (sub-phase 10.7) does not count this dialog, so its answer keeps the `endpoint_ms` wait: "one hour" can continue with "and twenty minutes".
 - `TimerDesk::new` loads the table from the store, and `run` (`src/lib.rs`) makes it before the conversation use case gets it. Thus no request changes a table that a later load replaces. A failed load logs a `warn` event and starts with an empty table. The load sets `starting := false` on each entry, because no start call survives a restart. Until the first `Snapshot`, the view is empty, so `Set` gives `Full`.
 - `TimerDesk::run(events)` reads the receiver. A state change goes into the view. `TimerEnded` runs `ended`, so a finished timer and a timer that a person cancels in HA leave the table. Sub-phase 19.10 adds the ring. `Snapshot` replaces the view and runs `reconcile`.
-- This sub-phase adds `starting: bool` to `Timer` in `src/domain/timers.rs`. `plan` sets it on the entry of `Start`. A state of the helper that is `active` or `paused` in the view clears it, in a state change or in `reconcile`. `ended` removes and gives an entry only when it does not start. HA sends the end of an older timer on the helper before the `active` of the new one, so the late `Cancelled` of a voice cancel cannot remove a new entry on the same helper. `forget(timers, helper, order)` removes the entry of `helper` only while it starts and has `order`. `reconcile` keeps an entry that starts: its start call decides it. A start call succeeds only after `events` has the `active` state of its helper (sub-phase 19.7), and `sync` sends that state before a later `Snapshot`. Thus a successful start always clears `starting`, also when a reconnect comes between the call and the result. These two rules replace the `forget` and `reconcile` parts of AC-19.4b-2.
+- This sub-phase adds `starting: bool` to `Timer` in `src/domain/timers.rs`. `plan` sets it on the entry of `Start`. A state of the helper that is `active` or `paused` in the view clears it, in a state change or in `reconcile`. `ended` removes and gives an entry only when it does not start. HA sends the end of an older timer on the helper before the `active` of the new one, so the late `Cancelled` of a voice cancel cannot remove a new entry on the same helper. `forget(timers, helper, order)` removes the entry of `helper` only while it starts and has `order`. `reconcile` keeps an entry that starts: its start call decides it. A start call succeeds only after `events` has the `active` state of its helper (sub-phase 19.7), and `sync` sends that state that state before a later `Snapshot`. Thus a successful start always clears `starting`, also when a reconnect comes between the call and the result. These two rules replace the `forget` and `reconcile` parts of AC-19.4b-2.
 - A `Finished`, and a cancel in HA, leave the entry in the table until `run` reads the event, so the helper is not free before then.
 - At the start and after each reconnect, `reconcile` removes each entry that does not start and whose helper is `idle`, with no ring: its timer ended or was cancelled while Jarvis was not connected, and Jarvis cannot tell which. An entry whose helper is `active` or `paused` stays, and its end rings on its satellite (sub-phase 19.10). A reservation that `decide` makes after `sync` loads a snapshot, but before `run` reads it, starts, so it stays.
 - A request without a satellite (text from the HA UI) can set a timer, and its entry has no satellite.
