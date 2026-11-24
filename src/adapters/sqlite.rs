@@ -1,4 +1,4 @@
-//! `InteractionLog` with SQLite.
+//! `InteractionLog` and `TimerStore` with SQLite.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -17,18 +17,21 @@ use crate::domain::feedback::Interaction;
 use crate::domain::feedback::Mark;
 use crate::domain::speaker::Source;
 use crate::domain::speech::Audio;
+use crate::domain::timers::Timers;
 use crate::ports::Change;
 use crate::ports::Filter;
 use crate::ports::InteractionLog;
 use crate::ports::Page;
+use crate::ports::TimerStore;
 
 /// The migration steps of the schema. The step at index `n` moves the schema from version `n` to
 /// version `n + 1`.
-const STEPS: [&str; 3] = [
+const STEPS: [&str; 4] = [
     "CREATE TABLE interactions (id INTEGER PRIMARY KEY, time INTEGER NOT NULL, record TEXT NOT NULL, audio BLOB)",
     "CREATE TABLE marks (interaction INTEGER NOT NULL, mark TEXT NOT NULL)",
     "ALTER TABLE interactions ADD COLUMN speaker TEXT; ALTER TABLE interactions ADD COLUMN source TEXT; \
     ALTER TABLE interactions ADD COLUMN embedding BLOB",
+    "CREATE TABLE timers (id INTEGER PRIMARY KEY, record TEXT NOT NULL)",
 ];
 
 /// The JSON record of an interaction with its marks, in the order that they were stored, and its
@@ -309,6 +312,26 @@ impl InteractionLog for SqliteLog {
     }
 }
 
+#[async_trait]
+impl TimerStore for SqliteLog {
+    async fn load(&self) -> anyhow::Result<Timers> {
+        let query = "SELECT record FROM timers WHERE id = 0";
+        let record: Option<String> = self
+            .run(move |connection| connection.query_row(query, [], |row| row.get(0)).optional())
+            .await?;
+        Ok(match record {
+            Some(record) => serde_json::from_str(&record)?,
+            None => Timers::default(),
+        })
+    }
+
+    async fn save(&self, timers: &Timers) -> anyhow::Result<()> {
+        let replace = "INSERT OR REPLACE INTO timers (id, record) VALUES (0, ?1)";
+        self.execute(replace, (serde_json::to_string(timers)?,))
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -326,6 +349,7 @@ mod tests {
     use crate::domain::feedback::Value;
     use crate::domain::state::EntityId;
     use crate::domain::state::ServiceCall;
+    use crate::domain::timers::Timer;
 
     /// The first page of 50 interactions.
     const PAGE: Page = Page {
@@ -475,7 +499,7 @@ mod tests {
     fn ac_12_4_3_open_creates_the_database() -> anyhow::Result<()> {
         let (_log, folder) = log();
         let path = folder.path().join("jarvis.db");
-        assert_eq!(version(&path)?, 3);
+        assert_eq!(version(&path)?, 4);
         let connection = Connection::open(path)?;
         let count: u32 =
             connection.query_row("SELECT count(*) FROM interactions", [], |row| row.get(0))?;
@@ -488,11 +512,11 @@ mod tests {
     fn ac_12_4_4_newer_schema_is_an_error() -> anyhow::Result<()> {
         let folder = tempfile::tempdir()?;
         let config = config(&folder);
-        Connection::open(&config.database)?.pragma_update(None, "user_version", 4)?;
+        Connection::open(&config.database)?.pragma_update(None, "user_version", 5)?;
         let Err(error) = SqliteLog::open(&config) else {
             panic!("a newer schema opens");
         };
-        let expected = "the schema version 4 of the database is newer than the version 3 of Jarvis";
+        let expected = "the schema version 5 of the database is newer than the version 4 of Jarvis";
         assert_eq!(error.to_string(), expected);
         Ok(())
     }
@@ -599,7 +623,7 @@ mod tests {
         stored(&config.database, 1, &unspoken(7))?;
         let log = SqliteLog::open(&config)?;
         assert_eq!(log.get(7).await?, Some(unspoken(7)));
-        assert_eq!(version(&config.database)?, 3);
+        assert_eq!(version(&config.database)?, 4);
         Ok(())
     }
 
@@ -612,7 +636,7 @@ mod tests {
         let log = SqliteLog::open(&config)?;
         assert_eq!(log.get(7).await?, Some(unspoken(7)));
         assert_eq!(log.embedding(7).await?, None);
-        assert_eq!(version(&config.database)?, 3);
+        assert_eq!(version(&config.database)?, 4);
         Ok(())
     }
 
@@ -788,6 +812,51 @@ mod tests {
         log.prune(day(40)).await?;
         assert_eq!(log.audio(1).await?, None);
         assert_eq!(log.embedding(1).await?, Some(embedding));
+        Ok(())
+    }
+
+    /// A table with a named Kitchen timer and a generic timer from a typed request.
+    fn timers() -> Timers {
+        let chicken = Timer {
+            satellite: Some("assist_satellite.kitchen".to_owned()),
+            name: Some("chicken".to_owned()),
+            duration: "five minutes".to_owned(),
+            order: 0,
+        };
+        let generic = Timer {
+            satellite: None,
+            name: None,
+            duration: "ten minutes".to_owned(),
+            order: 1,
+        };
+        let entries = [("timer.jarvis_1", chicken), ("timer.jarvis_2", generic)];
+        let entries = entries.map(|(helper, timer)| (helper.to_owned(), timer));
+        Timers {
+            timers: entries.into(),
+            next: 2,
+        }
+    }
+
+    /// AC-19.8-1.
+    #[tokio::test]
+    async fn ac_19_8_1_new_adapter_loads_the_saved_table() -> anyhow::Result<()> {
+        let (log, folder) = log();
+        log.save(&Timers::default()).await?;
+        log.save(&timers()).await?;
+        let reopened = SqliteLog::open(&config(&folder))?;
+        assert_eq!(reopened.load().await?, timers());
+        Ok(())
+    }
+
+    /// AC-19.8-2.
+    #[tokio::test]
+    async fn ac_19_8_2_timers_keep_the_interactions() -> anyhow::Result<()> {
+        let (log, _folder) = log();
+        assert_eq!(log.load().await?, Timers::default());
+        log.append(interaction(7), None).await?;
+        log.save(&timers()).await?;
+        assert_eq!(log.load().await?, timers());
+        assert_eq!(log.list(Filter::All, PAGE).await?, [interaction(7)]);
         Ok(())
     }
 }
