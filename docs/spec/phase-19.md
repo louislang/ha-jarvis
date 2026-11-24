@@ -10,7 +10,7 @@ You chose these rules (2026-11-08, 2026-11-17 and 2026-11-22):
 - The satellite that set the timer announces its end. It says "Your chicken timer is done" ("Your timer is done" for a generic timer) every 15 s for up to 2 minutes, until the user says "stop" on that satellite, or "cancel the chicken timer". Other requests on that satellite run normally and do not stop the ring. "Stop" on a ringing satellite commits early.
 - "Cancel the chicken timer" cancels by name. "Cancel that timer" cancels the timer when only one runs. "Cancel the most recent timer" cancels the newest. When several run, "cancel that timer" asks which timer and names them ("Which timer, the chicken timer or the pizza timer?"), with a dialog question of phase 10. "Pause the chicken timer" and "resume the chicken timer" work the same way.
 - "How long is left on the timer?" with several timers lists them all. This phase does not add or subtract time.
-- A later phase (stop and mute) adds a general "stop" and "never mind". This phase uses "stop" only for a ringing timer (sub-phase 19.10).
+- A later phase (stop and mute) adds a general "stop" and "never mind". This phase uses "stop" only for a ringing timer (sub-phase 19.10b).
 
 Each sub-phase that adds an intent adds its seed examples to `intents.toml` and its pool to `responses.toml`, as in phase 18 (the preface of `phase-18.md`). The new intents go at the end of `intents.toml`, so the contexts of the existing examples do not change.
 
@@ -548,43 +548,66 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 ### 19.10 Timer Ring
 
-**Goal:** Announce the end of a timer on the satellite that set it, every 15 s for up to 2 minutes, until the user says "stop" there or cancels that timer by name.
+**Goal:** Announce the end of a timer on the satellite that set it, every 15 s for up to 2 minutes. Sub-phase 19.10b adds "stop" and the cancel of a ringing timer by name.
 
 - **Implements:** G25. **Depends on:** 19.9d.
-- **Files:** modify `src/domain/timers.rs`, `src/app/timers.rs`, `src/app/conversation.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `README.md` (the ring and "stop", `CLAUDE.md` workflow item 15).
-- **Quint:** `timers.qnt` (the rules of `finish`, `ringOnce`, `stop` and `silence`).
+- **Files:** modify `src/domain/timers.rs`, `src/app/timers.rs`, `src/app/conversation.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `README.md` (the ring, `CLAUDE.md` workflow item 15).
+- **Quint:** `timers.qnt` (the rules of `finish` and `ringOnce`).
 
 **Model.**
 
-- `RING_INTERVAL` is 15 s, `RINGS` is 8 and `RING_FOR` is 120 s, constants in `src/app/timers.rs`. Thus the last ring starts 105 s after the end when the satellite is idle. `TimerEnded` with `Finished` runs `ended`. When the entry has a satellite, a ring starts. The ring has the satellite and the entry, and its text is `timer_done` with the `timer` and `duration` of the entry. Each ring picks an answer and records its use, as a `failure` answer does (sub-phase 4.9c).
+- `RING_INTERVAL` is 15 s, `RINGS` is 8 and `RING_FOR` is 120 s, constants in `src/app/timers.rs`. Thus the last ring starts 105 s after the end when the satellite is idle. `TimerEnded` with `Finished` runs `ended`. When the entry has a satellite, a ring starts. The ring has the satellite, the entry and the time of the event. Its text is `done(timer, pools, rng) -> Option<Chosen>` (in `src/domain/timers.rs`): a response of `timer_done` with the `timer` and `duration` of the entry. Each ring picks an answer and records its use, as a `failure` answer does (sub-phase 4.9c). When `timer_done` does not render, the ring task ends.
 - Ring `k` (from 0 to 7) starts `k * RING_INTERVAL` after the event, or when ring `k - 1` ends, if that is later. Each ring calls `Queues::queued` (sub-phase 4.9b) with the current generation of the satellite. Thus each ring waits for its turn and until the satellite is idle, and a new request on the satellite drops only the ring that waits at that time. The next ring continues.
-- `Queues::queued` runs its `speak` future only after the wait for idle, the margin and the generation check (sub-phase 4.9b). The `speak` future of a ring first checks that its ring, by its number, still exists and that the virtual time is less than the event plus 120 s (`RING_FOR`). Only then does it call `Home::announce`. Else it makes no announce, and the ring task ends. Thus a "stop" on another satellite, a cancel by name, or a long wait for idle drops a ring that already waits in the queue. This sub-phase makes `Queues::queued` public and does not change it. The model has no time: `ringOnce` is this check when it passes. The driver of sub-phase 19.12 makes each ring at once on an idle satellite, so its traces do not reach `RING_FOR`, and no new Quint action is necessary.
-- `TimerDesk` keeps the rings by helper, each with a number that it counts up. A new finish on the same helper replaces its ring, so the task of the old ring stops at its next check. `TimerDesk::stop(satellite) -> bool` removes each ring of the satellite, and gives true when it removed one. `TimerDesk::ringing() -> bool` gives true while a ring exists.
-- `Conversation::route` checks the ring first (sub-phase 10.5, before step 1). When the request has a satellite, `is_cancel(text, dialog.cancel)` is true (sub-phase 10.3), and `stop` of the satellite gives true, `handle` returns empty text. Jarvis records no interaction for it, as for a cancel. `handle` takes the open dialog before `route` (sub-phase 16.1b), so this "stop" also closes the dialog of the satellite. "Stop" is a phrase of `dialog.cancel`. "Stop" on another satellite does not stop the ring. Without a ring, "stop" is routed as before.
-- `plan` (sub-phase 19.4c) also gets the timers of the rings. `Cancel` with a name first matches the labels of the ringing timers with `fill`. A match gives `Silence { helper, timer }`, before the candidates of the table. `answer` gives `Reply` from the pool of the intent with no call. `TimerDesk::decide` then removes the ring of `helper`. A ringing timer is no longer in HA, so it needs no call. This applies on any satellite.
+- `Queues::queued` runs its `speak` future only after the wait for idle, the margin and the generation check (sub-phase 4.9b). The `speak` future of a ring first checks that its ring, by its number, still exists and that the virtual time is less than the event plus 120 s (`RING_FOR`). Only then does it call `Home::announce`. Else it makes no announce. The ring task makes the same check before each ring, and ends when it fails. Thus a long wait for idle, or a new ring on the helper, drops a ring that already waits in the queue. The model has no time: `ringOnce` is this check when it passes. The driver of sub-phase 19.12 makes each ring at once on an idle satellite, so its traces do not reach `RING_FOR`, and no new Quint action is necessary.
+- `TimerDesk` keeps the rings by helper, each with a number that it counts up. A new finish on the same helper replaces its ring, so the task of the old ring stops at its next check. When the ring task ends, it removes its ring, only when the ring of the helper still has its number.
+- The conversation use case runs the ring task, because it holds the pools, the random source, the backfill and the announce queues. `TimerDesk::run(events, ring)` gives each new ring and its helper to the function `ring`. `Conversation::run_timers(events)` runs it with a function that spawns the ring task. `run` (sub-phase 19.9c) starts `run_timers` with the receiver of the timer inputs after it makes the conversation use case. Until then, the receiver keeps the inputs in their order.
 - During a local training run, Jarvis releases its TTS (sub-phase 13.10e). An announce then fails, and Jarvis logs it. The next ring tries again. A restart of Jarvis ends each ring, because the rings are not saved.
-- The later stop and mute phase replaces the check of `route` with its general "stop". Its "stop" calls `TimerDesk::stop` for the satellite, so a ring stays one of the things that "stop" ends.
+- `FakeHome` records the virtual time of each announce.
 
 **Acceptance criteria.**
 
 - AC-19.10-1: When the Kitchen satellite set "chicken" and the receiver gets `TimerEnded` with `Finished` for its helper, `FakeHome` records the announce "Your chicken timer is done." on the Kitchen satellite, then the same announce 15 s of virtual time after the start of the one before, 8 in total, and no announce 120 s or more after the event. When the Kitchen satellite is not idle from 100 s to 130 s, `FakeHome` records no announce after 100 s.
 - AC-19.10-2: When the timer is generic, the announce is "Your timer is done." When the timer was in `FakeTimerStore` at the start of the `TimerDesk`, the announce is on its satellite.
-- AC-19.10-3: When the user says "stop" on the Kitchen satellite after the second announce, `handle` returns empty text, the interaction log gets no record, and `FakeHome` records no further announce.
-- AC-19.10-4: When the user says "stop" on the Office satellite, the announces on the Kitchen satellite continue.
-- AC-19.10-5: When the user makes another request on the Kitchen satellite during the ring, the request gets its normal reply, and the next ring is announced.
-- AC-19.10-6: When the user says "cancel the chicken timer" on the Office satellite while a ring waits in the queue of the Kitchen satellite, the reply is "I cancelled the chicken timer.", and `FakeHome` records no `timer.cancel` and no further announce.
-- AC-19.10-7: When the timer has no satellite, or the event is `Cancelled`, `FakeHome` records no announce.
-- AC-19.10-8: When no ring runs, "stop" with an open dialog gives the reply from `cancelled` (AC-10.5-4).
-- AC-19.10-9: When a new timer on the same helper finishes during a ring, `FakeHome` records each later announce only once for each 15 s, with the text of the new timer.
+- AC-19.10-3: When the user makes another request on the Kitchen satellite during the ring, the request gets its normal reply, and the next ring is announced.
+- AC-19.10-4: When the timer has no satellite, or the event is `Cancelled`, `FakeHome` records no announce.
+- AC-19.10-5: When a new timer on the same helper finishes during a ring, `FakeHome` records each later announce only once for each 15 s, with the text of the new timer.
 
 **Proofs.**
 
 - P-19.10-1. Requires: `RingsBounded` (P-19.1-2), `AnnounceWhenIdle` (P-4.7-2). Argument: the ring task loops `RINGS` times at most, and each ring goes through the announce queue. The `speak` future announces only before the event plus `RING_FOR`, and `queued` runs it last, so no announce starts at or after 120 s.
-- P-19.10-3, P-19.10-6. Requires: `NoRingAfterStop` (P-19.1-2). Argument: `route` calls `stop`, and `TimerDesk::decide` removes the ring of a `Silence` plan, before they return. The `speak` future of each ring checks its ring after every wait of `queued`, just before `Home::announce`.
-- P-19.10-4. Argument: `stop` removes only the rings of the satellite of the request.
-- P-19.10-7. Argument: `run` starts a ring only in the `Finished` arm, and only for an entry with a satellite.
-- P-19.10-9. Argument: the check compares the number of the ring, and the new finish gave the helper a new number.
-- P-19.10-2, P-19.10-5, P-19.10-8. Evidence: test.
+- P-19.10-4. Argument: `run` starts a ring only in the `Finished` arm, and only for an entry with a satellite.
+- P-19.10-5. Argument: the check compares the number of the ring, and the new finish gave the helper a new number.
+- P-19.10-2, P-19.10-3. Evidence: test.
+
+---
+
+### 19.10b Timer Stop
+
+**Goal:** Stop the ring of a timer when the user says "stop" on the satellite that rings, or cancels that timer by name on any satellite.
+
+- **Implements:** G25. **Depends on:** 19.10.
+- **Files:** modify `src/domain/timers.rs`, `src/app/timers.rs`, `src/app/conversation.rs`, `README.md` ("stop" and the cancel of a ringing timer, `CLAUDE.md` workflow item 15).
+- **Quint:** `timers.qnt` (the rules of `stop` and `silence`).
+
+**Model.**
+
+- `TimerDesk::stop(satellite) -> bool` removes each ring of the satellite, and gives true when it removed one. `TimerDesk::ringing() -> bool` gives true while a ring exists. The check of the ring task (sub-phase 19.10) then fails, so a "stop" or a cancel by name drops a ring that already waits in the queue.
+- `Conversation::route` checks the ring first (sub-phase 10.5, before step 1). When the request has a satellite, `is_cancel(text, dialog.cancel)` is true (sub-phase 10.3), and `stop` of the satellite gives true, `handle` returns empty text. Jarvis records no interaction for it, as for a cancel. `handle` takes the open dialog before `route` (sub-phase 16.1b), so this "stop" also closes the dialog of the satellite. "Stop" is a phrase of `dialog.cancel`. "Stop" on another satellite does not stop the ring. Without a ring, "stop" is routed as before.
+- `plan` (sub-phase 19.4c) also gets the timers of the rings. `Cancel` with a name first matches the labels of the ringing timers with `fill`. A match gives `Silence { helper, timer }`, before the candidates of the table. `answer` gives `Reply` from the pool of the intent with no call. `TimerDesk::decide` then removes the ring of `helper`. A ringing timer is no longer in HA, so it needs no call. This applies on any satellite.
+- The later stop and mute phase replaces the check of `route` with its general "stop". Its "stop" calls `TimerDesk::stop` for the satellite, so a ring stays one of the things that "stop" ends.
+
+**Acceptance criteria.**
+
+- AC-19.10b-1: When the user says "stop" on the Kitchen satellite after the second announce, `handle` returns empty text, the interaction log gets no record, and `FakeHome` records no further announce.
+- AC-19.10b-2: When the user says "stop" on the Office satellite, the announces on the Kitchen satellite continue.
+- AC-19.10b-3: When the user says "cancel the chicken timer" on the Office satellite while a ring waits in the queue of the Kitchen satellite, the reply is "I cancelled the chicken timer.", and `FakeHome` records no `timer.cancel` and no further announce.
+- AC-19.10b-4: When no ring runs, "stop" with an open dialog gives the reply from `cancelled` (AC-10.5-4).
+
+**Proofs.**
+
+- P-19.10b-1, P-19.10b-3. Requires: `NoRingAfterStop` (P-19.1-2). Argument: `route` calls `stop`, and `TimerDesk::decide` removes the ring of a `Silence` plan, before they return. The `speak` future of each ring checks its ring after every wait of `queued`, just before `Home::announce`.
+- P-19.10b-2. Argument: `stop` removes only the rings of the satellite of the request.
+- P-19.10b-4. Evidence: test.
 
 ---
 
@@ -592,7 +615,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 **Goal:** Let "stop" on a ringing satellite use the early commit wait. The ring then stops 100 ms after the word, not 600 ms.
 
-- **Implements:** G1, G25. **Depends on:** 19.10.
+- **Implements:** G1, G25. **Depends on:** 19.10b.
 - **Files:** modify `src/app/speech.rs`, `src/lib.rs`.
 - **Quint:** `commit.qnt` (unchanged: `confident` is abstract).
 
