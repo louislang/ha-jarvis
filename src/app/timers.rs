@@ -1,5 +1,6 @@
 //! The timer use case: the timer table, its store and the timer helpers of HA.
 
+use std::collections::BTreeMap;
 use std::mem;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -11,9 +12,11 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::domain::decide::Decision;
 use crate::domain::responses::Pools;
 use crate::domain::state::Event;
+use crate::domain::state::State;
 use crate::domain::state_cache::StateCache;
 use crate::domain::timers;
 use crate::domain::timers::Plan;
+use crate::domain::timers::TimerAction;
 use crate::domain::timers::TimerInput;
 use crate::domain::timers::TimerRequest;
 use crate::domain::timers::Timers;
@@ -25,6 +28,8 @@ struct Desk {
     timers: Timers,
     /// The timer helper states, in the order of HA.
     view: StateCache,
+    /// The run count of each helper: the new runs that the view showed.
+    runs: BTreeMap<String, u64>,
 }
 
 impl Desk {
@@ -34,17 +39,9 @@ impl Desk {
             TimerInput::Event(Event::TimerEnded { entity_id, .. }) => {
                 timers::ended(self.timers.clone(), &entity_id).1
             }
-            TimerInput::Event(event) => {
-                let Event::StateChanged { entity_id, .. } = &event else {
-                    return self.timers.clone();
-                };
-                let helper = entity_id.clone();
-                self.view = mem::take(&mut self.view).apply(event);
-                let table = self.timers.clone();
-                let state = self.view.state(&helper);
-                state.map_or(table.clone(), |state| timers::running(table, state))
-            }
+            TimerInput::Event(event) => self.changed(event),
             TimerInput::Snapshot(states) => {
+                self.count(&states);
                 let states = states
                     .into_iter()
                     .map(|state| (Arc::from(state.entity_id.as_str()), Arc::new(state)));
@@ -56,6 +53,45 @@ impl Desk {
             }
         }
     }
+
+    /// The table after the state change `event` of a helper, which also changes the view and
+    /// counts a new run of the helper.
+    fn changed(&mut self, event: Event) -> Timers {
+        let Event::StateChanged { entity_id, .. } = &event else {
+            return self.timers.clone();
+        };
+        let helper = entity_id.clone();
+        let old = self.view.state(&helper).cloned();
+        self.view = mem::take(&mut self.view).apply(event);
+        let table = self.timers.clone();
+        let Some(state) = self.view.state(&helper) else {
+            return table;
+        };
+        if is_new_run(old.as_ref(), state) {
+            *self.runs.entry(helper).or_default() += 1;
+        }
+        timers::running(table, state)
+    }
+
+    /// Counts a new run of each helper of the snapshot `states` that starts a new run, or whose
+    /// `last_updated` differs from the view.
+    fn count(&mut self, states: &[State]) {
+        for state in states {
+            let old = self.view.state(&state.entity_id);
+            // A snapshot cannot show continuity, so each change of the helper is a new run.
+            let moved = old.is_none_or(|old| old.last_updated != state.last_updated);
+            if moved || is_new_run(old, state) {
+                *self.runs.entry(state.entity_id.clone()).or_default() += 1;
+            }
+        }
+    }
+}
+
+/// True when `new` starts a new run of a helper whose state was `old`: `old` is not `active` or
+/// `paused`, and `new` is.
+fn is_new_run(old: Option<&State>, new: &State) -> bool {
+    let running = |state: &State| matches!(state.state.as_str(), "active" | "paused");
+    running(new) && !old.is_some_and(running)
 }
 
 /// Plans the timer requests on the timer table, keeps the table in its store and follows the
@@ -81,6 +117,7 @@ impl TimerDesk {
             desk: tokio::sync::Mutex::new(Desk {
                 timers: timers::restored(&loaded),
                 view: StateCache::default(),
+                runs: BTreeMap::new(),
             }),
             store,
             similarity,
@@ -88,8 +125,9 @@ impl TimerDesk {
     }
 
     /// The decision for `request` from `satellite` at `now`, with a response of `pools` that `rng`
-    /// selects, and the guard of the start call of a new entry. Plans on the view and keeps the
-    /// new table under the lock, so two requests cannot take the same helper.
+    /// selects, and the guard of its call: the start call of a new entry, or the call of an `Act`
+    /// with the run count of its helper. Plans on the view and keeps the new table under the lock,
+    /// so two requests cannot take the same helper.
     ///
     /// # Panics
     ///
@@ -107,17 +145,35 @@ impl TimerDesk {
         let (plan, table) =
             timers::plan(request, timers, &desk.view, now, satellite, self.similarity);
         self.keep(&mut desk, table).await;
-        let guard = match &plan {
-            Plan::Start { helper, .. } => Some(Guard {
+        let guard = self.guard(&plan, request.action, order, &desk);
+        let rng = &mut rng.lock().expect("no lock holder panics");
+        (timers::answer(&plan, request, pools, rng), guard)
+    }
+
+    /// The guard of the call of `plan` for `action`: of the start call of the entry with `order`,
+    /// or of an `Act` with the run count of its helper in `desk`.
+    fn guard(
+        self: &Arc<Self>,
+        plan: &Plan,
+        action: TimerAction,
+        order: u64,
+        desk: &Desk,
+    ) -> Option<Guard> {
+        match plan {
+            Plan::Start { helper, .. } => Some(Guard::Start(StartGuard {
                 desk: Arc::clone(self),
                 helper: helper.clone(),
                 order,
                 armed: true,
+            })),
+            Plan::Act { helper, .. } => Some(Guard::Act {
+                desk: Arc::clone(self),
+                helper: helper.clone(),
+                action,
+                run: desk.runs.get(helper).copied(),
             }),
             _ => None,
-        };
-        let rng = &mut rng.lock().expect("no lock holder panics");
-        (timers::answer(&plan, request, pools, rng), guard)
+        }
     }
 
     /// Removes the entry of `helper` while it starts and has `order`: its start call failed.
@@ -148,9 +204,58 @@ impl TimerDesk {
     }
 }
 
+/// The call of a timer decision.
+pub enum Guard {
+    /// The start call of a new entry.
+    Start(StartGuard),
+    /// The call of an `Act` on the run of its helper.
+    Act {
+        /// The desk of the helper.
+        desk: Arc<TimerDesk>,
+        /// The helper of the call.
+        helper: String,
+        /// The action of the call.
+        action: TimerAction,
+        /// The run count of the helper in the view at the decision.
+        run: Option<u64>,
+    },
+}
+
+impl Guard {
+    /// The result of `call`, which makes the call of the decision. A start call ends its guard.
+    /// An `Act` makes `call` under the lock of the desk, and only while the view shows the helper
+    /// in the same run and in a state that the action acts on. Else it makes no call.
+    ///
+    /// # Errors
+    ///
+    /// `call` fails.
+    pub async fn made(self, call: impl Future<Output = anyhow::Result<()>>) -> anyhow::Result<()> {
+        match self {
+            Self::Start(start) => {
+                let made = call.await;
+                start.ended(made.is_ok()).await;
+                made
+            }
+            Self::Act {
+                desk,
+                helper,
+                action,
+                run,
+            } => {
+                let held = desk.desk.lock().await;
+                let same = held.runs.get(&helper).copied() == run;
+                if !same || !timers::fits(action, &held.view, &helper) {
+                    return Ok(());
+                }
+                call.await
+            }
+        }
+    }
+}
+
 /// The start call of a new entry. A failed call, or a drop before the call ends, forgets the
 /// entry, so that its helper and its name become free.
-pub struct Guard {
+pub struct StartGuard {
     /// The desk of the entry.
     desk: Arc<TimerDesk>,
     /// The helper of the entry.
@@ -161,10 +266,10 @@ pub struct Guard {
     armed: bool,
 }
 
-impl Guard {
+impl StartGuard {
     /// Ends the guard after the call, and forgets the entry when the call failed (`made` false).
     /// The guard stays armed until `forget` ends, so a drop while it waits still forgets.
-    pub async fn ended(mut self, made: bool) {
+    async fn ended(mut self, made: bool) {
         if !made {
             self.desk.forget(&self.helper, self.order).await;
         }
@@ -172,7 +277,7 @@ impl Guard {
     }
 }
 
-impl Drop for Guard {
+impl Drop for StartGuard {
     /// Forgets the entry in a new task when the call did not end.
     fn drop(&mut self) {
         if !self.armed {
@@ -194,7 +299,6 @@ mod tests {
     use crate::domain::state::ServiceCall;
     use crate::domain::state::TimerEnd;
     use crate::domain::timers::Timer;
-    use crate::domain::timers::TimerAction;
     use crate::testing::fakes::FakeTimerStore;
     use crate::testing::fakes::timer_state;
 
@@ -246,7 +350,7 @@ mod tests {
         ) -> (String, Option<ServiceCall>) {
             let (decision, guard) = self.decide((intent, action), name, satellite).await;
             if let Some(guard) = guard {
-                guard.ended(true).await;
+                guard.made(async { Ok(()) }).await.expect("no call fails");
             }
             let Decision::Reply { reply, call } = decision else {
                 panic!("not a reply");
@@ -275,6 +379,20 @@ mod tests {
             self.desk
                 .decide(&request, satellite, now, &pools, &rng)
                 .await
+        }
+
+        /// A new desk whose view shows "chicken" `active` on `timer.jarvis_1`.
+        async fn running() -> Self {
+            let fixture = Self::free().await;
+            fixture.set("chicken").await;
+            fixture.feed(vec![changed(J1, "active")]).await;
+            fixture
+        }
+
+        /// The guard of the call of the request `intent` with `action` for "chicken".
+        async fn waiting(&self, request: (&str, TimerAction)) -> Guard {
+            let (_, guard) = self.decide(request, Some("chicken"), KITCHEN).await;
+            guard.expect("a guard of the call")
         }
 
         /// The reply to `timer_set` for `name` from the Kitchen satellite.
@@ -343,12 +461,23 @@ mod tests {
         TimerInput::Snapshot(states.collect())
     }
 
-    /// The `Cancelled` end of `timer.jarvis_1`.
-    fn cancelled() -> TimerInput {
+    /// The end `end` of `timer.jarvis_1`.
+    fn ended(end: TimerEnd) -> TimerInput {
         TimerInput::Event(Event::TimerEnded {
             entity_id: J1.to_owned(),
-            end: TimerEnd::Cancelled,
+            end,
         })
+    }
+
+    /// True when `guard` makes its call.
+    async fn calls(guard: Guard) -> bool {
+        let mut called = false;
+        let call = async {
+            called = true;
+            Ok(())
+        };
+        guard.made(call).await.expect("no call fails");
+        called
     }
 
     /// AC-19.9b-1.
@@ -358,7 +487,9 @@ mod tests {
         fixture.set("chicken").await;
         fixture.feed(vec![changed(J1, "active")]).await;
         assert_eq!(fixture.saved(J1), Some(entry("chicken", 0, false)));
-        fixture.feed(vec![changed(J1, "idle"), cancelled()]).await;
+        fixture
+            .feed(vec![changed(J1, "idle"), ended(TimerEnd::Cancelled)])
+            .await;
         let reply = fixture.left(Some("chicken"), KITCHEN).await;
         assert_eq!(reply, "There is no chicken timer.");
         assert_eq!(fixture.saved(J1), None);
@@ -414,7 +545,7 @@ mod tests {
         fixture.feed(vec![changed(J1, "idle")]).await;
         let (_, call) = fixture.set("pasta").await;
         assert_eq!(call.map(|call| call.target), Some(vec![J1.to_owned()]));
-        fixture.feed(vec![cancelled()]).await;
+        fixture.feed(vec![ended(TimerEnd::Cancelled)]).await;
         assert_eq!(fixture.saved(J1), Some(entry("pasta", 1, true)));
         fixture.feed(vec![changed(J1, "active")]).await;
         let reply = fixture.left(Some("pasta"), KITCHEN).await;
@@ -461,11 +592,64 @@ mod tests {
         let set = ("timer_set", TimerAction::Set);
         let (_, guard) = fixture.decide(set, Some("chicken"), KITCHEN).await;
         let held = fixture.desk.desk.lock().await;
-        let cleanup = tokio::spawn(guard.expect("a start guard").ended(false));
+        let failed = async { Err(anyhow::anyhow!("the call failed")) };
+        let cleanup = tokio::spawn(guard.expect("a start guard").made(failed));
         tokio::task::yield_now().await;
         cleanup.abort();
         drop(held);
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         assert_eq!(fixture.saved(J1), None);
+    }
+
+    /// AC-19.9d-2: a waiting call skips a new run of its helper, from Jarvis or from HA.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9d_2_waiting_call_skips_a_new_run() {
+        let pause = ("timer_pause", TimerAction::Pause);
+        let cancel = ("timer_cancel", TimerAction::Cancel);
+        let fixture = Fixture::running().await;
+        let guard = fixture.waiting(pause).await;
+        let end = vec![changed(J1, "idle"), ended(TimerEnd::Finished)];
+        fixture.feed(end).await;
+        let set = ("timer_set", TimerAction::Set);
+        fixture
+            .ask(set, Some("pasta"), "assist_satellite.office")
+            .await;
+        fixture.feed(vec![changed(J1, "active")]).await;
+        assert!(!calls(guard).await, "a pause of the new timer");
+        let fixture = Fixture::running().await;
+        let guard = fixture.waiting(cancel).await;
+        let restart = vec![changed(J1, "idle"), changed(J1, "active")];
+        fixture.feed(restart).await;
+        assert!(!calls(guard).await, "a cancel of the timer from HA");
+    }
+
+    /// AC-19.9d-2: a waiting cancel acts on its own run, also after a pause in HA.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9d_2_waiting_cancel_acts_on_its_run() {
+        let cancel = ("timer_cancel", TimerAction::Cancel);
+        let fixture = Fixture::running().await;
+        let guard = fixture.waiting(cancel).await;
+        fixture.feed(vec![changed(J1, "paused")]).await;
+        assert!(calls(guard).await, "no cancel of the paused timer");
+        let guard = Fixture::running().await.waiting(cancel).await;
+        assert!(calls(guard).await, "no cancel");
+    }
+
+    /// AC-19.9d-2: a snapshot with another `last_updated` of the helper is a new run.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9d_2_reconnect_restart_is_a_new_run() {
+        let cancel = ("timer_cancel", TimerAction::Cancel);
+        let fixture = Fixture::running().await;
+        let guard = fixture.waiting(cancel).await;
+        let mut restarted = timer_state(J1, "active");
+        restarted.last_updated = "2026-11-22T12:03:00Z".parse().expect("a timestamp");
+        fixture
+            .feed(vec![TimerInput::Snapshot(vec![restarted])])
+            .await;
+        assert!(!calls(guard).await, "a cancel of the new timer");
+        let fixture = Fixture::running().await;
+        let guard = fixture.waiting(cancel).await;
+        fixture.feed(vec![snapshot(&[(J1, "active")])]).await;
+        assert!(calls(guard).await, "no cancel after the same snapshot");
     }
 }

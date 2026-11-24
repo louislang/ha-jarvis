@@ -183,6 +183,7 @@ flowchart LR
     crate_app_conversation --> crate_domain_speech
     crate_app_conversation --> crate_domain_state
     crate_app_conversation --> crate_domain_state_cache
+    crate_app_conversation --> crate_domain_timers
     crate_app_conversation --> crate_domain_training
     crate_app_conversation --> crate_ports
     crate_app_plugins --> crate

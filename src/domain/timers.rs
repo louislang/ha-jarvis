@@ -578,7 +578,8 @@ fn matching(action: TimerAction, timers: &Timers, cache: &StateCache) -> Vec<Can
     ensures
         found == in_state(*cache, helper@, action),
 )]
-fn fits(action: TimerAction, cache: &StateCache, helper: &str) -> bool {
+#[must_use]
+pub fn fits(action: TimerAction, cache: &StateCache, helper: &str) -> bool {
     let Some(state) = cache.states.get(helper) else {
         return false;
     };

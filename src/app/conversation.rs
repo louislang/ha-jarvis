@@ -78,6 +78,7 @@ use crate::domain::state::EntityId;
 use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
+use crate::domain::timers;
 use crate::domain::training;
 use crate::ports::Clock;
 use crate::ports::Context;
@@ -504,7 +505,7 @@ impl Conversation {
     }
 
     /// The decision for `prediction` of `request` (`started`), with a `Timer` as the decision of
-    /// the timer desk for the satellite of `heard` at its time, and the guard of its start call.
+    /// the timer desk for the satellite of `heard` at its time, and the guard of its call.
     async fn timed(
         &self,
         prediction: &Prediction,
@@ -695,8 +696,9 @@ impl Conversation {
     }
 
     /// The intent of the `Slot` dialog `dialog` with probability 1 and the value that `text` fills
-    /// in place of the missing slot, and the transcript of the dialog with "in" and the value. `None`
-    /// when the dialog has no choices or no choice fits.
+    /// in place of the missing slot, and the transcript of the dialog with "in" and the value. A
+    /// `duration` dialog takes the normalized `text` when `timers::duration` reads it. `None` when
+    /// the dialog has no choices or no choice fits.
     fn filled(&self, dialog: &Dialog, text: &str) -> Option<(Prediction, String)> {
         let Pending::Slot {
             intent,
@@ -709,7 +711,11 @@ impl Conversation {
             return None;
         };
         let similarity = self.queues.dialog.choice_similarity;
-        let value = dialog::fill(text, choices, similarity).filter(|_| !choices.is_empty())?;
+        let value = if missing == "duration" {
+            Some(intent::normalize(text)).filter(|value| timers::duration(value).is_some())
+        } else {
+            dialog::fill(text, choices, similarity).filter(|_| !choices.is_empty())
+        }?;
         let transcript = format!("{transcript} in {value}");
         let kept = slots.iter().filter(|slot| &slot.name != missing).cloned();
         let filled = Slot {
@@ -723,9 +729,9 @@ impl Conversation {
         Some((prediction, transcript))
     }
 
-    /// `dialog` of `key` with one more question from `ask_area` on the satellite of `heard` at its
-    /// time, in its queue with the generation of `heard`, or a `failure` answer at the turn limit.
-    /// Also its record with `prediction`.
+    /// `dialog` of `key` with its question again (`asked_again`) on the satellite of `heard` at its
+    /// time, in its queue with the generation of `heard`, or a `failure` answer at the turn limit
+    /// or when the question does not render. Also its record with `prediction`.
     fn ask_again(
         &self,
         prediction: Prediction,
@@ -734,18 +740,28 @@ impl Conversation {
         heard: &Heard,
     ) -> Answered {
         let max_turns = self.queues.dialog.max_turns;
-        let Some(next) = dialog::next_turn(dialog, max_turns, heard.time) else {
+        let next = dialog::next_turn(dialog, max_turns, heard.time);
+        let question = next.as_ref().and_then(|next| self.again(&next.pending));
+        let (Some(next), Some(question)) = (next, question) else {
             return said(prediction, Route::Reply, self.failure(), None);
         };
         let generation = heard.origin.as_ref().map(|origin| origin.generation);
         self.queues.put(key, next, heard.link, generation);
         let request = heard.origin.clone();
-        let question = self.chosen("ask_area");
         let response = self.spoken(question.clone());
         let (question, after) = self.ask(question, request);
         let (mut handled, logged) = said(prediction, Route::Ask, response, after);
         handled.text = question.text;
         (handled, logged)
+    }
+
+    /// The question again of the dialog that waits for `pending` (`asked_again`), or `None` when it
+    /// does not render.
+    fn again(&self, pending: &Pending) -> Option<Chosen> {
+        let (pool, context) = asked_again(pending);
+        let mut question = self.chosen(pool);
+        question.text = responses::render(&question.text, &context).ok()?;
+        Some(question)
     }
 
     /// The ID and the name of the area of the device `device` in the hot cache.
@@ -847,7 +863,7 @@ impl Conversation {
     }
 
     /// The dispatch of `decision` of `heard` from `area` on its satellite, with the guard of its
-    /// start call. Without a satellite, the answer of a deferred job, whose question opens a dialog
+    /// call. Without a satellite, the answer of a deferred job, whose question opens a dialog
     /// for `key`, or a `failure` answer when the job fails, and that answer as a response.
     async fn reply(
         &self,
@@ -980,7 +996,7 @@ impl Conversation {
     }
 
     /// Plays the title of the kind `kind` of `call` through Plezy (`watch`), or makes the calls
-    /// of `resolve` of `call` with `search` in order. Then ends `guard`. When one fails, makes no
+    /// of `resolve` of `call` with `search` in order, through `guard`. When one fails, makes no
     /// more calls, logs the error, queues a `failure` answer on the satellite of `request` with the
     /// generation of `request`, and records its use.
     fn after(
@@ -992,15 +1008,18 @@ impl Conversation {
     ) -> Work {
         let conversation = self.clone();
         async move {
-            let made = if let Some(kind) = kind {
-                conversation.watch(call, &kind).await
-            } else {
-                let calls = conversation.resolve(call, search).await;
-                conversation.make(calls).await
+            let work = async {
+                if let Some(kind) = kind {
+                    conversation.watch(call, &kind).await
+                } else {
+                    let calls = conversation.resolve(call, search).await;
+                    conversation.make(calls).await
+                }
             };
-            if let Some(guard) = guard {
-                guard.ended(made.is_ok()).await;
-            }
+            let made = match guard {
+                Some(guard) => guard.made(work).await,
+                None => work.await,
+            };
             let Err(error) = made else {
                 return Ok(());
             };
@@ -1812,6 +1831,28 @@ fn said(prediction: Prediction, route: Route, response: Spoken, after: Option<Wo
         response,
     };
     (Handled { text, after }, Some((prediction, decided)))
+}
+
+/// The pool and the template context of the question again of a dialog that waits for `pending`:
+/// `ask_duration` for the duration, `ask_timer` with each choice as the `timer` of an item of
+/// `timers` for the timer, else `ask_area`.
+fn asked_again(pending: &Pending) -> (&'static str, Map<String, Value>) {
+    let mut context = Map::new();
+    match pending {
+        Pending::Slot { missing, .. } if missing == "duration" => ("ask_duration", context),
+        Pending::Slot {
+            missing, choices, ..
+        } if missing == "timer" => {
+            let timers = choices.iter().map(|choice| {
+                let mut item = Map::new();
+                item.insert("timer".to_owned(), Value::from(choice.as_str()));
+                Value::from(item)
+            });
+            context.insert("timers".to_owned(), Value::from_iter(timers));
+            ("ask_timer", context)
+        }
+        _ => ("ask_area", context),
+    }
 }
 
 /// The parts of the record of a request that its decision gives.
@@ -5898,10 +5939,12 @@ mod tests {
         let (conversation, store) = timing(&home, requests, &[(J1, "chicken")], "active").await;
         let gate = home.delay();
         let (_, pause) = timed(&conversation, "pause the timer").await?;
+        // The pause call holds the desk, so the new timer waits for its failure.
         let new = async {
+            tokio::task::yield_now().await;
+            drop(gate);
             feed(&conversation, vec![finished(), shown("idle")]).await;
             timed(&conversation, "set a timer").await?.1.await?;
-            drop(gate);
             anyhow::Ok(())
         };
         tokio::join!(pause, new).1?;
@@ -5957,6 +6000,42 @@ mod tests {
         assert_eq!(text, "Your chicken timer is set for five minutes.");
         after.await?;
         assert_eq!(home.calls(), [start_call()]);
+        Ok(())
+    }
+
+    /// AC-19.9d-1: the answer to "For how long?" fills the duration.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9d_1_duration_answer_sets_the_timer() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let set = predicted("timer_set", 0.9, ("timer", "chicken"));
+        let unclear = predicted("unknown", 0.9, ("timer", ""));
+        let (conversation, _) = timing(&home, vec![set, unclear], &[], "idle").await;
+        for text in ["set a timer for the chicken", "soon"] {
+            timed(&conversation, text).await?.1.await?;
+        }
+        assert_eq!(asks(&home), ["For how long?", "For how long?"]);
+        let (text, after) = timed(&conversation, "ten minutes").await?;
+        assert_eq!(text, "Your chicken timer is set for ten minutes.");
+        after.await?;
+        let mut start = start_call();
+        start.data.insert("duration".to_owned(), json!(600));
+        assert_eq!(home.calls().last(), Some(&start));
+        Ok(())
+    }
+
+    /// AC-19.9d-1: an unclear answer to "Which timer" asks the same question again.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9d_1_which_timer_asks_again() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let entries = [(J1, "chicken"), ("timer.jarvis_2", "pizza")];
+        let cancel = predicted("timer_cancel", 0.9, ("timer", ""));
+        let unclear = predicted("unknown", 0.9, ("timer", ""));
+        let (conversation, _) = timing(&home, vec![cancel, unclear], &entries, "active").await;
+        for text in ["cancel that timer", "soon"] {
+            timed(&conversation, text).await?.1.await?;
+        }
+        let question = "Which timer, the chicken timer or the pizza timer?";
+        assert_eq!(asks(&home), [question, question]);
         Ok(())
     }
 }
