@@ -13,6 +13,7 @@ use crate::domain::responses::Pools;
 use crate::domain::state::Event;
 use crate::domain::state_cache::StateCache;
 use crate::domain::timers;
+use crate::domain::timers::Plan;
 use crate::domain::timers::TimerInput;
 use crate::domain::timers::TimerRequest;
 use crate::domain::timers::Timers;
@@ -87,27 +88,43 @@ impl TimerDesk {
     }
 
     /// The decision for `request` from `satellite` at `now`, with a response of `pools` that `rng`
-    /// selects. Plans on the view and keeps the new table under the lock, so two requests cannot
-    /// take the same helper.
+    /// selects, and the guard of the start call of a new entry. Plans on the view and keeps the
+    /// new table under the lock, so two requests cannot take the same helper.
     ///
     /// # Panics
     ///
     /// A holder of the lock of `rng` panicked.
     pub async fn decide(
-        &self,
+        self: &Arc<Self>,
         request: &TimerRequest,
         satellite: Option<String>,
         now: Timestamp,
         pools: &Pools,
         rng: &Mutex<StdRng>,
-    ) -> Decision {
+    ) -> (Decision, Option<Guard>) {
         let mut desk = self.desk.lock().await;
-        let timers = desk.timers.clone();
+        let (timers, order) = (desk.timers.clone(), desk.timers.next);
         let (plan, table) =
             timers::plan(request, timers, &desk.view, now, satellite, self.similarity);
         self.keep(&mut desk, table).await;
+        let guard = match &plan {
+            Plan::Start { helper, .. } => Some(Guard {
+                desk: Arc::clone(self),
+                helper: helper.clone(),
+                order,
+                armed: true,
+            }),
+            _ => None,
+        };
         let rng = &mut rng.lock().expect("no lock holder panics");
-        timers::answer(&plan, request, pools, rng)
+        (timers::answer(&plan, request, pools, rng), guard)
+    }
+
+    /// Removes the entry of `helper` while it starts and has `order`: its start call failed.
+    async fn forget(&self, helper: &str, order: u64) {
+        let mut desk = self.desk.lock().await;
+        let table = timers::forget(desk.timers.clone(), helper, order);
+        self.keep(&mut desk, table).await;
     }
 
     /// Applies each input of `events` to the view and the table, until the sender drops.
@@ -128,6 +145,42 @@ impl TimerDesk {
         if let Err(error) = self.store.save(&desk.timers).await {
             tracing::warn!("the timer table did not save: {error:#}");
         }
+    }
+}
+
+/// The start call of a new entry. A failed call, or a drop before the call ends, forgets the
+/// entry, so that its helper and its name become free.
+pub struct Guard {
+    /// The desk of the entry.
+    desk: Arc<TimerDesk>,
+    /// The helper of the entry.
+    helper: String,
+    /// The order of the entry.
+    order: u64,
+    /// True until the call ends.
+    armed: bool,
+}
+
+impl Guard {
+    /// Ends the guard after the call, and forgets the entry when the call failed (`made` false).
+    /// The guard stays armed until `forget` ends, so a drop while it waits still forgets.
+    pub async fn ended(mut self, made: bool) {
+        if !made {
+            self.desk.forget(&self.helper, self.order).await;
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for Guard {
+    /// Forgets the entry in a new task when the call did not end.
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (desk, order) = (Arc::clone(&self.desk), self.order);
+        let helper = mem::take(&mut self.helper);
+        tokio::spawn(async move { desk.forget(&helper, order).await });
     }
 }
 
@@ -157,7 +210,7 @@ mod tests {
     /// A desk on a `FakeTimerStore`.
     struct Fixture {
         /// The desk.
-        desk: TimerDesk,
+        desk: Arc<TimerDesk>,
         /// The store of the desk.
         store: Arc<FakeTimerStore>,
     }
@@ -171,7 +224,7 @@ mod tests {
                 saved.timers.insert((*helper).to_owned(), timer.clone());
             }
             Self {
-                desk: TimerDesk::new(Arc::clone(&store) as _, 0.85).await,
+                desk: Arc::new(TimerDesk::new(Arc::clone(&store) as _, 0.85).await),
                 store,
             }
         }
@@ -183,15 +236,32 @@ mod tests {
             fixture
         }
 
-        /// The reply from the pools of `responses.toml` and the call of the request `intent` with
-        /// `action` and the `timer` slot `name` from `satellite`, with "five minutes" as the
-        /// duration of a `Set`.
+        /// The reply and the call of the request `intent` with `action` and the `timer` slot
+        /// `name` from `satellite`. A start call is made.
         async fn ask(
             &self,
             (intent, action): (&str, TimerAction),
             name: Option<&str>,
             satellite: &str,
         ) -> (String, Option<ServiceCall>) {
+            let (decision, guard) = self.decide((intent, action), name, satellite).await;
+            if let Some(guard) = guard {
+                guard.ended(true).await;
+            }
+            let Decision::Reply { reply, call } = decision else {
+                panic!("not a reply");
+            };
+            (reply.text, call)
+        }
+
+        /// The decision and the start guard of the request `intent` with `action` and the
+        /// `timer` slot `name` from `satellite`, with "five minutes" as the duration of a `Set`.
+        async fn decide(
+            &self,
+            (intent, action): (&str, TimerAction),
+            name: Option<&str>,
+            satellite: &str,
+        ) -> (Decision, Option<Guard>) {
             let request = TimerRequest {
                 intent: intent.to_owned(),
                 action,
@@ -201,14 +271,10 @@ mod tests {
             };
             let now: Timestamp = "2026-11-22T12:00:00Z".parse().expect("a timestamp");
             let satellite = Some(satellite.to_owned());
-            let catalog = crate::load_catalog(Path::new("intents.toml")).expect("a catalog");
-            let pools = crate::load_pools(Path::new("responses.toml"), &catalog).expect("pools");
-            let rng = Mutex::new(StdRng::seed_from_u64(1));
-            let decision = self.desk.decide(&request, satellite, now, &pools, &rng);
-            let Decision::Reply { reply, call } = decision.await else {
-                panic!("not a reply");
-            };
-            (reply.text, call)
+            let (pools, rng) = (pools(), Mutex::new(StdRng::seed_from_u64(1)));
+            self.desk
+                .decide(&request, satellite, now, &pools, &rng)
+                .await
         }
 
         /// The reply to `timer_set` for `name` from the Kitchen satellite.
@@ -239,6 +305,12 @@ mod tests {
             let saved = self.store.timers.lock().expect("no test panics");
             saved.timers.get(helper).cloned()
         }
+    }
+
+    /// The pools of `responses.toml`.
+    fn pools() -> Pools {
+        let catalog = crate::load_catalog(Path::new("intents.toml")).expect("a catalog");
+        crate::load_pools(Path::new("responses.toml"), &catalog).expect("pools")
     }
 
     /// The entry `name` with the order `order` from the Kitchen satellite.
@@ -380,5 +452,20 @@ mod tests {
         let (reply, call) = fixture.set("chicken").await;
         assert_eq!(reply, "There is already a chicken timer.");
         assert_eq!(call, None);
+    }
+
+    /// AC-19.9e-2: a failed start whose cleanup drops while it waits for the desk frees the entry.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9e_2_dropped_cleanup_frees_the_name() {
+        let fixture = Fixture::free().await;
+        let set = ("timer_set", TimerAction::Set);
+        let (_, guard) = fixture.decide(set, Some("chicken"), KITCHEN).await;
+        let held = fixture.desk.desk.lock().await;
+        let cleanup = tokio::spawn(guard.expect("a start guard").ended(false));
+        tokio::task::yield_now().await;
+        cleanup.abort();
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        assert_eq!(fixture.saved(J1), None);
     }
 }

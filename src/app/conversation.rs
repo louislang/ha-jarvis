@@ -35,6 +35,7 @@ use crate::app::background::Habits;
 use crate::app::plugins::Plugins;
 use crate::app::speech::Committed;
 use crate::app::speech::Utterances;
+use crate::app::timers::Guard;
 use crate::app::timers::TimerDesk;
 use crate::app::training::Trigger;
 use crate::domain::catalog::Catalog;
@@ -480,7 +481,7 @@ impl Conversation {
         heard: &Heard,
         new: bool,
     ) -> (Handled, Decided) {
-        let decision = self.timed(prediction, request, heard).await;
+        let (decision, guard) = self.timed(prediction, request, heard).await;
         let (mut decided, pending) = self.parts(&decision);
         let route = decided.route;
         // Only a spoken request counts. Text from the HA UI has no satellite.
@@ -491,7 +492,7 @@ impl Conversation {
             new && heard.satellite.is_some(),
         );
         let area = request.area.as_ref();
-        let (handled, answer) = self.reply(decision, area, heard, key.clone()).await;
+        let (handled, answer) = self.reply(decision, area, heard, key.clone(), guard).await;
         if let (Some(key), Some(pending)) = (key, pending) {
             self.open(key, pending, heard);
         }
@@ -503,11 +504,16 @@ impl Conversation {
     }
 
     /// The decision for `prediction` of `request` (`started`), with a `Timer` as the decision of
-    /// the timer desk for the satellite of `heard` at its time.
-    async fn timed(&self, prediction: &Prediction, request: &Request, heard: &Heard) -> Decision {
+    /// the timer desk for the satellite of `heard` at its time, and the guard of its start call.
+    async fn timed(
+        &self,
+        prediction: &Prediction,
+        request: &Request,
+        heard: &Heard,
+    ) -> (Decision, Option<Guard>) {
         let decision = self.started(self.decide(prediction, request));
         let Decision::Timer(request) = decision else {
-            return decision;
+            return (decision, None);
         };
         let (satellite, pools) = (heard.satellite.clone(), self.pools.load());
         let timers = &self.timers;
@@ -840,15 +846,16 @@ impl Conversation {
         answers.fresh(name, call, request.area.as_ref(), request.now, fresh_min)
     }
 
-    /// The dispatch of `decision` of `heard` from `area` on its satellite. Without a satellite, the
-    /// answer of a deferred job, whose question opens a dialog for `key`, or a `failure` answer
-    /// when the job fails, and that answer as a response.
+    /// The dispatch of `decision` of `heard` from `area` on its satellite, with the guard of its
+    /// start call. Without a satellite, the answer of a deferred job, whose question opens a dialog
+    /// for `key`, or a `failure` answer when the job fails, and that answer as a response.
     async fn reply(
         &self,
         decision: Decision,
         area: Option<&AreaId>,
         heard: &Heard,
         key: Option<Key>,
+        guard: Option<Guard>,
     ) -> (Handled, Option<Spoken>) {
         let answer = match (decision, heard.satellite.as_deref()) {
             (Decision::Defer { job, .. }, None) => match job {
@@ -861,8 +868,10 @@ impl Conversation {
             },
             (decision, _) => {
                 let (request, address) = (heard.origin.clone(), heard.address.as_deref());
-                let handled = self.dispatch(decision, area, request, heard.first(), address);
-                return (handled, None);
+                return (
+                    self.dispatch(decision, area, request, heard.first(), address, guard),
+                    None,
+                );
             }
         };
         let spoken = self.or_failure(answer);
@@ -874,7 +883,7 @@ impl Conversation {
     /// work, and its fetch, answer or question only with `request`, its satellite and generation.
     /// Records the use of the reply. Later announces go to the record of `request`. A question of
     /// System Two links its answers to the record `first` and gets `address`, the form of address
-    /// of the speaker.
+    /// of the speaker. The call ends `guard`.
     fn dispatch(
         &self,
         decision: Decision,
@@ -882,9 +891,10 @@ impl Conversation {
         request: Option<Origin>,
         first: u64,
         address: Option<&str>,
+        guard: Option<Guard>,
     ) -> Handled {
         let (chosen, after) = match decision {
-            Decision::Reply { reply, call } => self.replied(reply, call, request),
+            Decision::Reply { reply, call } => self.replied(reply, call, request, guard),
             Decision::Defer {
                 filler,
                 job: Job::Fetch { call, pool },
@@ -932,20 +942,21 @@ impl Conversation {
         })
     }
 
-    /// `reply` and the work of `call` for `request`, with a search first when the intent of the
-    /// pool of `reply` has `search`, or a Plezy play when it has `title`.
+    /// `reply` and the work of `call` for `request`, which ends `guard`, with a search first when
+    /// the intent of the pool of `reply` has `search`, or a Plezy play when it has `title`.
     fn replied(
         &self,
         reply: Chosen,
         call: Option<ServiceCall>,
         request: Option<Origin>,
+        guard: Option<Guard>,
     ) -> (Chosen, Option<Work>) {
         let catalog = self.catalog.load();
         let mut intents = catalog.intents.iter();
         let intent = intents.find(|intent| intent.name == reply.pool);
         let search = intent.is_some_and(|intent| intent.search);
         let kind = intent.and_then(|intent| intent.title.clone());
-        let after = call.map(|call| self.after(call, search, kind, request));
+        let after = call.map(|call| self.after(call, (search, kind), request, guard));
         (reply, after)
     }
 
@@ -969,15 +980,15 @@ impl Conversation {
     }
 
     /// Plays the title of the kind `kind` of `call` through Plezy (`watch`), or makes the calls
-    /// of `resolve` of `call` with `search` in order. When one fails, makes no more calls, logs
-    /// the error, queues a `failure` answer on the satellite of `request` with the generation of
-    /// `request`, and records its use.
+    /// of `resolve` of `call` with `search` in order. Then ends `guard`. When one fails, makes no
+    /// more calls, logs the error, queues a `failure` answer on the satellite of `request` with the
+    /// generation of `request`, and records its use.
     fn after(
         &self,
         call: ServiceCall,
-        search: bool,
-        kind: Option<String>,
+        (search, kind): (bool, Option<String>),
         request: Option<Origin>,
+        guard: Option<Guard>,
     ) -> Work {
         let conversation = self.clone();
         async move {
@@ -987,6 +998,9 @@ impl Conversation {
                 let calls = conversation.resolve(call, search).await;
                 conversation.make(calls).await
             };
+            if let Some(guard) = guard {
+                guard.ended(made.is_ok()).await;
+            }
             let Err(error) = made else {
                 return Ok(());
             };
@@ -2558,7 +2572,7 @@ mod tests {
         });
         let (_task, _store, conversation) = start(&home)?;
         let start = Instant::now();
-        let handled = conversation.dispatch(reply(Some(call())), None, None, 0, None);
+        let handled = conversation.dispatch(reply(Some(call())), None, None, 0, None, None);
         assert_eq!(Instant::now(), start, "dispatch waited for the call");
         assert!(handled.after.is_some(), "the call is not in after");
         Ok(())
@@ -2570,7 +2584,7 @@ mod tests {
         let home = Arc::new(FakeHome::default());
         let (_task, _store, conversation) = start(&home)?;
         let after = conversation
-            .dispatch(reply(Some(call())), None, None, 0, None)
+            .dispatch(reply(Some(call())), None, None, 0, None, None)
             .after;
         assert_eq!(home.calls(), [], "a call came before the start");
         after.ok_or_else(|| anyhow::anyhow!("no after"))?.await?;
@@ -2582,7 +2596,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_4_8_3_store_receives_new_use_count() -> anyhow::Result<()> {
         let started = start(&Arc::new(FakeHome::default()))?;
-        let _ = started.2.dispatch(reply(Some(call())), None, None, 0, None);
+        let _ = started
+            .2
+            .dispatch(reply(Some(call())), None, None, 0, None, None);
         let expected = responses::record_use(unused(), "lights_on", 1);
         assert_eq!(last_save(started).await?, expected);
         Ok(())
@@ -2593,7 +2609,7 @@ mod tests {
     async fn ac_4_8_4_reply_without_call_makes_no_call() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
         let (_task, _store, conversation) = start(&home)?;
-        let handled = conversation.dispatch(reply(None), None, None, 0, None);
+        let handled = conversation.dispatch(reply(None), None, None, 0, None, None);
         assert!(handled.after.is_none(), "a reply with no call has work");
         assert_eq!(home.calls(), []);
         Ok(())
@@ -2605,7 +2621,7 @@ mod tests {
         let started = start(&Arc::new(FakeHome::default()))?;
         thread::scope(|scope| {
             for _ in 0..100 {
-                scope.spawn(|| started.2.dispatch(reply(None), None, None, 0, None));
+                scope.spawn(|| started.2.dispatch(reply(None), None, None, 0, None, None));
             }
         });
         let saved = last_save(started).await?;
@@ -2776,7 +2792,7 @@ mod tests {
         satellite: Option<&str>,
     ) -> anyhow::Result<Work> {
         let request = conversation.origin(satellite, 0);
-        let handled = conversation.dispatch(decision, None, request, 0, None);
+        let handled = conversation.dispatch(decision, None, request, 0, None, None);
         handled.after.ok_or_else(|| anyhow::anyhow!("no after"))
     }
 
@@ -2955,7 +2971,7 @@ mod tests {
         let classifier = Arc::<FakeClassifier>::default();
         let (_cache, changes, conversation) =
             still_with(&home, "idle", classifier, Arc::clone(&reasoner));
-        let _ = conversation.dispatch(reply(None), None, None, 0, None);
+        let _ = conversation.dispatch(reply(None), None, None, 0, None, None);
         let _ = changes
             .try_iter()
             .fold(unused(), |pools, change| change(pools));
@@ -5910,6 +5926,37 @@ mod tests {
         };
         tokio::join!(start, new).1?;
         assert_eq!(saved(&store), Some(named("pasta", true)));
+        Ok(())
+    }
+
+    /// AC-19.9e-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9e_1_failed_start_frees_the_name() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let sets = vec![set_timer("chicken"), set_timer("chicken")];
+        let (conversation, _) = timing(&home, sets, &[], "idle").await;
+        drop(home.delay());
+        timed(&conversation, "set a timer").await?.1.await?;
+        assert_eq!(announces(&home).len(), 1, "no failure announce");
+        let (text, after) = timed(&conversation, "set a timer").await?;
+        assert_eq!(text, "Your chicken timer is set for five minutes.");
+        after.await?;
+        assert_eq!(home.calls().last(), Some(&start_call()));
+        Ok(())
+    }
+
+    /// AC-19.9e-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9e_2_dropped_start_frees_the_name() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let sets = vec![set_timer("chicken"), set_timer("chicken")];
+        let (conversation, _) = timing(&home, sets, &[], "idle").await;
+        drop(timed(&conversation, "set a timer").await?);
+        tokio::task::yield_now().await;
+        let (text, after) = timed(&conversation, "set a timer").await?;
+        assert_eq!(text, "Your chicken timer is set for five minutes.");
+        after.await?;
+        assert_eq!(home.calls(), [start_call()]);
         Ok(())
     }
 }
