@@ -1180,6 +1180,7 @@ mod tests {
     use crate::testing::fakes::SetClock;
     use crate::testing::fakes::house;
     use crate::testing::fakes::log_dispatch;
+    use crate::testing::fakes::timer_desk;
 
     /// The entity that the tests change.
     const KITCHEN: &str = "light.kitchen";
@@ -2773,7 +2774,16 @@ mod tests {
         let (catalog, threshold) = (Arc::clone(&activation.catalog), config.model.threshold);
         let habits = Arc::clone(&learner.learning.habits);
         Conversation::new(
-            pools, backfill, queues, classifier, catalog, threshold, two, habits, recorder,
+            pools,
+            backfill,
+            queues,
+            classifier,
+            catalog,
+            threshold,
+            two,
+            habits,
+            recorder,
+            timer_desk(),
         )
     }
 

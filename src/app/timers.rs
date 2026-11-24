@@ -136,16 +136,14 @@ mod tests {
     use std::path::Path;
 
     use rand::SeedableRng;
-    use serde_json::Value;
-    use serde_json::json;
 
     use super::*;
     use crate::domain::state::ServiceCall;
-    use crate::domain::state::State;
     use crate::domain::state::TimerEnd;
     use crate::domain::timers::Timer;
     use crate::domain::timers::TimerAction;
     use crate::testing::fakes::FakeTimerStore;
+    use crate::testing::fakes::timer_state;
 
     /// The Kitchen satellite.
     const KITCHEN: &str = "assist_satellite.kitchen";
@@ -254,21 +252,9 @@ mod tests {
         }
     }
 
-    /// The state `value` of `helper`, with 5 minutes left when it is `active`.
-    fn state(helper: &str, value: &str) -> State {
-        let state: Value = json!({
-            "entity_id": helper,
-            "state": value,
-            "attributes": { "finishes_at": "2026-11-22T12:05:00+00:00" },
-            "last_updated": "2026-11-22T12:00:00Z",
-            "context": { "id": "c1", "user_id": null, "parent_id": null },
-        });
-        serde_json::from_value(state).expect("a helper state")
-    }
-
     /// The state change of `helper` to `value`.
     fn changed(helper: &str, value: &str) -> TimerInput {
-        let new = state(helper, value);
+        let new = timer_state(helper, value);
         TimerInput::Event(Event::StateChanged {
             entity_id: helper.to_owned(),
             old: None,
@@ -279,7 +265,9 @@ mod tests {
 
     /// The snapshot with each helper of `states` in its state.
     fn snapshot(states: &[(&str, &str)]) -> TimerInput {
-        let states = states.iter().map(|(helper, value)| state(helper, value));
+        let states = states
+            .iter()
+            .map(|(helper, value)| timer_state(helper, value));
         TimerInput::Snapshot(states.collect())
     }
 

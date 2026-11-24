@@ -48,6 +48,7 @@ use tokio::signal::unix::SignalKind;
 use tokio::sync::Notify;
 use tokio::sync::OwnedRwLockReadGuard;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -89,6 +90,7 @@ use crate::app::review::Reviewer;
 use crate::app::speech::Listener;
 use crate::app::speech::Speech;
 use crate::app::speech::Utterances;
+use crate::app::timers::TimerDesk;
 use crate::app::training::FIXTURE;
 use crate::app::training::Training;
 use crate::app::training::Trigger;
@@ -105,6 +107,7 @@ use crate::domain::speech::Audio;
 use crate::domain::speech::CommitPolicy;
 use crate::domain::state::Snapshot;
 use crate::domain::state_cache::StateCache;
+use crate::domain::timers::TimerInput;
 use crate::domain::training::Settings;
 use crate::domain::training::TrainingSet;
 use crate::domain::training::TrainingState;
@@ -1542,8 +1545,24 @@ type Started = (
     Arc<LiveModels>,
 );
 
-/// The pools task, the queues, the habit task and the reasoner of an app.
-type Parts = (PoolsTask, Arc<Queues>, HabitsTask, Arc<dyn Reasoner>);
+/// The hot cache, its announce queues, the pools task, the habit task and the timer desk of an
+/// app.
+type Synced = (
+    watch::Receiver<StateCache>,
+    Arc<Queues>,
+    PoolsTask,
+    HabitsTask,
+    Arc<TimerDesk>,
+);
+
+/// The pools task, the queues, the habit task, the reasoner and the timer desk of an app.
+type Parts = (
+    PoolsTask,
+    Arc<Queues>,
+    HabitsTask,
+    Arc<dyn Reasoner>,
+    Arc<TimerDesk>,
+);
 
 /// The live models, the listener, the activation, the recorder and the log of an app.
 type Loaded = (Arc<LiveModels>, Listener, Activation, (Recorder, Logged));
@@ -1963,7 +1982,7 @@ async fn start_app_with(
     system_two: SystemTwo,
     (extras, library): (Extras, Option<Arc<dyn MediaLibrary>>),
 ) -> anyhow::Result<Started> {
-    let (cache, queues, task, habits) = start_tasks(&home, config, pools)?;
+    let (cache, queues, task, habits, timers) = start_tasks(&home, config, pools).await?;
     let checks = (extras, (task.changes.clone(), habits.habits.clone()));
     let loaded = load_models(
         config,
@@ -1977,8 +1996,13 @@ async fn start_app_with(
     .await?;
     let prerender = start_prerender(config, &loaded.2.speech, &task.pools, &cache);
     start_report(config, &cache);
-    let parts = (task, queues, habits, reasoner);
-    let started = started(config, parts, system_two, loaded, prerender);
+    let started = started(
+        config,
+        (task, queues, habits, reasoner, timers),
+        system_two,
+        loaded,
+        prerender,
+    );
     start_media(config, home, cache, catalog, &started, library);
     Ok(started)
 }
@@ -1986,7 +2010,7 @@ async fn start_app_with(
 /// The app of `config`, `parts`, `system_two`, `loaded` and `prerender`. Starts its prefetch.
 fn started(
     config: &Config,
-    (task, queues, habits, reasoner): Parts,
+    (task, queues, habits, reasoner, timers): Parts,
     system_two: SystemTwo,
     (models, listener, activation, (recorder, logged)): Loaded,
     prerender: JoinHandle<()>,
@@ -2003,6 +2027,7 @@ fn started(
                 system_two,
                 habits.habits.clone(),
                 recorder,
+                timers,
             ),
             listener,
             speech: Arc::clone(&activation.speech),
@@ -2230,25 +2255,22 @@ fn process_trainer(config: &Config) -> ProcessTrainer {
     }
 }
 
-/// Starts the sync of a hot cache with `home`, and the pools task of the source pools `pools` and
-/// the habit task of `config` on it. Gives the hot cache, its announce queues and the two tasks.
+/// Starts the sync of a hot cache with `home`, the pools task of the source pools `pools` and the
+/// habit task of `config` on it, and the timer desk on the timer changes of the sync. Gives the
+/// hot cache, its announce queues, the two tasks and the timer desk.
 ///
 /// # Errors
 ///
-/// The saved pools or the habit file cannot load.
-fn start_tasks(
+/// The saved pools, the habit file or the log database cannot load.
+async fn start_tasks(
     home: &Arc<dyn Home>,
     config: &Config,
     pools: Pools,
-) -> anyhow::Result<(
-    watch::Receiver<StateCache>,
-    Arc<Queues>,
-    PoolsTask,
-    HabitsTask,
-)> {
-    let (cache, queues) = start_sync(Arc::clone(home), config);
+) -> anyhow::Result<Synced> {
+    let (cache, queues, inputs) = start_sync(Arc::clone(home), config);
     let (task, habits) = start_stores(config, pools, &cache)?;
-    Ok((cache, queues, task, habits))
+    let timers = start_timers(config, inputs).await?;
+    Ok((cache, queues, task, habits, timers))
 }
 
 /// Starts the pools task of the source pools `pools` and the saved pools of `config`, and the
@@ -2445,18 +2467,41 @@ fn start_media(
 }
 
 /// Starts the sync of a hot cache with `home`. Gives the hot cache and the announce queues of
-/// `config` on it.
-fn start_sync(home: Arc<dyn Home>, config: &Config) -> (watch::Receiver<StateCache>, Arc<Queues>) {
+/// `config` on it, and the receiver of the timer changes.
+fn start_sync(
+    home: Arc<dyn Home>,
+    config: &Config,
+) -> (
+    watch::Receiver<StateCache>,
+    Arc<Queues>,
+    UnboundedReceiver<TimerInput>,
+) {
     let (cache, receiver) = watch::channel(StateCache::default());
     let sync = Arc::clone(&home);
-    // Sub-phase 19.9 reads the timer changes.
-    let (timers, _) = tokio::sync::mpsc::unbounded_channel();
+    let (timers, inputs) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(async move { app::background::sync(sync.as_ref(), &cache, &timers).await });
     let margin = Duration::from_millis(config.announce.margin_ms);
     let idle_wait = Duration::from_secs(config.announce.idle_wait_s);
     let dialog = config.dialog.clone();
     let queues = Queues::new(home, receiver.clone(), margin, idle_wait, dialog);
-    (receiver, Arc::new(queues))
+    (receiver, Arc::new(queues), inputs)
+}
+
+/// The timer desk on the log database of `config`, with a task that runs it on `inputs`.
+///
+/// # Errors
+///
+/// The log database cannot open.
+async fn start_timers(
+    config: &Config,
+    inputs: UnboundedReceiver<TimerInput>,
+) -> anyhow::Result<Arc<TimerDesk>> {
+    let store = Arc::new(SqliteLog::open(&config.log)?);
+    let timers = TimerDesk::new(store, config.dialog.choice_similarity).await;
+    let timers = Arc::new(timers);
+    let running = Arc::clone(&timers);
+    tokio::spawn(async move { running.run(inputs).await });
+    Ok(timers)
 }
 
 /// Starts a task that pre-renders `pools` with `speech` for the area names of the first snapshot
@@ -2681,6 +2726,7 @@ mod tests {
     use crate::testing::fakes::FakeVoiceEmbedder;
     use crate::testing::fakes::FakeWyomingClient;
     use crate::testing::fakes::MqttSubscriber;
+    use crate::testing::fakes::timer_desk;
 
     /// A valid configuration with every field.
     const VALID: &str = include_str!("../jarvis.toml");
@@ -3570,17 +3616,17 @@ mod tests {
         let reasoner: Arc<dyn Reasoner> = Arc::new(FakeReasoner::default());
         let activation = activation_of(task.changes, speech, cache, catalog);
         let backfill = backfill(config, &reasoner, &activation);
-        let (queues, threshold) = (queues(config), config.model.threshold);
         Ok(Conversation::new(
             task.pools,
             backfill,
-            queues,
+            queues(config),
             Arc::new(CurrentClassifier::new(FIXTURE.to_owned(), classifier)),
             Arc::clone(&activation.catalog),
-            threshold,
+            config.model.threshold,
             two(config),
             Arc::new(habits),
             recorder(utterances),
+            timer_desk(),
         ))
     }
 

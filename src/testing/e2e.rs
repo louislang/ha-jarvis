@@ -44,6 +44,7 @@ use crate::testing::fakes::FakeHome;
 use crate::testing::fakes::FakePlugin;
 use crate::testing::fakes::FakeReasoner;
 use crate::testing::fakes::FakeWyomingClient;
+use crate::testing::fakes::timer_desk;
 
 /// The samples of one 20 ms chunk of 16 kHz audio.
 const CHUNK_SAMPLES: usize = 320;
@@ -1687,7 +1688,7 @@ mod tests {
     async fn system_probes(config: &Config) -> anyhow::Result<Probes> {
         let home = Arc::new(FakeHome::default());
         home.send(Event::Reconnected);
-        let (mut cache, queues) = crate::start_sync(Arc::clone(&home) as _, config);
+        let (mut cache, queues, _) = crate::start_sync(Arc::clone(&home) as _, config);
         cache.changed().await?;
         let reasoner = Arc::new(FakeReasoner::default());
         reasoner.hold_steps();
@@ -1738,7 +1739,6 @@ mod tests {
             Arc::clone(&catalog),
             cache.clone(),
         );
-        let habits = Arc::new(Habits::new(RequestHabits::default(), 14.0, cache));
         let conversation = Conversation::new(
             Arc::clone(&pools),
             Arc::new(backfill),
@@ -1747,8 +1747,9 @@ mod tests {
             catalog,
             config.model.threshold,
             fake_two(config, reasoner, clock),
-            habits,
+            Arc::new(Habits::new(RequestHabits::default(), 14.0, cache)),
             recorder,
+            timer_desk(),
         );
         Ok((conversation, pools))
     }
