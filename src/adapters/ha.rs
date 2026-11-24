@@ -63,8 +63,8 @@ const EVENT_TYPES: [&str; 6] = [
 pub struct HaHome<S> {
     /// The send half of the socket and the next request ID.
     writer: AsyncMutex<Writer<S>>,
-    /// The result sender of each request that waits, by request ID.
-    pending: Mutex<HashMap<u64, ResultSender>>,
+    /// Each request that waits, by request ID.
+    pending: Mutex<HashMap<u64, Waiter>>,
     /// Locked from each connect until HA gives the result of each subscription.
     subscribing: Arc<AsyncMutex<()>>,
     /// The events, until [`HaHome::events`] takes them.
@@ -91,10 +91,18 @@ struct Writer<S> {
     next_id: u64,
 }
 
+/// A request that waits for its result.
+struct Waiter {
+    /// The sender of the result.
+    sender: ResultSender,
+    /// True for `get_states`, whose result also gives `Loaded`.
+    states: bool,
+}
+
 /// Removes a request ID from `pending` when the request ends, also by timeout.
 struct Pending<'home> {
     /// The pending map.
-    map: &'home Mutex<HashMap<u64, ResultSender>>,
+    map: &'home Mutex<HashMap<u64, Waiter>>,
     /// The request ID.
     id: u64,
 }
@@ -186,8 +194,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         // The writer lock stops new requests until `pending` is empty.
         let mut writer = adapter.writer.lock().await;
         writer.sink = None;
-        for (_, sender) in adapter.pending().drain() {
-            sender.send(Err(disconnected())).ok();
+        for (_, waiter) in adapter.pending().drain() {
+            waiter.sender.send(Err(disconnected())).ok();
         }
     }
 
@@ -363,7 +371,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
                 id: *next_id,
             };
             *next_id += 1;
-            self.pending().insert(pending.id, sender);
+            let states = command["type"] == "get_states";
+            self.pending().insert(pending.id, Waiter { sender, states });
             command["id"] = Value::from(pending.id);
             let text = Message::text(command.to_string());
             sink.send(text).await.context("connection error")?;
@@ -375,8 +384,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             .map_err(|_| timeout(deadline))?
     }
 
-    /// Sends a result or a `pong` to its pending request and an event to `events`. Ignores
-    /// other messages and IDs.
+    /// Sends a result or a `pong` to its pending request and an event to `events`. Gives `Loaded`
+    /// before the result of `get_states`. Ignores other messages and IDs.
     fn deliver(&self, text: &str, events: &Events) {
         let (id, result) = match serde_json::from_str(text) {
             Ok(Incoming::Result {
@@ -395,15 +404,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             }
             Err(_) => return,
         };
-        let Some(sender) = self.pending().remove(&id) else {
+        let Some(waiter) = self.pending().remove(&id) else {
             return;
         };
+        if let (true, Ok(states)) = (waiter.states, &result) {
+            let states = timer_states(states);
+            events.unbounded_send(Event::Loaded { states }).ok();
+        }
         // The request can time out between the removal and the send.
-        sender.send(result).ok();
+        waiter.sender.send(result).ok();
     }
 
     /// The pending map.
-    fn pending(&self) -> MutexGuard<'_, HashMap<u64, ResultSender>> {
+    fn pending(&self) -> MutexGuard<'_, HashMap<u64, Waiter>> {
         self.pending
             .lock()
             .expect("no code panics while it holds the pending map")
@@ -446,6 +459,19 @@ fn timeout(deadline: Duration) -> anyhow::Error {
 /// The error of a request while HA is disconnected.
 fn disconnected() -> anyhow::Error {
     anyhow::anyhow!("connection error: HA disconnected")
+}
+
+/// The states of the timer helpers in the `get_states` result `states`.
+fn timer_states(states: &Value) -> Vec<State> {
+    let timer = |state: &&Value| {
+        state["entity_id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("timer."))
+    };
+    let timers = states.as_array().into_iter().flatten().filter(timer);
+    timers
+        .filter_map(|state| State::deserialize(state).ok())
+        .collect()
 }
 
 /// Puts the aliases of `entries` into `fields`, and a name from `names` or the ID if it has none.
@@ -646,11 +672,19 @@ fn unexpected(kind: &str) -> String {
 mod tests {
     use super::*;
 
+    use std::iter;
+
     use futures::FutureExt;
     use futures::future;
     use serde_json::Value;
     use tokio::io::DuplexStream;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use tokio::sync::watch;
     use tokio::time::Instant;
+
+    use crate::app::background;
+    use crate::domain::state_cache::StateCache;
+    use crate::domain::timers::TimerInput;
 
     /// The only token that `FakeHaServer` accepts.
     const TOKEN: &str = "abc";
@@ -744,6 +778,24 @@ mod tests {
             }
             kinds.sort_by_key(ToString::to_string);
             assert_eq!(kinds, EVENT_TYPES.map(Value::from));
+        }
+
+        /// Answers `auth` with `auth_ok` and answers each subscription.
+        async fn ready(&mut self) {
+            self.receive_auth().await;
+            self.send("auth_ok").await;
+            self.subscribe().await;
+        }
+
+        /// Answers each request from `house` as HA does until a `get_states`, and gives it.
+        async fn until_states(&mut self, house: &Value) -> Value {
+            loop {
+                let request = self.receive().await;
+                if request["type"] == "get_states" {
+                    return request;
+                }
+                self.reply(&request, house_result(house, &request)).await;
+            }
         }
 
         /// Answers each request from `house.json` as HA does, until the client closes.
@@ -1252,6 +1304,19 @@ mod tests {
         state
     }
 
+    /// The reference house with only the state `value` of `timer.jarvis_1`.
+    fn timer_house(value: &str) -> Value {
+        let mut house = house();
+        house["states"] = json!([timer(value)]);
+        house
+    }
+
+    /// The `Snapshot` of the state `value` of `timer.jarvis_1`.
+    fn snapshot(value: &str) -> TimerInput {
+        let state = serde_json::from_value(timer(value)).expect("the timer state is a state");
+        TimerInput::Snapshot(vec![state])
+    }
+
     /// The `state_changed` event of `timer.jarvis_1` to `value`.
     fn timer_change(value: &str) -> Value {
         let data = json!({ "entity_id": JARVIS_1, "old_state": null, "new_state": timer(value) });
@@ -1303,6 +1368,78 @@ mod tests {
         let delivered = network.events.next().now_or_never().flatten();
         assert_eq!(delivered, Some(parsed(change)));
         Ok(())
+    }
+
+    /// Runs `sync` on an adapter whose only connection is to a `FakeHaServer` that `server` runs.
+    /// Gives the timer inputs.
+    fn synced<F>(
+        server: impl FnOnce(FakeHaServer) -> F + Send + 'static,
+    ) -> UnboundedReceiver<TimerInput>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let transport = Mutex::new(Some(open(server)));
+        let connector = move || {
+            let transport = transport
+                .lock()
+                .expect("no test panics with the lock")
+                .take();
+            future::ready(transport.ok_or_else(|| io::ErrorKind::ConnectionRefused.into()))
+        };
+        let home = HaHome::start(connector, TOKEN, &config());
+        let (timers, inputs) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let (cache, _) = watch::channel(StateCache::default());
+            background::sync(home.as_ref(), &cache, &timers).await;
+        });
+        inputs
+    }
+
+    /// The timer inputs after every task waits, before the first ping.
+    async fn inputs(mut receiver: UnboundedReceiver<TimerInput>) -> Vec<TimerInput> {
+        time::sleep(Duration::from_millis(1)).await;
+        iter::from_fn(|| receiver.try_recv().ok()).collect()
+    }
+
+    /// The `TimerEnded` of `timer.jarvis_1` with `Finished`.
+    fn finished() -> TimerInput {
+        TimerInput::Event(parsed(timer_event("timer.finished")))
+    }
+
+    /// AC-19.7b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_7b_2_timer_event_before_states_comes_before_snapshot() {
+        let receiver = synced(|mut server| async move {
+            server.ready().await;
+            let idle = timer_house("idle");
+            let states = server.until_states(&idle).await;
+            server.send_event(timer_event("timer.finished")).await;
+            server.reply(&states, idle["states"].clone()).await;
+            server.send_event(timer_change("active")).await;
+            server.serve(idle).await;
+        });
+        let change = TimerInput::Event(parsed(timer_change("active")));
+        let expected = vec![finished(), snapshot("idle"), change];
+        assert_eq!(inputs(receiver).await, expected);
+    }
+
+    /// AC-19.7b-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_7b_3_overlapping_loads_keep_socket_order() {
+        let receiver = synced(|mut server| async move {
+            server.ready().await;
+            let (active, idle) = (timer_house("active"), timer_house("idle"));
+            let states = server.until_states(&active).await;
+            let registry = json!({ "event_type": "entity_registry_updated" });
+            server.send_event(registry).await;
+            server.reply(&states, active["states"].clone()).await;
+            let states = server.until_states(&active).await;
+            server.send_event(timer_event("timer.finished")).await;
+            server.reply(&states, idle["states"].clone()).await;
+            server.serve(idle).await;
+        });
+        let expected = vec![snapshot("active"), finished(), snapshot("idle")];
+        assert_eq!(inputs(receiver).await, expected);
     }
 
     /// A `light.turn_on` call of the kitchen light at half brightness.

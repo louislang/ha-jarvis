@@ -2448,7 +2448,9 @@ fn start_media(
 fn start_sync(home: Arc<dyn Home>, config: &Config) -> (watch::Receiver<StateCache>, Arc<Queues>) {
     let (cache, receiver) = watch::channel(StateCache::default());
     let sync = Arc::clone(&home);
-    tokio::spawn(async move { app::background::sync(sync.as_ref(), &cache).await });
+    // Sub-phase 19.9 reads the timer changes.
+    let (timers, _) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move { app::background::sync(sync.as_ref(), &cache, &timers).await });
     let margin = Duration::from_millis(config.announce.margin_ms);
     let idle_wait = Duration::from_secs(config.announce.idle_wait_s);
     let dialog = config.dialog.clone();

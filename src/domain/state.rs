@@ -148,6 +148,11 @@ pub enum Event {
         /// How the timer ended.
         end: TimerEnd,
     },
+    /// A `get_states` result.
+    Loaded {
+        /// The states of the timer helpers.
+        states: Vec<State>,
+    },
 }
 
 /// How an HA timer ended.
