@@ -55,6 +55,7 @@ use crate::Device;
 use crate::adapters::supertonic::SupertonicTts;
 use crate::app::conversation::Speakers;
 use crate::app::review;
+use crate::app::timers::TimerDesk;
 use crate::app::training::FIXTURE;
 use crate::app::training::Training;
 use crate::app::training::Trigger;
@@ -78,6 +79,7 @@ use crate::domain::state::Event;
 use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
+use crate::domain::state::State;
 use crate::domain::state_cache::StateCache;
 use crate::domain::timers::Timers;
 use crate::domain::training::TrainingSet;
@@ -123,6 +125,26 @@ use crate::ports::VoiceProfiles;
 #[must_use]
 pub(crate) fn house() -> Snapshot {
     serde_json::from_str(include_str!("house.json")).expect("house.json is a snapshot")
+}
+
+/// The state `value` of the timer helper `helper`, which finishes at 12:05 on 2026-11-22.
+#[must_use]
+pub(crate) fn timer_state(helper: &str, value: &str) -> State {
+    let state = json!({
+        "entity_id": helper,
+        "state": value,
+        "attributes": { "finishes_at": "2026-11-22T12:05:00+00:00" },
+        "last_updated": "2026-11-22T12:00:00Z",
+        "context": { "id": "c1", "user_id": null, "parent_id": null },
+    });
+    serde_json::from_value(state).expect("a timer helper state")
+}
+
+/// A timer desk on an empty `FakeTimerStore`, with an empty view.
+#[must_use]
+pub(crate) fn timer_desk() -> Arc<TimerDesk> {
+    let store = Arc::new(FakeTimerStore::default());
+    Arc::new(futures::executor::block_on(TimerDesk::new(store, 0.85)))
 }
 
 /// A dispatcher that writes the `info` events to `log`.

@@ -35,6 +35,7 @@ use crate::app::background::Habits;
 use crate::app::plugins::Plugins;
 use crate::app::speech::Committed;
 use crate::app::speech::Utterances;
+use crate::app::timers::TimerDesk;
 use crate::app::training::Trigger;
 use crate::domain::catalog::Catalog;
 use crate::domain::catalog::Intent;
@@ -226,6 +227,8 @@ pub struct Conversation {
     titles: Arc<ArcSwap<Vec<Title>>>,
     /// The media library of the episode lookups, unset without the Plex plugin.
     library: Arc<OnceLock<Arc<dyn MediaLibrary>>>,
+    /// The timer table, which decides the timer requests.
+    timers: Arc<TimerDesk>,
 }
 
 impl Conversation {
@@ -234,7 +237,7 @@ impl Conversation {
     /// responses with a random source seeded from the time of `two`. Records the requests in
     /// `habits` and in `recorder`, with IDs from the time of `two` in microseconds, above the
     /// stored IDs of `recorder`. Starts the training runs of `train` requests with the trigger of
-    /// `recorder`.
+    /// `recorder`. Gives the timer requests to `timers`.
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
@@ -250,6 +253,7 @@ impl Conversation {
         two: SystemTwo,
         habits: Arc<Habits>,
         recorder: Recorder,
+        timers: Arc<TimerDesk>,
     ) -> Self {
         use rand::SeedableRng;
         let now = two.clock.now();
@@ -271,6 +275,7 @@ impl Conversation {
             next_id,
             titles: Arc::new(ArcSwap::from_pointee(Vec::new())),
             library: Arc::default(),
+            timers,
         }
     }
 
@@ -475,7 +480,7 @@ impl Conversation {
         heard: &Heard,
         new: bool,
     ) -> (Handled, Decided) {
-        let decision = self.started(self.decide(prediction, request));
+        let decision = self.timed(prediction, request, heard).await;
         let (mut decided, pending) = self.parts(&decision);
         let route = decided.route;
         // Only a spoken request counts. Text from the HA UI has no satellite.
@@ -495,6 +500,20 @@ impl Conversation {
         tracing::info!(transcript, ?top, ?route, reply, "handled");
         decided.response = answer.unwrap_or(decided.response);
         (handled, decided)
+    }
+
+    /// The decision for `prediction` of `request` (`started`), with a `Timer` as the decision of
+    /// the timer desk for the satellite of `heard` at its time.
+    async fn timed(&self, prediction: &Prediction, request: &Request, heard: &Heard) -> Decision {
+        let decision = self.started(self.decide(prediction, request));
+        let Decision::Timer(request) = decision else {
+            return decision;
+        };
+        let (satellite, pools) = (heard.satellite.clone(), self.pools.load());
+        let timers = &self.timers;
+        timers
+            .decide(&request, satellite, heard.time, &pools, &self.rng)
+            .await
     }
 
     /// `decision`, with a `Train` as a `Reply` with its reply when `voice` of the trigger starts a
@@ -735,8 +754,7 @@ impl Conversation {
 
     /// The decision for `prediction` with its Plex title matched (`titled`) of `request` in the
     /// current hot cache and pools, a `not_in_library` reply when the title has no match, a reply
-    /// with the fresh prefetched answer of `prefetched` or `prefetched_fetch`, or a System Two job
-    /// for a timer request.
+    /// with the fresh prefetched answer of `prefetched` or `prefetched_fetch`.
     fn decide(&self, prediction: &Prediction, request: &Request) -> Decision {
         if let Some(text) = self.prefetched(prediction, request) {
             return stored_reply(text);
@@ -757,9 +775,6 @@ impl Conversation {
             self.threshold,
             rng,
         );
-        if let Decision::Timer(_) = decision {
-            return decide::defer(request, &pools, rng);
-        }
         match self.prefetched_fetch(&decision, request) {
             Some(text) => stored_reply(text),
             None => decision,
@@ -2337,8 +2352,13 @@ mod tests {
     use crate::domain::model::Slot;
     use crate::domain::responses::Pool;
     use crate::domain::speaker::Source;
+    use crate::domain::state::Event;
     use crate::domain::state::ServiceCall;
     use crate::domain::state::State;
+    use crate::domain::state::TimerEnd;
+    use crate::domain::timers::Timer;
+    use crate::domain::timers::TimerInput;
+    use crate::domain::timers::Timers;
     use crate::ports::Classifier;
     use crate::ports::Plugin;
     use crate::testing::fakes;
@@ -2350,6 +2370,7 @@ mod tests {
     use crate::testing::fakes::FakePlugin;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStore;
+    use crate::testing::fakes::FakeTimerStore;
     use crate::testing::fakes::FakeTrainer;
     use crate::testing::fakes::FakeTts;
     use crate::testing::fakes::FakeVoiceEmbedder;
@@ -2438,6 +2459,7 @@ mod tests {
             },
             Arc::new(habits),
             recorder(),
+            fakes::timer_desk(),
         )
     }
 
@@ -3816,6 +3838,7 @@ mod tests {
             two,
             base.habits,
             recorder,
+            base.timers,
         );
         let _ = conversation.handle(LIGHTS, on_satellite()).await?;
         let ids: Vec<u64> = written(&log)
@@ -5694,5 +5717,199 @@ mod tests {
         tomorrow.arguments["when"] = json!("tomorrow");
         refetched(10, tomorrow, KITCHEN).await?;
         refetched(10, today("get_weather"), OFFICE).await
+    }
+
+    /// The first timer helper.
+    const J1: &str = "timer.jarvis_1";
+
+    /// A `timer_set` prediction for "five minutes" with the name `name`.
+    fn set_timer(name: &str) -> Prediction {
+        let mut set = predicted("timer_set", 0.9, ("duration", "five minutes"));
+        let (name, value) = ("timer".to_owned(), name.to_owned());
+        set.slots.push(Slot { name, value });
+        set
+    }
+
+    /// A conversation on `home` with the pools of `responses.toml`, whose classifier gives
+    /// `predictions`, and whose timer desk has a store with each name of `entries` on its helper,
+    /// and a view that shows both helpers in the state `value`. Also the store.
+    async fn timing(
+        home: &Arc<FakeHome>,
+        predictions: Vec<Prediction>,
+        entries: &[(&str, &str)],
+        value: &str,
+    ) -> (Conversation, Arc<FakeTimerStore>) {
+        let classifier = scripted(&[]);
+        for prediction in predictions {
+            classifier.script(prediction);
+        }
+        let (_cache, _changes, mut conversation) =
+            still_with(home, "idle", classifier, Arc::default());
+        let catalog = crate::load_catalog(Path::new("intents.toml")).expect("a catalog");
+        let pools = crate::load_pools(Path::new("responses.toml"), &catalog).expect("pools");
+        conversation.pools = Arc::new(ArcSwap::from_pointee(pools));
+        let store = stored(entries);
+        let desk = TimerDesk::new(Arc::clone(&store) as _, 0.85).await;
+        conversation.timers = Arc::new(desk);
+        feed(&conversation, vec![shown(value)]).await;
+        (conversation, store)
+    }
+
+    /// A store with each name of `entries` on its helper.
+    fn stored(entries: &[(&str, &str)]) -> Arc<FakeTimerStore> {
+        let store = Arc::new(FakeTimerStore::default());
+        let saved = entries
+            .iter()
+            .map(|(helper, name)| ((*helper).to_owned(), named(name, false)));
+        *store.timers.lock().expect("no test panics") = Timers {
+            timers: saved.collect(),
+            next: entries.len() as u64,
+        };
+        store
+    }
+
+    /// The entry "five minutes" with the name `name` from the satellite, with the order 0 or 1.
+    fn named(name: &str, starting: bool) -> Timer {
+        Timer {
+            satellite: Some(SATELLITE.to_owned()),
+            name: Some(name.to_owned()),
+            duration: "five minutes".to_owned(),
+            order: u64::from(name == "pasta" || name == "pizza"),
+            starting,
+        }
+    }
+
+    /// Runs the timer desk of `conversation` on `inputs`.
+    async fn feed(conversation: &Conversation, inputs: Vec<TimerInput>) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        for input in inputs {
+            sender.send(input).expect("the receiver is open");
+        }
+        drop(sender);
+        conversation.timers.run(receiver).await;
+    }
+
+    /// The snapshot with `timer.jarvis_1` and `timer.jarvis_2` in the state `value`.
+    fn shown(value: &str) -> TimerInput {
+        let states = [J1, "timer.jarvis_2"].map(|helper| fakes::timer_state(helper, value));
+        TimerInput::Snapshot(states.to_vec())
+    }
+
+    /// The end of the timer of `timer.jarvis_1`.
+    fn finished() -> TimerInput {
+        let (entity_id, end) = (J1.to_owned(), TimerEnd::Finished);
+        TimerInput::Event(Event::TimerEnded { entity_id, end })
+    }
+
+    /// The `timer.start` call of five minutes on `timer.jarvis_1`.
+    fn start_call() -> ServiceCall {
+        let mut call = service("timer", "start", J1);
+        call.data.insert("duration".to_owned(), json!(300));
+        call
+    }
+
+    /// The reply and the work of `text` from the satellite.
+    async fn timed(conversation: &Conversation, text: &str) -> anyhow::Result<(String, Work)> {
+        let Handled { text, after } = conversation.handle(text, on_satellite()).await?;
+        Ok((text, after.ok_or_else(|| anyhow::anyhow!("no after"))?))
+    }
+
+    /// The saved entry of `timer.jarvis_1`.
+    fn saved(store: &FakeTimerStore) -> Option<Timer> {
+        let saved = store.timers.lock().expect("no test panics");
+        saved.timers.get(J1).cloned()
+    }
+
+    /// AC-19.9c-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9c_1_set_replies_then_starts_the_helper() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (conversation, store) = timing(&home, vec![set_timer("chicken")], &[], "idle").await;
+        let (text, after) = timed(&conversation, "set a timer").await?;
+        assert_eq!(text, "Your chicken timer is set for five minutes.");
+        assert_eq!(home.calls(), []);
+        after.await?;
+        assert_eq!(home.calls(), [start_call()]);
+        assert_eq!(saved(&store), Some(named("chicken", true)));
+        Ok(())
+    }
+
+    /// AC-19.9c-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9c_2_which_timer_then_cancel() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let entries = [(J1, "chicken"), ("timer.jarvis_2", "pizza")];
+        let cancel = predicted("timer_cancel", 0.9, ("timer", ""));
+        let (conversation, _) = timing(&home, vec![cancel], &entries, "active").await;
+        let (text, after) = timed(&conversation, "cancel that timer").await?;
+        after.await?;
+        let question = "Which timer, the chicken timer or the pizza timer?";
+        assert_eq!(
+            (text.as_str(), asks(&home)),
+            ("", vec![question.to_owned()])
+        );
+        let (text, after) = timed(&conversation, "the chicken").await?;
+        assert_eq!(text, "I cancelled the chicken timer.");
+        after.await?;
+        assert_eq!(home.calls().last(), Some(&service("timer", "cancel", J1)));
+        Ok(())
+    }
+
+    /// AC-19.9c-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9c_3_started_entry_survives_a_failed_call() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (conversation, store) = timing(&home, vec![set_timer("chicken")], &[], "idle").await;
+        let gate = home.delay();
+        let (_, after) = timed(&conversation, "set a timer").await?;
+        let active = async {
+            feed(&conversation, vec![shown("active")]).await;
+            drop(gate);
+        };
+        tokio::join!(after, active).0?;
+        assert_eq!(saved(&store), Some(named("chicken", false)));
+        Ok(())
+    }
+
+    /// AC-19.9c-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9c_4_failed_pause_keeps_a_new_timer() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let requests = vec![
+            predicted("timer_pause", 0.9, ("timer", "")),
+            set_timer("pasta"),
+        ];
+        let (conversation, store) = timing(&home, requests, &[(J1, "chicken")], "active").await;
+        let gate = home.delay();
+        let (_, pause) = timed(&conversation, "pause the timer").await?;
+        let new = async {
+            feed(&conversation, vec![finished(), shown("idle")]).await;
+            timed(&conversation, "set a timer").await?.1.await?;
+            drop(gate);
+            anyhow::Ok(())
+        };
+        tokio::join!(pause, new).1?;
+        assert_eq!(saved(&store), Some(named("pasta", true)));
+        Ok(())
+    }
+
+    /// AC-19.9c-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_9c_5_failed_old_start_keeps_a_new_timer() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let sets = vec![set_timer("chicken"), set_timer("pasta")];
+        let (conversation, store) = timing(&home, sets, &[], "idle").await;
+        let gate = home.delay();
+        let (_, start) = timed(&conversation, "set a timer").await?;
+        let new = async {
+            let ended = vec![shown("active"), finished(), shown("idle")];
+            feed(&conversation, ended).await;
+            timed(&conversation, "set a timer").await?.1.await?;
+            drop(gate);
+            anyhow::Ok(())
+        };
+        tokio::join!(start, new).1?;
+        assert_eq!(saved(&store), Some(named("pasta", true)));
+        Ok(())
     }
 }
