@@ -256,6 +256,8 @@ pub struct Timer {
     pub duration: String,
     /// The order of the set request: a later timer has a higher order.
     pub order: u64,
+    /// True while the start call of the entry runs.
+    pub starting: bool,
 }
 
 // Not derived: the derived `clone` has no `ensures`, so Verus cannot see that a copy is equal.
@@ -272,6 +274,7 @@ impl Clone for Timer {
             name: self.name.clone(),
             duration: self.duration.clone(),
             order: self.order,
+            starting: self.starting,
         }
     }
 }
@@ -355,7 +358,7 @@ pub struct Remaining {
         unique(table.timers@),
         match planned {
             Plan::Start { helper, .. } => cached_free(*cache, timers.timers@, helper)
-                && table.timers@.contains_key(helper)
+                && table.timers@.contains_key(helper) && table.timers@[helper].starting
                 && table.timers@.remove(helper) == timers.timers@,
             Plan::Full => none_free(*cache, timers.timers@) && table == timers,
             _ => table == timers,
@@ -386,6 +389,7 @@ pub fn set(
         name,
         duration: spoken.clone(),
         order: timers.next,
+        starting: true,
     };
     let mut table = timers;
     table.timers.insert(helper.clone(), timer);
@@ -605,43 +609,131 @@ fn idle(cache: &StateCache, helper: &str) -> bool {
     matches!(cache.states.get(helper), Some(state) if state.state.as_str() == "idle")
 }
 
-/// `timers` without the entry of `helper` when `cache` shows `helper` `idle`: a failed start call.
+/// `timers` without the entry of `helper` when it starts and has `order`: a failed start call.
 #[verus_spec(table =>
     ensures
-        table.timers@ == if crate::domain::speaker::shows(*cache, helper@, "idle"@) {
+        table.timers@ == if starts(timers.timers@, helper@)
+            && timers.timers@[crate::domain::contracts::string_key(helper@)].order == order {
             timers.timers@.remove(crate::domain::contracts::string_key(helper@))
         } else {
             timers.timers@
         },
 )]
 #[must_use]
-pub fn forget(timers: Timers, helper: &str, cache: &StateCache) -> Timers {
+pub fn forget(timers: Timers, helper: &str, order: u64) -> Timers {
+    proof! {
+        broadcast use
+            crate::domain::contracts::axiom_string_contains_borrowed_key,
+            crate::domain::contracts::axiom_string_maps_borrowed_key;
+    }
     let mut table = timers;
-    if idle(cache, helper) {
+    if matches!(table.timers.get(helper), Some(timer) if timer.starting && timer.order == order) {
         table.timers.remove(helper);
     }
     table
 }
 
-/// The entry of `helper`, and `timers` without it: HA ended the helper.
+/// The entry of `helper`, and `timers` without it: HA ended the helper. An entry that starts stays,
+/// because its start call decides it.
 #[verus_spec((entry, table) =>
     ensures
-        table.timers@ == timers.timers@.remove(crate::domain::contracts::string_key(helper@)),
+        table.timers@ == if starts(timers.timers@, helper@) {
+            timers.timers@
+        } else {
+            timers.timers@.remove(crate::domain::contracts::string_key(helper@))
+        },
+        starts(timers.timers@, helper@) ==> entry is None,
 )]
 #[must_use]
 pub fn ended(timers: Timers, helper: &str) -> (Option<Timer>, Timers) {
+    proof! {
+        broadcast use
+            crate::domain::contracts::axiom_string_contains_borrowed_key,
+            crate::domain::contracts::axiom_string_maps_borrowed_key;
+    }
+    if matches!(timers.timers.get(helper), Some(timer) if timer.starting) {
+        return (None, timers);
+    }
     let mut table = timers;
     let entry = table.timers.remove(helper);
     (entry, table)
 }
 
-/// `timers` without each entry whose helper `cache` shows `idle`: a reconnect.
+/// `timers` with `starting` cleared on the entry of the helper of `state` when `state` is `active`
+/// or `paused`.
+#[verus_spec(table =>
+    ensures
+        table.next == timers.next,
+        table.timers@ == if acts_on(TimerAction::Cancel, state.state@)
+            && timers.timers@.contains_key(state.entity_id) {
+            timers.timers@.insert(state.entity_id, started(timers.timers@[state.entity_id]))
+        } else {
+            timers.timers@
+        },
+)]
+#[must_use]
+pub fn running(timers: Timers, state: &State) -> Timers {
+    let mut table = timers;
+    let now = state.state.as_str();
+    if now != "active" && now != "paused" {
+        return table;
+    }
+    if let Some(mut entry) = table.timers.remove(&state.entity_id) {
+        entry.starting = false;
+        table.timers.insert(state.entity_id.clone(), entry);
+    }
+    table
+}
+
+/// `timers` with `starting` cleared on each entry: no start call survives a restart.
+#[verus_spec(table =>
+    ensures
+        table.next == timers.next,
+        forall|helper: String| #[trigger] table.timers@.contains_key(helper)
+            == timers.timers@.contains_key(helper),
+        forall|helper: String| #[trigger] table.timers@.contains_key(helper)
+            ==> table.timers@[helper] == started(timers.timers@[helper]),
+)]
+#[must_use]
+pub fn restored(timers: &Timers) -> Timers {
+    let mut table = BTreeMap::new();
+    let entries = timers.timers.iter();
+    proof_decl! {
+        let ghost all = vstd::std_specs::iter::IteratorSpec::remaining(&entries);
+    }
+    #[cfg_attr(verus_only, verus_spec(entry_iter =>
+        invariant
+            entry_iter.seq() == all,
+            listing(timers.timers@, all),
+            restored_before(table@, timers.timers@, all, entry_iter.index()),
+    ))]
+    for (helper, timer) in entries {
+        let mut entry = timer.clone();
+        entry.starting = false;
+        table.insert(helper.clone(), entry);
+    }
+    proof! {
+        assert forall|helper: String| #[trigger] timers.timers@.contains_key(helper)
+            implies table@.contains_key(helper) by {
+            let index = index_of(timers.timers@, all, helper);
+        }
+    }
+    Timers {
+        timers: table,
+        next: timers.next,
+    }
+}
+
+/// `timers` after a reconnect: without each entry that does not start and whose helper `cache`
+/// shows `idle`, and with `starting` cleared on each entry whose helper `cache` shows `active` or
+/// `paused`.
 #[verus_spec(table =>
     ensures
         forall|helper: String| #[trigger] table.timers@.contains_key(helper)
-            == (timers.timers@.contains_key(helper) && !crate::domain::speaker::shows(*cache, helper@, "idle"@)),
+            == (timers.timers@.contains_key(helper) && (timers.timers@[helper].starting
+                || !crate::domain::speaker::shows(*cache, helper@, "idle"@))),
         forall|helper: String| #[trigger] table.timers@.contains_key(helper)
-            ==> table.timers@[helper] == timers.timers@[helper],
+            ==> table.timers@[helper] == settled(timers.timers@[helper], *cache, helper),
 )]
 #[must_use]
 pub fn reconcile(timers: &Timers, cache: &StateCache) -> Timers {
@@ -656,14 +748,21 @@ pub fn reconcile(timers: &Timers, cache: &StateCache) -> Timers {
             listing(timers.timers@, all),
             reconciled(table@, timers.timers@, *cache, all, entry_iter.index()),
     ))]
-    for (helper, _) in entries {
-        if idle(cache, helper) {
+    for (helper, timer) in entries {
+        if timer.starting {
+            // `Cancel` acts on an `active` or `paused` helper.
+            if fits(TimerAction::Cancel, cache, helper) {
+                let mut entry = timer.clone();
+                entry.starting = false;
+                table.insert(helper.clone(), entry);
+            }
+        } else if idle(cache, helper) {
             table.remove(helper);
         }
     }
     proof! {
-        assert forall|helper: String| #[trigger] table@.contains_key(helper)
-            implies !crate::domain::speaker::shows(*cache, helper@, "idle"@) by {
+        assert forall|helper: String| #[trigger] timers.timers@.contains_key(helper)
+            implies reconciled_entry(table@, timers.timers@, *cache, helper) by {
             let index = index_of(timers.timers@, all, helper);
         }
     }
@@ -1241,15 +1340,57 @@ pub open spec fn kept_before(found: Seq<Candidate>, timers: Map<String, Timer>, 
     &&& distinct(found)
 }
 
-/// True when `table` is `timers` without the entries whose helper `cache` shows `idle`, among the
-/// first `count` entries of `all`.
+/// True when `table` has the entry of `helper` of `timers` after a reconnect with `cache`: without
+/// it when it does not start and `cache` shows `helper` `idle`, else `settled`.
+pub open spec fn reconciled_entry(table: Map<String, Timer>, timers: Map<String, Timer>, cache: StateCache, helper: String) -> bool {
+    &&& table.contains_key(helper) == (timers[helper].starting || !crate::domain::speaker::shows(cache, helper@, "idle"@))
+    &&& table.contains_key(helper) ==> table[helper] == settled(timers[helper], cache, helper)
+}
+
+/// True when `table` is `timers` after a reconnect with `cache` for the first `count` entries of
+/// `all`, and each other entry is its entry of `timers`, or `settled`.
 pub open spec fn reconciled(table: Map<String, Timer>, timers: Map<String, Timer>, cache: StateCache, all: Seq<(&String, &Timer)>, count: int) -> bool {
-    &&& forall|helper: String| #[trigger] table.contains_key(helper)
-        ==> timers.contains_key(helper) && table[helper] == timers[helper]
+    &&& forall|helper: String| #[trigger] table.contains_key(helper) ==> timers.contains_key(helper)
+        && (table[helper] == timers[helper] || table[helper] == settled(timers[helper], cache, helper))
     &&& forall|helper: String| #[trigger] timers.contains_key(helper) && !table.contains_key(helper)
-        ==> crate::domain::speaker::shows(cache, helper@, "idle"@)
+        ==> !timers[helper].starting && crate::domain::speaker::shows(cache, helper@, "idle"@)
     &&& forall|index: int| #![trigger all[index]] 0 <= index < count
-        && crate::domain::speaker::shows(cache, (*all[index].0)@, "idle"@) ==> !table.contains_key(*all[index].0)
+        ==> reconciled_entry(table, timers, cache, *all[index].0)
+}
+
+/// True when `table` has the entries of `timers` with `starting` cleared, and each of the first
+/// `count` entries of `all`.
+pub open spec fn restored_before(table: Map<String, Timer>, timers: Map<String, Timer>, all: Seq<(&String, &Timer)>, count: int) -> bool {
+    &&& forall|helper: String| #[trigger] table.contains_key(helper)
+        ==> timers.contains_key(helper) && table[helper] == started(timers[helper])
+    &&& forall|index: int| #![trigger all[index]] 0 <= index < count ==> table.contains_key(*all[index].0)
+}
+
+/// True when the entry of the helper `helper` in `timers` starts.
+pub open spec fn starts(timers: Map<String, Timer>, helper: Seq<char>) -> bool {
+    let key = crate::domain::contracts::string_key(helper);
+    timers.contains_key(key) && timers[key].starting
+}
+
+/// `timer` with `starting` cleared.
+pub open spec fn started(timer: Timer) -> Timer {
+    Timer {
+        satellite: timer.satellite,
+        name: timer.name,
+        duration: timer.duration,
+        order: timer.order,
+        starting: false,
+    }
+}
+
+/// The entry `timer` of `helper` after a reconnect with `cache`: started when it starts and `cache`
+/// shows `helper` `active` or `paused`.
+pub open spec fn settled(timer: Timer, cache: StateCache, helper: String) -> Timer {
+    if timer.starting && in_state(cache, helper@, TimerAction::Cancel) {
+        started(timer)
+    } else {
+        timer
+    }
 }
 
 /// True when `made` is a call of the domain `timer` on the helper of `plan`: `start` for `Start`,
@@ -1518,6 +1659,7 @@ mod tests {
             name: Some("chicken".to_owned()),
             duration: "five minutes".to_owned(),
             order: 0,
+            starting: true,
         };
         assert_eq!(timers.timers.get("timer.jarvis_1"), Some(&entry));
         let generic = request(None, Some("ten minutes"));
@@ -1578,6 +1720,7 @@ mod tests {
             name: Some(name.to_owned()),
             duration: "ten minutes".to_owned(),
             order,
+            starting: false,
         }
     }
 
@@ -1628,18 +1771,103 @@ mod tests {
 
     #[test]
     fn ac_19_4b_2_table_follows_ha() {
-        let (timers, cache) = three();
-        let running = table(&[
-            ("timer.jarvis_1", entry("chicken", 1)),
-            ("timer.jarvis_2", entry("pasta", 0)),
-        ]);
-        assert_eq!(forget(timers.clone(), "timer.jarvis_3", &cache), running);
-        assert_eq!(forget(timers.clone(), "timer.jarvis_2", &cache), timers);
-        let (gone, after) = ended(timers.clone(), "timer.jarvis_2");
+        let (timers, _) = three();
+        let (gone, after) = ended(timers, "timer.jarvis_2");
         assert_eq!(gone, Some(entry("pasta", 0)));
         let rest: Vec<&String> = after.timers.keys().collect();
         assert_eq!(rest, ["timer.jarvis_1", "timer.jarvis_3"]);
-        assert_eq!(reconcile(&timers, &cache), running);
+    }
+
+    /// The entry "chicken" with the order `order`, whose start call runs.
+    fn starting(order: u64) -> Timer {
+        Timer {
+            starting: true,
+            ..entry("chicken", order)
+        }
+    }
+
+    /// The HA state `state` of the helper `id`.
+    fn state_of(id: &str, state: &str) -> State {
+        let mut found = helper(state, &json!({}));
+        id.clone_into(&mut found.entity_id);
+        found
+    }
+
+    #[test]
+    fn ac_19_9_1_start_call_marks_the_entry() {
+        let timers = one(Some("chicken"), "five minutes", &idle());
+        let chicken = Timer {
+            duration: "five minutes".to_owned(),
+            ..entry("chicken", 0)
+        };
+        let start = Timer {
+            starting: true,
+            ..chicken.clone()
+        };
+        assert_eq!(timers.timers.get("timer.jarvis_1"), Some(&start));
+        for state in ["active", "paused"] {
+            let after = running(timers.clone(), &state_of("timer.jarvis_1", state));
+            assert_eq!(after.timers.get("timer.jarvis_1"), Some(&chicken));
+        }
+        let after = running(timers.clone(), &state_of("timer.jarvis_1", "idle"));
+        assert_eq!(after, timers);
+        let both = table(&[
+            ("timer.jarvis_1", starting(0)),
+            ("timer.jarvis_2", entry("pasta", 1)),
+        ]);
+        let cleared = table(&[
+            ("timer.jarvis_1", entry("chicken", 0)),
+            ("timer.jarvis_2", entry("pasta", 1)),
+        ]);
+        assert_eq!(restored(&both), cleared);
+    }
+
+    #[test]
+    fn ac_19_9_2_forget_only_its_own_start() {
+        let timers = table(&[
+            ("timer.jarvis_1", starting(1)),
+            ("timer.jarvis_2", entry("pasta", 0)),
+        ]);
+        let rest = table(&[("timer.jarvis_2", entry("pasta", 0))]);
+        assert_eq!(forget(timers.clone(), "timer.jarvis_1", 1), rest);
+        assert_eq!(forget(timers.clone(), "timer.jarvis_1", 2), timers);
+        assert_eq!(forget(timers.clone(), "timer.jarvis_2", 0), timers);
+    }
+
+    #[test]
+    fn ac_19_9_3_late_end_keeps_a_new_start() {
+        let timers = table(&[
+            ("timer.jarvis_1", starting(1)),
+            ("timer.jarvis_2", entry("pasta", 0)),
+        ]);
+        assert_eq!(
+            ended(timers.clone(), "timer.jarvis_1"),
+            (None, timers.clone())
+        );
+        let rest = table(&[("timer.jarvis_1", starting(1))]);
+        assert_eq!(
+            ended(timers, "timer.jarvis_2"),
+            (Some(entry("pasta", 0)), rest)
+        );
+    }
+
+    #[test]
+    fn ac_19_9_4_reconnect_keeps_starts() {
+        let timers = table(&[
+            ("timer.jarvis_1", starting(0)),
+            ("timer.jarvis_2", entry("pasta", 1)),
+            ("timer.jarvis_3", starting(2)),
+        ]);
+        let cache = cache(&[
+            ("timer.jarvis_1", "idle"),
+            ("timer.jarvis_2", "idle"),
+            ("timer.jarvis_3", "active"),
+        ]);
+        let kept = table(&[
+            ("timer.jarvis_1", starting(0)),
+            ("timer.jarvis_3", entry("chicken", 2)),
+        ]);
+        assert_eq!(reconcile(&timers, &cache), kept);
     }
 
     /// A generic "ten minutes" entry with the order `order`.
