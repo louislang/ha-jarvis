@@ -344,7 +344,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/app/review.rs` | Application | `Review` use case. | 12.7 |
 | `src/app/training.rs` | Application | Generated examples, training trigger, training run, accept and swap. | 13.6 |
 | `src/app/plugins.rs` | Application | Plugin registry: lookup by tool name, result cache and deadline. | 17.1 |
-| `src/app/timers.rs` | Application | `TimerDesk`: the timer table and its store, the timer events of HA, the rings and stop. | 19.9 |
+| `src/app/timers.rs` | Application | `TimerDesk`: the timer table and its store, the timer events of HA, the rings and stop. | 19.9b |
 | `src/adapters/ha.rs` | Adapter | `Home` over the HA WebSocket API. | 2.2 |
 | `src/adapters/onnx.rs` | Adapter | `Classifier` and `ModelLoader` with ONNX Runtime. | 3.12 |
 | `src/adapters/files.rs` | Adapter | `Store<T>` with TOML or JSON files and atomic write. `PluginRequests` with Markdown files in a folder (sub-phase 14.12). | 4.3 |
