@@ -822,12 +822,14 @@ mod tests {
             name: Some("chicken".to_owned()),
             duration: "five minutes".to_owned(),
             order: 0,
+            starting: false,
         };
         let generic = Timer {
             satellite: None,
             name: None,
             duration: "ten minutes".to_owned(),
             order: 1,
+            starting: false,
         };
         let entries = [("timer.jarvis_1", chicken), ("timer.jarvis_2", generic)];
         let entries = entries.map(|(helper, timer)| (helper.to_owned(), timer));
