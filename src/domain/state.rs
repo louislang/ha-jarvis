@@ -141,6 +141,22 @@ pub enum Event {
     RegistryUpdated,
     /// A connection to HA opened, also the first.
     Reconnected,
+    /// HA ended a timer helper.
+    TimerEnded {
+        /// The timer helper.
+        entity_id: String,
+        /// How the timer ended.
+        end: TimerEnd,
+    },
+}
+
+/// How an HA timer ended.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TimerEnd {
+    /// The time ran out: `timer.finished`.
+    Finished,
+    /// A person or a service cancelled it: `timer.cancelled`.
+    Cancelled,
 }
 
 /// An HA service call.

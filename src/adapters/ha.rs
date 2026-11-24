@@ -19,6 +19,7 @@ use futures::future;
 use futures::future::AbortHandle;
 use futures::future::Abortable;
 use futures::lock::Mutex as AsyncMutex;
+use futures::lock::MutexGuard as AsyncMutexGuard;
 use futures::stream;
 use futures::stream::BoxStream;
 use futures::stream::SplitSink;
@@ -39,6 +40,7 @@ use crate::domain::state::Event;
 use crate::domain::state::ServiceCall;
 use crate::domain::state::Snapshot;
 use crate::domain::state::State;
+use crate::domain::state::TimerEnd;
 use crate::ports::Home;
 
 /// The sender of the events of all connections.
@@ -48,11 +50,13 @@ type Events = mpsc::UnboundedSender<Event>;
 type ResultSender = oneshot::Sender<anyhow::Result<Value>>;
 
 /// The HA events that the adapter subscribes to.
-const EVENT_TYPES: [&str; 4] = [
+const EVENT_TYPES: [&str; 6] = [
     "area_registry_updated",
     "device_registry_updated",
     "entity_registry_updated",
     "state_changed",
+    "timer.cancelled",
+    "timer.finished",
 ];
 
 /// `Home` over the HA WebSocket API.
@@ -61,6 +65,8 @@ pub struct HaHome<S> {
     writer: AsyncMutex<Writer<S>>,
     /// The result sender of each request that waits, by request ID.
     pending: Mutex<HashMap<u64, ResultSender>>,
+    /// Locked from each connect until HA gives the result of each subscription.
+    subscribing: Arc<AsyncMutex<()>>,
     /// The events, until [`HaHome::events`] takes them.
     events: Mutex<Option<mpsc::UnboundedReceiver<Event>>>,
     /// The deadline of each request except an announce.
@@ -117,6 +123,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
                 next_id: 1,
             }),
             pending: Mutex::new(HashMap::new()),
+            subscribing: Arc::default(),
             events: Mutex::new(Some(receiver)),
             deadline: Duration::from_millis(config.request_timeout_ms),
             announce_deadline: Duration::from_secs(config.announce_timeout_s),
@@ -165,11 +172,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         let Some(adapter) = home.upgrade() else {
             return;
         };
+        let subscribing = Arc::clone(&adapter.subscribing);
+        let subscribed = subscribing.lock().await;
         adapter.writer.lock().await.sink = Some(sink);
         drop(adapter);
         let read = pin::pin!(Self::read(home, stream, events));
         // The subscriptions and the pings need the read loop for their results.
-        future::select(read, pin::pin!(Self::control(home, events, ping))).await;
+        let control = Self::control(home, events, ping, subscribed);
+        future::select(read, pin::pin!(control)).await;
         let Some(adapter) = home.upgrade() else {
             return;
         };
@@ -190,12 +200,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         }
     }
 
-    /// Subscribes to [`EVENT_TYPES`], gives `Reconnected`, then pings every `interval`.
+    /// Subscribes to [`EVENT_TYPES`], releases `subscribed`, gives `Reconnected`, then pings every
+    /// `interval`.
     ///
     /// # Errors
     ///
     /// A subscription or a ping fails.
-    async fn control(home: &Weak<Self>, events: &Events, interval: Duration) -> anyhow::Result<()> {
+    async fn control(
+        home: &Weak<Self>,
+        events: &Events,
+        interval: Duration,
+        subscribed: AsyncMutexGuard<'_, ()>,
+    ) -> anyhow::Result<()> {
         let subscriptions = EVENT_TYPES.map(|kind| {
             Self::send(
                 home,
@@ -203,6 +219,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             )
         });
         future::try_join_all(subscriptions).await?;
+        drop(subscribed);
         events.unbounded_send(Event::Reconnected).ok();
         loop {
             time::sleep(interval).await;
@@ -255,7 +272,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         if !call.target.is_empty() {
             command["target"] = json!({ "entity_id": call.target });
         }
-        let mut result = self.request(command).await?;
+        let mut result = self.service(command, self.deadline).await?;
         let response = || result.get_mut("response").map_or(Value::Null, Value::take);
         Ok(call.return_response.then(response))
     }
@@ -289,7 +306,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             "type": "call_service", "domain": "assist_satellite", "service": service,
             "target": { "entity_id": [satellite] }, "service_data": data,
         });
-        self.request_within(command, self.announce_deadline).await?;
+        self.service(command, self.announce_deadline).await?;
         Ok(())
     }
 
@@ -318,6 +335,18 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         self.request_within(command, self.deadline).await
     }
 
+    /// Sends the service call `command` after the subscriptions, and waits `deadline` in all for
+    /// its result. HA sends the state changes of a call before its result, so `events` has them.
+    async fn service(&self, command: Value, deadline: Duration) -> anyhow::Result<Value> {
+        let call = async {
+            drop(self.subscribing.lock().await);
+            self.request_within(command, deadline).await
+        };
+        time::timeout(deadline, call)
+            .await
+            .unwrap_or_else(|_| Err(timeout(deadline)))
+    }
+
     /// Sends the JSON object `command` with the next ID and waits `deadline` for its result.
     async fn request_within(
         &self,
@@ -343,7 +372,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         };
         time::timeout(deadline, exchange)
             .await
-            .map_err(|_| anyhow::anyhow!("timeout error: no result within {deadline:?}"))?
+            .map_err(|_| timeout(deadline))?
     }
 
     /// Sends a result or a `pong` to its pending request and an event to `events`. Ignores
@@ -407,6 +436,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Home for HaHome<S> {
 /// The wait before connection attempt `attempt + 1`: 100 ms, doubled each attempt, at most 2 s.
 fn delay(attempt: u32) -> Duration {
     Duration::from_millis(100 << attempt.min(5)).min(Duration::from_secs(2))
+}
+
+/// The error of a request without a result within `deadline`.
+fn timeout(deadline: Duration) -> anyhow::Error {
+    anyhow::anyhow!("timeout error: no result within {deadline:?}")
 }
 
 /// The error of a request while HA is disconnected.
@@ -483,6 +517,25 @@ enum HaEvent {
         alias = "entity_registry_updated"
     )]
     RegistryUpdated,
+    /// A timer helper finished.
+    #[serde(rename = "timer.finished")]
+    TimerFinished {
+        /// The timer helper.
+        data: TimerData,
+    },
+    /// A timer helper was cancelled.
+    #[serde(rename = "timer.cancelled")]
+    TimerCancelled {
+        /// The timer helper.
+        data: TimerData,
+    },
+}
+
+/// The data of a timer event.
+#[derive(Deserialize)]
+struct TimerData {
+    /// The timer helper.
+    entity_id: String,
 }
 
 /// The data of a `state_changed` event.
@@ -506,6 +559,14 @@ impl From<HaEvent> for Event {
                 context,
             },
             HaEvent::RegistryUpdated => Self::RegistryUpdated,
+            HaEvent::TimerFinished { data } => Self::TimerEnded {
+                entity_id: data.entity_id,
+                end: TimerEnd::Finished,
+            },
+            HaEvent::TimerCancelled { data } => Self::TimerEnded {
+                entity_id: data.entity_id,
+                end: TimerEnd::Cancelled,
+            },
         }
     }
 }
@@ -585,6 +646,7 @@ fn unexpected(kind: &str) -> String {
 mod tests {
     use super::*;
 
+    use futures::FutureExt;
     use futures::future;
     use serde_json::Value;
     use tokio::io::DuplexStream;
@@ -1149,6 +1211,98 @@ mod tests {
         assert_eq!(network.event().await, Event::Reconnected);
         assert_eq!(network.attempt(1) - failed, Duration::from_millis(100));
         drop(server);
+    }
+
+    /// The timer helper of the timer tests.
+    const JARVIS_1: &str = "timer.jarvis_1";
+
+    /// The event `kind` of `timer.jarvis_1`.
+    fn timer_event(kind: &str) -> Value {
+        json!({ "event_type": kind, "data": { "entity_id": JARVIS_1 } })
+    }
+
+    /// AC-19.7-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_7_1_timer_events_give_timer_ended() {
+        for (kind, end) in [
+            ("timer.finished", TimerEnd::Finished),
+            ("timer.cancelled", TimerEnd::Cancelled),
+        ] {
+            let entity_id = JARVIS_1.to_owned();
+            let expected = Event::TimerEnded { entity_id, end };
+            assert_eq!(next_event(timer_event(kind)).await, expected);
+        }
+    }
+
+    /// AC-19.7-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_7_2_subscribes_to_timer_events_before_reconnected() {
+        let (_home, mut network) = start(0);
+        let _server = network.accept().await;
+        assert_eq!(network.event().await, Event::Reconnected);
+        for kind in ["timer.finished", "timer.cancelled"] {
+            assert!(EVENT_TYPES.contains(&kind), "no subscription to {kind}");
+        }
+    }
+
+    /// The state `value` of `timer.jarvis_1`, as HA gives it.
+    fn timer(value: &str) -> Value {
+        let mut state = house()["states"][0].clone();
+        (state["entity_id"], state["state"]) = (json!(JARVIS_1), json!(value));
+        state
+    }
+
+    /// The `state_changed` event of `timer.jarvis_1` to `value`.
+    fn timer_change(value: &str) -> Value {
+        let data = json!({ "entity_id": JARVIS_1, "old_state": null, "new_state": timer(value) });
+        let context = json!({ "id": "01K", "user_id": null, "parent_id": null });
+        json!({ "event_type": "state_changed", "data": data, "context": context })
+    }
+
+    /// The event of the HA event `event`.
+    fn parsed(event: Value) -> Event {
+        serde_json::from_value::<HaEvent>(event)
+            .expect("the event is an HA event")
+            .into()
+    }
+
+    /// The pending result of a `call`.
+    type Call = tokio::task::JoinHandle<anyhow::Result<Option<Value>>>;
+
+    /// Starts an adapter and a `call` while the server holds the results of the subscriptions.
+    /// Checks that the server receives nothing for 1 s, then gives the results.
+    async fn call_after_subscriptions() -> (Network, FakeHaServer, Call) {
+        let (home, mut network) = start(0);
+        let mut server = network.authenticated().await;
+        let mut subscriptions = Vec::new();
+        for _ in EVENT_TYPES {
+            subscriptions.push(server.receive().await);
+        }
+        let call = tokio::spawn(async move { home.call(turn_on(false)).await });
+        time::sleep(Duration::from_secs(1)).await;
+        let early = server.request().now_or_never();
+        assert!(early.is_none(), "the call was sent early: {early:?}");
+        for subscription in &subscriptions {
+            server.reply(subscription, Value::Null).await;
+        }
+        (network, server, call)
+    }
+
+    /// AC-19.7-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_7_3_call_waits_for_subscriptions() -> anyhow::Result<()> {
+        let (mut network, mut server, call) = call_after_subscriptions().await;
+        let request = server.receive().await;
+        assert_eq!(request["type"], "call_service");
+        let change = timer_change("active");
+        server.send_event(change.clone()).await;
+        let result = json!({ "context": { "id": "01K" } });
+        server.reply(&request, result).await;
+        call.await??;
+        assert_eq!(network.event().await, Event::Reconnected);
+        let delivered = network.events.next().now_or_never().flatten();
+        assert_eq!(delivered, Some(parsed(change)));
+        Ok(())
     }
 
     /// A `light.turn_on` call of the kitchen light at half brightness.
