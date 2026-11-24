@@ -905,6 +905,12 @@ pub fn ex_value_from_f64(number: f64) -> Value {
     <Value as From<f64>>::from(number)
 }
 
+/// Makes the JSON number `number`. <https://docs.rs/serde_json/1/serde_json/enum.Value.html#impl-From%3Cu32%3E-for-Value>
+#[verifier::external_fn_specification]
+pub fn ex_value_from_u32(number: u32) -> Value {
+    <Value as From<u32>>::from(number)
+}
+
 /// The text of the JSON string `value`, or `None` for another JSON type.
 pub uninterp spec fn text(value: Value) -> Option<Seq<char>>;
 

@@ -147,3 +147,21 @@ responses = ["Okay, never mind.", "Cancelled."]
 
 [pools.not_in_library]
 responses = ["That is not in the Plex library.", "I could not find that on Plex."]
+
+[pools.ask_timer]
+responses = ['Which timer, {% for t in timers %}the {% if t.timer %}{{ t.timer }} timer{% else %}timer for {{ t.duration }}{% endif %}{{ " or " if loop.revindex == 2 else (", " if not loop.last else "") }}{% endfor %}?']
+
+[pools.ask_duration]
+responses = ["For how long?"]
+
+[pools.timer_full]
+responses = ["All timers are in use."]
+
+[pools.timer_taken]
+responses = ["There is already a {{ timer }} timer."]
+
+[pools.timer_missing]
+responses = ["{% if timer %}There is no {{ timer }} timer.{% else %}No timer is running.{% endif %}"]
+
+[pools.timer_done]
+responses = ["{% if timer %}Your {{ timer }} timer is done.{% else %}Your timer is done.{% endif %}"]

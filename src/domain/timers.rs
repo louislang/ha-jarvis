@@ -5,13 +5,21 @@ use std::collections::BTreeMap;
 use std::num::ParseIntError;
 
 use jiff::Timestamp;
+use rand::rngs::StdRng;
 use serde::Deserialize;
+use serde_json::Value;
 use text2num::Language;
 use vstd::prelude::*;
 
+use crate::domain::decide::Chosen;
+use crate::domain::decide::Decision;
+use crate::domain::decide::Job;
 use crate::domain::dialog;
 use crate::domain::intent;
+use crate::domain::responses;
+use crate::domain::responses::Pools;
 use crate::domain::select;
+use crate::domain::state::ServiceCall;
 use crate::domain::state::State;
 use crate::domain::state_cache::StateCache;
 
@@ -499,6 +507,7 @@ pub fn candidates(action: TimerAction, timers: &Timers, cache: &StateCache) -> V
     }
     found.sort_by(ascending);
     proof! {
+        assert(crate::domain::contracts::gives(ascending, by_order()));
         let places = choose|places: Seq<int>| crate::domain::contracts::placed(kept, found@, by_order(), places);
         assert forall|index: int| 0 <= index < found@.len()
             implies entry_of(timers.timers@, *cache, action, #[trigger] found@[index]) by {
@@ -829,6 +838,139 @@ fn remaining(found: &[Candidate], cache: &StateCache, now: Timestamp) -> Vec<Rem
     timers
 }
 
+/// The decision for `plan` of `request`: a reply from the pool of the intent or of the plan with
+/// the call of `Start` or `Act`, else a System Two job.
+#[verus_spec(decision =>
+    requires
+        responses::filled(pools@),
+        responses::timer_pooled(pools@),
+        pools@.contains_key(crate::domain::contracts::string_key(request.intent@)),
+        pools@.contains_key(crate::domain::contracts::string_key("filler"@)),
+    ensures
+        decision matches Decision::Reply { call: Some(made), .. } ==> timer_call(*plan, made),
+        decision is Reply || crate::domain::decide::deferred(decision, request.transcript),
+        plan is Unclear ==> crate::domain::decide::deferred(decision, request.transcript),
+)]
+#[must_use]
+pub fn answer(plan: &Plan, request: &TimerRequest, pools: &Pools, rng: &mut StdRng) -> Decision {
+    let intent = request.intent.as_str();
+    let (pool, call) = match plan {
+        Plan::Start { helper, seconds } => {
+            let mut data = serde_json::Map::new();
+            data.insert("duration".to_owned(), Value::from(*seconds));
+            (intent, Some(call(helper, "start", data)))
+        }
+        Plan::Act {
+            helper, service, ..
+        } => (intent, Some(call(helper, service, serde_json::Map::new()))),
+        Plan::Taken => ("timer_taken", None),
+        Plan::Full => ("timer_full", None),
+        Plan::Missing => ("timer_missing", None),
+        _ => return defer(request, pools, rng),
+    };
+    match rendered(pools, pool, &context(plan, request), rng) {
+        Some(reply) => Decision::Reply { reply, call },
+        None => defer(request, pools, rng),
+    }
+}
+
+/// A filler and a System Two job with the transcript of `request`.
+#[verus_spec(decision =>
+    requires
+        responses::filled(pools@),
+        pools@.contains_key(crate::domain::contracts::string_key("filler"@)),
+    ensures
+        crate::domain::decide::deferred(decision, request.transcript),
+)]
+fn defer(request: &TimerRequest, pools: &Pools, rng: &mut StdRng) -> Decision {
+    Decision::Defer {
+        filler: pick(pools, "filler", rng),
+        job: Job::Llm(request.transcript.clone()),
+    }
+}
+
+/// The call of the timer service `service` on `helper` with `data`.
+#[verus_spec(made =>
+    ensures
+        made.domain@ == "timer"@ && made.service@ == service@,
+        made.target@.len() == 1 && made.target@[0]@ == helper@,
+)]
+fn call(helper: &str, service: &str, data: serde_json::Map<String, Value>) -> ServiceCall {
+    ServiceCall {
+        domain: "timer".to_owned(),
+        service: service.to_owned(),
+        target: vec![helper.to_owned()],
+        data,
+        return_response: false,
+    }
+}
+
+/// The template context of `plan`: `timer` and `duration` of the entry of `Act`, else of
+/// `request`.
+#[verus_verify]
+fn context(plan: &Plan, request: &TimerRequest) -> serde_json::Map<String, Value> {
+    match plan {
+        Plan::Act { timer, .. } => described(timer.name.as_ref(), Some(&timer.duration)),
+        _ => described(request.timer.as_ref(), request.duration.as_ref()),
+    }
+}
+
+/// The variables `timer` and `duration` with `name` and `duration`, else an empty string.
+#[verus_verify]
+fn described(name: Option<&String>, duration: Option<&String>) -> serde_json::Map<String, Value> {
+    let mut variables = serde_json::Map::new();
+    variables.insert("timer".to_owned(), Value::from(text(name)));
+    variables.insert("duration".to_owned(), Value::from(text(duration)));
+    variables
+}
+
+/// A copy of `value`, or an empty string.
+#[verus_verify]
+fn text(value: Option<&String>) -> String {
+    match value {
+        Some(value) => value.clone(),
+        None => String::new(),
+    }
+}
+
+/// A random response of the pool `name` rendered with `context`, or `None` when it does not render.
+#[verus_spec(
+    requires
+        responses::filled(pools@),
+        pools@.contains_key(crate::domain::contracts::string_key(name@)),
+)]
+fn rendered(
+    pools: &Pools,
+    name: &str,
+    context: &serde_json::Map<String, Value>,
+    rng: &mut StdRng,
+) -> Option<Chosen> {
+    let mut chosen = pick(pools, name, rng);
+    chosen.text = responses::render(chosen.text.as_str(), context).ok()?;
+    Some(chosen)
+}
+
+/// A random response of the pool `name`, with its template as the text.
+#[verus_spec(
+    requires
+        responses::filled(pools@),
+        pools@.contains_key(crate::domain::contracts::string_key(name@)),
+)]
+fn pick(pools: &Pools, name: &str, rng: &mut StdRng) -> Chosen {
+    proof! {
+        broadcast use
+            crate::domain::contracts::axiom_string_contains_borrowed_key,
+            crate::domain::contracts::axiom_string_maps_borrowed_key;
+    }
+    let pool = pools.get(name).expect("the pool exists");
+    let index = responses::select(pool, rng, None);
+    Chosen {
+        text: pool.responses[index].text.clone(),
+        pool: name.to_owned(),
+        index,
+    }
+}
+
 verus! {
 
 broadcast use {
@@ -993,6 +1135,19 @@ pub open spec fn reconciled(table: Map<String, Timer>, timers: Map<String, Timer
         && crate::domain::speaker::shows(cache, (*all[index].0)@, "idle"@) ==> !table.contains_key(*all[index].0)
 }
 
+/// True when `made` is a call of the domain `timer` on the helper of `plan`: `start` for `Start`,
+/// the service of `Act` for `Act`.
+pub open spec fn timer_call(plan: Plan, made: ServiceCall) -> bool {
+    &&& made.domain@ == "timer"@
+    &&& match plan {
+        Plan::Start { helper, .. } => made.target@.len() == 1 && made.target@[0]@ == helper@
+            && made.service@ == "start"@,
+        Plan::Act { helper, service, .. } => made.target@.len() == 1 && made.target@[0]@ == helper@
+            && made.service@ == service@,
+        _ => false,
+    }
+}
+
 /// True when `action` removes the entry that it acts on.
 pub open spec fn removes(action: TimerAction) -> bool {
     action is Cancel || action is CancelLast
@@ -1056,10 +1211,13 @@ proof fn index_of(timers: Map<String, Timer>, all: Seq<(&String, &Timer)>, helpe
 mod tests {
     use std::sync::Arc;
 
+    use rand::SeedableRng;
     use serde_json::Value;
     use serde_json::json;
 
     use super::*;
+    use crate::domain::responses::Pool;
+    use crate::domain::responses::Response;
 
     #[test]
     fn ac_19_2_1_durations_in_seconds() {
@@ -1478,5 +1636,112 @@ mod tests {
         );
         let none = planned(TimerAction::Left, None, &timers, &StateCache::default());
         assert_eq!(none.0, Plan::Missing);
+    }
+
+    /// The pools of `responses.toml`, each response with no uses.
+    fn pools() -> Pools {
+        let file: toml::Table =
+            toml::from_str(include_str!("../../responses.toml")).expect("responses.toml is TOML");
+        let mut pools = Pools::new();
+        for (name, pool) in file["pools"].as_table().expect("pools is a table") {
+            let texts: Vec<String> = pool["responses"].clone().try_into().expect("texts");
+            let responses = texts.into_iter().map(|text| Response {
+                text,
+                uses: 0,
+                generated: false,
+            });
+            let responses = responses.collect();
+            pools.insert(
+                name.clone(),
+                Pool {
+                    responses,
+                    last: None,
+                },
+            );
+        }
+        pools
+    }
+
+    /// The answer to `plan` for a request of `intent` with the slots `timer` and `duration`.
+    fn answered(
+        plan: &Plan,
+        intent: &str,
+        timer: Option<&str>,
+        duration: Option<&str>,
+    ) -> Decision {
+        let request = TimerRequest {
+            intent: intent.to_owned(),
+            ..request(timer, duration)
+        };
+        answer(plan, &request, &pools(), &mut StdRng::seed_from_u64(1))
+    }
+
+    /// The text and the call of the reply `decision`.
+    fn replied(decision: Decision) -> (String, Option<ServiceCall>) {
+        let Decision::Reply { reply, call } = decision else {
+            panic!("{decision:?} is not a reply");
+        };
+        (reply.text, call)
+    }
+
+    /// The call of the timer service `service` on `timer.jarvis_1` with `data`.
+    fn called(service: &str, data: &Value) -> ServiceCall {
+        ServiceCall {
+            domain: "timer".to_owned(),
+            service: service.to_owned(),
+            target: vec!["timer.jarvis_1".to_owned()],
+            data: data.as_object().expect("data is an object").clone(),
+            return_response: false,
+        }
+    }
+
+    #[test]
+    fn ac_19_6_1_start_replies_and_starts_the_helper() {
+        let plan = Plan::Start {
+            helper: "timer.jarvis_1".to_owned(),
+            seconds: 300,
+        };
+        let decision = answered(&plan, "timer_set", Some("chicken"), Some("five minutes"));
+        let text = "Your chicken timer is set for five minutes.".to_owned();
+        let call = Some(called("start", &json!({ "duration": 300 })));
+        assert_eq!(replied(decision), (text, call));
+        let decision = answered(&plan, "timer_set", None, Some("ten minutes"));
+        assert_eq!(replied(decision).0, "Timer set for ten minutes.");
+    }
+
+    #[test]
+    fn ac_19_6_2_act_replies_and_calls_the_service() {
+        let plan = act("timer.jarvis_1", "cancel", generic(0));
+        let decision = answered(&plan, "timer_cancel", None, None);
+        let text = "I cancelled the timer for ten minutes.".to_owned();
+        assert_eq!(
+            replied(decision),
+            (text, Some(called("cancel", &json!({}))))
+        );
+    }
+
+    #[test]
+    fn ac_19_6_3_taken_full_and_missing_reply_with_no_call() {
+        let cases = [
+            (
+                Plan::Taken,
+                Some("chicken"),
+                "There is already a chicken timer.",
+            ),
+            (Plan::Full, None, "All timers are in use."),
+            (Plan::Missing, Some("pizza"), "There is no pizza timer."),
+            (Plan::Missing, None, "No timer is running."),
+        ];
+        for (plan, timer, text) in cases {
+            let decision = answered(&plan, "timer_cancel", timer, None);
+            assert_eq!(replied(decision), (text.to_owned(), None), "{plan:?}");
+        }
+    }
+
+    #[test]
+    fn ac_19_6_4_unclear_defers() {
+        let decision = answered(&Plan::Unclear, "timer_set", None, Some("ten bananas"));
+        let deferred = matches!(&decision, Decision::Defer { job: Job::Llm(asked), .. } if asked == "set a timer");
+        assert!(deferred, "{decision:?}");
     }
 }
