@@ -15,7 +15,9 @@ use crate::domain::decide::Chosen;
 use crate::domain::decide::Decision;
 use crate::domain::decide::Job;
 use crate::domain::dialog;
+use crate::domain::dialog::Pending;
 use crate::domain::intent;
+use crate::domain::model::Slot;
 use crate::domain::responses;
 use crate::domain::responses::Pools;
 use crate::domain::select;
@@ -788,7 +790,7 @@ fn meant(slot: Option<&String>, found: Vec<Candidate>, similarity: f64) -> Vec<C
 /// The label of each candidate of `found`: its name, else its duration.
 #[verus_spec(labels =>
     ensures
-        labels@.len() == found@.len(),
+        labelled(labels@, found@),
 )]
 fn labels(found: &[Candidate]) -> Vec<String> {
     let mut labels = Vec::new();
@@ -797,6 +799,8 @@ fn labels(found: &[Candidate]) -> Vec<String> {
         invariant
             index <= found@.len(),
             labels@.len() == index,
+            forall|earlier: int| 0 <= earlier < index
+                ==> labels@[earlier] == label(#[trigger] found@[earlier].timer),
         decreases found@.len() - index,
     ))]
     while index < found.len() {
@@ -839,7 +843,8 @@ fn remaining(found: &[Candidate], cache: &StateCache, now: Timestamp) -> Vec<Rem
 }
 
 /// The decision for `plan` of `request`: a reply from the pool of the intent or of the plan with
-/// the call of `Start` or `Act`, else a System Two job.
+/// the call of `Start` or `Act`, a question for a missing slot, or a System Two job for `Unclear`
+/// and for a pool that does not render.
 #[verus_spec(decision =>
     requires
         responses::filled(pools@),
@@ -848,11 +853,57 @@ fn remaining(found: &[Candidate], cache: &StateCache, now: Timestamp) -> Vec<Rem
         pools@.contains_key(crate::domain::contracts::string_key("filler"@)),
     ensures
         decision matches Decision::Reply { call: Some(made), .. } ==> timer_call(*plan, made),
-        decision is Reply || crate::domain::decide::deferred(decision, request.transcript),
+        plan is Taken || plan is Full || plan is Missing || plan is Left
+            ==> decision matches Decision::Reply { call: None, .. }
+            || crate::domain::decide::deferred(decision, request.transcript),
         plan is Unclear ==> crate::domain::decide::deferred(decision, request.transcript),
+        plan is NoDuration ==> crate::domain::decide::deferred(decision, request.transcript)
+            || (slot_asked(decision, "duration"@) && asked_choices(decision).len() == 0),
+        plan matches Plan::Several { timers } ==> crate::domain::decide::deferred(decision, request.transcript)
+            || (slot_asked(decision, "timer"@) && labelled(asked_choices(decision), timers@)),
 )]
 #[must_use]
 pub fn answer(plan: &Plan, request: &TimerRequest, pools: &Pools, rng: &mut StdRng) -> Decision {
+    let context = context(plan, request);
+    let decision = match plan {
+        Plan::Unclear => None,
+        Plan::Several { timers } => {
+            let pending = awaiting(request, "timer", labels(timers));
+            asked(pools, "ask_timer", &context, pending, rng)
+        }
+        Plan::NoDuration => {
+            let pending = awaiting(request, "duration", Vec::new());
+            asked(pools, "ask_duration", &context, pending, rng)
+        }
+        _ => replied(plan, request, &context, pools, rng),
+    };
+    match decision {
+        Some(decision) => decision,
+        None => Decision::Defer {
+            filler: pick(pools, "filler", rng),
+            job: Job::Llm(request.transcript.clone()),
+        },
+    }
+}
+
+/// The reply from the pool of the intent of `request` or of `plan`, with the call of `Start` or
+/// `Act`, or `None` when the pool does not render with `context`.
+#[verus_spec(decision =>
+    requires
+        responses::filled(pools@),
+        responses::timer_pooled(pools@),
+        pools@.contains_key(crate::domain::contracts::string_key(request.intent@)),
+    ensures
+        decision is None || (decision matches Some(Decision::Reply { call, .. })
+            && (call matches Some(made) ==> timer_call(*plan, made))),
+)]
+fn replied(
+    plan: &Plan,
+    request: &TimerRequest,
+    context: &serde_json::Map<String, Value>,
+    pools: &Pools,
+    rng: &mut StdRng,
+) -> Option<Decision> {
     let intent = request.intent.as_str();
     let (pool, call) = match plan {
         Plan::Start { helper, seconds } => {
@@ -866,27 +917,10 @@ pub fn answer(plan: &Plan, request: &TimerRequest, pools: &Pools, rng: &mut StdR
         Plan::Taken => ("timer_taken", None),
         Plan::Full => ("timer_full", None),
         Plan::Missing => ("timer_missing", None),
-        _ => return defer(request, pools, rng),
+        _ => (intent, None),
     };
-    match rendered(pools, pool, &context(plan, request), rng) {
-        Some(reply) => Decision::Reply { reply, call },
-        None => defer(request, pools, rng),
-    }
-}
-
-/// A filler and a System Two job with the transcript of `request`.
-#[verus_spec(decision =>
-    requires
-        responses::filled(pools@),
-        pools@.contains_key(crate::domain::contracts::string_key("filler"@)),
-    ensures
-        crate::domain::decide::deferred(decision, request.transcript),
-)]
-fn defer(request: &TimerRequest, pools: &Pools, rng: &mut StdRng) -> Decision {
-    Decision::Defer {
-        filler: pick(pools, "filler", rng),
-        job: Job::Llm(request.transcript.clone()),
-    }
+    let reply = rendered(pools, pool, context, rng)?;
+    Some(Decision::Reply { reply, call })
 }
 
 /// The call of the timer service `service` on `helper` with `data`.
@@ -905,22 +939,95 @@ fn call(helper: &str, service: &str, data: serde_json::Map<String, Value>) -> Se
     }
 }
 
-/// The template context of `plan`: `timer` and `duration` of the entry of `Act`, else of
-/// `request`.
-#[verus_verify]
-fn context(plan: &Plan, request: &TimerRequest) -> serde_json::Map<String, Value> {
-    match plan {
-        Plan::Act { timer, .. } => described(timer.name.as_ref(), Some(&timer.duration)),
-        _ => described(request.timer.as_ref(), request.duration.as_ref()),
+/// The question from the pool `name` rendered with `context`, with `pending`, or `None` when the
+/// pool does not render.
+#[verus_spec(decision =>
+    requires
+        responses::filled(pools@),
+        pools@.contains_key(crate::domain::contracts::string_key(name@)),
+    ensures
+        decision is None || (decision matches Some(Decision::Ask { pending: waiting, .. }) && waiting == pending),
+)]
+fn asked(
+    pools: &Pools,
+    name: &str,
+    context: &serde_json::Map<String, Value>,
+    pending: Pending,
+    rng: &mut StdRng,
+) -> Option<Decision> {
+    let question = rendered(pools, name, context, rng)?;
+    Some(Decision::Ask { question, pending })
+}
+
+/// The dialog of `request` that waits for the slot `missing` with `choices`, with the `timer` slot
+/// of `request` as its slot.
+#[verus_spec(waiting =>
+    ensures
+        waiting matches Pending::Slot { missing: asked, choices: offered, .. }
+            && asked@ == missing@ && offered == choices,
+)]
+fn awaiting(request: &TimerRequest, missing: &str, choices: Vec<String>) -> Pending {
+    let mut slots = Vec::new();
+    if let Some(name) = &request.timer {
+        slots.push(Slot {
+            name: "timer".to_owned(),
+            value: name.clone(),
+        });
+    }
+    Pending::Slot {
+        intent: request.intent.clone(),
+        slots,
+        missing: missing.to_owned(),
+        choices,
+        transcript: request.transcript.clone(),
     }
 }
 
-/// The variables `timer` and `duration` with `name` and `duration`, else an empty string.
+/// The template context of `plan`: `timer` and `duration` of the entry of `Act`, else of
+/// `request`, and the `timers` of `Left` and `Several`.
 #[verus_verify]
-fn described(name: Option<&String>, duration: Option<&String>) -> serde_json::Map<String, Value> {
+fn context(plan: &Plan, request: &TimerRequest) -> serde_json::Map<String, Value> {
+    let mut context = match plan {
+        Plan::Act { timer, .. } => described(timer.name.as_ref(), Some(&timer.duration), None),
+        _ => described(request.timer.as_ref(), request.duration.as_ref(), None),
+    };
+    let mut timers = Vec::new();
+    match plan {
+        Plan::Left { timers: found } => {
+            for remaining in found {
+                let timer = &remaining.timer;
+                let left = Some(remaining.left);
+                let entry = described(timer.name.as_ref(), Some(&timer.duration), left);
+                timers.push(Value::from(entry));
+            }
+        }
+        Plan::Several { timers: found } => {
+            for candidate in found {
+                let timer = &candidate.timer;
+                let entry = described(timer.name.as_ref(), Some(&timer.duration), None);
+                timers.push(Value::from(entry));
+            }
+        }
+        _ => return context,
+    }
+    context.insert("timers".to_owned(), Value::from(timers));
+    context
+}
+
+/// The variables `timer` and `duration` with `name` and `duration`, else an empty string, and
+/// `left` as spoken text when given.
+#[verus_verify]
+fn described(
+    name: Option<&String>,
+    duration: Option<&String>,
+    left: Option<u32>,
+) -> serde_json::Map<String, Value> {
     let mut variables = serde_json::Map::new();
     variables.insert("timer".to_owned(), Value::from(text(name)));
     variables.insert("duration".to_owned(), Value::from(text(duration)));
+    if let Some(seconds) = left {
+        variables.insert("left".to_owned(), Value::from(spoken(seconds)));
+    }
     variables
 }
 
@@ -1146,6 +1253,33 @@ pub open spec fn timer_call(plan: Plan, made: ServiceCall) -> bool {
             && made.service@ == service@,
         _ => false,
     }
+}
+
+/// The label of `timer`: its name, else its duration.
+pub open spec fn label(timer: Timer) -> String {
+    match timer.name {
+        Some(name) => name,
+        None => timer.duration,
+    }
+}
+
+/// True when `decision` asks for the slot `missing`.
+pub open spec fn slot_asked(decision: Decision, missing: Seq<char>) -> bool {
+    decision matches Decision::Ask { pending: Pending::Slot { missing: asked, .. }, .. } && asked@ == missing
+}
+
+/// The choices of the slot question `decision`.
+pub open spec fn asked_choices(decision: Decision) -> Seq<String> {
+    match decision {
+        Decision::Ask { pending: Pending::Slot { choices, .. }, .. } => choices@,
+        _ => seq![],
+    }
+}
+
+/// True when `labels` has the label of each candidate of `found`, in order.
+pub open spec fn labelled(labels: Seq<String>, found: Seq<Candidate>) -> bool {
+    &&& labels.len() == found.len()
+    &&& forall|index: int| 0 <= index < found.len() ==> labels[index] == label(#[trigger] found[index].timer)
 }
 
 /// True when `action` removes the entry that it acts on.
@@ -1684,6 +1818,14 @@ mod tests {
         (reply.text, call)
     }
 
+    /// The text and the pending dialog of the question `decision`.
+    fn asked(decision: Decision) -> (String, Pending) {
+        let Decision::Ask { question, pending } = decision else {
+            panic!("{decision:?} is not a question");
+        };
+        (question.text, pending)
+    }
+
     /// The call of the timer service `service` on `timer.jarvis_1` with `data`.
     fn called(service: &str, data: &Value) -> ServiceCall {
         ServiceCall {
@@ -1743,5 +1885,75 @@ mod tests {
         let decision = answered(&Plan::Unclear, "timer_set", None, Some("ten bananas"));
         let deferred = matches!(&decision, Decision::Defer { job: Job::Llm(asked), .. } if asked == "set a timer");
         assert!(deferred, "{decision:?}");
+    }
+
+    /// The candidate of `timer` on `helper`.
+    fn candidate(helper: &str, timer: Timer) -> Candidate {
+        Candidate {
+            helper: helper.to_owned(),
+            timer,
+        }
+    }
+
+    #[test]
+    fn ac_19_6b_1_several_asks_which_timer() {
+        let chicken = candidate("timer.jarvis_1", entry("chicken", 0));
+        let pizza = candidate("timer.jarvis_2", entry("pizza", 1));
+        let plan = Plan::Several {
+            timers: vec![chicken.clone(), pizza.clone()],
+        };
+        let pending = Pending::Slot {
+            intent: "timer_cancel".to_owned(),
+            slots: Vec::new(),
+            missing: "timer".to_owned(),
+            choices: vec!["chicken".to_owned(), "pizza".to_owned()],
+            transcript: "set a timer".to_owned(),
+        };
+        let text = "Which timer, the chicken timer or the pizza timer?".to_owned();
+        let decision = answered(&plan, "timer_cancel", None, None);
+        assert_eq!(asked(decision), (text, pending));
+        let ten = candidate("timer.jarvis_3", generic(2));
+        let plan = Plan::Several {
+            timers: vec![chicken, pizza, ten],
+        };
+        let text = "Which timer, the chicken timer, the pizza timer or the timer for ten minutes?";
+        assert_eq!(asked(answered(&plan, "timer_cancel", None, None)).0, text);
+    }
+
+    #[test]
+    fn ac_19_6b_2_left_lists_the_spoken_times() {
+        let chicken = Remaining {
+            timer: entry("chicken", 0),
+            left: 252,
+        };
+        let ten = Remaining {
+            timer: generic(1),
+            left: 600,
+        };
+        let plan = Plan::Left {
+            timers: vec![chicken, ten],
+        };
+        let text =
+            "The chicken timer has 4 minutes and 12 seconds left. The timer for ten minutes \
+            has 10 minutes left."
+                .to_owned();
+        let decision = answered(&plan, "timer_left", None, None);
+        assert_eq!(replied(decision), (text, None));
+    }
+
+    #[test]
+    fn ac_19_6b_3_no_duration_asks_for_how_long() {
+        let decision = answered(&Plan::NoDuration, "timer_set", Some("chicken"), None);
+        let pending = Pending::Slot {
+            intent: "timer_set".to_owned(),
+            slots: vec![Slot {
+                name: "timer".to_owned(),
+                value: "chicken".to_owned(),
+            }],
+            missing: "duration".to_owned(),
+            choices: Vec::new(),
+            transcript: "set a timer".to_owned(),
+        };
+        assert_eq!(asked(decision), ("For how long?".to_owned(), pending));
     }
 }
