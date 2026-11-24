@@ -1,28 +1,54 @@
-//! The timer use case: the timer table, its store and the timer helpers of HA.
+//! The timer use case: the timer table, its store, the timer helpers of HA and the rings.
 
 use std::collections::BTreeMap;
 use std::mem;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use jiff::Timestamp;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::time::Instant;
 
 use crate::domain::decide::Decision;
 use crate::domain::responses::Pools;
 use crate::domain::state::Event;
 use crate::domain::state::State;
+use crate::domain::state::TimerEnd;
 use crate::domain::state_cache::StateCache;
 use crate::domain::timers;
 use crate::domain::timers::Plan;
+use crate::domain::timers::Timer;
 use crate::domain::timers::TimerAction;
 use crate::domain::timers::TimerInput;
 use crate::domain::timers::TimerRequest;
 use crate::domain::timers::Timers;
 use crate::ports::TimerStore;
 
-/// The timer table and the view of the timer helpers, which one lock guards.
+/// The time between the starts of two rings.
+pub const RING_INTERVAL: Duration = Duration::from_secs(15);
+
+/// The most rings of one timer.
+pub const RINGS: u32 = 8;
+
+/// The time after the end of a timer from which it no longer rings.
+pub const RING_FOR: Duration = Duration::from_secs(120);
+
+/// The announces of the end of a timer on the satellite that set it.
+#[derive(Clone)]
+pub struct Ring {
+    /// The satellite that set the timer.
+    pub satellite: String,
+    /// The number of the ring. A new finish on the helper gives a new number.
+    pub number: u64,
+    /// The ended entry.
+    pub timer: Timer,
+    /// The time of the end.
+    pub start: Instant,
+}
+
+/// The timer table, the view of the timer helpers and the rings, which one lock guards.
 struct Desk {
     /// The timer table.
     timers: Timers,
@@ -30,16 +56,24 @@ struct Desk {
     view: StateCache,
     /// The run count of each helper: the new runs that the view showed.
     runs: BTreeMap<String, u64>,
+    /// The ring of the last finished timer of each helper.
+    rings: BTreeMap<String, Ring>,
+    /// The number of the last ring.
+    rung: u64,
 }
 
 impl Desk {
-    /// The table after `input`, which also changes the view.
-    fn after(&mut self, input: TimerInput) -> Timers {
+    /// The table after `input`, which also changes the view, and the helper and the ring that a
+    /// finish starts.
+    fn after(&mut self, input: TimerInput) -> (Timers, Option<(String, Ring)>) {
         match input {
-            TimerInput::Event(Event::TimerEnded { entity_id, .. }) => {
-                timers::ended(self.timers.clone(), &entity_id).1
+            TimerInput::Event(Event::TimerEnded { entity_id, end }) => {
+                let (entry, table) = timers::ended(self.timers.clone(), &entity_id);
+                let finished = entry.filter(|_| end == TimerEnd::Finished);
+                let ring = finished.and_then(|timer| self.ring(entity_id, timer));
+                (table, ring)
             }
-            TimerInput::Event(event) => self.changed(event),
+            TimerInput::Event(event) => (self.changed(event), None),
             TimerInput::Snapshot(states) => {
                 self.count(&states);
                 let states = states
@@ -49,9 +83,24 @@ impl Desk {
                     states: states.collect(),
                     ..StateCache::default()
                 };
-                timers::reconcile(&self.timers, &self.view)
+                (timers::reconcile(&self.timers, &self.view), None)
             }
         }
+    }
+
+    /// The new ring of `timer` on `helper`, which replaces the ring of the helper, when the timer
+    /// has a satellite.
+    fn ring(&mut self, helper: String, timer: Timer) -> Option<(String, Ring)> {
+        let satellite = timer.satellite.clone()?;
+        self.rung += 1;
+        let ring = Ring {
+            satellite,
+            number: self.rung,
+            timer,
+            start: Instant::now(),
+        };
+        self.rings.insert(helper.clone(), ring.clone());
+        Some((helper, ring))
     }
 
     /// The table after the state change `event` of a helper, which also changes the view and
@@ -118,6 +167,8 @@ impl TimerDesk {
                 timers: timers::restored(&loaded),
                 view: StateCache::default(),
                 runs: BTreeMap::new(),
+                rings: BTreeMap::new(),
+                rung: 0,
             }),
             store,
             similarity,
@@ -183,13 +234,36 @@ impl TimerDesk {
         self.keep(&mut desk, table).await;
     }
 
-    /// Applies each input of `events` to the view and the table, until the sender drops.
-    pub async fn run(&self, mut events: UnboundedReceiver<TimerInput>) {
+    /// Applies each input of `events` to the view and the table, until the sender drops. Gives
+    /// each new ring and its helper to `ring`.
+    pub async fn run(
+        &self,
+        mut events: UnboundedReceiver<TimerInput>,
+        mut ring: impl FnMut(String, Ring),
+    ) {
         while let Some(input) = events.recv().await {
             let mut desk = self.desk.lock().await;
-            let table = desk.after(input);
+            let (table, started) = desk.after(input);
             self.keep(&mut desk, table).await;
+            if let Some((helper, started)) = started {
+                ring(helper, started);
+            }
         }
+    }
+
+    /// True while the desk keeps the ring `number` of `helper` and `RING_FOR` after its start has
+    /// not passed.
+    pub async fn rings(&self, helper: &str, number: u64) -> bool {
+        let desk = self.desk.lock().await;
+        let ring = desk.rings.get(helper);
+        ring.is_some_and(|ring| ring.number == number && Instant::now() < ring.start + RING_FOR)
+    }
+
+    /// Removes the ring `number` of `helper`, whose task ended.
+    pub async fn end(&self, helper: &str, number: u64) {
+        let mut desk = self.desk.lock().await;
+        desk.rings
+            .retain(|key, ring| key != helper || ring.number != number);
     }
 
     /// Makes `table` the table of `desk`, and saves it when it changed. Logs a failed save.
@@ -415,7 +489,7 @@ mod tests {
                 sender.send(input).expect("the receiver is open");
             }
             drop(sender);
-            self.desk.run(receiver).await;
+            self.desk.run(receiver, |_, _| ()).await;
         }
 
         /// The saved entry of `helper`.

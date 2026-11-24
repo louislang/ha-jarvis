@@ -1124,6 +1124,19 @@ fn context(plan: &Plan, request: &TimerRequest) -> serde_json::Map<String, Value
     context
 }
 
+/// The ring text of `timer`: a random response of `timer_done` with its name and duration, or
+/// `None` when it does not render.
+#[verus_spec(
+    requires
+        responses::filled(pools@),
+        responses::timer_pooled(pools@),
+)]
+#[must_use]
+pub fn done(timer: &Timer, pools: &Pools, rng: &mut StdRng) -> Option<Chosen> {
+    let context = described(timer.name.as_ref(), Some(&timer.duration), None);
+    rendered(pools, "timer_done", &context, rng)
+}
+
 /// The variables `timer` and `duration` with `name` and `duration`, else an empty string, and
 /// `left` as spoken text when given.
 #[verus_verify]

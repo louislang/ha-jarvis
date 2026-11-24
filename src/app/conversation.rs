@@ -21,9 +21,11 @@ use jiff::Timestamp;
 use rand::rngs::StdRng;
 use serde_json::Map;
 use serde_json::Value;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 
 use crate::CurrentClassifier;
 use crate::DialogConfig;
@@ -36,6 +38,9 @@ use crate::app::plugins::Plugins;
 use crate::app::speech::Committed;
 use crate::app::speech::Utterances;
 use crate::app::timers::Guard;
+use crate::app::timers::RING_INTERVAL;
+use crate::app::timers::RINGS;
+use crate::app::timers::Ring;
 use crate::app::timers::TimerDesk;
 use crate::app::training::Trigger;
 use crate::domain::catalog::Catalog;
@@ -79,6 +84,8 @@ use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
 use crate::domain::timers;
+use crate::domain::timers::Timer;
+use crate::domain::timers::TimerInput;
 use crate::domain::training;
 use crate::ports::Clock;
 use crate::ports::Context;
@@ -311,6 +318,58 @@ impl Conversation {
             }
         }
         Ok(handled)
+    }
+
+    /// Runs the timer desk on `inputs` with a task for each new ring, which a drop aborts.
+    pub async fn run_timers(&self, inputs: UnboundedReceiver<TimerInput>) {
+        let mut rings = JoinSet::new();
+        let ring = |helper, ring| {
+            while rings.try_join_next().is_some() {}
+            rings.spawn(self.clone().ring(helper, ring));
+        };
+        self.timers.run(inputs, ring).await;
+        rings.detach_all();
+    }
+
+    /// Announces the end of the timer of `ring` of `helper` on its satellite through its queue,
+    /// `RINGS` times, each `RING_INTERVAL` after the start of the one before or when it ends,
+    /// while the timer desk keeps the ring. Logs a failed announce.
+    async fn ring(self, helper: String, ring: Ring) {
+        let (timers, satellite) = (&self.timers, ring.satellite.as_str());
+        for count in 0..RINGS {
+            tokio::time::sleep_until(ring.start + RING_INTERVAL * count).await;
+            if !timers.rings(&helper, ring.number).await {
+                break;
+            }
+            let Some(text) = self.done(&ring.timer) else {
+                break;
+            };
+            let generation = self.queues.generation(satellite);
+            let speak = async {
+                if !timers.rings(&helper, ring.number).await {
+                    return Ok(());
+                }
+                self.queues.home.announce(satellite, &text).await
+            };
+            let announced = self
+                .queues
+                .queued(satellite, generation, &text, speak.boxed());
+            if let Err(error) = announced.await {
+                tracing::warn!("the ring on {satellite} failed: {error:#}");
+            }
+        }
+        timers.end(&helper, ring.number).await;
+    }
+
+    /// The ring text of `timer` from the current pools. Records its use.
+    fn done(&self, timer: &Timer) -> Option<String> {
+        let chosen = {
+            let pools = self.pools.load();
+            let mut rng = self.rng.lock().expect("no lock holder panics");
+            timers::done(timer, &pools, &mut rng)?
+        };
+        self.backfill.record_use(chosen.pool, chosen.index);
+        Some(chosen.text)
     }
 
     /// The identification of the voice request `heard` in `context` with its embedding, which also
@@ -2411,8 +2470,6 @@ mod tests {
     use crate::domain::state::ServiceCall;
     use crate::domain::state::State;
     use crate::domain::state::TimerEnd;
-    use crate::domain::timers::Timer;
-    use crate::domain::timers::TimerInput;
     use crate::domain::timers::Timers;
     use crate::ports::Classifier;
     use crate::ports::Plugin;
@@ -5796,20 +5853,31 @@ mod tests {
         entries: &[(&str, &str)],
         value: &str,
     ) -> (Conversation, Arc<FakeTimerStore>) {
+        let store = stored(entries);
+        let (_cache, conversation) = desked(home, predictions, &store, value).await;
+        (conversation, store)
+    }
+
+    /// `timing` on `store`, with the hot cache instead of the store.
+    async fn desked(
+        home: &Arc<FakeHome>,
+        predictions: Vec<Prediction>,
+        store: &Arc<FakeTimerStore>,
+        value: &str,
+    ) -> (watch::Sender<StateCache>, Conversation) {
         let classifier = scripted(&[]);
         for prediction in predictions {
             classifier.script(prediction);
         }
-        let (_cache, _changes, mut conversation) =
+        let (cache, _changes, mut conversation) =
             still_with(home, "idle", classifier, Arc::default());
         let catalog = crate::load_catalog(Path::new("intents.toml")).expect("a catalog");
         let pools = crate::load_pools(Path::new("responses.toml"), &catalog).expect("pools");
         conversation.pools = Arc::new(ArcSwap::from_pointee(pools));
-        let store = stored(entries);
-        let desk = TimerDesk::new(Arc::clone(&store) as _, 0.85).await;
+        let desk = TimerDesk::new(Arc::clone(store) as _, 0.85).await;
         conversation.timers = Arc::new(desk);
         feed(&conversation, vec![shown(value)]).await;
-        (conversation, store)
+        (cache, conversation)
     }
 
     /// A store with each name of `entries` on its helper.
@@ -5843,7 +5911,7 @@ mod tests {
             sender.send(input).expect("the receiver is open");
         }
         drop(sender);
-        conversation.timers.run(receiver).await;
+        conversation.run_timers(receiver).await;
     }
 
     /// The snapshot with `timer.jarvis_1` and `timer.jarvis_2` in the state `value`.
@@ -6036,6 +6104,134 @@ mod tests {
         }
         let question = "Which timer, the chicken timer or the pizza timer?";
         assert_eq!(asks(&home), [question, question]);
+        Ok(())
+    }
+
+    /// A conversation on `home` whose classifier gives `predictions`, whose timer desk has `timer`
+    /// on `timer.jarvis_1` in its store and gets its end `end`, with the hot cache.
+    async fn rung(
+        home: &Arc<FakeHome>,
+        predictions: Vec<Prediction>,
+        timer: Timer,
+        end: TimerEnd,
+    ) -> (watch::Sender<StateCache>, Conversation) {
+        let store = Arc::new(FakeTimerStore::default());
+        let saved = store.timers.lock();
+        saved
+            .expect("no test panics")
+            .timers
+            .insert(J1.to_owned(), timer);
+        let (cache, conversation) = desked(home, predictions, &store, "active").await;
+        let entity_id = J1.to_owned();
+        let ended = TimerInput::Event(Event::TimerEnded { entity_id, end });
+        feed(&conversation, vec![ended]).await;
+        (cache, conversation)
+    }
+
+    /// The time from `start` to each announce of `home`.
+    fn rang(home: &FakeHome, start: Instant) -> Vec<Duration> {
+        let times = home.announce_times();
+        times.iter().map(|time| *time - start).collect()
+    }
+
+    /// The time of the first `count` rings of an end `after` the start on an idle satellite.
+    fn ring_times(count: u32, after: Duration) -> Vec<Duration> {
+        (0..count)
+            .map(|ring| after + MARGIN + RING_INTERVAL * ring)
+            .collect()
+    }
+
+    /// The house and the time of the end of "chicken", whose ring ran for 300 s, while the
+    /// satellite was not idle from `busy` for 30 s.
+    async fn chicken_rang(busy: Duration) -> (Arc<FakeHome>, Instant) {
+        let (home, start) = (Arc::new(FakeHome::default()), Instant::now());
+        let chicken = named("chicken", false);
+        let (cache, _conversation) = rung(&home, Vec::new(), chicken, TimerEnd::Finished).await;
+        tokio::time::sleep(busy).await;
+        set(&cache, "responding");
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        set(&cache, "idle");
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        (home, start)
+    }
+
+    /// AC-19.10-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_10_1_rings_every_15_s_for_2_minutes() {
+        let (home, start) = chicken_rang(Duration::from_secs(300)).await;
+        assert_eq!(rang(&home, start), ring_times(8, Duration::ZERO));
+        assert_eq!(announces(&home), ["Your chicken timer is done."; 8]);
+        let (home, start) = chicken_rang(Duration::from_secs(100)).await;
+        assert_eq!(rang(&home, start), ring_times(7, Duration::ZERO));
+    }
+
+    /// AC-19.10-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_10_2_generic_stored_timer_rings_on_its_satellite() {
+        let home = Arc::new(FakeHome::default());
+        let generic = Timer {
+            name: None,
+            ..named("chicken", false)
+        };
+        let _rung = rung(&home, Vec::new(), generic, TimerEnd::Finished).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(announces(&home), ["Your timer is done."]);
+        assert_eq!(home.calls()[0].target, [SATELLITE]);
+    }
+
+    /// AC-19.10-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_10_3_other_request_keeps_the_ring() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let left = predicted("timer_left", 0.9, ("timer", ""));
+        let chicken = named("chicken", false);
+        let (_cache, conversation) = rung(&home, vec![left], chicken, TimerEnd::Finished).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let handled = conversation
+            .handle("how long is left", on_satellite())
+            .await?;
+        assert_eq!(handled.text, "No timer is running.");
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        assert_eq!(announces(&home).len(), 2);
+        Ok(())
+    }
+
+    /// AC-19.10-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_10_4_no_satellite_or_cancel_never_rings() {
+        let home = Arc::new(FakeHome::default());
+        let typed = Timer {
+            satellite: None,
+            ..named("chicken", false)
+        };
+        let _typed = rung(&home, Vec::new(), typed, TimerEnd::Finished).await;
+        let chicken = named("chicken", false);
+        let _cancelled = rung(&home, Vec::new(), chicken, TimerEnd::Cancelled).await;
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(home.calls(), []);
+    }
+
+    /// Sets a timer on `timer.jarvis_1` after its last end, and finishes it.
+    async fn set_and_finish(conversation: &Conversation) -> anyhow::Result<()> {
+        feed(conversation, vec![shown("idle")]).await;
+        timed(conversation, "set a timer").await?.1.await?;
+        feed(conversation, vec![shown("active"), finished()]).await;
+        Ok(())
+    }
+
+    /// AC-19.10-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_10_5_new_finish_replaces_the_ring() -> anyhow::Result<()> {
+        let (home, start) = (Arc::new(FakeHome::default()), Instant::now());
+        let chicken = named("chicken", false);
+        let pasta = vec![set_timer("pasta")];
+        let (_cache, conversation) = rung(&home, pasta, chicken, TimerEnd::Finished).await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        set_and_finish(&conversation).await?;
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        let pasta = ring_times(8, Duration::from_secs(10));
+        assert_eq!(rang(&home, start), [vec![MARGIN], pasta].concat());
+        assert_eq!(announces(&home)[1..], ["Your pasta timer is done."; 8]);
         Ok(())
     }
 }

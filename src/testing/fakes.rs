@@ -46,6 +46,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::net::TcpStream;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tracing::Dispatch;
 use tracing::subscriber::NoSubscriber;
 
@@ -185,6 +186,8 @@ pub(crate) struct FakeHome {
     gates: Mutex<VecDeque<oneshot::Receiver<()>>>,
     /// The service calls, in order. An announce is its `assist_satellite.announce` call.
     calls: Mutex<Vec<ServiceCall>>,
+    /// The virtual time of each announce, in order.
+    announced: Mutex<Vec<Instant>>,
     /// The response data that `call` gives.
     response: Mutex<Option<Value>>,
     /// The response data of the next calls, in order, before `response`.
@@ -205,6 +208,7 @@ impl FakeHome {
             receiver: Mutex::new(Some(receiver)),
             gates: Mutex::default(),
             calls: Mutex::default(),
+            announced: Mutex::default(),
             response: Mutex::default(),
             next: Mutex::default(),
             library: Mutex::default(),
@@ -228,6 +232,11 @@ impl FakeHome {
         let (sender, receiver) = oneshot::channel();
         lock(&self.gates).push_back(receiver);
         sender
+    }
+
+    /// The virtual time of each announce, in order.
+    pub(crate) fn announce_times(&self) -> Vec<Instant> {
+        lock(&self.announced).clone()
     }
 
     /// Makes the later calls give `response` as their response data.
@@ -305,6 +314,7 @@ impl Home for FakeHome {
     }
 
     async fn announce(&self, satellite: &str, text: &str) -> anyhow::Result<()> {
+        lock(&self.announced).push(Instant::now());
         let data = [("message", json!(text)), ("preannounce", json!(false))];
         lock(&self.calls).push(ServiceCall {
             domain: "assist_satellite".to_owned(),
