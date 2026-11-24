@@ -165,7 +165,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 - The candidates of an action are the entries whose helper has these HA states: `active` or `paused` for `Cancel`, `CancelLast` and `Left`, `active` for `Pause`, and `paused` for `Resume`. `Set` has no candidates. An entry whose start call runs has an `idle` helper, so it is never a candidate.
 - `candidates(action, timers, cache) -> Vec<Candidate>`: the candidates in `order`. `Candidate { helper, timer }` has the helper entity ID and a copy of the entry.
-- `forget(timers, helper, cache)` removes the entry of `helper` only when the hot cache shows the helper `idle` (a failed start call). `ended(timers, helper) -> (Option<Timer>, Timers)` removes the entry of `helper` and gives it (the HA events). `reconcile(timers, cache)` removes each entry whose helper the hot cache shows `idle` (a reconnect, sub-phase 19.9).
+- `forget(timers, helper, cache)` removes the entry of `helper` only when the hot cache shows the helper `idle` (a failed start call). `ended(timers, helper) -> (Option<Timer>, Timers)` removes the entry of `helper` and gives it (the HA events). `reconcile(timers, cache)` removes each entry whose helper the hot cache shows `idle` (a reconnect, sub-phase 19.9b).
 
 **Acceptance criteria.**
 
@@ -233,7 +233,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
   - `timer_cancel` and `timer_cancel_last`: `{% if timer %}I cancelled the {{ timer }} timer.{% else %}I cancelled the timer for {{ duration }}.{% endif %}`
   - `timer_pause` and `timer_resume`: the template of `timer_cancel` with "Pausing the" and "Resuming the" in place of "I cancelled the".
   - `timer_left`: `{% for t in timers %}{% if t.timer %}The {{ t.timer }} timer{% else %}The timer for {{ t.duration }}{% endif %} has {{ t.left }} left.{{ " " if not loop.last else "" }}{% endfor %}`
-- Until sub-phase 19.9, `Conversation::act` gives a `Timer` decision the `Defer` with `Job::Llm` of step 1. `just fixture-model` trains the fixture model again. The tests of AC-3.2-1 and AC-3.2c-2 get the six names. New seeds can lower the probability of other intents (sub-phase 18.19f). Before the merge, the PR measures the light commands of AC-9.2-5 with the new fixture model. When one is less than `model.commit_threshold`, the PR changes the timer examples, not the tests.
+- Until sub-phase 19.9c, `Conversation::act` gives a `Timer` decision the `Defer` with `Job::Llm` of step 1. `just fixture-model` trains the fixture model again. The tests of AC-3.2-1 and AC-3.2c-2 get the six names. New seeds can lower the probability of other intents (sub-phase 18.19f). Before the merge, the PR measures the light commands of AC-9.2-5 with the new fixture model. When one is less than `model.commit_threshold`, the PR changes the timer examples, not the tests.
 
 **Acceptance criteria.**
 
@@ -300,7 +300,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - The render context of `answer` (sub-phase 19.6) also has `timers` for `Left` and `Several`: each timer with `timer` (its name, else an empty string), `duration` and, for `Left`, `left`.
   - `Left { timers }`: `Reply` from the pool of the intent. `left` is `spoken` (sub-phase 19.2). No call.
   - `Several { timers }`: `Ask` from `ask_timer` with `Pending::Slot { intent, slots: [], missing: "timer", choices, transcript }`. The choices are the labels of `timers`. Routing step 2 of sub-phase 10.5 fills it as it fills the area: the answer "the chicken" adds the slot `timer = chicken`, and `decide` runs again.
-  - `NoDuration`: `Ask` from `ask_duration` with `Pending::Slot { intent, slots, missing: "duration", choices: [], transcript }`. `slots` has the `timer` slot of the request, if any. Sub-phase 19.9 fills it.
+  - `NoDuration`: `Ask` from `ask_duration` with `Pending::Slot { intent, slots, missing: "duration", choices: [], transcript }`. `slots` has the `timer` slot of the request, if any. Sub-phase 19.9d fills it.
   - A pool that does not render gives `Defer` with `Job::Llm`, as in sub-phase 19.6.
 
 **Acceptance criteria.**
@@ -340,7 +340,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 - P-19.7-1, P-19.7-2, P-19.7-3. Evidence: test, and step 4 of the field log for the order of HA.
 
-**Field log.** Before the first release with sub-phase 19.9, on the live HA, in the developer tools, with a helper `timer.jarvis_1`:
+**Field log.** Before the first release with sub-phase 19.9c, on the live HA, in the developer tools, with a helper `timer.jarvis_1`:
 
 1. Call `timer.start` with the data `duration: 5` (a number). Make sure that the timer runs 5 s, and that its state has `finishes_at` while it is `active`.
 2. Listen to `timer.finished`, `timer.cancelled` and `state_changed`. Make sure that the end of the timer fires `timer.finished` with `entity_id`, and that the state change to `idle` comes before it. Start the timer again and cancel it. Make sure that HA fires `timer.cancelled` and no `timer.finished`. Start it again at once. Make sure that `timer.cancelled` comes before the state change to `active`.
@@ -358,7 +358,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 **Model.**
 
-- `sync` (sub-phase 2.9) gets a sender of `TimerInput` (in `src/domain/timers.rs`): `Event(Event)` or `Snapshot(Vec<State>)`. It sends each `StateChanged` of an entity in the domain `timer` after it applies it to the hot cache, and each `TimerEnded` (sub-phase 19.7), which does not change the hot cache. When the HA adapter delivers the result of a `get_states` request, it first gives `Event::Loaded { states }` in `events`, with the states of the entities in the domain `timer` from that result. The read loop delivers the messages one at a time in the order of the socket, so `Loaded` comes after each event that HA sends before the states, and before each later event. `sync` sends the states of each `Loaded` as `Snapshot` when it reads it. Thus each `Snapshot` is the states of one `get_states` result, at the place of that result in the socket, also when two loads overlap or a load fails after its `get_states`. Thus a timer that ends while `load` runs gives its `TimerEnded` before the `Snapshot` that shows its helper `idle`. HA writes the `idle` state and fires the timer event in one step of its event loop, so no result of `get_states` comes between them. Thus the receiver gets the changes of the timer helpers and the timer events in the order of HA. A closed receiver does not stop `sync`. Until sub-phase 19.9, `run` gives `sync` a sender whose receiver it drops. A timer event and `Loaded` do not change the cache, so `cache_sync.qnt` and its driver do not change.
+- `sync` (sub-phase 2.9) gets a sender of `TimerInput` (in `src/domain/timers.rs`): `Event(Event)` or `Snapshot(Vec<State>)`. It sends each `StateChanged` of an entity in the domain `timer` after it applies it to the hot cache, and each `TimerEnded` (sub-phase 19.7), which does not change the hot cache. When the HA adapter delivers the result of a `get_states` request, it first gives `Event::Loaded { states }` in `events`, with the states of the entities in the domain `timer` from that result. The read loop delivers the messages one at a time in the order of the socket, so `Loaded` comes after each event that HA sends before the states, and before each later event. `sync` sends the states of each `Loaded` as `Snapshot` when it reads it. Thus each `Snapshot` is the states of one `get_states` result, at the place of that result in the socket, also when two loads overlap or a load fails after its `get_states`. Thus a timer that ends while `load` runs gives its `TimerEnded` before the `Snapshot` that shows its helper `idle`. HA writes the `idle` state and fires the timer event in one step of its event loop, so no result of `get_states` comes between them. Thus the receiver gets the changes of the timer helpers and the timer events in the order of HA. A closed receiver does not stop `sync`. Until sub-phase 19.9c, `run` gives `sync` a sender whose receiver it drops. A timer event and `Loaded` do not change the cache, so `cache_sync.qnt` and its driver do not change.
 
 **Acceptance criteria.**
 
@@ -397,61 +397,131 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 ---
 
-### 19.9 Timer Use Case
+### 19.9 Timer Start Rules
 
-**Goal:** Connect the timer table to the requests, to the store and to the HA events. "Set a timer", "cancel that timer", "pause", "resume" and "how long is left" then act on the HA timer helpers, also after a restart of Jarvis.
+**Goal:** Let the start call of a timer decide its own entry. A late timer event, a reconnect or a failed call then cannot remove a new timer on the same helper.
 
-- **Implements:** G13, G25. **Depends on:** 19.8.
-- **Files:** create `src/app/timers.rs`. Modify `src/domain/timers.rs`, `src/app/conversation.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `src/testing/e2e.rs`, `README.md` (the timer requests and the setup step of the timer helpers, `CLAUDE.md` workflow item 15).
+- **Implements:** G25. **Depends on:** 19.8.
+- **Files:** modify `src/domain/timers.rs`, `src/adapters/sqlite.rs` (tests only).
+
+**Model.**
+
+- `Timer` gets `starting: bool`: the start call of the entry runs. `set` (sub-phase 19.4) sets it on the new entry.
+- `running(timers, state) -> Timers`: when `state` is `active` or `paused`, it clears `starting` on the entry of its helper. Else the table does not change. `restored(timers) -> Timers` clears `starting` on each entry, because no start call survives a restart.
+- `ended(timers, helper)` removes and gives the entry of `helper` only when it does not start. Else it gives `None` and the same table. HA sends the end of an older timer on the helper before the `active` of the new one, so the late `Cancelled` of a voice cancel cannot remove a new entry on the same helper.
+- `forget(timers, helper, order)` removes the entry of `helper` only while it starts and has `order`. It does not read the cache.
+- `reconcile(timers, cache)` keeps each entry that starts: its start call decides it. It removes each entry that does not start and whose helper the cache shows `idle`. It clears `starting` on each entry whose helper the cache shows `active` or `paused`.
+- These rules replace the `forget` and `reconcile` parts of AC-19.4b-2.
+
+**Acceptance criteria.**
+
+- AC-19.9-1: When `set` adds an entry, the entry starts. `running` with the state `active` or `paused` of its helper clears `starting`, and with `idle` does not change the table. `restored` clears `starting` on each entry.
+- AC-19.9-2: `forget` with the helper and the order of an entry that starts removes it. It keeps an entry that does not start, and an entry that starts with another order.
+- AC-19.9-3: `ended` keeps an entry that starts and gives `None`. It removes an entry that does not start and gives it.
+- AC-19.9-4: When an entry that starts and an entry that does not start have `idle` helpers, and an entry that starts has an `active` helper, `reconcile` keeps the first, removes the second, and clears `starting` on the third.
+
+**Proofs.**
+
+- P-19.9-1 (AC-19.9-1). Ensures: the entry of `Start` starts. `running` changes only `starting` of the entry of the helper of `state`, and only when `state` is `active` or `paused`. `restored` keeps each key, and no entry of its result starts. Argument: `set` inserts one entry. `running` is one guarded change on one key. `restored` is a loop over the entries, whose invariant states that the entries before `index` do not start.
+- P-19.9-2 to P-19.9-4 (AC-19.9-2 to AC-19.9-4). Ensures: `ended` changes no entry that starts. `forget` removes an entry only when it starts and has the order of the call. `reconcile` keeps each entry that starts, and removes an entry that does not start if and only if the cache shows its helper `idle`. Argument: each is one guarded remove or a filter.
+
+---
+
+### 19.9b Timer Desk
+
+**Goal:** Add `TimerDesk`, which plans the timer requests, keeps the timer table in its store and follows the timer helpers of HA. The table then follows HA, also after a restart of Jarvis.
+
+- **Implements:** G25. **Depends on:** 19.9.
+- **Files:** create `src/app/timers.rs`.
 
 **Model.**
 
 - `TimerDesk` holds, in one async mutex, the timer table, the view and the rings (sub-phase 19.10). It also holds the `TimerStore` and `dialog.choice_similarity`. Each change of the table saves it under the lock, so the saves keep the order of the changes. A failed save logs a `warn` event, and the table in memory stays.
 - The view is a `StateCache` of the timer helpers. Only `run` changes it, from the receiver (sub-phase 19.7b): `apply` (sub-phase 2.7) for each state change, and a new cache of the states of each `Snapshot`. `TimerDesk` does not read the hot cache. Thus each state change of a helper and each timer event reach the table in the order of HA.
 - `TimerDesk::decide(request, satellite, now, pools, rng) -> Decision`: takes the lock, runs `plan` (sub-phase 19.4c) with the view, stores and saves the new table, and gives `answer` (sub-phase 19.6). One lock, so two requests at the same time cannot take the same free helper.
-- `Conversation::act` gives a `Timer` decision to `TimerDesk::decide` with the satellite of the request, the time of the request, the current pools and its RNG. This replaces the `Defer` of sub-phase 19.5. The result goes through `dispatch` as each other decision: the reply first, then the call (`ReplyBeforeCall`), and the question through the announce queue (sub-phase 10.4).
-- `TimerDesk::decide` puts a guard with the helper and the order of the new entry in a `Start` decision, and the `after` work of its `timer.start` call takes it. When that call fails, the `after` work runs `forget` (sub-phase 19.4b) with the helper and the order, before the `failure` answer (sub-phase 4.9c). When the guard drops before the call ends, it runs `forget` the same way in a new task. Thus the decision or the `after` work can drop for any reason, for example a failed write of the reply in the Wyoming adapter, and the helper and the name become free. After the call ends, the guard does nothing. Thus a failed or dropped start frees the helper and the name. A failed cancel, pause or resume does not run `forget` and does not change the table. Its timer can end, and a new timer can take the helper, before the failure comes. An `active` state clears `starting` before the start call ends, so a timer can also end, and a new timer can take the helper, before a start call fails. `next` only grows while Jarvis runs, and a restart drops each start call, so no new entry has the order of a start call that runs. Thus the failure of a start call meets only its own entry. When the connection fails after HA starts a timer but before Jarvis gets the result, or when the start call drops after it reaches HA, the helper runs with no entry and no ring.
-- `TimerDesk::decide` also puts the helper and the `last_updated` of its state in the view in an `Act` decision. The `after` work of its call takes the lock of `TimerDesk`, makes the call under the lock, and then releases it. It makes the call only when the view still shows the helper with that `last_updated`. Else it makes no call. Each new run of a helper changes its state, so a cancel, pause or resume that waits, for example for the write of its reply, cannot act on a new timer on the helper, from Jarvis or from HA. Under the lock, no request can take the helper and the view does not change during the call. HA has no conditional call, so a change in HA that the view does not have yet can still meet the call.
-- Routing step 2 of sub-phase 10.5 also fills a `Slot` dialog whose missing slot is `duration`: when `duration` (sub-phase 19.2) reads the answer, the normalized answer is the `duration` slot, and `decide` runs again with the slots of the dialog. Else steps 3 to 6 apply, so Jarvis asks again up to `dialog.max_turns`. `is_answer` (sub-phase 10.7) does not count this dialog, so its answer keeps the `endpoint_ms` wait: "one hour" can continue with "and twenty minutes".
-- `TimerDesk::new` loads the table from the store, and `run` (`src/lib.rs`) makes it before the conversation use case gets it. Thus no request changes a table that a later load replaces. A failed load logs a `warn` event and starts with an empty table. The load sets `starting := false` on each entry, because no start call survives a restart. Until the first `Snapshot`, the view is empty, so `Set` gives `Full`.
-- `TimerDesk::run(events)` reads the receiver. A state change goes into the view. `TimerEnded` runs `ended`, so a finished timer and a timer that a person cancels in HA leave the table. Sub-phase 19.10 adds the ring. `Snapshot` replaces the view and runs `reconcile`.
-- This sub-phase adds `starting: bool` to `Timer` in `src/domain/timers.rs`. `plan` sets it on the entry of `Start`. A state of the helper that is `active` or `paused` in the view clears it, in a state change or in `reconcile`. `ended` removes and gives an entry only when it does not start. HA sends the end of an older timer on the helper before the `active` of the new one, so the late `Cancelled` of a voice cancel cannot remove a new entry on the same helper. `forget(timers, helper, order)` removes the entry of `helper` only while it starts and has `order`. `reconcile` keeps an entry that starts: its start call decides it. A start call succeeds only after `events` has the `active` state of its helper (sub-phase 19.7), and `sync` sends that state that state before a later `Snapshot`. Thus a successful start always clears `starting`, also when a reconnect comes between the call and the result. These two rules replace the `forget` and `reconcile` parts of AC-19.4b-2.
+- `TimerDesk::new` loads the table from the store and runs `restored` (sub-phase 19.9). A failed load logs a `warn` event and starts with an empty table. Until the first `Snapshot`, the view is empty, so `Set` gives `Full`.
+- `TimerDesk::run(events)` reads the receiver. A state change goes into the view and runs `running`. `TimerEnded` runs `ended`, so a finished timer and a timer that a person cancels in HA leave the table. Sub-phase 19.10 adds the ring. `Snapshot` replaces the view and runs `reconcile`.
 - A `Finished`, and a cancel in HA, leave the entry in the table until `run` reads the event, so the helper is not free before then.
 - At the start and after each reconnect, `reconcile` removes each entry that does not start and whose helper is `idle`, with no ring: its timer ended or was cancelled while Jarvis was not connected, and Jarvis cannot tell which. An entry whose helper is `active` or `paused` stays, and its end rings on its satellite (sub-phase 19.10). A reservation that `decide` makes after `sync` loads a snapshot, but before `run` reads it, starts, so it stays.
+- A start call succeeds only after `events` has the `active` state of its helper (sub-phase 19.7), and `sync` sends that state before a later `Snapshot`. Thus a successful start always clears `starting`, also when a reconnect comes between the call and the result.
 - A request without a satellite (text from the HA UI) can set a timer, and its entry has no satellite.
-- `start_sync` also gives the receiver of the `TimerInput`. `run` makes the `TimerDesk` with the SQLite adapter as its `TimerStore`, gives it to the conversation use case, and starts `TimerDesk::run` with this receiver.
-- The README gets the setup step: in HA, create five timer helpers with the names "Jarvis 1" to "Jarvis 5", so that their entity IDs are `timer.jarvis_1` to `timer.jarvis_5`, and turn on "Restore" for each. Jarvis uses each `timer.jarvis_` helper. The tests add the helpers to the snapshot of the reference house before they load the cache, because the reference house has no timer entity.
 
 **Acceptance criteria.**
 
-- AC-19.9-1: When `FakeClassifier` gives `timer_set` with `duration = five minutes` and `timer = chicken` on the Kitchen satellite, `handle` returns "Your chicken timer is set for five minutes.", `FakeHome` records `timer.start` on `timer.jarvis_1` with `{ duration: 300 }` after the reply, and `FakeTimerStore` has the entry.
-- AC-19.9-2: When "chicken" and "pizza" are `active` and the user says "cancel that timer", `handle` returns empty text, and `FakeHome` records `ask` with "Which timer, the chicken timer or the pizza timer?". When the user then answers "the chicken", `FakeHome` records `timer.cancel` on the helper of "chicken", and the reply is "I cancelled the chicken timer."
-- AC-19.9-3: When the user says "set a timer for the chicken", `FakeHome` records `ask` with "For how long?". When the user answers "ten minutes", `FakeHome` records `timer.start` with `{ duration: 600 }`, and the reply is "Your chicken timer is set for ten minutes." When the user answers "soon", Jarvis asks again.
-- AC-19.9-4: When the Kitchen satellite set "chicken" and the Office satellite asks `timer_left` for "chicken", the reply gives the time left of "chicken".
-- AC-19.9-5: When `FakeHome` fails the `timer.start` call, `FakeHome` records an announce from `failure`, and the next `timer_set` with the same name gives `timer.start` on the same helper, not `timer_taken`.
-- AC-19.9-6: When the receiver gets `TimerEnded` with `Cancelled` for the helper of "chicken", the next `timer_left` for "chicken" replies "There is no chicken timer.", and `FakeTimerStore` has no entry for it.
-- AC-19.9-7: When `FakeTimerStore` has "chicken" on an `active` helper and "pasta" on an `idle` helper, and a new `TimerDesk` gets `Snapshot`, `timer_left` gives only "chicken", and `FakeTimerStore` has no entry for "pasta".
-- AC-19.9-8: When two `timer_set` requests run at the same time with one free helper, one gets `timer.start` and the other gets "All timers are in use."
-- AC-19.9-9: When the user cancels "chicken" on `timer.jarvis_1`, the view shows `timer.jarvis_1` `idle`, and a `timer_set` for "pasta" takes `timer.jarvis_1` before `run` reads the `Cancelled` of "chicken", the table still has "pasta" after that `Cancelled`. After the state `active` of `timer.jarvis_1`, `timer_left` gives "pasta".
-- AC-19.9-10: When `sync` sends a `Snapshot` with `timer.jarvis_1` `idle`, and a `timer_set` for "pasta" takes `timer.jarvis_1` before `run` reads that `Snapshot`, the table still has "pasta" after it.
-- AC-19.9-11: When `FakeTimerStore` has "chicken" with `starting` on an `idle` helper and "pasta" with `starting` on an `active` helper, a new `TimerDesk` that gets `Snapshot` has only "pasta", which does not start.
-- AC-19.9-12: When `FakeTimerStore` has "chicken", the first `timer_set` for "chicken" after `TimerDesk::new` replies "There is already a chicken timer."
-- AC-19.9-13: When the view shows the helper `active` before its `timer.start` call fails, the entry stays.
-- AC-19.9-14: When `FakeHome` holds a `timer.pause` call on a helper, the timer of the helper ends, a new `timer_set` takes the same helper, and then the pause call fails, the new entry stays and starts.
-- AC-19.9-15: When `FakeHome` holds a `timer.start` call, the view shows the helper `active`, the timer ends, a new `timer_set` takes the same helper, and then the held start call fails, the new entry stays and starts.
-- AC-19.9-16: When the `after` work of a `timer_set` drops before it runs, `FakeHome` gets no `timer.start` call, and the next `timer_set` with the same name gives `timer.start` on the same helper, not `timer_taken`.
-- AC-19.9-17: When the `after` work of a `timer_pause` waits, its timer ends, and a `timer_set` from another satellite takes the same helper, the `after` work makes no call, and the new timer stays `active`. When the helper starts again from HA instead, with a new `last_updated` and no entry, a waiting `timer_cancel` also makes no call. With no change of the helper, it makes the call.
+- AC-19.9b-1: When `run` gets `TimerEnded` with `Cancelled` for the helper of "chicken", the next `timer_left` for "chicken" replies "There is no chicken timer.", and `FakeTimerStore` has no entry for it.
+- AC-19.9b-2: When `FakeTimerStore` has "chicken" on an `active` helper and "pasta" on an `idle` helper, and a new `TimerDesk` gets `Snapshot`, `timer_left` gives only "chicken", and `FakeTimerStore` has no entry for "pasta".
+- AC-19.9b-3: When two `timer_set` requests run `decide` at the same time with one free helper, one gives the call `timer.start` and the other replies "All timers are in use."
+- AC-19.9b-4: When the Kitchen satellite set "chicken" and the Office satellite asks `timer_left` for "chicken", the reply gives the time left of "chicken".
+- AC-19.9b-5: When `decide` cancels "chicken" on `timer.jarvis_1`, the view shows `timer.jarvis_1` `idle`, and a `timer_set` for "pasta" takes `timer.jarvis_1` before `run` reads the `Cancelled` of "chicken", the table still has "pasta" after that `Cancelled`. After the state `active` of `timer.jarvis_1`, `timer_left` gives "pasta".
+- AC-19.9b-6: When `sync` sends a `Snapshot` with `timer.jarvis_1` `idle`, and a `timer_set` for "pasta" takes `timer.jarvis_1` before `run` reads that `Snapshot`, the table still has "pasta" after it.
+- AC-19.9b-7: When `FakeTimerStore` has "chicken" with `starting` on an `idle` helper and "pasta" with `starting` on an `active` helper, a new `TimerDesk` that gets `Snapshot` has only "pasta", which does not start.
+- AC-19.9b-8: When `FakeTimerStore` has "chicken", the first `timer_set` for "chicken" after `TimerDesk::new` replies "There is already a chicken timer."
 
 **Proofs.**
 
-- P-19.9-1. Requires: `ReplyBeforeCall` (sub-phase 16.1). Argument: the timer decision is a `Reply` with a call, and `dispatch` gives the call as `after` work (P-4.8-1).
-- P-19.9-2, P-19.9-3. Argument: `Several` and `NoDuration` give `Ask` (P-19.6b-1, P-19.6b-3), `act` opens the dialog (sub-phase 10.5), and the filled answer runs `decide` again with the `timer` or `duration` slot (P-10.5-1).
-- P-19.9-17. Argument: the `after` work of an `Act` checks `last_updated` in the view and calls under the lock of `TimerDesk`, and `set` and `run` take the same lock. A new run of the helper changes `last_updated`.
-- P-19.9-5, P-19.9-14, P-19.9-15, P-19.9-16. Argument: the failure arm of `after` and the drop of the guard run `forget` only for a `timer.start` call, with the order of its entry. The entry of that call still starts. A new entry on the same helper has a higher order. A failed pause, cancel or resume runs no `forget`.
-- P-19.9-7, P-19.9-11, P-19.9-12. Argument: `TimerDesk::new` loads the table and clears `starting` before any request or input, and `Snapshot` runs `reconcile` and saves.
-- P-19.9-8. Requires: P-19.4-1. Argument: `TimerDesk::decide` runs `plan` and stores the table under one lock, so the second `plan` sees the entry of the first.
-- P-19.9-9, P-19.9-10, P-19.9-13. Ensures: `ended` changes no entry that starts. `forget` removes an entry only when it starts and has the order of the call. `reconcile` keeps each entry that starts, and removes an entry that does not start if and only if the view shows its helper `idle`. Argument: each is one guarded remove or a filter. The new entry starts until `run` reads the `active` of its helper, and HA sends that state after the end of the older timer, so the old `Cancelled` meets a starting entry.
-- P-19.9-4, P-19.9-6. Evidence: test.
+- P-19.9b-3. Requires: P-19.4-1. Argument: `TimerDesk::decide` runs `plan` and stores the table under one lock, so the second `plan` sees the entry of the first.
+- P-19.9b-2, P-19.9b-7, P-19.9b-8. Argument: `TimerDesk::new` loads the table and runs `restored` (P-19.9-1) before any request or input, and `Snapshot` runs `reconcile` (P-19.9-4) and saves.
+- P-19.9b-5, P-19.9b-6. Requires: P-19.9-1 to P-19.9-4. Argument: the new entry starts until `run` reads the `active` of its helper, and HA sends that state after the end of the older timer, so the old `Cancelled` and the old `Snapshot` meet an entry that starts.
+- P-19.9b-1, P-19.9b-4. Evidence: test.
+
+---
+
+### 19.9c Timer Requests
+
+**Goal:** Give the timer requests to `TimerDesk`, and the timer inputs of `sync` to its `run`. "Set a timer", "cancel that timer", "pause", "resume" and "how long is left" then act on the HA timer helpers.
+
+- **Implements:** G13, G25. **Depends on:** 19.9b.
+- **Files:** modify `src/app/timers.rs`, `src/app/conversation.rs`, `src/app/background.rs` (tests only), `src/lib.rs`, `src/testing/fakes.rs`, `src/testing/e2e.rs`, `README.md` (the timer requests and the setup step of the timer helpers, `CLAUDE.md` workflow item 15).
+
+**Model.**
+
+- `Conversation::act` gives a `Timer` decision to `TimerDesk::decide` with the satellite of the request, the time of the request, the current pools and its RNG. This replaces the `Defer` of sub-phase 19.5. The result goes through `dispatch` as each other decision: the reply first, then the call (`ReplyBeforeCall`), and the question through the announce queue (sub-phase 10.4).
+- `TimerDesk::decide` puts a guard with the helper and the order of the new entry in a `Start` decision, and the `after` work of its `timer.start` call takes it. When that call fails, the `after` work runs `forget` (sub-phase 19.9) with the helper and the order, before the `failure` answer (sub-phase 4.9c). When the guard drops before the call ends, it runs `forget` the same way in a new task. Thus the decision or the `after` work can drop for any reason, for example a failed write of the reply in the Wyoming adapter, and the helper and the name become free. After the call ends, the guard does nothing. Thus a failed or dropped start frees the helper and the name. A failed cancel, pause or resume does not run `forget` and does not change the table. Its timer can end, and a new timer can take the helper, before the failure comes. An `active` state clears `starting` before the start call ends, so a timer can also end, and a new timer can take the helper, before a start call fails. `next` only grows while Jarvis runs, and a restart drops each start call, so no new entry has the order of a start call that runs. Thus the failure of a start call meets only its own entry. When the connection fails after HA starts a timer but before Jarvis gets the result, or when the start call drops after it reaches HA, the helper runs with no entry and no ring.
+- `start_sync` also gives the receiver of the `TimerInput`. `run` makes the `TimerDesk` with the SQLite adapter as its `TimerStore` before the conversation use case gets it, gives it to the conversation use case, and starts `TimerDesk::run` with this receiver. Thus no request changes a table that a later load replaces.
+- The README gets the timer requests and the setup step: in HA, create five timer helpers with the names "Jarvis 1" to "Jarvis 5", so that their entity IDs are `timer.jarvis_1` to `timer.jarvis_5`, and turn on "Restore" for each. Jarvis uses each `timer.jarvis_` helper. The tests add the helpers to the snapshot of the reference house before they load the cache, because the reference house has no timer entity.
+
+**Acceptance criteria.**
+
+- AC-19.9c-1: When `FakeClassifier` gives `timer_set` with `duration = five minutes` and `timer = chicken` on the Kitchen satellite, `handle` returns "Your chicken timer is set for five minutes.", `FakeHome` records `timer.start` on `timer.jarvis_1` with `{ duration: 300 }` after the reply, and `FakeTimerStore` has the entry.
+- AC-19.9c-2: When "chicken" and "pizza" are `active` and the user says "cancel that timer", `handle` returns empty text, and `FakeHome` records `ask` with "Which timer, the chicken timer or the pizza timer?". When the user then answers "the chicken", `FakeHome` records `timer.cancel` on the helper of "chicken", and the reply is "I cancelled the chicken timer."
+- AC-19.9c-3: When `FakeHome` fails the `timer.start` call, `FakeHome` records an announce from `failure`, and the next `timer_set` with the same name gives `timer.start` on the same helper, not `timer_taken`.
+- AC-19.9c-4: When the view shows the helper `active` before its `timer.start` call fails, the entry stays.
+- AC-19.9c-5: When `FakeHome` holds a `timer.pause` call on a helper, the timer of the helper ends, a new `timer_set` takes the same helper, and then the pause call fails, the new entry stays and starts.
+- AC-19.9c-6: When `FakeHome` holds a `timer.start` call, the view shows the helper `active`, the timer ends, a new `timer_set` takes the same helper, and then the held start call fails, the new entry stays and starts.
+- AC-19.9c-7: When the `after` work of a `timer_set` drops before it runs, `FakeHome` gets no `timer.start` call, and the next `timer_set` with the same name gives `timer.start` on the same helper, not `timer_taken`.
+
+**Proofs.**
+
+- P-19.9c-1. Requires: `ReplyBeforeCall` (sub-phase 16.1). Argument: the timer decision is a `Reply` with a call, and `dispatch` gives the call as `after` work (P-4.8-1).
+- P-19.9c-2. Argument: `Several` gives `Ask` (P-19.6b-1), `act` opens the dialog (sub-phase 10.5), and the filled answer runs `decide` again with the `timer` slot (P-10.5-1).
+- P-19.9c-3 to P-19.9c-7. Requires: P-19.9-1, P-19.9-2. Argument: the failure arm of `after` and the drop of the guard run `forget` only for a `timer.start` call, with the order of its entry. The entry of that call still starts, unless the `active` state of its helper cleared `starting`. A new entry on the same helper has a higher order. A failed pause, cancel or resume runs no `forget`.
+
+---
+
+### 19.9d Timer Waits
+
+**Goal:** Fill the duration of a timer from the answer to "For how long?", ask a timer question again with its own text, and let a cancel, pause or resume that waits act only on its own timer.
+
+- **Implements:** G13, G25. **Depends on:** 19.9c.
+- **Files:** modify `src/domain/timers.rs`, `src/app/timers.rs`, `src/app/conversation.rs`, `README.md` (the answer to "For how long?", `CLAUDE.md` workflow item 15).
+
+**Model.**
+
+- Routing step 2 of sub-phase 10.5 also fills a `Slot` dialog whose missing slot is `duration`: when `duration` (sub-phase 19.2) reads the answer, the normalized answer is the `duration` slot, and `decide` runs again with the slots of the dialog. Else steps 3 to 6 apply, so Jarvis asks again up to `dialog.max_turns`. `is_answer` (sub-phase 10.7) does not count this dialog, so its answer keeps the `endpoint_ms` wait: "one hour" can continue with "and twenty minutes".
+- Step 5 of sub-phase 10.5 asks a `Slot` dialog for `duration` or `timer` again with its own question, not from `ask_area`: `ask_duration`, or `ask_timer` with the choices of the dialog as the `timer` of each item of `timers`. A choice of a generic timer is its duration, so the question again says "the ten minutes timer". A `Slot` dialog for the area asks from `ask_area`, as before.
+- `TimerDesk` counts the runs of each helper. The count increases when the view changes the helper from `idle`, or from no state, to `active` or `paused`, in a state change or in a `Snapshot`. Each new timer on a helper starts from `idle`, so it is a new run. A pause or a resume in HA is the same run.
+- `TimerDesk::decide` puts the helper and its run count in the view in an `Act` decision. The `after` work of its call takes the lock of `TimerDesk`, makes the call under the lock, and then releases it. It makes the call only when the view still shows the helper with the same run count, in a state that the action acts on (the candidates of sub-phase 19.4b). Else it makes no call. Thus a cancel, pause or resume that waits, for example for the write of its reply, cannot act on a new timer on the helper, from Jarvis or from HA. A cancel that waits still cancels its timer when a person pauses or resumes that timer in HA, because the entry of a cancel already left the table and the reply said "cancelled". Under the lock, no request can take the helper and the view does not change during the call. HA has no conditional call, so a change in HA that the view does not have yet can still meet the call.
+- `fits` (sub-phase 19.4b) becomes public, so that the `after` work checks the state with the rule of the candidates.
+
+**Acceptance criteria.**
+
+- AC-19.9d-1: When the user says "set a timer for the chicken", `FakeHome` records `ask` with "For how long?". When the user answers "ten minutes", `FakeHome` records `timer.start` with `{ duration: 600 }`, and the reply is "Your chicken timer is set for ten minutes." When the user answers "soon", `FakeHome` records `ask` with "For how long?" again. When "chicken" and "pizza" are `active` and the user answers "soon" to "Which timer, the chicken timer or the pizza timer?", `FakeHome` records `ask` with the same question again.
+- AC-19.9d-2: When the `after` work of a `timer_pause` waits, its timer ends, and a `timer_set` from another satellite takes the same helper, the `after` work makes no call, and the new timer stays `active`. When the helper starts again from HA instead, with no entry, a waiting `timer_cancel` also makes no call. When a person pauses the timer in HA while a `timer_cancel` waits, the `after` work makes the call `timer.cancel`. With no change of the helper, it makes the call.
+
+**Proofs.**
+
+- P-19.9d-1. Argument: `NoDuration` gives `Ask` (P-19.6b-3), `act` opens the dialog (sub-phase 10.5), and the filled answer runs `decide` again with the `duration` slot (P-10.5-1). Step 5 picks the pool from the missing slot of the dialog.
+- P-19.9d-2. Argument: the `after` work of an `Act` checks the run count and the state in the view and calls under the lock of `TimerDesk`, and `decide` and `run` take the same lock. A new run of the helper increases the run count. A pause in HA keeps the run count and a state that `timer.cancel` acts on.
 
 ---
 
@@ -459,7 +529,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 **Goal:** Announce the end of a timer on the satellite that set it, every 15 s for up to 2 minutes, until the user says "stop" there or cancels that timer by name.
 
-- **Implements:** G25. **Depends on:** 19.9.
+- **Implements:** G25. **Depends on:** 19.9d.
 - **Files:** modify `src/domain/timers.rs`, `src/app/timers.rs`, `src/app/conversation.rs`, `src/lib.rs`, `src/testing/fakes.rs`, `README.md` (the ring and "stop", `CLAUDE.md` workflow item 15).
 - **Quint:** `timers.qnt` (the rules of `finish`, `ringOnce`, `stop` and `silence`).
 
