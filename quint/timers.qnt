@@ -12,8 +12,8 @@ module timers {
   /// The entry of the Jarvis table for one helper. `owned = false` is no entry.
   type Entry = { owned: bool, sat: SATELLITE, name: str, order: int }
 
-  /// The ring of the last timer that finished on one helper.
-  type Bell = { sat: SATELLITE, name: str, left: int, rung: int, stopped: bool }
+  /// The ring of the last timer that finished on one helper, with the order of its entry and the time of its end.
+  type Bell = { sat: SATELLITE, name: str, order: int, start: int, left: int, rung: int, stopped: bool }
 
   /// The helpers in entity ID order, so that `setTimer` takes the first free helper.
   pure val HELPERS: List[HELPER] = List("h1", "h2")
@@ -27,6 +27,15 @@ module timers {
   /// The rings of one finished timer.
   pure val RINGS = 8
 
+  /// The seconds between the starts of two rings.
+  pure val RING_INTERVAL = 15
+
+  /// The seconds after the end of a timer from which it no longer rings.
+  pure val RING_FOR = 120
+
+  /// The duration of a generic timer on each helper, as the driver sets it.
+  pure val DURATIONS: HELPER -> str = Map("h1" -> "one minute", "h2" -> "two minutes")
+
   /// The helpers as a set.
   pure val HELPER_SET: Set[HELPER] = HELPERS.indices().map(i => HELPERS[i])
 
@@ -34,7 +43,7 @@ module timers {
   pure val NO_ENTRY: Entry = { owned: false, sat: "", name: "", order: 0 }
 
   /// No ring.
-  pure val NO_RING: Bell = { sat: "", name: "", left: 0, rung: 0, stopped: false }
+  pure val NO_RING: Bell = { sat: "", name: "", order: 0, start: 0, left: 0, rung: 0, stopped: false }
 
   /// The HA state of each helper: `"idle"`, `"active"` or `"paused"`.
   var ha: HELPER -> str
@@ -50,6 +59,9 @@ module timers {
 
   /// The ring of each helper.
   var ring: HELPER -> Bell
+
+  /// The virtual time in seconds.
+  var now: int
 
   /// The kind of the last step.
   var lastAction: Action
@@ -67,6 +79,7 @@ module timers {
     starting' = HELPER_SET.mapBy(_ => false),
     nextOrder' = 0,
     ring' = HELPER_SET.mapBy(_ => NO_RING),
+    now' = 0,
     lastAction' = Other,
     lastHelper' = "h1",
     lastWasFree' = false,
@@ -87,6 +100,12 @@ module timers {
   /// An entry has the name `n`, and `n` is not `""`.
   def taken(n: str): bool = n != "" and HELPER_SET.exists(h => owned(h) and timer.get(h).name == n)
 
+  /// The label of the timer or the ring with the name `n` on `h`: the name, else the duration.
+  pure def label(h: HELPER, n: str): str = if (n == "") DURATIONS.get(h) else n
+
+  /// A ring with rings left has the label `l`.
+  def ringing(l: str): bool = HELPER_SET.exists(g => ring.get(g).left > 0 and label(g, ring.get(g).name) == l)
+
   /// Ring `r` after a stop: no ring left, and `stopped`.
   pure def hush(r: Bell): Bell = r.with("left", 0).with("stopped", true)
 
@@ -97,6 +116,7 @@ module timers {
     starting' = newStarting,
     nextOrder' = nextOrder,
     ring' = newRing,
+    now' = now,
     lastAction' = a,
     lastHelper' = h,
     lastWasFree' = false,
@@ -115,6 +135,7 @@ module timers {
       starting' = starting.set(h, true),
       nextOrder' = nextOrder + 1,
       ring' = ring,
+      now' = now,
       lastAction' = SetTimer,
       lastHelper' = h,
       lastWasFree' = free(h),
@@ -133,11 +154,13 @@ module timers {
     move(Other, h, ha, timer.set(h, NO_ENTRY), starting.set(h, false), ring),
   }
 
+  /// Jarvis can cancel the timer of `h`: it runs, does not start, and no ring with rings left has its label.
+  def cancellable(h: HELPER): bool =
+    owned(h) and not(starting.get(h)) and live(h) and not(ringing(label(h, timer.get(h).name)))
+
   /// Jarvis cancels the timer of `h`.
   action cancel(h: HELPER): bool = all {
-    owned(h),
-    not(starting.get(h)),
-    live(h),
+    cancellable(h),
     move(Other, h, ha.set(h, "idle"), timer.set(h, NO_ENTRY), starting, ring),
   }
 
@@ -164,7 +187,7 @@ module timers {
   /// HA ends the timer of `h` and sends `timer.finished`. A timer of Jarvis starts a ring, and its entry goes.
   action finish(h: HELPER): bool = {
     val e = timer.get(h)
-    val bell = { sat: e.sat, name: e.name, left: RINGS, rung: 0, stopped: false }
+    val bell = { sat: e.sat, name: e.name, order: e.order, start: now, left: RINGS, rung: 0, stopped: false }
     all {
       ha.get(h) == "active",
       move(Other, h, ha.set(h, "idle"), timer.set(h, NO_ENTRY), starting, if (e.owned) ring.set(h, bell) else ring),
@@ -195,12 +218,23 @@ module timers {
   /// Jarvis starts again with its saved table. No start call and no ring survives.
   action restart = connect(HELPER_SET.mapBy(_ => false), HELPER_SET.mapBy(h => ring.get(h).with("left", 0)))
 
-  /// One ring of `h` on its satellite.
+  /// One ring of `h` on its satellite, at its time or later. Each ring whose `RING_FOR` passes ends.
   action ringOnce(h: HELPER): bool = {
     val r = ring.get(h)
+    val t = if (now > r.start + RING_INTERVAL * r.rung) now else r.start + RING_INTERVAL * r.rung
+    val rang = ring.set(h, r.with("left", r.left - 1).with("rung", r.rung + 1))
     all {
       r.left > 0,
-      move(Ring, h, ha, timer, starting, ring.set(h, r.with("left", r.left - 1).with("rung", r.rung + 1))),
+      t < r.start + RING_FOR,
+      ha' = ha,
+      timer' = timer,
+      starting' = starting,
+      nextOrder' = nextOrder,
+      ring' = HELPER_SET.mapBy(g => if (rang.get(g).start + RING_FOR <= t) rang.get(g).with("left", 0) else rang.get(g)),
+      now' = t,
+      lastAction' = Ring,
+      lastHelper' = h,
+      lastWasFree' = false,
     }
   }
 
@@ -208,14 +242,17 @@ module timers {
   action stop(s: SATELLITE): bool =
     move(Other, lastHelper, ha, timer, starting, HELPER_SET.mapBy(h => if (ring.get(h).sat == s) hush(ring.get(h)) else ring.get(h)))
 
-  /// A request cancels the ringing timer of `h` by name.
-  action silence(h: HELPER): bool = {
+  /// The ring of `h` has rings left, and no newer ring with rings left has its label.
+  def newest(h: HELPER): bool = {
     val r = ring.get(h)
-    all {
-      r.left > 0,
-      r.name != "",
-      move(Other, h, ha, timer, starting, ring.set(h, hush(r))),
-    }
+    val newer = HELPER_SET.exists(g => ring.get(g).left > 0 and label(g, ring.get(g).name) == label(h, r.name) and ring.get(g).order > r.order)
+    r.left > 0 and not(newer)
+  }
+
+  /// A request cancels the newest ringing timer with the label of the ring of `h`.
+  action silence(h: HELPER): bool = all {
+    newest(h),
+    move(Other, h, ha, timer, starting, ring.set(h, hush(ring.get(h)))),
   }
 
   /// Any enabled event.
@@ -282,7 +319,7 @@ module timers {
 
   /// After `cancel`, `haCancel`, or `quietEnd` and `reconnect`, the helper has no entry and keeps the ring of its last timer.
   run ac_19_1_4_cancel_never_rings = {
-    val first = { sat: "s1", name: "", left: RINGS, rung: 0, stopped: false }
+    val first = { sat: "s1", name: "", order: 0, start: 0, left: RINGS, rung: 0, stopped: false }
     val gone = timer.get("h1") == NO_ENTRY and ring.get("h1") == first
     init
       .then(setTimer("s1", ""))
@@ -308,7 +345,7 @@ module timers {
     .then(setTimer("s2", "chicken"))
     .then(started("h1"))
     .then(finish("h1"))
-    .expect(ring.get("h1") == { sat: "s2", name: "chicken", left: RINGS, rung: 0, stopped: false })
+    .expect(ring.get("h1") == { sat: "s2", name: "chicken", order: 0, start: 0, left: RINGS, rung: 0, stopped: false })
     .then(stop("s1"))
     .expect(ring.get("h1").left == RINGS and not(ring.get("h1").stopped))
     .then(ringOnce("h1"))
@@ -334,5 +371,51 @@ module timers {
     .then(restart)
     .expect(timer.get("h1").owned and ha.get("h1") == "active")
     .then(finish("h1"))
-    .expect(ring.get("h1") == { sat: "s1", name: "chicken", left: RINGS, rung: 0, stopped: false })
+    .expect(ring.get("h1") == { sat: "s1", name: "chicken", order: 0, start: 0, left: RINGS, rung: 0, stopped: false })
+
+  /// A cancel by the label of a ringing timer is a `silence`, also for a generic timer.
+  run ac_19_12b_1_cancel_meets_the_ring = init
+    .then(setTimer("s1", ""))
+    .then(started("h1"))
+    .then(finish("h1"))
+    .then(setTimer("s1", ""))
+    .then(started("h1"))
+    .expect(not(cancellable("h1")))
+    .then(silence("h1"))
+    .expect(ring.get("h1").stopped)
+    .then(cancel("h1"))
+
+  /// Of two rings with the same name, `silence` takes the newest.
+  run ac_19_12b_2_newest_ring = init
+    .then(setTimer("s1", ""))
+    .then(started("h1"))
+    .then(setTimer("s1", "chicken"))
+    .then(started("h2"))
+    .then(finish("h2"))
+    .then(cancel("h1"))
+    .then(setTimer("s2", "chicken"))
+    .then(started("h1"))
+    .then(finish("h1"))
+    .expect(ring.get("h1").order == 2 and ring.get("h2").order == 1)
+    .expect(not(newest("h2")) and newest("h1"))
+    .then(silence("h1"))
+    .then(silence("h2"))
+
+  /// A ring ends at `RING_FOR` from its start, also while another ring rings.
+  run ac_19_12b_3_ring_for = init
+    .then(setTimer("s1", ""))
+    .then(setTimer("s2", ""))
+    .then(started("h1"))
+    .then(started("h2"))
+    .then(finish("h1"))
+    .then(finish("h2"))
+    .then(8.reps(_ => ringOnce("h2")))
+    .then(setTimer("s1", ""))
+    .then(setTimer("s2", ""))
+    .then(started("h1"))
+    .then(started("h2"))
+    .then(finish("h2"))
+    .then(2.reps(_ => ringOnce("h2")))
+    .expect(ring.get("h1").left == 0)
+    .then(ringOnce("h1").fail())
 }
