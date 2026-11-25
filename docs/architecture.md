@@ -203,7 +203,9 @@ flowchart LR
     crate_app_review --> crate_ports
     crate_app_speech --> crate_app_conversation
     crate_app_speech --> crate_app_speech
+    crate_app_speech --> crate_app_timers
     crate_app_speech --> crate_domain_catalog
+    crate_app_speech --> crate_domain_dialog
     crate_app_speech --> crate_domain_intent
     crate_app_speech --> crate_domain_responses
     crate_app_speech --> crate_domain_speech

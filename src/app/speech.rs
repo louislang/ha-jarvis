@@ -17,7 +17,9 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use crate::app::conversation::Queues;
+use crate::app::timers::TimerDesk;
 use crate::domain::catalog;
+use crate::domain::dialog;
 use crate::domain::intent;
 use crate::domain::responses;
 use crate::domain::responses::Pools;
@@ -154,7 +156,8 @@ impl Utterances {
 }
 
 /// Starts listen sessions that warm System Two, predict on each changed first-pass partial,
-/// commit by the policy, early for an answer to an open dialog, and give the second-pass
+/// commit by the policy, early for an answer to an open dialog or a cancel phrase during a timer
+/// ring, and give the second-pass
 /// transcript, which it keeps with its audio and the task of its voice embedding.
 pub struct Listener {
     /// The two passes of each session.
@@ -175,17 +178,22 @@ pub struct Listener {
     utterances: Arc<Utterances>,
     /// The voice embedding of each committed utterance.
     voice: Arc<dyn VoiceEmbedder>,
+    /// The timer rings, during which a cancel phrase commits early.
+    timers: Arc<TimerDesk>,
+    /// The cancel phrases: `dialog.cancel`.
+    cancel: Vec<String>,
 }
 
 impl Listener {
     /// Listens with `stt` and `classifier`, warms `reasoner`, and commits by `policy` and
     /// `threshold`, or early for an answer to a dialog of `queues` that is open at the time of
-    /// `clock`. Keeps each transcript in `utterances` with its embedding by `voice`.
+    /// `clock`, or for a phrase of `cancel` while `timers` rings. Keeps each transcript in
+    /// `utterances` with its embedding by `voice`.
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
-        reason = "the session connects both passes, the prediction, the dialogs, the utterances \
-                  and the voice"
+        reason = "the session connects both passes, the prediction, the dialogs, the utterances, \
+                  the voice and the rings"
     )]
     pub fn new(
         stt: Arc<dyn SpeechToText>,
@@ -197,6 +205,8 @@ impl Listener {
         clock: Arc<dyn Clock>,
         utterances: Arc<Utterances>,
         voice: Arc<dyn VoiceEmbedder>,
+        timers: Arc<TimerDesk>,
+        cancel: Vec<String>,
     ) -> Self {
         Self {
             stt,
@@ -208,6 +218,8 @@ impl Listener {
             clock,
             utterances,
             voice,
+            timers,
+            cancel,
         }
     }
 
@@ -241,6 +253,8 @@ impl Listener {
             clock: Arc::clone(&self.clock),
             utterances: Arc::clone(&self.utterances),
             voice: Arc::clone(&self.voice),
+            timers: Arc::clone(&self.timers),
+            cancel: self.cancel.clone(),
             text: String::new(),
             confident: false,
             samples: Vec::new(),
@@ -269,9 +283,14 @@ struct Session {
     utterances: Arc<Utterances>,
     /// The voice embedding of the utterance.
     voice: Arc<dyn VoiceEmbedder>,
+    /// The timer rings, during which a cancel phrase commits early.
+    timers: Arc<TimerDesk>,
+    /// The cancel phrases.
+    cancel: Vec<String>,
     /// The text of the last changed, non-empty partial.
     text: String,
-    /// True when `text` answers an open dialog or its prediction is a confident command.
+    /// True when `text` answers an open dialog, is a cancel phrase during a timer ring, or its
+    /// prediction is a confident command.
     confident: bool,
     /// The pushed samples.
     samples: Vec<i16>,
@@ -288,10 +307,11 @@ impl Session {
         }
     }
 
-    /// True when `text` answers an open dialog, with no prediction, or when its prediction is a
-    /// confident command.
+    /// True when `text` answers an open dialog or is a cancel phrase during a timer ring, with no
+    /// prediction, or when its prediction is a confident command.
     async fn is_confident(&self, text: &str) -> bool {
         self.queues.is_answer(text, self.clock.now())
+            || (dialog::is_cancel(text, &self.cancel) && self.timers.ringing().await)
             || confident(&*self.classifier, self.threshold, text).await
     }
 
@@ -575,16 +595,23 @@ mod tests {
     use crate::domain::model::Slot;
     use crate::domain::responses::Pool;
     use crate::domain::responses::Response;
+    use crate::domain::state::Event;
+    use crate::domain::state::TimerEnd;
     use crate::domain::state_cache::StateCache;
+    use crate::domain::timers::Timer;
+    use crate::domain::timers::TimerInput;
+    use crate::domain::timers::Timers;
     use crate::testing::fakes::FakeClassifier;
     use crate::testing::fakes::FakeClock;
     use crate::testing::fakes::FakeHome;
     use crate::testing::fakes::FakeReasoner;
     use crate::testing::fakes::FakeStt;
+    use crate::testing::fakes::FakeTimerStore;
     use crate::testing::fakes::FakeTts;
     use crate::testing::fakes::FakeVoiceEmbedder;
     use crate::testing::fakes::SetClock;
     use crate::testing::fakes::log_dispatch;
+    use crate::testing::fakes::timer_desk;
 
     /// Commits 200 ms after confident text, 600 ms after other text and at 10 s of audio.
     const POLICY: CommitPolicy = CommitPolicy {
@@ -614,14 +641,19 @@ mod tests {
         }
     }
 
-    /// Queues with the cancel phrase "never mind" and a dialog timeout of 15 s, with a dialog for
+    /// The cancel phrases "never mind" and "stop".
+    fn cancel() -> Vec<String> {
+        vec!["never mind".to_owned(), "stop".to_owned()]
+    }
+
+    /// Queues with the cancel phrases of `cancel` and a dialog timeout of 15 s, with a dialog for
     /// each of `open` on its own key, asked at `asked`.
     fn dialogs(open: Vec<Pending>, asked: Timestamp) -> Arc<Queues> {
         let dialog = DialogConfig {
             max_turns: 3,
             timeout_s: 15,
             choice_similarity: 0.85,
-            cancel: vec!["never mind".to_owned()],
+            cancel: cancel(),
         };
         let (home, cache) = (
             Arc::new(FakeHome::default()),
@@ -634,13 +666,18 @@ mod tests {
         Arc::new(queues)
     }
 
-    /// A listener on `stt`, `classifier`, `voice` and the dialogs of `queues` at the Unix epoch,
-    /// that warms `reasoner`.
+    /// Queues with no dialogs, and a timer desk with no ring.
+    fn no_dialogs() -> (Arc<Queues>, Arc<TimerDesk>) {
+        (dialogs(Vec::new(), Timestamp::UNIX_EPOCH), timer_desk())
+    }
+
+    /// A listener on `stt`, `classifier`, `voice`, the dialogs of `queues` at the Unix epoch and
+    /// the rings of `timers`, that warms `reasoner`.
     fn listener(
         stt: FakeStt,
         classifier: &Arc<FakeClassifier>,
         reasoner: &Arc<FakeReasoner>,
-        queues: Arc<Queues>,
+        (queues, timers): (Arc<Queues>, Arc<TimerDesk>),
         voice: Arc<dyn VoiceEmbedder>,
     ) -> Listener {
         let classifier = Arc::clone(classifier) as Arc<dyn Classifier>;
@@ -657,6 +694,8 @@ mod tests {
             clock,
             utterances,
             voice,
+            timers,
+            cancel(),
         )
     }
 
@@ -713,13 +752,13 @@ mod tests {
         stt: FakeStt,
         predictions: Vec<Prediction>,
     ) -> anyhow::Result<(Box<dyn Listening>, Arc<FakeClassifier>)> {
-        session_in(dialogs(Vec::new(), Timestamp::UNIX_EPOCH), stt, predictions)
+        session_in(no_dialogs(), stt, predictions)
     }
 
-    /// A session on `stt` and the dialogs of `queues`, with a classifier that gives
-    /// `predictions`, and that classifier.
+    /// A session on `stt`, the dialogs of `queues` and the rings of `timers`, with a classifier
+    /// that gives `predictions`, and that classifier.
     fn session_in(
-        queues: Arc<Queues>,
+        queues: (Arc<Queues>, Arc<TimerDesk>),
         stt: FakeStt,
         predictions: Vec<Prediction>,
     ) -> anyhow::Result<(Box<dyn Listening>, Arc<FakeClassifier>)> {
@@ -736,7 +775,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_7_1_4_listen_warms_the_reasoner_once() -> anyhow::Result<()> {
         let reasoner = Arc::new(FakeReasoner::default());
-        let queues = dialogs(Vec::new(), Timestamp::UNIX_EPOCH);
+        let queues = no_dialogs();
         let voice = Arc::new(FakeVoiceEmbedder);
         let listener = listener(
             FakeStt::default(),
@@ -757,18 +796,13 @@ mod tests {
         partials: Vec<Partial>,
         predictions: Vec<Prediction>,
     ) -> anyhow::Result<(Vec<Option<String>>, Arc<FakeClassifier>)> {
-        pushes_in(
-            dialogs(Vec::new(), Timestamp::UNIX_EPOCH),
-            partials,
-            predictions,
-        )
-        .await
+        pushes_in(no_dialogs(), partials, predictions).await
     }
 
-    /// The result of each push of a 20 ms chunk with the dialogs of `queues`, one push for each
-    /// of `partials`, and the classifier.
+    /// The result of each push of a 20 ms chunk with the dialogs and the rings of `queues`, one
+    /// push for each of `partials`, and the classifier.
     async fn pushes_in(
-        queues: Arc<Queues>,
+        queues: (Arc<Queues>, Arc<TimerDesk>),
         partials: Vec<Partial>,
         predictions: Vec<Prediction>,
     ) -> anyhow::Result<(Vec<Option<String>>, Arc<FakeClassifier>)> {
@@ -859,10 +893,7 @@ mod tests {
             partials: vec![partial(TEXT, Some(0), 700)],
             ..FakeStt::default()
         };
-        let (queues, voice) = (
-            dialogs(Vec::new(), Timestamp::UNIX_EPOCH),
-            Arc::new(GatedEmbedder(Mutex::new(gate))),
-        );
+        let (queues, voice) = (no_dialogs(), Arc::new(GatedEmbedder(Mutex::new(gate))));
         let listener = listener(stt, &Arc::default(), &Arc::default(), queues, voice);
         let transcript = listener.listen()?.push(vec![0; 320]).await?;
         assert_eq!(transcript, Some(TEXT.to_owned()));
@@ -891,7 +922,7 @@ mod tests {
         };
         let classifier = Arc::new(FakeClassifier::default());
         classifier.script(prediction("lights_on", 0.95));
-        let queues = dialogs(Vec::new(), Timestamp::UNIX_EPOCH);
+        let queues = no_dialogs();
         let voice = Arc::new(FakeVoiceEmbedder);
         let listener = listener(stt, &classifier, &Arc::default(), queues, voice);
         let mut session = listener.listen()?;
@@ -1097,13 +1128,67 @@ mod tests {
         text: &str,
         silences: &[u64],
     ) -> anyhow::Result<Vec<Option<String>>> {
+        ring_pushes((dialogs(open, asked), timer_desk()), text, silences).await
+    }
+
+    /// `answer_pushes` with the dialogs and the rings of `queues`.
+    async fn ring_pushes(
+        queues: (Arc<Queues>, Arc<TimerDesk>),
+        text: &str,
+        silences: &[u64],
+    ) -> anyhow::Result<Vec<Option<String>>> {
         let partials: Vec<Partial> = silences
             .iter()
             .map(|silence| partial(text, Some(500), 500 + silence))
             .collect();
-        let queues = dialogs(open, asked);
         let (results, _) = pushes_in(queues, partials, vec![prediction("unknown", 0.95)]).await?;
         Ok(results)
+    }
+
+    /// A timer desk with the ring of a generic timer of the Kitchen satellite on
+    /// `timer.jarvis_1`.
+    async fn ringing() -> anyhow::Result<Arc<TimerDesk>> {
+        let store = Arc::new(FakeTimerStore::default());
+        let timer = Timer {
+            satellite: Some("assist_satellite.kitchen".to_owned()),
+            name: None,
+            duration: "one minute".to_owned(),
+            order: 0,
+            starting: false,
+        };
+        let helper = "timer.jarvis_1".to_owned();
+        *store.timers.lock().expect("no test panics") = Timers {
+            timers: BTreeMap::from([(helper.clone(), timer)]),
+            next: 1,
+        };
+        let desk = Arc::new(TimerDesk::new(store, 0.85).await);
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let end = TimerEnd::Finished;
+        sender.send(TimerInput::Event(Event::TimerEnded {
+            entity_id: helper,
+            end,
+        }))?;
+        drop(sender);
+        desk.run(receiver, |_, _| {}).await;
+        Ok(desk)
+    }
+
+    /// AC-19.11-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_11_1_stop_during_a_ring_commits_at_early_commit_ms() -> anyhow::Result<()> {
+        let queues = (dialogs(Vec::new(), Timestamp::UNIX_EPOCH), ringing().await?);
+        let results = ring_pushes(queues, "stop", &[0, 199, 200]).await?;
+        assert_eq!(results, commit_after(2, "stop"));
+        Ok(())
+    }
+
+    /// AC-19.11-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_11_2_stop_without_a_ring_commits_at_endpoint_ms() -> anyhow::Result<()> {
+        let silences = [0, 200, 599, 600];
+        let results = answer_pushes(Vec::new(), Timestamp::UNIX_EPOCH, "stop", &silences).await?;
+        assert_eq!(results, commit_after(3, "stop"));
+        Ok(())
     }
 
     /// AC-10.7-1.
