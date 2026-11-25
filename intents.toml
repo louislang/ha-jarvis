@@ -325,7 +325,7 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 [[intent]]
 name = "timer_set"
 kind = "timer"
-examples = ["set a timer for [ten minutes](duration)", "set a timer for [five minutes](duration) for the [chicken](timer)", "set a [pasta](timer) timer for [eight minutes](duration)", "start a timer for [thirty seconds](duration)", "timer for [an hour](duration)", "set a [laundry](timer) timer for [one hour and twenty minutes](duration)", "set a timer"]
+examples = ["set a timer for [ten minutes](duration)", "set a timer for [five minutes](duration) for the [chicken](timer)", "set a [pasta](timer) timer for [eight minutes](duration)", "start a timer for [thirty seconds](duration)", "timer for [an hour](duration)", "set a [laundry](timer) timer for [one hour and twenty minutes](duration)", "set a timer", "set a timer for the [chicken](timer)", "set a [pizza](timer) timer", "timer for the [pasta](timer)"]
 optional = ["timer", "duration"]
 timer = "set"
 
