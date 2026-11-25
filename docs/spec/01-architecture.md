@@ -8,7 +8,7 @@ Jarvis uses hexagonal architecture (ports and adapters). There are four layers.
 
 | Layer | Folder | Contents | Can depend on |
 |---|---|---|---|
-| Domain | `src/domain/` | Pure rules: catalog, model input and output, training set, decide, select, dialogs, habits, feedback, learned intents, speaker identification, speech policy, timers. | Pure crates only (see section 7). |
+| Domain | `src/domain/` | Pure rules: catalog, model input and output, training set, decide, select, dialogs, habits, feedback, learned intents, speaker identification, speech policy, timers, mute. | Pure crates only (see section 7). |
 | Ports | `src/ports.rs` | Traits for the driving ports and the driven ports. | Domain, and the crates of section 7 for ports. |
 | Application | `src/app/` | Use cases. They connect the domain to the ports. | Domain, ports, and the crates of section 7 for the application. |
 | Adapters | `src/adapters/` | Port implementations for one technology each. | Ports, domain, technology crates. |
@@ -56,6 +56,7 @@ Dependency rules:
                                    │   │ learn speaker speech   │ │   Models ─────────▶ LiveModels (lib.rs)
                                    │   └────────────────────────┘ │   PluginRequests ─▶ adapters/files.rs
                                    │                              │   TimerStore ─────▶ adapters/sqlite.rs
+                                   │                              │   MuteStore ──────▶ adapters/sqlite.rs
                                    │                              │   MediaLibrary ───▶ adapters/plex.rs ─▶ Plex
                                    │                              │   Status ─────────▶ adapters/mqtt.rs (no port) ─▶ MQTT broker
                                    └──────────────────────────────┘
@@ -69,7 +70,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 |---|---|---|---|
 | `Assistant` | Driving | `info`, `listen` (gives a `Listening` session: `push`, `finish`), `handle`, `speak` | Implemented by `App` in `src/lib.rs`. Called by `adapters/wyoming.rs`. |
 | `Review` | Driving | `list`, `audio`, `mark`, `intents`, `proposals`, `resolve`, `people`, `assign` | Implemented by `app/review.rs`. Called by `adapters/web.rs`. |
-| `Control` | Driving | `status`, `settings`, `save` | Implemented in `src/lib.rs`. Called by `adapters/web.rs`. |
+| `Control` | Driving | `status`, `settings`, `save`, `mutes`, `unmute` | Implemented in `src/lib.rs`. Called by `adapters/web.rs`. |
 | `Home` | Driven | `snapshot`, `events`, `call`, `announce`, `ask` | `adapters/ha.rs` |
 | `SpeechToText` | Driven | `stream` (first pass: gives `accept`, `partial`, `reset`), `transcribe` (second pass), `set_hotwords` | `adapters/sherpa.rs` |
 | `TextToSpeech` | Driven | `synth` | `adapters/supertonic.rs` |
@@ -82,6 +83,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | `Plugin` | Driven | `tool`, `fetch` | One adapter for each remote API: `adapters/open_meteo.rs` (weather), `adapters/plex.rs` (new shows) |
 | `InteractionLog` | Driven | `append`, `update`, `list`, `get`, `audio`, `embedding`, `mark`, `marked`, `deferred`, `prune` | `adapters/sqlite.rs` |
 | `TimerStore` | Driven | `load`, `save` | `adapters/sqlite.rs` (the table `timers` of `jarvis.db`) |
+| `MuteStore` | Driven | `load`, `save` | `adapters/sqlite.rs` (the table `mutes` of `jarvis.db`) |
 | `Store<T>` | Driven | `load`, `save` | `adapters/files.rs` (TOML or JSON from the file extension) |
 | `Clock` | Driven | `now` | `SystemClock` in `src/lib.rs` |
 | `Models` | Driven | `release`, `restore` | `LiveModels` in `src/lib.rs` |
@@ -179,6 +181,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 34. **Speech biasing.** The second pass decodes with modified beam search and a list of hotwords: the names and aliases of the areas, of the entities that people control (lights, switches, fans, climate, covers, locks, media players, scenes, scripts and automations), the command verbs of the intent catalog (`verbs`, for example "Resume" and "Turn on"), and the playlists, artists and albums of the Music Assistant library. A phrase of the list that the audio matches gets `asr.hotwords_score` for each token. Each stream gets the list (`create_stream_with_hotwords`), so the list changes without a model reload. Jarvis builds the list at the start and each hour (sub-phases 18.17 to 18.18b). On the GPU host with the CPU provider, "Play Radio Head." became "Play Radiohead." and "Activate movie time." became "Activate Movie Time.". Hotwords keep the case of the names: hotwords in capital letters broke the decode. A verb has a capital first letter, because it starts the sentence. The first pass stays greedy, because on the GPU host its text only gives the speculative prediction.
 35. **TV playback through Plezy.** Movies and shows play in the Plezy app on the Apple TV of the Living Room, not on the Plex player of the Sony TV, because Plezy on the Apple TV plays more reliably. Each TV intent names the Apple TV as its `entity`. Jarvis first turns on the TV. Then it plays the link `plezy://play?server=<server>&id=<item>` with `media_player.play_media`, and after `PLEZY_WAIT` it presses Select on the remote of the Apple TV to accept the "Open in Plezy" popup of tvOS. The link has the Plex server ID and the item key from the title list, so one form plays a movie, a show and one episode (sub-phases 18.19 to 18.19c). System Two plays a title through the same work with the tool `play_on_tv` (sub-phase 18.19g).
 36. **Timers in HA timer helpers.** A voice timer runs in an HA timer helper, so HA keeps the time, and the HA UI shows and controls the timer. You create the helpers once, with "Restore" on, for example `timer.jarvis_1` to `timer.jarvis_5`. Jarvis uses each helper whose entity ID starts with `timer.jarvis_`. Jarvis needs no admin rights and creates no helper. Jarvis keeps a table: the helper, the satellite, the name and the spoken duration of each timer. It saves the table in `jarvis.db` after each change and loads it at the start. At each connection to HA, also the first, an entry whose helper is `idle` and whose start call does not run goes with no ring, because Jarvis cannot tell a missed end from a cancel. A new timer takes the free helper with the lowest entity ID: `idle` in HA and not in the table. HA fires `timer.finished` at the end of a timer and `timer.cancelled` at a cancel. A state change cannot tell them apart, so Jarvis subscribes to both events. At `timer.finished`, the satellite that set the timer announces its end every 15 s, 8 times, through its announce queue, until the user says a cancel phrase of `dialog.cancel` ("stop") on that satellite or cancels that timer by name (phase 19).
+37. **Stop and mute.** A cancel phrase of `dialog.cancel` ("stop", "never mind") on a satellite never goes to System One or System Two. Each request on a satellite already increases its generation, which drops its queued announces, stops its System Two and fetch jobs at their next step and closes its dialog (sub-phases 10.5b and 16.1b). The Satellite1 stops its own speech at the wake word. Thus a cancel phrase only adds the stop of the ring of the satellite and the reply "Okay.". A bare "stop" pauses the music of the room (`music_pause`) only when Jarvis did nothing on the satellite: no ring, no open dialog, no live job or queue item, and no speech in the last 10 s. "Mute" also turns on the `_mute_microphones` switch of the satellite through HA, so the satellite stops listening. You unmute with the button of the satellite, the switch in HA or the Jarvis tab. At the end of "mute for ten minutes", Jarvis unmutes only when the switch still has the `on` state of the mute, so a change by a person or by training wins. The end waits for the end of a local training run. Jarvis keeps the timed mutes in the table `mutes` of `jarvis.db`, so a restart keeps them (phase 20).
 
 ## 6. Latency Budget (System One)
 
@@ -316,6 +319,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `quint/prefetch.qnt` | Model | Prefetch window, refresh, freshness and side effects. | 14.8 |
 | `quint/speaker.qnt` | Model | Speaker identification and enrollment. | 15.5 |
 | `quint/timers.qnt` | Model | Timer table, timer helpers and rings. | 19.1 |
+| `quint/mute.qnt` | Model | Mute switches, voice mutes and their end. | 20.4 |
 | `quint/jarvis.qnt` | Model | The system model: the request lifecycle on two satellites. | 16.1 |
 | `quint/composed.qnt` | Model | The system model composed with the component models, and one wrapper module for each component model. | 16.3 |
 | `src/lib.rs` | Root | Module tree, `Config`, `SystemClock`, `LiveModels`, `App` (implements `Assistant` by delegation), `run`, the `dataset` command, `main`. | 0.1 |
@@ -338,6 +342,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/domain/learn.rs` | Domain | Clusters, proposal validation, approval rule, prefetch schedule and freshness. | 14.1 |
 | `src/domain/speaker.rs` | Domain | Discovery, presence, proximity and identification. | 15.1 |
 | `src/domain/timers.rs` | Domain | Timer durations, time left, the timer table, the plan of a timer request and its answer. | 19.2 |
+| `src/domain/mute.rs` | Domain | The plan of a mute request, its answer and the rule of its end. | 20.5 |
 | `src/app/background.rs` | Application | Hot cache sync, request habit store, backfill, learned intents, prefetch, hotword refresh, Plex title refresh. | 2.9 |
 | `src/app/conversation.rs` | Application | `handle` use case, dispatch, deferred jobs, dialog map. | 4.8 |
 | `src/app/speech.rs` | Application | `listen` and `speak` use cases, audio cache, pre-render. | 6.3b |
@@ -345,6 +350,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/app/training.rs` | Application | Generated examples, training trigger, training run, accept and swap. | 13.6 |
 | `src/app/plugins.rs` | Application | Plugin registry: lookup by tool name, result cache and deadline. | 17.1 |
 | `src/app/timers.rs` | Application | `TimerDesk`: the timer table and its store, the timer events of HA, the rings and stop. | 19.9b |
+| `src/app/mute.rs` | Application | `MuteDesk`: the mute requests, the timed mutes, their store and their end. | 20.7 |
 | `src/adapters/ha.rs` | Adapter | `Home` over the HA WebSocket API. | 2.2 |
 | `src/adapters/onnx.rs` | Adapter | `Classifier` and `ModelLoader` with ONNX Runtime. | 3.12 |
 | `src/adapters/files.rs` | Adapter | `Store<T>` with TOML or JSON files and atomic write. `PluginRequests` with Markdown files in a folder (sub-phase 14.12). | 4.3 |
@@ -352,7 +358,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/adapters/sherpa.rs` | Adapter | `SpeechToText` (first and second pass), `VoiceEmbedder`, `VoiceProfiles` with sherpa-onnx. | 6.2 |
 | `src/adapters/supertonic.rs` | Adapter | `TextToSpeech` with the Supertonic-3 graphs in ONNX Runtime and fixed input lengths. | 9.3 |
 | `src/adapters/openai.rs` | Adapter | `Reasoner` with OpenAI. Prompt builders. | 7.1 |
-| `src/adapters/sqlite.rs` | Adapter | `InteractionLog` with SQLite. `TimerStore` in the same database (sub-phase 19.8). | 12.4 |
+| `src/adapters/sqlite.rs` | Adapter | `InteractionLog` with SQLite. `TimerStore` (sub-phase 19.8) and `MuteStore` (sub-phase 20.9) in the same database. | 12.4 |
 | `src/adapters/web.rs` | Driving adapter | Web server of the Jarvis tab with token auth. It calls `Review` and `Control`. | 12.8 |
 | `src/adapters/review.html` | Driving adapter | The page of the Jarvis tab: review, status and settings. `web.rs` embeds it with `include_str!`. | 12.9 |
 | `src/adapters/mqtt.rs` | Adapter | The status entity through MQTT discovery, a retained state and a last will. No port (section 1). | 12.9c |
@@ -636,6 +642,7 @@ examples = ["start training", "retrain yourself", "train your model", "start a n
 - `kind = "prefetch"`: Jarvis replies with the prefetched answer when it is fresh. Else Jarvis treats the request as System Two. Only learned intents use this kind.
 - `kind = "train"`: Jarvis replies from the pool and starts a training run (sub-phase 13.11).
 - `kind = "timer"`: Jarvis acts on a timer helper (decision 36). `timer` is the action: `set`, `cancel`, `cancel_last`, `pause`, `resume` or `left`. The slots are `duration` and the optional name `timer`. A timer intent needs no area (phase 19).
+- `kind = "mute"`: Jarvis turns on the mute switch of the satellite. The optional slot `duration` gives the end of the mute. A mute intent needs no area (phase 20).
 - `select` is a list of entity filters. A filter has a `domain`, an optional `name` and an optional `device_class`. `name` matches whole words of the entity name or an alias, without case sensitivity (`fan` matches "Office Fan", not "Infant Monitor"). An entity matches when one filter matches. `select` skips an entity that has an entity category, that is hidden or disabled, or that is on a satellite device (a device with an `assist_satellite` entity) and is not a `media_player`.
 - `exclude` is a list of entity IDs that `select` never matches. Use it for a sensor that gives bad values.
 - `plugin` is the tool name of the plugin of a fetch intent, for example `get_weather`.
@@ -691,13 +698,13 @@ responses = ["Training is already running."]
 responses = ["Which room?"]
 
 [pools.cancelled]
-responses = ["Okay, never mind."]
+responses = ["Okay."]
 
 [pools.not_in_library]
 responses = ["That is not in the Plex library."]
 ```
 
-The pool `ask_area` holds the questions for a missing area. A pool that is not an intent pool uses no template variable, except the timer answer pools `ask_timer`, `ask_duration`, `timer_full`, `timer_taken`, `timer_missing` and `timer_done`, which can use `timer`, `duration` and `timers` (sub-phase 19.6). The pool of a `timer` intent can use only `timer`, `duration` and `timers` (sub-phase 19.5).
+The pool `ask_area` holds the questions for a missing area. A pool that is not an intent pool uses no template variable, except the timer answer pools `ask_timer`, `ask_duration`, `timer_full`, `timer_taken`, `timer_missing` and `timer_done`, which can use `timer`, `duration` and `timers` (sub-phase 19.6). The pool of a `timer` intent can use only `timer`, `duration` and `timers` (sub-phase 19.5). The pool of a `mute` intent can use only `duration` (sub-phase 20.6).
 
 Template variables of an intent pool: `area` (area name), slot names, `entity` (state, attributes, name), `entities` (a list of `entity` objects), `response` (the plugin result of a fetch), `address` (the form of address of the speaker, sub-phase 15.9). A response with `address` is a candidate only when the speaker has a form of address. `entity` exists only for `target = "entity"`, `entities` only for a list query, and `response` only for `kind = "fetch"`.
 
@@ -817,5 +824,6 @@ Each model has state variables, actions and named invariants. `02-rules.md` sect
 | `prefetch.qnt` | Prefetch | `domain/learn.rs`, `app/background.rs` | `NoCallFromPrefetch`, `ServedAnswerIsFresh`, `PrefetchOnlyInWindow`, `NoEarlyRefresh` |
 | `speaker.qnt` | Speaker identification and voice assignment | `domain/speaker.rs`, `app/review.rs` | `SpeakerIsCandidate`, `NoVoiceOnlyEnrollment`, `ProfilesBounded`, `PickWins` |
 | `timers.qnt` | Timer table, timer helpers and rings | `domain/timers.rs`, `app/timers.rs` | `UniqueNames`, `StartOnFreeHelper`, `RingsBounded`, `NoRingAfterStop` |
+| `mute.qnt` | Mute switches, voice mutes and their end | `domain/mute.rs`, `app/mute.rs` | `NoUnmuteAfterPress`, `NoEarlyUnmute`, `NoUnmuteInTraining` |
 | `jarvis.qnt` | System | All use cases | `OneHandledPerRequest`, `ReplyBeforeCall`, `FillerBeforeAnswer`, `ModelSwapAtomic`, `NoTalkOver` |
 | `composed.qnt` | System with the components | All use cases | `SystemInvariants`, `ComponentInvariants` |
