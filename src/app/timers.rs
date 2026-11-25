@@ -799,7 +799,7 @@ mod tests {
     const RESUME: (&str, TimerAction) = ("timer_resume", TimerAction::Resume);
 
     /// The model state of `timers.qnt` that the conformance test compares.
-    #[derive(Debug, Deserialize, PartialEq)]
+    #[derive(Debug, Default, Deserialize, PartialEq)]
     struct TimerModel {
         /// The HA state of each helper.
         ha: BTreeMap<String, String>,
@@ -861,12 +861,7 @@ mod tests {
         /// The HA of the driver, and the table and the rings of the desk.
         fn from_driver(driver: &TimerDriver) -> anyhow::Result<Self> {
             let desk = driver.fixture.desk.desk.try_lock()?;
-            let mut model = Self {
-                ha: BTreeMap::new(),
-                timer: BTreeMap::new(),
-                starting: BTreeMap::new(),
-                ring: BTreeMap::new(),
-            };
+            let mut model = Self::default();
             for (helper, state) in &driver.ha {
                 let (name, entry) = (swap(HELPERS, helper), desk.timers.timers.get(helper));
                 model.ha.insert(name.clone(), state.clone());
@@ -960,26 +955,41 @@ mod tests {
             call.filter(|_| made)
         }
 
-        /// A set on the first free helper, with the duration of that helper.
-        fn set(&self, model: &str, name: &str) -> anyhow::Result<()> {
+        /// The helper that a set for `name` takes: the first free one, or none for a taken name.
+        fn planned(&self, name: &str) -> anyhow::Result<Option<String>> {
             let desk = self.fixture.desk.desk.try_lock()?;
             let free = |helper: &&String| {
                 self.ha[*helper] == "idle" && !desk.timers.timers.contains_key(*helper)
             };
-            let first = self.ha.keys().find(free).cloned();
-            drop(desk);
-            let duration = if first.as_deref() == Some(J2) {
-                "two minutes"
+            let mut names = desk.timers.timers.values();
+            let taken = names.any(|timer| timer.name.as_deref() == Some(name));
+            Ok(self.ha.keys().find(free).filter(|_| !taken).cloned())
+        }
+
+        /// A set, which must start the helper that it takes for the duration of that helper.
+        fn set(&self, model: &str, name: &str) -> anyhow::Result<()> {
+            let helper = self.planned(name)?;
+            let (duration, seconds) = if helper.as_deref() == Some(J2) {
+                ("two minutes", 120)
             } else {
-                "one minute"
+                ("one minute", 60)
             };
-            self.ask(("timer_set", TimerAction::Set), name, duration, model);
+            let call = self.ask(("timer_set", TimerAction::Set), name, duration, model);
+            let made = call.map(|call| {
+                (
+                    call.service,
+                    call.target,
+                    call.data.get("duration").cloned(),
+                )
+            });
+            let wanted =
+                helper.map(|helper| ("start".to_owned(), vec![helper], Some(seconds.into())));
+            anyhow::ensure!(made == wanted, "the set of {name:?} called {made:?}");
             Ok(())
         }
 
-        /// The request `intent` with `action` for the label of the timer of the model helper
-        /// `model`, from the Kitchen satellite, then the state `state` of the helper and the end
-        /// `end`. Fails when the request does not call the service of `action` on that helper.
+        /// The request for the label of the timer of the model helper `model`, which must call the
+        /// service of its action on that helper, then the state `state` of the helper and `end`.
         fn act(
             &mut self,
             request: (&str, TimerAction),
