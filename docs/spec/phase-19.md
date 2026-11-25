@@ -11,7 +11,7 @@ You chose these rules (2026-11-08, 2026-11-17, 2026-11-22 and 2026-11-25):
 - "Cancel the chicken timer" cancels by name. "Cancel that timer" cancels the timer when only one runs. "Cancel the most recent timer" cancels the newest. When several run, "cancel that timer" asks which timer and names them ("Which timer, the chicken timer or the pizza timer?"), with a dialog question of phase 10. "Pause the chicken timer" and "resume the chicken timer" work the same way.
 - "How long is left on the timer?" with several timers lists them all. This phase does not add or subtract time.
 - A later phase (stop and mute) adds a general "stop" and "never mind". This phase uses "stop" only for a ringing timer (sub-phase 19.10b).
-- The LED ring of the satellite shows the progress of a running timer, with no change to the firmware. The firmware draws the ring only for an HA Assist timer, so Jarvis keeps a mirror Assist timer on the satellite (sub-phases 19.13 to 19.18). The mirror only drives the ring. Jarvis cancels it before its end, so the firmware never rings, and Jarvis rings as before. This work comes before phase 20.
+- The LED ring of the satellite shows the progress of a running timer, with no change to the firmware. The firmware draws the ring only for an HA Assist timer, so Jarvis keeps a mirror Assist timer on the satellite (sub-phases 19.13 to 19.18). The mirror only drives the ring. Jarvis cancels it before its end, so that the firmware does not ring, and Jarvis rings as before. This work comes before phase 20.
 
 Each sub-phase that adds an intent adds its seed examples to `intents.toml` and its pool to `responses.toml`, as in phase 18 (the preface of `phase-18.md`). The new intents go at the end of `intents.toml`, so the contexts of the existing examples do not change.
 
@@ -703,7 +703,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 ### 19.13 Mirror Quint Model
 
-**Goal:** Add `quint/mirrors.qnt`, the model of the mirrors of the timers (`01-architecture.md` decision 38). Prove that the firmware rings for a mirror only after Jarvis lost its cancel, and that each running timer of a satellite has its mirror, before the Rust code exists.
+**Goal:** Add `quint/mirrors.qnt`, the model of the mirrors of the timers (`01-architecture.md` decision 38). Prove that the firmware rings for a mirror only after Jarvis lost or delayed its cancel, and that each running timer of a satellite has its mirror, before the Rust code exists.
 
 - **Implements:** G19, G25. **Depends on:** 19.12b.
 - **Files:** create `quint/mirrors.qnt`.
@@ -717,10 +717,10 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
   - `entry: HELPER -> SATELLITE`: the satellite of the entry of the helper, `""` for no entry. `mirror: HELPER -> SATELLITE`: the mirrors of `TimerDesk`, `""` for no mirror.
   - `calls: List[{ op: str, h: HELPER, s: SATELLITE }]`: the queue of the mirror task. `op` is `"start"`, `"pause"`, `"resume"` or `"cancel"`.
   - `assist: Set[(HELPER, SATELLITE)]`: the Assist timers in HA. A set is sufficient, because each start call first cancels the pair (sub-phase 19.16).
-  - `late: Set[(HELPER, SATELLITE)]`: the pairs whose state in HA Jarvis does not know, because Jarvis missed the end of the helper, a restart dropped the call, or a call failed.
+  - `late: Set[(HELPER, SATELLITE)]`: the pairs whose state in HA Jarvis does not know, because Jarvis missed the end of the helper, a restart dropped the call, a call failed, or a cancel can come after the end of its mirror.
   - `connected: bool`: Jarvis is connected to HA.
   - History: `lastAction` (`MirrorRing` or `Other`) and `lastWasLate` (the pair of the `MirrorRing` was in `late` before the step).
-- A helper runs when it is `"active"` or `"paused"`. A pair is legit when `mirror[h] = s` and `ha[h]` runs. Each action that queues a call appends it at the end of `calls`. Jarvis sees the effect of `start`, `outside`, `pause`, `resume`, `end` and `satRestart`, so they need `connected`.
+- A helper runs when it is `"active"` or `"paused"`. A pair is legit when `mirror[h] = s` and `ha[h]` runs. Each action that queues a call appends it at the end of `calls`, except a `cancel`. A `cancel` removes each queued call of its pair and goes ahead of each queued call that is not a `cancel`, so that it waits only for the calls of other ends. Jarvis sees the effect of `start`, `outside`, `pause`, `resume`, `end` and `satRestart`, so they need `connected`.
 - Actions:
   - `start(s)` (when a helper is free): a timer from `s` starts on the first free helper. A free helper is `"idle"` in `ha` and `seen` and has no entry. `ha`, `seen := "active"`, `entry := s`, `mirror := s`, and the call `start`.
   - `outside(h)` (when `h` is `"idle"` in `ha` and `seen` and has no entry): a person starts `h` in HA. `ha`, `seen := "active"`. No call.
@@ -737,7 +737,8 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
   - `satRestart(s)`: the satellite `s` starts again, and Jarvis sees its entity change from `unavailable`. Each pair of `s` leaves `assist` and `late`. Each helper with `mirror[h] = s` whose `seen` runs gets the call `start`.
   - `call` (when `calls` is not empty and `connected`): the mirror task makes the first call. `start` adds its pair to `assist`, and `cancel` removes it. Both remove the pair from `late`. `pause` and `resume` do not change `assist`, because the model has no time.
   - `callFails` (when `calls` is not empty): the first call fails. Its pair goes into `late`.
-  - `mirrorRing(h, s)` (when `(h, s)` is in `assist`, is in `late` or is not legit, and no call of `calls` has the pair): the mirror reaches its end, and the firmware rings. The pair leaves `assist` and `late`. A call in `calls` reaches HA before the end of its mirror, because a mirror ends `MIRROR_PAD` after its helper (sub-phase 19.16). The model has no time, so this is its assumption.
+  - `slow(h, s)` (when `calls` has the `cancel` of `(h, s)` and the pair is in `assist`): HA or the calls ahead of the cancel are slow, so the cancel can come after the end of the mirror. The pair goes into `late`.
+  - `mirrorRing(h, s)` (when `(h, s)` is in `assist`, and it is in `late`, or it is not legit and no call of `calls` has the pair): the mirror reaches its end, and the firmware rings. The pair leaves `assist` and `late`. A later `cancel` of the pair removes nothing. The model has no time. Thus a queued call that is not `slow` reaches HA before the end of its mirror: this is the assumption of the model, and `slow` is each case where it does not hold.
 - `mirrors.qnt` is not in `composed.qnt`, as `timers.qnt` is not (sub-phase 19.1). The model leaves out the names, the durations and the rings, which `timers.qnt` covers. A satellite restart while Jarvis is not connected is not in the model: its ring stays dark until the next new run, and no mirror rings.
 - Invariants:
   - `NoMirrorRing`: when `lastAction = MirrorRing`, `lastWasLate` is true.
@@ -747,14 +748,14 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 - AC-19.13-1 [Quint]: `quint typecheck` passes.
 - AC-19.13-2 [Quint]: The two invariants hold in simulation and to 10 steps in `quint verify`.
-- AC-19.13-3 [Quint]: The test `ac_19_13_3_mirror_follows_the_helper` passes: after `start("s1")` and `call`, `assist` has `("h1", "s1")`. `pause("h1")` queues `pause`. After `call` and `end("h1")`, `calls` has only `cancel` of `("h1", "s1")`. After `call`, `assist` is empty, and `mirrorRing("h1", "s1")` is not enabled.
-- AC-19.13-4 [Quint]: The test `ac_19_13_4_restart_replaces_the_mirror` passes: after `start("s1")`, `start("s2")`, two `call`, `quietEnd("h2")` and `restart`, `calls` is `start` of `("h1", "s1")`, then `cancel` of `("h2", "s2")`.
+- AC-19.13-3 [Quint]: The test `ac_19_13_3_mirror_follows_the_helper` passes: after `start("s1")` and `call`, `assist` has `("h1", "s1")`. `pause("h1")` queues `pause`. After `call` and `end("h1")`, `calls` has only `cancel` of `("h1", "s1")`. After `call`, `assist` is empty, and `mirrorRing("h1", "s1")` is not enabled. After `start("s1")` and `end("h1")` with no `call` between them, `calls` has only that `cancel`.
+- AC-19.13-4 [Quint]: The test `ac_19_13_4_restart_replaces_the_mirror` passes: after `start("s1")`, `start("s2")`, two `call`, `quietEnd("h2")` and `restart`, `calls` is `cancel` of `("h2", "s2")`, then `start` of `("h1", "s1")`.
 - AC-19.13-5 [Quint]: The test `ac_19_13_5_restarts_show_the_ring_again` passes: after `start("s1")`, `call` and `satRestart("s1")`, `assist` is empty and `calls` is `start` of `("h1", "s1")`. After `call` and `haRestart`, the same holds. After `call`, `assist` is `Set(("h1", "s1"))`.
-- AC-19.13-6 [Quint]: The test `ac_19_13_6_lost_cancel_can_ring` passes: after `start("s1")`, `call`, `end("h1")` and `callFails`, `mirrorRing("h1", "s1")` is enabled, and after it `lastWasLate` is true.
+- AC-19.13-6 [Quint]: The test `ac_19_13_6_lost_or_slow_cancel_can_ring` passes: after `start("s1")`, `call`, `end("h1")` and `callFails`, `mirrorRing("h1", "s1")` is enabled, and after it `lastWasLate` is true. After `start("s1")`, `call`, `end("h1")` and `slow("h1", "s1")`, `mirrorRing("h1", "s1")` is enabled, and the `cancel` stays in `calls`.
 
 **Proofs.**
 
-- P-19.13-2 (AC-19.13-2). `NoMirrorRing`: a pair enters `assist` only through a `start` call, and its helper runs with that mirror when Jarvis queues the call. Each step that stops a legit pair (`end`, `connect` of a helper that does not run) queues a `cancel` for it in the same step. Each step that loses such a call (`quietEnd`, the drop of `restart`, `callFails`) puts the pair into `late`. Thus a pair that is not legit and not in `late` has a call in `calls`, and `mirrorRing` is not enabled for it. `MirrorsShown`: each step that changes `entry` or a running state queues the call that makes `assist` follow it, or puts the pair into `late`. Evidence for the bounded executions: model check.
+- P-19.13-2 (AC-19.13-2). `NoMirrorRing`: a pair enters `assist` only through a `start` call, and its helper runs with that mirror when Jarvis queues the call. Each step that stops a legit pair (`end`, `connect` of a helper that does not run) queues a `cancel` for it in the same step. Each step that loses such a call (`quietEnd`, the drop of `restart`, `callFails`) or delays it past the end of the mirror (`slow`) puts the pair into `late`. A `cancel` removes only the calls of its own pair, so the other pairs keep their calls. Thus a pair that is not legit and not in `late` has a call in `calls`, and `mirrorRing` is not enabled for it. The model does not show that a queued cancel is in time: that is its assumption, and `slow` removes it. `MirrorsShown`: each step that changes `entry` or a running state queues the call that makes `assist` follow it, or puts the pair into `late`. Evidence for the bounded executions: model check.
 - P-19.13-1, P-19.13-3 to P-19.13-6. Evidence: model check.
 
 ---
@@ -768,7 +769,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 **Model.**
 
-- `Home::assist(satellite, text) -> Result<()>`: runs `text` through the HA conversation agent for the device of the satellite entity `satellite`. The HA adapter sends three requests, each with the deadline `ha.request_timeout_ms`:
+- `Home::assist(satellite, text) -> Result<()>`: runs `text` through the HA conversation agent for the device of the satellite entity `satellite`. The HA adapter sends three requests. The whole call has the deadline `ASSIST_TIMEOUT`, 1 s, a constant in `src/adapters/ha.rs`, not `ha.request_timeout_ms`, so that a slow call cannot hold the mirror task for long:
   1. `config/entity_registry/get` with `entity_id = satellite` gives the `device_id`.
   2. `assist_pipeline/pipeline/list` gives the pipelines. The adapter takes the first pipeline whose `conversation_engine` is `conversation.home_assistant`. The preferred pipeline of the house is Jarvis, so the run must name this pipeline.
   3. `assist_pipeline/run` with `start_stage = "intent"`, `end_stage = "intent"`, `input = { text }`, `pipeline` and `device_id`. HA gives the result of the request, then the events of the run with the same request ID. The adapter keeps the waiter of the run after its result, and gives it the `intent-end` or `error` event of the run. The adapter ignores the other events of the run, and each event after the waiter goes.
@@ -781,7 +782,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - AC-19.14-1: When `FakeHaServer` gives the device `office_device` for `assist_satellite.carson_office` and the pipelines "Jarvis" (`conversation.jarvis`) and "Home Assistant" (`conversation.home_assistant`), `assist` with "cancel the jarvis 1 timer" sends `assist_pipeline/run` with the stages `intent`, the text, the ID of "Home Assistant" and `office_device`. When the server then sends `run-start` and `intent-end` with `action_done`, `assist` returns `Ok`.
 - AC-19.14-2: When `intent-end` has `response_type = error` and the speech "Sorry, I couldn't find that timer", `assist` returns an error that has the speech. An `error` event with the message "no such pipeline" gives an error that has the message.
 - AC-19.14-3: When no pipeline has `conversation.home_assistant`, or the satellite entity has no device, `assist` returns an error, and the server receives no `assist_pipeline/run`.
-- AC-19.14-4: When the server sends no `intent-end`, `assist` returns a timeout error, and a later `intent-end` of that request does not reach `events`.
+- AC-19.14-4: When the server sends no `intent-end`, `assist` returns a timeout error `ASSIST_TIMEOUT` after the call, and a later `intent-end` of that request does not reach `events`.
 
 **Proofs.**
 
@@ -827,14 +828,14 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 
 ### 19.16 Timer LED Ring
 
-**Goal:** Send the mirror commands of `TimerDesk` to HA. The LED ring of the satellite that set a timer then shows its progress, and the firmware never rings, because Jarvis cancels the mirror before its end.
+**Goal:** Send the mirror commands of `TimerDesk` to HA. The LED ring of the satellite that set a timer then shows its progress, and the firmware does not ring in normal operation, because Jarvis cancels the mirror before its end.
 
 - **Implements:** G25. **Depends on:** 19.15.
 - **Files:** modify `src/domain/timers.rs`, `src/app/conversation.rs`, `README.md` (the LED ring and the HA pipeline that it needs, `CLAUDE.md` workflow item 15).
 
 **Model.**
 
-- `MIRROR_PAD` is 2 s, a constant in `src/domain/timers.rs`. A mirror runs for the time left of its helper and `MIRROR_PAD` more. Rule 3 of sub-phase 19.15 sends the cancel at the end of the helper, so the cancel reaches HA about `MIRROR_PAD` before the end of the mirror, less the time of the calls before it in the queue. A cancel 1 s before the end of an Assist timer was in time (2026-11-25).
+- `MIRROR_PAD` is 2 s, a constant in `src/domain/timers.rs`. A mirror runs for the time left of its helper and `MIRROR_PAD` more. Rule 3 of sub-phase 19.15 gives the cancel at the end of the helper. The cancel goes ahead of the queued calls that are not cancels, so it waits for the call in flight, at most `ASSIST_TIMEOUT` (sub-phase 19.14), and for the cancels of other ends at the same time. A cancel 1 s before the end of an Assist timer was in time (2026-11-25). Thus a cancel is in time when it waits for at most one call and HA acts on it in less than about 1 s. This is not a guarantee: a slower HA, or several ends at the same time, can let the mirror ring (`slow` in `mirrors.qnt`).
 - The name of the mirror of a helper is the object ID of the helper with each `_` as a space: `mirror_name("timer.jarvis_1")` is "jarvis 1". The name is fixed for each helper, for these reasons:
   - Only one timer runs on a helper, and the replace of a start call (below) keeps at most one mirror with the name on each satellite. Each command also names the device, so HA can tell the mirrors of two satellites apart. Thus each cancel, pause and resume targets one Assist timer.
   - HA keeps a spoken name only for the form "named chicken", a generic timer has no name, and "cancel the timer" fails when a satellite has two Assist timers (2026-11-25).
@@ -844,12 +845,13 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - `mirror_texts(change, helper, now) -> Vec<String>`: the texts of one `MirrorChange`, in order:
   - `Start(state)`: "cancel the {name} timer" first, which removes a mirror of an earlier run. Then, when `left(state, now)` (sub-phase 19.3) is more than 0, "set a timer for {mirror_duration(left + MIRROR_PAD)} named {name}", and "pause the {name} timer" when the state is `paused`.
   - `Pause`, `Resume`, `Cancel`: "pause the {name} timer", "resume the {name} timer" or "cancel the {name} timer".
-- `Conversation::run_timers` gives `TimerDesk::run` a function that sends each `Mirror` into a channel. A task reads the channel in order, and sends each text of `mirror_texts` with the time of the clock through `Home::assist` (sub-phase 19.14) on the satellite of the `Mirror`. One task keeps the order of the calls of each helper. A failed call logs a `warn` event and the task continues. Jarvis does not try a failed call again. The first call of a `Start` logs a `debug` event instead, because no mirror is its usual result.
+- `Conversation::run_timers` gives `TimerDesk::run` a function that sends each `Mirror` into a channel. A task keeps a queue of calls: the satellite, the helper and one text of `mirror_texts` with the time of the clock. Before each call, it moves each `Mirror` of the channel into the queue, in order. The texts of a `Cancel` first remove each queued call of the same helper and satellite, and then go ahead of each queued call that is not a cancel of an end. Each other `Mirror` goes at the end. The task sends the first call of the queue through `Home::assist` (sub-phase 19.14) on its satellite. One task keeps the order of the calls of each helper. A failed call logs a `warn` event and the task continues. Jarvis does not try a failed call again. The first call of a `Start` logs a `debug` event instead, because no mirror is its usual result.
 - A mirror failure never changes the timer table, the reply or the ring: the task runs after the state change of the helper, and it gives nothing back.
 - These cases can still leave a stray mirror, which the firmware rings at its end until a press of the action button:
   - Jarvis is not connected when a helper finishes. The mirror ends `MIRROR_PAD` after the helper. Jarvis also does not ring for this timer (sub-phase 19.9b), so the firmware ring is the only end signal.
   - Jarvis is not connected when a person cancels a helper in HA. The next `Snapshot` cancels the mirror (rule 4 of sub-phase 19.15), so it rings only when it ends before the connection.
   - A cancel, pause or resume call fails, or a restart of Jarvis drops it from the queue. The mirror rings at its own end, at the latest the time left and `MIRROR_PAD` after the call. The next start of the same helper on that satellite, a restart of HA or a restart of the satellite removes it first.
+  - HA is slow, or several timers end at the same time, so the cancel comes after the end of the mirror. The mirror rings at the end of its helper and `MIRROR_PAD`, and the late cancel removes nothing.
 - The README gets the LED ring, and the setup rule that HA must keep an Assist pipeline with the conversation agent "Home Assistant". The satellites keep Jarvis as their pipeline.
 
 **Acceptance criteria.**
@@ -858,12 +860,13 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - AC-19.16-2: For `Start` with `active` and `finishes_at` 300 s after `now` on `timer.jarvis_1`, `mirror_texts` gives "cancel the jarvis 1 timer" and "set a timer for 5 minutes and 2 seconds named jarvis 1". For `paused` with `remaining = "0:04:12"`, it gives "cancel the jarvis 1 timer", "set a timer for 4 minutes and 14 seconds named jarvis 1" and "pause the jarvis 1 timer". With `finishes_at` before `now`, it gives only the cancel. `Pause`, `Resume` and `Cancel` give one text each.
 - AC-19.16-3: When `FakeClassifier` gives `timer_set` with `duration = five minutes` and `timer = chicken` on the Kitchen satellite, `FakeHome` records, after the `timer.start` call, `assist` on the Kitchen satellite with "cancel the jarvis 1 timer", then "set a timer for 5 minutes and 2 seconds named jarvis 1". When the helper becomes `idle` and finishes, `FakeHome` records "cancel the jarvis 1 timer" and the announce "Your chicken timer is done."
 - AC-19.16-4: When `FakeHome` fails each `assist` call, the reply, the `timer.start` call, the entry and the announces of the ring are the same as with no failure, and `FakeHome` records each later `assist` call.
+- AC-19.16-5: When `FakeHome` holds an `assist` call, the queue has the start texts of "pizza" on `timer.jarvis_2`, and the helper of "chicken" becomes `idle`, the next `assist` call after the held one is "cancel the jarvis 1 timer". A queued start text of "chicken" is not sent.
 
 **Proofs.**
 
 - P-19.16-2 (AC-19.16-2). Ensures: `mirror_texts` gives one text for `Pause`, `Resume` and `Cancel`, and one to three texts for `Start`. The addition of `MIRROR_PAD` does not overflow. Argument: the addition saturates. The texts are evidence by test: they come from `format!`, which Verus cannot see.
 - P-19.16-1. Evidence: test. Verus proves that the divisions and remainders do not overflow (P-19.2-3).
-- P-19.16-3, P-19.16-4. Argument: the desk gives `Start` at the `active` state of the start call and `Cancel` at the `idle` state (P-19.15-1), and one task sends them in order. The task holds no lock of the desk and changes no state of the conversation.
+- P-19.16-3 to P-19.16-5. Argument: the desk gives `Start` at the `active` state of the start call and `Cancel` at the `idle` state (P-19.15-1), and one task sends them, each cancel ahead of the calls that are not cancels. The task holds no lock of the desk and changes no state of the conversation.
 
 ---
 
@@ -907,7 +910,8 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - `end(h)`: the state `idle`, then `TimerEnded` with `Finished`. `quietEnd(h)`: the HA state of the driver becomes `idle`, and the desk gets nothing.
 - `reconnect`: `Snapshot` with the HA states of the driver. A helper keeps its `last_updated` until its HA state changes. `restart`: the queue empties, and a new `TimerDesk` with the same `FakeTimerStore` gets `Snapshot`. `haRestart`: the Assist timers empty, and `Snapshot` gives each running helper a new `last_updated`.
 - `satRestart(s)`: the Assist timers of the satellite go, and the desk gets the state change of the satellite entity from `unavailable` to `idle`.
-- `call`: the driver takes the first `Mirror` of the queue and applies it to its Assist timers. `callFails`: it takes it and applies nothing. `mirrorRing(h, s)`: the pair leaves the Assist timers.
+- The driver puts each `Mirror` of `run` into its queue with the rule of the mirror task (sub-phase 19.16): a `Cancel` removes the queued values of its helper and satellite and goes ahead of each value that is not a `Cancel`.
+- `call`: the driver takes the first `Mirror` of the queue and applies it to its Assist timers. `callFails`: it takes it and applies nothing. `slow(h, s)`: nothing. `mirrorRing(h, s)`: the pair leaves the Assist timers.
 - After each step, the driver compares the satellites of the entries, `mirrors` of the desk, the queue (helper, satellite and kind of change) and the Assist timers with the model.
 
 **Acceptance criteria.**
