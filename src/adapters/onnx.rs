@@ -582,28 +582,41 @@ mod tests {
         Ok(())
     }
 
-    /// AC-19.5-7.
-    #[tokio::test]
-    async fn ac_19_5_7_light_commands_stay_confident() -> anyhow::Result<()> {
+    /// Checks that the fixture model gives `intent` at `model.commit_threshold` or more for each
+    /// of `texts`.
+    async fn assert_confident(intent: &str, texts: &[&str]) -> anyhow::Result<()> {
         let threshold = crate::Config::load(Path::new("jarvis.toml"))?
             .model
             .commit_threshold;
         let classifier = OnnxLoader.load(Path::new(FIXTURE), Device::Cpu).await?;
-        let texts = [
-            "turn on the office lights",
-            "office lights on",
-            "turn the office lights on",
-        ];
         for text in texts {
             let prediction = classifier.predict("area: none", text).await?;
             let (top, probability) = &prediction.ranked[0];
-            assert_eq!(top, "lights_on", "top label of {text}");
+            assert_eq!(top, intent, "top label of {text}");
             assert!(
                 *probability >= threshold,
                 "{text} gives {probability}, under {threshold}"
             );
         }
         Ok(())
+    }
+
+    /// AC-19.5-7.
+    #[tokio::test]
+    async fn ac_19_5_7_light_commands_stay_confident() -> anyhow::Result<()> {
+        let texts = [
+            "turn on the office lights",
+            "office lights on",
+            "turn the office lights on",
+        ];
+        assert_confident("lights_on", &texts).await
+    }
+
+    /// Field defect of 2026-11-25: a timer name with no duration went to System Two.
+    #[tokio::test]
+    async fn fix_a_timer_name_with_no_duration_sets_a_timer() -> anyhow::Result<()> {
+        let texts = ["set a timer for the chicken", "timer for the chicken"];
+        assert_confident("timer_set", &texts).await
     }
 
     /// AC-3.12-11.
