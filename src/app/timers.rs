@@ -932,21 +932,32 @@ mod tests {
             ))
         }
 
-        /// The request `intent` with `action` for `name`, with `duration`, from the model satellite
-        /// `model`. Makes the call of an `Act`.
-        fn ask(&self, request: (&str, TimerAction), name: &str, duration: &str, model: &str) {
+        /// The call that the request `intent` with `action` for `name`, with `duration`, from the
+        /// model satellite `model` makes, if any.
+        fn ask(
+            &self,
+            request: (&str, TimerAction),
+            name: &str,
+            duration: &str,
+            model: &str,
+        ) -> Option<ServiceCall> {
             let satellite = swap(SATELLITES, model);
             let decide = self
                 .fixture
                 .decide(request, Some(name), duration, &satellite);
-            match self.runtime.block_on(decide).1 {
-                Some(Guard::Start(mut start)) => start.armed = false,
-                Some(act) => self
-                    .runtime
-                    .block_on(act.made(async { Ok(()) }))
-                    .expect("no call fails"),
-                None => (),
-            }
+            let (decision, guard) = self.runtime.block_on(decide);
+            let made = match guard {
+                Some(Guard::Start(mut start)) => {
+                    start.armed = false;
+                    true
+                }
+                Some(act) => self.runtime.block_on(calls(act)),
+                None => false,
+            };
+            let Decision::Reply { call, .. } = decision else {
+                return None;
+            };
+            call.filter(|_| made)
         }
 
         /// A set on the first free helper, with the duration of that helper.
@@ -968,7 +979,7 @@ mod tests {
 
         /// The request `intent` with `action` for the label of the timer of the model helper
         /// `model`, from the Kitchen satellite, then the state `state` of the helper and the end
-        /// `end`.
+        /// `end`. Fails when the request does not call the service of `action` on that helper.
         fn act(
             &mut self,
             request: (&str, TimerAction),
@@ -976,9 +987,17 @@ mod tests {
             state: &str,
             end: Option<TimerEnd>,
         ) -> anyhow::Result<()> {
-            let (_, timer) = self.entry(model)?;
+            let (helper, timer) = self.entry(model)?;
             let label = timer.name.as_ref().unwrap_or(&timer.duration);
-            self.ask(request, label, &timer.duration, "s1");
+            let call = self.ask(request, label, &timer.duration, "s1");
+            let made = call.map(|call| (call.service, call.target));
+            let service = match request.1 {
+                TimerAction::Cancel => "cancel",
+                TimerAction::Pause => "pause",
+                _ => "start",
+            };
+            let wanted = Some((service.to_owned(), vec![helper]));
+            anyhow::ensure!(made == wanted, "{} of {model} called {made:?}", request.0);
             self.change(model, state, end);
             Ok(())
         }
@@ -1009,6 +1028,8 @@ mod tests {
                 desk: Arc::new(self.runtime.block_on(desk)),
                 store,
             };
+            // The new desk numbers its rings from 1 again.
+            self.counts.clear();
             self.reconnect();
         }
 
