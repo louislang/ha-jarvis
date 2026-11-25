@@ -112,9 +112,9 @@ Each request on a satellite already increases its generation. Thus the request d
   - History of the last step: `unmuted: SAT -> bool`, `unmutedEnd: SAT -> int`, `unmutedPressed: SAT -> bool`.
 - Actions:
   - `voiceMute(s, timed)` (when not `on[s]`, not `calling[s].live` and not `training`): `calling[s] := { live: true, timed, end: now + LENGTH }`.
-  - `callDone(s)` (when `calling[s].live`): `on[s] := true`, and `version[s]` adds 1 when `on[s]` was false. `pressed[s] := false`. A timed call sets `mute[s] := { live: true, end, version: version[s] }`. An untimed call sets `mute[s].live := false`. Then `due`, because the end of a timed mute can pass while its call waits: the end task of sub-phase 20.8 then unmutes at once. The desk reads the `on` state of its call milliseconds after the result, so the model makes the two one step.
+  - `callDone(s)` (when `calling[s].live`): `calling[s].live := false`, `on[s] := true`, and `version[s]` adds 1 when `on[s]` was false. `pressed[s] := false`. A timed call sets `mute[s] := { live: true, end, version: version[s] }`. An untimed call sets `mute[s].live := false`. Then `due`, because the end of a timed mute can pass while its call waits: the end task of sub-phase 20.8 then unmutes at once. The desk reads the `on` state of its call milliseconds after the result, so the model makes the two one step.
   - `callFailed(s)`: `calling[s].live := false`. `press(s)`: a person changes the switch (the button, HA or the Jarvis tab). `on[s]` flips, `version[s]` adds 1 and `pressed[s] := true`.
-  - `tick`: `now += 1`, then `due`. `trainStart` (when not `training`): each switch that is not `on` gets `on`, `version + 1` and `trainMuted`, and `training := true`. `trainEnd` (when `training`): each `trainMuted` switch gets `off` and `version + 1`, `training := false`, then `due`. `restart` (when not `training`): each `calling[s].live := false`, then `due`.
+  - `tick`: `now += 1`, then `due`. `trainStart` (when not `training`): each switch that is not `on` gets `on`, `version + 1` and `trainMuted`, and `training := true`. The training run takes the hold of the desk (sub-phase 20.8) before it reads the switches, so `trainStart` comes before or after a whole `due`. `trainEnd` (when `training`): each `trainMuted` switch gets `off` and `version + 1`, `training := false`, then `due`. `restart` (when not `training`): each `calling[s].live := false`, then `due`.
   - `due`: for each `s` with `mute[s].live`, `mute[s].end <= now` and not `training`: `mute[s].live := false`. When `on[s]` and `version[s] = mute[s].version`, also `on[s] := false`, `version[s] += 1`, `unmuted[s] := true`, `unmutedEnd[s] := mute[s].end` and `unmutedPressed[s] := pressed[s]`.
 - `mute.qnt` is not in `composed.qnt` (sub-phase 16.3). A mute request is an ordinary request of the lifecycle.
 - Invariants:
@@ -230,27 +230,30 @@ Each request on a satellite already increases its generation. Thus the request d
 **Goal:** Unmute a satellite at the end of "mute for N minutes", only when the switch still has the state of the mute. A change by a person then always wins, and a local training run keeps its mute.
 
 - **Implements:** G16, G26. **Depends on:** 20.7.
-- **Files:** modify `src/app/mute.rs`, `src/app/conversation.rs`, `src/lib.rs`, `README.md` (the timed mute, `CLAUDE.md` workflow item 15).
-- **Quint:** `mute.qnt` (the rules of `callDone`, `tick` and `trainEnd`).
+- **Files:** modify `src/app/mute.rs`, `src/app/conversation.rs`, `src/app/training.rs`, `src/lib.rs`, `README.md` (the timed mute, `CLAUDE.md` workflow item 15).
+- **Quint:** `mute.qnt` (the rules of `callDone`, `tick`, `trainStart` and `trainEnd`).
 
 **Model.**
 
-- `MuteDesk` keeps the timed mutes by satellite in one async mutex. It also gets the `Clock` and the receiver of the status channel (sub-phase 12.9b).
+- `MuteDesk` keeps the timed mutes by satellite and a `held` flag in one async mutex. It also gets the `Clock`.
 - The `after` work of the `switch.turn_on` call of a `Mute` plan gives its result to `MuteDesk::started`, as the guard of a timer start call gets its result (sub-phase 19.9e). After a success, `started` waits until the hot cache shows the switch `on`, for at most `MUTE_WAIT` (5 s, a constant in `src/app/mute.rs`). Then it stores `Mute` with the time of the request plus the seconds and that `last_updated`, in place of the mute of the satellite, and starts its end task. A mute without seconds removes the mute of the satellite. When the wait ends with no `on`, `started` logs a `warn` event and stores nothing.
-- The end task sleeps until `end`, then waits until the status is not `training`. Then, under the lock, when the satellite still has this mute, it removes it, and when `unmutes` gives true, it calls `switch.turn_off` on the switch. A failed call logs a `warn` event. HA has no conditional call, so a press in HA that the hot cache does not have yet can still meet the call.
-- Training mutes only the switches that are `off`, and it unmutes only those (sub-phase 13.10e). Thus it does not touch a voice mute, and a timed end during a local run waits for `online`.
+- `MuteDesk::hold() -> Hold` takes the lock, sets `held` and releases the lock. The drop of `Hold` clears `held`. `Training::paused` (sub-phase 13.10e) takes a `Hold` before step 1 reads the mute switches, and drops it after step 5.
+- The end task sleeps until `end`, then waits until `held` is false. Then it takes the lock, and while `held` is false, it removes the mute of the satellite when it is still this mute. When `unmutes` gives true, it calls `switch.turn_off` and waits until the hot cache shows the switch `off`, for at most `MUTE_WAIT`, before it releases the lock. A failed call logs a `warn` event. Thus training reads the switches either before the check or after the `off` state of the call, and it mutes that switch again. `hold` waits at most for one call, one `MUTE_WAIT` and one save of a SQLite row (sub-phase 20.9). HA has no conditional call, so a press in HA that the hot cache does not have yet can still meet the call.
+- Training mutes only the switches that are `off`, and it unmutes only those. Thus it does not touch a voice mute, and a timed end during a local run waits for the drop of its `Hold`.
 
 **Acceptance criteria.**
 
 - AC-20.8-1: When "mute for ten minutes" on the Kitchen satellite returns "Muting for ten minutes." and the hot cache shows its switch `on`, `FakeHome` records `switch.turn_off` on the switch 600 s of virtual time after the request, and not before.
 - AC-20.8-2: When a person turns the switch `off` and `on` again during the mute, `FakeHome` records no `switch.turn_off` at the end. After "mute" with no duration, `FakeHome` records no `switch.turn_off` within 24 hours.
-- AC-20.8-3: When the status is `training` at the end, `FakeHome` records no `switch.turn_off` until the status is `online`, and then records it.
+- AC-20.8-3: When a local training run holds the desk at the end, `FakeHome` records no `switch.turn_off` until the run drops its `Hold`, and then records it.
 - AC-20.8-4: When the hot cache does not show the switch `on` within 5 s after the call, the log has a `warn` event, and `FakeHome` records no `switch.turn_off`.
+- AC-20.8-5: When `FakeHome` holds the `switch.turn_off` call of an end and a local training run starts, the run calls `switch.turn_on` on that switch only after the call ends and the hot cache shows it `off`.
 
 **Proofs.**
 
-- P-20.8-1 to P-20.8-3. Requires: `NoUnmuteAfterPress`, `NoEarlyUnmute`, `NoUnmuteInTraining` (P-20.4-2), P-20.5-3. Argument: the end task sleeps until `end`, waits for a status that is not `training`, and calls only when `unmutes` gives true under the lock.
+- P-20.8-1 to P-20.8-3. Requires: `NoUnmuteAfterPress`, `NoEarlyUnmute`, `NoUnmuteInTraining` (P-20.4-2), P-20.5-3. Argument: the end task sleeps until `end`, and checks `held`, checks `unmutes`, calls and waits for `off` under one lock, which `hold` also takes.
 - P-20.8-4. Evidence: test.
+- P-20.8-5. Argument: `Training::paused` takes the `Hold` before it reads the switches, and `hold` waits for the lock of the end task.
 
 ---
 
@@ -293,7 +296,7 @@ Each request on a satellite already increases its generation. Thus the request d
 **Model.** The driver plays the part of the conversation use case, of HA and of training. It maps `s1` and `s2` to the Kitchen and Office satellites, whose switches start `off`. A tick is 60 s of virtual time, and `LENGTH` is the duration "two minutes".
 
 - `voiceMute(s, timed)`: `MuteDesk::decide` with or without "two minutes", and `FakeHome` holds the call. `callDone(s)` gives the result and the `on` state, and `callFailed(s)` fails the call.
-- `press(s)`: the switch flips with a new `last_updated`. `trainStart` and `trainEnd`: the status `training` with the `on` states of the switches that were `off`, then the `off` states and `online`. `restart`: a new `MuteDesk` on the same store. The held calls drop.
+- `press(s)`: the switch flips with a new `last_updated`. `trainStart` and `trainEnd`: `MuteDesk::hold` with the `on` states of the switches that were `off`, then the `off` states and the drop of the `Hold`. `restart`: a new `MuteDesk` on the same store. The held calls drop.
 - `FakeHome` applies each `switch.turn_off` to the hot cache with a new `last_updated`. After each step, the driver waits until each end task waits, then compares the switches and the timed mutes (satellite, end) with the model.
 
 **Acceptance criteria.**
