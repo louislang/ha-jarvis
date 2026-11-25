@@ -16,7 +16,7 @@ This specification uses ASD-STE100 Simplified Technical English (STE).
 | `00-overview.md` | This file: the specification format, technical names, goals, examples and the phase index. |
 | `01-architecture.md` | Layers, ports, the System One model, decisions, latency budget, crates, files, configuration, machines, the reference house and the change map. |
 | `02-rules.md` | Code rules, Python rules, test rules, Quint rules, proof rules, PR rules and the required checks. |
-| `phase-00.md` to `phase-19.md` | One file for each phase. |
+| `phase-00.md` to `phase-20.md` | One file for each phase. |
 
 `CLAUDE.md` at the repository root holds the working rules for code changes. It must agree with `02-rules.md`.
 
@@ -78,6 +78,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | Dialog | The state of one open conversation on one satellite. |
 | Timer helper | An HA `timer` entity whose entity ID starts with `timer.jarvis_`. You create it once. Jarvis runs its voice timers on these helpers. |
 | Ring | The repeated announce of the end of a timer on the satellite that set it. |
+| Voice mute | The mute of the microphones of one satellite that a mute request turns on: its `_mute_microphones` switch is `on`. A timed voice mute has an end. |
 | Response latency | The time that Jarvis adds to a request: from the voice end that the VAD detects to the `transcript` event, from `transcript` to `handled`, and from `synthesize` to the first audio chunk. The time that HA takes between these events is not part of it. |
 | Request habit | A spoken request that people make in the same time slot on several days, for example "what's the traffic like today?" on weekdays at 08:00. Its key is the intent name, or the name of the learned entry of a cluster of System Two requests. HA state changes and automations are not request habits. |
 | Bucket | One time slot for request habits: the day type (weekday or weekend) and the hour. |
@@ -151,6 +152,7 @@ A sub-phase can also have a **Field log**: steps on real hardware or accounts (s
 | G23 | Each proof about a domain function is a Verus proof, written in the same PR as the function. Verus also proves that no domain function overflows an integer, indexes out of bounds or fails an `expect`. The only trusted code is the contracts in `src/domain/contracts.rs`. |
 | G24 | Jarvis has a tab in the HA sidebar: the review of interactions and proposals, the status of Jarvis (online, training or restarting) and a form of chosen settings. A save restarts Jarvis. When the start with the new settings fails, Jarvis puts the last good settings back and shows the rollback. The status entity shows the status to dashboards and automations, also when Jarvis is down, and it stays after an HA restart. |
 | G25 | You can set a generic or a named timer by voice, ask for the time left, and cancel, pause and resume a timer. The timers run in the timer helpers of HA, and they survive a restart of Jarvis. When a timer ends, the satellite that set it announces it every 15 s for up to 2 minutes, or until the user says "stop". |
+| G26 | "Stop" or "never mind" on a satellite ends what Jarvis does there: its speech, its queued answers, its pending System Two and fetch work, its open question and its ringing timer, and Jarvis says "Okay.". A bare "stop" when Jarvis does nothing there pauses the music of the room. "Mute" stops Jarvis and turns on the microphone mute of that satellite through HA, until you unmute it or until the end of "mute for N minutes". |
 
 ### 1.1 Example System One Requests
 
@@ -221,3 +223,4 @@ Each line is one PR. The work order follows the rows of this table, not the phas
 | [15 Speaker Identification](phase-15.md) | 15.1 Tracker discovery · 15.1b Presence sensor discovery · 15.2 People and presence · 15.2b Discovery report · 15.2c Tracker proximity · 15.3 Voice embedder · 15.3b Voice profiles · 15.4 Voice embedding at commit · 15.5 Speaker Quint model · 15.6 Speaker signals · 15.6c Identification · 15.6d Enrollment rule · 15.6e Identification use case · 15.6b Speaker record · 15.8 Voice sample assignment · 15.8b Voice assignment use case · 15.8d Assignment conformance · 15.8c Voice assignment page · 15.8e Voice match confirmation · 15.8f Speaker pick needs a voice · 15.9 Form of address · 15.9c Address reply · 15.9b Address settings and System Two · 15.9d Voice address · 15.9e Addressed command responses |
 | [16 System Model](phase-16.md) | 16.1 System Quint model · 16.1b Newest request at handle · 16.2 System conformance · 16.2b System conformance of model swaps · 16.2c System conformance of calls and announces · 16.3 Composed Quint model · 16.4 Composed conformance · 16.4b Composed conformance of training runs |
 | [19 Voice Timers](phase-19.md) | 19.1 Timer Quint model · 19.2 Timer durations · 19.3 Time left · 19.4 Timer table · 19.4b Timer candidates · 19.4c Timer plan · 19.5 Timer intents · 19.6 Timer answers · 19.6b Timer questions · 19.7 Timer events · 19.7b Timer inputs · 19.8 Timer store · 19.9 Timer start rules · 19.9b Timer desk · 19.9c Timer requests · 19.9e Timer start guard · 19.9d Timer waits · 19.10 Timer ring · 19.10b Timer stop · 19.11 Early stop commit · 19.12 Timer conformance · 19.12b Timer ring model |
+| [20 Stop and Mute](phase-20.md) | 20.1 Stop route · 20.2 Satellite work · 20.3 Stop pauses the music · 20.4 Mute Quint model · 20.5 Mute plan · 20.6 Mute intent · 20.7 Mute desk · 20.8 Timed unmute · 20.9 Mute store · 20.10 Mute conformance · 20.11 Unmute in the Jarvis tab |
