@@ -646,7 +646,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Model.** The driver plays the part of the conversation use case and of HA. It maps `h1` and `h2` to `timer.jarvis_1` and `timer.jarvis_2`, `s1` and `s2` to the Kitchen and Office satellites, and `""` and `"chicken"` to no name and "chicken".
 
 - `set(s, n)`: `TimerDesk::decide` with `timer_set`, the name `n`, and the duration "one minute" for `timer.jarvis_1` or "two minutes" for `timer.jarvis_2`, so the labels of two generic timers differ. `started(h)` sends the state `active` of the helper, and `startFailed(h)` runs `forget`.
-- `cancel(h)`, `pause(h)`, `resume(h)`: `TimerDesk::decide` with the action and the label of the timer of `h`, then the state change of the call. For `cancel(h)`, the driver then sends `TimerEnded` with `Cancelled` in the same step, because the `cancel` of the model is one step. `outside(h)` sends the state `active`. `quietEnd(h)` changes only the state of the next `Snapshot`.
+- `cancel(h)`, `pause(h)`, `resume(h)`: `TimerDesk::decide` with the action and the label of the timer of `h`, then the state change of the call. For `cancel(h)`, the driver then sends `TimerEnded` with `Cancelled` in the same step, because the `cancel` of the model is one step. `outside(h)` sends the state `active`. `quietEnd(h)` sends the state `idle` with no `TimerEnded`.
 - `finish(h)` and `haCancel(h)`: the state `idle`, then `TimerEnded` with `Finished` or `Cancelled`. `reconnect`: `Snapshot` with the states of the model. `restart`: a new `TimerDesk` with the same `FakeTimerStore`, then `Snapshot`.
 - `ringOnce(h)`: virtual time advances to the next ring, and the satellite is idle. `stop(s)`: `TimerDesk::stop` of the satellite of `s`. `silence(h)`: `TimerDesk::decide` with `timer_cancel` and the name of the ring of `h`.
 - After each step, the driver compares the table (helper, satellite, name, order and `starting`) and the rings (satellite and left rings) with the model. A held start call stays across `reconnect`. `restart` drops it.
@@ -659,6 +659,44 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 **Proofs.**
 
 - P-19.12-1. Evidence: test. With P-19.1-2, it gives `UniqueNames`, `StartOnFreeHelper`, `RingsBounded` and `NoRingAfterStop` for the Rust code on the replayed traces.
+
+---
+
+### 19.12b Timer Ring Model
+
+**Goal:** Add the labels of the timers and the time of the rings to `timers.qnt`, and let a cancel by name stop the newest ring with that name. The model then has the cancel of a ringing timer (sub-phase 19.10b) and the end of a ring at `RING_FOR` (sub-phase 19.10), as the code does.
+
+- **Implements:** G19, G25. **Depends on:** 19.12.
+- **Files:** modify `quint/timers.qnt`, `src/app/timers.rs`.
+- **Quint:** `timers.qnt` (the rules of `cancel`, `ringOnce` and `silence`, and conformance).
+
+**Model.**
+
+- Constants: `RING_INTERVAL = 15` and `RING_FOR = 120`, in seconds, as in `src/app/timers.rs`. `DURATIONS = Map("h1" -> "one minute", "h2" -> "two minutes")`: the duration of a generic timer on each helper, as the driver of sub-phase 19.12 sets it.
+- State: `now: int` is the virtual time in seconds, from 0 at `init`. A ring gets `order` (the order of the ended entry) and `start` (`now` at its `finish`).
+- The label of an entry or a ring on `h` is its name, or `DURATIONS[h]` when the name is `""` (sub-phase 19.4). A ring is live when `left > 0`.
+- `cancel(h)` also needs that no live ring has the label of the entry of `h`. Else the cancel by that label gives `Silence` (sub-phase 19.10b), which is `silence`.
+- `silence(h)` (when `ring[h]` is live, and no other live ring with the same label has a higher `order`): a request cancels the ringing timer by its label. This replaces the condition of sub-phase 19.1 that the name is not `""`, so a generic ring also gets `silence`.
+- `ringOnce(h)`: the time of the ring is `t`, the later of `now` and `start + RING_INTERVAL * rung`. The action needs `left > 0` and `t < start + RING_FOR` (the check of the ring task, sub-phase 19.10). It sets `now := t`. Each other ring with `start + RING_FOR <= t` gets `left := 0`, not `stopped`: its ring task ends at its next check. This replaces the last two sentences of the third item of the model of sub-phase 19.10.
+- `TimerDesk` gives `plan` the rings in the `order` of their entries. Thus `meant` (sub-phase 19.4c) takes the newest ring with the label, also when two rings have the same name. Before, the rings came in entity ID order.
+- The driver of sub-phase 19.12 changes:
+  - `silence(h)`: `TimerDesk::decide` with `timer_cancel` and the label of the ring of `h`.
+  - `ringOnce(h)`: after the ring, the driver ends each ring of `TimerDesk` whose check (`TimerDesk::rings`) fails, as its ring task does.
+- The invariants do not change. P-19.1-2 still holds: the end at `RING_FOR` only sets `left := 0`.
+
+**Acceptance criteria.**
+
+- AC-19.12b-1 [Quint]: The test `ac_19_12b_1_cancel_meets_the_ring` passes: when a generic timer on `h1` rings and a new generic timer on `h1` is `active`, `cancel(h1)` is not enabled. After `silence(h1)`, the ring is `stopped` and `cancel(h1)` is enabled.
+- AC-19.12b-2 [Quint]: The test `ac_19_12b_2_newest_ring` passes: when "chicken" with the order 1 rings on `h2` and "chicken" with the order 2 rings on `h1`, `silence(h2)` is not enabled, and `silence(h1)` is. After `silence(h1)`, `silence(h2)` is enabled.
+- AC-19.12b-3 [Quint]: The test `ac_19_12b_3_ring_for` passes: both timers finish at the time 0, `h2` rings 8 times, a new timer on `h2` finishes and rings 2 times, and then `ringOnce(h1)` is not enabled and the ring of `h1` has `left = 0`.
+- AC-19.12b-4: When "chicken" with the order 1 rings on `timer.jarvis_2` and "chicken" with the order 2 rings on `timer.jarvis_1`, "cancel the chicken timer" removes the ring of `timer.jarvis_1`, and the ring of `timer.jarvis_2` stays.
+- AC-19.12b-5: When `quint-connect` replays the test `ac_19_12b_3_ring_for` against the driver, the timer table, the helper states and the rings match the model after each step.
+
+**Proofs.**
+
+- P-19.12b-4. Argument: `TimerDesk` gives `plan` the rings in increasing `order`, and the loop of `meant` runs from the last candidate and keeps the first one with the label that `fill` gives. Thus `Silence` is on the ring with the highest `order`.
+- P-19.12b-1 to P-19.12b-3. Evidence: model check.
+- P-19.12b-5. Evidence: test.
 
 ## Field Log
 
