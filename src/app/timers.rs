@@ -104,13 +104,15 @@ impl Desk {
         Some((helper, ring))
     }
 
-    /// The helper and the ended entry of each ring.
+    /// The helper and the ended entry of each ring, in the order of the entries.
     fn ringing(&self) -> Vec<Candidate> {
         let rings = self.rings.iter().map(|(helper, ring)| Candidate {
             helper: helper.clone(),
             timer: ring.timer.clone(),
         });
-        rings.collect()
+        let mut rings: Vec<Candidate> = rings.collect();
+        rings.sort_by_key(|ring| ring.timer.order);
+        rings
     }
 
     /// The table after the state change `event` of a helper, which also changes the view and
@@ -1074,6 +1076,13 @@ mod tests {
                 if *count == RINGS {
                     desk.end(&helper, ring.number).await;
                 }
+                let rings = desk.desk.lock().await.rings.clone();
+                // Each ring task ends at its next check after `RING_FOR`.
+                for (helper, ring) in rings {
+                    if !desk.rings(&helper, ring.number).await {
+                        desk.end(&helper, ring.number).await;
+                    }
+                }
                 anyhow::Ok(())
             })
         }
@@ -1092,11 +1101,11 @@ mod tests {
             self.runtime.block_on(self.fixture.desk.stop(&satellite));
         }
 
-        /// A cancel of the ringing timer of the model helper `model` by its name.
+        /// A cancel of the ringing timer of the model helper `model` by its label.
         fn silence(&self, model: &str) -> anyhow::Result<()> {
-            let ring = self.ring(model)?;
-            let name = ring.timer.name.unwrap_or_default();
-            self.ask(CANCEL, &name, &ring.timer.duration, "s1");
+            let Timer { name, duration, .. } = self.ring(model)?.timer;
+            let label = name.unwrap_or_else(|| duration.clone());
+            self.ask(CANCEL, &label, &duration, "s1");
             Ok(())
         }
     }
@@ -1124,6 +1133,66 @@ mod tests {
                 silence(h: String) => self.silence(&h)?,
             })
         }
+    }
+
+    /// AC-19.12b-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_12b_4_cancel_silences_the_newest_ring() {
+        let entries = [
+            (J1, entry("chicken", 2, false)),
+            (J2, entry("chicken", 1, false)),
+        ];
+        let fixture = Fixture::new(&entries).await;
+        let finished = [J1, J2].map(|helper| {
+            TimerInput::Event(Event::TimerEnded {
+                entity_id: helper.to_owned(),
+                end: TimerEnd::Finished,
+            })
+        });
+        fixture.feed(finished.into()).await;
+        fixture.ask(CANCEL, Some("chicken"), KITCHEN).await;
+        let desk = fixture.desk.desk.lock().await;
+        let rings: Vec<&String> = desk.rings.keys().collect();
+        assert_eq!(rings, [J2], "the ring of the older chicken timer stays");
+    }
+
+    /// Sets a generic timer on `s1` and on `s2`, then starts `h1` and `h2`.
+    fn start_both(driver: &mut TimerDriver) -> anyhow::Result<()> {
+        driver.set("s1", "")?;
+        driver.set("s2", "")?;
+        driver.change("h1", "active", None);
+        driver.change("h2", "active", None);
+        Ok(())
+    }
+
+    /// AC-19.12b-5. `quint test` writes no `mbt::actionTaken`, so the test plays the steps of
+    /// `ac_19_12b_3_ring_for` on the driver itself.
+    #[test]
+    fn ac_19_12b_5_ring_for_conformance() -> anyhow::Result<()> {
+        let mut driver = TimerDriver::new();
+        start_both(&mut driver)?;
+        driver.end("h1", Some(TimerEnd::Finished));
+        driver.end("h2", Some(TimerEnd::Finished));
+        for _ in 0..RINGS {
+            driver.ring_once("h2")?;
+        }
+        start_both(&mut driver)?;
+        driver.end("h2", Some(TimerEnd::Finished));
+        driver.ring_once("h2")?;
+        driver.ring_once("h2")?;
+        let model = TimerModel::from_driver(&driver)?;
+        let rings: Vec<(&str, u32)> = model
+            .ring
+            .iter()
+            .map(|(helper, bell)| (helper.as_str(), bell.left))
+            .collect();
+        assert_eq!(
+            rings,
+            [("h2", RINGS - 2)],
+            "the ring of h1 ended at RING_FOR"
+        );
+        anyhow::ensure!(driver.ring_once("h1").is_err(), "h1 rings after RING_FOR");
+        Ok(())
     }
 
     /// AC-19.12-1. `quint_run` replays 100 traces by default.
