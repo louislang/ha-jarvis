@@ -1784,6 +1784,7 @@ mod tests {
             classifier,
             reasoner,
             queues,
+            &timer_desk(),
         )
     }
 

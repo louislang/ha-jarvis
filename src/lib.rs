@@ -987,8 +987,8 @@ impl Assistant for App {
 }
 
 /// The listener of `config` on `stt`, which predicts each partial with `classifier`, commits early
-/// for an answer to an open dialog of `queues`, warms `reasoner` and keeps the utterances with
-/// their embeddings by `voice` for `log.correlate_s`.
+/// for an answer to an open dialog of `queues` or for a cancel phrase while `timers` rings, warms
+/// `reasoner` and keeps the utterances with their embeddings by `voice` for `log.correlate_s`.
 fn listener(
     config: &Config,
     stt: Arc<dyn SpeechToText>,
@@ -996,6 +996,7 @@ fn listener(
     classifier: Arc<dyn Classifier>,
     reasoner: Arc<dyn Reasoner>,
     queues: &Arc<Queues>,
+    timers: &Arc<TimerDesk>,
 ) -> Listener {
     let asr = &config.asr;
     let policy = CommitPolicy {
@@ -1010,7 +1011,17 @@ fn listener(
         config.log.correlate_s,
     ));
     Listener::new(
-        stt, classifier, reasoner, policy, threshold, queues, clock, utterances, voice,
+        stt,
+        classifier,
+        reasoner,
+        policy,
+        threshold,
+        queues,
+        clock,
+        utterances,
+        voice,
+        Arc::clone(timers),
+        config.dialog.cancel.clone(),
     )
 }
 
@@ -1990,8 +2001,8 @@ async fn start_app_with(
     let loaded = load_models(
         config,
         &reasoner,
-        &queues,
-        Arc::clone(&home),
+        (&queues, &timers.0),
+        &home,
         &cache,
         &catalog,
         checks,
@@ -2387,7 +2398,8 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
 }
 
 /// The live models of `config`, then the listener on their STT and voice embedder, which predicts
-/// with their System One model, sees the dialogs of `queues` and warms `reasoner`, the
+/// with their System One model, sees the dialogs of `queues` and the rings of `timers` and warms
+/// `reasoner`, the
 /// [`activation`] on their TTS, and the recorder of [`start_log`]. Starts the training trigger and
 /// the learned intent check with `checks`, `home`, the live models and the [`activation`].
 ///
@@ -2397,8 +2409,8 @@ fn system_two(config: &Config, reasoner: Arc<dyn Reasoner>, plugins: Arc<Plugins
 async fn load_models(
     config: &Config,
     reasoner: &Arc<dyn Reasoner>,
-    queues: &Arc<Queues>,
-    home: Arc<dyn Home>,
+    (queues, timers): (&Arc<Queues>, &Arc<TimerDesk>),
+    home: &Arc<dyn Home>,
     cache: &watch::Receiver<StateCache>,
     catalog: &Arc<Catalog>,
     checks: Checks,
@@ -2408,7 +2420,15 @@ async fn load_models(
     let stt = Arc::clone(&live) as _;
     let (activation, checks) = activation(config, checks, Arc::clone(&live) as _, cache)?;
     let classifier = Arc::clone(models.classifier()) as _;
-    let listener = listener(config, stt, live, classifier, Arc::clone(reasoner), queues);
+    let listener = listener(
+        config,
+        stt,
+        live,
+        classifier,
+        Arc::clone(reasoner),
+        queues,
+        timers,
+    );
     let recorded = start_log(
         config,
         &listener,
@@ -2416,7 +2436,7 @@ async fn load_models(
         reasoner,
         cache,
         checks,
-        (home, Arc::clone(&models)),
+        (Arc::clone(home), Arc::clone(&models)),
     )?;
     Ok((models, listener, activation, recorded))
 }
@@ -3688,6 +3708,7 @@ mod tests {
             Arc::clone(&classifier),
             reasoner,
             &queues,
+            &timer_desk(),
         );
         let utterances = Arc::clone(listener.utterances());
         Ok(App {
