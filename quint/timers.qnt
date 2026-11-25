@@ -183,17 +183,17 @@ module timers {
     move(Other, h, ha.set(h, "idle"), timer, starting, ring),
   }
 
-  /// Connects to HA with the rings `rings`: each entry whose helper is `idle` goes, and no start call runs.
-  action connect(rings: HELPER -> Bell): bool = {
-    val kept = HELPER_SET.mapBy(h => if (ha.get(h) == "idle") NO_ENTRY else timer.get(h))
-    move(Other, lastHelper, ha, kept, HELPER_SET.mapBy(_ => false), rings)
+  /// Connects to HA with the start calls `starts` and the rings `rings`: each entry that does not start and whose helper is `idle` goes.
+  action connect(starts: HELPER -> bool, rings: HELPER -> Bell): bool = {
+    val kept = HELPER_SET.mapBy(h => if (ha.get(h) == "idle" and not(starts.get(h))) NO_ENTRY else timer.get(h))
+    move(Other, lastHelper, ha, kept, starts, rings)
   }
 
-  /// Jarvis connects to HA again.
-  action reconnect = connect(ring)
+  /// Jarvis connects to HA again. The start calls continue.
+  action reconnect = connect(starting, ring)
 
-  /// Jarvis starts again with its saved table. No ring survives.
-  action restart = connect(HELPER_SET.mapBy(h => ring.get(h).with("left", 0)))
+  /// Jarvis starts again with its saved table. No start call and no ring survives.
+  action restart = connect(HELPER_SET.mapBy(_ => false), HELPER_SET.mapBy(h => ring.get(h).with("left", 0)))
 
   /// One ring of `h` on its satellite.
   action ringOnce(h: HELPER): bool = {

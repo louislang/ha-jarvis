@@ -401,7 +401,14 @@ impl Drop for StartGuard {
 mod tests {
     use std::path::Path;
 
+    use quint_connect::Driver;
+    use quint_connect::State as ModelState;
+    use quint_connect::Step;
+    use quint_connect::quint_run;
+    use quint_connect::switch;
     use rand::SeedableRng;
+    use serde::Deserialize;
+    use tokio::runtime::Runtime;
 
     use super::*;
     use crate::domain::state::ServiceCall;
@@ -456,7 +463,9 @@ mod tests {
             name: Option<&str>,
             satellite: &str,
         ) -> (String, Option<ServiceCall>) {
-            let (decision, guard) = self.decide((intent, action), name, satellite).await;
+            let (decision, guard) = self
+                .decide((intent, action), name, "five minutes", satellite)
+                .await;
             if let Some(guard) = guard {
                 guard.made(async { Ok(()) }).await.expect("no call fails");
             }
@@ -466,19 +475,20 @@ mod tests {
             (reply.text, call)
         }
 
-        /// The decision and the start guard of the request `intent` with `action` and the
-        /// `timer` slot `name` from `satellite`, with "five minutes" as the duration of a `Set`.
+        /// The decision and the start guard of the request `intent` with `action`, the `timer`
+        /// slot `name` and the `duration` slot `duration` from `satellite`.
         async fn decide(
             &self,
             (intent, action): (&str, TimerAction),
             name: Option<&str>,
+            duration: &str,
             satellite: &str,
         ) -> (Decision, Option<Guard>) {
             let request = TimerRequest {
                 intent: intent.to_owned(),
                 action,
                 timer: name.map(str::to_owned),
-                duration: Some("five minutes".to_owned()),
+                duration: Some(duration.to_owned()),
                 transcript: intent.to_owned(),
             };
             let now: Timestamp = "2026-11-22T12:00:00Z".parse().expect("a timestamp");
@@ -499,7 +509,9 @@ mod tests {
 
         /// The guard of the call of the request `intent` with `action` for "chicken".
         async fn waiting(&self, request: (&str, TimerAction)) -> Guard {
-            let (_, guard) = self.decide(request, Some("chicken"), KITCHEN).await;
+            let (_, guard) = self
+                .decide(request, Some("chicken"), "five minutes", KITCHEN)
+                .await;
             guard.expect("a guard of the call")
         }
 
@@ -698,7 +710,9 @@ mod tests {
     async fn ac_19_9e_2_dropped_cleanup_frees_the_name() {
         let fixture = Fixture::free().await;
         let set = ("timer_set", TimerAction::Set);
-        let (_, guard) = fixture.decide(set, Some("chicken"), KITCHEN).await;
+        let (_, guard) = fixture
+            .decide(set, Some("chicken"), "five minutes", KITCHEN)
+            .await;
         let held = fixture.desk.desk.lock().await;
         let failed = async { Err(anyhow::anyhow!("the call failed")) };
         let cleanup = tokio::spawn(guard.expect("a start guard").made(failed));
@@ -759,5 +773,331 @@ mod tests {
         let guard = fixture.waiting(cancel).await;
         fixture.feed(vec![snapshot(&[(J1, "active")])]).await;
         assert!(calls(guard).await, "no cancel after the same snapshot");
+    }
+
+    /// The model helpers and the timer helpers.
+    const HELPERS: [(&str, &str); 2] = [("h1", J1), ("h2", J2)];
+
+    /// The model satellites and the satellites.
+    const SATELLITES: [(&str, &str); 2] = [("s1", KITCHEN), ("s2", "assist_satellite.office")];
+
+    /// The other name of `name` in `pairs`: the code name of a model name, or the model name of a
+    /// code name.
+    fn swap(pairs: [(&str, &str); 2], name: &str) -> String {
+        let pair = pairs.iter().find(|pair| pair.0 == name || pair.1 == name);
+        let (model, code) = pair.expect("a name of the model or the code");
+        if *model == name { code } else { model }.to_string()
+    }
+
+    /// The cancel request.
+    const CANCEL: (&str, TimerAction) = ("timer_cancel", TimerAction::Cancel);
+
+    /// The pause request.
+    const PAUSE: (&str, TimerAction) = ("timer_pause", TimerAction::Pause);
+
+    /// The resume request.
+    const RESUME: (&str, TimerAction) = ("timer_resume", TimerAction::Resume);
+
+    /// The model state of `timers.qnt` that the conformance test compares.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct TimerModel {
+        /// The HA state of each helper.
+        ha: BTreeMap<String, String>,
+        /// The table entry of each helper.
+        timer: BTreeMap<String, Entry>,
+        /// True for each helper whose start call runs.
+        starting: BTreeMap<String, bool>,
+        /// The rings with rings left, by helper. The desk removes a ring without rings left.
+        #[serde(deserialize_with = "left_rings")]
+        ring: BTreeMap<String, Bell>,
+    }
+
+    /// A table entry of the model. `owned = false` is no entry.
+    #[derive(Debug, Default, Deserialize, PartialEq)]
+    struct Entry {
+        /// True for an entry.
+        owned: bool,
+        /// The satellite that set the timer.
+        sat: String,
+        /// The name, or `""` for a generic timer.
+        name: String,
+        /// The order of the set request.
+        order: u64,
+    }
+
+    /// A ring of the model.
+    #[derive(Debug, Deserialize, PartialEq)]
+    struct Bell {
+        /// The satellite of the ring.
+        sat: String,
+        /// The rings left.
+        left: u32,
+    }
+
+    /// The rings of the model with rings left.
+    fn left_rings<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<String, Bell>, D::Error> {
+        let rings: BTreeMap<String, Bell> = BTreeMap::deserialize(deserializer)?;
+        Ok(rings
+            .into_iter()
+            .filter(|(_, bell)| bell.left > 0)
+            .collect())
+    }
+
+    impl Entry {
+        /// The model entry of the table entry `entry`.
+        fn of(entry: Option<&Timer>) -> Self {
+            entry.map_or_else(Self::default, |entry| Self {
+                owned: true,
+                sat: swap(SATELLITES, entry.satellite.as_deref().unwrap_or_default()),
+                name: entry.name.clone().unwrap_or_default(),
+                order: entry.order,
+            })
+        }
+    }
+
+    impl ModelState<TimerDriver> for TimerModel {
+        /// The HA of the driver, and the table and the rings of the desk.
+        fn from_driver(driver: &TimerDriver) -> anyhow::Result<Self> {
+            let desk = driver.fixture.desk.desk.try_lock()?;
+            let mut model = Self {
+                ha: BTreeMap::new(),
+                timer: BTreeMap::new(),
+                starting: BTreeMap::new(),
+                ring: BTreeMap::new(),
+            };
+            for (helper, state) in &driver.ha {
+                let (name, entry) = (swap(HELPERS, helper), desk.timers.timers.get(helper));
+                model.ha.insert(name.clone(), state.clone());
+                let starting = entry.is_some_and(|entry| entry.starting);
+                model.starting.insert(name.clone(), starting);
+                model.timer.insert(name.clone(), Entry::of(entry));
+                let bell = desk.rings.get(helper).map(|ring| driver.bell(ring));
+                model.ring.extend(bell.map(|bell| (name, bell)));
+            }
+            Ok(model)
+        }
+    }
+
+    /// Replays `timers.qnt` against `TimerDesk`, as the conversation use case and as HA.
+    struct TimerDriver {
+        /// The paused runtime of the desk.
+        runtime: Runtime,
+        /// The desk and its store.
+        fixture: Fixture,
+        /// The HA state of each helper, which the next snapshot shows.
+        ha: BTreeMap<String, String>,
+        /// The rings made of each ring, by its number.
+        counts: BTreeMap<u64, u32>,
+    }
+
+    impl TimerDriver {
+        /// A driver with no timers and both helpers `idle`.
+        fn new() -> Self {
+            let mut runtime = tokio::runtime::Builder::new_current_thread();
+            let runtime = runtime.enable_time().start_paused(true).build();
+            let runtime = runtime.expect("the runtime builds");
+            let fixture = runtime.block_on(Fixture::new(&[]));
+            let ha = [J1, J2].map(|helper| (helper.to_owned(), "idle".to_owned()));
+            let driver = Self {
+                runtime,
+                fixture,
+                ha: ha.into(),
+                counts: BTreeMap::new(),
+            };
+            driver.reconnect();
+            driver
+        }
+
+        /// Gives the desk the snapshot of HA.
+        fn reconnect(&self) {
+            let states: Vec<(&str, &str)> = self
+                .ha
+                .iter()
+                .map(|(helper, state)| (helper.as_str(), state.as_str()))
+                .collect();
+            self.runtime
+                .block_on(self.fixture.feed(vec![snapshot(&states)]));
+        }
+
+        /// The entry of the model helper `model` and its timer helper.
+        fn entry(&self, model: &str) -> anyhow::Result<(String, Timer)> {
+            let helper = swap(HELPERS, model);
+            let desk = self.fixture.desk.desk.try_lock()?;
+            let entry = desk.timers.timers.get(&helper).cloned();
+            Ok((
+                helper,
+                entry.ok_or_else(|| anyhow::anyhow!("no entry on {model}"))?,
+            ))
+        }
+
+        /// The request `intent` with `action` for `name`, with `duration`, from the model satellite
+        /// `model`. Makes the call of an `Act`.
+        fn ask(&self, request: (&str, TimerAction), name: &str, duration: &str, model: &str) {
+            let satellite = swap(SATELLITES, model);
+            let decide = self
+                .fixture
+                .decide(request, Some(name), duration, &satellite);
+            match self.runtime.block_on(decide).1 {
+                Some(Guard::Start(mut start)) => start.armed = false,
+                Some(act) => self
+                    .runtime
+                    .block_on(act.made(async { Ok(()) }))
+                    .expect("no call fails"),
+                None => (),
+            }
+        }
+
+        /// A set on the first free helper, with the duration of that helper.
+        fn set(&self, model: &str, name: &str) -> anyhow::Result<()> {
+            let desk = self.fixture.desk.desk.try_lock()?;
+            let free = |helper: &&String| {
+                self.ha[*helper] == "idle" && !desk.timers.timers.contains_key(*helper)
+            };
+            let first = self.ha.keys().find(free).cloned();
+            drop(desk);
+            let duration = if first.as_deref() == Some(J2) {
+                "two minutes"
+            } else {
+                "one minute"
+            };
+            self.ask(("timer_set", TimerAction::Set), name, duration, model);
+            Ok(())
+        }
+
+        /// The request `intent` with `action` for the label of the timer of the model helper
+        /// `model`, from the Kitchen satellite, then the state `state` of the helper and the end
+        /// `end`.
+        fn act(
+            &mut self,
+            request: (&str, TimerAction),
+            model: &str,
+            state: &str,
+            end: Option<TimerEnd>,
+        ) -> anyhow::Result<()> {
+            let (_, timer) = self.entry(model)?;
+            let label = timer.name.as_ref().unwrap_or(&timer.duration);
+            self.ask(request, label, &timer.duration, "s1");
+            self.change(model, state, end);
+            Ok(())
+        }
+
+        /// HA changes the model helper `model` to `state`, then sends `end`.
+        fn change(&mut self, model: &str, state: &str, end: Option<TimerEnd>) {
+            let helper = swap(HELPERS, model);
+            self.ha.insert(helper.clone(), state.to_owned());
+            let mut inputs = vec![changed(&helper, state)];
+            let end = end.map(|end| Event::TimerEnded {
+                entity_id: helper,
+                end,
+            });
+            inputs.extend(end.map(TimerInput::Event));
+            self.runtime.block_on(self.fixture.feed(inputs));
+        }
+
+        /// HA ends the timer of the model helper `model`, then sends `end`.
+        fn end(&mut self, model: &str, end: Option<TimerEnd>) {
+            self.change(model, "idle", end);
+        }
+
+        /// A new desk on the saved table, with the snapshot of HA.
+        fn restart(&mut self) {
+            let store = Arc::clone(&self.fixture.store);
+            let desk = TimerDesk::new(Arc::clone(&store) as _, 0.85);
+            self.fixture = Fixture {
+                desk: Arc::new(self.runtime.block_on(desk)),
+                store,
+            };
+            self.reconnect();
+        }
+
+        /// The model ring of the desk ring `ring`.
+        fn bell(&self, ring: &Ring) -> Bell {
+            let count = self.counts.get(&ring.number).copied().unwrap_or_default();
+            Bell {
+                sat: swap(SATELLITES, &ring.satellite),
+                left: RINGS - count,
+            }
+        }
+
+        /// The ring of the model helper `model`.
+        fn ring(&self, model: &str) -> anyhow::Result<Ring> {
+            let desk = self.fixture.desk.desk.try_lock()?;
+            let ring = desk.rings.get(&swap(HELPERS, model)).cloned();
+            ring.ok_or_else(|| anyhow::anyhow!("no ring on {model}"))
+        }
+
+        /// The next ring of the model helper `model`, at its time on an idle satellite.
+        fn ring_once(&mut self, model: &str) -> anyhow::Result<()> {
+            let (helper, ring) = (swap(HELPERS, model), self.ring(model)?);
+            let count = self.counts.entry(ring.number).or_default();
+            let desk = &self.fixture.desk;
+            self.runtime.block_on(async {
+                tokio::time::sleep_until(ring.start + RING_INTERVAL * *count).await;
+                anyhow::ensure!(
+                    desk.rings(&helper, ring.number).await,
+                    "the ring on {model} ended"
+                );
+                *count += 1;
+                if *count == RINGS {
+                    desk.end(&helper, ring.number).await;
+                }
+                anyhow::Ok(())
+            })
+        }
+
+        /// The failed start call of the timer of the model helper `model`.
+        fn start_failed(&self, model: &str) -> anyhow::Result<()> {
+            let (helper, timer) = self.entry(model)?;
+            let forget = self.fixture.desk.forget(&helper, timer.order);
+            self.runtime.block_on(forget);
+            Ok(())
+        }
+
+        /// "Stop" on the model satellite `model`.
+        fn stop(&self, model: &str) {
+            let satellite = swap(SATELLITES, model);
+            self.runtime.block_on(self.fixture.desk.stop(&satellite));
+        }
+
+        /// A cancel of the ringing timer of the model helper `model` by its name.
+        fn silence(&self, model: &str) -> anyhow::Result<()> {
+            let ring = self.ring(model)?;
+            let name = ring.timer.name.unwrap_or_default();
+            self.ask(CANCEL, &name, &ring.timer.duration, "s1");
+            Ok(())
+        }
+    }
+
+    impl Driver for TimerDriver {
+        type State = TimerModel;
+
+        fn step(&mut self, step: &Step) -> anyhow::Result<()> {
+            switch!(step {
+                init => *self = Self::new(),
+                setTimer(s: String, n: String) => self.set(&s, &n)?,
+                started(h: String) => self.change(&h, "active", None),
+                startFailed(h: String) => self.start_failed(&h)?,
+                cancel(h: String) => self.act(CANCEL, &h, "idle", Some(TimerEnd::Cancelled))?,
+                pause(h: String) => self.act(PAUSE, &h, "paused", None)?,
+                resume(h: String) => self.act(RESUME, &h, "active", None)?,
+                outside(h: String) => self.change(&h, "active", None),
+                finish(h: String) => self.end(&h, Some(TimerEnd::Finished)),
+                haCancel(h: String) => self.end(&h, Some(TimerEnd::Cancelled)),
+                quietEnd(h: String) => self.end(&h, None),
+                reconnect => self.reconnect(),
+                restart => self.restart(),
+                ringOnce(h: String) => self.ring_once(&h)?,
+                stop(s: String) => self.stop(&s),
+                silence(h: String) => self.silence(&h)?,
+            })
+        }
+    }
+
+    /// AC-19.12-1. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/timers.qnt", max_steps = 30, seed = "1")]
+    fn ac_19_12_1_conformance() -> impl Driver {
+        TimerDriver::new()
     }
 }
