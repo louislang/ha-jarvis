@@ -649,10 +649,11 @@ impl Conversation {
     }
 
     /// The reply to `text` as an answer to the `open` dialog and its key on the satellite of
-    /// `heard` at its time: a `cancelled` reply that closes it, or a question again, with the
-    /// prediction and the record parts of an unclear answer. Else the prediction to decide and its
-    /// transcript: the filled intent of a `Slot` dialog, or the System One prediction of `text` in
-    /// the area of `heard`, with true for a new request.
+    /// `heard` at its time: empty text with no record when a cancel phrase stops a ring there, a
+    /// `cancelled` reply that closes it, or a question again, with the prediction and the record
+    /// parts of an unclear answer. Else the prediction to decide and its transcript: the filled
+    /// intent of a `Slot` dialog, or the System One prediction of `text` in the area of `heard`,
+    /// with true for a new request.
     ///
     /// # Errors
     ///
@@ -663,6 +664,9 @@ impl Conversation {
         open: Option<(Dialog, Key)>,
         heard: &Heard,
     ) -> anyhow::Result<ControlFlow<Answered, (Prediction, String, bool)>> {
+        if let Some(cancelled) = self.cancelled(text, open.as_ref(), heard).await {
+            return Ok(ControlFlow::Break(cancelled));
+        }
         let Some((dialog, key)) = open else {
             return Ok(ControlFlow::Continue((
                 self.predict(text, heard).await?,
@@ -670,9 +674,6 @@ impl Conversation {
                 true,
             )));
         };
-        if dialog::is_cancel(text, &self.queues.dialog.cancel) {
-            return Ok(ControlFlow::Break(self.cancel(key, heard)));
-        }
         if let Some((prediction, transcript)) = self.filled(&dialog, text) {
             return Ok(ControlFlow::Continue((prediction, transcript, false)));
         }
@@ -721,6 +722,31 @@ impl Conversation {
         let answer = self.answer(text, None, &thread).await;
         let spoken = self.or_failure(answer.map(|all| unpooled(all.join(" "))));
         said(prediction, Route::Llm, spoken, None)
+    }
+
+    /// The reply to the cancel phrase `text` of `heard`, with no record: empty text when it stops a
+    /// ring on the satellite of `heard`, else a `cancelled` reply that closes the `open` dialog.
+    async fn cancelled(
+        &self,
+        text: &str,
+        open: Option<&(Dialog, Key)>,
+        heard: &Heard,
+    ) -> Option<Answered> {
+        if !dialog::is_cancel(text, &self.queues.dialog.cancel) {
+            return None;
+        }
+        if let Some(satellite) = &heard.satellite
+            && self.timers.stop(satellite).await
+        {
+            return Some((
+                Handled {
+                    text: String::new(),
+                    after: None,
+                },
+                None,
+            ));
+        }
+        open.map(|(_, key)| self.cancel(key.clone(), heard))
     }
 
     /// A `cancelled` reply, with no record. Closes the dialog of `key`, unless the request of
@@ -6232,6 +6258,83 @@ mod tests {
         let pasta = ring_times(8, Duration::from_secs(10));
         assert_eq!(rang(&home, start), [vec![MARGIN], pasta].concat());
         assert_eq!(announces(&home)[1..], ["Your pasta timer is done."; 8]);
+        Ok(())
+    }
+
+    /// The satellite entity of the office.
+    const OFFICE_SATELLITE: &str = "assist_satellite.office";
+
+    /// The reply to `text` from the office satellite, after its work.
+    async fn from_office(conversation: &Conversation, text: &str) -> anyhow::Result<String> {
+        let office = Context {
+            satellite_id: Some(OFFICE_SATELLITE.to_owned()),
+            ..Context::default()
+        };
+        let Handled { text, after } = conversation.handle(text, office).await?;
+        if let Some(after) = after {
+            after.await?;
+        }
+        Ok(text)
+    }
+
+    /// AC-19.10b-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_10b_1_stop_ends_the_ring() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let chicken = named("chicken", false);
+        let (_cache, mut conversation) = rung(&home, Vec::new(), chicken, TimerEnd::Finished).await;
+        let (writer, mut log) = tokio::sync::mpsc::unbounded_channel();
+        conversation.recorder.writer = writer;
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        let handled = conversation.handle("stop", on_satellite()).await?;
+        assert_eq!((handled.text.as_str(), handled.after.is_none()), ("", true));
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(announces(&home).len(), 2);
+        assert!(log.try_recv().is_err(), "a record of the stop");
+        assert!(
+            !conversation.timers.ringing().await,
+            "a ring after the stop"
+        );
+        Ok(())
+    }
+
+    /// AC-19.10b-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_10b_2_stop_on_another_satellite_keeps_the_ring() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let left = predicted("timer_left", 0.9, ("timer", ""));
+        let chicken = named("chicken", false);
+        let (_cache, conversation) = rung(&home, vec![left], chicken, TimerEnd::Finished).await;
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        let text = from_office(&conversation, "stop").await?;
+        assert_eq!(text, "No timer is running.");
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(announces(&home).len(), 8);
+        Ok(())
+    }
+
+    /// AC-19.10b-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_10b_3_cancel_by_name_silences_a_waiting_ring() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let cancel = predicted("timer_cancel", 0.9, ("timer", "chicken"));
+        let chicken = named("chicken", false);
+        let (cache, conversation) = rung(&home, vec![cancel], chicken, TimerEnd::Finished).await;
+        set(&cache, "responding");
+        let text = from_office(&conversation, "cancel the chicken timer").await?;
+        assert_eq!(text, "I cancelled the chicken timer.");
+        set(&cache, "idle");
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(home.calls(), []);
+        Ok(())
+    }
+
+    /// AC-19.10b-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_10b_4_stop_without_a_ring_cancels_the_dialog() -> anyhow::Result<()> {
+        let texts = ["turn on the lights", "stop"];
+        let (replies, _) = talk(&Arc::default(), Arc::default(), &texts, &["lights_on"]).await?;
+        assert_eq!(replies[1].text, "Cancelled.");
         Ok(())
     }
 }

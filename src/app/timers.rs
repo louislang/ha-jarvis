@@ -18,6 +18,7 @@ use crate::domain::state::State;
 use crate::domain::state::TimerEnd;
 use crate::domain::state_cache::StateCache;
 use crate::domain::timers;
+use crate::domain::timers::Candidate;
 use crate::domain::timers::Plan;
 use crate::domain::timers::Timer;
 use crate::domain::timers::TimerAction;
@@ -103,6 +104,15 @@ impl Desk {
         Some((helper, ring))
     }
 
+    /// The helper and the ended entry of each ring.
+    fn ringing(&self) -> Vec<Candidate> {
+        let rings = self.rings.iter().map(|(helper, ring)| Candidate {
+            helper: helper.clone(),
+            timer: ring.timer.clone(),
+        });
+        rings.collect()
+    }
+
     /// The table after the state change `event` of a helper, which also changes the view and
     /// counts a new run of the helper.
     fn changed(&mut self, event: Event) -> Timers {
@@ -177,8 +187,8 @@ impl TimerDesk {
 
     /// The decision for `request` from `satellite` at `now`, with a response of `pools` that `rng`
     /// selects, and the guard of its call: the start call of a new entry, or the call of an `Act`
-    /// with the run count of its helper. Plans on the view and keeps the new table under the lock,
-    /// so two requests cannot take the same helper.
+    /// with the run count of its helper. Plans on the view and the rings, and keeps the new table
+    /// under the lock, so two requests cannot take the same helper. Removes the ring of `Silence`.
     ///
     /// # Panics
     ///
@@ -193,8 +203,19 @@ impl TimerDesk {
     ) -> (Decision, Option<Guard>) {
         let mut desk = self.desk.lock().await;
         let (timers, order) = (desk.timers.clone(), desk.timers.next);
-        let (plan, table) =
-            timers::plan(request, timers, &desk.view, now, satellite, self.similarity);
+        let (ringing, view) = (desk.ringing(), &desk.view);
+        let (plan, table) = timers::plan(
+            request,
+            timers,
+            ringing,
+            view,
+            now,
+            satellite,
+            self.similarity,
+        );
+        if let Plan::Silence { helper, .. } = &plan {
+            desk.rings.remove(helper);
+        }
         self.keep(&mut desk, table).await;
         let guard = self.guard(&plan, request.action, order, &desk);
         let rng = &mut rng.lock().expect("no lock holder panics");
@@ -249,6 +270,19 @@ impl TimerDesk {
                 ring(helper, started);
             }
         }
+    }
+
+    /// Removes each ring of `satellite`. True when it removed one.
+    pub async fn stop(&self, satellite: &str) -> bool {
+        let mut desk = self.desk.lock().await;
+        let before = desk.rings.len();
+        desk.rings.retain(|_, ring| ring.satellite != satellite);
+        desk.rings.len() < before
+    }
+
+    /// True while a ring exists.
+    pub async fn ringing(&self) -> bool {
+        !self.desk.lock().await.rings.is_empty()
     }
 
     /// True while the desk keeps the ring `number` of `helper` and `RING_FOR` after its start has

@@ -338,6 +338,13 @@ pub enum Plan {
     },
     /// No timer fits the request.
     Missing,
+    /// Stop the ring of `helper`, whose timer is no longer in HA.
+    Silence {
+        /// The entity ID of the helper.
+        helper: String,
+        /// The ended entry of the ring.
+        timer: Timer,
+    },
 }
 
 /// A timer and its time left.
@@ -773,8 +780,9 @@ pub fn reconcile(timers: &Timers, cache: &StateCache) -> Timers {
     }
 }
 
-/// The plan of the timer request `request` from `satellite` at `now`, and the table after it.
-/// `similarity` is the least Jaro-Winkler similarity of a spoken name to a label.
+/// The plan of the timer request `request` from `satellite` at `now` while the timers of
+/// `ringing` ring, and the table after it. `similarity` is the least Jaro-Winkler similarity of a
+/// spoken name to a label.
 #[verus_spec((planned, table) =>
     requires
         unique(timers.timers@),
@@ -795,6 +803,7 @@ pub fn reconcile(timers: &Timers, cache: &StateCache) -> Timers {
 pub fn plan(
     request: &TimerRequest,
     timers: Timers,
+    ringing: Vec<Candidate>,
     cache: &StateCache,
     now: Timestamp,
     satellite: Option<String>,
@@ -804,6 +813,9 @@ pub fn plan(
     if matches!(action, TimerAction::Set) {
         return set(request, timers, cache, satellite);
     }
+    if let Some(silence) = silenced(request, ringing, similarity) {
+        return (silence, timers);
+    }
     let mut found = candidates(action, &timers, cache);
     if matches!(action, TimerAction::CancelLast) {
         let chosen = found.pop();
@@ -811,20 +823,26 @@ pub fn plan(
     }
     let mut kept = meant(request.timer.as_ref(), found, similarity);
     if matches!(action, TimerAction::Left) {
-        let planned = if kept.is_empty() {
-            Plan::Missing
-        } else {
-            Plan::Left {
-                timers: remaining(&kept, cache, now),
-            }
-        };
-        return (planned, timers);
+        return (remaining(&kept, cache, now), timers);
     }
     if kept.len() > 1 {
         return (Plan::Several { timers: kept }, timers);
     }
     let chosen = kept.pop();
     act(action, chosen, timers)
+}
+
+/// `Silence` on the timer of `ringing` that the name of a `Cancel` request `request` means.
+#[verus_spec(silence =>
+    ensures
+        silence matches Some(planned) ==> planned is Silence,
+)]
+fn silenced(request: &TimerRequest, ringing: Vec<Candidate>, similarity: f64) -> Option<Plan> {
+    let (TimerAction::Cancel, Some(name)) = (request.action, &request.timer) else {
+        return None;
+    };
+    let Candidate { helper, timer } = meant(Some(name), ringing, similarity).pop()?;
+    Some(Plan::Silence { helper, timer })
 }
 
 /// `Act` on `chosen` with the service of `action`, or `Missing` without a candidate, and the table
@@ -925,9 +943,16 @@ fn labels(found: &[Candidate]) -> Vec<String> {
     labels
 }
 
-/// Each candidate of `found` whose helper `cache` shows with a time left at `now`, with that time.
-#[verus_verify]
-fn remaining(found: &[Candidate], cache: &StateCache, now: Timestamp) -> Vec<Remaining> {
+/// `Left` with each candidate of `found` whose helper `cache` shows with a time left at `now`, with
+/// that time, or `Missing` without a candidate.
+#[verus_spec(planned =>
+    ensures
+        planned is Left || planned is Missing,
+)]
+fn remaining(found: &[Candidate], cache: &StateCache, now: Timestamp) -> Plan {
+    if found.is_empty() {
+        return Plan::Missing;
+    }
     let mut timers = Vec::new();
     let mut index = 0;
     #[cfg_attr(verus_only, verus_spec(
@@ -949,7 +974,7 @@ fn remaining(found: &[Candidate], cache: &StateCache, now: Timestamp) -> Vec<Rem
         }
         index += 1;
     }
-    timers
+    Plan::Left { timers }
 }
 
 /// The decision for `plan` of `request`: a reply from the pool of the intent or of the plan with
@@ -963,7 +988,7 @@ fn remaining(found: &[Candidate], cache: &StateCache, now: Timestamp) -> Vec<Rem
         pools@.contains_key(crate::domain::contracts::string_key("filler"@)),
     ensures
         decision matches Decision::Reply { call: Some(made), .. } ==> timer_call(*plan, made),
-        plan is Taken || plan is Full || plan is Missing || plan is Left
+        plan is Taken || plan is Full || plan is Missing || plan is Left || plan is Silence
             ==> decision matches Decision::Reply { call: None, .. }
             || crate::domain::decide::deferred(decision, request.transcript),
         plan is Unclear ==> crate::domain::decide::deferred(decision, request.transcript),
@@ -1093,12 +1118,14 @@ fn awaiting(request: &TimerRequest, missing: &str, choices: Vec<String>) -> Pend
     }
 }
 
-/// The template context of `plan`: `timer` and `duration` of the entry of `Act`, else of
-/// `request`, and the `timers` of `Left` and `Several`.
+/// The template context of `plan`: `timer` and `duration` of the entry of `Act` or `Silence`,
+/// else of `request`, and the `timers` of `Left` and `Several`.
 #[verus_verify]
 fn context(plan: &Plan, request: &TimerRequest) -> serde_json::Map<String, Value> {
     let mut context = match plan {
-        Plan::Act { timer, .. } => described(timer.name.as_ref(), Some(&timer.duration), None),
+        Plan::Act { timer, .. } | Plan::Silence { timer, .. } => {
+            described(timer.name.as_ref(), Some(&timer.duration), None)
+        }
         _ => described(request.timer.as_ref(), request.duration.as_ref(), None),
     };
     let mut timers = Vec::new();
@@ -1903,7 +1930,15 @@ mod tests {
             action,
             ..request(timer, None)
         };
-        plan(&request, timers.clone(), cache, now(), None, 0.85)
+        plan(
+            &request,
+            timers.clone(),
+            Vec::new(),
+            cache,
+            now(),
+            None,
+            0.85,
+        )
     }
 
     /// The plan `Act` with `service` on `helper` and its entry `timer`.
