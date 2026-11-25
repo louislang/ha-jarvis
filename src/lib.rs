@@ -959,7 +959,8 @@ pub struct App {
     listener: Listener,
     /// The `speak` use case.
     speech: Arc<Speech>,
-    /// The prefetch task. It holds a sender of the pools task, so it stops when the app drops.
+    /// The prefetch task, and the timer task with its rings. They hold a sender of the pools task,
+    /// so they stop when the app drops.
     _prefetch: Option<AbortOnDropHandle<()>>,
 }
 
@@ -1545,23 +1546,25 @@ type Started = (
     Arc<LiveModels>,
 );
 
-/// The hot cache, its announce queues, the pools task, the habit task and the timer desk of an
-/// app.
+/// The timer desk of an app and the receiver of its timer changes.
+type Timing = (Arc<TimerDesk>, UnboundedReceiver<TimerInput>);
+
+/// The hot cache, its announce queues, the pools task, the habit task and the timing of an app.
 type Synced = (
     watch::Receiver<StateCache>,
     Arc<Queues>,
     PoolsTask,
     HabitsTask,
-    Arc<TimerDesk>,
+    Timing,
 );
 
-/// The pools task, the queues, the habit task, the reasoner and the timer desk of an app.
+/// The pools task, the queues, the habit task, the reasoner and the timing of an app.
 type Parts = (
     PoolsTask,
     Arc<Queues>,
     HabitsTask,
     Arc<dyn Reasoner>,
-    Arc<TimerDesk>,
+    Timing,
 );
 
 /// The live models, the listener, the activation, the recorder and the log of an app.
@@ -2007,10 +2010,11 @@ async fn start_app_with(
     Ok(started)
 }
 
-/// The app of `config`, `parts`, `system_two`, `loaded` and `prerender`. Starts its prefetch.
+/// The app of `config`, `parts`, `system_two`, `loaded` and `prerender`. Starts its prefetch and
+/// the run of its timer desk.
 fn started(
     config: &Config,
-    (task, queues, habits, reasoner, timers): Parts,
+    (task, queues, habits, reasoner, (timers, inputs)): Parts,
     system_two: SystemTwo,
     (models, listener, activation, (recorder, logged)): Loaded,
     prerender: JoinHandle<()>,
@@ -2039,13 +2043,28 @@ fn started(
     );
     let conversation = started.0.conversation.clone();
     let habits = Arc::clone(&started.1.1.habits);
-    let prefetch = Prefetch::new(conversation, activation, habits, config);
-    let task = AbortOnDropHandle::new(app::background::start_prefetch(prefetch));
+    let task = start_background(conversation, inputs, (activation, habits), config);
     started.0 = App {
         _prefetch: Some(task),
         ..started.0
     };
     started
+}
+
+/// Starts the prefetch with `activation`, `habits` and `config`, and the timer desk on `inputs`.
+fn start_background(
+    conversation: Conversation,
+    inputs: UnboundedReceiver<TimerInput>,
+    (activation, habits): (Activation, Arc<Habits>),
+    config: &Config,
+) -> AbortOnDropHandle<()> {
+    let prefetch = Prefetch::new(conversation.clone(), activation, habits, config);
+    let prefetch = AbortOnDropHandle::new(app::background::start_prefetch(prefetch));
+    AbortOnDropHandle::new(tokio::spawn(async move {
+        conversation.run_timers(inputs).await;
+        // The prefetch task runs until the app drops.
+        let _ = prefetch.await;
+    }))
 }
 
 /// The recorder of the utterances of `listener` on the log of `config` with the training trigger,
@@ -2255,9 +2274,9 @@ fn process_trainer(config: &Config) -> ProcessTrainer {
     }
 }
 
-/// Starts the sync of a hot cache with `home`, the pools task of the source pools `pools` and the
-/// habit task of `config` on it, and the timer desk on the timer changes of the sync. Gives the
-/// hot cache, its announce queues, the two tasks and the timer desk.
+/// Starts the sync of a hot cache with `home`, and the pools task of the source pools `pools` and
+/// the habit task of `config` on it. Gives the hot cache, its announce queues, the two tasks, and
+/// the timer desk with the timer changes of the sync.
 ///
 /// # Errors
 ///
@@ -2269,8 +2288,8 @@ async fn start_tasks(
 ) -> anyhow::Result<Synced> {
     let (cache, queues, inputs) = start_sync(Arc::clone(home), config);
     let (task, habits) = start_stores(config, pools, &cache)?;
-    let timers = start_timers(config, inputs).await?;
-    Ok((cache, queues, task, habits, timers))
+    let timers = start_timers(config).await?;
+    Ok((cache, queues, task, habits, (timers, inputs)))
 }
 
 /// Starts the pools task of the source pools `pools` and the saved pools of `config`, and the
@@ -2487,21 +2506,15 @@ fn start_sync(
     (receiver, Arc::new(queues), inputs)
 }
 
-/// The timer desk on the log database of `config`, with a task that runs it on `inputs`.
+/// The timer desk on the log database of `config`.
 ///
 /// # Errors
 ///
 /// The log database cannot open.
-async fn start_timers(
-    config: &Config,
-    inputs: UnboundedReceiver<TimerInput>,
-) -> anyhow::Result<Arc<TimerDesk>> {
+async fn start_timers(config: &Config) -> anyhow::Result<Arc<TimerDesk>> {
     let store = Arc::new(SqliteLog::open(&config.log)?);
     let timers = TimerDesk::new(store, config.dialog.choice_similarity).await;
-    let timers = Arc::new(timers);
-    let running = Arc::clone(&timers);
-    tokio::spawn(async move { running.run(inputs).await });
-    Ok(timers)
+    Ok(Arc::new(timers))
 }
 
 /// Starts a task that pre-renders `pools` with `speech` for the area names of the first snapshot
