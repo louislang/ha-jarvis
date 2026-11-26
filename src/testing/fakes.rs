@@ -194,6 +194,21 @@ pub(crate) struct FakeHome {
     next: Mutex<VecDeque<Value>>,
     /// The response data of a `get_library` call for each media type, before `next`.
     library: Mutex<BTreeMap<String, Value>>,
+    /// The `assist` calls, in order.
+    assists: Mutex<Vec<Assisted>>,
+    /// True when `assist` fails.
+    assist_fails: AtomicBool,
+}
+
+/// One `assist` call of `FakeHome`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Assisted {
+    /// The satellite entity.
+    pub satellite: String,
+    /// The command text.
+    pub text: String,
+    /// The virtual time of the call.
+    pub at: Instant,
 }
 
 impl FakeHome {
@@ -212,7 +227,19 @@ impl FakeHome {
             response: Mutex::default(),
             next: Mutex::default(),
             library: Mutex::default(),
+            assists: Mutex::default(),
+            assist_fails: AtomicBool::new(false),
         }
+    }
+
+    /// The `assist` calls, in order.
+    pub(crate) fn assists(&self) -> Vec<Assisted> {
+        lock(&self.assists).clone()
+    }
+
+    /// Makes the later `assist` calls fail.
+    pub(crate) fn fail_assists(&self) {
+        self.assist_fails.store(true, Ordering::SeqCst);
     }
 
     /// Makes the later `snapshot` calls give `snapshot`.
@@ -339,6 +366,16 @@ impl Home for FakeHome {
             return_response: false,
         });
         self.wait().await
+    }
+
+    async fn assist(&self, satellite: &str, text: &str) -> anyhow::Result<()> {
+        lock(&self.assists).push(Assisted {
+            satellite: satellite.to_owned(),
+            text: text.to_owned(),
+            at: Instant::now(),
+        });
+        anyhow::ensure!(!self.assist_fails.load(Ordering::SeqCst), "no timer");
+        Ok(())
     }
 }
 
@@ -1782,5 +1819,29 @@ impl MqttSubscriber {
                 });
             }
         }
+    }
+}
+
+/// Tests of the fakes.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `FakeHome` records each `assist` call and fails the calls after `fail_assists`.
+    #[tokio::test(start_paused = true)]
+    async fn fake_home_records_and_fails_assist() {
+        let home = FakeHome::default();
+        let start = Instant::now();
+        assert!(home.assist("assist_satellite.office", "a").await.is_ok());
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        home.fail_assists();
+        assert!(home.assist("assist_satellite.office", "b").await.is_err());
+        let call = |text: &str, at| Assisted {
+            satellite: "assist_satellite.office".to_owned(),
+            text: text.to_owned(),
+            at,
+        };
+        let expected = vec![call("a", start), call("b", start + Duration::from_secs(1))];
+        assert_eq!(home.assists(), expected);
     }
 }
