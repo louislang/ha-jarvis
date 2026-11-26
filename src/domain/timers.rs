@@ -298,6 +298,30 @@ pub enum TimerInput {
     Snapshot(Vec<State>),
 }
 
+/// A command for the mirror Assist timer of a helper, which drives the LED ring of a satellite.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mirror {
+    /// The entity ID of the helper.
+    pub helper: String,
+    /// The satellite of the mirror.
+    pub satellite: String,
+    /// The change of the mirror.
+    pub change: MirrorChange,
+}
+
+/// A change of a mirror.
+#[verus_verify]
+#[derive(Clone, Debug, PartialEq)]
+pub enum MirrorChange {
+    /// Start the mirror, or replace it, for the state of the helper at its new run or its resume.
+    Start(State),
+    /// Pause the mirror.
+    Pause,
+    /// Cancel the mirror.
+    Cancel,
+}
+
 /// The plan of a timer request.
 #[verus_verify]
 #[derive(Clone, Debug, PartialEq)]

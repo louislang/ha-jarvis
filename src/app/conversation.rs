@@ -320,14 +320,15 @@ impl Conversation {
         Ok(handled)
     }
 
-    /// Runs the timer desk on `inputs` with a task for each new ring, which a drop aborts.
+    /// Runs the timer desk on `inputs` with a task for each new ring, which a drop aborts. Drops
+    /// each mirror command.
     pub async fn run_timers(&self, inputs: UnboundedReceiver<TimerInput>) {
         let mut rings = JoinSet::new();
         let ring = |helper, ring| {
             while rings.try_join_next().is_some() {}
             rings.spawn(self.clone().ring(helper, ring));
         };
-        self.timers.run(inputs, ring).await;
+        self.timers.run(inputs, ring, drop).await;
         rings.detach_all();
     }
 

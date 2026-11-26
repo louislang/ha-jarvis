@@ -1169,7 +1169,7 @@ mod tests {
             end,
         }))?;
         drop(sender);
-        desk.run(receiver, |_, _| {}).await;
+        desk.run(receiver, |_, _| {}, |_| {}).await;
         Ok(desk)
     }
 
