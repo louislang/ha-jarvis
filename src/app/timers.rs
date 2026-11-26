@@ -1126,6 +1126,10 @@ mod tests {
         ha: BTreeMap<String, String>,
         /// The rings made of each ring, by its number.
         counts: BTreeMap<u64, u32>,
+        /// The mirror commands of the desk, in order.
+        mirrors: Vec<Mirror>,
+        /// The `last_updated` of each helper that a restart of HA changed.
+        updated: BTreeMap<String, Timestamp>,
     }
 
     impl TimerDriver {
@@ -1136,25 +1140,34 @@ mod tests {
             let runtime = runtime.expect("the runtime builds");
             let fixture = runtime.block_on(Fixture::new(&[]));
             let ha = [J1, J2].map(|helper| (helper.to_owned(), "idle".to_owned()));
-            let driver = Self {
+            let mut driver = Self {
                 runtime,
                 fixture,
                 ha: ha.into(),
                 counts: BTreeMap::new(),
+                mirrors: Vec::new(),
+                updated: BTreeMap::new(),
             };
             driver.reconnect();
             driver
         }
 
         /// Gives the desk the snapshot of HA.
-        fn reconnect(&self) {
-            let states: Vec<(&str, &str)> = self
-                .ha
-                .iter()
-                .map(|(helper, state)| (helper.as_str(), state.as_str()))
-                .collect();
-            self.runtime
-                .block_on(self.fixture.feed(vec![snapshot(&states)]));
+        fn reconnect(&mut self) {
+            let states = self.ha.iter().map(|(helper, value)| {
+                let mut state = timer_state(helper, value);
+                let updated = self.updated.get(helper).copied();
+                state.last_updated = updated.unwrap_or(state.last_updated);
+                state
+            });
+            let snapshot = TimerInput::Snapshot(states.collect());
+            self.feed(vec![snapshot]);
+        }
+
+        /// Runs the desk on `inputs`, and keeps its mirror commands.
+        fn feed(&mut self, inputs: Vec<TimerInput>) {
+            let mirrors = self.runtime.block_on(self.fixture.feed(inputs));
+            self.mirrors.extend(mirrors);
         }
 
         /// The entry of the model helper `model` and its timer helper.
@@ -1257,13 +1270,14 @@ mod tests {
         fn change(&mut self, model: &str, state: &str, end: Option<TimerEnd>) {
             let helper = swap(HELPERS, model);
             self.ha.insert(helper.clone(), state.to_owned());
+            self.updated.remove(&helper);
             let mut inputs = vec![changed(&helper, state)];
             let end = end.map(|end| Event::TimerEnded {
                 entity_id: helper,
                 end,
             });
             inputs.extend(end.map(TimerInput::Event));
-            self.runtime.block_on(self.fixture.feed(inputs));
+            self.feed(inputs);
         }
 
         /// HA ends the timer of the model helper `model`, then sends `end`.
@@ -1438,5 +1452,219 @@ mod tests {
     #[quint_run(spec = "quint/timers.qnt", max_steps = 30, seed = "1")]
     fn ac_19_12_1_conformance() -> impl Driver {
         TimerDriver::new()
+    }
+
+    /// The model state of `mirrors.qnt` that the conformance test compares.
+    #[derive(Debug, Default, Deserialize, PartialEq)]
+    struct MirrorModel {
+        /// The satellite of the entry of each helper, `""` for no entry.
+        entry: BTreeMap<String, String>,
+        /// The satellite of the mirror of each helper, `""` for no mirror.
+        mirror: BTreeMap<String, String>,
+        /// The kind, the helper and the satellite of each queued call, in the order of the queue.
+        #[serde(deserialize_with = "in_order")]
+        calls: Vec<(String, String, String)>,
+        /// The Assist timers.
+        assist: BTreeSet<(String, String)>,
+    }
+
+    /// A queued call of the model.
+    #[derive(Deserialize)]
+    struct Call {
+        /// The kind of the call.
+        op: String,
+        /// The helper of the mirror.
+        h: String,
+        /// The satellite of the mirror.
+        s: String,
+        /// The number of the call.
+        n: u64,
+    }
+
+    /// The queued calls of the model in the order of the queue: each cancel first, else the
+    /// lower number first.
+    fn in_order<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<(String, String, String)>, D::Error> {
+        let mut calls: Vec<Call> = Vec::deserialize(deserializer)?;
+        calls.sort_by_key(|call| (call.op != "cancel", call.n));
+        Ok(calls
+            .into_iter()
+            .map(|call| (call.op, call.h, call.s))
+            .collect())
+    }
+
+    /// The model satellite of `satellite`, `""` for none.
+    fn model_satellite(satellite: Option<&String>) -> String {
+        satellite.map_or_else(String::new, |satellite| swap(SATELLITES, satellite))
+    }
+
+    /// The model kind of the call of `change`.
+    fn op(change: &MirrorChange) -> String {
+        let op = match change {
+            MirrorChange::Start(_) => "start",
+            MirrorChange::Pause => "pause",
+            MirrorChange::Cancel => "cancel",
+        };
+        op.to_owned()
+    }
+
+    impl ModelState<MirrorDriver> for MirrorModel {
+        /// The entries and the mirrors of the desk, and the queue and the Assist timers of the
+        /// driver.
+        fn from_driver(driver: &MirrorDriver) -> anyhow::Result<Self> {
+            let desk = driver.timers.fixture.desk.desk.try_lock()?;
+            let mut model = Self {
+                assist: driver.assist.clone(),
+                ..Self::default()
+            };
+            for (name, helper) in HELPERS {
+                let entry = desk.timers.timers.get(helper);
+                let entry = entry.and_then(|entry| entry.satellite.as_ref());
+                model.entry.insert(name.to_owned(), model_satellite(entry));
+                let mirror = model_satellite(desk.mirrors.get(helper));
+                model.mirror.insert(name.to_owned(), mirror);
+            }
+            let calls = driver.queue.iter().map(|mirror| {
+                let helper = swap(HELPERS, &mirror.helper);
+                (
+                    op(&mirror.change),
+                    helper,
+                    swap(SATELLITES, &mirror.satellite),
+                )
+            });
+            model.calls = calls.collect();
+            Ok(model)
+        }
+    }
+
+    /// Replays `mirrors.qnt` against `TimerDesk`, as HA and as the mirror task.
+    struct MirrorDriver {
+        /// The desk and HA.
+        timers: TimerDriver,
+        /// The queue of the mirror task.
+        queue: Vec<Mirror>,
+        /// The Assist timers, as pairs of a model helper and a model satellite.
+        assist: BTreeSet<(String, String)>,
+        /// The restarts of HA, which give the new `last_updated` of a running helper.
+        restarts: i64,
+    }
+
+    impl MirrorDriver {
+        /// A driver with no timers, no mirrors and both helpers `idle`.
+        fn new() -> Self {
+            Self {
+                timers: TimerDriver::new(),
+                queue: Vec::new(),
+                assist: BTreeSet::new(),
+                restarts: 0,
+            }
+        }
+
+        /// A generic timer from the model satellite `model` on the first free helper, which then
+        /// becomes `active`.
+        fn start(&mut self, model: &str) -> anyhow::Result<()> {
+            let helper = self.timers.planned("")?;
+            let helper = helper.ok_or_else(|| anyhow::anyhow!("no free helper"))?;
+            self.timers.set(model, "")?;
+            self.timers.change(&swap(HELPERS, &helper), "active", None);
+            Ok(())
+        }
+
+        /// HA restarts: the Assist timers go, and each running helper gets a new `last_updated`.
+        fn ha_restart(&mut self) {
+            self.assist.clear();
+            self.restarts += 1;
+            let restarted = Timestamp::from_second(self.restarts).expect("a timestamp");
+            let running = self.timers.ha.iter().filter(|(_, state)| *state != "idle");
+            let updated = running.map(|(helper, _)| (helper.clone(), restarted));
+            self.timers.updated.extend(updated);
+            self.timers.reconnect();
+        }
+
+        /// The model satellite `model` restarts: its Assist timers go, and its entity changes
+        /// from `unavailable` to `idle`.
+        fn sat_restart(&mut self, model: &str) {
+            self.assist.retain(|(_, satellite)| satellite != model);
+            let back = satellite(&swap(SATELLITES, model), "unavailable", "idle");
+            self.timers.feed(vec![back]);
+        }
+
+        /// Takes the first call of the queue, and applies it to the Assist timers when it is
+        /// `made`.
+        fn call(&mut self, made: bool) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.queue.is_empty(), "no queued call");
+            let mirror = self.queue.remove(0);
+            let pair = (
+                swap(HELPERS, &mirror.helper),
+                swap(SATELLITES, &mirror.satellite),
+            );
+            match mirror.change {
+                MirrorChange::Start(_) if made => self.assist.insert(pair),
+                MirrorChange::Cancel if made => self.assist.remove(&pair),
+                _ => false,
+            };
+            Ok(())
+        }
+
+        /// Moves the mirror commands of the desk into the queue, as the mirror task does: a
+        /// `Cancel` removes the queued commands of its helper and satellite, and goes ahead of
+        /// each command that is not a `Cancel`.
+        fn enqueue(&mut self) {
+            for mirror in mem::take(&mut self.timers.mirrors) {
+                let mut at = self.queue.len();
+                if mirror.change == MirrorChange::Cancel {
+                    let pair = (&mirror.helper, &mirror.satellite);
+                    self.queue
+                        .retain(|queued| (&queued.helper, &queued.satellite) != pair);
+                    let cancels = self.queue.iter();
+                    at = cancels
+                        .take_while(|queued| queued.change == MirrorChange::Cancel)
+                        .count();
+                }
+                self.queue.insert(at, mirror);
+            }
+        }
+
+        /// Plays the step `step` of the model.
+        fn act(&mut self, step: &Step) -> anyhow::Result<()> {
+            switch!(step {
+                init => *self = Self::new(),
+                start(s: String) => self.start(&s)?,
+                outside(h: String) => self.timers.change(&h, "active", None),
+                pause(h: String) => self.timers.change(&h, "paused", None),
+                resume(h: String) => self.timers.change(&h, "active", None),
+                end(h: String) => self.timers.end(&h, Some(TimerEnd::Finished)),
+                quietEnd(h: String) => self.timers.ha.insert(swap(HELPERS, &h), "idle".to_owned()),
+                reconnect => self.timers.reconnect(),
+                restart => {
+                    self.queue.clear();
+                    self.timers.restart();
+                },
+                haRestart => self.ha_restart(),
+                satRestart(s: String) => self.sat_restart(&s),
+                // The argument is `made`.
+                call => self.call(true)?,
+                callFails => self.call(false)?,
+                slow => {},
+                mirrorRing(h: String, s: String) => self.assist.remove(&(h, s)),
+            })
+        }
+    }
+
+    impl Driver for MirrorDriver {
+        type State = MirrorModel;
+
+        fn step(&mut self, step: &Step) -> anyhow::Result<()> {
+            self.act(step)?;
+            self.enqueue();
+            Ok(())
+        }
+    }
+
+    /// AC-19.18-1. `quint_run` replays 100 traces by default.
+    #[quint_run(spec = "quint/mirrors.qnt", max_steps = 30, seed = "1")]
+    fn ac_19_18_1_conformance() -> impl Driver {
+        MirrorDriver::new()
     }
 }
