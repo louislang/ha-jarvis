@@ -59,6 +59,9 @@ const EVENT_TYPES: [&str; 6] = [
     "timer.finished",
 ];
 
+/// The deadline of a whole `assist` call, so that a slow HA cannot hold the mirror task for long.
+const ASSIST_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// `Home` over the HA WebSocket API.
 pub struct HaHome<S> {
     /// The send half of the socket and the next request ID.
@@ -97,6 +100,19 @@ struct Waiter {
     sender: ResultSender,
     /// True for `get_states`, whose result also gives `Loaded`.
     states: bool,
+    /// True for `assist_pipeline/run`, which waits after its result for its end event.
+    run: bool,
+}
+
+impl Waiter {
+    /// The waiter of a request of type `kind`.
+    fn new(sender: ResultSender, kind: &Value) -> Self {
+        Self {
+            sender,
+            states: kind == "get_states",
+            run: kind == "assist_pipeline/run",
+        }
+    }
 }
 
 /// Removes a request ID from `pending` when the request ends, also by timeout.
@@ -308,6 +324,37 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         self.speak(satellite, "start_conversation", data).await
     }
 
+    /// Runs `text` through `conversation.home_assistant` for the device of the satellite entity
+    /// `satellite`, with the intent stage only, within [`ASSIST_TIMEOUT`].
+    ///
+    /// # Errors
+    ///
+    /// A connection, HA or timeout error, or the speech of a response that is not `action_done`.
+    pub async fn assist(&self, satellite: &str, text: &str) -> anyhow::Result<()> {
+        time::timeout(ASSIST_TIMEOUT, self.run_intent(satellite, text))
+            .await
+            .unwrap_or_else(|_| Err(timeout(ASSIST_TIMEOUT)))
+    }
+
+    /// Runs `text` with the first pipeline of `conversation.home_assistant` on the device of
+    /// `satellite`. Fails when the response is not `action_done`.
+    async fn run_intent(&self, satellite: &str, text: &str) -> anyhow::Result<()> {
+        let (entry, pipelines) = futures::try_join!(
+            self.request(json!({ "type": "config/entity_registry/get", "entity_id": satellite })),
+            self.request(json!({ "type": "assist_pipeline/pipeline/list" })),
+        )?;
+        let device = entry["device_id"].as_str().context("HA error: no device")?;
+        let mut listed = pipelines["pipelines"].as_array().into_iter().flatten();
+        let pipeline = listed
+            .find(|pipeline| pipeline["conversation_engine"] == "conversation.home_assistant")
+            .context("HA error: no pipeline with conversation.home_assistant")?;
+        let command = json!({
+            "type": "assist_pipeline/run", "start_stage": "intent", "end_stage": "intent",
+            "input": { "text": text }, "pipeline": pipeline["id"], "device_id": device,
+        });
+        done(&self.request(command).await?)
+    }
+
     /// Calls the `assist_satellite` service `service` on `satellite` with `data`.
     async fn speak(&self, satellite: &str, service: &str, data: Value) -> anyhow::Result<()> {
         let command = json!({
@@ -371,8 +418,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
                 id: *next_id,
             };
             *next_id += 1;
-            let states = command["type"] == "get_states";
-            self.pending().insert(pending.id, Waiter { sender, states });
+            let waiter = Waiter::new(sender, &command["type"]);
+            self.pending().insert(pending.id, waiter);
             command["id"] = Value::from(pending.id);
             let text = Message::text(command.to_string());
             sink.send(text).await.context("connection error")?;
@@ -384,8 +431,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
             .map_err(|_| timeout(deadline))?
     }
 
-    /// Sends a result or a `pong` to its pending request and an event to `events`. Gives `Loaded`
-    /// before the result of `get_states`. Ignores other messages and IDs.
+    /// Sends a result or a `pong` to its pending request and an event to [`HaHome::event`]. Gives
+    /// `Loaded` before the result of `get_states`. Ignores other messages and IDs.
     fn deliver(&self, text: &str, events: &Events) {
         let (id, result) = match serde_json::from_str(text) {
             Ok(Incoming::Result {
@@ -398,13 +445,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
                 (id, Err(anyhow::anyhow!("HA error: {error}")))
             }
             Ok(Incoming::Pong { id }) => (id, Ok(Value::Null)),
-            Ok(Incoming::Event { event }) => {
-                events.unbounded_send(event.into()).ok();
+            Ok(Incoming::Event { id, event }) => {
+                self.event(id, event, events);
                 return;
             }
             Err(_) => return,
         };
-        let Some(waiter) = self.pending().remove(&id) else {
+        let Some(waiter) = self.take(id, result.is_ok()) else {
             return;
         };
         if let (true, Ok(states)) = (waiter.states, &result) {
@@ -413,6 +460,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> HaHome<S> {
         }
         // The request can time out between the removal and the send.
         waiter.sender.send(result).ok();
+    }
+
+    /// Removes the waiter of `id`, except a run with a successful result.
+    fn take(&self, id: u64, success: bool) -> Option<Waiter> {
+        let mut pending = self.pending();
+        if success && pending.get(&id)?.run {
+            return None;
+        }
+        pending.remove(&id)
+    }
+
+    /// Gives the `intent-end` or `error` event of a run to its waiter, and an event of
+    /// [`EVENT_TYPES`] to `events`. Ignores the other events.
+    fn event(&self, id: u64, mut event: Value, events: &Events) {
+        let result = match event["type"].as_str() {
+            Some("intent-end") => Ok(event["data"].take()),
+            Some("error") => Err(anyhow::anyhow!("HA error: {}", event["data"]["message"])),
+            _ => {
+                if let Ok(event) = HaEvent::deserialize(event) {
+                    events.unbounded_send(event.into()).ok();
+                }
+                return;
+            }
+        };
+        if let Some(waiter) = self.pending().remove(&id) {
+            waiter.sender.send(result).ok();
+        }
     }
 
     /// The pending map.
@@ -444,6 +518,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Home for HaHome<S> {
     async fn ask(&self, satellite: &str, question: &str) -> anyhow::Result<()> {
         HaHome::ask(self, satellite, question).await
     }
+
+    async fn assist(&self, satellite: &str, text: &str) -> anyhow::Result<()> {
+        HaHome::assist(self, satellite, text).await
+    }
 }
 
 /// The wait before connection attempt `attempt + 1`: 100 ms, doubled each attempt, at most 2 s.
@@ -454,6 +532,17 @@ fn delay(attempt: u32) -> Duration {
 /// The error of a request without a result within `deadline`.
 fn timeout(deadline: Duration) -> anyhow::Error {
     anyhow::anyhow!("timeout error: no result within {deadline:?}")
+}
+
+/// `Ok` when the `intent-end` data `end` has `action_done`, else an error with its speech.
+fn done(end: &Value) -> anyhow::Result<()> {
+    let response = &end["intent_output"]["response"];
+    let speech = &response["speech"]["plain"]["speech"];
+    anyhow::ensure!(
+        response["response_type"] == "action_done",
+        "HA error: {speech}"
+    );
+    Ok(())
 }
 
 /// The error of a request while HA is disconnected.
@@ -518,10 +607,12 @@ enum Incoming {
         /// The request ID of the `ping`.
         id: u64,
     },
-    /// An event of a subscription.
+    /// An event of a subscription or of a run.
     Event {
+        /// The ID of the subscription or the run.
+        id: u64,
         /// The event.
-        event: HaEvent,
+        event: Value,
     },
 }
 
@@ -795,6 +886,34 @@ mod tests {
                     return request;
                 }
                 self.reply(&request, house_result(house, &request)).await;
+            }
+        }
+
+        /// Answers `config/entity_registry/get` of the Office satellite with `device` and
+        /// `assist_pipeline/pipeline/list` with `pipelines`. Gives the next other request, or
+        /// `None` when the client closes first.
+        async fn until_run(&mut self, device: &Value, pipelines: &Value) -> Option<Value> {
+            loop {
+                let request = self.request().await?;
+                let result = match request["type"].as_str() {
+                    Some("config/entity_registry/get") if request["entity_id"] == OFFICE => {
+                        json!({ "entity_id": OFFICE, "device_id": device })
+                    }
+                    Some("assist_pipeline/pipeline/list") => {
+                        json!({ "pipelines": pipelines, "preferred_pipeline": "jarvis" })
+                    }
+                    _ => return Some(request),
+                };
+                self.reply(&request, result).await;
+            }
+        }
+
+        /// Sends the result of `run`, then each of `events` with its ID.
+        async fn run_events(&mut self, run: &Value, events: Vec<Value>) {
+            self.reply(run, Value::Null).await;
+            for event in events {
+                let message = json!({ "id": run["id"], "type": "event", "event": event });
+                self.send_json(&message).await;
             }
         }
 
@@ -1572,5 +1691,144 @@ mod tests {
         assert_eq!(request["service"], "start_conversation");
         assert_eq!(request["service_data"], data);
         Ok(())
+    }
+
+    /// The Office satellite entity.
+    const OFFICE: &str = "assist_satellite.carson_office";
+
+    /// The command text of the tests of `assist`.
+    const TEXT: &str = "cancel the jarvis 1 timer";
+
+    /// The pipelines "Jarvis" and, when `home_assistant` is true, "Home Assistant".
+    fn pipelines(home_assistant: bool) -> Value {
+        let jarvis = json!({
+            "id": "jarvis", "name": "Jarvis", "conversation_engine": "conversation.jarvis",
+        });
+        let home = json!({
+            "id": "01ha", "name": "Home Assistant",
+            "conversation_engine": "conversation.home_assistant",
+        });
+        if home_assistant {
+            json!([jarvis, home])
+        } else {
+            json!([jarvis])
+        }
+    }
+
+    /// An `intent-end` event with `response_type` and the speech `speech`.
+    fn intent_end(response_type: &str, speech: &str) -> Value {
+        let response =
+            json!({ "response_type": response_type, "speech": { "plain": { "speech": speech } } });
+        json!({ "type": "intent-end", "data": { "intent_output": { "response": response } } })
+    }
+
+    /// A `run-start` event.
+    fn run_start() -> Value {
+        json!({ "type": "run-start", "data": { "pipeline": "01ha" } })
+    }
+
+    /// Runs `assist` for the Office satellite against a server with `device` and `pipelines`
+    /// that sends `events` of the run. Gives the result and the run that the server received.
+    async fn assisted(
+        device: Value,
+        pipelines: Value,
+        events: Vec<Value>,
+    ) -> (anyhow::Result<()>, Option<Value>) {
+        let (sender, receiver) = oneshot::channel();
+        let home = ready(move |mut server| async move {
+            let run = server.until_run(&device, &pipelines).await;
+            if let Some(run) = &run {
+                server.run_events(run, events).await;
+            }
+            sender.send(run).ok();
+            server.wait_close().await;
+        })
+        .await;
+        let result = home.assist(OFFICE, TEXT).await;
+        drop(home);
+        (result, receiver.await.expect("the server ends"))
+    }
+
+    /// The text of the error of `result`.
+    fn error_text(result: anyhow::Result<()>) -> String {
+        format!("{:#}", result.expect_err("assist fails"))
+    }
+
+    /// AC-19.14-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_14_1_assist_runs_the_intent_stage_on_the_device() -> anyhow::Result<()> {
+        let events = vec![run_start(), intent_end("action_done", "Timer cancelled")];
+        let (result, run) = assisted(json!("office_device"), pipelines(true), events).await;
+        result?;
+        let run = run.expect("the server receives the run");
+        let expected = json!({
+            "id": run["id"], "type": "assist_pipeline/run", "start_stage": "intent",
+            "end_stage": "intent", "input": { "text": TEXT },
+            "pipeline": "01ha", "device_id": "office_device",
+        });
+        assert_eq!(run, expected);
+        Ok(())
+    }
+
+    /// AC-19.14-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_14_2_error_response_or_event_gives_its_text() {
+        let speech = "Sorry, I couldn't find that timer";
+        let end = vec![run_start(), intent_end("error", speech)];
+        let (result, _) = assisted(json!("office_device"), pipelines(true), end).await;
+        let text = error_text(result);
+        assert!(text.contains(speech), "{text}");
+        let error =
+            json!({ "type": "error", "data": { "code": "x", "message": "no such pipeline" } });
+        let (result, _) = assisted(json!("office_device"), pipelines(true), vec![error]).await;
+        let text = error_text(result);
+        assert!(text.contains("no such pipeline"), "{text}");
+    }
+
+    /// AC-19.14-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_14_3_no_pipeline_or_no_device_sends_no_run() {
+        let end = || vec![intent_end("action_done", "Done")];
+        let cases = [
+            (json!("office_device"), pipelines(false)),
+            (Value::Null, pipelines(true)),
+        ];
+        for (device, pipelines) in cases {
+            let (result, run) = assisted(device, pipelines, end()).await;
+            assert!(result.is_err(), "assist succeeded");
+            assert_eq!(run, None);
+        }
+    }
+
+    /// Answers the run with `run-start` only. After `ASSIST_TIMEOUT` and more, sends its
+    /// `intent-end`, then an `entity_registry_updated` event.
+    async fn end_late(mut server: FakeHaServer) {
+        let run = server
+            .until_run(&json!("office_device"), &pipelines(true))
+            .await
+            .expect("the adapter sends the run");
+        server.run_events(&run, vec![run_start()]).await;
+        time::sleep(ASSIST_TIMEOUT * 2).await;
+        let end = intent_end("action_done", "");
+        let late = json!({ "id": run["id"], "type": "event", "event": end });
+        server.send_json(&late).await;
+        let registry = json!({ "event_type": "entity_registry_updated" });
+        server.send_event(registry).await;
+        server.wait_close().await;
+    }
+
+    /// AC-19.14-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_14_4_no_intent_end_is_timeout_and_late_end_is_dropped() {
+        let (home, mut network) = start(0);
+        let server = network.accept().await;
+        assert_eq!(network.event().await, Event::Reconnected);
+        tokio::spawn(end_late(server));
+        let start = Instant::now();
+        let text = error_text(home.assist(OFFICE, TEXT).await);
+        assert!(text.contains("timeout"), "{text}");
+        assert_eq!(start.elapsed(), ASSIST_TIMEOUT);
+        assert_eq!(network.event().await, Event::RegistryUpdated);
+        assert!(home.pending().is_empty(), "the run is still pending");
     }
 }

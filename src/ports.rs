@@ -107,6 +107,10 @@ pub trait Home: Send + Sync {
 
     /// Speaks `question` on the satellite entity `satellite`, then listens without the wake word.
     async fn ask(&self, satellite: &str, question: &str) -> anyhow::Result<()>;
+
+    /// Runs `text` through the HA conversation agent for the device of the satellite entity
+    /// `satellite`, with no speech.
+    async fn assist(&self, satellite: &str, text: &str) -> anyhow::Result<()>;
 }
 
 /// The System One model.
