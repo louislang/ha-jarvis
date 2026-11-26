@@ -71,7 +71,7 @@ All ports are in `src/ports.rs`. A port gets a method only in the phase that use
 | `Assistant` | Driving | `info`, `listen` (gives a `Listening` session: `push`, `finish`), `handle`, `speak` | Implemented by `App` in `src/lib.rs`. Called by `adapters/wyoming.rs`. |
 | `Review` | Driving | `list`, `audio`, `mark`, `intents`, `proposals`, `resolve`, `people`, `assign` | Implemented by `app/review.rs`. Called by `adapters/web.rs`. |
 | `Control` | Driving | `status`, `settings`, `save`, `mutes`, `unmute` | Implemented in `src/lib.rs`. Called by `adapters/web.rs`. |
-| `Home` | Driven | `snapshot`, `events`, `call`, `announce`, `ask` | `adapters/ha.rs` |
+| `Home` | Driven | `snapshot`, `events`, `call`, `announce`, `ask`, `assist` | `adapters/ha.rs` |
 | `SpeechToText` | Driven | `stream` (first pass: gives `accept`, `partial`, `reset`), `transcribe` (second pass), `set_hotwords` | `adapters/sherpa.rs` |
 | `TextToSpeech` | Driven | `synth` | `adapters/supertonic.rs` |
 | `VoiceEmbedder` | Driven | `embed` | `adapters/sherpa.rs` |
@@ -182,6 +182,7 @@ Satellite ◀──audio─────┘◀── AudioChunk... ────�
 35. **TV playback through Plezy.** Movies and shows play in the Plezy app on the Apple TV of the Living Room, not on the Plex player of the Sony TV, because Plezy on the Apple TV plays more reliably. Each TV intent names the Apple TV as its `entity`. Jarvis first turns on the TV. Then it plays the link `plezy://play?server=<server>&id=<item>` with `media_player.play_media`, and after `PLEZY_WAIT` it presses Select on the remote of the Apple TV to accept the "Open in Plezy" popup of tvOS. The link has the Plex server ID and the item key from the title list, so one form plays a movie, a show and one episode (sub-phases 18.19 to 18.19c). System Two plays a title through the same work with the tool `play_on_tv` (sub-phase 18.19g).
 36. **Timers in HA timer helpers.** A voice timer runs in an HA timer helper, so HA keeps the time, and the HA UI shows and controls the timer. You create the helpers once, with "Restore" on, for example `timer.jarvis_1` to `timer.jarvis_5`. Jarvis uses each helper whose entity ID starts with `timer.jarvis_`. Jarvis needs no admin rights and creates no helper. Jarvis keeps a table: the helper, the satellite, the name and the spoken duration of each timer. It saves the table in `jarvis.db` after each change and loads it at the start. At each connection to HA, also the first, an entry whose helper is `idle` and whose start call does not run goes with no ring, because Jarvis cannot tell a missed end from a cancel. A new timer takes the free helper with the lowest entity ID: `idle` in HA and not in the table. HA fires `timer.finished` at the end of a timer and `timer.cancelled` at a cancel. A state change cannot tell them apart, so Jarvis subscribes to both events. At `timer.finished`, the satellite that set the timer announces its end every 15 s, 8 times, through its announce queue, until the user says a cancel phrase of `dialog.cancel` ("stop") on that satellite or cancels that timer by name (phase 19).
 37. **Stop and mute.** A cancel phrase of `dialog.cancel` ("stop", "never mind") on a satellite never goes to System One or System Two. Each request on a satellite already increases its generation, which drops its queued announces, stops its System Two and fetch jobs at their next step and closes its dialog (sub-phases 10.5b and 16.1b). The Satellite1 stops its own speech at the wake word. Thus a cancel phrase only adds the stop of the ring of the satellite and the reply "Okay.". A bare "stop" pauses the music of the room (`music_pause`) only when Jarvis did nothing on the satellite: no ring, no open dialog, no live job or queue item, and no speech in the last 10 s. "Mute" also turns on the `_mute_microphones` switch of the satellite through HA, so the satellite stops listening. You unmute with the button of the satellite, the switch in HA or the Jarvis tab. At the end of "mute for ten minutes", Jarvis unmutes only when the switch still has the `on` state of the mute, so a change by a person or by training wins. The end waits for the end of a local training run. Jarvis keeps the timed mutes in the table `mutes` of `jarvis.db`, so a restart keeps them (phase 20).
+38. **Timer progress on the LED ring.** The Satellite1 firmware draws a progress ring only for an HA Assist timer, and a Jarvis timer is an HA timer helper. Thus Jarvis keeps a mirror: an Assist timer on the satellite that set the timer, for the time left of its helper and `MIRROR_PAD` more. Jarvis sends each mirror command as text to the HA conversation agent `conversation.home_assistant` with `assist_pipeline/run`, the intent stage only and the device of the satellite. HA speaks nothing in this mode. The name of a mirror is fixed for each helper ("jarvis 1" for `timer.jarvis_1`), so each command targets one Assist timer. The mirror follows the helper in the view of `TimerDesk`: it starts at a new run, pauses and resumes with the helper, and Jarvis cancels it when the helper stops. The helper ends `MIRROR_PAD` before its mirror, and an end cancel goes ahead of the other queued commands, so the firmware does not ring in normal operation, and Jarvis rings as before. A slow HA can still let a mirror ring. A failed mirror command only logs. After a restart of Jarvis, HA or the satellite, a new mirror for the time left replaces the old one (sub-phases 19.13 to 19.18).
 
 ## 6. Latency Budget (System One)
 
@@ -320,6 +321,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `quint/speaker.qnt` | Model | Speaker identification and enrollment. | 15.5 |
 | `quint/timers.qnt` | Model | Timer table, timer helpers and rings. | 19.1 |
 | `quint/mute.qnt` | Model | Mute switches, voice mutes and their end. | 20.4 |
+| `quint/mirrors.qnt` | Model | Timer mirrors on the LED ring of the satellites. | 19.13 |
 | `quint/jarvis.qnt` | Model | The system model: the request lifecycle on two satellites. | 16.1 |
 | `quint/composed.qnt` | Model | The system model composed with the component models, and one wrapper module for each component model. | 16.3 |
 | `src/lib.rs` | Root | Module tree, `Config`, `SystemClock`, `LiveModels`, `App` (implements `Assistant` by delegation), `run`, the `dataset` command, `main`. | 0.1 |
@@ -341,7 +343,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/domain/feedback.rs` | Domain | Interactions and marks. | 12.3 |
 | `src/domain/learn.rs` | Domain | Clusters, proposal validation, approval rule, prefetch schedule and freshness. | 14.1 |
 | `src/domain/speaker.rs` | Domain | Discovery, presence, proximity and identification. | 15.1 |
-| `src/domain/timers.rs` | Domain | Timer durations, time left, the timer table, the plan of a timer request and its answer. | 19.2 |
+| `src/domain/timers.rs` | Domain | Timer durations, time left, the timer table, the plan of a timer request and its answer, and the mirror commands. | 19.2 |
 | `src/domain/mute.rs` | Domain | The plan of a mute request, its answer and the rule of its end. | 20.5 |
 | `src/app/background.rs` | Application | Hot cache sync, request habit store, backfill, learned intents, prefetch, hotword refresh, Plex title refresh. | 2.9 |
 | `src/app/conversation.rs` | Application | `handle` use case, dispatch, deferred jobs, dialog map. | 4.8 |
@@ -349,7 +351,7 @@ Jarvis uses these files. No other files are permitted without a change to this s
 | `src/app/review.rs` | Application | `Review` use case. | 12.7 |
 | `src/app/training.rs` | Application | Generated examples, training trigger, training run, accept and swap. | 13.6 |
 | `src/app/plugins.rs` | Application | Plugin registry: lookup by tool name, result cache and deadline. | 17.1 |
-| `src/app/timers.rs` | Application | `TimerDesk`: the timer table and its store, the timer events of HA, the rings and stop. | 19.9b |
+| `src/app/timers.rs` | Application | `TimerDesk`: the timer table and its store, the timer events of HA, the rings, stop and the mirrors. | 19.9b |
 | `src/app/mute.rs` | Application | `MuteDesk`: the mute requests, the timed mutes, their store and their end. | 20.7 |
 | `src/adapters/ha.rs` | Adapter | `Home` over the HA WebSocket API. | 2.2 |
 | `src/adapters/onnx.rs` | Adapter | `Classifier` and `ModelLoader` with ONNX Runtime. | 3.12 |
@@ -825,5 +827,6 @@ Each model has state variables, actions and named invariants. `02-rules.md` sect
 | `speaker.qnt` | Speaker identification and voice assignment | `domain/speaker.rs`, `app/review.rs` | `SpeakerIsCandidate`, `NoVoiceOnlyEnrollment`, `ProfilesBounded`, `PickWins` |
 | `timers.qnt` | Timer table, timer helpers and rings | `domain/timers.rs`, `app/timers.rs` | `UniqueNames`, `StartOnFreeHelper`, `RingsBounded`, `NoRingAfterStop` |
 | `mute.qnt` | Mute switches, voice mutes and their end | `domain/mute.rs`, `app/mute.rs` | `NoUnmuteAfterPress`, `NoEarlyUnmute`, `NoUnmuteInTraining` |
+| `mirrors.qnt` | Timer mirrors | `app/timers.rs` | `NoMirrorRing`, `MirrorsShown` |
 | `jarvis.qnt` | System | All use cases | `OneHandledPerRequest`, `ReplyBeforeCall`, `FillerBeforeAnswer`, `ModelSwapAtomic`, `NoTalkOver` |
 | `composed.qnt` | System with the components | All use cases | `SystemInvariants`, `ComponentInvariants` |
