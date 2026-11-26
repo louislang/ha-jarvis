@@ -1,6 +1,7 @@
 //! The timer use case: the timer table, its store, the timer helpers of HA and the rings.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::mem;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -19,6 +20,8 @@ use crate::domain::state::TimerEnd;
 use crate::domain::state_cache::StateCache;
 use crate::domain::timers;
 use crate::domain::timers::Candidate;
+use crate::domain::timers::Mirror;
+use crate::domain::timers::MirrorChange;
 use crate::domain::timers::Plan;
 use crate::domain::timers::Timer;
 use crate::domain::timers::TimerAction;
@@ -57,6 +60,8 @@ struct Desk {
     view: StateCache,
     /// The run count of each helper: the new runs that the view showed.
     runs: BTreeMap<String, u64>,
+    /// The satellite of the mirror of each helper.
+    mirrors: BTreeMap<String, String>,
     /// The ring of the last finished timer of each helper.
     rings: BTreeMap<String, Ring>,
     /// The number of the last ring.
@@ -64,29 +69,40 @@ struct Desk {
 }
 
 impl Desk {
-    /// The table after `input`, which also changes the view, and the helper and the ring that a
-    /// finish starts.
-    fn after(&mut self, input: TimerInput) -> (Timers, Option<(String, Ring)>) {
+    /// The table after `input`, which also changes the view, the helper and the ring that a
+    /// finish starts, and the mirror commands of the input.
+    fn after(&mut self, input: TimerInput) -> (Timers, Option<(String, Ring)>, Vec<Mirror>) {
         match input {
             TimerInput::Event(Event::TimerEnded { entity_id, end }) => {
                 let (entry, table) = timers::ended(self.timers.clone(), &entity_id);
                 let finished = entry.filter(|_| end == TimerEnd::Finished);
                 let ring = finished.and_then(|timer| self.ring(entity_id, timer));
-                (table, ring)
+                (table, ring, Vec::new())
             }
-            TimerInput::Event(event) => (self.changed(event), None),
+            TimerInput::Event(event) => {
+                let (table, mirror) = self.changed(event);
+                (table, None, mirror.into_iter().collect())
+            }
             TimerInput::Snapshot(states) => {
-                self.count(&states);
-                let states = states
-                    .into_iter()
-                    .map(|state| (Arc::from(state.entity_id.as_str()), Arc::new(state)));
-                self.view = StateCache {
-                    states: states.collect(),
-                    ..StateCache::default()
-                };
-                (timers::reconcile(&self.timers, &self.view), None)
+                let (table, mirrors) = self.snapshot(states);
+                (table, None, mirrors)
             }
         }
+    }
+
+    /// The table after the snapshot `states`, which replaces the view, and its mirror commands.
+    fn snapshot(&mut self, states: Vec<State>) -> (Timers, Vec<Mirror>) {
+        let renewed = self.count(&states);
+        let states = states
+            .into_iter()
+            .map(|state| (Arc::from(state.entity_id.as_str()), Arc::new(state)));
+        self.view = StateCache {
+            states: states.collect(),
+            ..StateCache::default()
+        };
+        let table = timers::reconcile(&self.timers, &self.view);
+        let mirrors = self.shown(&renewed, &table);
+        (table, mirrors)
     }
 
     /// The new ring of `timer` on `helper`, which replaces the ring of the helper, when the timer
@@ -116,43 +132,119 @@ impl Desk {
     }
 
     /// The table after the state change `event` of a helper, which also changes the view and
-    /// counts a new run of the helper.
-    fn changed(&mut self, event: Event) -> Timers {
+    /// counts a new run of the helper, and its mirror command.
+    fn changed(&mut self, event: Event) -> (Timers, Option<Mirror>) {
         let Event::StateChanged { entity_id, .. } = &event else {
-            return self.timers.clone();
+            return (self.timers.clone(), None);
         };
         let helper = entity_id.clone();
         let old = self.view.state(&helper).cloned();
         self.view = mem::take(&mut self.view).apply(event);
         let table = self.timers.clone();
-        let Some(state) = self.view.state(&helper) else {
-            return table;
+        let Some(state) = self.view.state(&helper).cloned() else {
+            return (table, self.cancel(&helper, None));
         };
-        if is_new_run(old.as_ref(), state) {
-            *self.runs.entry(helper).or_default() += 1;
+        let mirror = if is_new_run(old.as_ref(), &state) {
+            *self.runs.entry(helper.clone()).or_default() += 1;
+            self.start(&helper, &table, &state)
+        } else {
+            self.moved(&helper, old.as_ref(), &state)
+        };
+        (timers::running(table, &state), mirror)
+    }
+
+    /// The mirror command of `helper`, a helper of `mirrors`, for its change from `old` to `new`
+    /// in the same run: `Pause`, `Start` for a resume, or `Cancel` when it no longer runs.
+    fn moved(&mut self, helper: &str, old: Option<&State>, new: &State) -> Option<Mirror> {
+        let satellite = self.mirrors.get(helper)?.clone();
+        let change = match (old.map(|old| old.state.as_str()), new.state.as_str()) {
+            (Some("active"), "paused") => MirrorChange::Pause,
+            (Some("paused"), "active") => MirrorChange::Start(new.clone()),
+            (_, "active" | "paused") => return None,
+            _ => return self.cancel(helper, None),
+        };
+        Some(Mirror {
+            helper: helper.to_owned(),
+            satellite,
+            change,
+        })
+    }
+
+    /// The `Start` of the mirror of `helper` in `state` on the satellite of its entry in `table`,
+    /// which the helper keeps in `mirrors`. None for an entry without a satellite.
+    fn start(&mut self, helper: &str, table: &Timers, state: &State) -> Option<Mirror> {
+        let satellite = table.timers.get(helper)?.satellite.clone()?;
+        self.mirrors.insert(helper.to_owned(), satellite.clone());
+        Some(Mirror {
+            helper: helper.to_owned(),
+            satellite,
+            change: MirrorChange::Start(state.clone()),
+        })
+    }
+
+    /// The `Cancel` of the mirror of `helper` on its satellite in `mirrors`, else on `satellite`.
+    /// The helper leaves `mirrors`.
+    fn cancel(&mut self, helper: &str, satellite: Option<String>) -> Option<Mirror> {
+        let satellite = self.mirrors.remove(helper).or(satellite)?;
+        Some(Mirror {
+            helper: helper.to_owned(),
+            satellite,
+            change: MirrorChange::Cancel,
+        })
+    }
+
+    /// The mirror commands of a snapshot in the view, before `table` replaces the table, at most
+    /// one for each helper, in entity ID order: `Start` for each new run of `renewed`, and
+    /// `Cancel` for each helper that does not run.
+    fn shown(&mut self, renewed: &BTreeSet<String>, table: &Timers) -> Vec<Mirror> {
+        let shown = self.view.states.keys().map(ToString::to_string);
+        let mut helpers: BTreeSet<String> = shown.collect();
+        helpers.extend(self.mirrors.keys().cloned());
+        helpers.extend(self.timers.timers.keys().cloned());
+        let mut mirrors = Vec::new();
+        for helper in helpers {
+            let state = self.view.state(&helper).filter(|state| is_running(state));
+            let mirror = match state.cloned() {
+                Some(state) if renewed.contains(&helper) => self.start(&helper, table, &state),
+                Some(_) => None,
+                None => {
+                    let removed = self.timers.timers.get(&helper);
+                    let removed = removed.filter(|_| !table.timers.contains_key(&helper));
+                    let satellite = removed.and_then(|entry| entry.satellite.clone());
+                    self.cancel(&helper, satellite)
+                }
+            };
+            mirrors.extend(mirror);
         }
-        timers::running(table, state)
+        mirrors
     }
 
     /// Counts a new run of each helper of the snapshot `states` that starts a new run, or whose
-    /// `last_updated` differs from the view.
-    fn count(&mut self, states: &[State]) {
+    /// `last_updated` differs from the view. The helpers with a new run.
+    fn count(&mut self, states: &[State]) -> BTreeSet<String> {
+        let mut renewed = BTreeSet::new();
         for state in states {
             let old = self.view.state(&state.entity_id);
             // A snapshot cannot show continuity, so each change of the helper is a new run.
             let moved = old.is_none_or(|old| old.last_updated != state.last_updated);
             if moved || is_new_run(old, state) {
                 *self.runs.entry(state.entity_id.clone()).or_default() += 1;
+                renewed.insert(state.entity_id.clone());
             }
         }
+        renewed
     }
 }
 
 /// True when `new` starts a new run of a helper whose state was `old`: `old` is not `active` or
 /// `paused`, and `new` is.
 fn is_new_run(old: Option<&State>, new: &State) -> bool {
-    let running = |state: &State| matches!(state.state.as_str(), "active" | "paused");
-    running(new) && !old.is_some_and(running)
+    is_running(new) && !old.is_some_and(is_running)
+}
+
+/// True when `state` is `active` or `paused`.
+fn is_running(state: &State) -> bool {
+    matches!(state.state.as_str(), "active" | "paused")
 }
 
 /// Plans the timer requests on the timer table, keeps the table in its store and follows the
@@ -179,6 +271,7 @@ impl TimerDesk {
                 timers: timers::restored(&loaded),
                 view: StateCache::default(),
                 runs: BTreeMap::new(),
+                mirrors: BTreeMap::new(),
                 rings: BTreeMap::new(),
                 rung: 0,
             }),
@@ -258,16 +351,20 @@ impl TimerDesk {
     }
 
     /// Applies each input of `events` to the view and the table, until the sender drops. Gives
-    /// each new ring and its helper to `ring`.
+    /// each new ring and its helper to `ring`, and each mirror command to `mirror` under the lock.
     pub async fn run(
         &self,
         mut events: UnboundedReceiver<TimerInput>,
         mut ring: impl FnMut(String, Ring),
+        mut mirror: impl FnMut(Mirror),
     ) {
         while let Some(input) = events.recv().await {
             let mut desk = self.desk.lock().await;
-            let (table, started) = desk.after(input);
+            let (table, started, mirrors) = desk.after(input);
             self.keep(&mut desk, table).await;
+            for command in mirrors {
+                mirror(command);
+            }
             if let Some((helper, started)) = started {
                 ring(helper, started);
             }
@@ -530,14 +627,18 @@ mod tests {
                 .0
         }
 
-        /// Runs the desk on `inputs`.
-        async fn feed(&self, inputs: Vec<TimerInput>) {
+        /// Runs the desk on `inputs`. The mirror commands of the desk.
+        async fn feed(&self, inputs: Vec<TimerInput>) -> Vec<Mirror> {
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
             for input in inputs {
                 sender.send(input).expect("the receiver is open");
             }
             drop(sender);
-            self.desk.run(receiver, |_, _| ()).await;
+            let mut mirrors = Vec::new();
+            self.desk
+                .run(receiver, |_, _| (), |mirror| mirrors.push(mirror))
+                .await;
+            mirrors
         }
 
         /// The saved entry of `helper`.
@@ -775,6 +876,83 @@ mod tests {
         let guard = fixture.waiting(cancel).await;
         fixture.feed(vec![snapshot(&[(J1, "active")])]).await;
         assert!(calls(guard).await, "no cancel after the same snapshot");
+    }
+
+    /// The mirror command `change` of `helper` on `satellite`.
+    fn mirror(helper: &str, satellite: &str, change: MirrorChange) -> Mirror {
+        Mirror {
+            helper: helper.to_owned(),
+            satellite: satellite.to_owned(),
+            change,
+        }
+    }
+
+    /// The mirror start of `timer.jarvis_1` on the Kitchen satellite in `state`.
+    fn started(state: State) -> Vec<Mirror> {
+        vec![mirror(J1, KITCHEN, MirrorChange::Start(state))]
+    }
+
+    /// AC-19.15-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_15_1_mirror_follows_the_helper() {
+        let fixture = Fixture::free().await;
+        fixture.set("chicken").await;
+        let active = timer_state(J1, "active");
+        let start = fixture.feed(vec![changed(J1, "active")]).await;
+        assert_eq!(start, started(active.clone()));
+        let pause = fixture.feed(vec![changed(J1, "paused")]).await;
+        assert_eq!(pause, [mirror(J1, KITCHEN, MirrorChange::Pause)]);
+        let resume = fixture.feed(vec![changed(J1, "active")]).await;
+        assert_eq!(resume, started(active));
+        let end = vec![changed(J1, "idle"), ended(TimerEnd::Finished)];
+        let cancel = fixture.feed(end).await;
+        assert_eq!(cancel, [mirror(J1, KITCHEN, MirrorChange::Cancel)]);
+    }
+
+    /// AC-19.15-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_15_2_no_satellite_no_mirror() {
+        let anonymous = Timer {
+            satellite: None,
+            ..entry("chicken", 0, true)
+        };
+        let fixture = Fixture::new(&[(J1, anonymous)]).await;
+        fixture.feed(vec![snapshot(&[(J1, "idle")])]).await;
+        let start = fixture.feed(vec![changed(J1, "active")]).await;
+        assert_eq!(start, [], "a mirror of a timer without a satellite");
+        let fixture = Fixture::free().await;
+        let start = fixture.feed(vec![changed(J1, "active")]).await;
+        assert_eq!(start, [], "a mirror of a helper from HA");
+    }
+
+    /// AC-19.15-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_15_3_snapshot_restarts_or_cancels_the_mirror() {
+        let fixture = Fixture::running().await;
+        let same = fixture.feed(vec![snapshot(&[(J1, "active")])]).await;
+        assert_eq!(same, [], "a mirror of the same run");
+        let mut restarted = timer_state(J1, "active");
+        restarted.last_updated = "2026-11-22T12:03:00Z".parse().expect("a timestamp");
+        let input = TimerInput::Snapshot(vec![restarted.clone()]);
+        assert_eq!(fixture.feed(vec![input]).await, started(restarted));
+        let idle = fixture.feed(vec![snapshot(&[(J1, "idle")])]).await;
+        assert_eq!(idle, [mirror(J1, KITCHEN, MirrorChange::Cancel)]);
+    }
+
+    /// AC-19.15-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_15_4_restart_starts_and_cancels_mirrors() {
+        let office = "assist_satellite.office";
+        let pasta = Timer {
+            satellite: Some(office.to_owned()),
+            ..entry("pasta", 1, false)
+        };
+        let fixture = Fixture::new(&[(J1, entry("chicken", 0, false)), (J2, pasta)]).await;
+        let states = [(J1, "active"), (J2, "idle")];
+        let mirrors = fixture.feed(vec![snapshot(&states)]).await;
+        let mut wanted = started(timer_state(J1, "active"));
+        wanted.push(mirror(J2, office, MirrorChange::Cancel));
+        assert_eq!(mirrors, wanted);
     }
 
     /// The model helpers and the timer helpers.
