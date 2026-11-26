@@ -374,6 +374,7 @@ impl Home for FakeHome {
             text: text.to_owned(),
             at: Instant::now(),
         });
+        self.wait().await?;
         anyhow::ensure!(!self.assist_fails.load(Ordering::SeqCst), "no timer");
         Ok(())
     }
