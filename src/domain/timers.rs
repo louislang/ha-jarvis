@@ -211,6 +211,76 @@ fn clock(text: &str) -> Option<u32> {
     Some(total)
 }
 
+/// The seconds that a mirror runs after the end of its helper.
+#[verus_verify]
+pub const MIRROR_PAD: u32 = 2;
+
+/// `seconds` as hours, minutes and seconds with digits, each part that is not 0, for example "1
+/// hour and 5 seconds".
+#[verus_verify]
+#[must_use]
+pub fn mirror_duration(seconds: u32) -> String {
+    if seconds >= 3600 {
+        joined(&spoken(seconds), seconds % 60, "second")
+    } else {
+        spoken(seconds)
+    }
+}
+
+/// The name of the mirror of `helper`: its object ID with each `_` as a space.
+#[verus_verify]
+#[must_use]
+pub fn mirror_name(helper: &str) -> String {
+    let object = match helper.split_once('.') {
+        Some((_, object)) => object,
+        None => helper,
+    };
+    let chars: Vec<char> = object.chars().collect();
+    let mut name = String::new();
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(decreases chars@.len() - index))]
+    while index < chars.len() {
+        let letter = chars[index];
+        name.push(if letter == '_' { ' ' } else { letter });
+        index += 1;
+    }
+    name
+}
+
+/// The Assist texts of `change` of the mirror of `helper` at `now`, in order. A `Start` cancels
+/// the mirror of an earlier run first.
+#[verus_spec(texts =>
+    ensures
+        match change {
+            MirrorChange::Start(_) => 1 <= texts@.len() <= 3,
+            _ => texts@.len() == 1,
+        },
+)]
+#[must_use]
+pub fn mirror_texts(change: &MirrorChange, helper: &str, now: Timestamp) -> Vec<String> {
+    let name = mirror_name(helper);
+    let (cancel, pause) = (
+        format!("cancel the {name} timer"),
+        format!("pause the {name} timer"),
+    );
+    match change {
+        MirrorChange::Start(state) => {
+            let mut texts = vec![cancel];
+            let seconds = left(state, now).unwrap_or(0);
+            if seconds > 0 {
+                let duration = mirror_duration(seconds.saturating_add(MIRROR_PAD));
+                texts.push(format!("set a timer for {duration} named {name}"));
+                if state.state.as_str() == "paused" {
+                    texts.push(pause);
+                }
+            }
+            texts
+        }
+        MirrorChange::Pause => vec![pause],
+        MirrorChange::Cancel => vec![cancel],
+    }
+}
+
 /// What a timer request does.
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -1632,6 +1702,44 @@ mod tests {
     /// `now` of the tests.
     fn now() -> Timestamp {
         "2026-11-22T12:00:00Z".parse().expect("a timestamp")
+    }
+
+    #[test]
+    fn ac_19_16_1_mirror_durations_and_names() {
+        let cases = [
+            (2, "2 seconds"),
+            (302, "5 minutes and 2 seconds"),
+            (3605, "1 hour and 5 seconds"),
+            (3661, "1 hour and 1 minute and 1 second"),
+            (86_402, "24 hours and 2 seconds"),
+        ];
+        for (seconds, text) in cases {
+            assert_eq!(mirror_duration(seconds), text, "{seconds}");
+        }
+        assert_eq!(mirror_name("timer.jarvis_1"), "jarvis 1");
+        assert_eq!(mirror_name("timer.jarvis_kitchen_2"), "jarvis kitchen 2");
+    }
+
+    #[test]
+    fn ac_19_16_2_mirror_texts() {
+        let texts = |change: MirrorChange| mirror_texts(&change, "timer.jarvis_1", now());
+        let (cancel, pause) = ("cancel the jarvis 1 timer", "pause the jarvis 1 timer");
+        let active = helper(
+            "active",
+            &json!({ "finishes_at": "2026-11-22T12:05:00+00:00" }),
+        );
+        let set = "set a timer for 5 minutes and 2 seconds named jarvis 1";
+        assert_eq!(texts(MirrorChange::Start(active)), [cancel, set]);
+        let paused = helper("paused", &json!({ "remaining": "0:04:12" }));
+        let set = "set a timer for 4 minutes and 14 seconds named jarvis 1";
+        assert_eq!(texts(MirrorChange::Start(paused)), [cancel, set, pause]);
+        let ended = helper(
+            "active",
+            &json!({ "finishes_at": "2026-11-22T11:59:00+00:00" }),
+        );
+        assert_eq!(texts(MirrorChange::Start(ended)), [cancel]);
+        assert_eq!(texts(MirrorChange::Pause), [pause]);
+        assert_eq!(texts(MirrorChange::Cancel), [cancel]);
     }
 
     #[test]

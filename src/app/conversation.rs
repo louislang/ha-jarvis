@@ -2,6 +2,7 @@
 //! writer task.
 
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::mem;
 use std::ops::ControlFlow;
 use std::sync::Arc;
@@ -84,6 +85,8 @@ use crate::domain::state::HomeConfig;
 use crate::domain::state::ServiceCall;
 use crate::domain::state_cache::StateCache;
 use crate::domain::timers;
+use crate::domain::timers::Mirror;
+use crate::domain::timers::MirrorChange;
 use crate::domain::timers::Timer;
 use crate::domain::timers::TimerInput;
 use crate::domain::training;
@@ -147,6 +150,61 @@ pub struct SystemTwo {
     pub prefetch_services: Vec<String>,
     /// The prefetched answers and the areas of the requests of the prefetch intents.
     pub answers: Arc<Answers>,
+}
+
+/// One `Home::assist` call of the mirror task.
+#[derive(Clone)]
+struct MirrorCall {
+    /// The satellite of the mirror.
+    satellite: String,
+    /// The helper of the mirror.
+    helper: String,
+    /// The text of the call.
+    text: String,
+    /// What the call is.
+    kind: CallKind,
+}
+
+/// What a mirror call is.
+#[derive(Clone, Copy, PartialEq)]
+enum CallKind {
+    /// The cancel of the mirror at the end of its helper.
+    End,
+    /// The cancel of a mirror of an earlier run before a start.
+    Replace,
+    /// Another call.
+    Other,
+}
+
+/// `queue` with the calls of the texts of `mirror` at `now`. A `Cancel` first removes each queued
+/// call of its helper and satellite, and then goes ahead of each queued call that is not a
+/// `Cancel`. The calls of another command go at the end.
+fn queued(queue: &mut VecDeque<MirrorCall>, mirror: &Mirror, now: Timestamp) {
+    let mut kind = match mirror.change {
+        MirrorChange::Start(_) => CallKind::Replace,
+        MirrorChange::Pause => CallKind::Other,
+        MirrorChange::Cancel => CallKind::End,
+    };
+    let mut at = queue.len();
+    if kind == CallKind::End {
+        queue.retain(|call| call.helper != mirror.helper || call.satellite != mirror.satellite);
+        at = queue
+            .iter()
+            .take_while(|call| call.kind == CallKind::End)
+            .count();
+    }
+    let texts = timers::mirror_texts(&mirror.change, &mirror.helper, now);
+    for text in texts {
+        let (satellite, helper) = (mirror.satellite.clone(), mirror.helper.clone());
+        let call = MirrorCall {
+            satellite,
+            helper,
+            text,
+            kind,
+        };
+        queue.insert(at, call);
+        (at, kind) = (at + 1, CallKind::Other);
+    }
 }
 
 /// The parts of the log of the requests, and the training trigger, which trains on its marks.
@@ -320,16 +378,58 @@ impl Conversation {
         Ok(handled)
     }
 
-    /// Runs the timer desk on `inputs` with a task for each new ring, which a drop aborts. Drops
-    /// each mirror command.
+    /// Runs the timer desk on `inputs` with a task for each new ring, which a drop aborts, and
+    /// with the mirror task, which sends the mirror commands to HA.
+    ///
+    /// # Panics
+    ///
+    /// Never: the mirror task keeps its receiver until the desk drops the sender.
     pub async fn run_timers(&self, inputs: UnboundedReceiver<TimerInput>) {
         let mut rings = JoinSet::new();
         let ring = |helper, ring| {
             while rings.try_join_next().is_some() {}
             rings.spawn(self.clone().ring(helper, ring));
         };
-        self.timers.run(inputs, ring, drop).await;
+        let (sender, mirrors) = tokio::sync::mpsc::unbounded_channel();
+        let mirror = move |mirror| sender.send(mirror).expect("the mirror task runs");
+        tokio::join!(self.timers.run(inputs, ring, mirror), self.mirror(mirrors));
         rings.detach_all();
+    }
+
+    /// Sends the queued calls of the mirror commands of `mirrors` through `Home::assist`, one at a
+    /// time, until the sender drops. Before each call, moves the commands of the channel into the
+    /// queue. Logs a failed call.
+    async fn mirror(&self, mut mirrors: UnboundedReceiver<Mirror>) {
+        let mut queue = VecDeque::new();
+        loop {
+            if queue.is_empty() {
+                let Some(mirror) = mirrors.recv().await else {
+                    return;
+                };
+                queued(&mut queue, &mirror, self.two.clock.now());
+            }
+            while let Ok(mirror) = mirrors.try_recv() {
+                queued(&mut queue, &mirror, self.two.clock.now());
+            }
+            let Some(MirrorCall {
+                satellite,
+                text,
+                kind,
+                ..
+            }) = queue.pop_front()
+            else {
+                continue;
+            };
+            let Err(error) = self.queues.home.assist(&satellite, &text).await else {
+                continue;
+            };
+            // A start first cancels a mirror of an earlier run, which usually does not exist.
+            if kind == CallKind::Replace {
+                tracing::debug!("no mirror to cancel on {satellite}: {error:#}");
+            } else {
+                tracing::warn!("the mirror call \"{text}\" on {satellite} failed: {error:#}");
+            }
+        }
     }
 
     /// Announces the end of the timer of `ring` of `helper` on its satellite through its queue,
@@ -6336,6 +6436,115 @@ mod tests {
         let texts = ["turn on the lights", "stop"];
         let (replies, _) = talk(&Arc::default(), Arc::default(), &texts, &["lights_on"]).await?;
         assert_eq!(replies[1].text, "Cancelled.");
+        Ok(())
+    }
+
+    /// The state change of `helper` to `value`.
+    fn changed(helper: &str, value: &str) -> TimerInput {
+        let new = fakes::timer_state(helper, value);
+        TimerInput::Event(Event::StateChanged {
+            entity_id: helper.to_owned(),
+            old: None,
+            context: new.context.clone(),
+            new: Some(Box::new(new)),
+        })
+    }
+
+    /// The texts of the `assist` calls of `home`.
+    fn assisted(home: &FakeHome) -> Vec<String> {
+        home.assists().into_iter().map(|call| call.text).collect()
+    }
+
+    /// A conversation on `home` at 12:00, five minutes before the end of `fakes::timer_state`,
+    /// whose classifier gives `predictions`, with both helpers `idle`. Also the store.
+    async fn noon(
+        home: &Arc<FakeHome>,
+        predictions: Vec<Prediction>,
+    ) -> anyhow::Result<(Conversation, Arc<FakeTimerStore>)> {
+        let (mut conversation, store) = timing(home, predictions, &[], "idle").await;
+        conversation.two.clock = Arc::new(FakeClock("2026-11-22T12:00:00Z".parse()?));
+        Ok((conversation, store))
+    }
+
+    /// Sets "chicken" from the satellite on `home`, starts its helper, ends it and waits for its
+    /// ring. The reply, the entry and the `assist` texts after the start.
+    async fn mirrored(
+        home: &Arc<FakeHome>,
+    ) -> anyhow::Result<(String, Option<Timer>, Vec<String>)> {
+        let (conversation, store) = noon(home, vec![set_timer("chicken")]).await?;
+        let (text, after) = timed(&conversation, "set a timer").await?;
+        after.await?;
+        feed(&conversation, vec![changed(J1, "active")]).await;
+        let (entry, started) = (saved(&store), assisted(home));
+        feed(&conversation, vec![changed(J1, "idle"), finished()]).await;
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        Ok((text, entry, started))
+    }
+
+    /// The cancel text of the mirror of `timer.jarvis_1`.
+    const CANCEL_J1: &str = "cancel the jarvis 1 timer";
+
+    /// The start text of the mirror of `timer.jarvis_1` for five minutes.
+    const SET_J1: &str = "set a timer for 5 minutes and 2 seconds named jarvis 1";
+
+    /// AC-19.16-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_16_3_timer_drives_its_mirror() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (_, _, started) = mirrored(&home).await?;
+        assert_eq!(started, [CANCEL_J1, SET_J1]);
+        assert_eq!(home.assists()[0].satellite, SATELLITE);
+        assert_eq!(home.calls()[0], start_call());
+        assert_eq!(assisted(&home)[2..], [CANCEL_J1]);
+        assert_eq!(announces(&home)[0], "Your chicken timer is done.");
+        Ok(())
+    }
+
+    /// AC-19.16-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_16_4_failed_mirror_changes_nothing() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let normal = mirrored(&home).await?;
+        let failing = Arc::new(FakeHome::default());
+        failing.fail_assists();
+        assert_eq!(mirrored(&failing).await?, normal);
+        assert_eq!(failing.calls(), home.calls());
+        assert_eq!(assisted(&failing), [CANCEL_J1, SET_J1, CANCEL_J1]);
+        Ok(())
+    }
+
+    /// Sends the start of "chicken", which `gate` holds at its first `assist` call, then the
+    /// start of "pizza" and the end of "chicken", and opens `gate`.
+    async fn hold_chicken(sender: UnboundedSender<TimerInput>, gate: oneshot::Sender<()>) {
+        let pause = Duration::from_millis(1);
+        let send = |input| sender.send(input).expect("the desk runs");
+        send(changed(J1, "active"));
+        tokio::time::sleep(pause).await;
+        send(changed("timer.jarvis_2", "active"));
+        send(changed(J1, "idle"));
+        tokio::time::sleep(pause).await;
+        gate.send(()).expect("the call waits");
+    }
+
+    /// AC-19.16-5.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_16_5_end_cancel_goes_first() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let sets = vec![set_timer("chicken"), set_timer("pizza")];
+        let (conversation, _) = noon(&home, sets).await?;
+        for _ in 0..2 {
+            timed(&conversation, "set a timer").await?.1.await?;
+        }
+        let gate = home.delay();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        tokio::join!(
+            conversation.run_timers(receiver),
+            hold_chicken(sender, gate)
+        );
+        let texts = assisted(&home);
+        assert_eq!(texts[..2], [CANCEL_J1; 2]);
+        let chicken = texts.iter().filter(|text| text.ends_with("named jarvis 1"));
+        assert_eq!(chicken.count(), 0, "{texts:?}");
         Ok(())
     }
 }
