@@ -1,6 +1,6 @@
 # Phase 13: Training
 
-This phase improves the System One model. Jarvis builds the training set, trains on the GPU host (RunPod when local training fails), mutes the satellites and pauses itself during a local run, and keeps a new model only when it is equal or better.
+This phase improves the System One model. Jarvis builds the training set, trains on the GPU host (RunPod when local training fails), mutes the satellites and pauses itself during a local run, and keeps a new model only when it is not clearly worse: each held-out accuracy is at most `train.margin` lower, or the new model has an intent that the old model does not have. A release that changes the intents starts a run by itself.
 
 ---
 
@@ -54,6 +54,7 @@ AC-13.1-5 moves to sub-phase 13.1b as AC-13.1b-1.
 - `training_set(catalog, generated, marked, areas, rng, settings) -> TrainingSet`: the examples of `seed_set` (sub-phase 3.3b), `generated` (labeled examples) and `mark_examples(marked)`. The text of each example is normalized, so the builder compares the texts.
 - Precedence: a mark is higher than a seed, and a seed is higher than a generated example. Of two marks, the newer mark is higher. Of two examples with the same source and time, the later one in the order generated, seeds, marks is higher.
 - The set keeps an example only when no example with the same text and a different label is higher.
+- Sub-phase 13.12 removes `rng`.
 
 **Acceptance criteria.**
 
@@ -76,19 +77,19 @@ AC-13.1-5 moves to sub-phase 13.1b as AC-13.1b-1.
 
 - `held_out` is in sub-phase 3.3.
 - `metrics(predictions, examples, threshold) -> Metrics { intent, slots }`. `intent`: an `Intent(k)` example is correct when the top label is `k` with a probability of `threshold` or more. An `Intent(unknown)` example is also correct when the top probability is less than `threshold`. A `Not(k)` example is correct when the top label is not `k`, or its probability is less than `threshold`. `slots`: the share of examples with spans whose decoded slots equal the spans.
-- `accept(new, old) -> bool = new.intent >= old.intent and new.slots >= old.slots`. Thus "never worse" means never worse on these two measures.
+- `accept(new, old) -> bool = new.intent >= old.intent and new.slots >= old.slots`. Thus "never worse" means never worse on these two measures. Sub-phase 13.13 adds the margin `train.margin`, and sub-phase 13.14 accepts a new model with a label that the old model does not have.
 
 **Acceptance criteria.**
 
 - AC-13.2-1: When the top label of an `Intent(k)` example is `k` with a probability less than `threshold`, `metrics` counts it as wrong.
 - AC-13.2-2: When the decoded slots of an example differ from its spans, `metrics` counts it as wrong in `slots`.
 - AC-13.2-3: When a `Not` example has a top label other than its label, `metrics` counts it as correct.
-- AC-13.2-4: When both new measures equal the old ones, `accept` returns true. When the new intent accuracy is higher but the new slot accuracy is lower, it returns false.
+- AC-13.2-4: When both new measures equal the old ones, `accept` returns true. When the new intent accuracy is higher but the new slot accuracy is lower, it returns false. AC-13.13-1 replaces this criterion.
 
 **Proofs.**
 
 - P-13.2-1, P-13.2-3. Ensures: an `Intent(k)` example is correct if and only if the top label is `k` with a probability of `threshold` or more (or, for `unknown`, the top probability is less than `threshold`). A `Not(k)` example is correct if and only if the top label is not `k` or its probability is less than `threshold`. Argument: each arm of `metrics` is the comparison in the model, with the threshold test.
-- P-13.2-4. Ensures: `accept(new, old)` is true if and only if `new.intent >= old.intent` and `new.slots >= old.slots`. Argument: `accept` is the conjunction of two `>=`.
+- P-13.2-4. Ensures: `accept(new, old)` is true if and only if `new.intent >= old.intent` and `new.slots >= old.slots`. Argument: `accept` is the conjunction of two `>=`. P-13.13-1 replaces this proof.
 - P-13.2-2 (AC-13.2-2). Ensures: an example with spans is correct in `slots` if and only if its decoded slots equal its spans. Argument: the slot measure compares the two sets for each example with spans and counts the equal ones.
 
 ---
@@ -100,7 +101,7 @@ AC-13.1-5 moves to sub-phase 13.1b as AC-13.1b-1.
 - **Implements:** G16. **Depends on:** 13.2.
 - **Files:** modify `src/domain/training.rs`, `src/lib.rs`, `jarvis.toml`.
 
-**Model.** `TrainingState { current: Option<run_id>, last_time }`. `changes(state, marked) = |action marks with a mark time after last_time|`. Request habits are not training data (`01-architecture.md` decision 9), so they do not count. `should_train(count, min_changes) = count >= min_changes`. This sub-phase adds `train.state` and `train.min_changes`.
+**Model.** `TrainingState { current: Option<run_id>, last_time }`. `changes(state, marked) = |action marks with a mark time after last_time|`. Request habits are not training data (`01-architecture.md` decision 9), so they do not count. `should_train(count, min_changes) = count >= min_changes`. This sub-phase adds `train.state` and `train.min_changes`. Sub-phase 13.15 adds the catalog hash to `TrainingState` and `stale` to `should_train`.
 
 **Acceptance criteria.**
 
@@ -136,6 +137,7 @@ AC-13.1-5 moves to sub-phase 13.1b as AC-13.1b-1.
   - `FailureKeepsModel`: when `lastAction` is a final failure, `modelAcc = prevAcc`.
   - `FallbackOnce`: one run has at most one RunPod attempt, and only after a local failure.
   - `PauseOnlyLocal`: `paused` if and only if `run = Local`.
+- Sub-phase 13.13 adds `MARGIN` to the swap guard and renames `SwapNeverWorse` to `SwapWithinMargin`. Sub-phase 13.14 adds `label` to the done actions and the invariant `NewLabelSwaps`, so AC-13.4-2 then checks seven invariants. Sub-phase 13.15 adds `stale` and `release`.
 
 **Acceptance criteria.**
 
@@ -319,7 +321,7 @@ AC-13.1-5 moves to sub-phase 13.1b as AC-13.1b-1.
 
 0. Keep `started := now`.
 1. `refresh` the generated examples.
-2. Build the training set with `training_set` from the catalog, the generated examples, the marked interactions with the first interaction of each marked dialog answer (`get`), the area names of the hot cache and an RNG with the seed `started` in seconds. The generated examples are the seeds of a copy of the catalog whose intents have the generated examples (`seed_set`). Upload only the examples that are not held out. When the held-out set is empty, stop with an error before training.
+2. Build the training set with `training_set` from the catalog, the generated examples, the marked interactions with the first interaction of each marked dialog answer (`get`), the area names of the hot cache and an RNG with the seed `started` in seconds. The generated examples are the seeds of a copy of the catalog whose intents have the generated examples (`seed_set`). Upload only the examples that are not held out. When the held-out set is empty, stop with an error before training. Sub-phase 13.12 removes the RNG: each context then comes from the text of the example.
 3. `train` of the local `Trainer` with the run ID `started` in the format `%Y%m%d-%H%M%S`. Sub-phase 13.10e mutes the satellites and pauses Jarvis for this call.
 
 - `FakeTrainer` records each call, waits while a test holds its gate, and gives the scripted results in order. A success creates `<dir>/<run_id>/`.
@@ -340,7 +342,7 @@ AC-13.9-5 to AC-13.9-8, AC-13.9-10 and AC-13.9-11 move to sub-phase 13.9b as AC-
 
 ### 13.9b Training Swap
 
-**Goal:** Add the second half of the training run: evaluate both models on the held-out set, and swap or reject. The model never gets worse.
+**Goal:** Add the second half of the training run: evaluate both models on the held-out set, and swap or reject. A clearly worse model never replaces the current one.
 
 - **Implements:** G3, G16, G19. **Depends on:** 13.9.
 - **Files:** modify `src/app/training.rs`, `src/domain/training.rs`, `src/testing/fakes.rs`.
@@ -356,6 +358,7 @@ AC-13.9-5 to AC-13.9-8, AC-13.9-10 and AC-13.9-11 move to sub-phase 13.9b as AC-
 - `Training::changes` gives the change count: `changes` (sub-phase 13.3) of the saved training state and the marked interactions.
 - The `Store` of `train.state` holds `TrainingState` as JSON. Without the file, the state has no `current`, and `last_time` is the Unix epoch.
 - `FakeModelLoader` gets a gate that blocks `load`.
+- Sub-phases 13.13 and 13.14 change `accept` of step 6, and sub-phase 13.15 adds the catalog hash to step 7. In AC-13.9b-2, a lower measure is then lower by more than its margin.
 
 **Acceptance criteria.**
 
@@ -369,7 +372,7 @@ AC-13.9-5 to AC-13.9-8, AC-13.9-10 and AC-13.9-11 move to sub-phase 13.9b as AC-
 
 **Proofs.**
 
-- P-13.9b-1, P-13.9b-2. Requires: `SwapNeverWorse`. Argument: step 6 swaps only when `accept(new, old)`, which is `new >= old`.
+- P-13.9b-1, P-13.9b-2. Requires: `SwapNeverWorse`. Argument: step 6 swaps only when `accept(new, old)`, which is `new >= old`. P-13.13-3 and P-13.14-3 replace this argument for the rules of sub-phases 13.13 and 13.14.
 - P-13.9b-3, P-13.9b-4. Requires: `CountResetsAfterRun`, `FailureKeepsModel`. Argument: step 7 runs after both branches of step 6. The error path returns before step 6.
 - P-13.9b-5. Argument: `handle` reads the classifier through the `Classifier` wrapper of sub-phase 5.4, which calls `ArcSwap::load` once. `load` never waits for a writer.
 - P-13.9b-6, P-13.9b-7. Evidence: test.
@@ -651,6 +654,150 @@ AC-13.10d-1 moves to sub-phase 13.10f as AC-13.10f-1.
 
 - P-13.11-1, P-13.11-2. Requires: `OneRun`. Argument: the handler uses the same compare-and-swap as P-13.9c-3. Success replies from `start_training`, failure from `training_busy`.
 - P-13.11-3. Argument: the voice run uses the same run function, so P-13.9b-2 applies.
+
+---
+
+### 13.12 Contexts from the Text
+
+**Goal:** Give each training example a context from a hash of its text, not from an RNG with the start time as its seed. A run on the same data then builds the same set, and the held-out contexts stay the same across runs and releases.
+
+- **Implements:** G16. **Depends on:** 13.11.
+- **Files:** modify `src/domain/training.rs`, `src/app/training.rs`, `src/lib.rs`.
+
+**Model.**
+
+- `sample_context(areas, text) -> String`: `context_text` of `areas[xxh3(text) mod |areas|]`, or of no area when `areas` is empty. `text` is the normalized text of the example, and `xxh3` is the hash of `held_out` (sub-phase 3.3). `text` replaces the parameter `rng` of sub-phase 3.3.
+- `seed_set` (sub-phase 3.3b) and `training_set` (sub-phase 13.1b) do not have `rng`. Step 2 of the training run (sub-phase 13.9) and the dataset command (sub-phase 3.4) use no RNG.
+- The context of an example changes only when its text or the area names of the hot cache change.
+- Three runs on the same data, with RNG seeds 1 s or 2 s apart, gave intent accuracies from 0.9150 to 0.9433 on the same 247 held-out examples. 35 of these examples changed between right and wrong. The new contexts of each run caused this noise.
+- The file of `jarvis dataset` changes, so `just fixture-model` trains the fixture model again one time.
+
+**Acceptance criteria.**
+
+- AC-13.12-1: When `sample_context` gets the same areas and the same text two times, it returns the same context. This replaces AC-3.3-3.
+- AC-13.12-2: When `sample_context` runs for 1,000 different texts with 4 areas, each area occurs between 200 and 300 times.
+- AC-13.12-3: When two runs start 2 s apart on the same data, `FakeTrainer` records two equal training sets.
+
+**Proofs.**
+
+- P-13.12-1 (AC-13.12-1). Ensures: the context is `sampled(areas, xxh3(text))`. Argument: `sample_context` reads only `areas` and `text`, and the contract of `xxh3_64` makes the hash a function of the bytes.
+- P-13.12-2. Evidence: test (statistical property of the hash on this input set).
+- P-13.12-3. Argument: no step of the set builder reads the clock or an RNG. The start time only names the run (sub-phase 13.9, step 3).
+
+---
+
+### 13.13 Accept Margin
+
+**Goal:** Accept a new model whose held-out accuracies are each at most `train.margin` lower than those of the old model. Run-to-run noise then does not keep a stale model.
+
+- **Implements:** G16, G19. **Depends on:** 13.12.
+- **Files:** modify `src/domain/training.rs`, `src/app/training.rs`, `src/lib.rs`, `jarvis.toml`, `quint/training.qnt`, `README.md` (the accept rule, `CLAUDE.md` workflow item 15).
+- **Quint:** `training.qnt` (conformance).
+
+**Model.**
+
+- `accept(new, old, margin) -> bool = new.intent >= old.intent - margin.intent and new.slots >= old.slots - margin.slots`. `margin` is a `Metrics`. This replaces `accept` of sub-phase 13.2.
+- This sub-phase adds `train.margin`, a table with `intent` and `slots`. Its default is `{ intent = 0.03, slots = 0.02 }` (`01-architecture.md` decision 13). It is not a field of the settings form (sub-phase 12.9d). Step 6 of the training run (sub-phase 13.9b) gives it to `accept`.
+- Jarvis keeps no best score across runs (decision 13).
+- In AC-13.9b-2 and AC-13.11-3, a lower measure is now lower by more than its margin.
+- `training.qnt`: `MARGIN = 1`, one level of `ACC`. A done action with the accuracy `a` swaps when `a + MARGIN >= modelAcc`. `SwapWithinMargin` replaces `SwapNeverWorse`: for every `(old, new)` in `swaps`, `new + MARGIN >= old`. `ac_13_4_3_rejected_run_resets_count` ends with `localDone(0)`, two levels below the model.
+- The driver of `training.qnt` sets `train.margin` to one accuracy level. For example, its levels have the intent accuracies 0, 0.5 and 1 and the same slot accuracy, and the margin is `{ intent = 0.5, slots = 0.0 }`.
+- `composed.qnt` keeps the guard `a >= modelAcc` of `swap(v, a)`. Its driver uses the margin of `jarvis.toml`, and its levels differ by 1 in a measure. Thus the code accepts each swap that the guard allows.
+
+**Acceptance criteria.**
+
+- AC-13.13-1: When the new measures are 0.9069 and 0.9472 and the old measures are 0.9352 and 0.9553 (the run `20261126-010715`), `accept` with the margin `{ intent = 0.03, slots = 0.02 }` returns true. When the new intent accuracy is 0.90 or the new slot accuracy is 0.93, it returns false. This replaces AC-13.2-4.
+- AC-13.13-2: When `jarvis.toml` has no `train.margin`, `Config::parse` gives the margin `{ intent = 0.03, slots = 0.02 }`.
+- AC-13.13-3: When both measures of the new classifier are lower than those of the old one, but by less than `train.margin`, the next `predict` of the `Classifier` wrapper uses the new classifier, and the training state names the new run.
+- AC-13.13-4 [Quint]: The test `ac_13_13_4_drop_within_margin_swaps` passes: a run one level below the model swaps, and a run two levels below it does not.
+- AC-13.13-5 [Quint]: `SwapWithinMargin` holds in simulation and to 10 steps in `quint verify`.
+
+**Proofs.**
+
+- P-13.13-1 (AC-13.13-1). Ensures: `accept(new, old, margin)` is true if and only if `new.intent >= old.intent - margin.intent` and `new.slots >= old.slots - margin.slots`. Argument: `accept` is the conjunction of two `>=`, each with one subtraction. This replaces P-13.2-4.
+- P-13.13-2. Evidence: test.
+- P-13.13-3. Requires: `SwapWithinMargin`. Argument: step 6 swaps if and only if `accept(new, old, train.margin)` is true (P-13.13-1).
+- P-13.13-4, P-13.13-5. Evidence: model check. `SwapWithinMargin` also has an inductive argument: the only append to `swaps` is guarded by `a + MARGIN >= modelAcc` and appends `(modelAcc, a)`.
+
+---
+
+### 13.14 New Intent Accept
+
+**Goal:** Accept a new model without the score comparison when the training set has a label that the old model does not have. A new intent of a release, or a new active learned intent, then gets to System One at the next run.
+
+- **Implements:** G14, G16, G19. **Depends on:** 13.13.
+- **Files:** modify `src/domain/training.rs`, `src/app/training.rs`, `quint/training.qnt`, `quint/composed.qnt`, `README.md` (the accept rule, `CLAUDE.md` workflow item 15).
+- **Quint:** `training.qnt` (conformance).
+
+**Model.**
+
+- `lacks_label(labels, ranked) -> bool`: true when a label of `labels` is not a label of `ranked`. The ranking of a prediction has each label of its model (sub-phase 3.11c).
+- `accept(new, old, margin, missing) -> bool`: true when `missing` is true, else the rule of sub-phase 13.13.
+- Step 6 of the training run: `missing := lacks_label(labels of the set, ranked of the first held-out prediction of the old classifier)`. The log also names `missing`.
+- The old model cannot give a label that it does not have, so it cannot serve the new intent. Its accuracy on the examples of that intent is 0.
+- `training.qnt`: the done actions are `localDone(a, label)` and `runpodDone(a, label)`. `label` is true when the training set has a label that the old model does not have. A done action swaps when `label` is true or `a + MARGIN >= modelAcc`, and appends `(modelAcc, a, label)` to `swaps`. `SwapWithinMargin`: for every `(old, new, label)` in `swaps`, `label` is true or `new + MARGIN >= old`. `NewLabelSwaps`: when `lastAction` is a done action with `label`, `modelAcc` is its accuracy.
+- `composed.qnt`: `done(a)` is the done action with `label = false`.
+- The fakes of the driver of `training.qnt` rank each label of its catalog. For a done step with `label`, the driver first swaps in a classifier that has the same level and does not rank one label. Thus the measures do not change.
+
+**Acceptance criteria.**
+
+- AC-13.14-1: When `labels` has `timer_set` and `ranked` does not, `lacks_label` returns true. When `ranked` has each label of `labels`, it returns false.
+- AC-13.14-2: When `missing` is true, `accept` returns true, also when both new measures are 0 and both old measures are 1.
+- AC-13.14-3: When the training set has an intent that the old classifier does not rank, and both new measures are lower by more than `train.margin`, the next `predict` of the `Classifier` wrapper uses the new classifier.
+- AC-13.14-4 [Quint]: The test `ac_13_14_4_new_label_swaps` passes: at the accuracy 2, `localDone(0, true)` swaps in the model of the accuracy 0.
+- AC-13.14-5 [Quint]: `NewLabelSwaps` holds in simulation and to 10 steps in `quint verify`.
+
+**Proofs.**
+
+- P-13.14-1 (AC-13.14-1). Ensures: `lacks_label(labels, ranked)` is true if and only if a label of `labels` is not the label of a pair of `ranked`. Argument: a loop over `labels` searches `ranked` for each label. Its loop invariant: each label before the index is in `ranked`.
+- P-13.14-2 (AC-13.14-2). Ensures: `accept(new, old, margin, missing)` is true if and only if `missing` is true or the rule of P-13.13-1 is true. Argument: `accept` is the disjunction of `missing` and the conjunction of P-13.13-1.
+- P-13.14-3. Requires: `NewLabelSwaps`. Argument: step 6 gets `missing` from the labels of the set and the ranking of the old classifier, and swaps when `accept` is true (P-13.14-2).
+- P-13.14-4, P-13.14-5. Evidence: model check.
+
+---
+
+### 13.15 Catalog Change Trigger
+
+**Goal:** Start a training run by itself when a release changes the intents or the seed examples of the model in use. A new or changed intent of `intents.toml` then gets to System One without 20 marks or "Start training".
+
+- **Implements:** G16, G19. **Depends on:** 13.14.
+- **Files:** modify `src/domain/training.rs`, `src/app/training.rs`, `quint/training.qnt`, `quint/composed.qnt`, `README.md` (the training trigger, `CLAUDE.md` workflow item 15).
+- **Quint:** `training.qnt` (conformance).
+
+**Model.**
+
+- `catalog_hash(catalog) -> u64`: `xxh3` of the intent names and the seed examples of `intents.toml` in file order, then the unknown examples, each followed by a newline. Services, filters and responses do not change the model, so they are not part of the hash. The learned intents are not part of it, because their activations are already changes (sub-phase 14.11).
+- `TrainingState` gets `catalog: Option<u64>`, the catalog hash of the last finished run. Step 7 of the training run (sub-phase 13.9b) saves the hash of the catalog of the run, after an accepted run and after a rejected run. A failed run does not change it. A training state without `catalog`, from an earlier release, gives `None`.
+- `stale(state, hash)`: true when `state.current` is set and `state.catalog` is not `Some(hash)`. `just fixture-model` trains the fixture model on the catalog of its release, so a state without `current` is never stale.
+- `should_train(count, min_changes, stale) = stale or count >= min_changes`. This replaces `should_train` of sub-phase 13.3. `check` of the trigger (sub-phase 13.9c) gives it `stale` of the saved state and of `catalog_hash` of `intents.toml`.
+- The trigger check, not a new start step, starts the run. The trigger checks at the start and then each `train.check_interval_s`. Thus a changed catalog starts a run at the first check after the start, with the one-run guard, the activity (sub-phase 13.10b) and the failure backoff. After a failed run, the hash stays, so the first check after the backoff starts a run again.
+- A rejected run saves the hash, so its catalog does not start a run again. The same data builds the same set (sub-phase 13.12), and `train.py` trains with a fixed seed. Thus a second run gives the same model and the same rejection.
+- `training.qnt` gets `stale` (the catalog of the training state differs from `intents.toml`) and `release` (if `Idle` and `swaps` is not empty: `stale := true`). A release restarts Jarvis, so it occurs only between runs. The training state names a run only after an accepted run, which is a swap. `autoStart` is enabled when `changes >= MIN or stale`. A done action sets `stale := false`, and a final failure does not change `stale`. `CountResetsAfterRun`: when `lastAction` is a done action, `changes = during` and `stale` is false.
+- `composed.qnt` has no `release`, and its `unchanged` keeps `stale`.
+- The driver of `training.qnt` maps `release` to a save of the training state with a catalog hash that differs from the hash of its catalog.
+
+**Acceptance criteria.**
+
+- AC-13.15-1: When a seed example or an intent name of the catalog changes, `catalog_hash` changes. When the service of an intent changes, `catalog_hash` does not change.
+- AC-13.15-2: When `stale` is true and the count is 0, `should_train` returns true. When `stale` is false, `should_train` obeys AC-13.3-2.
+- AC-13.15-3: When the training state names a run and has no catalog hash, a check at the change count 0 starts a run. When the training state names no run, a check at the change count 0 starts no run.
+- AC-13.15-4: When a run is rejected, the training state has the catalog hash of `intents.toml`, and the next check at the change count 0 starts no run.
+- AC-13.15-5 [Quint]: The test `ac_13_15_5_release_starts_run` passes: after an accepted run and `release`, `autoStart` starts a run at the change count 0, and after the end of that run `autoStart` is not enabled.
+
+**Proofs.**
+
+- P-13.15-1. Evidence: test. Argument: `catalog_hash` joins the names and the examples in order and calls `xxh3_64` one time. The contract of `xxh3_64` does not state that different texts give different hashes, so Verus cannot prove the criterion.
+- P-13.15-2 (AC-13.15-2). Ensures: `should_train(c, m, s)` is true if and only if `s` is true or `c >= m`. Argument: `should_train` is the disjunction of `s` and `c >= m`. This replaces P-13.3-2.
+- P-13.15-3. Argument: `check` starts a run when `should_train` is true (P-13.9c-2), and `stale` is false when the state names no run.
+- P-13.15-4. Requires: `CountResetsAfterRun`. Argument: step 7 saves the hash after both branches of step 6.
+- P-13.15-5. Evidence: model check.
+
+**Field log.**
+
+1. Install the release on the GPU host. Record that a training run starts by itself at the first check, because the training state of the earlier release has no catalog hash. If the training state names no run, say "Start training".
+2. Record that the log shows both measures, `missing`, `accepted true` and the new run, and that `training.json` has the catalog hash.
+3. In the Office, say "Set a timer for the chicken". Record that the interaction has the intent `timer_set`.
+4. After one more `train.check_interval_s`, record that no second run started.
 
 ## Field Log
 

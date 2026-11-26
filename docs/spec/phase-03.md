@@ -144,7 +144,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Model.**
 
 - `context_text(area, habit_lines) -> String`: `"area: <area or none> | habits: <lines joined by '; ' or none>"`.
-- `sample_context(areas, rng) -> String`: `context_text` of a random area and no habit lines. No sub-phase adds habit lines (`01-architecture.md` decision 9). Sub-phase 11.5 removes the `habits` part and the parameter `habit_lines`.
+- `sample_context(areas, rng) -> String`: `context_text` of a random area and no habit lines. No sub-phase adds habit lines (`01-architecture.md` decision 9). Sub-phase 11.5 removes the `habits` part and the parameter `habit_lines`. Sub-phase 13.12 replaces `rng` with the text of the example.
 - `held_out(text, holdout) -> bool = xxh3(normalize(text)) mod 10000 < holdout * 10000`. This sub-phase adds `train.holdout`.
 - This sub-phase adds `rand` and `xxhash-rust` (`01-architecture.md` section 7).
 
@@ -152,14 +152,14 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 - AC-3.3-1: When `context_text("kitchen", [])` runs, it returns `"area: kitchen | habits: none"`.
 - AC-3.3-2: When `context_text(None, ["a", "b"])` runs, it returns `"area: none | habits: a; b"`. AC-11.5-1 replaces AC-3.3-1 and this criterion.
-- AC-3.3-3: When `sample_context` gets the same seed, it returns the same context.
+- AC-3.3-3: When `sample_context` gets the same seed, it returns the same context. AC-13.12-1 replaces this criterion.
 - AC-3.3-8: When `held_out` runs two times for the same text, it returns the same value.
 - AC-3.3-9: When `held_out` runs for 1,000 different texts with `holdout = 0.1`, between 70 and 130 are held out.
 
 **Proofs.**
 
 - P-3.3-1, P-3.3-2. Ensures: the result is `area: <area or none> | habits: <lines joined by "; " or none>`. Argument: `context_text` is a `format!` with two branches for empty values.
-- P-3.3-3 (AC-3.3-3). Ensures: the same areas and the same seed give the same context. Argument: `sample_context` reads only `rng` and `areas`. A seeded RNG gives the same sequence.
+- P-3.3-3 (AC-3.3-3). Ensures: the same areas and the same seed give the same context. Argument: `sample_context` reads only `rng` and `areas`. A seeded RNG gives the same sequence. P-13.12-1 replaces this proof.
 - P-3.3-8. Evidence: test. Argument: `xxh3` with a fixed seed is a pure function, and `normalize` is pure. Verus cannot state the claim, because `vstd` does not interpret `f64` multiplication and comparison.
 - P-3.3-9. Evidence: test (statistical property of the hash on this input set).
 
@@ -176,7 +176,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 
 - `TrainingSet { base_model, epochs, batch_size, labels, tags, examples }` (JSON in `01-architecture.md` section 9).
 - `Example { context, text, label: Intent(name) | Not(name), spans: Option<Vec<Span>> }`. An `unknown` example has an empty span list. `Span` derives the serde traits for the JSON.
-- `seed_set(catalog, areas, rng, settings) -> TrainingSet`: one `Intent` example for each seed example and one `unknown` example for each unknown seed. Each example gets `sample_context`. `settings` gives `base_model`, `epochs` and `batch_size`.
+- `seed_set(catalog, areas, rng, settings) -> TrainingSet`: one `Intent` example for each seed example and one `unknown` example for each unknown seed. Each example gets `sample_context`. `settings` gives `base_model`, `epochs` and `batch_size`. Sub-phase 13.12 removes `rng`.
 
 **Acceptance criteria.**
 
@@ -218,7 +218,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 - **Implements:** G3. **Depends on:** 3.3c.
 - **Files:** modify `src/lib.rs`, `src/main.rs`, `jarvis.toml`, `Cargo.toml`.
 
-**Model.** `clap` parses the command line of `jarvis`. The command reads the configuration file `<config>` (`[train]`: `base_model`, `epochs`, `batch_size`) and the catalog file that its key `intents` names. This sub-phase adds `intents`. With `--house`, the areas come from that snapshot. Without it, the area list is empty. It writes the result of `seed_set` as JSON, without the held-out examples. Thus the fixture model never trains on a held-out seed, and the first comparison in sub-phase 13.9 is fair. The RNG has the fixed seed 1, so two runs give the same file. `jarvis::main` returns an `ExitCode`, and `src/main.rs` returns it, so a failed command exits with a failure code.
+**Model.** `clap` parses the command line of `jarvis`. The command reads the configuration file `<config>` (`[train]`: `base_model`, `epochs`, `batch_size`) and the catalog file that its key `intents` names. This sub-phase adds `intents`. With `--house`, the areas come from that snapshot. Without it, the area list is empty. It writes the result of `seed_set` as JSON, without the held-out examples. Thus the fixture model never trains on a held-out seed, and the first comparison in sub-phase 13.9 is fair. The RNG has the fixed seed 1, so two runs give the same file. Sub-phase 13.12 removes the RNG, because each context then comes from the text. `jarvis::main` returns an `ExitCode`, and `src/main.rs` returns it, so a failed command exits with a failure code.
 
 **Acceptance criteria.**
 
