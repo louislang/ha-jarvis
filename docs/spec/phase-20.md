@@ -188,7 +188,7 @@ Each request on a satellite already increases its generation. Thus the request d
 - AC-20.6-2: When the prediction is `mute` 0.95 with `duration = ten minutes`, `decide` gives `Decision::Mute` with `Some("ten minutes")` and the transcript, also with no area.
 - AC-20.6-3: When the plan is `Mute` with the Kitchen switch, `answer` gives `Reply` with "Muting for ten minutes." and the call `switch.turn_on` on the switch, or "Muting." with no duration. `Missing` and `Unclear` give "Sorry, I could not do that." with no call.
 - AC-20.6-4: When the fixture model gets each example of `mute` with the context `area: none`, the top label is `mute`, and the slots are those of its markup.
-- AC-20.6-5: When the fixture model gets "turn on the office lights", "office lights on" and "turn the office lights on" with the context `area: none`, the top label is `lights_on` with a probability of `model.commit_threshold` or more.
+- AC-20.6-5: When the fixture model gets "turn on the office lights", "office lights on" and "turn the office lights on" with the context `area: Office`, the top label is `lights_on` with a probability of `model.commit_threshold` or more.
 
 **Proofs.**
 

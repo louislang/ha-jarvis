@@ -662,7 +662,7 @@ AC-13.10d-1 moves to sub-phase 13.10f as AC-13.10f-1.
 **Goal:** Give each training example a context from a hash of its text, not from an RNG with the start time as its seed. A run on the same data then builds the same set, and the held-out contexts stay the same across runs and releases.
 
 - **Implements:** G16. **Depends on:** 13.11.
-- **Files:** modify `src/domain/training.rs`, `src/app/training.rs`, `src/lib.rs`.
+- **Files:** modify `src/domain/training.rs`, `src/app/training.rs`, `src/lib.rs`, `src/adapters/onnx.rs`.
 
 **Model.**
 
@@ -671,6 +671,7 @@ AC-13.10d-1 moves to sub-phase 13.10f as AC-13.10f-1.
 - The context of an example changes only when its text or the area names of the hot cache change.
 - Three runs on the same data, with RNG seeds 1 s or 2 s apart, gave intent accuracies from 0.9150 to 0.9433 on the same 247 held-out examples. 35 of these examples changed between right and wrong. The new contexts of each run caused this noise.
 - The file of `jarvis dataset` changes, so `just fixture-model` trains the fixture model again one time.
+- AC-19.5-7 and AC-20.6-5 use the context `area: Office`. The fixture set has no example with the context `area: none`, so with the new contexts "office lights on" gives `lights_on` only 0.718 with that context. The test helper `assert_confident` of `src/adapters/onnx.rs` uses the same context.
 
 **Acceptance criteria.**
 
