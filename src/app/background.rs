@@ -87,7 +87,7 @@ const LIBRARY_TYPES: [&str; 3] = ["playlist", "artist", "album"];
 
 /// Keeps `cache` equal to the states and the registries of `home` until the event stream ends,
 /// from the first `Reconnected`. Publishes each new cache to the receivers of `cache`. Sends the
-/// timer changes to `timers` in the order of the events.
+/// timer changes and the satellite changes to `timers` in the order of the events.
 pub async fn sync(
     home: &dyn Home,
     cache: &watch::Sender<StateCache>,
@@ -98,8 +98,9 @@ pub async fn sync(
         // A closed receiver does not stop the sync.
         match event {
             Event::StateChanged { ref entity_id, .. } => {
-                let timer = entity_id.starts_with("timer.");
-                let input = timer.then(|| TimerInput::Event(event.clone()));
+                let sent =
+                    entity_id.starts_with("timer.") || entity_id.starts_with("assist_satellite.");
+                let input = sent.then(|| TimerInput::Event(event.clone()));
                 cache.send_modify(|cache| *cache = mem::take(cache).apply(event));
                 if let Some(input) = input {
                     timers.send(input).ok();
@@ -1360,6 +1361,18 @@ mod tests {
         assert_eq!(received(&mut inputs), expected);
         let applied = StateCache::load(house()).apply(active);
         assert_eq!(*cache.borrow(), applied.apply(changed(KITCHEN, "off")));
+    }
+
+    /// AC-19.17-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_17_1_sync_sends_satellite_changes() {
+        let (home, cache, mut inputs) = spawn(FakeHome::default()).await;
+        home.send(Event::Reconnected);
+        let idle = changed("assist_satellite.carson_kitchen", "idle");
+        home.send(idle.clone());
+        settle().await;
+        assert_eq!(received(&mut inputs), [TimerInput::Event(idle.clone())]);
+        assert_eq!(*cache.borrow(), StateCache::load(house()).apply(idle));
     }
 
     /// The `habits.save_interval_s` of the tests.

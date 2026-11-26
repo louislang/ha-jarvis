@@ -79,6 +79,15 @@ impl Desk {
                 let ring = finished.and_then(|timer| self.ring(entity_id, timer));
                 (table, ring, Vec::new())
             }
+            TimerInput::Event(Event::StateChanged {
+                entity_id,
+                old,
+                new,
+                ..
+            }) if entity_id.starts_with("assist_satellite.") => {
+                let mirrors = self.returned(&entity_id, old.as_deref(), new.as_deref());
+                (self.timers.clone(), None, mirrors)
+            }
             TimerInput::Event(event) => {
                 let (table, mirror) = self.changed(event);
                 (table, None, mirror.into_iter().collect())
@@ -88,6 +97,29 @@ impl Desk {
                 (table, None, mirrors)
             }
         }
+    }
+
+    /// The `Start` of each mirror of `satellite` whose helper the view shows running, in entity ID
+    /// order, when the satellite changes from `old` `unavailable` to `new`: its restart dropped
+    /// its Assist timers.
+    fn returned(&self, satellite: &str, old: Option<&State>, new: Option<&State>) -> Vec<Mirror> {
+        let away = |state: &State| state.state == "unavailable";
+        if !old.is_some_and(away) || new.is_none_or(away) {
+            return Vec::new();
+        }
+        let shown = self
+            .mirrors
+            .iter()
+            .filter(|(_, mirrored)| *mirrored == satellite);
+        let started = shown.filter_map(|(helper, _)| {
+            let state = self.view.state(helper).filter(|state| is_running(state))?;
+            Some(Mirror {
+                helper: helper.clone(),
+                satellite: satellite.to_owned(),
+                change: MirrorChange::Start(state.clone()),
+            })
+        });
+        started.collect()
     }
 
     /// The table after the snapshot `states`, which replaces the view, and its mirror commands.
@@ -953,6 +985,35 @@ mod tests {
         let mut wanted = started(timer_state(J1, "active"));
         wanted.push(mirror(J2, office, MirrorChange::Cancel));
         assert_eq!(mirrors, wanted);
+    }
+
+    /// The state change of the satellite entity `satellite` from `old` to `new`.
+    fn satellite(satellite: &str, old: &str, new: &str) -> TimerInput {
+        let (old, new) = (timer_state(satellite, old), timer_state(satellite, new));
+        TimerInput::Event(Event::StateChanged {
+            entity_id: satellite.to_owned(),
+            context: new.context.clone(),
+            old: Some(Box::new(old)),
+            new: Some(Box::new(new)),
+        })
+    }
+
+    /// AC-19.17-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_19_17_2_satellite_restart_starts_its_mirrors() {
+        let fixture = Fixture::running().await;
+        let restart = fixture
+            .feed(vec![satellite(KITCHEN, "unavailable", "idle")])
+            .await;
+        assert_eq!(restart, started(timer_state(J1, "active")));
+        let listening = satellite(KITCHEN, "idle", "listening");
+        let office = satellite("assist_satellite.office", "unavailable", "idle");
+        let other = fixture.feed(vec![listening, office]).await;
+        assert_eq!(
+            other,
+            [],
+            "a mirror start without a restart of its satellite"
+        );
     }
 
     /// The model helpers and the timer helpers.
