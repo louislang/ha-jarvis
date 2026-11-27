@@ -223,7 +223,7 @@ This phase adds the intent catalog, the training set contract, the Python traini
 **Acceptance criteria.**
 
 - AC-3.4-1: When `jarvis dataset jarvis.toml out.json --house src/testing/house.json` runs, `out.json` is a valid training set.
-- AC-3.4-2: When it runs with `--house`, each context names an area of the reference house.
+- AC-3.4-2: When it runs with `--house`, each context names an area of the reference house. AC-13.12-4 replaces this criterion.
 - AC-3.4-3: When it runs without `--house`, each context is `"area: none | habits: none"`. AC-11.5-2 replaces this criterion.
 - AC-3.4-4: When the command runs two times with the same inputs, the two files are equal.
 - AC-3.4-5: When the command runs, the file has no example for which `held_out` is true.
