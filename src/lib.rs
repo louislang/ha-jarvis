@@ -33,8 +33,6 @@ use clap::error::ErrorKind;
 use futures::future::BoxFuture;
 use jiff::SignedDuration;
 use jiff::Timestamp;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
 use serde::Deserialize;
 use serde_json::Value;
 use tempfile::NamedTempFile;
@@ -1478,8 +1476,7 @@ fn seed_examples(config: &Path, house: Option<&Path>) -> anyhow::Result<Training
         epochs: train.epochs,
         batch_size: train.batch_size,
     };
-    let mut set =
-        domain::training::seed_set(&catalog, &areas, &mut StdRng::seed_from_u64(1), settings);
+    let mut set = domain::training::seed_set(&catalog, &areas, settings);
     set.examples
         .retain(|example| !domain::training::held_out(&example.text, train.holdout));
     Ok(set)
