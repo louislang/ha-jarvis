@@ -256,7 +256,8 @@ pub fn context_text(area: Option<&str>) -> String {
     context
 }
 
-/// The context of the area of `areas` that the hash of the example text `text` picks.
+/// The context of the area of `areas`, or of no area, that the hash of the example text `text`
+/// picks.
 #[verus_spec(context =>
     ensures
         context@ == sampled(areas@, crate::domain::contracts::xxh3(vstd::utf8::encode_utf8(text@))),
@@ -264,15 +265,8 @@ pub fn context_text(area: Option<&str>) -> String {
 #[must_use]
 pub fn sample_context(areas: &[String], text: &str) -> String {
     let random = xxh3::xxh3_64(text.as_bytes());
-    if areas.is_empty() {
-        return context_text(None);
-    }
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the remainder is less than the number of areas"
-    )]
-    let index = (random % areas.len() as u64) as usize;
-    context_text(Some(areas[index].as_str()))
+    let index = (u128::from(random) % (areas.len() as u128 + 1)) as usize;
+    context_text(areas.get(index).map(String::as_str))
 }
 
 /// The training set of the seed examples of `catalog`, each with a context from `areas` that its
@@ -1060,9 +1054,11 @@ pub open spec fn context_spec(area: Seq<char>) -> Seq<char> {
     "area: "@ + area
 }
 
-/// The context of the area of `areas` at `random` modulo its length, or of no area.
+/// The context of the area of `areas` at `random` modulo its length plus one, or of no area at
+/// the index of its length.
 pub open spec fn sampled(areas: Seq<String>, random: u64) -> Seq<char> {
-    let area = if areas.len() == 0 { "none"@ } else { areas[random as int % areas.len() as int]@ };
+    let index = random as int % (areas.len() + 1) as int;
+    let area = if index == areas.len() { "none"@ } else { areas[index]@ };
     context_spec(area)
 }
 
@@ -1529,10 +1525,14 @@ mod tests {
         let contexts: Vec<String> = (0..1000)
             .map(|index| sample_context(&areas, &format!("turn on light {index}")))
             .collect();
-        for area in &areas {
-            let context = context_text(Some(area));
+        let options = areas.iter().map(|area| Some(area.as_str())).chain([None]);
+        for area in options {
+            let context = context_text(area);
             let count = contexts.iter().filter(|other| **other == context).count();
-            assert!((200..=300).contains(&count), "{area} occurs {count} times");
+            assert!(
+                (150..=250).contains(&count),
+                "{context} occurs {count} times"
+            );
         }
     }
 

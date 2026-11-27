@@ -583,14 +583,14 @@ mod tests {
     }
 
     /// Checks that the fixture model gives `intent` at `model.commit_threshold` or more for each
-    /// of `texts` in the context `area: Office`.
+    /// of `texts`.
     async fn assert_confident(intent: &str, texts: &[&str]) -> anyhow::Result<()> {
         let threshold = crate::Config::load(Path::new("jarvis.toml"))?
             .model
             .commit_threshold;
         let classifier = OnnxLoader.load(Path::new(FIXTURE), Device::Cpu).await?;
         for text in texts {
-            let prediction = classifier.predict("area: Office", text).await?;
+            let prediction = classifier.predict("area: none", text).await?;
             let (top, probability) = &prediction.ranked[0];
             assert_eq!(top, intent, "top label of {text}");
             assert!(
