@@ -662,21 +662,21 @@ AC-13.10d-1 moves to sub-phase 13.10f as AC-13.10f-1.
 **Goal:** Give each training example a context from a hash of its text, not from an RNG with the start time as its seed. A run on the same data then builds the same set, and the held-out contexts stay the same across runs and releases.
 
 - **Implements:** G16. **Depends on:** 13.11.
-- **Files:** modify `src/domain/training.rs`, `src/app/training.rs`, `src/lib.rs`, `src/adapters/onnx.rs`.
+- **Files:** modify `src/domain/training.rs`, `src/app/training.rs`, `src/lib.rs`.
 
 **Model.**
 
-- `sample_context(areas, text) -> String`: `context_text` of `areas[xxh3(text) mod |areas|]`, or of no area when `areas` is empty. `text` is the normalized text of the example, and `xxh3` is the hash of `held_out` (sub-phase 3.3). `text` replaces the parameter `rng` of sub-phase 3.3.
+- `sample_context(areas, text) -> String`: with `i = xxh3(text) mod (|areas| + 1)`, `context_text` of `areas[i]`, or of no area when `i = |areas|`. `text` is the normalized text of the example, and `xxh3` is the hash of `held_out` (sub-phase 3.3). `text` replaces the parameter `rng` of sub-phase 3.3.
 - `seed_set` (sub-phase 3.3b) and `training_set` (sub-phase 13.1b) do not have `rng`. Step 2 of the training run (sub-phase 13.9) and the dataset command (sub-phase 3.4) use no RNG.
 - The context of an example changes only when its text or the area names of the hot cache change.
 - Three runs on the same data, with RNG seeds 1 s or 2 s apart, gave intent accuracies from 0.9150 to 0.9433 on the same 247 held-out examples. 35 of these examples changed between right and wrong. The new contexts of each run caused this noise.
 - The file of `jarvis dataset` changes, so `just fixture-model` trains the fixture model again one time.
-- AC-19.5-7 and AC-20.6-5 use the context `area: Office`. The fixture set has no example with the context `area: none`, so with the new contexts "office lights on" gives `lights_on` only 0.718 with that context. The test helper `assert_confident` of `src/adapters/onnx.rs` uses the same context.
+- The speculative prediction (sub-phase 6.8) uses the context of no area, because the `transcribe` event names no satellite. Thus the set also has examples with no area. Measured on the fixture model with the contexts from the text: without no area, "office lights on" gave `lights_on` 0.718 with no area, and AC-9.2-5 failed with a p95 of 737 ms. With no area, it gave 0.965.
 
 **Acceptance criteria.**
 
 - AC-13.12-1: When `sample_context` gets the same areas and the same text two times, it returns the same context. This replaces AC-3.3-3.
-- AC-13.12-2: When `sample_context` runs for 1,000 different texts with 4 areas, each area occurs between 200 and 300 times.
+- AC-13.12-2: When `sample_context` runs for 1,000 different texts with 4 areas, each area and no area occur between 150 and 250 times.
 - AC-13.12-3: When two runs start 2 s apart on the same data, `FakeTrainer` records two equal training sets.
 
 **Proofs.**
