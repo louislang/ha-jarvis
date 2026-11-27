@@ -77,7 +77,7 @@ AC-13.1-5 moves to sub-phase 13.1b as AC-13.1b-1.
 
 - `held_out` is in sub-phase 3.3.
 - `metrics(predictions, examples, threshold) -> Metrics { intent, slots }`. `intent`: an `Intent(k)` example is correct when the top label is `k` with a probability of `threshold` or more. An `Intent(unknown)` example is also correct when the top probability is less than `threshold`. A `Not(k)` example is correct when the top label is not `k`, or its probability is less than `threshold`. `slots`: the share of examples with spans whose decoded slots equal the spans.
-- `accept(new, old) -> bool = new.intent >= old.intent and new.slots >= old.slots`. Thus "never worse" means never worse on these two measures. Sub-phase 13.13 adds the margin `train.margin`, and sub-phase 13.14 accepts a new model with a label that the old model does not have.
+- `accept(new, old) -> bool = new.intent >= old.intent and new.slots >= old.slots`. Thus "never worse" means never worse on these two measures. Sub-phase 13.13 adds the margin `train.margin`, and sub-phase 13.14 measures both models only on the held-out examples whose labels the old model has.
 
 **Acceptance criteria.**
 
@@ -137,7 +137,7 @@ AC-13.1-5 moves to sub-phase 13.1b as AC-13.1b-1.
   - `FailureKeepsModel`: when `lastAction` is a final failure, `modelAcc = prevAcc`.
   - `FallbackOnce`: one run has at most one RunPod attempt, and only after a local failure.
   - `PauseOnlyLocal`: `paused` if and only if `run = Local`.
-- Sub-phase 13.13 adds `MARGIN` to the swap guard and renames `SwapNeverWorse` to `SwapWithinMargin`. Sub-phase 13.14 adds `label` to the done actions and the invariant `NewLabelSwaps`, so AC-13.4-2 then checks seven invariants. Sub-phase 13.15 adds `stale` and `release`.
+- Sub-phase 13.13 adds `MARGIN` to the swap guard and renames `SwapNeverWorse` to `SwapWithinMargin`. Sub-phase 13.15 adds `stale` and `release`.
 
 **Acceptance criteria.**
 
@@ -724,36 +724,30 @@ AC-13.10d-1 moves to sub-phase 13.10f as AC-13.10f-1.
 
 ### 13.14 New Intent Accept
 
-**Goal:** Accept a new model without the score comparison when the training set has a label that the old model does not have. A new intent of a release, or a new active learned intent, then gets to System One at the next run.
+**Goal:** Measure the old model and the new model only on the held-out examples whose labels the old model has. A new intent of a release, or a new active learned intent, then does not lower the score of the old model, and a new model that is worse on the other intents stays rejected.
 
 - **Implements:** G14, G16, G19. **Depends on:** 13.13.
-- **Files:** modify `src/domain/training.rs`, `src/app/training.rs`, `quint/training.qnt`, `quint/composed.qnt`, `README.md` (the accept rule, `CLAUDE.md` workflow item 15).
-- **Quint:** `training.qnt` (conformance).
+- **Files:** modify `src/domain/training.rs`, `src/app/training.rs`, `README.md` (the accept rule, `CLAUDE.md` workflow item 15).
 
 **Model.**
 
-- `lacks_label(labels, ranked) -> bool`: true when a label of `labels` is not a label of `ranked`. The ranking of a prediction has each label of its model (sub-phase 3.11c).
-- `accept(new, old, margin, missing) -> bool`: true when `missing` is true, else the rule of sub-phase 13.13.
-- Step 6 of the training run: `missing := lacks_label(labels of the set, ranked of the first held-out prediction of the old classifier)`. The log also names `missing`.
-- The old model cannot give a label that it does not have, so it cannot serve the new intent. Its accuracy on the examples of that intent is 0.
-- `training.qnt`: the done actions are `localDone(a, label)` and `runpodDone(a, label)`. `label` is true when the training set has a label that the old model does not have. A done action swaps when `label` is true or `a + MARGIN >= modelAcc`, and appends `(modelAcc, a, label)` to `swaps`. `SwapWithinMargin`: for every `(old, new, label)` in `swaps`, `label` is true or `new + MARGIN >= old`. `NewLabelSwaps`: when `lastAction` is a done action with `label`, `modelAcc` is its accuracy.
-- `composed.qnt`: `done(a)` is the done action with `label = false`.
-- The fakes of the driver of `training.qnt` rank each label of its catalog. For a done step with `label`, the driver first swaps in a classifier that has the same level and does not rank one label. Thus the measures do not change.
+- `known(held, ranked) -> Vec<Example>`: the examples of `held` whose label names a label of `ranked`, in the order of `held`. The label `Intent(name)` and the label `Not(name)` name `name`. The ranking of a prediction has each label of its model (sub-phase 3.11c).
+- Step 6 of the training run: the old classifier predicts the first example of `held`. `compared := known(held, ranked of that prediction)`. Both measures of both classifiers come from `compared`, and `accept` of sub-phase 13.13 compares them. The log also names the counts of `held` and `compared`.
+- When the old model has each label of the set, `compared` is `held`, and step 6 does not change.
+- The old model cannot give a label that it does not have, so its accuracy on the examples of that label is 0, and a `Not` example of that label is always correct for it. These examples do not compare the two models.
+- When `compared` is empty, each measure of both classifiers is 0 (`metrics`, sub-phase 13.2), so `accept` is true.
+- `training.qnt` and `composed.qnt` do not change. Their accuracy levels are the accuracies on `compared`, and `SwapWithinMargin` (sub-phase 13.13) still holds.
 
 **Acceptance criteria.**
 
-- AC-13.14-1: When `labels` has `timer_set` and `ranked` does not, `lacks_label` returns true. When `ranked` has each label of `labels`, it returns false.
-- AC-13.14-2: When `missing` is true, `accept` returns true, also when both new measures are 0 and both old measures are 1.
-- AC-13.14-3: When the training set has an intent that the old classifier does not rank, and both new measures are lower by more than `train.margin`, the next `predict` of the `Classifier` wrapper uses the new classifier.
-- AC-13.14-4 [Quint]: The test `ac_13_14_4_new_label_swaps` passes: at the accuracy 2, `localDone(0, true)` swaps in the model of the accuracy 0.
-- AC-13.14-5 [Quint]: `NewLabelSwaps` holds in simulation and to 10 steps in `quint verify`.
+- AC-13.14-1: When `held` has examples of `timer_set` and `lights_on`, and `ranked` has `lights_on` and not `timer_set`, `known` returns only the `lights_on` examples. When `ranked` has each label of `held`, it returns `held`.
+- AC-13.14-2: When the training set has an intent that the old classifier does not rank, and the new classifier is lower by less than `train.margin` on the examples of the other intents, the next `predict` of the `Classifier` wrapper uses the new classifier.
+- AC-13.14-3: When the training set has an intent that the old classifier does not rank, and the new classifier is lower by more than `train.margin` on the examples of the other intents, the next `predict` of the `Classifier` wrapper uses the old classifier.
 
 **Proofs.**
 
-- P-13.14-1 (AC-13.14-1). Ensures: `lacks_label(labels, ranked)` is true if and only if a label of `labels` is not the label of a pair of `ranked`. Argument: a loop over `labels` searches `ranked` for each label. Its loop invariant: each label before the index is in `ranked`.
-- P-13.14-2 (AC-13.14-2). Ensures: `accept(new, old, margin, missing)` is true if and only if `missing` is true or the rule of P-13.13-1 is true. Argument: `accept` is the disjunction of `missing` and the conjunction of P-13.13-1.
-- P-13.14-3. Requires: `NewLabelSwaps`. Argument: step 6 gets `missing` from the labels of the set and the ranking of the old classifier, and swaps when `accept` is true (P-13.14-2).
-- P-13.14-4, P-13.14-5. Evidence: model check.
+- P-13.14-1 (AC-13.14-1). Ensures: each example of `known(held, ranked)` is an example of `held` whose label names a label of `ranked`, and each such example of `held` is in the result, in order. Argument: a loop over `held` keeps each example whose label name is in `ranked`. Its loop invariant: the result is the filter of `held` before the index.
+- P-13.14-2, P-13.14-3. Requires: `SwapWithinMargin`. Argument: step 6 swaps if and only if `accept` of the measures on `compared` is true (P-13.13-1).
 
 ---
 
@@ -796,7 +790,7 @@ AC-13.10d-1 moves to sub-phase 13.10f as AC-13.10f-1.
 **Field log.**
 
 1. Install the release on the GPU host. Record that a training run starts by itself at the first check, because the training state of the earlier release has no catalog hash. If the training state names no run, say "Start training".
-2. Record that the log shows both measures, `missing`, `accepted true` and the new run, and that `training.json` has the catalog hash.
+2. Record that the log shows both measures, the counts of `held` and `compared`, `accepted true` and the new run, and that `training.json` has the catalog hash.
 3. In the Office, say "Set a timer for the chicken". Record that the interaction has the intent `timer_set`.
 4. After one more `train.check_interval_s`, record that no second run started.
 
