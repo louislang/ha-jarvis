@@ -244,7 +244,7 @@ Each sub-phase that adds an intent adds its seed examples to `intents.toml` and 
 - AC-19.5-4: When the prediction is `timer_set` 0.95 with no slot, `decide` gives `Decision::Timer` with `timer = None` and `duration = None`.
 - AC-19.5-5: When the pool of a `timer` intent uses `area`, `validate_pools` returns an error with the pool and the variable.
 - AC-19.5-6: When the fixture model gets each trained example of the six timer intents with the context `area: none`, the top label is the intent of the example, and the slots are those of its markup.
-- AC-19.5-7: When the fixture model gets "turn on the office lights", "office lights on" and "turn the office lights on" with the context `area: none`, the top label is `lights_on` with a probability of `model.commit_threshold` or more.
+- AC-19.5-7: When the fixture model gets "turn on the office lights", "office lights on" and "turn the office lights on" with the context `area: Office`, the top label is `lights_on` with a probability of `model.commit_threshold` or more.
 
 **Proofs.**
 
