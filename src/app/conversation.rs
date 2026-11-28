@@ -750,11 +750,10 @@ impl Conversation {
     }
 
     /// The reply to `text` as an answer to the `open` dialog and its key on the satellite of
-    /// `heard` at its time: empty text with no record when a cancel phrase stops a ring there, a
-    /// `cancelled` reply that closes it, or a question again, with the prediction and the record
-    /// parts of an unclear answer. Else the prediction to decide and its transcript: the filled
-    /// intent of a `Slot` dialog, or the System One prediction of `text` in the area of `heard`,
-    /// with true for a new request.
+    /// `heard` at its time: the `cancelled` reply to a cancel phrase, or a question again, with
+    /// the prediction and the record parts of an unclear answer. Else the prediction to decide and
+    /// its transcript: the filled intent of a `Slot` dialog, or the System One prediction of `text`
+    /// in the area of `heard`, with true for a new request.
     ///
     /// # Errors
     ///
@@ -825,8 +824,8 @@ impl Conversation {
         said(prediction, Route::Llm, spoken, None)
     }
 
-    /// The reply to the cancel phrase `text` of `heard`, with no record: empty text when it stops a
-    /// ring on the satellite of `heard`, else a `cancelled` reply that closes the `open` dialog.
+    /// The `cancelled` reply to the cancel phrase `text` of `heard`, with no record. On a
+    /// satellite, it stops the rings there. Else it closes the `open` dialog, and needs one.
     async fn cancelled(
         &self,
         text: &str,
@@ -836,28 +835,14 @@ impl Conversation {
         if !dialog::is_cancel(text, &self.queues.dialog.cancel) {
             return None;
         }
-        if let Some(satellite) = &heard.satellite
-            && self.timers.stop(satellite).await
-        {
-            return Some((
-                Handled {
-                    text: String::new(),
-                    after: None,
-                },
-                None,
-            ));
-        }
-        open.map(|(_, key)| self.cancel(key.clone(), heard))
-    }
-
-    /// A `cancelled` reply, with no record. Closes the dialog of `key`, unless the request of
-    /// `heard` on its satellite closed it.
-    fn cancel(&self, key: Key, heard: &Heard) -> Answered {
-        if heard.origin.is_none() {
-            self.queues.dialogs().close(key);
+        // `handle` closed the dialog of the satellite when it increased its generation.
+        if let Some(satellite) = &heard.satellite {
+            self.timers.stop(satellite).await;
+        } else {
+            self.queues.dialogs().close(open?.1.clone());
         }
         let text = self.pick("cancelled");
-        (Handled { text, after: None }, None)
+        Some((Handled { text, after: None }, None))
     }
 
     /// The prediction of the normalized `text` in the model context of `heard` by the System One
@@ -2721,7 +2706,7 @@ mod tests {
             ("failure".to_owned(), pool(&[("Failed.", failure)])),
             ("filler".to_owned(), pool(&[("One moment.", 0)])),
             ("ask_area".to_owned(), pool(&[("Which room?", 0)])),
-            ("cancelled".to_owned(), pool(&[("Cancelled.", 0)])),
+            ("cancelled".to_owned(), pool(&[("Okay.", 0)])),
             (
                 "weather".to_owned(),
                 pool(&[("It is {{ response.sky }}.", 0)]),
@@ -3560,7 +3545,7 @@ mod tests {
         let home = Arc::new(FakeHome::default());
         let texts = ["turn on the lights", "never mind"];
         let (replies, conversation) = talk(&home, Arc::default(), &texts, &["lights_on"]).await?;
-        assert_eq!(replies[1].text, "Cancelled.");
+        assert_eq!(replies[1].text, "Okay.");
         assert!(replies[1].after.is_none(), "the cancel has work");
         assert_eq!(home.calls(), []);
         assert_eq!(open_dialogs(&conversation), BTreeMap::new());
@@ -4306,7 +4291,7 @@ mod tests {
         )?;
         open_llm(&conversation);
         let cancelled = conversation.handle("never mind", on_satellite()).await?;
-        assert_eq!(cancelled.text, "Cancelled.");
+        assert_eq!(cancelled.text, "Okay.");
         job.await?;
         assert_eq!(home.calls(), []);
         Ok(())
@@ -6378,9 +6363,9 @@ mod tests {
         Ok(text)
     }
 
-    /// AC-19.10b-1.
+    /// AC-20.1-3.
     #[tokio::test(start_paused = true)]
-    async fn ac_19_10b_1_stop_ends_the_ring() -> anyhow::Result<()> {
+    async fn ac_20_1_3_stop_ends_the_ring() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
         let chicken = named("chicken", false);
         let (_cache, mut conversation) = rung(&home, Vec::new(), chicken, TimerEnd::Finished).await;
@@ -6388,7 +6373,10 @@ mod tests {
         conversation.recorder.writer = writer;
         tokio::time::sleep(Duration::from_secs(16)).await;
         let handled = conversation.handle("stop", on_satellite()).await?;
-        assert_eq!((handled.text.as_str(), handled.after.is_none()), ("", true));
+        assert_eq!(
+            (handled.text.as_str(), handled.after.is_none()),
+            ("Okay.", true)
+        );
         tokio::time::sleep(Duration::from_secs(300)).await;
         assert_eq!(announces(&home).len(), 2);
         assert!(log.try_recv().is_err(), "a record of the stop");
@@ -6403,12 +6391,11 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn ac_19_10b_2_stop_on_another_satellite_keeps_the_ring() -> anyhow::Result<()> {
         let home = Arc::new(FakeHome::default());
-        let left = predicted("timer_left", 0.9, ("timer", ""));
         let chicken = named("chicken", false);
-        let (_cache, conversation) = rung(&home, vec![left], chicken, TimerEnd::Finished).await;
+        let (_cache, conversation) = rung(&home, Vec::new(), chicken, TimerEnd::Finished).await;
         tokio::time::sleep(Duration::from_secs(16)).await;
         let text = from_office(&conversation, "stop").await?;
-        assert_eq!(text, "No timer is running.");
+        assert_eq!(text, "Okay.");
         tokio::time::sleep(Duration::from_secs(300)).await;
         assert_eq!(announces(&home).len(), 8);
         Ok(())
@@ -6435,7 +6422,7 @@ mod tests {
     async fn ac_19_10b_4_stop_without_a_ring_cancels_the_dialog() -> anyhow::Result<()> {
         let texts = ["turn on the lights", "stop"];
         let (replies, _) = talk(&Arc::default(), Arc::default(), &texts, &["lights_on"]).await?;
-        assert_eq!(replies[1].text, "Cancelled.");
+        assert_eq!(replies[1].text, "Okay.");
         Ok(())
     }
 
@@ -6545,6 +6532,60 @@ mod tests {
         assert_eq!(texts[..2], [CANCEL_J1; 2]);
         let chicken = texts.iter().filter(|text| text.ends_with("named jarvis 1"));
         assert_eq!(chicken.count(), 0, "{texts:?}");
+        Ok(())
+    }
+
+    /// AC-20.1-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_20_1_1_never_mind_without_a_dialog() -> anyhow::Result<()> {
+        let (home, reasoner) = (Arc::new(FakeHome::default()), Arc::default());
+        let (log, conversation) = logging_with(
+            &home,
+            scripted(&["unknown"]),
+            Arc::clone(&reasoner),
+            Duration::ZERO,
+        );
+        let Handled { text, after } = conversation.handle("never mind", in_kitchen()).await?;
+        if let Some(after) = after {
+            after.await?;
+        }
+        assert_eq!(text, "Okay.");
+        assert_eq!(written(&log).await.len(), 0, "the cancel was logged");
+        assert_eq!(reasoner.questions(), [] as [&str; 0]);
+        assert_eq!(home.calls(), []);
+        Ok(())
+    }
+
+    /// AC-20.1-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_20_1_2_stop_drops_the_system_two_answer() -> anyhow::Result<()> {
+        let (home, reasoner) = (Arc::default(), Arc::new(FakeReasoner::default()));
+        let conversation = deferring(&home, &reasoner, &["unknown"]);
+        reasoner.hold_steps();
+        let deferred = conversation.handle("plan dinner", in_kitchen()).await?;
+        let job = tokio::spawn(deferred.after.expect("a System Two job"));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let step = reasoner.take_step().expect("the answer waits");
+        let stopped = conversation.handle("stop", in_kitchen()).await?;
+        assert_eq!(stopped.text, "Okay.");
+        _ = step.send(Scripted::Sentence("Pasta."));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        drop(reasoner.take_step());
+        job.await??;
+        assert_eq!(announces(&home), [] as [&str; 0]);
+        Ok(())
+    }
+
+    /// AC-20.1-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_20_1_4_typed_never_mind_is_a_prediction() -> anyhow::Result<()> {
+        let conversation = deferring(&Arc::default(), &Arc::default(), &["lights_on"]);
+        let typed = Context {
+            device_id: Some(KITCHEN.to_owned()),
+            ..Context::default()
+        };
+        let text = conversation.handle("never mind", typed).await?.text;
+        assert!(["Lights on.", "Done."].contains(&text.as_str()), "{text}");
         Ok(())
     }
 }
