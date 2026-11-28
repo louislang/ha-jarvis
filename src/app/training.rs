@@ -13,8 +13,6 @@ use std::time::Duration;
 
 use jiff::SignedDuration;
 use jiff::Timestamp;
-use rand::SeedableRng;
-use rand::rngs::StdRng;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Map;
@@ -250,7 +248,7 @@ impl Training {
     /// A step fails, or the held-out set is empty. The classifier and the state then do not change.
     pub async fn run(&self) -> anyhow::Result<()> {
         let started = self.clock.now();
-        let set = self.training_set(started).await?;
+        let set = self.training_set().await?;
         let holdout = self.config.train.holdout;
         let (held, upload): (Vec<Example>, Vec<Example>) = set
             .examples
@@ -404,24 +402,23 @@ impl Training {
         Ok(training::changes(&state, &marked, &learned))
     }
 
-    /// The full training set of a run that starts at `started` on the intents and the active
-    /// learned intents, after a `refresh`.
-    async fn training_set(&self, started: Timestamp) -> anyhow::Result<TrainingSet> {
+    /// The full training set of a run on the intents and the active learned intents, after a
+    /// `refresh`.
+    async fn training_set(&self) -> anyhow::Result<TrainingSet> {
         let (store, train) = (self.generated.as_ref(), &self.config.train);
         let catalog = self.live()?;
         let generated = store.load()?.unwrap_or_default();
         let generated = refresh(&*self.reasoner, store, &catalog, generated, train).await?;
         let marked = self.marked().await?;
         let areas = background::area_names(&self.cache.borrow());
-        let mut rng = StdRng::seed_from_u64(started.as_second().unsigned_abs());
         let settings = Settings {
             base_model: train.base_model.clone(),
             epochs: train.epochs,
             batch_size: train.batch_size,
         };
         let copy = generated_catalog(&catalog, generated);
-        let examples = training::seed_set(&copy, &areas, &mut rng, settings.clone()).examples;
-        let set = training::training_set(&catalog, examples, &marked, &areas, &mut rng, settings);
+        let examples = training::seed_set(&copy, &areas, settings.clone()).examples;
+        let set = training::training_set(&catalog, examples, &marked, &areas, settings);
         Ok(set)
     }
 
@@ -1328,6 +1325,17 @@ mod tests {
             1,
             "the old classifier predicts"
         );
+    }
+
+    /// AC-13.12-3. Each run fails, because the trainer has no scripted result.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_12_3_runs_two_seconds_apart_train_on_equal_sets() {
+        let harness = swap(&classifier(&[]));
+        let _failed = harness.training.run().await;
+        advance(&harness, 2);
+        let _failed = harness.training.run().await;
+        let calls = recorded(&harness.trainer);
+        assert_eq!(calls[0].1, calls[1].1, "the two sets differ");
     }
 
     /// The run ID and the set of each `train` call of `trainer`.

@@ -1,8 +1,6 @@
 //! Training set, context samples, held-out split, accuracy measures and change count.
 
 use jiff::Timestamp;
-use rand::Rng;
-use rand::rngs::StdRng;
 use serde::Deserialize;
 use serde::Serialize;
 use vstd::prelude::*;
@@ -258,23 +256,21 @@ pub fn context_text(area: Option<&str>) -> String {
     context
 }
 
-/// The context of an area that `rng` picks from `areas`.
+/// The context of the area of `areas`, or of no area, that the hash of the example text `text`
+/// picks.
 #[verus_spec(context =>
     ensures
-        context@ == sampled(areas@, crate::domain::contracts::next(&*old(rng))),
+        context@ == sampled(areas@, crate::domain::contracts::xxh3(vstd::utf8::encode_utf8(text@))),
 )]
 #[must_use]
-pub fn sample_context(areas: &[String], rng: &mut StdRng) -> String {
-    let random = rng.next_u32() as usize;
-    if areas.is_empty() {
-        return context_text(None);
-    }
-    let area = &areas[random % areas.len()];
-    context_text(Some(area.as_str()))
+pub fn sample_context(areas: &[String], text: &str) -> String {
+    let random = xxh3::xxh3_64(text.as_bytes());
+    let index = (u128::from(random) % (areas.len() as u128 + 1)) as usize;
+    context_text(areas.get(index).map(String::as_str))
 }
 
-/// The training set of the seed examples of `catalog`, each with a context that `rng` samples
-/// from `areas`.
+/// The training set of the seed examples of `catalog`, each with a context from `areas` that its
+/// text picks.
 ///
 /// # Panics
 ///
@@ -287,12 +283,7 @@ pub fn sample_context(areas: &[String], rng: &mut StdRng) -> String {
         catalog::views(set.labels@) == seq!["unknown"@] + catalog::names(catalog.intents@),
 )]
 #[must_use]
-pub fn seed_set(
-    catalog: &Catalog,
-    areas: &[String],
-    rng: &mut StdRng,
-    settings: Settings,
-) -> TrainingSet {
+pub fn seed_set(catalog: &Catalog, areas: &[String], settings: Settings) -> TrainingSet {
     let mut examples = Vec::new();
     let mut index = 0;
     #[cfg_attr(verus_only, verus_spec(
@@ -307,13 +298,13 @@ pub fn seed_set(
             assert(catalog::valid_intent(*catalog, index as int));
             assert(catalog.intents@.take(index + 1).drop_last() =~= catalog.intents@.take(index as int));
         }
-        push_intent(&catalog.intents[index], areas, rng, &mut examples);
+        push_intent(&catalog.intents[index], areas, &mut examples);
         index += 1;
     }
     proof! {
         assert(catalog.intents@.take(index as int) =~= catalog.intents@);
     }
-    push_unknown(&catalog.unknown_examples, areas, rng, &mut examples);
+    push_unknown(&catalog.unknown_examples, areas, &mut examples);
     TrainingSet {
         base_model: settings.base_model,
         epochs: settings.epochs,
@@ -331,7 +322,7 @@ pub fn seed_set(
     ensures
         final(examples)@.len() == old(examples)@.len() + intent.examples@.len(),
 )]
-fn push_intent(intent: &Intent, areas: &[String], rng: &mut StdRng, examples: &mut Vec<Example>) {
+fn push_intent(intent: &Intent, areas: &[String], examples: &mut Vec<Example>) {
     let mut index = 0;
     #[cfg_attr(verus_only, verus_spec(
         invariant
@@ -344,7 +335,7 @@ fn push_intent(intent: &Intent, areas: &[String], rng: &mut StdRng, examples: &m
         let example =
             intent::parse_example(intent.examples[index].as_str()).expect("the catalog is valid");
         examples.push(Example {
-            context: sample_context(areas, rng),
+            context: sample_context(areas, &example.text),
             text: example.text,
             label: Label::Intent(intent.name.clone()),
             spans: Some(example.spans),
@@ -358,7 +349,7 @@ fn push_intent(intent: &Intent, areas: &[String], rng: &mut StdRng, examples: &m
     ensures
         final(examples)@.len() == old(examples)@.len() + texts@.len(),
 )]
-fn push_unknown(texts: &[String], areas: &[String], rng: &mut StdRng, examples: &mut Vec<Example>) {
+fn push_unknown(texts: &[String], areas: &[String], examples: &mut Vec<Example>) {
     let mut index = 0;
     #[cfg_attr(verus_only, verus_spec(
         invariant
@@ -368,7 +359,7 @@ fn push_unknown(texts: &[String], areas: &[String], rng: &mut StdRng, examples: 
     ))]
     while index < texts.len() {
         examples.push(Example {
-            context: sample_context(areas, rng),
+            context: sample_context(areas, &texts[index]),
             text: texts[index].clone(),
             label: Label::Intent("unknown".to_owned()),
             spans: Some(Vec::new()),
@@ -495,10 +486,9 @@ pub fn training_set(
     generated: Vec<Example>,
     marked: &[Interaction],
     areas: &[String],
-    rng: &mut StdRng,
     settings: Settings,
 ) -> TrainingSet {
-    let seeds = seed_set(catalog, areas, rng, settings);
+    let seeds = seed_set(catalog, areas, settings);
     let mut all = Vec::new();
     push_ranked(generated, 0, &mut all);
     push_ranked(seeds.examples, 1, &mut all);
@@ -1064,9 +1054,11 @@ pub open spec fn context_spec(area: Seq<char>) -> Seq<char> {
     "area: "@ + area
 }
 
-/// The context of the area of `areas` at `random` modulo its length, or of no area.
-pub open spec fn sampled(areas: Seq<String>, random: u32) -> Seq<char> {
-    let area = if areas.len() == 0 { "none"@ } else { areas[random as int % areas.len() as int]@ };
+/// The context of the area of `areas` at `random` modulo its length plus one, or of no area at
+/// the index of its length.
+pub open spec fn sampled(areas: Seq<String>, random: u64) -> Seq<char> {
+    let index = random as int % (areas.len() + 1) as int;
+    let area = if index == areas.len() { "none"@ } else { areas[index]@ };
     context_spec(area)
 }
 
@@ -1245,8 +1237,6 @@ impl vstd::std_specs::convert::FromSpecImpl<ExampleFile> for Example {
 mod tests {
     use super::*;
 
-    use rand::SeedableRng;
-
     use crate::domain::feedback::Action;
     use crate::domain::feedback::Mark;
 
@@ -1264,7 +1254,7 @@ mod tests {
         let catalog: Catalog =
             toml::from_str(include_str!("../../intents.toml")).expect("intents.toml is a catalog");
         let areas = ["kitchen".to_owned(), "office".to_owned()];
-        let set = seed_set(&catalog, &areas, &mut StdRng::seed_from_u64(1), settings());
+        let set = seed_set(&catalog, &areas, settings());
         (catalog, set)
     }
 
@@ -1397,8 +1387,7 @@ mod tests {
         let mut mark = marked(1, Some(Value::Bad), Some("fan_on"));
         mark.transcript = "Turn on the lights!".to_owned();
         let (catalog, _) = training_set();
-        let mut rng = StdRng::seed_from_u64(1);
-        let set = super::training_set(&catalog, Vec::new(), &[mark], &[], &mut rng, settings());
+        let set = super::training_set(&catalog, Vec::new(), &[mark], &[], settings());
         let examples = set.examples.into_iter();
         let same = examples.filter(|example| example.text == "turn on the lights");
         let labels: Vec<Label> = same.map(|example| example.label).collect();
@@ -1521,12 +1510,30 @@ mod tests {
         assert_eq!(context_text(None), "area: none");
     }
 
-    /// AC-3.3-3.
+    /// AC-13.12-1.
     #[test]
-    fn ac_3_3_3_same_seed_gives_same_context() {
+    fn ac_13_12_1_same_text_gives_same_context() {
         let areas = ["kitchen".to_owned(), "office".to_owned()];
-        let sample = |seed| sample_context(&areas, &mut StdRng::seed_from_u64(seed));
-        assert_eq!(sample(7), sample(7));
+        let first = sample_context(&areas, "turn on the lights");
+        assert_eq!(first, sample_context(&areas, "turn on the lights"));
+    }
+
+    /// AC-13.12-2.
+    #[test]
+    fn ac_13_12_2_texts_spread_over_the_areas() {
+        let areas = ["kitchen", "office", "den", "hall"].map(str::to_owned);
+        let contexts: Vec<String> = (0..1000)
+            .map(|index| sample_context(&areas, &format!("turn on light {index}")))
+            .collect();
+        let options = areas.iter().map(|area| Some(area.as_str())).chain([None]);
+        for area in options {
+            let context = context_text(area);
+            let count = contexts.iter().filter(|other| **other == context).count();
+            assert!(
+                (150..=250).contains(&count),
+                "{context} occurs {count} times"
+            );
+        }
     }
 
     /// AC-3.3b-1.
