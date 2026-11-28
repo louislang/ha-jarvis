@@ -96,6 +96,7 @@ holdout = 0.1
 failure_backoff_s = 21600
 timeout_min = 60
 max_vram_gb = 4.5 # PyTorch cap of a local run
+margin = { intent = 0.03, slots = 0.02 } # largest drop of each held-out accuracy of a new model
 paraphrases = 50
 unknown_paraphrases = 300
 python = ".venv/bin/python"

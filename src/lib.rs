@@ -106,6 +106,7 @@ use crate::domain::speech::CommitPolicy;
 use crate::domain::state::Snapshot;
 use crate::domain::state_cache::StateCache;
 use crate::domain::timers::TimerInput;
+use crate::domain::training::Metrics;
 use crate::domain::training::Settings;
 use crate::domain::training::TrainingSet;
 use crate::domain::training::TrainingState;
@@ -685,6 +686,9 @@ pub struct TrainConfig {
     pub timeout_min: u64,
     /// The GPU memory cap of a local run, in GB.
     pub max_vram_gb: f64,
+    /// The largest drop of each held-out accuracy that a new model can have.
+    #[serde(default = "default_margin", with = "MarginFields")]
+    pub margin: Metrics,
     /// The number of generated examples of each intent.
     pub paraphrases: usize,
     /// The number of generated examples of `unknown`.
@@ -693,6 +697,24 @@ pub struct TrainConfig {
     pub python: PathBuf,
     /// The training fallback. Without it, Jarvis has no training fallback.
     pub runpod: Option<RunPodConfig>,
+}
+
+/// The fields of `train.margin`.
+#[derive(Deserialize)]
+#[serde(remote = "Metrics", deny_unknown_fields)]
+struct MarginFields {
+    /// The largest drop of the intent accuracy.
+    intent: f64,
+    /// The largest drop of the slot accuracy.
+    slots: f64,
+}
+
+/// The `train.margin` of a configuration without it (decision 13).
+fn default_margin() -> Metrics {
+    Metrics {
+        intent: 0.03,
+        slots: 0.02,
+    }
 }
 
 /// The `[train.runpod]` section.
@@ -2893,6 +2915,10 @@ mod tests {
             failure_backoff_s: 21600,
             timeout_min: 60,
             max_vram_gb: 4.5,
+            margin: Metrics {
+                intent: 0.03,
+                slots: 0.02,
+            },
             paraphrases: 50,
             unknown_paraphrases: 300,
             python: PathBuf::from(".venv/bin/python"),
@@ -3010,6 +3036,20 @@ mod tests {
             address: BTreeMap::new(),
         };
         assert_eq!(Config::parse(VALID)?, expected);
+        Ok(())
+    }
+
+    /// AC-13.13-2.
+    #[test]
+    fn ac_13_13_2_config_without_margin_has_the_default() -> anyhow::Result<()> {
+        let line = "margin = { intent = 0.03, slots = 0.02 }";
+        assert!(VALID.contains(line), "jarvis.toml has no {line}");
+        let margin = Config::parse(&VALID.replace(line, ""))?.train.margin;
+        let expected = Metrics {
+            intent: 0.03,
+            slots: 0.02,
+        };
+        assert_eq!(margin, expected);
         Ok(())
     }
 
