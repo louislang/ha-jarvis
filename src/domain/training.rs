@@ -854,18 +854,21 @@ fn is_value(slot: &Slot, text: &str, span: &Span) -> bool {
     }
 }
 
-/// True when the new model is never worse than the old one: both measures of `new` are equal or
-/// higher.
+/// True when each measure of `new` is at most its `margin` lower than that of `old`.
 #[verus_spec(accepted =>
     ensures
-        exists|intent: bool, slots: bool| #[trigger] vstd::std_specs::cmp::ge_ensures::<f64>(new.intent, old.intent, intent)
-            && #[trigger] vstd::std_specs::cmp::ge_ensures::<f64>(new.slots, old.slots, slots)
+        exists|intent: bool, slots: bool| #[trigger] within(new.intent, old.intent, margin.intent, intent)
+            && #[trigger] within(new.slots, old.slots, margin.slots, slots)
             && accepted == (intent && slots),
 )]
 #[must_use]
-pub fn accept(new: Metrics, old: Metrics) -> bool {
-    let intent = new.intent >= old.intent;
-    let slots = new.slots >= old.slots;
+pub fn accept(new: Metrics, old: Metrics, margin: Metrics) -> bool {
+    let intent = new.intent >= old.intent - margin.intent;
+    let slots = new.slots >= old.slots - margin.slots;
+    proof! {
+        assert(within(new.intent, old.intent, margin.intent, intent));
+        assert(within(new.slots, old.slots, margin.slots, slots));
+    }
     intent && slots
 }
 
@@ -945,6 +948,12 @@ pub fn should_train(count: usize, min_changes: usize) -> bool {
 verus! {
 
 broadcast use vstd::utf8::encode_utf8_push;
+
+/// True when `kept` is the result of `new >= old - margin`.
+pub open spec fn within(new: f64, old: f64, margin: f64, kept: bool) -> bool {
+    exists|floor: f64| #[trigger] vstd::std_specs::ops::sub_ensures::<f64>(old, margin, floor)
+        && vstd::std_specs::cmp::ge_ensures::<f64>(new, floor, kept)
+}
 
 /// The number of bytes of the first `count` characters of `text`.
 pub open spec fn bytes_before(text: Seq<char>, count: int) -> int {
@@ -1465,19 +1474,32 @@ mod tests {
         assert_eq!(metrics(&predictions, &examples, 0.7), expected);
     }
 
-    /// AC-13.2-4.
+    /// AC-13.13-1.
     #[test]
-    fn ac_13_2_4_accept_needs_both_measures() {
+    fn ac_13_13_1_accept_within_the_margin() {
+        let margin = Metrics {
+            intent: 0.03,
+            slots: 0.02,
+        };
         let old = Metrics {
-            intent: 0.8,
-            slots: 0.9,
+            intent: 0.9352,
+            slots: 0.9553,
         };
         let new = Metrics {
-            intent: 0.9,
-            slots: 0.8,
+            intent: 0.9069,
+            slots: 0.9472,
         };
-        assert!(accept(old, old), "equal measures are accepted");
-        assert!(!accept(new, old), "a lower slot accuracy is rejected");
+        assert!(
+            accept(new, old, margin),
+            "the run 20261126-010715 is accepted"
+        );
+        let low_intent = Metrics {
+            intent: 0.90,
+            ..new
+        };
+        let low_slots = Metrics { slots: 0.93, ..new };
+        assert!(!accept(low_intent, old, margin), "intent 0.90 is rejected");
+        assert!(!accept(low_slots, old, margin), "slots 0.93 is rejected");
     }
 
     /// AC-13.3-1.

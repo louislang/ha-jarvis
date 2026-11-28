@@ -240,8 +240,8 @@ pub struct Training {
 }
 
 impl Training {
-    /// One run: trains on the examples that are not held out, and swaps the classifier when the
-    /// new one is never worse on the held-out examples. Saves the start time and the current run.
+    /// One run: trains on the examples that are not held out, and swaps the classifier when each
+    /// measure of the new one on the held-out examples is at most `train.margin` lower. Saves the start time and the current run.
     ///
     /// # Errors
     ///
@@ -262,7 +262,7 @@ impl Training {
         let run_id = started.strftime("%Y%m%d-%H%M%S").to_string();
         let dir = self.train(&run_id, &upload).await?;
         let new = self.loader.load(&dir, self.config.device).await?;
-        let accepted = self.never_worse(new.as_ref(), &held, &run_id).await?;
+        let accepted = self.acceptable(new.as_ref(), &held, &run_id).await?;
         self.finish(started, &run_id, &dir, accepted.then_some(new))
     }
 
@@ -371,9 +371,9 @@ impl Training {
         Ok(())
     }
 
-    /// True when `new` of the run `run_id` is never worse than the current classifier on `held`.
-    /// Logs both measures and the decision.
-    async fn never_worse(
+    /// True when each measure of `new` of the run `run_id` on `held` is at most `train.margin`
+    /// lower than that of the current classifier. Logs both measures and the decision.
+    async fn acceptable(
         &self,
         new: &dyn Classifier,
         held: &[Example],
@@ -383,7 +383,7 @@ impl Training {
         let threshold = self.config.model.threshold;
         let new_metrics = measure(new, held, threshold).await?;
         let old_metrics = measure(old.classifier.as_ref(), held, threshold).await?;
-        let accepted = training::accept(new_metrics, old_metrics);
+        let accepted = training::accept(new_metrics, old_metrics, self.config.train.margin);
         tracing::info!(
             "run {run_id}: new {new_metrics:?}, old {old_metrics:?}, accepted {accepted}"
         );
@@ -1112,6 +1112,30 @@ mod tests {
         Ok(())
     }
 
+    /// AC-13.13-3. The new classifier gives a label that no example has and a wrong slot, so each
+    /// of its measures is 0 and lower than the old one, but by less than 1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_13_3_drop_within_the_margin_is_swapped() -> anyhow::Result<()> {
+        let (old, new) = (classifier(&[]), predicting("none", &wrong_slot()));
+        let harness = edited(&old, |training| {
+            let margin = Metrics {
+                intent: 1.0,
+                slots: 1.0,
+            };
+            training.config.train.margin = margin;
+        });
+        script(&harness, &new, Ok(()));
+        harness.training.run().await?;
+        assert_eq!(
+            next_calls(&harness, &new).await,
+            1,
+            "the new classifier predicts"
+        );
+        let state = harness.training.state.load()?.expect("a saved state");
+        assert_eq!(state.current.as_deref(), Some(RUN));
+        Ok(())
+    }
+
     /// AC-13.9b-3.
     #[tokio::test(start_paused = true)]
     async fn ac_13_9b_3_run_resets_the_change_count() -> anyhow::Result<()> {
@@ -1716,24 +1740,45 @@ mod tests {
         runpod_ends: usize,
     }
 
+    /// Gives `training` the examples, the held-out share, `min_changes` 2 and the margin of the
+    /// driver levels.
+    fn levelled(training: &mut Training) {
+        let mut catalog = catalog();
+        let kept = ["lights_on", "lights_off"];
+        catalog
+            .intents
+            .retain(|intent| kept.contains(&intent.name.as_str()));
+        for intent in &mut catalog.intents {
+            intent
+                .examples
+                .retain(|text| !text.starts_with("switch the lights off"));
+        }
+        catalog.unknown_examples.clear();
+        training.catalog = Arc::new(catalog);
+        // The held-out share 0.3 holds out two examples of `lights_on` and one of `lights_off`,
+        // and not the text of the marks. Thus the levels give the intent accuracies 0, 1/3 and
+        // 2/3 and the same slot accuracy, and the margin is one level.
+        training.config.train.holdout = 0.3;
+        training.config.train.min_changes = 2;
+        let margin = Metrics {
+            intent: 0.5,
+            slots: 0.0,
+        };
+        training.config.train.margin = margin;
+    }
+
     impl TrainingDriver {
         /// A driver at `initWith(runpod)`: no run, no changes and the classifier of level 0.
         fn new(runpod: bool) -> Self {
             let mut runtime = tokio::runtime::Builder::new_current_thread();
             let runtime = runtime.enable_time().start_paused(true).build();
             let levels = [
-                predicting("unknown", &wrong_slot()),
-                classifier(&wrong_slot()),
+                predicting("unknown", &[]),
+                predicting("lights_off", &[]),
                 classifier(&[]),
             ];
             let harness = edited(&levels[0], |training| {
-                let mut catalog = catalog();
-                catalog.intents.retain(|intent| intent.name == "lights_on");
-                catalog.unknown_examples.clear();
-                training.catalog = Arc::new(catalog);
-                // Each example is held out, so each level gives strictly higher measures.
-                training.config.train.holdout = 1.0;
-                training.config.train.min_changes = 2;
+                levelled(training);
                 if !runpod {
                     training.runpod = None;
                 }

@@ -12,6 +12,9 @@ module training {
   /// The accuracies of a model.
   pure val ACC = Set(0, 1, 2)
 
+  /// The largest drop of the accuracy that a new model can have: one level of `ACC`.
+  pure val MARGIN = 1
+
   /// A RunPod fallback is configured. `init` chooses it, `initLocal` sets false and no action changes it, so each check covers both values.
   var RUNPOD: bool
 
@@ -121,10 +124,10 @@ module training {
   /// A voice request starts a run at any count.
   action voiceStart = start(VoiceStart)
 
-  /// Ends the run with a new model of accuracy `a`: swaps when it is not worse, and keeps only the changes made during the run.
+  /// Ends the run with a new model of accuracy `a`: swaps when it is at most `MARGIN` lower, and keeps only the changes made during the run.
   action finish(a: int): bool = all {
-    swaps' = if (a >= modelAcc) swaps.append((modelAcc, a)) else swaps,
-    modelAcc' = if (a >= modelAcc) a else modelAcc,
+    swaps' = if (a + MARGIN >= modelAcc) swaps.append((modelAcc, a)) else swaps,
+    modelAcc' = if (a + MARGIN >= modelAcc) a else modelAcc,
     runState' = Idle,
     ends' = ends + 1,
     changes' = during,
@@ -206,8 +209,8 @@ module training {
   /// At most one run occurs at a time.
   val OneRun = starts - ends <= 1
 
-  /// A swap never installs a worse model.
-  val SwapNeverWorse = swaps.foldl(true, (ok, s) => ok and s._2 >= s._1)
+  /// A swap never installs a model more than `MARGIN` lower.
+  val SwapWithinMargin = swaps.foldl(true, (ok, s) => ok and s._2 + MARGIN >= s._1)
 
   /// After a run, the count holds only the changes made during the run.
   val CountResetsAfterRun = match lastAction {
@@ -228,7 +231,7 @@ module training {
   val PauseOnlyLocal = paused == (runState == Local)
 
   /// The invariants that `just quint` checks.
-  val allInvariants = OneRun and SwapNeverWorse and CountResetsAfterRun and FailureKeepsModel and FallbackOnce and PauseOnlyLocal
+  val allInvariants = OneRun and SwapWithinMargin and CountResetsAfterRun and FailureKeepsModel and FallbackOnce and PauseOnlyLocal
 
   /// A rejected run keeps the model and counts only the changes made during it.
   run ac_13_4_3_rejected_run_resets_count = init
@@ -238,10 +241,24 @@ module training {
     .then(change)
     .then(autoStart)
     .then(change)
-    .then(localDone(1))
+    .then(localDone(0))
     .expect(all {
       modelAcc == 2,
       swaps == List((0, 2)),
       changes == 1,
+    })
+
+  /// A run one level below the model swaps, and a run two levels below it does not.
+  run ac_13_13_4_drop_within_margin_swaps = init
+    .then(voiceStart)
+    .then(localDone(2))
+    .then(voiceStart)
+    .then(localDone(0))
+    .expect(modelAcc == 2)
+    .then(voiceStart)
+    .then(localDone(1))
+    .expect(all {
+      modelAcc == 1,
+      swaps == List((0, 2), (2, 1)),
     })
 }
