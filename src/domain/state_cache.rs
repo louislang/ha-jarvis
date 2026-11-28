@@ -347,6 +347,38 @@ pub fn mute_switches(cache: &StateCache) -> MuteSwitches {
     }
 }
 
+/// The first mute switch, in any state, on the device of the satellite `satellite`.
+#[verus_spec(switch =>
+    ensures
+        match switch {
+            Some(id) => satellite_switch(*cache, satellite@, id),
+            None => forall|index: int| #[trigger] first(cache.entities@, satellite@, index)
+                ==> !switchable(*cache, cache.entities@[index]),
+        },
+)]
+#[must_use]
+pub fn mute_switch(cache: &StateCache, satellite: &str) -> Option<EntityId> {
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= cache.entities@.len(),
+            forall|earlier: int| 0 <= earlier < index
+                ==> #[trigger] cache.entities@[earlier].entity_id.0@ != satellite@,
+        decreases cache.entities@.len() - index,
+    ))]
+    while index < cache.entities.len() {
+        let entity = &cache.entities[index];
+        if entity.entity_id.0.as_str() == satellite {
+            proof! {
+                assert(first(cache.entities@, satellite@, index as int));
+            }
+            return device_switch(cache, entity.device_id.as_ref()?.as_str());
+        }
+        index += 1;
+    }
+    None
+}
+
 /// The mute switches in `cache` on a satellite device, with the state `off`.
 #[verus_spec(off =>
     ensures
@@ -414,15 +446,18 @@ fn is_unmuted(cache: &StateCache, entity: &Entity) -> bool {
 )]
 fn is_unswitched(cache: &StateCache, entity: &Entity) -> bool {
     StateCache::in_domain(entity.entity_id.0.as_str(), "assist_satellite")
-        && !matches!(&entity.device_id, Some(device) if has_mute_switch(cache, device.as_str()))
+        && !matches!(&entity.device_id, Some(device) if device_switch(cache, device.as_str()).is_some())
 }
 
-/// True when the device `device` has a mute switch.
-#[verus_spec(found =>
+/// The first mute switch of the device `device`.
+#[verus_spec(switch =>
     ensures
-        found == switched(*cache, device@),
+        match switch {
+            Some(id) => switch_among(*cache, device@, id),
+            None => !switched(*cache, device@),
+        },
 )]
-fn has_mute_switch(cache: &StateCache, device: &str) -> bool {
+fn device_switch(cache: &StateCache, device: &str) -> Option<EntityId> {
     let mut index = 0;
     #[cfg_attr(verus_only, verus_spec(
         invariant
@@ -436,17 +471,17 @@ fn has_mute_switch(cache: &StateCache, device: &str) -> bool {
         if is_mute_switch(entity.entity_id.0.as_str())
             && matches!(&entity.device_id, Some(id) if id.as_str() == device)
         {
-            return true;
+            return Some(EntityId(entity.entity_id.0.clone()));
         }
         index += 1;
     }
-    false
+    None
 }
 
 /// True when `entity_id` is a `switch` entity ID that ends in `_mute_microphones`.
 #[verus_spec(found =>
     ensures
-        found == mute_switch(entity_id@),
+        found == mute_id(entity_id@),
 )]
 fn is_mute_switch(entity_id: &str) -> bool {
     let id = entity_id.as_bytes();
@@ -617,7 +652,7 @@ pub open spec fn aliased(aliases: Seq<String>, lower: Seq<char>) -> bool {
 }
 
 /// True when the entity ID `entity_id` is a `switch` entity ID that ends in `_mute_microphones`.
-pub open spec fn mute_switch(entity_id: Seq<char>) -> bool {
+pub open spec fn mute_id(entity_id: Seq<char>) -> bool {
     let id = vstd::utf8::encode_utf8(entity_id);
     let suffix = vstd::utf8::encode_utf8("_mute_microphones"@);
     &&& in_domain(entity_id, "switch"@)
@@ -627,15 +662,34 @@ pub open spec fn mute_switch(entity_id: Seq<char>) -> bool {
 /// True when `entity` is a mute switch on a satellite device in `cache`, with the state `off`.
 pub open spec fn unmuted(cache: StateCache, entity: Entity) -> bool {
     let key = crate::domain::contracts::str_key(entity.entity_id.0@);
-    &&& mute_switch(entity.entity_id.0@)
+    &&& mute_id(entity.entity_id.0@)
     &&& cache.states@.contains_key(key) && cache.states@[key].state@ == "off"@
     &&& entity.device_id matches Some(device) && crate::domain::select::satellite(cache, device@)
 }
 
 /// True when `entity` is a mute switch of the device `device`.
 pub open spec fn switch_of(entity: Entity, device: Seq<char>) -> bool {
-    &&& mute_switch(entity.entity_id.0@)
+    &&& mute_id(entity.entity_id.0@)
     &&& entity.device_id matches Some(id) && id@ == device
+}
+
+/// True when `id` is a mute switch of the device `device` in `cache`.
+pub open spec fn switch_among(cache: StateCache, device: Seq<char>, id: EntityId) -> bool {
+    exists|index: int| 0 <= index < cache.entities@.len()
+        && id == (#[trigger] cache.entities@[index]).entity_id
+        && switch_of(cache.entities@[index], device)
+}
+
+/// True when `id` is a mute switch on the device of the first entity `satellite` in `cache`.
+pub open spec fn satellite_switch(cache: StateCache, satellite: Seq<char>, id: EntityId) -> bool {
+    exists|index: int| #[trigger] first(cache.entities@, satellite, index)
+        && (cache.entities@[index].device_id matches Some(device)
+            && switch_among(cache, device@, id))
+}
+
+/// True when `entity` is on a device with a mute switch in `cache`.
+pub open spec fn switchable(cache: StateCache, entity: Entity) -> bool {
+    entity.device_id matches Some(device) && switched(cache, device@)
 }
 
 /// True when the device `device` has a mute switch in `cache`.
@@ -647,7 +701,7 @@ pub open spec fn switched(cache: StateCache, device: Seq<char>) -> bool {
 /// True when `entity` is a satellite without a device or without a mute switch on its device.
 pub open spec fn unswitched(cache: StateCache, entity: Entity) -> bool {
     &&& in_domain(entity.entity_id.0@, "assist_satellite"@)
-    &&& !(entity.device_id matches Some(device) && switched(cache, device@))
+    &&& !switchable(cache, entity)
 }
 
 /// True when `id` is the ID of an unmuted mute switch among the first `count` entities.
@@ -914,6 +968,26 @@ mod tests {
                 off: vec![id(KITCHEN_MUTE)],
                 missing: Vec::new(),
             }
+        );
+    }
+
+    /// AC-20.5-1.
+    #[test]
+    fn ac_20_5_1_mute_switch_of_satellite() {
+        let mut house = house();
+        assert_eq!(
+            mute_switch(
+                &StateCache::load(house.clone()),
+                "assist_satellite.carson_kitchen"
+            ),
+            Some(id(KITCHEN_MUTE))
+        );
+        house
+            .entities
+            .retain(|entity| entity.entity_id.0 != "switch.carson_bedroom_mute_microphones");
+        assert_eq!(
+            mute_switch(&StateCache::load(house), "assist_satellite.carson_bedroom"),
+            None
         );
     }
 
