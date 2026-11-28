@@ -60,6 +60,8 @@ use crate::app::timers::TimerDesk;
 use crate::app::training::FIXTURE;
 use crate::app::training::Training;
 use crate::app::training::Trigger;
+use crate::domain::catalog;
+use crate::domain::catalog::Catalog;
 use crate::domain::decide::PluginCall;
 use crate::domain::decide::Question;
 use crate::domain::feedback;
@@ -537,6 +539,24 @@ pub fn training(holdout: f64, models: &Path) -> (Training, Arc<FakeTrainer>) {
         status: watch::Sender::default(),
     };
     (training, trainer)
+}
+
+/// A ranking with `top` at 0.9 and each other label of `intents.toml` at 0, as a model ranks each
+/// of its labels.
+///
+/// # Panics
+///
+/// `intents.toml` is not valid.
+#[must_use]
+pub fn ranked(top: &str) -> Vec<(String, f32)> {
+    let catalog: Catalog =
+        toml::from_str(include_str!("../../intents.toml")).expect("it is a catalog");
+    let others = catalog::labels(&catalog)
+        .into_iter()
+        .filter(|label| label != top);
+    let mut ranked = vec![(top.to_owned(), 0.9)];
+    ranked.extend(others.map(|label| (label, 0.0)));
+    ranked
 }
 
 /// `jarvis.toml` with the held-out share `holdout` and the model folder `models`.

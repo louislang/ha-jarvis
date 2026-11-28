@@ -872,6 +872,58 @@ pub fn accept(new: Metrics, old: Metrics, margin: Metrics) -> bool {
     intent && slots
 }
 
+/// The examples of `held` whose label names a label of `ranked`, in the order of `held`.
+#[verus_spec(compared =>
+    ensures
+        compared@ == known_of(held@, ranked@, held@.len() as int),
+)]
+#[must_use]
+pub fn known(held: Vec<Example>, ranked: &[(String, f32)]) -> Vec<Example> {
+    let mut compared = Vec::new();
+    let all = held.into_iter();
+    proof_decl! {
+        let ghost seen = vstd::std_specs::iter::IteratorSpec::remaining(&all);
+    }
+    #[cfg_attr(verus_only, verus_spec(held_iter =>
+        invariant
+            held_iter.seq() == seen,
+            seen == held@,
+            compared@ == known_of(seen, ranked@, held_iter.index() as int),
+    ))]
+    for example in all {
+        if has_label(ranked, &example.label) {
+            compared.push(example);
+        }
+    }
+    compared
+}
+
+/// True when a label of `ranked` is the name of `label`.
+#[verus_spec(found =>
+    ensures
+        found == ranks(ranked@, label_view(*label).1),
+)]
+fn has_label(ranked: &[(String, f32)], label: &Label) -> bool {
+    let name = match label {
+        Label::Intent(name) | Label::Not(name) => name,
+    };
+    let mut index = 0;
+    #[cfg_attr(verus_only, verus_spec(
+        invariant
+            index <= ranked@.len(),
+            label_view(*label).1 == name@,
+            forall|done: int| 0 <= done < index ==> #[trigger] ranked@[done].0@ != name@,
+        decreases ranked@.len() - index,
+    ))]
+    while index < ranked.len() {
+        if ranked[index].0.as_str() == name.as_str() {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 /// The state of the training runs.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 pub struct TrainingState {
@@ -1140,6 +1192,24 @@ spec fn chosen(ranked: Seq<Ranked>, count: int) -> Seq<Example>
         chosen(ranked, count - 1).push(ranked[count - 1].example)
     } else {
         chosen(ranked, count - 1)
+    }
+}
+
+/// True when a label of `ranked` is `name`.
+pub open spec fn ranks(ranked: Seq<(String, f32)>, name: Seq<char>) -> bool {
+    exists|index: int| 0 <= index < ranked.len() && #[trigger] ranked[index].0@ == name
+}
+
+/// The examples of the first `count` of `held` whose label names a label of `ranked`, in order.
+pub open spec fn known_of(held: Seq<Example>, ranked: Seq<(String, f32)>, count: int) -> Seq<Example>
+    decreases count,
+{
+    if count <= 0 {
+        Seq::empty()
+    } else if ranks(ranked, label_view(held[count - 1].label).1) {
+        known_of(held, ranked, count - 1).push(held[count - 1])
+    } else {
+        known_of(held, ranked, count - 1)
     }
 }
 
@@ -1500,6 +1570,27 @@ mod tests {
         let low_slots = Metrics { slots: 0.93, ..new };
         assert!(!accept(low_intent, old, margin), "intent 0.90 is rejected");
         assert!(!accept(low_slots, old, margin), "slots 0.93 is rejected");
+    }
+
+    /// AC-13.14-1.
+    #[test]
+    fn ac_13_14_1_known_keeps_the_labels_of_the_ranking() {
+        let not = Label::Not("lights_on".to_owned());
+        let examples = vec![
+            held(intent("timer_set")),
+            held(intent("lights_on")),
+            held(not),
+        ];
+        let ranked = |labels: &[&str]| -> Vec<(String, f32)> {
+            labels
+                .iter()
+                .map(|label| ((*label).to_owned(), 0.5))
+                .collect()
+        };
+        let lights = known(examples.clone(), &ranked(&["lights_on", "unknown"]));
+        assert_eq!(lights, examples[1..], "only the lights_on examples");
+        let all = known(examples.clone(), &ranked(&["timer_set", "lights_on"]));
+        assert_eq!(all, examples, "each label is ranked");
     }
 
     /// AC-13.3-1.
