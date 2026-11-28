@@ -108,6 +108,10 @@ use crate::ports::Work;
 /// the live test, Select pressed Open 2 s to 3 s after the play.
 const PLEZY_WAIT: Duration = Duration::from_secs(3);
 
+/// The time after the last speech on a satellite during which Jarvis still does something there.
+/// A reply plays after `handle` returns, so the time also covers a reply of a few seconds.
+const SPOKE_WITHIN: Duration = Duration::from_secs(10);
+
 /// The name of the System Two tool that plays a Plex title on the TV.
 const PLAY_TOOL: &str = "play_on_tv";
 
@@ -368,14 +372,27 @@ impl Conversation {
         heard.origin = self.origin(heard.satellite.as_deref(), heard.id);
         let voice = self.identify_voice(&mut heard, &context).await;
         let (handled, logged) = self.respond(text, (key, open), area, &mut heard).await?;
-        if let Some((prediction, decided)) = logged {
-            let id = heard.id;
-            self.append(heard, &prediction, decided);
-            if let Some(identified) = voice {
-                self.record_speaker(id, identified);
-            }
+        if let Some(logged) = logged {
+            self.finish(heard, &handled, logged, voice);
         }
         Ok(handled)
+    }
+
+    /// Ends the logged reply `handled` to `heard` with its prediction and decision: writes the
+    /// time of its speech on the satellite, its record and the speaker `voice` of the record.
+    fn finish(
+        &self,
+        heard: Heard,
+        handled: &Handled,
+        (prediction, decided): (Prediction, Decided),
+        voice: Option<Identified>,
+    ) {
+        self.queues.replied(heard.satellite.as_deref(), handled);
+        let id = heard.id;
+        self.append(heard, &prediction, decided);
+        if let Some(identified) = voice {
+            self.record_speaker(id, identified);
+        }
     }
 
     /// Runs the timer desk on `inputs` with a task for each new ring, which a drop aborts, and
@@ -1311,7 +1328,9 @@ impl Conversation {
     /// or a `failure` answer when it fails, with the generation of `request`.
     fn fetch(&self, call: PluginCall, pool: String, origin: Origin) -> Work {
         let conversation = self.clone();
+        let work = self.queues.work(&origin.satellite, origin.generation);
         async move {
+            let _work = work;
             if !conversation
                 .queues
                 .is_current(&origin.satellite, origin.generation)
@@ -1329,7 +1348,10 @@ impl Conversation {
     /// satellite of its request as it arrives, or a `failure` answer when the answer fails.
     fn llm(&self, text: String, area: Option<AreaId>, thread: Thread) -> Work {
         let conversation = self.clone();
+        let origin = thread.request.as_ref();
+        let work = origin.map(|origin| self.queues.work(&origin.satellite, origin.generation));
         async move {
+            let _work = work;
             let answer = conversation.answer(&text, area.as_ref(), &thread).await;
             let (Err(error), Some(origin)) = (answer, &thread.request) else {
                 return Ok(());
@@ -2299,6 +2321,31 @@ pub struct Queues {
     links: Mutex<BTreeMap<Key, u64>>,
     /// The turn limit, the timeout, the choice similarity and the cancel phrases of a dialog.
     dialog: DialogConfig,
+    /// The count of the live work of each satellite and generation.
+    live: Arc<Mutex<BTreeMap<(String, u64), usize>>>,
+    /// The time of the last speech of each satellite.
+    spoke: Mutex<BTreeMap<String, tokio::time::Instant>>,
+}
+
+/// One live work of a satellite with a generation, counted from its creation to its drop.
+#[must_use]
+struct LiveWork {
+    /// The counts of the queues.
+    live: Arc<Mutex<BTreeMap<(String, u64), usize>>>,
+    /// The satellite and the generation of the work.
+    key: (String, u64),
+}
+
+impl Drop for LiveWork {
+    fn drop(&mut self) {
+        let mut live = self.live.lock().expect("no lock holder panics");
+        if let Some(count) = live.get_mut(&self.key) {
+            *count -= 1;
+            if *count == 0 {
+                live.remove(&self.key);
+            }
+        }
+    }
 }
 
 impl Queues {
@@ -2321,6 +2368,8 @@ impl Queues {
             dialogs: Mutex::default(),
             links: Mutex::default(),
             dialog,
+            live: Arc::default(),
+            spoke: Mutex::default(),
         }
     }
 
@@ -2384,6 +2433,50 @@ impl Queues {
             _ => false,
         };
         (!open.is_empty() && dialog::is_cancel(text, &rules.cancel)) || open.iter().any(fills)
+    }
+
+    /// True when live work with the current generation of `satellite` exists, or when the
+    /// satellite spoke less than `SPOKE_WITHIN` ago.
+    ///
+    /// # Panics
+    ///
+    /// Never: no lock holder panics.
+    #[must_use]
+    pub fn busy(&self, satellite: &str) -> bool {
+        let key = (satellite.to_owned(), self.generation(satellite));
+        let working = self
+            .live
+            .lock()
+            .expect("no lock holder panics")
+            .contains_key(&key);
+        let spoke = self.spoke.lock().expect("no lock holder panics");
+        let last = spoke.get(satellite);
+        working || last.is_some_and(|time| time.elapsed() < SPOKE_WITHIN)
+    }
+
+    /// Live work on `satellite` with `generation` until its drop.
+    fn work(&self, satellite: &str, generation: u64) -> LiveWork {
+        let key = (satellite.to_owned(), generation);
+        let mut live = self.live.lock().expect("no lock holder panics");
+        *live.entry(key.clone()).or_default() += 1;
+        LiveWork {
+            live: Arc::clone(&self.live),
+            key,
+        }
+    }
+
+    /// Makes now the time of the last speech of `satellite` when the reply `handled` on it has
+    /// text.
+    fn replied(&self, satellite: Option<&str>, handled: &Handled) {
+        if let Some(satellite) = satellite.filter(|_| !handled.text.is_empty()) {
+            self.spoke(satellite);
+        }
+    }
+
+    /// Makes now the time of the last speech of `satellite`.
+    fn spoke(&self, satellite: &str) {
+        let mut spoke = self.spoke.lock().expect("no lock holder panics");
+        spoke.insert(satellite.to_owned(), tokio::time::Instant::now());
     }
 
     /// The generation of the dialog key of `satellite`.
@@ -2453,8 +2546,20 @@ impl Queues {
         text: &str,
         speak: BoxFuture<'_, anyhow::Result<()>>,
     ) -> anyhow::Result<()> {
+        let _work = self.work(satellite, generation);
         let queue = self.queue(satellite);
         let _turn = queue.turn.lock().await;
+        if !self.waited(satellite, text).await || !self.is_current(satellite, generation) {
+            return Ok(());
+        }
+        let spoken = speak.await;
+        self.spoke(satellite);
+        spoken
+    }
+
+    /// True when `satellite` is still idle `margin` after it became idle, within `idle_wait`.
+    /// Else logs the drop of the announce of `text`.
+    async fn waited(&self, satellite: &str, text: &str) -> bool {
         let mut cache = self.cache.clone();
         let idle = |cache: &StateCache| {
             cache
@@ -2466,17 +2571,13 @@ impl Queues {
             let wait = tokio::time::timeout_at(deadline, cache.wait_for(idle));
             if !matches!(wait.await, Ok(Ok(_))) {
                 tracing::warn!("{satellite} is not idle, so the announce of {text:?} is dropped");
-                return Ok(());
+                return false;
             }
             tokio::time::sleep(self.margin).await;
             if idle(&cache.borrow()) {
-                break;
+                return true;
             }
         }
-        if !self.is_current(satellite, generation) {
-            return Ok(());
-        }
-        speak.await
     }
 }
 
@@ -6586,6 +6687,106 @@ mod tests {
         };
         let text = conversation.handle("never mind", typed).await?.text;
         assert!(["Lights on.", "Done."].contains(&text.as_str()), "{text}");
+        Ok(())
+    }
+
+    /// A conversation on `home` and `reasoner` with the classifier of `scripted(labels)`, whose
+    /// System Two steps wait for the test, with no step timeout within the tests.
+    fn holding(
+        home: &Arc<FakeHome>,
+        reasoner: &Arc<FakeReasoner>,
+        labels: &[&str],
+    ) -> Conversation {
+        let mut conversation = deferring(home, reasoner, labels);
+        conversation.two.timeout = Duration::from_secs(3600);
+        reasoner.hold_steps();
+        conversation
+    }
+
+    /// Sends the held steps "Pasta." and the end of the answer of `reasoner`, each after the
+    /// announce of the step before.
+    async fn say_pasta(reasoner: &FakeReasoner) {
+        for step in [Scripted::Sentence("Pasta."), Scripted::Done] {
+            _ = reasoner.take_step().expect("a step waits").send(step);
+            tokio::time::sleep(MARGIN * 2).await;
+        }
+    }
+
+    /// AC-20.2-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_20_2_1_waiting_job_is_work() -> anyhow::Result<()> {
+        let (home, reasoner) = (Arc::new(FakeHome::default()), Arc::default());
+        let conversation = holding(&home, &reasoner, &["unknown"]);
+        let deferred = conversation.handle("plan dinner", in_kitchen()).await?;
+        assert_eq!(deferred.text, "One moment.");
+        let job = tokio::spawn(deferred.after.expect("a System Two job"));
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let queues = &conversation.queues;
+        assert!(
+            queues.busy(SATELLITE),
+            "the kitchen is not busy with the job"
+        );
+        assert!(!queues.busy(OFFICE_SATELLITE), "the office is busy");
+        say_pasta(&reasoner).await;
+        job.await??;
+        assert_eq!(announces(&home), ["Pasta."]);
+        tokio::time::sleep(SPOKE_WITHIN).await;
+        assert!(!queues.busy(SATELLITE), "the kitchen is busy after the job");
+        Ok(())
+    }
+
+    /// AC-20.2-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_20_2_2_waiting_failure_is_work() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (_cache, _changes, conversation) = still(&home, "responding");
+        let after = tokio::spawn(failed(&home, &conversation)?);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        assert!(
+            conversation.queues.busy(SATELLITE),
+            "the failure is not work"
+        );
+        assert!(!after.is_finished(), "the failure did not wait for idle");
+        Ok(())
+    }
+
+    /// AC-20.2-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_20_2_3_reply_is_speech_for_ten_seconds() -> anyhow::Result<()> {
+        let conversation = deferring(&Arc::default(), &Arc::default(), &["lights_on"]);
+        let handled = conversation
+            .handle("turn on the lights", in_kitchen())
+            .await?;
+        handled.after.expect("the light call").await?;
+        tokio::time::sleep(Duration::from_secs(9)).await;
+        let queues = &conversation.queues;
+        assert!(queues.busy(SATELLITE), "the reply of 9 s ago is not speech");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(!queues.busy(SATELLITE), "the reply of 10 s ago is speech");
+        let stopped = conversation.handle("stop", in_kitchen()).await?;
+        assert_eq!(stopped.text, "Okay.");
+        assert!(!queues.busy(SATELLITE), "the cancelled reply is speech");
+        Ok(())
+    }
+
+    /// AC-20.2-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_20_2_4_older_job_is_not_work() -> anyhow::Result<()> {
+        let (home, reasoner) = (Arc::new(FakeHome::default()), Arc::default());
+        let conversation = holding(&home, &reasoner, &["unknown", "lights_on"]);
+        let deferred = conversation.handle("plan dinner", in_kitchen()).await?;
+        let job = tokio::spawn(deferred.after.expect("a System Two job"));
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let newer = conversation
+            .handle("turn on the lights", in_kitchen())
+            .await?;
+        newer.after.expect("the light call").await?;
+        tokio::time::sleep(SPOKE_WITHIN).await;
+        assert!(!job.is_finished(), "the older job ended");
+        assert!(
+            !conversation.queues.busy(SATELLITE),
+            "the older job is work"
+        );
         Ok(())
     }
 }
