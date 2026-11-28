@@ -820,11 +820,10 @@ mod tests {
         classifier
     }
 
-    /// A prediction of `label` with 0.9 and no slots.
+    /// A prediction of `label` with 0.9, each other label and no slots.
     fn predicted(label: &str) -> Prediction {
-        let ranked = vec![(label.to_owned(), 0.9)];
         Prediction {
-            ranked,
+            ranked: fakes::ranked(label),
             slots: Vec::new(),
         }
     }

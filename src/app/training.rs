@@ -241,7 +241,8 @@ pub struct Training {
 
 impl Training {
     /// One run: trains on the examples that are not held out, and swaps the classifier when each
-    /// measure of the new one on the held-out examples is at most `train.margin` lower. Saves the start time and the current run.
+    /// measure of the new one is at most `train.margin` lower on the held-out examples whose
+    /// labels the old one ranks. Saves the start time and the current run.
     ///
     /// # Errors
     ///
@@ -262,7 +263,7 @@ impl Training {
         let run_id = started.strftime("%Y%m%d-%H%M%S").to_string();
         let dir = self.train(&run_id, &upload).await?;
         let new = self.loader.load(&dir, self.config.device).await?;
-        let accepted = self.acceptable(new.as_ref(), &held, &run_id).await?;
+        let accepted = self.acceptable(new.as_ref(), held, &run_id).await?;
         self.finish(started, &run_id, &dir, accepted.then_some(new))
     }
 
@@ -371,21 +372,33 @@ impl Training {
         Ok(())
     }
 
-    /// True when each measure of `new` of the run `run_id` on `held` is at most `train.margin`
-    /// lower than that of the current classifier. Logs both measures and the decision.
+    /// True when each measure of `new` of the run `run_id` is at most `train.margin` lower than
+    /// that of the current classifier, both on the examples of `held` whose labels the current
+    /// classifier ranks. Logs both measures, the counts and the decision.
     async fn acceptable(
         &self,
         new: &dyn Classifier,
-        held: &[Example],
+        held: Vec<Example>,
         run_id: &str,
     ) -> anyhow::Result<bool> {
+        use anyhow::Context as _;
+
         let old = self.classifier.0.load_full();
-        let threshold = self.config.model.threshold;
-        let new_metrics = measure(new, held, threshold).await?;
-        let old_metrics = measure(old.classifier.as_ref(), held, threshold).await?;
+        let (threshold, count) = (self.config.model.threshold, held.len());
+        let first = held.first().context("the held-out set is empty")?;
+        let ranked = old
+            .classifier
+            .predict(&first.context, &first.text)
+            .await?
+            .ranked;
+        let compared = training::known(held, &ranked);
+        let new_metrics = measure(new, &compared, threshold).await?;
+        let old_metrics = measure(old.classifier.as_ref(), &compared, threshold).await?;
         let accepted = training::accept(new_metrics, old_metrics, self.config.train.margin);
         tracing::info!(
-            "run {run_id}: new {new_metrics:?}, old {old_metrics:?}, accepted {accepted}"
+            "run {run_id}: held {count}, compared {}, new {new_metrics:?}, old {old_metrics:?}, \
+             accepted {accepted}",
+            compared.len()
         );
         Ok(accepted)
     }
@@ -1038,10 +1051,14 @@ mod tests {
 
     /// A classifier that gives `label` with 0.9 and `slots` for each text.
     fn predicting(label: &str, slots: &[Slot]) -> Arc<FakeClassifier> {
+        ranking(&fakes::ranked(label), slots)
+    }
+
+    /// A classifier that gives `ranked` and `slots` for each text.
+    fn ranking(ranked: &[(String, f32)], slots: &[Slot]) -> Arc<FakeClassifier> {
         let classifier = FakeClassifier::default();
         for _ in 0..1000 {
-            let ranked = vec![(label.to_owned(), 0.9)];
-            let slots = slots.to_vec();
+            let (ranked, slots) = (ranked.to_vec(), slots.to_vec());
             classifier.script(Prediction { ranked, slots });
         }
         Arc::new(classifier)
@@ -1133,6 +1150,65 @@ mod tests {
         );
         let state = harness.training.state.load()?.expect("a saved state");
         assert_eq!(state.current.as_deref(), Some(RUN));
+        Ok(())
+    }
+
+    /// A run of `new` on `lights_on` and the new intent `timer_set` with each example held out and
+    /// the margin 0.6. The old classifier gives `lights_on` without slots and does not rank
+    /// `timer_set`. Its slot accuracy is 0.5 on the `lights_on` examples and 0.67 on each example.
+    fn new_intent(new: &Arc<FakeClassifier>) -> Harness {
+        let mut ranked = fakes::ranked("lights_on");
+        ranked.retain(|(label, _)| label != "timer_set");
+        let harness = edited(&ranking(&ranked, &[]), |training| {
+            let mut catalog = catalog();
+            let names = ["lights_on", "timer_set"];
+            catalog
+                .intents
+                .retain(|intent| names.contains(&intent.name.as_str()));
+            for intent in &mut catalog.intents {
+                let kept = |text: &String| text.starts_with("turn on the") || text == "set a timer";
+                intent.examples.retain(kept);
+            }
+            catalog.unknown_examples.clear();
+            training.catalog = Arc::new(catalog);
+            training.config.train.holdout = 1.0;
+            let margin = Metrics {
+                intent: 0.6,
+                slots: 0.6,
+            };
+            training.config.train.margin = margin;
+        });
+        script(&harness, new, Ok(()));
+        harness
+    }
+
+    /// AC-13.14-2. The new slot accuracy is 0.5 lower on the `lights_on` examples, and 0.67 lower
+    /// on each example.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_14_2_new_intent_within_the_margin_is_swapped() -> anyhow::Result<()> {
+        let new = classifier(&wrong_slot());
+        let harness = new_intent(&new);
+        harness.training.run().await?;
+        assert_eq!(
+            next_calls(&harness, &new).await,
+            1,
+            "the new classifier predicts"
+        );
+        Ok(())
+    }
+
+    /// AC-13.14-3. The new intent accuracy is 1 lower on the `lights_on` examples, and 0.33 lower
+    /// on each example.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_14_3_new_intent_beyond_the_margin_is_rejected() -> anyhow::Result<()> {
+        let new = predicting("timer_set", &[]);
+        let harness = new_intent(&new);
+        harness.training.run().await?;
+        assert_eq!(
+            next_calls(&harness, &new).await,
+            0,
+            "the old classifier predicts"
+        );
         Ok(())
     }
 
