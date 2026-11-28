@@ -3464,14 +3464,12 @@ mod tests {
         Ok(())
     }
 
-    /// AC-3.4-2.
+    /// AC-13.12-4.
     #[test]
-    fn ac_3_4_2_each_context_names_a_house_area() -> anyhow::Result<()> {
-        let expected: Vec<String> = fakes::house()
-            .areas
-            .iter()
-            .map(|area| training::context_text(Some(area.name.as_str())))
-            .collect();
+    fn ac_13_12_4_each_context_names_a_house_area_or_none() -> anyhow::Result<()> {
+        let areas = fakes::house().areas;
+        let names = areas.iter().map(|area| Some(area.name.as_str()));
+        let expected: Vec<String> = names.chain([None]).map(training::context_text).collect();
         for context in contexts(&HOUSE)? {
             assert!(
                 expected.contains(&context),
