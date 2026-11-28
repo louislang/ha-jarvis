@@ -151,6 +151,7 @@ pub mod domain {
     pub mod intent;
     pub mod learn;
     pub mod model;
+    pub mod mute;
     pub mod responses;
     pub mod select;
     pub mod speaker;
