@@ -344,8 +344,9 @@ impl Training {
         done
     }
 
-    /// Saves the state of the run `run_id` that started at `started` and trained `dir`. Swaps in
-    /// `new` and deletes the old model folders when the run gives one, else deletes `dir`.
+    /// Saves the state and the catalog hash of the run `run_id` that started at `started` and
+    /// trained `dir`. Swaps in `new` and deletes the old model folders when the run gives one,
+    /// else deletes `dir`.
     fn finish(
         &self,
         started: Timestamp,
@@ -360,8 +361,12 @@ impl Training {
             fs::remove_dir_all(dir)?;
             previous.clone()
         };
-        let last_time = started;
-        self.state.save(&TrainingState { current, last_time })?;
+        let (last_time, catalog) = (started, Some(training::catalog_hash(&self.catalog)));
+        self.state.save(&TrainingState {
+            current,
+            last_time,
+            catalog,
+        })?;
         if let Some(new) = new {
             self.classifier.swap(run_id.to_owned(), new);
             let keep = [run_id, previous.as_deref().unwrap_or(FIXTURE), FIXTURE];
@@ -413,6 +418,16 @@ impl Training {
         let learned = self.learned.load()?.unwrap_or_default().intents;
         let marked = self.log.marked().await?;
         Ok(training::changes(&state, &marked, &learned))
+    }
+
+    /// True when the training state names a run of a catalog other than `intents.toml`.
+    ///
+    /// # Errors
+    ///
+    /// The state cannot be read.
+    pub fn stale(&self) -> anyhow::Result<bool> {
+        let (state, hash) = (self.state.load()?, training::catalog_hash(&self.catalog));
+        Ok(training::stale(&state.unwrap_or_default(), hash))
     }
 
     /// The full training set of a run on the intents and the active learned intents, after a
@@ -491,7 +506,8 @@ impl Trigger {
         }
     }
 
-    /// Starts a run after the failure backoff when the change count reaches `min_changes`.
+    /// Starts a run after the failure backoff when the catalog is stale or the change count
+    /// reaches `min_changes`.
     ///
     /// # Errors
     ///
@@ -511,14 +527,16 @@ impl Trigger {
         Ok(())
     }
 
-    /// True when the backoff after a failed run has passed and the count reaches `min_changes`.
+    /// True when the backoff after a failed run has passed and the catalog is stale or the count
+    /// reaches `min_changes`.
     async fn needed(&self) -> anyhow::Result<bool> {
         let (failed, min) = (*self.failed(), self.training.config.train.min_changes);
         let now = self.training.clock.now();
         if failed.is_some_and(|end| now.duration_since(end) < self.backoff) {
             return Ok(false);
         }
-        Ok(training::should_train(self.training.changes().await?, min))
+        let (count, stale) = (self.training.changes().await?, self.training.stale()?);
+        Ok(training::should_train(count, min, stale))
     }
 
     /// Starts a run at any change count and without the backoff. Gives whether it started one.
@@ -1306,6 +1324,52 @@ mod tests {
         Ok(())
     }
 
+    /// Saves a training state that names the run `previous` and has the catalog hash `catalog`.
+    fn named(harness: &Harness, catalog: Option<u64>) -> anyhow::Result<()> {
+        let current = Some("previous".to_owned());
+        let state = TrainingState {
+            current,
+            catalog,
+            ..TrainingState::default()
+        };
+        harness.training.state.save(&state)
+    }
+
+    /// AC-13.15-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_15_3_state_without_catalog_starts_a_run() -> anyhow::Result<()> {
+        let harness = swap(&classifier(&[]));
+        let trigger = trigger(&harness, 0);
+        trigger.check().await?;
+        settle().await;
+        assert_eq!(calls(&harness), 0, "a run started without a named run");
+        named(&harness, None)?;
+        trigger.check().await?;
+        settle().await;
+        assert_eq!(calls(&harness), 1, "no run started");
+        Ok(())
+    }
+
+    /// AC-13.15-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_13_15_4_rejected_run_saves_the_catalog() -> anyhow::Result<()> {
+        let (old, new) = (classifier(&[]), classifier(&wrong_slot()));
+        let harness = swap(&old);
+        named(&harness, None)?;
+        script(&harness, &new, Ok(()));
+        let trigger = trigger(&harness, 0);
+        trigger.check().await?;
+        settle().await;
+        let state = harness.training.state.load()?.expect("a saved state");
+        assert_eq!(state.current.as_deref(), Some("previous"), "accepted");
+        let hash = training::catalog_hash(&harness.training.catalog);
+        assert_eq!(state.catalog, Some(hash));
+        trigger.check().await?;
+        settle().await;
+        assert_eq!(calls(&harness), 1, "a second run started");
+        Ok(())
+    }
+
     /// AC-13.9d-2. The conversation logs the run of the classifier that predicts (its own
     /// AC-13.9d-2 test).
     #[tokio::test(start_paused = true)]
@@ -1888,6 +1952,14 @@ mod tests {
             self.runtime.block_on(settle());
             *gate = Arc::clone(&trainer.gate).try_lock_owned().ok();
         }
+
+        /// Saves the training state with a catalog hash other than that of its catalog.
+        fn release(&self) -> anyhow::Result<()> {
+            let training = &self.harness.training;
+            let catalog = Some(!training::catalog_hash(&training.catalog));
+            let saved = training.state.load()?.unwrap_or_default();
+            training.state.save(&TrainingState { catalog, ..saved })
+        }
     }
 
     impl Driver for TrainingDriver {
@@ -1917,6 +1989,7 @@ mod tests {
                     self.end(true, Ok(()));
                 },
                 runpodFail => self.end(true, Err("the RunPod job failed")),
+                release => self.release()?,
             })
         }
     }

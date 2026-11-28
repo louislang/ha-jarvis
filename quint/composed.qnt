@@ -84,7 +84,7 @@ module trainingOf {
 
   /// The instance does not change.
   action unchanged = all {
-    RUNPOD' = RUNPOD, changes' = changes, during' = during, runState' = runState, paused' = paused, starts' = starts,
+    RUNPOD' = RUNPOD, changes' = changes, during' = during, stale' = stale, runState' = runState, paused' = paused, starts' = starts,
     ends' = ends, modelAcc' = modelAcc, prevAcc' = prevAcc, swaps' = swaps, attempts' = attempts, lastAction' = lastAction,
   }
 }

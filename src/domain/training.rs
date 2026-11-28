@@ -931,6 +931,8 @@ pub struct TrainingState {
     pub current: Option<String>,
     /// The start time of the last run.
     pub last_time: Timestamp,
+    /// The catalog hash of the last finished run, or `None` before the first.
+    pub catalog: Option<u64>,
 }
 
 /// The number of action marks of `marked` with a mark time after the last run of `state`, plus
@@ -987,14 +989,48 @@ fn activations(learned: &[LearnedIntent], after: i128) -> usize {
     count
 }
 
-/// True when `count` changes are enough to start a training run.
+/// True when the catalog is `stale` or `count` changes are enough to start a training run.
 #[verus_spec(train =>
     ensures
-        train == (count >= min_changes),
+        train == (stale || count >= min_changes),
 )]
 #[must_use]
-pub fn should_train(count: usize, min_changes: usize) -> bool {
-    count >= min_changes
+pub fn should_train(count: usize, min_changes: usize, stale: bool) -> bool {
+    stale || count >= min_changes
+}
+
+/// The hash of the intent names and the seed examples of `catalog` in file order, then of the
+/// `unknown` examples, each followed by a newline.
+#[verus_verify]
+#[must_use]
+pub fn catalog_hash(catalog: &Catalog) -> u64 {
+    let mut text = String::new();
+    for intent in &catalog.intents {
+        text.push_str(intent.name.as_str());
+        text.push('\n');
+        push_lines(&mut text, &intent.examples);
+    }
+    push_lines(&mut text, &catalog.unknown_examples);
+    xxh3::xxh3_64(text.as_bytes())
+}
+
+/// Appends each of `lines` and a newline to `text`.
+#[verus_verify]
+fn push_lines(text: &mut String, lines: &[String]) {
+    for line in lines {
+        text.push_str(line.as_str());
+        text.push('\n');
+    }
+}
+
+/// True when `state` names a run whose catalog hash is not `hash`.
+#[verus_spec(stale =>
+    ensures
+        stale == (state.current.is_some() && state.catalog != Some(hash)),
+)]
+#[must_use]
+pub fn stale(state: &TrainingState, hash: u64) -> bool {
+    state.current.is_some() && !matches!(state.catalog, Some(saved) if saved == hash)
 }
 
 verus! {
@@ -1599,6 +1635,7 @@ mod tests {
         let state = TrainingState {
             current: Some("run-1".to_owned()),
             last_time: "2026-11-15T07:00:00Z".parse().expect("a timestamp"),
+            catalog: None,
         };
         let mut marks: Vec<Interaction> = (0..23)
             .map(|id| marked(id, Some(Value::Good), None))
@@ -1612,8 +1649,32 @@ mod tests {
     /// AC-13.3-2.
     #[test]
     fn ac_13_3_2_should_train_at_min_changes() {
-        assert!(!should_train(19, 20), "one change short starts no run");
-        assert!(should_train(20, 20), "min_changes starts a run");
+        assert!(!should_train(19, 20, false), "one short starts a run");
+        assert!(should_train(20, 20, false), "min_changes starts no run");
+    }
+
+    /// AC-13.15-1.
+    #[test]
+    fn ac_13_15_1_catalog_hash_follows_names_and_examples() {
+        let (catalog, _) = training_set();
+        let hash = catalog_hash(&catalog);
+        let mut seed = catalog.clone();
+        seed.intents[0].examples[0].push_str(" now");
+        assert_ne!(catalog_hash(&seed), hash, "a new seed keeps the hash");
+        let mut name = catalog.clone();
+        name.intents[0].name.push_str("_now");
+        assert_ne!(catalog_hash(&name), hash, "a new name keeps the hash");
+        let mut service = catalog.clone();
+        service.intents[0].service = Some("light.toggle".to_owned());
+        assert_eq!(catalog_hash(&service), hash, "a service changes it");
+    }
+
+    /// AC-13.15-2.
+    #[test]
+    fn ac_13_15_2_stale_catalog_starts_a_run_at_count_0() {
+        assert!(should_train(0, 20, true), "a stale catalog starts no run");
+        assert!(!should_train(19, 20, false), "one short starts a run");
+        assert!(should_train(20, 20, false), "min_changes starts no run");
     }
 
     /// AC-11.5-1.

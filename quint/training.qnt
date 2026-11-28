@@ -1,10 +1,10 @@
-// Training: the trigger, the run, the local and RunPod attempts, the pause, the accept rule and the swap.
+// Training: the trigger, the catalog release, the run, the local and RunPod attempts, the pause, the accept rule and the swap.
 module training {
   /// Where the current run trains.
   type Run = Idle | Local | RunPod
 
   /// A step of the model. A done step has the accuracy of the new model.
-  type Event = Init | Change | AutoStart | VoiceStart | LocalDone(int) | LocalFail | RunpodDone(int) | RunpodFail
+  type Event = Init | Change | Release | AutoStart | VoiceStart | LocalDone(int) | LocalFail | RunpodDone(int) | RunpodFail
 
   /// The change count that starts a run.
   pure val MIN = 2
@@ -23,6 +23,9 @@ module training {
 
   /// The changes since the run started.
   var during: int
+
+  /// The catalog hash of the training state differs from that of `intents.toml`.
+  var stale: bool
 
   /// Where the current run trains.
   var runState: Run
@@ -63,6 +66,7 @@ module training {
     RUNPOD' = runpod,
     changes' = 0,
     during' = 0,
+    stale' = false,
     runState' = Idle,
     paused' = false,
     starts' = 0,
@@ -91,6 +95,24 @@ module training {
     record(Change),
     changes' = changes + 1,
     during' = if (runState != Idle) during + 1 else during,
+    stale' = stale,
+    runState' = runState,
+    paused' = paused,
+    starts' = starts,
+    ends' = ends,
+    modelAcc' = modelAcc,
+    swaps' = swaps,
+    attempts' = attempts,
+  }
+
+  /// A release with other intents or seed examples restarts Jarvis between runs, after an accepted run.
+  action release = all {
+    runState == Idle,
+    swaps.length() > 0,
+    record(Release),
+    stale' = true,
+    changes' = changes,
+    during' = during,
     runState' = runState,
     paused' = paused,
     starts' = starts,
@@ -108,6 +130,7 @@ module training {
     paused' = true,
     starts' = starts + 1,
     during' = 0,
+    stale' = stale,
     attempts' = List(Local),
     changes' = changes,
     ends' = ends,
@@ -115,9 +138,9 @@ module training {
     swaps' = swaps,
   }
 
-  /// The change count reaches `MIN`.
+  /// The change count reaches `MIN`, or the catalog is stale.
   action autoStart = all {
-    changes >= MIN,
+    changes >= MIN or stale,
     start(AutoStart),
   }
 
@@ -132,16 +155,18 @@ module training {
     ends' = ends + 1,
     changes' = during,
     during' = during,
+    stale' = false,
     starts' = starts,
     attempts' = attempts,
   }
 
-  /// Ends the run with a failure. The model and the change count stay.
+  /// Ends the run with a failure. The model, the change count and `stale` stay.
   action failRun = all {
     runState' = Idle,
     ends' = ends + 1,
     changes' = changes,
     during' = during,
+    stale' = stale,
     starts' = starts,
     modelAcc' = modelAcc,
     swaps' = swaps,
@@ -166,6 +191,7 @@ module training {
       attempts' = attempts.append(RunPod),
       changes' = changes,
       during' = during,
+      stale' = stale,
       starts' = starts,
       ends' = ends,
       modelAcc' = modelAcc,
@@ -194,6 +220,7 @@ module training {
     nondet a = ACC.oneOf()
     any {
       change,
+      release,
       autoStart,
       voiceStart,
       localDone(a),
@@ -212,10 +239,10 @@ module training {
   /// A swap never installs a model more than `MARGIN` lower.
   val SwapWithinMargin = swaps.foldl(true, (ok, s) => ok and s._2 + MARGIN >= s._1)
 
-  /// After a run, the count holds only the changes made during the run.
+  /// After a run, the count holds only the changes made during the run, and the catalog is not stale.
   val CountResetsAfterRun = match lastAction {
-    | LocalDone(_) => changes == during
-    | RunpodDone(_) => changes == during
+    | LocalDone(_) => changes == during and not(stale)
+    | RunpodDone(_) => changes == during and not(stale)
     | _ => true
   }
 
@@ -261,4 +288,14 @@ module training {
       modelAcc == 1,
       swaps == List((0, 2), (2, 1)),
     })
+
+  /// A release after an accepted run starts a run at the change count 0, and its end stops the next start.
+  run ac_13_15_5_release_starts_run = init
+    .then(voiceStart)
+    .then(localDone(2))
+    .then(release)
+    .then(autoStart)
+    .expect(all { runState == Local, changes == 0 })
+    .then(localDone(2))
+    .then(autoStart.fail())
 }
