@@ -678,12 +678,14 @@ AC-13.10d-1 moves to sub-phase 13.10f as AC-13.10f-1.
 - AC-13.12-1: When `sample_context` gets the same areas and the same text two times, it returns the same context. This replaces AC-3.3-3.
 - AC-13.12-2: When `sample_context` runs for 1,000 different texts with 4 areas, each area and no area occur between 150 and 250 times.
 - AC-13.12-3: When two runs start 2 s apart on the same data, `FakeTrainer` records two equal training sets.
+- AC-13.12-4: When `jarvis dataset` runs with `--house`, each context names an area of the reference house or no area. This replaces AC-3.4-2.
 
 **Proofs.**
 
 - P-13.12-1 (AC-13.12-1). Ensures: the context is `sampled(areas, xxh3(text))`. Argument: `sample_context` reads only `areas` and `text`, and the contract of `xxh3_64` makes the hash a function of the bytes.
 - P-13.12-2. Evidence: test (statistical property of the hash on this input set).
 - P-13.12-3. Argument: no step of the set builder reads the clock or an RNG. The start time only names the run (sub-phase 13.9, step 3).
+- P-13.12-4. Evidence: test. Argument: each context of the set comes from `sample_context`, which gives an area of `areas` or no area (P-13.12-1).
 
 ---
 
