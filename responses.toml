@@ -143,7 +143,7 @@ responses = ["Sorry, I could not do that."]
 responses = ["Which room?", "In which room?"]
 
 [pools.cancelled]
-responses = ["Okay, never mind.", "Cancelled."]
+responses = ["Okay."]
 
 [pools.not_in_library]
 responses = ["That is not in the Plex library.", "I could not find that on Plex."]
