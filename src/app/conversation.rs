@@ -351,7 +351,8 @@ impl Conversation {
     }
 
     /// The reply to the transcript `text` in `context` and its work. An answer to the open dialog
-    /// of the satellite, else of the conversation, can cancel it, fill it or ask again. Else the
+    /// of the satellite, else of the conversation, can cancel it, fill it or ask again. A bare
+    /// "stop" on a satellite where Jarvis does nothing pauses the music there. Else the
     /// System One prediction of the normalized text in the area name of the satellite device, its
     /// decision and its dispatch, or the answer of a deferred job when `context` has no
     /// satellite. A question opens a dialog. A new request from a satellite counts in the habits.
@@ -522,11 +523,11 @@ impl Conversation {
         heard: &mut Heard,
     ) -> anyhow::Result<Answered> {
         let routed = self.route(text, open, heard).await?;
-        let (prediction, transcript, new) = match routed {
+        let (prediction, transcript, turn) = match routed {
             ControlFlow::Continue(routed) => routed,
             ControlFlow::Break(answered) => return Ok(answered),
         };
-        if new {
+        if turn == Turn::New {
             heard.link = None;
         }
         let now = heard.time;
@@ -536,14 +537,18 @@ impl Conversation {
             now,
             address: heard.address.clone(),
         };
-        let (handled, decided) = self.act(&prediction, &request, key, heard, new).await;
+        let acted = self.act(&prediction, &request, key, heard, turn).await;
+        let Some((handled, decided)) = acted else {
+            return Ok(self.cancel());
+        };
         Ok((handled, Some((prediction, decided))))
     }
 
     /// `text` in `context` from the area `name` at `now`, with a new interaction ID and, from a
-    /// satellite, the utterance of `text`.
+    /// satellite, the utterance of `text` and whether Jarvis is busy there.
     fn hear(&self, text: &str, context: &Context, name: Option<&str>, now: Timestamp) -> Heard {
         let satellite = context.satellite_id.clone();
+        let busy = satellite.as_deref().is_some_and(|id| self.queues.busy(id));
         // A typed request never gets voice audio.
         let utterance = satellite
             .as_ref()
@@ -559,6 +564,7 @@ impl Conversation {
             link: None,
             address: self.address(context),
             origin: None,
+            busy,
         }
     }
 
@@ -649,26 +655,21 @@ impl Conversation {
     }
 
     /// The dispatch of the decision for `prediction` of `request` on the satellite of `heard`. A
-    /// question opens a dialog for `key`. A `new` request from a satellite counts in the habits.
-    /// Logs the request. Also the parts of its record that the decision gives.
+    /// question opens a dialog for `key`. A new request from a satellite counts in the habits.
+    /// Logs the request. Also the parts of its record that the decision gives. `None` when `timed`
+    /// gives none.
     async fn act(
         &self,
         prediction: &Prediction,
         request: &Request,
         key: Option<Key>,
         heard: &Heard,
-        new: bool,
-    ) -> (Handled, Decided) {
-        let (decision, guard) = self.timed(prediction, request, heard).await;
+        turn: Turn,
+    ) -> Option<(Handled, Decided)> {
+        let (decision, guard) = self.timed(prediction, request, heard, turn).await?;
         let (mut decided, pending) = self.parts(&decision);
         let route = decided.route;
-        // Only a spoken request counts. Text from the HA UI has no satellite.
-        self.record(
-            prediction,
-            route,
-            request.now,
-            new && heard.satellite.is_some(),
-        );
+        self.record(prediction, route, heard, turn);
         let area = request.area.as_ref();
         let (handled, answer) = self.reply(decision, area, heard, key.clone(), guard).await;
         if let (Some(key), Some(pending)) = (key, pending) {
@@ -678,26 +679,30 @@ impl Conversation {
         let transcript = request.transcript.as_str();
         tracing::info!(transcript, ?top, ?route, reply, "handled");
         decided.response = answer.unwrap_or(decided.response);
-        (handled, decided)
+        Some((handled, decided))
     }
 
-    /// The decision for `prediction` of `request` (`started`), with a `Timer` as the decision of
-    /// the timer desk for the satellite of `heard` at its time, and the guard of its call.
+    /// The decision for `prediction` of `request` (`started`) in `turn`, with a `Timer` as the
+    /// decision of the timer desk for the satellite of `heard` at its time, and the guard of its
+    /// call. `None` for a `Stop` turn whose decision is not a `Reply`.
     async fn timed(
         &self,
         prediction: &Prediction,
         request: &Request,
         heard: &Heard,
-    ) -> (Decision, Option<Guard>) {
+        turn: Turn,
+    ) -> Option<(Decision, Option<Guard>)> {
         let decision = self.started(self.decide(prediction, request));
+        if turn == Turn::Stop && !matches!(decision, Decision::Reply { .. }) {
+            return None;
+        }
         let Decision::Timer(request) = decision else {
-            return (decision, None);
+            return Some((decision, None));
         };
         let (satellite, pools) = (heard.satellite.clone(), self.pools.load());
         let timers = &self.timers;
-        timers
-            .decide(&request, satellite, heard.time, &pools, &self.rng)
-            .await
+        let timed = timers.decide(&request, satellite, heard.time, &pools, &self.rng);
+        Some(timed.await)
     }
 
     /// `decision`, with a `Train` as a `Reply` with its reply when `voice` of the trigger starts a
@@ -754,23 +759,26 @@ impl Conversation {
         (decided, pending)
     }
 
-    /// Records the top intent of `prediction` at `now` in the habits when the request is `spoken`
-    /// and the decision of kind `route` does not defer to System Two.
-    fn record(&self, prediction: &Prediction, route: Route, now: Timestamp, spoken: bool) {
+    /// Records the top intent of `prediction` at the time of `heard` in the habits when `heard` is
+    /// a new request from a satellite and the decision of kind `route` does not defer to System
+    /// Two.
+    fn record(&self, prediction: &Prediction, route: Route, heard: &Heard, turn: Turn) {
+        // Only a spoken request counts. Text from the HA UI has no satellite.
+        let spoken = turn == Turn::New && heard.satellite.is_some();
         let top = prediction
             .ranked
             .first()
             .filter(|_| spoken && !matches!(route, Route::Llm));
         if let Some((intent, _)) = top {
-            self.habits.observe(intent.clone(), now);
+            self.habits.observe(intent.clone(), heard.time);
         }
     }
 
     /// The reply to `text` as an answer to the `open` dialog and its key on the satellite of
     /// `heard` at its time: the `cancelled` reply to a cancel phrase, or a question again, with
     /// the prediction and the record parts of an unclear answer. Else the prediction to decide and
-    /// its transcript: the filled intent of a `Slot` dialog, or the System One prediction of `text`
-    /// in the area of `heard`, with true for a new request.
+    /// its transcript: the filled intent of a `Slot` dialog, the `music_pause` of a bare "stop", or
+    /// the System One prediction of `text` in the area of `heard`, and the kind of the turn.
     ///
     /// # Errors
     ///
@@ -780,23 +788,31 @@ impl Conversation {
         text: &str,
         open: Option<(Dialog, Key)>,
         heard: &Heard,
-    ) -> anyhow::Result<ControlFlow<Answered, (Prediction, String, bool)>> {
+    ) -> anyhow::Result<ControlFlow<Answered, (Prediction, String, Turn)>> {
         if let Some(cancelled) = self.cancelled(text, open.as_ref(), heard).await {
-            return Ok(ControlFlow::Break(cancelled));
+            return Ok(cancelled);
         }
         let Some((dialog, key)) = open else {
             return Ok(ControlFlow::Continue((
                 self.predict(text, heard).await?,
                 text.to_owned(),
-                true,
+                Turn::New,
             )));
         };
         if let Some((prediction, transcript)) = self.filled(&dialog, text) {
-            return Ok(ControlFlow::Continue((prediction, transcript, false)));
+            return Ok(ControlFlow::Continue((
+                prediction,
+                transcript,
+                Turn::Answer,
+            )));
         }
         let prediction = self.predict(text, heard).await?;
         if self.is_clear(&prediction) {
-            return Ok(ControlFlow::Continue((prediction, text.to_owned(), true)));
+            return Ok(ControlFlow::Continue((
+                prediction,
+                text.to_owned(),
+                Turn::New,
+            )));
         }
         let unclear = self.unclear(text, prediction, dialog, key, heard);
         Ok(ControlFlow::Break(unclear.await))
@@ -841,25 +857,43 @@ impl Conversation {
         said(prediction, Route::Llm, spoken, None)
     }
 
-    /// The `cancelled` reply to the cancel phrase `text` of `heard`, with no record. On a
-    /// satellite, it stops the rings there. Else it closes the `open` dialog, and needs one.
+    /// The `cancelled` reply to the cancel phrase `text` of `heard` (`cancel`). On a satellite, it
+    /// stops the rings there, and a bare "stop" when Jarvis did nothing there continues as
+    /// `music_pause`. Else it closes the `open` dialog, and needs one.
     async fn cancelled(
         &self,
         text: &str,
         open: Option<&(Dialog, Key)>,
         heard: &Heard,
-    ) -> Option<Answered> {
+    ) -> Option<ControlFlow<Answered, (Prediction, String, Turn)>> {
         if !dialog::is_cancel(text, &self.queues.dialog.cancel) {
             return None;
         }
         // `handle` closed the dialog of the satellite when it increased its generation.
         if let Some(satellite) = &heard.satellite {
-            self.timers.stop(satellite).await;
+            let stopped = self.timers.stop(satellite).await;
+            if !(stopped || heard.busy || open.is_some()) && intent::normalize(text) == "stop" {
+                let ranked = vec![("music_pause".to_owned(), 1.0)];
+                let prediction = Prediction {
+                    ranked,
+                    slots: Vec::new(),
+                };
+                return Some(ControlFlow::Continue((
+                    prediction,
+                    text.to_owned(),
+                    Turn::Stop,
+                )));
+            }
         } else {
             self.queues.dialogs().close(open?.1.clone());
         }
+        Some(ControlFlow::Break(self.cancel()))
+    }
+
+    /// The `cancelled` reply, with no record.
+    fn cancel(&self) -> Answered {
         let text = self.pick("cancelled");
-        Some((Handled { text, after: None }, None))
+        (Handled { text, after: None }, None)
     }
 
     /// The prediction of the normalized `text` in the model context of `heard` by the System One
@@ -1964,6 +1998,19 @@ struct Heard {
     address: Option<String>,
     /// The satellite of the request with its generation, or `None` for a typed request.
     origin: Option<Origin>,
+    /// True when Jarvis did something on the satellite before the request (`Queues::busy`).
+    busy: bool,
+}
+
+/// How `route` continues a request to its decision.
+#[derive(Clone, Copy, PartialEq)]
+enum Turn {
+    /// A new request.
+    New,
+    /// The answer that fills a dialog.
+    Answer,
+    /// A bare "stop" that pauses the music. Only a `Reply` decision continues.
+    Stop,
 }
 
 impl Heard {
@@ -6457,7 +6504,16 @@ mod tests {
             satellite_id: Some(OFFICE_SATELLITE.to_owned()),
             ..Context::default()
         };
-        let Handled { text, after } = conversation.handle(text, office).await?;
+        settled(conversation, text, office).await
+    }
+
+    /// The reply to `text` in `context`, after its work.
+    async fn settled(
+        conversation: &Conversation,
+        text: &str,
+        context: Context,
+    ) -> anyhow::Result<String> {
+        let Handled { text, after } = conversation.handle(text, context).await?;
         if let Some(after) = after {
             after.await?;
         }
@@ -6763,7 +6819,7 @@ mod tests {
         assert!(queues.busy(SATELLITE), "the reply of 9 s ago is not speech");
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(!queues.busy(SATELLITE), "the reply of 10 s ago is speech");
-        let stopped = conversation.handle("stop", in_kitchen()).await?;
+        let stopped = conversation.handle("never mind", in_kitchen()).await?;
         assert_eq!(stopped.text, "Okay.");
         assert!(!queues.busy(SATELLITE), "the cancelled reply is speech");
         Ok(())
@@ -6787,6 +6843,76 @@ mod tests {
             !conversation.queues.busy(SATELLITE),
             "the older job is work"
         );
+        Ok(())
+    }
+
+    /// A conversation on `home` and `reasoner` with the classifier of `scripted(labels)` and the
+    /// pools of `responses.toml`, and its cache.
+    fn pausing(
+        home: &Arc<FakeHome>,
+        reasoner: &Arc<FakeReasoner>,
+        labels: &[&str],
+    ) -> anyhow::Result<(watch::Sender<StateCache>, Conversation)> {
+        let classifier = scripted(labels);
+        let (cache, _, mut conversation) =
+            still_with(home, "idle", classifier, Arc::clone(reasoner));
+        let catalog = crate::load_catalog(Path::new("intents.toml"))?;
+        let pools = crate::load_pools(Path::new("responses.toml"), &catalog)?;
+        conversation.pools = Arc::new(ArcSwap::from_pointee(pools));
+        Ok((cache, conversation))
+    }
+
+    /// The reply to `text` from the kitchen satellite, after its work.
+    async fn in_the_kitchen(conversation: &Conversation, text: &str) -> anyhow::Result<String> {
+        settled(conversation, text, in_kitchen()).await
+    }
+
+    /// AC-20.3-1.
+    #[tokio::test(start_paused = true)]
+    async fn ac_20_3_1_idle_stop_pauses_the_music() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (_cache, conversation) = pausing(&home, &Arc::default(), &[])?;
+        assert_eq!(
+            in_the_kitchen(&conversation, "stop").await?,
+            "Pausing the music."
+        );
+        let pause = service("media_player", "media_pause", SPEAKER);
+        assert_eq!(home.calls(), [pause]);
+        Ok(())
+    }
+
+    /// AC-20.3-2.
+    #[tokio::test(start_paused = true)]
+    async fn ac_20_3_2_stop_after_a_reply_pauses_nothing() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (_cache, conversation) = pausing(&home, &Arc::default(), &["lights_on"])?;
+        in_the_kitchen(&conversation, "turn on the lights").await?;
+        let calls = home.calls();
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(in_the_kitchen(&conversation, "stop").await?, "Okay.");
+        assert_eq!(home.calls(), calls);
+        Ok(())
+    }
+
+    /// AC-20.3-3.
+    #[tokio::test(start_paused = true)]
+    async fn ac_20_3_3_never_mind_pauses_nothing() -> anyhow::Result<()> {
+        let home = Arc::new(FakeHome::default());
+        let (_cache, conversation) = pausing(&home, &Arc::default(), &[])?;
+        assert_eq!(in_the_kitchen(&conversation, "never mind").await?, "Okay.");
+        assert_eq!(home.calls(), []);
+        Ok(())
+    }
+
+    /// AC-20.3-4.
+    #[tokio::test(start_paused = true)]
+    async fn ac_20_3_4_stop_without_a_speaker_is_cancelled() -> anyhow::Result<()> {
+        let reasoner = Arc::new(FakeReasoner::default());
+        let (cache, conversation) = pausing(&Arc::default(), &reasoner, &[])?;
+        let speaker = |id: &Arc<str>| id.starts_with("media_player.");
+        cache.send_modify(|cache| cache.states.retain(|id, _| !speaker(id)));
+        assert_eq!(in_the_kitchen(&conversation, "stop").await?, "Okay.");
+        assert_eq!(reasoner.questions(), [] as [&str; 0]);
         Ok(())
     }
 }
